@@ -19,7 +19,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from curie_doclint import counts
-from curie_doclint.counts import CLAIMS, _CATALOG_MARKER, check_counts, parse_count
+from curie_doclint.counts import (
+    CLAIMS,
+    _CATALOG_MARKER,
+    check_counts,
+    check_name_sets,
+    parse_count,
+)
 
 from .conftest import REPO_ROOT, Regenerate, RunLint, write
 
@@ -30,6 +36,18 @@ _CLI_OUTPUT_DOC = "docs/interfaces/cli-output/INTERFACE.md"
 def _sdk_module(name: str) -> tuple[str, str]:
     """A runner module that imports the harness SDK at import level."""
     return f"runner/src/curie_runner/{name}.py", "from claude_agent_sdk import Thing\n"
+
+
+def _harness_names_prose(names: str) -> str:
+    """The harness sentence in the form that ENUMERATES the modules (#1019).
+
+    Matches the real doc's shape: the count, then the parenthesised backticked
+    list after "today", which is what the name claim reads.
+    """
+    return (
+        "CLEAN, but the SDK is not yet confined to one module: two runner modules\n"
+        f"still import `claude_agent_sdk` today ({names}), and the value that crosses.\n"
+    )
 
 
 def _harness_prose(count: str) -> str:
@@ -300,3 +318,70 @@ def test_count_drift_fails_through_the_cli(
     assert code != 0
     assert "runner modules importing claude_agent_sdk" in out
     assert "'six'" in out
+
+
+# --- the enumeration disagrees with the tree (#1019) ------------------------
+#
+# #952 gated the harness doc's COUNT but not the names beside it, so a rename or
+# a swap kept the count right and the list wrong. These drive the real
+# NAME_CLAIMS over miniature trees, same discipline as the count tests above.
+
+
+def test_matching_name_list_passes(tmp_path: Path) -> None:
+    # Positive control: a gate that reported everything would be no gate.
+    write(tmp_path, *_sdk_module("check"))
+    write(tmp_path, *_sdk_module("session"))
+    write(tmp_path, _HARNESS_DOC, _harness_names_prose("`check.py`, `session.py`"))
+    assert check_name_sets(tmp_path) == []
+
+
+def test_renamed_module_is_reported_by_name(tmp_path: Path) -> None:
+    # The tree renamed session.py -> runtime.py; the count is still two, so the
+    # count claim cannot see this.
+    write(tmp_path, *_sdk_module("check"))
+    write(tmp_path, *_sdk_module("runtime"))
+    write(tmp_path, _HARNESS_DOC, _harness_names_prose("`check.py`, `session.py`"))
+
+    findings = check_name_sets(tmp_path)
+    assert len(findings) == 1, findings
+    detail = findings[0].reason
+    assert "runtime.py" in detail and "session.py" in detail, detail
+
+
+def test_swapped_import_is_caught_though_the_count_is_unchanged(tmp_path: Path) -> None:
+    """The motivating case, and the one #952's count gate provably cannot catch.
+
+    One module drops the SDK import and another gains it. The count is identical,
+    so `check_counts` passes; only the enumeration reveals the drift. #844 Phase 2
+    moves imports between exactly these modules, so this is the likely edit.
+    """
+    write(tmp_path, *_sdk_module("check"))
+    write(tmp_path, *_sdk_module("plugin"))  # gained it
+    write(tmp_path, "runner/src/curie_runner/session.py", "import os\n")  # dropped it
+    write(tmp_path, _HARNESS_DOC, _harness_names_prose("`check.py`, `session.py`"))
+
+    # The old gate is blind to it: two modules stated, two modules in the tree.
+    assert check_counts(tmp_path) == []
+
+    findings = check_name_sets(tmp_path)
+    assert len(findings) == 1, findings
+    detail = findings[0].reason
+    assert "plugin.py" in detail and "session.py" in detail, detail
+
+
+def test_removed_enumeration_fails_rather_than_going_vacuous(tmp_path: Path) -> None:
+    # The vacuity guard, mirroring the count claims': a reworded sentence must
+    # fail loudly rather than quietly stop being checked.
+    write(tmp_path, *_sdk_module("check"))
+    write(tmp_path, _HARNESS_DOC, "The SDK is imported in some runner modules.\n")
+
+    findings = check_name_sets(tmp_path)
+    assert len(findings) == 1, findings
+    assert "no longer verified" in findings[0].reason
+
+
+def test_absent_seam_doc_is_skipped_for_names_too(tmp_path: Path) -> None:
+    # A miniature tree that is not the catalog carries no seam docs; that is not
+    # a defect, same rule the count claims follow.
+    write(tmp_path, *_sdk_module("check"))
+    assert check_name_sets(tmp_path) == []
