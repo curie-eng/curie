@@ -290,3 +290,39 @@ class WorkflowStateEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
     )
+
+
+class ConsoleSession(Base):
+    """One console login: the code that establishes it and the session it becomes.
+
+    ADR-0083. The console authenticates with a server-managed, revocable session
+    instead of holding the platform key in browser code. A row is created when the
+    CLI mints a login code and completed when the browser exchanges that code for a
+    session token.
+
+    Only HASHES of the code and the token are stored, so reading this table cannot
+    replay a session -- the same reason `Approval` does not store credentials. And
+    revocation is `revoked_at`, a column write: a durable row a human can kill,
+    rather than a self-contained signed token that stays valid until it expires.
+    That distinction is why ADR-0083 rejected a stateless JWT-shaped token.
+    """
+
+    __tablename__ = "console_sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # SHA-256 hex of the single-use login code. Unique so a hash collision or a
+    # duplicate mint cannot produce two rows one code could satisfy.
+    login_code_hash: Mapped[str] = mapped_column(unique=True, index=True)
+    login_code_expires_at: Mapped[datetime]
+    # Set at exchange, so NULL means "minted, never redeemed".
+    session_token_hash: Mapped[str | None] = mapped_column(
+        default=None, unique=True, index=True
+    )
+    session_expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    # Stamped at exchange; its presence is what makes the code single-use.
+    consumed_at: Mapped[datetime | None] = mapped_column(default=None)
+    revoked_at: Mapped[datetime | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+

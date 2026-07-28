@@ -952,3 +952,35 @@ class MemoryEntryEdit(BaseModel):
 
     content: str
     expected_version: int
+
+
+# --- console sessions (ADR-0083, #1044) -------------------------------------
+
+
+class ConsoleLoginCodeOut(BaseModel):
+    """A freshly minted login code, returned exactly once.
+
+    The code is plaintext here because this response IS the one delivery: the CLI
+    prints it for the operator to copy. Only its hash is stored.
+    """
+
+    code: str
+    expires_at: datetime
+
+
+class ConsoleSessionExchange(BaseModel):
+    """The browser's exchange request: a login code and nothing else."""
+
+    code: str = Field(min_length=1)
+
+
+class ConsoleSessionOut(BaseModel):
+    """The result of an exchange. Deliberately carries NO token.
+
+    The session token travels only as an `HttpOnly` cookie, so page script cannot
+    read it -- putting it in the body would hand the credential straight back to
+    the JavaScript this design exists to keep it away from.
+    """
+
+    expires_at: datetime
+
