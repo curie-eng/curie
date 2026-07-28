@@ -7,13 +7,15 @@
 //! in a root `.curieignore` (see [`Exclusions::load`]).
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
 /// Name of the optional per-bundle ignore file, read from the bundle root.
-const IGNORE_FILE: &str = ".curieignore";
+/// `pub(crate)` so `info` names it in a diagnostic without re-spelling it.
+pub(crate) const IGNORE_FILE: &str = ".curieignore";
 
 /// Entry names never packed, matched against any file or directory with that
 /// name at any depth.
@@ -29,9 +31,29 @@ const EXCLUDED_NAMES: &[&str] = &[
     ".pytest_cache",
 ];
 
+/// Why a bundle's `.curieignore` could not be applied.
+///
+/// A bundle-CONTENT defect, so it is returned rather than raised: `pack_tar_gz`
+/// refuses such a bundle, while `info` reports it and still describes the
+/// directory. Both need the same fact, only one of them wants to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IgnoreDefect {
+    /// The ignore file is a symlink, so reading it would follow a link that may
+    /// leave the bundle root.
+    Symlink,
+}
+
 /// Entries the archive skips: the built-in names plus whatever the bundle's
 /// `.curieignore` declares.
-struct Exclusions {
+///
+/// `pub` on purpose: `info`'s disk walk (`crate::info::BundleView`) and the
+/// integration suite's deployed-view helper must both describe the SAME file set
+/// `pack_tar_gz` ships, so they ask this type "would the packer include this
+/// entry?" rather than mirroring [`EXCLUDED_NAMES`]. A mirrored denylist drifts,
+/// and the mirror already had: it carried the built-in names but not the
+/// bundle's `.curieignore`, so the disk view and the deployed view described
+/// different bundles.
+pub struct Exclusions {
     /// Bare names, matched against any entry at any depth.
     names: Vec<String>,
     /// Bundle-root-relative paths, matched against the exact entry.
@@ -39,7 +61,23 @@ struct Exclusions {
 }
 
 impl Exclusions {
-    /// Read `.curieignore` from the bundle root, if present.
+    /// The built-in names alone, with no bundle `.curieignore` applied.
+    ///
+    /// For a caller holding a bundle's files but no directory to read an ignore
+    /// file from (a stored bundle read back over the platform API). Such a
+    /// bundle was already packed through [`Self::load`], so its `.curieignore`
+    /// exclusions are baked into the file list; only the built-in names remain
+    /// worth re-asserting.
+    pub fn builtin() -> &'static Self {
+        static BUILTIN: OnceLock<Exclusions> = OnceLock::new();
+        BUILTIN.get_or_init(|| Self {
+            names: EXCLUDED_NAMES.iter().map(|n| (*n).to_string()).collect(),
+            paths: Vec::new(),
+        })
+    }
+
+    /// Read `.curieignore` from the bundle root, if present, reporting a
+    /// defective ignore file rather than deciding what to do about it.
     ///
     /// One pattern per line, with `#` comments and blank lines skipped and
     /// surrounding whitespace plus a trailing `/` stripped. A pattern with no
@@ -49,19 +87,22 @@ impl Exclusions {
     /// There is no glob support, so an odd pattern simply never matches, and a
     /// pattern that could reach outside the bundle is dropped. The ignore file
     /// is stat'd without following links, so a symlinked `.curieignore` is
-    /// refused rather than read from outside the bundle root.
-    fn load(root: &Path) -> Result<Self> {
+    /// never read from outside the bundle root.
+    ///
+    /// The returned [`IgnoreDefect`] is the ONE stat, answered once for both
+    /// callers with different jobs: [`Self::load`] turns it into the packer's
+    /// refusal, while `info` turns it into a diagnostic and reports the
+    /// directory anyway. Neither restates the check.
+    pub(crate) fn resolve(root: &Path) -> Result<(Self, Option<IgnoreDefect>)> {
         let mut exclusions = Self {
-            names: EXCLUDED_NAMES.iter().map(|n| (*n).to_string()).collect(),
+            names: Self::builtin().names.clone(),
             paths: Vec::new(),
         };
         let ignore_path = root.join(IGNORE_FILE);
         match std::fs::symlink_metadata(&ignore_path) {
-            Ok(meta) if meta.file_type().is_symlink() => bail!(
-                "symlinks are not supported in plugin bundles: {} (the {} file must be a regular file inside the bundle)",
-                ignore_path.display(),
-                IGNORE_FILE
-            ),
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Ok((exclusions, Some(IgnoreDefect::Symlink)))
+            }
             Ok(meta) if meta.is_file() => {
                 let text = std::fs::read_to_string(&ignore_path)
                     .with_context(|| format!("reading {}", ignore_path.display()))?;
@@ -71,7 +112,21 @@ impl Exclusions {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err).with_context(|| format!("stat {}", ignore_path.display())),
         }
-        Ok(exclusions)
+        Ok((exclusions, None))
+    }
+
+    /// [`Self::resolve`] under the packer's policy: a defective `.curieignore`
+    /// is a refusal, because packing on despite it would ship a file set the
+    /// bundle author did not ask for.
+    fn load(root: &Path) -> Result<Self> {
+        match Self::resolve(root)? {
+            (exclusions, None) => Ok(exclusions),
+            (_, Some(IgnoreDefect::Symlink)) => bail!(
+                "symlinks are not supported in plugin bundles: {} (the {} file must be a regular file inside the bundle)",
+                root.join(IGNORE_FILE).display(),
+                IGNORE_FILE
+            ),
+        }
     }
 
     fn extend_from(&mut self, text: &str) {
@@ -97,10 +152,25 @@ impl Exclusions {
         }
     }
 
-    fn is_excluded(&self, rel: &Path) -> bool {
+    /// Would a recursive walk prune `rel` at `rel` itself?
+    ///
+    /// Callers that walk recursively (this module's [`append_dir`], `info`'s
+    /// disk walk) only need this: excluding a directory prunes its whole
+    /// subtree by never descending.
+    pub fn is_excluded(&self, rel: &Path) -> bool {
         let name = rel.file_name().unwrap_or_default();
         self.names.iter().any(|n| name == std::ffi::OsStr::new(n))
             || self.paths.iter().any(|p| rel == p)
+    }
+
+    /// Would a recursive walk have pruned `rel` at `rel` or at any ancestor?
+    ///
+    /// For a caller holding a FLAT list of bundle-root-relative paths rather
+    /// than a tree to walk. It never descends, so it must ask about every
+    /// ancestor to reach the answer [`is_excluded`](Self::is_excluded) reaches
+    /// by pruning.
+    pub(crate) fn excludes_any_ancestor(&self, rel: &Path) -> bool {
+        rel.ancestors().any(|ancestor| self.is_excluded(ancestor))
     }
 }
 

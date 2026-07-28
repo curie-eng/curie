@@ -10,6 +10,7 @@ The point of the three targets (`skill` in-process, `local` via docker compose, 
 - [README.md](README.md): what Curie is, how to run it, and the target-by-target CLI walkthroughs.
 - [docs/agents.md](docs/agents.md): the verification contract for an agent driving Curie. The exact commands that prove an outcome, and the rule that a file existing or a string appearing in output is never evidence.
 - [docs/vision.md](docs/vision.md): the north star, who it is for, and the parity thesis new features are held against.
+- `curie <tier> info --json`: run this before reporting a bundle as working. It prints what the harness actually resolved (skills, MCP servers, declared secret names, boot env, approval gates, eval suite, model) plus a `diagnostics` array naming every candidate it looked at and did NOT register, where it looked, and why. An empty inventory and an unreadable one are different facts, and this is the verb that keeps them different: a renamed `SKILL.md` or a deleted `evals/cases.json` shows up as a named rejection with a fix, not as a silently empty list. Available at all three targets (`curie skill info --plugin-dir <dir>`, `curie local info <agent>`, `curie cluster info <agent>`), static and offline by default, and it never prints a secret value.
 
 ## The parity ladder (skill -> local -> cluster)
 

@@ -183,8 +183,17 @@ pub fn check_outcome(report: &CheckReport) -> std::result::Result<(), crate::exi
     }
 }
 
-/// Run the offline MCP load check for a plugin bundle.
-pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result<()> {
+/// Run the offline MCP load check for a plugin bundle and return its report.
+///
+/// Split out of `check` so a second caller (`info --check-mcp`) probes MCP load
+/// through the identical container path instead of forking one: the report is
+/// the shared product, and only what each caller does with it differs (`check`
+/// emits it and maps the verdict to an exit; `info` folds it into `load`).
+pub(crate) async fn run_check_report(
+    plugin_dir: PathBuf,
+    image: String,
+    timeout_s: u64,
+) -> Result<CheckReport> {
     let requested_dir = plugin_dir.display().to_string();
     let plugin_dir = plugin_dir.canonicalize().map_err(|err| {
         crate::exit::CliError::usage(format!("plugin dir not found: {requested_dir}: {err}"))
@@ -211,6 +220,13 @@ pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result
              docker exited {status}; stdout: {stdout}; stderr: {stderr}"
         )
     })?;
+
+    Ok(report)
+}
+
+/// Run the offline MCP load check for a plugin bundle.
+pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result<()> {
+    let report = run_check_report(plugin_dir, image, timeout_s).await?;
 
     crate::ui::ui().emit(&CheckOutput { report: &report });
     check_outcome(&report).map_err(anyhow::Error::from)
@@ -957,7 +973,7 @@ fn find_repo_root() -> Option<PathBuf> {
 /// The rule is frozen as data in tests/vectors/model-credential-forwarding.json,
 /// which both this lane and the worker lane assert against: changing the rule
 /// here without changing the worker (or the vectors) fails that gate (issue #495).
-fn select_passthrough_env(
+pub(crate) fn select_passthrough_env(
     fake_model: bool,
     base_url_override: bool,
     byo_credential: Option<&str>,
@@ -3933,8 +3949,12 @@ const PLUGIN_FORMAT_SCHEMA: &str =
 /// `PluginManifest.model_validate` failing on the exact same input, without
 /// this Rust code needing to know that field exists at all.
 ///
-/// Returns the joined validator error messages on failure so the CLI's error
-/// names the actual offending field/type rather than an approximation of one.
+/// Returns the joined validator failures on failure so the CLI's error names the
+/// actual offending field rather than an approximation of one -- as LOCATIONS
+/// only, via `redact::schema_violation`. `ValidationError`'s own `Display`
+/// serializes the failing instance into its message, and this string reaches two
+/// places a manifest's own content must never reach: `skill approvals`' error and
+/// (through `parse_manifest_gates`) `info`'s exit-0 `diagnostics` payload.
 fn validate_against_plugin_format_schema(
     raw: &serde_json::Value,
 ) -> std::result::Result<(), String> {
@@ -3952,7 +3972,7 @@ fn validate_against_plugin_format_schema(
     });
     let errors: Vec<String> = validator
         .iter_errors(raw)
-        .map(|e| format!("{e} (at instance path {})", e.instance_path()))
+        .map(|e| crate::redact::schema_violation(&e))
         .collect();
     if errors.is_empty() {
         Ok(())
@@ -4096,7 +4116,7 @@ fn read_bundle_gates(plugin_dir: &Path) -> Result<Vec<(String, String)>> {
 /// read gates identically. Also validates the raw manifest against the frozen
 /// `plugin_format` schema once a policy is declared (#701) -- see
 /// `validate_against_plugin_format_schema`.
-fn parse_manifest_gates(body: &str, source: &str) -> Result<Vec<(String, String)>> {
+pub(crate) fn parse_manifest_gates(body: &str, source: &str) -> Result<Vec<(String, String)>> {
     let invalid = |problem: &str| {
         crate::exit::usage(format!(
             "invalid plugin manifest {source}: {problem}. The runner rejects this manifest and arms ZERO approval gates, including any well-formed ones"
@@ -4157,7 +4177,7 @@ fn parse_manifest_gates(body: &str, source: &str) -> Result<Vec<(String, String)
 /// (mirroring `binding.py`), then most recent. `list_deployments` returns rows
 /// oldest-first, so "most recent" is the last match. `None` when the agent has no
 /// active deployment (nothing is running its bundle yet).
-fn select_in_force_deployment(
+pub(crate) fn select_in_force_deployment(
     deployments: &[crate::api::Deployment],
 ) -> Option<&crate::api::Deployment> {
     let active: Vec<&crate::api::Deployment> = deployments
@@ -4422,6 +4442,49 @@ pub fn skill_approvals_list_unavailable() -> anyhow::Error {
         "approvals --list/--resolve",
         APPROVALS_LIST_REASON,
         APPROVALS_LIST_ALT,
+    )
+}
+
+/// Why `info --check-mcp` is not answered at the local/cluster tiers today.
+pub const INFO_CHECK_MCP_REASON: &str = "the MCP load probe boots a runner container against a bundle DIRECTORY (`curie_runner.check`), and this CLI does not yet write a deployed bundle's stored files out to a directory to probe; the bytes themselves are reachable over the API, so this is a step this CLI has not built rather than something the tier makes impossible";
+/// Where to probe MCP load instead, and what would close the gap.
+pub const INFO_CHECK_MCP_ALT: &str = "run `curie skill info --plugin-dir <dir> --check-mcp` (or `curie skill check`) against the bundle source, then deploy the bundle that probed clean; probing a deployed bundle directly is a tracked follow-up (materialize `ApiClient::bundle_files` into a temp directory and hand it to `run_check_report`)";
+
+/// `<local|cluster> info --check-mcp`: answered with a plain failure (exit 1),
+/// deliberately NOT `ExitClass::Unsupported`.
+///
+/// The static half of `info` works at every tier; only the container probe is
+/// missing here. The flag is still DECLARED at every tier so this reports WHY
+/// rather than erroring like an unknown-flag typo, matching
+/// `skill_approvals_list_unavailable` (issue #771, ADR-0041) -- but that is
+/// where the resemblance stops, and the exit class differs on purpose.
+///
+/// Exit 4 is reserved for a concept absent **by construction**, one no input and
+/// no future release can answer here (ADR-0041). This is not that. ADR-0083
+/// decision 3 already settled the underlying fact for the verb: a deployed
+/// bundle's bytes are fully reachable as `(path, content)` pairs via
+/// `ApiClient::bundle_files`, and `run_check_report` takes a `PathBuf`, so
+/// writing those files to a temp directory and running the identical probe is
+/// mechanically available today. Nothing but the code to do it is missing.
+///
+/// The tempting counter-argument -- that a probe on this workstation measures
+/// whether the servers load HERE rather than in the platform's own sandbox -- is
+/// refuted by the alternative this very decline recommends, which is itself a
+/// local probe standing in for the deployed one. The probe is offline and
+/// credential-free against the same runner image at every tier; if a local probe
+/// answered a different question, the recommended workaround would mislead too.
+///
+/// So the reason claims only what is true (the bar set by
+/// `skill_memory_unavailable`): the reconstruction step is unbuilt. "Not yet" is
+/// not "never", and an agent that reads exit 4 stops retrying and stops asking.
+pub fn info_check_mcp_unavailable() -> anyhow::Error {
+    anyhow::Error::from(
+        crate::exit::CliError::failure(crate::exit::not_available_here_message(
+            "info --check-mcp",
+            INFO_CHECK_MCP_REASON,
+            INFO_CHECK_MCP_ALT,
+        ))
+        .with_fix(INFO_CHECK_MCP_ALT),
     )
 }
 

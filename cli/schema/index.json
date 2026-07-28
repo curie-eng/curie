@@ -124,6 +124,12 @@
       "version": 1
     },
     {
+      "result": "InfoOutput",
+      "kind": "CliOutput",
+      "schema": "info.schema.json",
+      "version": 1
+    },
+    {
       "result": "ObservabilityOutput",
       "kind": "CliOutput",
       "schema": "observability.schema.json",

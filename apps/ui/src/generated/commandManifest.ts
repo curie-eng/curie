@@ -277,6 +277,55 @@ export const commandManifest = {
           "name": "check"
         },
         {
+          "about": "Print the resolved bundle plus discovery diagnostics: what the harness resolved from this bundle, and every candidate it looked at and did not register",
+          "args": [
+            {
+              "default_values": [
+                "."
+              ],
+              "global": false,
+              "help": "Plugin bundle directory",
+              "id": "plugin_dir",
+              "long": "plugin-dir",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Probe whether the declared MCP servers load, running the same offline check as `skill check`. Needs Docker and takes tens of seconds; omit for the fast static pass, which reports `load: \"not_probed\"` rather than implying a server registered",
+              "id": "check_mcp",
+              "long": "check-mcp",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Runner image for `--check-mcp`. Defaults to the same image resolution as `skill check`",
+              "id": "image",
+              "long": "image",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "30"
+              ],
+              "global": false,
+              "help": "`--check-mcp` deadline in seconds, forwarded to the runner container",
+              "id": "timeout",
+              "long": "timeout",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "info"
+        },
+        {
           "about": "View the bundle's declared approval gates, or print the env assignment that sets or clears the runner's override (nothing is mutated)",
           "args": [
             {
@@ -1165,6 +1214,65 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "deploy"
+        },
+        {
+          "about": "Print the deployed bundle's resolved inventory plus discovery diagnostics: what this CLI's pass over the in-force version's stored files resolved, and every candidate it looked at and did not register",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Not available at this tier: the MCP load probe boots a runner container against a bundle DIRECTORY (`curie_runner.check`), and this CLI does not yet write a deployed bundle's stored files out to a directory to probe; the bytes themselves are reachable over the API, so this is a step this CLI has not built rather than something the tier makes impossible; run `curie skill info --plugin-dir <dir> --check-mcp` (or `curie skill check`) against the bundle source, then deploy the bundle that probed clean; probing a deployed bundle directly is a tracked follow-up (materialize `ApiClient::bundle_files` into a temp directory and hand it to `run_check_report`)",
+              "id": "check_mcp",
+              "long": "check-mcp",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "info"
         },
         {
           "about": "List an agent's immutable versions (`GET /agents/{id}/versions`)",
@@ -2817,6 +2925,83 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "delete"
+        },
+        {
+          "about": "Print the deployed bundle's resolved inventory plus discovery diagnostics: what this CLI's pass over the in-force version's stored files resolved, and every candidate it looked at and did not register",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Not available at this tier: the MCP load probe boots a runner container against a bundle DIRECTORY (`curie_runner.check`), and this CLI does not yet write a deployed bundle's stored files out to a directory to probe; the bytes themselves are reachable over the API, so this is a step this CLI has not built rather than something the tier makes impossible; run `curie skill info --plugin-dir <dir> --check-mcp` (or `curie skill check`) against the bundle source, then deploy the bundle that probed clean; probing a deployed bundle directly is a tracked follow-up (materialize `ApiClient::bundle_files` into a temp directory and hand it to `run_check_report`)",
+              "id": "check_mcp",
+              "long": "check-mcp",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "info"
         },
         {
           "about": "List an agent's immutable versions (`GET /agents/{id}/versions`)",

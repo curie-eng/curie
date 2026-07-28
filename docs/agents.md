@@ -51,6 +51,33 @@ appearing in output, or a command not erroring is not evidence. Report success
 only when a command from this contract exits 0 **and** the stated fact holds in
 its `--json` payload.
 
+**Before reporting a bundle as working, at any tier: `curie skill info --json`.**
+It reports what the harness actually resolved from the bundle: discovered
+skills, declared MCP servers, declared secret names and boot env, approval
+gates, the eval suite, channel and comms, artifact paths, and the resolved model
+with its credential source by name. It is static and offline by default: no
+container, no model call, and it does not run the agent, so it supplements
+`eval` rather than replacing it. The deployed tiers answer the same verb over
+the in-force deployment's stored files, and both take the agent name as a
+positional written after `info`: `curie local info --json` and
+`curie cluster info --json`.
+
+**On `info`, exit 0 is not the check. Read the `diagnostics` array.** A bundle
+defect is a diagnosis, not a failure: an unparseable manifest, a `skills/`
+directory whose `SKILL.md` was renamed, a deleted evals/cases.json, an
+`approvalPolicy` the runner would refuse, all exit 0 and report what is wrong.
+An agent that checks only the exit code reads a broken bundle as healthy. Each
+entry names what the pass looked for, where it looked, and why the candidate did
+not count, which is what separates **not declared** from **declared but did not
+register**. An empty inventory with an empty `diagnostics` is the pass.
+
+**Two sentinel shapes appear in that payload and they mean different things.**
+`"available": false` means the concept has no meaning at this tier and names
+where it does have one; `"resolved": false` means the concept exists here but
+this bundle's state blocked determining it, and it is always paired with a
+`diagnostics` entry. Neither is ever an omitted key or an empty array, so an
+empty array in this payload really is an empty collection.
+
 **After scaffolding a bundle with `curie init`:** `curie skill check --json`
 exits 0 and `verdict` is `"green"`. Every server in `declared` has a non-null
 `registered` counterpart in `matches` with `connected` true. This runs offline

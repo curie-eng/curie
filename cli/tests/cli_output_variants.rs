@@ -40,6 +40,11 @@ use curie::commands::{
     ResumeOutput, SkillApprovalsOutput, VersionsOutput,
 };
 use curie::comms::CommsOutput;
+use curie::info::{
+    ArtifactRow, BootEnvRow, BundleInfo, CredentialInfo, Diagnostic, DiagnosticKind, GateRow,
+    InfoOutput, InfoReport, Maybe, McpLoad, McpRow, ModelInfo, SecretRow, SecretsBlock, SkillRow,
+    Unavailable, Unresolved,
+};
 use curie::local::{
     LocalDownOutput, LocalRebuildOutput, LocalStatusOutput, LocalUpOutput, ModelMode,
 };
@@ -176,6 +181,143 @@ fn cluster_status() -> Box<ClusterStatus> {
         pods_listed: true,
         urls: Vec::new(),
     })
+}
+
+fn unavailable(reason: &str, where_it_lives: &str) -> Unavailable {
+    Unavailable {
+        available: false,
+        reason: reason.to_string(),
+        where_it_lives: where_it_lives.to_string(),
+    }
+}
+
+fn unresolved(reason: &str) -> Unresolved {
+    Unresolved {
+        resolved: false,
+        reason: reason.to_string(),
+    }
+}
+
+/// A POPULATED skill-tier report, not a minimal one: #965 exists so every
+/// variant's payload actually reaches the schema gate, and a trivially empty
+/// sample would satisfy the registry while exercising none of the shape.
+///
+/// So this carries a real skill, a real MCP row, a real gate, a declared secret,
+/// a boot-env row, artifacts, and two diagnostics across two kinds -- plus BOTH
+/// sentinels, kept distinct: `channel`/`comms`/`bundle.deployed`/
+/// `model.recorded_runner`/`boot_env[].value_present` are `unavailable`
+/// (meaningless at the skill tier), while `evals` is `unresolved` (the concept
+/// exists here, this bundle's state blocked it). Conflating the two would let a
+/// consumer read "does not exist here" as "exists but is broken".
+fn info_report() -> InfoReport {
+    InfoReport {
+        info: "curie".to_string(),
+        version: 1,
+        tier: Maybe::Known("skill".to_string()),
+        bundle: Maybe::Known(BundleInfo {
+            name: Some("weather".to_string()),
+            version: Some("0.1.0".to_string()),
+            source: "disk".to_string(),
+            root: Maybe::Known("/tmp/weather".to_string()),
+            manifest_path: Some(".claude-plugin/plugin.json".to_string()),
+            manifest_location: Some(".claude-plugin/plugin.json".to_string()),
+            deployed: Maybe::Unavailable(unavailable(
+                "`skill up` runs bytes on disk, so no version is assigned",
+                "`curie local info <agent>`",
+            )),
+        }),
+        skills: Maybe::Known(vec![SkillRow {
+            name: "weather".to_string(),
+            path: "skills/weather/SKILL.md".to_string(),
+            description: Some("Look up a location's weather forecast.".to_string()),
+            allowed_tools: vec!["WebSearch".to_string(), "WebFetch".to_string()],
+        }]),
+        mcp_servers: Maybe::Known(vec![McpRow {
+            name: "github".to_string(),
+            source: ".mcp.json".to_string(),
+            form: "stdio".to_string(),
+            authed: true,
+            load: McpLoad::NotProbed,
+        }]),
+        secrets: Maybe::Known(SecretsBlock {
+            declared: vec![SecretRow {
+                name: "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+                satisfied: Maybe::Known(true),
+                source: Maybe::Known("shell_env".to_string()),
+            }],
+        }),
+        boot_env: vec![BootEnvRow {
+            name: "CURIE_MEMORY_REF".to_string(),
+            set_by_this_tier: Maybe::Known(false),
+            value_present: Maybe::Unavailable(unavailable(
+                "this CLI cannot read a running container's environment",
+                "the sandbox itself",
+            )),
+            note: Some("no durable memory is attached at the skill tier".to_string()),
+        }],
+        approval_gates: Maybe::Known(vec![GateRow {
+            gate: "Bash".to_string(),
+            route: "permission".to_string(),
+        }]),
+        evals: Maybe::Unresolved(unresolved("evals/cases.json is absent")),
+        channel: Maybe::Unavailable(unavailable(
+            "`skill message` posts straight to the runner; there is no channel",
+            "`curie local info <agent>`",
+        )),
+        comms: Maybe::Unavailable(unavailable(
+            "no dispatcher exists at the skill tier",
+            "`curie local info <agent>`",
+        )),
+        model: Maybe::Known(ModelInfo {
+            mode: "ambient_sdk_credential".to_string(),
+            model_id: None,
+            base_url_override: false,
+            credential: CredentialInfo {
+                name: Some("ANTHROPIC_API_KEY".to_string()),
+                source: "shell_env".to_string(),
+            },
+            recorded_runner: Maybe::Unavailable(unavailable(
+                "no runner is recorded for this bundle",
+                "`curie skill up` records one",
+            )),
+            note: "what a `skill up` from this shell WOULD resolve".to_string(),
+        }),
+        artifacts: vec![
+            ArtifactRow {
+                kind: "manifest".to_string(),
+                path: ".claude-plugin/plugin.json".to_string(),
+                exists: true,
+            },
+            ArtifactRow {
+                kind: "eval_suite".to_string(),
+                path: "evals/cases.json".to_string(),
+                exists: false,
+            },
+        ],
+        // Emitted in (kind, candidate, code) order, as `sort_diagnostics` does.
+        diagnostics: vec![
+            Diagnostic {
+                code: "evals.file_absent".to_string(),
+                kind: DiagnosticKind::Evals,
+                candidate: "evals/cases.json".to_string(),
+                looked_for: "an eval suite".to_string(),
+                looked_in: vec!["evals/cases.json".to_string()],
+                reason: "the bundle declares no eval suite at the conforming path".to_string(),
+                fix: Some("add evals/cases.json".to_string()),
+            },
+            Diagnostic {
+                code: "skill.no_skill_md".to_string(),
+                kind: DiagnosticKind::Skill,
+                candidate: "skills/drafts".to_string(),
+                looked_for: "SKILL.md".to_string(),
+                looked_in: vec!["skills/drafts/SKILL.md".to_string()],
+                reason: "the directory carries no conforming SKILL.md, so the loader \
+                         registers nothing from it"
+                    .to_string(),
+                fix: None,
+            },
+        ],
+    }
 }
 
 /// Every discovered enum, with one constructed sample per variant.
@@ -362,6 +504,13 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "DryRun" => ClusterDownOutput::DryRun(plan()),
             "Aborted" => ClusterDownOutput::Aborted,
             "Down" => ClusterDownOutput::Down { release_was_absent: false },
+        ],
+    );
+    m.insert(
+        "InfoOutput",
+        samples![
+            "DryRun" => InfoOutput::DryRun(plan()),
+            "Report" => InfoOutput::Report(info_report()),
         ],
     );
 

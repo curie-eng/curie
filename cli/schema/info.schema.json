@@ -1,0 +1,733 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/info/v1.json",
+  "title": "curie <tier> info --json",
+  "description": "The agent-facing payload of `curie <tier> info`: the dry-run plan, or one object describing what the harness resolved from a bundle plus a `diagnostics` array naming every candidate the discovery pass looked at and did NOT register. Two facts are kept distinct on purpose: `unavailable` ({available:false, reason, where}) means the concept has no meaning at this tier, while `unresolved` ({resolved:false, reason}) means the concept exists here but this bundle's state blocked resolving it. No field is ever omitted and no empty array is ever emitted for an unresolved concept, because an empty collection reads as `this bundle declares none` (ADR-0041). `diagnostic.kind` is the COARSE, CLOSED axis a consumer switches on, guaranteed a total match at v1; `diagnostic.code` is the FINE, OPEN axis whose prefix always equals its kind (the one documented exception is the `skills.*` family, which reports on the tree rather than one skill and still carries kind `skill`). CONSUMER CONTRACT: an unknown `code` must be treated as `a rejection with no specific branch`, never as a parse failure; failing closed on an unknown code is a consumer bug, not a contract break. The v1 code registry, by kind -- manifest: manifest.invalid_json, manifest.location_fallback, manifest.name_invalid; skill: skill.no_skill_md, skill.frontmatter_missing, skill.frontmatter_invalid, skill.tools_confusable, skill.symlink, skills.dir_absent, skills.empty; mcp: mcp.no_declaration, mcp.declared_none, mcp.manifest_unreadable, mcp.not_in_bundle_view, mcp.invalid_json, mcp.declared_pointer, mcp.not_probed, mcp.did_not_register, mcp.registered_zero_tools, mcp.probe_failed; evals: evals.file_absent, evals.invalid, evals.retired_format; secret: secret.unsatisfied, secret.name_invalid, secret.vault_unreadable; boot_env: boot_env.not_set_at_this_tier, boot_env.rows_scoped; approval_gate: approval_gate.manifest_invalid; artifact: artifact.symlink; state: state.runner_absent, state.foreign_runner, state.unreadable; deployed: deployed.no_active_deployment, deployed.bundle_unreadable. A DEPLOYED bundle is read through the platform's stored-TEXT-FILE view, which carries only the plugin manifest, `evals/cases.json` and `skills/**/SKILL.md`; a path the view cannot carry is reported as `mcp.not_in_bundle_view` with `mcp_servers` UNRESOLVED, never as the skill tier's `mcp.no_declaration` with an empty list, and `artifacts[].exists` means `present in the file view THIS report read`, not `present in the bundle`. When a lookup never completed at all (`deployed.no_active_deployment`, `deployed.bundle_unreadable` from the gap path) every bundle-derived block is `unresolved` and `artifacts` is empty, because rows asserting a path was absent would describe a bundle that was never read. EVOLUTION at v1 -- ADDITIVE, edited in place with no version bump: a new `code` string, a new `kind` enum value, a new optional report field, a new `mcpLoad` value, a new `credential.source` value. BREAKING, requires a v2 `$id` and a bumped `index.json` version: removing or renaming a `kind`, removing or renaming a `code` a consumer could have branched on, removing or retyping any field of `diagnostic`, making an optional report field required, or changing either sentinel shape. SECURITY: there is no `content` field anywhere in this contract and `additionalProperties` is false at every level; an MCP row carries exactly {name, source, form, authed, load}, because `env`, `headers`, `args`, `url` and `command` can each carry a literal token.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    },
+    "unavailable": {
+      "description": "The concept has no meaning at this tier. `reason` claims only what is true; `where` names the tier or command that DOES have it.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "const": false
+        },
+        "reason": {
+          "type": "string"
+        },
+        "where": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "available",
+        "reason",
+        "where"
+      ]
+    },
+    "unresolved": {
+      "description": "The concept exists at this tier, but this bundle's state blocked resolving it. Always paired with a `diagnostics` entry carrying the machine code.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "resolved": {
+          "const": false
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "resolved",
+        "reason"
+      ]
+    },
+    "maybeBool": {
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/unavailable"
+        },
+        {
+          "$ref": "#/$defs/unresolved"
+        }
+      ]
+    },
+    "mcpLoad": {
+      "enum": [
+        "not_probed",
+        "registered",
+        "registered_zero_tools",
+        "did_not_register",
+        "probe_failed"
+      ]
+    },
+    "credential": {
+      "description": "The model credential the CLI would forward, BY NAME. There is no value field.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "enum": [
+            "shell_env",
+            "curie_vault",
+            "env_file",
+            "none"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "source"
+      ]
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "manifest",
+            "skill",
+            "mcp",
+            "evals",
+            "secret",
+            "boot_env",
+            "approval_gate",
+            "artifact",
+            "state",
+            "deployed"
+          ]
+        },
+        "candidate": {
+          "type": "string"
+        },
+        "looked_for": {
+          "type": "string"
+        },
+        "looked_in": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reason": {
+          "type": "string"
+        },
+        "fix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "kind",
+        "candidate",
+        "looked_for",
+        "looked_in",
+        "reason",
+        "fix"
+      ]
+    },
+    "deployedInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "version_id": {
+          "type": "string"
+        },
+        "version_label": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "string"
+        },
+        "bundle_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent",
+        "agent_id",
+        "version_id",
+        "version_label",
+        "environment",
+        "bundle_sha256"
+      ]
+    },
+    "bundleInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "enum": [
+            "disk",
+            "deployed_bundle"
+          ]
+        },
+        "root": {
+          "description": "The filesystem root: real at `skill`, unavailable at the deployed tiers.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/unavailable"
+            }
+          ]
+        },
+        "manifest_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "manifest_location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deployed": {
+          "description": "The in-force deployed artifact: real at the deployed tiers, unavailable at `skill`.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/deployedInfo"
+            },
+            {
+              "$ref": "#/$defs/unavailable"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "source",
+        "root",
+        "manifest_path",
+        "manifest_location",
+        "deployed"
+      ]
+    },
+    "skillRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "allowed_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "path",
+        "description",
+        "allowed_tools"
+      ]
+    },
+    "mcpRow": {
+      "description": "Exactly the reviewed `DeclaredServer` field set plus `load`. A new key here is a value-leak vector and must re-run the threat model.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "form": {
+          "type": "string"
+        },
+        "authed": {
+          "type": "boolean"
+        },
+        "load": {
+          "$ref": "#/$defs/mcpLoad"
+        }
+      },
+      "required": [
+        "name",
+        "source",
+        "form",
+        "authed",
+        "load"
+      ]
+    },
+    "secretRow": {
+      "description": "A declared connector secret. NAMES only; satisfaction is a fact about THIS shell, so it is unavailable at the deployed tiers.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "satisfied": {
+          "$ref": "#/$defs/maybeBool"
+        },
+        "source": {
+          "oneOf": [
+            {
+              "enum": [
+                "shell_env",
+                "curie_vault",
+                "env_file",
+                "none"
+              ]
+            },
+            {
+              "$ref": "#/$defs/unavailable"
+            },
+            {
+              "$ref": "#/$defs/unresolved"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "satisfied",
+        "source"
+      ]
+    },
+    "secretsBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "declared": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/secretRow"
+          }
+        }
+      },
+      "required": [
+        "declared"
+      ]
+    },
+    "bootEnvRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "set_by_this_tier": {
+          "$ref": "#/$defs/maybeBool"
+        },
+        "value_present": {
+          "$ref": "#/$defs/maybeBool"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "set_by_this_tier",
+        "value_present",
+        "note"
+      ]
+    },
+    "gateRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gate": {
+          "type": "string"
+        },
+        "route": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "gate",
+        "route"
+      ]
+    },
+    "evalsInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "suite_name": {
+          "type": "string"
+        },
+        "case_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "path",
+        "suite_name",
+        "case_count"
+      ]
+    },
+    "channelInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "commsInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "connected": {
+          "type": "boolean"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "connected",
+        "detail"
+      ]
+    },
+    "recordedRunner": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "container_name": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "fake_model": {
+          "type": "boolean"
+        },
+        "plugin_dir": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "container_name",
+        "image",
+        "base_url",
+        "fake_model",
+        "plugin_dir"
+      ]
+    },
+    "modelInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_url_override": {
+          "type": "boolean"
+        },
+        "credential": {
+          "$ref": "#/$defs/credential"
+        },
+        "recorded_runner": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/recordedRunner"
+            },
+            {
+              "$ref": "#/$defs/unavailable"
+            },
+            {
+              "$ref": "#/$defs/unresolved"
+            }
+          ]
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "model_id",
+        "base_url_override",
+        "credential",
+        "recorded_runner",
+        "note"
+      ]
+    },
+    "artifactRow": {
+      "type": "object",
+      "description": "One expected file of the bundle shape. `exists` means `present in the FILE VIEW this report read`, not `present in the bundle`: at the deployed tiers the view is the platform's allowlisted stored-text-file set (plugin manifest, evals/cases.json, skills/**/SKILL.md), so a row for a path outside it is false there regardless of what the bundle ships, and the matching diagnostic says so.",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "exists": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "exists"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "info": {
+          "const": "curie"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tier": {
+          "oneOf": [
+            {
+              "enum": [
+                "skill",
+                "local",
+                "cluster"
+              ]
+            },
+            {
+              "$ref": "#/$defs/unresolved"
+            }
+          ]
+        },
+        "bundle": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/bundleInfo"
+            },
+            {
+              "$ref": "#/$defs/unresolved"
+            }
+          ]
+        },
+        "skills": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/skillRow"
+              }
+            },
+            {
+              "$ref": "#/$defs/unresolved"
+            }
+          ]
+        },
+        "mcp_servers": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/mcpRow"
+              }
+            },
+            {
+              "$ref": "#/$defs/unresolved"
+            }
+          ]
+        },
+        "secrets": {
+          "description": "The declared connector-secret NAMES come only from the manifest, so an unparseable manifest makes the whole block unresolved rather than reporting `declared: []`, which would read as `this bundle declares no secrets`.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/secretsBlock"
+            },
+            {
+              "$ref": "#/$defs/unresolved"
+            }
+          ]
+        },
+        "boot_env": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bootEnvRow"
+          }
+        },
+        "approval_gates": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/gateRow"
+              }
+            },
+            {
+              "$ref": "#/$defs/unresolved"
+            }
+          ]
+        },
+        "evals": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/evalsInfo"
+            },
+            {
+              "$ref": "#/$defs/unresolved"
+            }
+          ]
+        },
+        "channel": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/channelInfo"
+            },
+            {
+              "$ref": "#/$defs/unavailable"
+            }
+          ]
+        },
+        "comms": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/commsInfo"
+            },
+            {
+              "$ref": "#/$defs/unavailable"
+            }
+          ]
+        },
+        "model": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/modelInfo"
+            },
+            {
+              "$ref": "#/$defs/unavailable"
+            },
+            {
+              "$ref": "#/$defs/unresolved"
+            }
+          ]
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifactRow"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diagnostic"
+          }
+        }
+      },
+      "required": [
+        "info",
+        "version",
+        "tier",
+        "bundle",
+        "skills",
+        "mcp_servers",
+        "secrets",
+        "boot_env",
+        "approval_gates",
+        "evals",
+        "channel",
+        "comms",
+        "model",
+        "artifacts",
+        "diagnostics"
+      ]
+    }
+  ]
+}

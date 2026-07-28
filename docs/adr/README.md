@@ -112,5 +112,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0080 | [Rename the project to Curie](0080-rename-to-curie.md) | Accepted |
 | 0081 | [A nightly graded parity ladder verifies the real-model promise CI cannot](0081-nightly-graded-parity-ladder.md) | Accepted |
 | 0082 | [Connected-transport approval cards ride a real CLI-posted placeholder](0082-connected-transport-approval-cards-via-a-real-placeholder.md) | Accepted |
+| 0083 | [One discovery pass answers `info` at every tier](0083-one-discovery-pass-answers-info-at-every-tier.md) | Accepted |
 | 0084 | [Publish a verification contract for agents driving Curie](0084-publish-a-verification-contract-for-agents-driving-curie.md) | Accepted |
 <!-- END GENERATED: adr-index -->

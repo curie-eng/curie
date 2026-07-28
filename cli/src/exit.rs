@@ -134,11 +134,26 @@ pub fn unsupported(
     alternative: impl std::fmt::Display,
 ) -> anyhow::Error {
     anyhow::Error::from(
-        CliError::unsupported(format!(
-            "{concept} is not available at this tier: {reason}; {alternative}"
-        ))
-        .with_fix(alternative.to_string()),
+        CliError::unsupported(not_available_here_message(&concept, &reason, &alternative))
+            .with_fix(alternative.to_string()),
     )
+}
+
+/// The one wording of "this tier cannot answer that": the concept's absence, the
+/// reason, and the alternative, in that order.
+///
+/// Shared because the exit CLASS is what varies, not the sentence. [`unsupported`]
+/// pairs it with exit 4 for a concept absent by construction, while
+/// `commands::info_check_mcp_unavailable` pairs the identical sentence with exit
+/// 1 for a step that is merely unbuilt (ADR-0041 reserves exit 4 for the former).
+/// Two hand-built `format!`s drift apart one word at a time, and this string is
+/// the whole human-facing surface: `main` renders `{err:#}` and discards the fix.
+pub fn not_available_here_message(
+    concept: impl std::fmt::Display,
+    reason: impl std::fmt::Display,
+    alternative: impl std::fmt::Display,
+) -> String {
+    format!("{concept} is not available at this tier: {reason}; {alternative}")
 }
 
 /// Build a transient error (exit 3) as an `anyhow::Error` ready to `return Err(..)`.

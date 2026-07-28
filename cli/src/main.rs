@@ -483,6 +483,27 @@ enum SkillAction {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
+    /// Print the resolved bundle plus discovery diagnostics: what the harness
+    /// resolved from this bundle, and every candidate it looked at and did not
+    /// register.
+    Info {
+        /// Plugin bundle directory.
+        #[arg(long, default_value = ".")]
+        plugin_dir: PathBuf,
+        /// Probe whether the declared MCP servers load, running the same offline
+        /// check as `skill check`. Needs Docker and takes tens of seconds; omit
+        /// for the fast static pass, which reports `load: "not_probed"` rather
+        /// than implying a server registered.
+        #[arg(long)]
+        check_mcp: bool,
+        /// Runner image for `--check-mcp`. Defaults to the same image resolution
+        /// as `skill check`.
+        #[arg(long)]
+        image: Option<String>,
+        /// `--check-mcp` deadline in seconds, forwarded to the runner container.
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
     /// View the bundle's declared approval gates, or print the env assignment
     /// that sets or clears the runner's override (nothing is mutated).
     Approvals {
@@ -862,6 +883,21 @@ enum LocalAction {
         /// MCP server. The value never appears in argv. Repeatable.
         #[arg(long = "secret", value_name = "NAME")]
         secret: Vec<String>,
+    },
+    /// Print the deployed bundle's resolved inventory plus discovery
+    /// diagnostics: what this CLI's pass over the in-force version's stored
+    /// files resolved, and every candidate it looked at and did not register.
+    Info {
+        #[command(flatten)]
+        target: AgentTarget<LocalTier>,
+        // The help text is composed from the same consts the runtime
+        // `{error, fix}` payload uses, so the discovery surface cannot drift
+        // from the answer (issue #459, ADR-0041).
+        #[arg(long, help = format!(
+            "Not available at this tier: {}; {}",
+            commands::INFO_CHECK_MCP_REASON, commands::INFO_CHECK_MCP_ALT,
+        ))]
+        check_mcp: bool,
     },
     /// List an agent's immutable versions (`GET /agents/{id}/versions`).
     Versions {
@@ -1376,6 +1412,20 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Print the deployed bundle's resolved inventory plus discovery
+    /// diagnostics: what this CLI's pass over the in-force version's stored
+    /// files resolved, and every candidate it looked at and did not register.
+    Info {
+        #[command(flatten)]
+        target: ClusterAgentTarget,
+        // Same single-sourced prose as the local tier: the flag is declared so
+        // it can be DECLINED with a reason, not rejected as a typo.
+        #[arg(long, help = format!(
+            "Not available at this tier: {}; {}",
+            commands::INFO_CHECK_MCP_REASON, commands::INFO_CHECK_MCP_ALT,
+        ))]
+        check_mcp: bool,
+    },
     /// List an agent's immutable versions (`GET /agents/{id}/versions`).
     Versions {
         #[command(flatten)]
@@ -1584,6 +1634,29 @@ async fn run(command: Option<Command>) -> Result<()> {
                     artifacts::version(),
                 );
                 commands::check(plugin_dir, image, timeout).await
+            }
+            SkillAction::Info {
+                plugin_dir,
+                check_mcp,
+                image,
+                timeout,
+            } => {
+                let image = artifacts::resolve_image(
+                    image.as_deref(),
+                    artifacts::Channel::current(),
+                    artifacts::version(),
+                );
+                emit(
+                    curie::info::run(curie::info::InfoOpts {
+                        target: curie::info::InfoTarget::Skill {
+                            plugin_dir,
+                            image,
+                            timeout_s: timeout,
+                        },
+                        check_mcp,
+                    })
+                    .await?,
+                )
             }
             SkillAction::Approvals {
                 plugin_dir,
@@ -1878,6 +1951,25 @@ async fn run(command: Option<Command>) -> Result<()> {
                         // declared-secrets policy gate (#464).
                         secret_binding_supported: true,
                         connect_hint,
+                    })
+                    .await?,
+                )
+            }
+            LocalAction::Info { target, check_mcp } => {
+                // Answered, not absent: the STATIC half of info works here; only
+                // the container probe has no bundle directory to mount, so the
+                // flag reports why and exits 4 (issue #771, ADR-0041). The guard
+                // runs BEFORE any API call, so the decline needs no network.
+                if check_mcp {
+                    return Err(commands::info_check_mcp_unavailable());
+                }
+                emit(
+                    curie::info::run(curie::info::InfoOpts {
+                        target: curie::info::InfoTarget::Deployed {
+                            tier: curie::info::Tier::Local,
+                            opts: target.into(),
+                        },
+                        check_mcp: false,
                     })
                     .await?,
                 )
@@ -2488,6 +2580,35 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         yes,
                     )
+                    .await?,
+                )
+            }
+            ClusterAction::Info { target, check_mcp } => {
+                // The decline fires BEFORE `resolve_cluster_conn`, so it never
+                // triggers a kubectl discovery call: the answer is a property of
+                // the tier, not of any release (issue #771, ADR-0041).
+                if check_mcp {
+                    return Err(commands::info_check_mcp_unavailable());
+                }
+                let ClusterAgentTarget {
+                    agent,
+                    conn,
+                    dry_run,
+                } = target;
+                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                emit(
+                    curie::info::run(curie::info::InfoOpts {
+                        target: curie::info::InfoTarget::Deployed {
+                            tier: curie::info::Tier::Cluster,
+                            opts: AgentActionOpts {
+                                api_url,
+                                api_key,
+                                agent,
+                                dry_run,
+                            },
+                        },
+                        check_mcp: false,
+                    })
                     .await?,
                 )
             }

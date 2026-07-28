@@ -1263,3 +1263,235 @@ fn a_new_family_schema_gate_has_teeth() {
         "kill schema must reject a Done object missing the required `killed` key"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #1040: `curie <tier> info`. The report is built by the REAL `info::discover`
+// pass (never a hand-written fixture) so this check cannot drift from what the
+// command emits. Because `info.schema.json` sets `additionalProperties: false`
+// everywhere and `diagnostic.kind` is a closed enum, this is what stops a field
+// or a kind being added to Rust without the schema moving with it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use curie::info::{discover, BundleOrigin, BundleView, InfoOutput};
+
+/// The ten closed `kind` values. Duplicated from the schema on purpose: the
+/// assertion below compares this list against the schema's own enum, so a value
+/// removed or renamed on either side is a red test rather than a silent contract
+/// break for every consumer that switched on it.
+const INFO_DIAGNOSTIC_KINDS: &[&str] = &[
+    "manifest",
+    "skill",
+    "mcp",
+    "evals",
+    "secret",
+    "boot_env",
+    "approval_gate",
+    "artifact",
+    "state",
+    "deployed",
+];
+
+fn info_deployed_origin() -> BundleOrigin {
+    BundleOrigin::Deployed {
+        agent: "demo".to_string(),
+        agent_id: "a_1".to_string(),
+        version_id: "ver_1".to_string(),
+        version_label: "v1".to_string(),
+        environment: "prod".to_string(),
+        bundle_sha256: Some("abc123".to_string()),
+        channel: "C0DEMO".to_string(),
+    }
+}
+
+const INFO_MANIFEST: &str = r#"{
+  "name": "contract-bundle",
+  "version": "0.1.0",
+  "description": "A bundle exercising the info report contract.",
+  "secrets": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+  "approvalPolicy": { "gates": [{ "gate": "Bash", "route": "slack" }] }
+}"#;
+
+const INFO_SKILL_MD: &str = "---\nname: sample\ndescription: A sample skill.\nallowed-tools:\n  - WebSearch\n---\n\n# Sample\n";
+
+const INFO_CASES_JSON: &str = r#"{"name": "contract-bundle", "cases": [{"id": "c1", "input": "hi", "grader": {"kind": "contains", "expected": "hi"}}]}"#;
+
+fn info_files() -> Vec<(String, String)> {
+    vec![
+        (
+            ".claude-plugin/plugin.json".to_string(),
+            INFO_MANIFEST.to_string(),
+        ),
+        (
+            ".mcp.json".to_string(),
+            r#"{"mcpServers": {"github": {"command": "mcp-server-github", "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"}}}}"#
+                .to_string(),
+        ),
+        (
+            "skills/sample/SKILL.md".to_string(),
+            INFO_SKILL_MD.to_string(),
+        ),
+        (
+            "evals/cases.json".to_string(),
+            INFO_CASES_JSON.to_string(),
+        ),
+    ]
+}
+
+/// Write the same bundle to a real directory so the SKILL-tier branch (with its
+/// own inverted sentinels: a real `bundle.root`, an unavailable
+/// `bundle.deployed`) is validated too, not just the deployed one.
+fn info_disk_bundle() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (rel, content) in info_files() {
+        let path = dir.path().join(&rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, content).expect("write bundle file");
+    }
+    dir
+}
+
+#[test]
+fn info_json_validates_against_info_schema() {
+    let schema = load_schema("info.schema.json");
+    let v = validator(&schema);
+
+    // (a) A populated SKILL-tier report: a real filesystem root, a resolved
+    // skill/mcp/gates/evals inventory, and the deployed-only facts sentinelled.
+    let dir = info_disk_bundle();
+    let disk_view = BundleView::from_disk(dir.path()).expect("from_disk over a written bundle");
+    let disk = InfoOutput::Report(discover(&disk_view)).to_json();
+    assert!(
+        v.is_valid(&disk),
+        "a skill-tier info report must validate against info.schema.json: {disk}"
+    );
+
+    // (b) The DEPLOYED tier, exercising the inversion: `bundle.root` and `model`
+    // sentinelled, `bundle.deployed` and `channel` real.
+    let deployed_view = BundleView::from_files(info_deployed_origin(), info_files());
+    let deployed = InfoOutput::Report(discover(&deployed_view)).to_json();
+    assert!(
+        v.is_valid(&deployed),
+        "a deployed-tier info report must validate against info.schema.json: {deployed}"
+    );
+    assert_eq!(
+        deployed["bundle"]["root"]["available"],
+        serde_json::json!(false),
+        "the deployed branch must exercise the inverted sentinel, not skip it: {deployed}"
+    );
+    assert_eq!(
+        disk["bundle"]["deployed"]["available"],
+        serde_json::json!(false),
+        "the skill branch must exercise the opposite inversion: {disk}"
+    );
+
+    // (d) The dry-run branch of the family's `oneOf`.
+    let dry = InfoOutput::DryRun(DryRunPlan {
+        lines: vec![
+            "GET /agents/<id>/deployments".to_string(),
+            "GET /agents/<id>/versions/<vid>/files".to_string(),
+        ],
+    })
+    .to_json();
+    assert!(
+        v.is_valid(&dry),
+        "InfoOutput::DryRun must match the schema's dryRun branch: {dry}"
+    );
+}
+
+/// (c) The all-sentinel report carrying a diagnostic of EVERY one of the ten
+/// closed `kind` values, plus the closed-enum gate itself. `kind` is the coarse
+/// axis a consumer switches on and is guaranteed a total match at v1, so the
+/// schema's enum and the registry must agree exactly.
+#[test]
+fn info_schema_accepts_every_diagnostic_kind_and_the_enum_stays_closed() {
+    let schema = load_schema("info.schema.json");
+
+    // The schema's own enum is the contract; this list is the expectation.
+    let declared: BTreeSet<String> = schema["$defs"]["diagnostic"]["properties"]["kind"]["enum"]
+        .as_array()
+        .expect("diagnostic.kind must be a closed enum in info.schema.json")
+        .iter()
+        .map(|v| v.as_str().expect("every kind is a string").to_string())
+        .collect();
+    let expected: BTreeSet<String> = INFO_DIAGNOSTIC_KINDS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
+    assert_eq!(
+        declared, expected,
+        "removing or renaming a `kind` is a BREAKING change requiring info v2; \
+         adding one is additive and belongs in both this list and the schema"
+    );
+
+    // A report shaped entirely of sentinels, carrying one diagnostic per kind.
+    let v = validator(&schema);
+    let all_kinds = all_sentinel_report_with_every_kind();
+    assert!(
+        v.is_valid(&all_kinds),
+        "an all-sentinel report carrying every kind must validate: {all_kinds}"
+    );
+
+    // Teeth: an unknown kind must be REJECTED (that is what "closed" means), and
+    // a diagnostic missing one of its seven required keys must be rejected too.
+    let mut bad_kind = all_kinds.clone();
+    bad_kind["diagnostics"][0]["kind"] = serde_json::json!("not_a_kind");
+    assert!(
+        !v.is_valid(&bad_kind),
+        "info.schema.json must reject a diagnostic kind outside the closed enum"
+    );
+    let mut missing_key = all_kinds.clone();
+    missing_key["diagnostics"][0]
+        .as_object_mut()
+        .expect("object")
+        .remove("looked_in");
+    assert!(
+        !v.is_valid(&missing_key),
+        "info.schema.json must reject a diagnostic missing a required key"
+    );
+    // And an unknown top-level field, since additionalProperties is false.
+    let mut extra = all_kinds.clone();
+    extra
+        .as_object_mut()
+        .expect("object")
+        .insert("content".to_string(), serde_json::json!("secret bytes"));
+    assert!(
+        !v.is_valid(&extra),
+        "info.schema.json must reject an undeclared top-level field; there is no \
+         `content` field anywhere in this contract by design"
+    );
+}
+
+/// A REAL deployed-tier report (so every field name comes from the
+/// implementation, not from a guess) with its four `oneOf` inventory blocks
+/// driven to the `unresolved` sentinel and its `diagnostics` replaced by one
+/// entry of every closed `kind`. Only the two documented sentinel shapes and the
+/// seven-key diagnostic shape are written by hand here; both are pinned by the
+/// contract itself.
+fn all_sentinel_report_with_every_kind() -> serde_json::Value {
+    let view = BundleView::from_files(info_deployed_origin(), info_files());
+    let mut report = InfoOutput::Report(discover(&view)).to_json();
+
+    let unresolved = |reason: &str| serde_json::json!({ "resolved": false, "reason": reason });
+    report["skills"] = unresolved("the manifest could not be parsed");
+    report["mcp_servers"] = unresolved(".mcp.json is not valid JSON");
+    report["approval_gates"] = unresolved("approvalPolicy.gates[0] has no route");
+    report["evals"] = unresolved("evals/cases.json is absent");
+
+    report["diagnostics"] = serde_json::Value::Array(
+        INFO_DIAGNOSTIC_KINDS
+            .iter()
+            .map(|kind| {
+                serde_json::json!({
+                    "code": format!("{kind}.example"),
+                    "kind": kind,
+                    "candidate": "skills/example",
+                    "looked_for": "SKILL.md",
+                    "looked_in": ["skills/example/SKILL.md"],
+                    "reason": "the candidate did not conform",
+                    "fix": null,
+                })
+            })
+            .collect(),
+    );
+    report
+}

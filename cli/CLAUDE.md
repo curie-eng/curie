@@ -4,10 +4,10 @@ The `curie` CLI: Rust, clap + tokio + reqwest. Speaks only the
 frozen contracts (the generated `curie-aci-protocol` crate over HTTP/NDJSON,
 and the platform API's committed `apps/api/openapi.json`) and orchestrates a
 local runner container via Docker. Three command families: `skill` drives a
-plugin against a local runner with `up`, `down`, `status`, `message`, and
+plugin against a local runner with `up`, `down`, `status`, `info`, `message`, and
 `eval`; `local` wraps the compose stack and local API with `up`, `down`,
-`status`, `comms`, `message`, `deploy`, and `observability`; `cluster` wraps
-Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
+`status`, `info`, `comms`, `message`, `deploy`, and `observability`; `cluster` wraps
+Helm and the deployed release with `up`, `status`, `down`, `info`, `comms`, `message`,
 `deploy`, and `observability`. Full command reference in
 `cli/README.md`.
 
@@ -32,10 +32,21 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
   the streamed reply into one `SkillMessageOutput` under `--json` (it still
   streams live in the human path). The schema-gated ADR-0021 builders
   (`skill status`/`skill eval`, `skill check`, `local message`/`cluster message`,
-  `secrets list`, `guide`) now route through `Ui::emit` too (#474): each returns a
+  `secrets list`, `guide`, `info`) now route through `Ui::emit` too (#474): each returns a
   typed `CliOutput` whose `to_json` delegates to its unchanged pure builder, so the
   committed schemas stay byte-for-byte identical while the json-vs-human decision
-  lives only in `Ui::emit`. The one intentional non-`CliOutput` emit is the
+  lives only in `Ui::emit`. `InfoOutput` (`cli/src/info.rs`, #1040, ADR-0083) is the
+  newest of these and the reference shape for a new family: its `to_json` delegates
+  wholesale via `serde_json::to_value` over a `Serialize` report rather than
+  hand-picking fields into a `json!` literal, so it needs **no** `emits` entry in
+  `cli/api-mirrors.json` (see the emit-parity invariant below). `info` also converts
+  every bundle-CONTENT defect (an unparseable manifest, a `skills/<dir>` with no
+  `SKILL.md`, a missing `evals/cases.json`, an `approvalPolicy` the runner would
+  refuse, a deployment with no in-force version) into a `diagnostics` entry at exit
+  0, and only a genuinely unusable invocation (a `--plugin-dir` that does not exist
+  or holds no plugin manifest at all) is a usage error -- do not "fix" a diagnosed
+  defect into a failing exit, since a caller that must first learn WHAT is wrong
+  cannot be handed an error instead of the report. The one intentional non-`CliOutput` emit is the
   centralized error path in `main.rs` (`error_json` under `--json`): errors are not
   success-path values, so they stay on the error-emit mirror rather than the
   success-path `CliOutput` contract.
