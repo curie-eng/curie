@@ -127,11 +127,33 @@ def parse_count(token: str) -> int | None:
     return _NUMBER_WORDS.get(token.lower())
 
 
+def _sdk_importing_runner_module_names(repo_root: Path) -> set[str]:
+    """The runner modules that import ``claude_agent_sdk`` at import level.
+
+    This is the leakage the harness seam grades itself on: every module here is
+    one the SDK is not yet walled off from. The prose names them as bare file
+    names (``check.py``), so that is what this returns.
+
+    Args:
+        repo_root: The repository root to resolve ``runner/src`` against.
+
+    Returns:
+        The set of ``.py`` file names under ``runner/src`` carrying an SDK import.
+    """
+    src = repo_root / "runner" / "src"
+    return {
+        path.name
+        for path in sorted(src.rglob("*.py"))
+        if _SDK_IMPORT_RE.search(path.read_text(encoding="utf-8"))
+    }
+
+
 def _count_sdk_importing_runner_modules(repo_root: Path) -> int:
     """Count runner modules that import ``claude_agent_sdk`` at import level.
 
-    This is the leakage the harness seam grades itself on: every module here is
-    one the SDK is not yet walled off from.
+    Derived from [`_sdk_importing_runner_module_names`] rather than counted
+    separately, so the count claim and the name claim below cannot disagree with
+    each other about the same tree (#1019).
 
     Args:
         repo_root: The repository root to resolve ``runner/src`` against.
@@ -139,12 +161,7 @@ def _count_sdk_importing_runner_modules(repo_root: Path) -> int:
     Returns:
         The number of ``.py`` files under ``runner/src`` carrying an SDK import.
     """
-    src = repo_root / "runner" / "src"
-    return sum(
-        1
-        for path in sorted(src.rglob("*.py"))
-        if _SDK_IMPORT_RE.search(path.read_text(encoding="utf-8"))
-    )
+    return len(_sdk_importing_runner_module_names(repo_root))
 
 
 def _count_committed_cli_schemas(repo_root: Path) -> int:
@@ -220,6 +237,120 @@ CLAIMS: tuple[CountClaim, ...] = (
         source="#[test] in cli/tests/json_contract.rs",
     ),
 )
+
+
+@dataclass(frozen=True)
+class NameSetClaim:
+    """One ENUMERATION a seam doc states in prose, tied to its source of truth.
+
+    A count claim above pins how many; this pins which. #952 gated the harness
+    doc's "nine runner modules" but not the nine names listed beside it, so two
+    edits kept the gate green while making the doc wrong: renaming one of the
+    modules, or moving the import from one module to another. The second is the
+    likely one, because confining these imports is #844 Phase 2's refactor and
+    moving imports between modules is precisely what it does (#1019).
+
+    ``pattern`` must capture the region holding the list in group 1; the names
+    are then read out of it as backticked tokens, so re-ordering or re-wrapping
+    the sentence does not matter but changing the membership does.
+    """
+
+    doc: str
+    label: str
+    pattern: re.Pattern[str]
+    lister: Callable[[Path], set[str]]
+    source: str
+
+
+# A backticked file name inside the enumerated region.
+_BACKTICKED_NAME_RE = re.compile(r"`([^`]+\.py)`")
+
+# Every enumeration claim the seam catalog makes.
+NAME_CLAIMS: tuple[NameSetClaim, ...] = (
+    NameSetClaim(
+        doc="docs/interfaces/harness-modelsession/INTERFACE.md",
+        label="the runner modules importing claude_agent_sdk, by name",
+        # The parenthesised run after the claim sentence. DOTALL because the
+        # list wraps across lines in the prose.
+        pattern=re.compile(r"claude_agent_sdk`\s+today\s+\(([^)]*)\)", re.DOTALL),
+        lister=_sdk_importing_runner_module_names,
+        source="`from`/`import claude_agent_sdk` in runner/src/**/*.py",
+    ),
+)
+
+
+def check_name_sets(
+    repo_root: Path, claims: tuple[NameSetClaim, ...] = NAME_CLAIMS
+) -> list[Finding]:
+    """Assert every prose ENUMERATION in the seam catalog against the tree (#1019).
+
+    The count-claim sibling above answers "how many"; this answers "which", so a
+    rename or a swap that preserves the count cannot leave the list wrong while
+    the gate stays green.
+
+    Args:
+        repo_root: The repository root the docs and sources are resolved under.
+        claims: The claims to check; defaults to the catalog's own [`NAME_CLAIMS`].
+
+    Returns:
+        One finding per claim whose listed names disagree with the tree, or whose
+        anchor phrase vanished, and an empty list when every list matches.
+    """
+    findings: list[Finding] = []
+    is_catalog = _is_catalog_root(repo_root)
+
+    for claim in claims:
+        doc = repo_root / claim.doc
+        if not doc.is_file():
+            if is_catalog:
+                findings.append(
+                    Finding(
+                        claim.doc,
+                        claim.label,
+                        f"the seam doc has moved, so this claim ({claim.source}) is "
+                        "no longer verified. Restore the doc at this path, or update "
+                        f"this claim's doc path in {_CATALOG_MARKER}.",
+                    )
+                )
+            continue
+
+        regions = claim.pattern.findall(doc.read_text(encoding="utf-8"))
+        if not regions:
+            # Same anti-vacuity rule the count claims use: a reworded sentence
+            # must fail loudly rather than quietly stop being checked.
+            findings.append(
+                Finding(
+                    claim.doc,
+                    claim.label,
+                    "no sentence enumerates these any more, so the list is no longer "
+                    "verified. Restore the phrasing, or update this claim's pattern "
+                    f"in {_CATALOG_MARKER} "
+                    f"(source of truth: {claim.source}).",
+                )
+            )
+            continue
+
+        expected = claim.lister(repo_root)
+        for region in regions:
+            listed = set(_BACKTICKED_NAME_RE.findall(region))
+            missing = sorted(expected - listed)
+            extra = sorted(listed - expected)
+            if not missing and not extra:
+                continue
+            parts = []
+            if missing:
+                parts.append(f"the tree has {', '.join(missing)} but the prose omits them")
+            if extra:
+                parts.append(f"the prose lists {', '.join(extra)} but the tree does not")
+            findings.append(
+                Finding(
+                    claim.doc,
+                    claim.label,
+                    f"{'; '.join(parts)} ({claim.source}). Update the prose to match.",
+                )
+            )
+
+    return findings
 
 
 def check_counts(repo_root: Path, claims: tuple[CountClaim, ...] = CLAIMS) -> list[Finding]:

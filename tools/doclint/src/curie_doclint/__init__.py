@@ -33,7 +33,7 @@ from .citation import (
     path_exists,
     scan_raw_line_ban,
 )
-from .counts import check_counts
+from .counts import check_counts, check_name_sets
 from .finding import Finding
 from .frontmatter import SeamMeta, parse_and_validate
 from .generate import (
@@ -103,6 +103,7 @@ def _lint_and_count(repo_root: Path) -> tuple[list[Finding], int]:
     # region: the numbers sit mid-sentence, so they are asserted against source
     # rather than rewritten, and `--write` leaves them alone.
     findings.extend(check_counts(repo_root))
+    findings.extend(check_name_sets(repo_root))
     doc_findings, ignored = _check_docs(repo_root, cache)
     findings.extend(doc_findings)
     return findings, ignored
