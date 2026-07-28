@@ -112,4 +112,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0080 | [Rename the project to Curie](0080-rename-to-curie.md) | Accepted |
 | 0081 | [A nightly graded parity ladder verifies the real-model promise CI cannot](0081-nightly-graded-parity-ladder.md) | Accepted |
 | 0082 | [Connected-transport approval cards ride a real CLI-posted placeholder](0082-connected-transport-approval-cards-via-a-real-placeholder.md) | Accepted |
+| 0083 | [Console sessions and CLI-minted login codes](0083-console-sessions-and-cli-minted-login-codes.md) | Accepted |
 <!-- END GENERATED: adr-index -->
