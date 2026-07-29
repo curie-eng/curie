@@ -945,6 +945,56 @@
         "title": "BundleOut",
         "type": "object"
       },
+      "ConsoleLoginCodeOut": {
+        "description": "A freshly minted login code, returned exactly once.\n\nThe code is plaintext here because this response IS the one delivery: the CLI\nprints it for the operator to copy. Only its hash is stored.",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "expires_at"
+        ],
+        "title": "ConsoleLoginCodeOut",
+        "type": "object"
+      },
+      "ConsoleSessionExchange": {
+        "description": "The browser's exchange request: a login code and nothing else.",
+        "properties": {
+          "code": {
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "ConsoleSessionExchange",
+        "type": "object"
+      },
+      "ConsoleSessionOut": {
+        "description": "The result of an exchange. Deliberately carries NO token.\n\nThe session token travels only as an `HttpOnly` cookie, so page script cannot\nread it -- putting it in the body would hand the credential straight back to\nthe JavaScript this design exists to keep it away from.",
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expires_at"
+        ],
+        "title": "ConsoleSessionOut",
+        "type": "object"
+      },
       "CostReport": {
         "description": "Daily spend series + total for an agent (L1 Cost view).",
         "properties": {
@@ -4920,6 +4970,98 @@
         "summary": "Get Config",
         "tags": [
           "config"
+        ]
+      }
+    },
+    "/console/login-codes": {
+      "post": {
+        "description": "Mint a single-use login code for an operator to copy into the console.",
+        "operationId": "create_login_code_console_login_codes_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsoleLoginCodeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Login Code",
+        "tags": [
+          "console"
+        ]
+      }
+    },
+    "/console/session": {
+      "post": {
+        "description": "Exchange a login code for a session cookie.\n\nUnauthenticated by design (see the module docstring). Every rejection is the\nsame 401 with the same text: an unknown code, an already-consumed one, an\nexpired one and a revoked row are indistinguishable to the caller, so this\nendpoint cannot be used to enumerate which codes exist.",
+        "operationId": "exchange_login_code_console_session_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsoleSessionExchange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsoleSessionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Exchange Login Code",
+        "tags": [
+          "console"
         ]
       }
     },

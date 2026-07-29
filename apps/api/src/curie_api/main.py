@@ -27,6 +27,7 @@ from .routers import (
     approvals,
     bundles,
     config,
+    console,
     control,
     deployments,
     evals,
@@ -190,6 +191,7 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(config.router)
+    app.include_router(console.router)
     app.include_router(agents.router)
     app.include_router(deployments.router)
     app.include_router(bundles.router)
