@@ -94,17 +94,13 @@ def test_reset_thread_queues_a_pending_request(
     agent_id = _make_agent(client, auth_headers)
     valkey.srem(THREAD_RESET_SET, "t-reset-1")
     try:
-        resp = client.post(
-            f"/agents/{agent_id}/threads/t-reset-1/reset", headers=auth_headers
-        )
+        resp = client.post(f"/agents/{agent_id}/threads/t-reset-1/reset", headers=auth_headers)
         assert resp.status_code == 200
         assert resp.json() == {"requested": True}
         assert valkey.sismember(THREAD_RESET_SET, "t-reset-1")
 
         # Idempotent: requesting an already-pending thread again is a no-op.
-        again = client.post(
-            f"/agents/{agent_id}/threads/t-reset-1/reset", headers=auth_headers
-        )
+        again = client.post(f"/agents/{agent_id}/threads/t-reset-1/reset", headers=auth_headers)
         assert again.status_code == 200
         assert valkey.scard(THREAD_RESET_SET) >= 1
     finally:
@@ -284,8 +280,7 @@ def test_cost_filters_langfuse_by_the_agent_trace_token(
     assert captured, "cost endpoint issued no Langfuse metrics query"
     filters = captured[0]["filters"]
     assert any(
-        f["operator"] == "contains" and f["value"] == f"agent-{agent_id}"
-        for f in filters
+        f["operator"] == "contains" and f["value"] == f"agent-{agent_id}" for f in filters
     ), f"agent trace-token filter missing from {filters}"
 
 
@@ -294,13 +289,9 @@ def test_control_endpoints_require_api_key(client: Any) -> None:
     assert client.get(f"/agents/{missing}/kill").status_code == 401
 
 
-def test_missing_agent_is_404(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
+def test_missing_agent_is_404(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
     missing = "00000000-0000-0000-0000-000000000000"
-    assert (
-        client.post(f"/agents/{missing}/kill", headers=auth_headers).status_code == 404
-    )
+    assert client.post(f"/agents/{missing}/kill", headers=auth_headers).status_code == 404
 
 
 def _await_event(pubsub: Any, agent_id: str, action: str) -> dict[str, Any]:

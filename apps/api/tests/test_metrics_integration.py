@@ -33,9 +33,8 @@ pytestmark = pytest.mark.skipif(not _stack_up(), reason="dev stack not reachable
 
 def _lf_metric(query: dict[str, Any]) -> list[dict[str, Any]]:
     settings = get_settings()
-    url = (
-        f"{settings.langfuse_host}/api/public/metrics?query="
-        + urllib.parse.quote(json.dumps(query))
+    url = f"{settings.langfuse_host}/api/public/metrics?query=" + urllib.parse.quote(
+        json.dumps(query)
     )
     resp = httpx.get(
         url, auth=(settings.langfuse_public_key, settings.langfuse_secret_key), timeout=10
@@ -130,9 +129,7 @@ def _await_seeded_cost(name: str, start: str, end: str, floor: float) -> None:
     pytest.fail(f"seeded cost for {name!r} never became queryable in Langfuse")
 
 
-def test_summary_matches_langfuse_aggregates(
-    client: Any, auth_headers: dict[str, str]
-) -> None:
+def test_summary_matches_langfuse_aggregates(client: Any, auth_headers: dict[str, str]) -> None:
     # Seed our own cost-bearing workload so the assertions do not depend on
     # ambient data, then wait for Langfuse's async ingestion to reflect it.
     seed_name, seeded_cost = _seed_cost_bearing_trace()
@@ -193,9 +190,7 @@ def test_summary_matches_langfuse_aggregates(
     assert abs(body["cost_usd"] - float(cost[0]["sum_totalCost"])) < 1e-9
 
 
-def test_runs_series_sums_to_the_summary(
-    client: Any, auth_headers: dict[str, str]
-) -> None:
+def test_runs_series_sums_to_the_summary(client: Any, auth_headers: dict[str, str]) -> None:
     start, end = _window()
     summary = client.get(
         "/observability/metrics/summary",
@@ -213,9 +208,7 @@ def test_runs_series_sums_to_the_summary(
     assert sum(p["value"] for p in points) == summary["runs"]
 
 
-def test_environment_filter_passes_through(
-    client: Any, auth_headers: dict[str, str]
-) -> None:
+def test_environment_filter_passes_through(client: Any, auth_headers: dict[str, str]) -> None:
     start, end = _window()
     resp = client.get(
         "/observability/metrics/summary",
@@ -248,9 +241,7 @@ def test_metrics_require_api_key(client: Any) -> None:
     assert client.get("/observability/metrics/summary").status_code == 401
 
 
-def test_unknown_metric_is_422(
-    client: Any, auth_headers: dict[str, str]
-) -> None:
+def test_unknown_metric_is_422(client: Any, auth_headers: dict[str, str]) -> None:
     resp = client.get(
         "/observability/metrics/series",
         params={"metric": "bogus"},
@@ -259,9 +250,7 @@ def test_unknown_metric_is_422(
     assert resp.status_code == 422
 
 
-def test_malformed_date_is_422_not_500(
-    client: Any, auth_headers: dict[str, str]
-) -> None:
+def test_malformed_date_is_422_not_500(client: Any, auth_headers: dict[str, str]) -> None:
     resp = client.get(
         "/observability/metrics/summary",
         params={"start": "not-a-date"},

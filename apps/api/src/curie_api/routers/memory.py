@@ -30,9 +30,7 @@ from ..schemas import (
 )
 from .state import _enforce_caps
 
-router = APIRouter(
-    prefix="/agents", tags=["memory"], dependencies=[Depends(require_api_key)]
-)
+router = APIRouter(prefix="/agents", tags=["memory"], dependencies=[Depends(require_api_key)])
 
 # The runner writes memory here (mirrors runner/curie_runner/memory.py: a
 # single log-shaped key inside the reserved ``memory`` namespace).
@@ -45,9 +43,7 @@ async def _require_agent(session: SessionDep, agent_id: uuid.UUID) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
 
 
-async def _get_log_entry(
-    session: SessionDep, agent_id: uuid.UUID
-) -> WorkflowStateEntry | None:
+async def _get_log_entry(session: SessionDep, agent_id: uuid.UUID) -> WorkflowStateEntry | None:
     entry: WorkflowStateEntry | None = await session.scalar(
         select(WorkflowStateEntry).where(
             WorkflowStateEntry.agent_id == agent_id,
@@ -95,9 +91,7 @@ async def list_memory(agent_id: uuid.UUID, session: SessionDep) -> list[MemoryEn
     return [_to_out(i, r, entry.version) for i, r in enumerate(_records_of(entry))]
 
 
-@router.get(
-    "/{agent_id}/memory/{index}/provenance", response_model=MemoryTraceBackOut
-)
+@router.get("/{agent_id}/memory/{index}/provenance", response_model=MemoryTraceBackOut)
 async def memory_trace_back(
     agent_id: uuid.UUID, index: int, session: SessionDep
 ) -> MemoryTraceBackOut:
@@ -120,8 +114,7 @@ async def memory_trace_back(
         learned_from_session_id=prov.get("learned_from_session_id"),
         recorded_at=prov.get("recorded_at", ""),
         source_traces=[
-            SourceTraceOut(trace_id=str(tid), trace_url=_trace_url(str(tid)))
-            for tid in trace_ids
+            SourceTraceOut(trace_id=str(tid), trace_url=_trace_url(str(tid))) for tid in trace_ids
         ],
     )
 
@@ -151,26 +144,21 @@ async def edit_memory(
     if data.expected_version != entry.version:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"version mismatch: expected {data.expected_version}, "
-            f"stored {entry.version}",
+            f"version mismatch: expected {data.expected_version}, stored {entry.version}",
         )
     records = _records_of(entry)
     if index < 0 or index >= len(records):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
     updated = {**records[index], "content": data.content}
     replacement = [*records[:index], updated, *records[index + 1 :]]
-    await _enforce_caps(
-        session, agent_id, MEMORY_NAMESPACE, MEMORY_LOG_KEY, replacement
-    )
+    await _enforce_caps(session, agent_id, MEMORY_NAMESPACE, MEMORY_LOG_KEY, replacement)
     entry.value = replacement
     entry.version += 1
     await session.commit()
     return _to_out(index, updated, entry.version)
 
 
-@router.delete(
-    "/{agent_id}/memory/{index}", status_code=status.HTTP_204_NO_CONTENT
-)
+@router.delete("/{agent_id}/memory/{index}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_memory(
     agent_id: uuid.UUID,
     index: int,

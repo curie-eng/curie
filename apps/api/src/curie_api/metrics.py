@@ -32,6 +32,7 @@ def agent_trace_filter(agent_id: uuid.UUID | str) -> str:
 
     return f"agent-{agent_id}"
 
+
 SCALAR_METRICS = ("runs", "latency_p95_ms", "tokens", "cost_usd")
 ALL_METRICS = (*SCALAR_METRICS, "error_rate")
 
@@ -46,17 +47,11 @@ _SPEC: dict[str, tuple[str, str, str, str, bool]] = {
 }
 
 
-def resolve_window(
-    start: str | None, end: str | None, window_hours: int
-) -> tuple[str, str]:
+def resolve_window(start: str | None, end: str | None, window_hours: int) -> tuple[str, str]:
     """Resolve the [start, end] ISO window, defaulting to the last window_hours."""
 
     end_dt = datetime.fromisoformat(end) if end else datetime.now(UTC)
-    start_dt = (
-        datetime.fromisoformat(start)
-        if start
-        else end_dt - timedelta(hours=window_hours)
-    )
+    start_dt = datetime.fromisoformat(start) if start else end_dt - timedelta(hours=window_hours)
     return start_dt.isoformat(), end_dt.isoformat()
 
 
@@ -157,9 +152,7 @@ async def summary(
 ) -> MetricsSummary:
     scalars: dict[str, float] = {}
     for metric in SCALAR_METRICS:
-        rows = await lf.query_metrics(
-            _scalar_query(metric, start, end, environment, agent)
-        )
+        rows = await lf.query_metrics(_scalar_query(metric, start, end, environment, agent))
         key = _SPEC[metric][3]
         scalars[metric] = _num(rows[0], key) if rows else 0.0
 
@@ -228,9 +221,7 @@ async def series(
             for r in rows
             if r.get("time_dimension")
         ]
-    return MetricSeries(
-        metric=metric, granularity=granularity, start=start, end=end, points=points
-    )
+    return MetricSeries(metric=metric, granularity=granularity, start=start, end=end, points=points)
 
 
 async def _error_rate_series(
@@ -241,9 +232,7 @@ async def _error_rate_series(
     environment: str | None,
     agent: str | None,
 ) -> list[MetricPoint]:
-    rows = await lf.query_metrics(
-        _level_query(start, end, environment, agent, granularity)
-    )
+    rows = await lf.query_metrics(_level_query(start, end, environment, agent, granularity))
     buckets: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         ts = row.get("time_dimension")

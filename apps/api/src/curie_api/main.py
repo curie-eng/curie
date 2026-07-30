@@ -73,8 +73,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.resume_queue = ResumeQueue(
         valkey,
         stream=settings.runs_stream,
-        dead_letter_stream=settings.resume_dead_letter_stream
-        or settings.dead_letter_stream_name(),
+        dead_letter_stream=settings.resume_dead_letter_stream or settings.dead_letter_stream_name(),
     )
     # The composition root for approvals (#420, ADR-0034): the only place that
     # names Slack to build the approver-set selector, so the authorizer and the

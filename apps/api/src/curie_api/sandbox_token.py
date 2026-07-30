@@ -33,9 +33,7 @@ def _b64url_decode(seg: str) -> bytes:
 
 
 def _signature(api_key: str, signing_input: str) -> str:
-    digest = hmac.new(
-        api_key.encode(), signing_input.encode(), hashlib.sha256
-    ).digest()
+    digest = hmac.new(api_key.encode(), signing_input.encode(), hashlib.sha256).digest()
     return _b64url(digest)
 
 
@@ -54,9 +52,7 @@ def mint(api_key: str, *, agent: str, scope: str, exp: int) -> str:
     return f"{signing_input}.{_signature(api_key, signing_input)}"
 
 
-def verify(
-    token: str, api_key: str, *, agent: str, scope: str, now: int | None = None
-) -> bool:
+def verify(token: str, api_key: str, *, agent: str, scope: str, now: int | None = None) -> bool:
     """True only when ``token`` is a well-formed token signed by ``api_key`` that
     names exactly this ``agent`` and ``scope`` and has not expired. Returns False
     (never raises) on any malformed, tampered, wrong-key, wrong-claim, or expired

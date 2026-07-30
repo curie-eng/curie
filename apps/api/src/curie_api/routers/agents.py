@@ -1,7 +1,9 @@
 """Agents and their versions."""
 
 import functools
+import tempfile
 import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import IntegrityError
@@ -17,14 +19,13 @@ from ..schemas import (
     AgentUpdate,
     BundleFile,
     BundleFiles,
+    ConnectorManifests,
     VersionCreate,
     VersionOut,
     enforce_behavior_packs_size,
 )
 
-router = APIRouter(
-    prefix="/agents", tags=["agents"], dependencies=[Depends(require_api_key)]
-)
+router = APIRouter(prefix="/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
 
 # Postgres SQLSTATE for a unique_violation. asyncpg exposes it (and the
 # violated constraint's name) as plain attributes on the wrapped driver
@@ -119,9 +120,7 @@ async def get_agent(agent_id: uuid.UUID, session: SessionDep) -> AgentOut:
 
 
 @router.patch("/{agent_id}", response_model=AgentOut)
-async def update_agent(
-    agent_id: uuid.UUID, data: AgentUpdate, session: SessionDep
-) -> AgentOut:
+async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionDep) -> AgentOut:
     # Lets a redeploy move an existing agent's Slack channel (the CLI only sends
     # this when --slack-channel was passed explicitly). An omitted field is a
     # no-op so the agent's current channel is preserved.
@@ -148,9 +147,7 @@ async def update_agent(
         agent = await crud.update_agent_model(session, agent, data.model)
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).
-        agent = await crud.update_agent_approval_tools(
-            session, agent, data.approval_required_tools
-        )
+        agent = await crud.update_agent_approval_tools(session, agent, data.approval_required_tools)
     if data.approval_routes is not None:
         # Omitted leaves the bindings unchanged; an explicit {} clears them (#247).
         agent = await crud.update_agent_approval_routes(
@@ -196,18 +193,72 @@ async def create_version(
 
 
 @router.get("/{agent_id}/versions", response_model=list[VersionOut])
-async def list_versions(
-    agent_id: uuid.UUID, session: SessionDep
-) -> list[VersionOut]:
+async def list_versions(agent_id: uuid.UUID, session: SessionDep) -> list[VersionOut]:
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     versions = await crud.list_versions(session, agent_id)
     return [VersionOut.model_validate(v) for v in versions]
 
 
-@router.get(
-    "/{agent_id}/versions/{version_id}/files", response_model=BundleFiles
-)
+@router.get("/{agent_id}/versions/{version_id}/connectors", response_model=ConnectorManifests)
+async def read_version_connectors(
+    agent_id: uuid.UUID,
+    version_id: uuid.UUID,
+    session: SessionDep,
+    store: StoreDep,
+    release: str,
+    namespace: str,
+    app_name: str,
+) -> ConnectorManifests:
+    """Render this version's declared connectors into Kubernetes objects.
+
+    Read-only and side-effect free: the API computes the manifests and returns
+    them; the CALLER applies them with its own cluster credentials. That split
+    is deliberate -- rendering is a pure function, so the API needs no cluster
+    access for it, and this service (which receives internet webhooks) keeps the
+    read-only `pods: list` + `pods/log: get` RBAC it has today (ADR-0086).
+
+    `release`, `namespace`, and `app_name` are supplied by the caller because
+    they are install-time facts the API does not know: the Helm release name and
+    nameOverride live with whoever ran `cluster up`, not in the bundle.
+    """
+
+    version = await crud.get_version(session, version_id)
+    if version is None or version.agent_id != agent_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found")
+    if version.bundle_ref is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no bundle stored for this version")
+    data = await store.get(version.bundle_ref)
+    settings = get_settings()
+
+    def _render() -> ConnectorManifests:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundles.extract_and_validate(
+                data,
+                Path(tmp),
+                max_uncompressed_bytes=settings.bundle_max_uncompressed_bytes,
+                max_compression_ratio=settings.bundle_max_compression_ratio,
+                max_members=settings.bundle_max_members,
+            )
+            declared = bundles.read_connectors(Path(tmp))
+            secret_name = f"{release}-connector-secrets"
+            return ConnectorManifests(
+                manifests=bundles.render_connector_manifests(
+                    declared,
+                    release=release,
+                    namespace=namespace,
+                    app_name=app_name,
+                    secret_name=secret_name,
+                ),
+                mcp_entries=bundles.connector_mcp_entries(
+                    declared, release=release, namespace=namespace
+                ),
+            )
+
+    return await run_in_threadpool(_render)
+
+
+@router.get("/{agent_id}/versions/{version_id}/files", response_model=BundleFiles)
 async def read_version_files(
     agent_id: uuid.UUID,
     version_id: uuid.UUID,
@@ -222,9 +273,7 @@ async def read_version_files(
     if version is None or version.agent_id != agent_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found")
     if version.bundle_ref is None:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "no bundle stored for this version"
-        )
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no bundle stored for this version")
     data = await store.get(version.bundle_ref)
     settings = get_settings()
     read = functools.partial(

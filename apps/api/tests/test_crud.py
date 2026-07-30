@@ -24,9 +24,7 @@ def _count(query: str, agent_id: str) -> int:
     return asyncio.run(run())
 
 
-def test_full_round_trip(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
+def test_full_round_trip(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
     # create agent
     resp = client.post(
         "/agents",
@@ -74,9 +72,7 @@ def test_full_round_trip(
     assert got_agent.status_code == 200
     assert got_agent.json()["slack_channel"] == "C0TRIAGE01"
 
-    listed_versions = client.get(
-        f"/agents/{agent_id}/versions", headers=auth_headers
-    ).json()
+    listed_versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
     assert [v["id"] for v in listed_versions] == [version_id]
 
     listed_deployments = client.get(
@@ -84,9 +80,7 @@ def test_full_round_trip(
     ).json()
     assert [d["id"] for d in listed_deployments] == [deployment_id]
 
-    got_deployment = client.get(
-        f"/deployments/{deployment_id}", headers=auth_headers
-    )
+    got_deployment = client.get(f"/deployments/{deployment_id}", headers=auth_headers)
     assert got_deployment.status_code == 200
     assert got_deployment.json()["version_id"] == version_id
 
@@ -95,9 +89,7 @@ def test_missing_agent_returns_404(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     missing = "00000000-0000-0000-0000-000000000000"
-    assert (
-        client.get(f"/agents/{missing}", headers=auth_headers).status_code == 404
-    )
+    assert client.get(f"/agents/{missing}", headers=auth_headers).status_code == 404
 
 
 def test_version_for_missing_agent_returns_404(
@@ -145,9 +137,7 @@ def test_patch_agent_omitted_field_is_noop(
         json={"name": "stable", "slack_channel": "C0000KEEP1"},
         headers=auth_headers,
     ).json()
-    resp = client.patch(
-        f"/agents/{agent['id']}", json={}, headers=auth_headers
-    )
+    resp = client.patch(f"/agents/{agent['id']}", json={}, headers=auth_headers)
     assert resp.status_code == 200, resp.text
     assert resp.json()["slack_channel"] == "C0000KEEP1"
 

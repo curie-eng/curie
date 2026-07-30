@@ -106,8 +106,7 @@ def _count_eval_entries_for_agent(agent_id: str) -> int:
         return sum(
             1
             for _id, fields in sync.xrevrange("curie:evals", count=200)
-            if json.loads(fields[STREAM_PAYLOAD_FIELD.encode()]).get("agent_id")
-            == agent_id
+            if json.loads(fields[STREAM_PAYLOAD_FIELD.encode()]).get("agent_id") == agent_id
         )
     finally:
         sync.close()
@@ -119,9 +118,7 @@ def test_trigger_enqueues_for_active_dev_deployment(
     agent = _create_agent(client, auth_headers, "trigger-active")
     seeded = _seed(agent["id"])
 
-    resp = client.post(
-        "/evals/trigger", json={"agent_id": agent["id"]}, headers=auth_headers
-    )
+    resp = client.post("/evals/trigger", json={"agent_id": agent["id"]}, headers=auth_headers)
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["stream_id"]
@@ -174,9 +171,7 @@ def test_trigger_unknown_agent_returns_404_and_does_not_enqueue(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     missing = str(uuid.uuid4())
-    resp = client.post(
-        "/evals/trigger", json={"agent_id": missing}, headers=auth_headers
-    )
+    resp = client.post("/evals/trigger", json={"agent_id": missing}, headers=auth_headers)
     assert resp.status_code == 404, resp.text
     assert _count_eval_entries_for_agent(missing) == 0
 
@@ -187,9 +182,7 @@ def test_trigger_agent_without_active_dev_deployment_returns_404(
     agent = _create_agent(client, auth_headers, "trigger-nodeploy")
     # A version exists but was never deployed to dev.
     _seed(agent["id"], deploy=False)
-    resp = client.post(
-        "/evals/trigger", json={"agent_id": agent["id"]}, headers=auth_headers
-    )
+    resp = client.post("/evals/trigger", json={"agent_id": agent["id"]}, headers=auth_headers)
     assert resp.status_code == 404, resp.text
     assert _count_eval_entries_for_agent(agent["id"]) == 0
 
@@ -270,9 +263,7 @@ def test_trigger_active_dev_deployment_without_bundle_returns_400(
     agent = _create_agent(client, auth_headers, "trigger-no-bundle-deploy")
     _seed(agent["id"], commit_sha="deadbeef", bundle_ref=None)
 
-    resp = client.post(
-        "/evals/trigger", json={"agent_id": agent["id"]}, headers=auth_headers
-    )
+    resp = client.post("/evals/trigger", json={"agent_id": agent["id"]}, headers=auth_headers)
     assert resp.status_code == 400, resp.text
     assert "no built bundle" in resp.json()["detail"]
     assert _count_eval_entries_for_agent(agent["id"]) == 0

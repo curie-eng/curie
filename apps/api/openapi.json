@@ -945,6 +945,26 @@
         "title": "BundleOut",
         "type": "object"
       },
+      "ConnectorManifests": {
+        "description": "Kubernetes objects derived from a version's ``connectors.yaml``.\n\nThe API renders; the caller applies. Rendering is a pure function of the\nbundle plus the deployment context the caller supplies, so producing this\nneeds no cluster access and the API's read-only RBAC is untouched\n(ADR-0086, #1063).",
+        "properties": {
+          "manifests": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Manifests",
+            "type": "array"
+          },
+          "mcp_entries": {
+            "additionalProperties": true,
+            "title": "Mcp Entries",
+            "type": "object"
+          }
+        },
+        "title": "ConnectorManifests",
+        "type": "object"
+      },
       "CostReport": {
         "description": "Daily spend series + total for an agent (L1 Cost view).",
         "properties": {
@@ -4467,6 +4487,103 @@
         "summary": "Upload Bundle",
         "tags": [
           "bundles"
+        ]
+      }
+    },
+    "/agents/{agent_id}/versions/{version_id}/connectors": {
+      "get": {
+        "description": "Render this version's declared connectors into Kubernetes objects.\n\nRead-only and side-effect free: the API computes the manifests and returns\nthem; the CALLER applies them with its own cluster credentials. That split\nis deliberate -- rendering is a pure function, so the API needs no cluster\naccess for it, and this service (which receives internet webhooks) keeps the\nread-only `pods: list` + `pods/log: get` RBAC it has today (ADR-0086).\n\n`release`, `namespace`, and `app_name` are supplied by the caller because\nthey are install-time facts the API does not know: the Helm release name and\nnameOverride live with whoever ran `cluster up`, not in the bundle.",
+        "operationId": "read_version_connectors_agents__agent_id__versions__version_id__connectors_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Version Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "release",
+            "required": true,
+            "schema": {
+              "title": "Release",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "title": "Namespace",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "app_name",
+            "required": true,
+            "schema": {
+              "title": "App Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorManifests"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Version Connectors",
+        "tags": [
+          "agents"
         ]
       }
     },

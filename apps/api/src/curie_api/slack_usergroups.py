@@ -164,9 +164,7 @@ class SlackUserGroupClient:
             response.raise_for_status()
             body = response.json()
         except httpx.HTTPError as exc:
-            raise UserGroupLookupError(
-                f"usergroup {group_id} lookup failed: {exc}"
-            ) from exc
+            raise UserGroupLookupError(f"usergroup {group_id} lookup failed: {exc}") from exc
         except ValueError as exc:  # a 200 that is not JSON at all
             raise UserGroupLookupError(
                 f"usergroup {group_id} lookup returned a non-JSON body"
@@ -178,9 +176,7 @@ class SlackUserGroupClient:
             )
         users = body.get("users")
         if not isinstance(users, list) or not all(isinstance(u, str) for u in users):
-            raise UserGroupLookupError(
-                f"usergroup {group_id} lookup returned no member list"
-            )
+            raise UserGroupLookupError(f"usergroup {group_id} lookup returned no member list")
         return frozenset(users)
 
 

@@ -65,9 +65,7 @@ class ApproverSet(Protocol):
     @property
     def audit_name(self) -> str: ...
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict: ...
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict: ...
 
 
 class ExplicitUsers:
@@ -86,9 +84,7 @@ class ExplicitUsers:
     def __init__(self, users: Sequence[str]) -> None:
         self._users = tuple(users)
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         listed = actor in self._users
         evidence: dict[str, Any] = {
             "kind": "user_list",
@@ -128,9 +124,7 @@ class InvalidApprovers:
     def __init__(self, error: str) -> None:
         self._error = error
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(
             member=False,
             undetermined=True,

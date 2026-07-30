@@ -46,9 +46,7 @@ def _run_report(passed: int, total: int) -> tuple[httpx.Request, str]:
 def test_report_eval_posts_the_exact_commit_status() -> None:
     request, state = _run_report(34, 36)
     assert state == "failure"
-    assert str(request.url) == (
-        "https://api.github.com/repos/octo/demo/statuses/abc123def"
-    )
+    assert str(request.url) == ("https://api.github.com/repos/octo/demo/statuses/abc123def")
     assert request.method == "POST"
     body: dict[str, Any] = json.loads(request.content)
     assert body == {

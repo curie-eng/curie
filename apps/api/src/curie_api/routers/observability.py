@@ -73,9 +73,7 @@ async def list_runner_pods(
             lister.list_runner_pods, ns, settings.runner_pod_label_selector
         )
     except NoClusterConfigured as exc:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)
-        ) from exc
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except PodLogError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
     return RunnerPods(namespace=ns, pods=pods)
@@ -95,8 +93,7 @@ async def runner_logs(
     if namespace != settings.runner_namespace:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            f"logs are only available for the runner namespace "
-            f"{settings.runner_namespace!r}",
+            f"logs are only available for the runner namespace {settings.runner_namespace!r}",
         )
     try:
         runner_pods = await run_in_threadpool(
@@ -105,30 +102,19 @@ async def runner_logs(
             settings.runner_pod_label_selector,
         )
     except NoClusterConfigured as exc:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)
-        ) from exc
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except PodLogError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
     if pod not in runner_pods:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            f"{pod!r} is not a runner pod in namespace "
-            f"{settings.runner_namespace!r}",
+            f"{pod!r} is not a runner pod in namespace {settings.runner_namespace!r}",
         )
     try:
-        logs = await run_in_threadpool(
-            reader.read, namespace, pod, container, tail_lines, previous
-        )
+        logs = await run_in_threadpool(reader.read, namespace, pod, container, tail_lines, previous)
     except NoClusterConfigured as exc:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)
-        ) from exc
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except PodLogError as exc:
-        code = (
-            status.HTTP_404_NOT_FOUND
-            if exc.status == 404
-            else status.HTTP_502_BAD_GATEWAY
-        )
+        code = status.HTTP_404_NOT_FOUND if exc.status == 404 else status.HTTP_502_BAD_GATEWAY
         raise HTTPException(code, str(exc)) from exc
     return PodLogs(namespace=namespace, pod=pod, container=container, logs=logs)

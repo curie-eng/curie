@@ -36,14 +36,10 @@ async def list_traces(
 @router.get("/traces/{trace_id}", response_model=TraceTree)
 async def get_trace(trace_id: str, lf: LangfuseDep) -> TraceTree:
     if not _TRACE_ID_RE.match(trace_id):
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, "invalid trace id"
-        )
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid trace id")
     observations = await lf.get_observations(trace_id)
     if not observations:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "trace has no observations yet"
-        )
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "trace has no observations yet")
     trace = await lf.get_trace(trace_id)
     return TraceTree(
         trace=trace,
@@ -66,8 +62,6 @@ async def promote_trace_to_eval_case(trace_id: str, lf: LangfuseDep) -> EvalCase
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid trace id")
     observations = await lf.get_observations(trace_id)
     if not observations:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "trace has no observations yet"
-        )
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "trace has no observations yet")
     trace = await lf.get_trace(trace_id)
     return trace_to_eval_case(trace_id, trace, observations)

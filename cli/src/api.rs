@@ -21,6 +21,19 @@ pub struct ApiClient {
 /// so this is a valid Slack channel-ID shape, not a `#name`.
 pub const DEFAULT_SLACK_CHANNEL: &str = "C0LOCALDEV";
 
+/// Kubernetes objects the API derived from a version's `connectors.yaml`.
+///
+/// The API renders these; the CLI applies them. Rendering is a pure function so
+/// the API needs no cluster access for it, and cluster-write authority stays
+/// with the operator running this command (ADR-0086, #1063).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ConnectorManifests {
+    #[serde(default)]
+    pub manifests: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub mcp_entries: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
     pub id: String,
@@ -751,6 +764,41 @@ impl ApiClient {
     /// List an agent's immutable versions, ascending by `created_at` (oldest
     /// first): `GET /agents/{id}/versions`. `commands::versions` reverses
     /// this to newest-first before display/JSON output.
+    /// Ask the API to render a version's declared connectors.
+    ///
+    /// `release`/`namespace`/`app_name` are install-time facts the API does not
+    /// know -- they live with whoever ran `cluster up` -- so the caller supplies
+    /// them and the API stays a pure function.
+    pub async fn version_connectors(
+        &self,
+        agent_id: &str,
+        version_id: &str,
+        release: &str,
+        namespace: &str,
+        app_name: &str,
+    ) -> Result<ConnectorManifests> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/agents/{agent_id}/versions/{version_id}/connectors",
+                self.base_url
+            ))
+            .query(&[
+                ("release", release),
+                ("namespace", namespace),
+                ("app_name", app_name),
+            ])
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("GET /agents/{id}/versions/{vid}/connectors")?;
+        Self::expect_ok(resp, "rendering declared connectors")
+            .await?
+            .json()
+            .await
+            .context("decoding connector manifests")
+    }
+
     pub async fn list_versions(&self, agent_id: &str) -> Result<Vec<Version>> {
         let resp = self
             .http

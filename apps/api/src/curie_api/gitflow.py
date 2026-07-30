@@ -157,9 +157,7 @@ def clone_and_archive(clone_url: str, sha: str, settings: Settings) -> bytes:
                 timeout=120,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            raise GitFlowError(
-                f"could not archive {sha[:12]}: {_git_failure_detail(exc)}"
-            ) from exc
+            raise GitFlowError(f"could not archive {sha[:12]}: {_git_failure_detail(exc)}") from exc
         return archived.stdout
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -204,9 +202,7 @@ async def process_push(
     bundle_built = version is None or version.bundle_ref is None
     if bundle_built:
         try:
-            data = await run_in_threadpool(
-                clone_and_archive, clone_url, after, settings
-            )
+            data = await run_in_threadpool(clone_and_archive, clone_url, after, settings)
             extension, content_type = deploy.validate_archive(data, settings)
         except GitFlowError as exc:
             return WebhookResult(
@@ -229,9 +225,7 @@ async def process_push(
                 created_by="git-flow",
                 commit_sha=after,
             )
-        await deploy.store_bundle(
-            store, session, agent.id, version, data, extension, content_type
-        )
+        await deploy.store_bundle(store, session, agent.id, version, data, extension, content_type)
 
     # Either the version pre-existed with a bundle, or the block above created
     # or repaired it; it is non-None from here on.

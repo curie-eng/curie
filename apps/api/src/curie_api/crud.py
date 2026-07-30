@@ -19,9 +19,7 @@ from .models import (
 from .schemas import AgentCreate, ApprovalRequest, DeploymentCreate, VersionCreate
 
 
-async def get_version(
-    session: AsyncSession, version_id: uuid.UUID
-) -> AgentVersion | None:
+async def get_version(session: AsyncSession, version_id: uuid.UUID) -> AgentVersion | None:
     return await session.get(AgentVersion, version_id)
 
 
@@ -45,9 +43,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         repo_full_name=data.repo_full_name,
         model=data.model,
         behavior_packs=(
-            data.behavior_packs.model_dump()
-            if data.behavior_packs is not None
-            else None
+            data.behavior_packs.model_dump() if data.behavior_packs is not None else None
         ),
         approval_required_tools=data.approval_required_tools,
         approval_routes=(
@@ -72,9 +68,7 @@ async def get_agent(session: AsyncSession, agent_id: uuid.UUID) -> Agent | None:
     return await session.get(Agent, agent_id)
 
 
-async def agent_has_active_deployment(
-    session: AsyncSession, agent_id: uuid.UUID
-) -> bool:
+async def agent_has_active_deployment(session: AsyncSession, agent_id: uuid.UUID) -> bool:
     result = await session.scalar(
         select(Deployment.id)
         .where(Deployment.agent_id == agent_id, Deployment.status == "active")
@@ -88,28 +82,20 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
     # relationship cascade (which would emit an async lazy-load during flush) and
     # match the FK ondelete=CASCADE already declared on both child tables. Bundle
     # objects in MinIO are intentionally left in place (out of scope).
-    await session.execute(
-        delete(Deployment).where(Deployment.agent_id == agent_id)
-    )
-    await session.execute(
-        delete(AgentVersion).where(AgentVersion.agent_id == agent_id)
-    )
+    await session.execute(delete(Deployment).where(Deployment.agent_id == agent_id))
+    await session.execute(delete(AgentVersion).where(AgentVersion.agent_id == agent_id))
     await session.execute(delete(Agent).where(Agent.id == agent_id))
     await session.commit()
 
 
-async def update_agent_channel(
-    session: AsyncSession, agent: Agent, slack_channel: str
-) -> Agent:
+async def update_agent_channel(session: AsyncSession, agent: Agent, slack_channel: str) -> Agent:
     agent.slack_channel = slack_channel
     await session.commit()
     await session.refresh(agent)
     return agent
 
 
-async def update_agent_model(
-    session: AsyncSession, agent: Agent, model: str | None
-) -> Agent:
+async def update_agent_model(session: AsyncSession, agent: Agent, model: str | None) -> Agent:
     agent.model = model
     await session.commit()
     await session.refresh(agent)
@@ -172,9 +158,7 @@ async def update_agent_secrets(
     return agent
 
 
-async def get_agent_by_repo(
-    session: AsyncSession, repo_full_name: str
-) -> Agent | None:
+async def get_agent_by_repo(session: AsyncSession, repo_full_name: str) -> Agent | None:
     agent: Agent | None = await session.scalar(
         select(Agent).where(Agent.repo_full_name == repo_full_name)
     )
@@ -226,9 +210,7 @@ async def get_version_by_commit(
     return version
 
 
-async def list_versions(
-    session: AsyncSession, agent_id: uuid.UUID
-) -> list[AgentVersion]:
+async def list_versions(session: AsyncSession, agent_id: uuid.UUID) -> list[AgentVersion]:
     result = await session.scalars(
         select(AgentVersion)
         .where(AgentVersion.agent_id == agent_id)
@@ -258,9 +240,7 @@ async def create_deployment_row(
     return deployment
 
 
-async def create_deployment(
-    session: AsyncSession, data: DeploymentCreate
-) -> Deployment:
+async def create_deployment(session: AsyncSession, data: DeploymentCreate) -> Deployment:
     return await create_deployment_row(
         session,
         agent_id=data.agent_id,
@@ -302,9 +282,7 @@ async def list_deployments(
     return list(result)
 
 
-async def get_deployment(
-    session: AsyncSession, deployment_id: uuid.UUID
-) -> Deployment | None:
+async def get_deployment(session: AsyncSession, deployment_id: uuid.UUID) -> Deployment | None:
     return await session.get(Deployment, deployment_id)
 
 
@@ -347,9 +325,7 @@ async def get_approval(session: AsyncSession, approval_id: uuid.UUID) -> Approva
     return await session.get(Approval, approval_id)
 
 
-async def get_approval_route_binding(
-    session: AsyncSession, approval: Approval
-) -> Any:
+async def get_approval_route_binding(session: AsyncSession, approval: Approval) -> Any:
     """The route binding governing ``approval``, read fresh at resolve time
     (#420), or None when there is none to read.
 
@@ -378,9 +354,7 @@ async def get_approval_route_binding(
     return agent.approval_routes.get(approval.route)
 
 
-async def get_approval_by_dedupe_key(
-    session: AsyncSession, dedupe_key: str
-) -> Approval | None:
+async def get_approval_by_dedupe_key(session: AsyncSession, dedupe_key: str) -> Approval | None:
     result: Approval | None = await session.scalar(
         select(Approval).where(Approval.dedupe_key == dedupe_key)
     )
@@ -467,9 +441,7 @@ async def list_expired_pending_approvals(
     return list(result)
 
 
-async def expire_approval(
-    session: AsyncSession, approval_id: uuid.UUID
-) -> Approval | None:
+async def expire_approval(session: AsyncSession, approval_id: uuid.UUID) -> Approval | None:
     """Flip a pending approval past its SLA to expired (same CAS guard, so an
     in-flight resolution that already won is never overwritten)."""
 
@@ -561,9 +533,7 @@ _RESUMABLE_STATUSES = (
 )
 
 
-async def claim_resume_row(
-    session: AsyncSession, approval_id: uuid.UUID
-) -> Approval | None:
+async def claim_resume_row(session: AsyncSession, approval_id: uuid.UUID) -> Approval | None:
     """Atomically claim one owed-wake row for this reconcile pass (#411).
 
     ``SELECT ... FOR UPDATE SKIP LOCKED`` locks the row for the caller's

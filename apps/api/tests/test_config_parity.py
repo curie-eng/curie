@@ -114,9 +114,7 @@ class TestResumeDeadLetterStreamCoherence:
 
         assert resolved == WorkerConfig().dead_letter_stream_name() == "operations:dead"
 
-    def test_explicit_resume_override_wins(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_explicit_resume_override_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A narrower RESUME_DEAD_LETTER_STREAM override beats the derived name."""
         _clear_stream_env(monkeypatch)
         monkeypatch.setenv("CURIE_DEAD_LETTER_STREAM", "operations:dead")

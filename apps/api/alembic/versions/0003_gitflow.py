@@ -59,9 +59,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_column("deployments", "commit_sha", schema=SCHEMA)
     op.drop_column("deployments", "bot_identity", schema=SCHEMA)
-    op.drop_index(
-        "ix_agent_versions_commit_sha", "agent_versions", schema=SCHEMA
-    )
+    op.drop_index("ix_agent_versions_commit_sha", "agent_versions", schema=SCHEMA)
     op.drop_column("agent_versions", "commit_sha", schema=SCHEMA)
     op.drop_index("ix_agents_repo_full_name", "agents", schema=SCHEMA)
     op.drop_column("agents", "repo_full_name", schema=SCHEMA)

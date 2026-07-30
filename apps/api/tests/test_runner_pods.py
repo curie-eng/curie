@@ -49,9 +49,7 @@ def test_lists_runner_pods_with_the_default_namespace_and_selector(
     body = resp.json()
     assert body["namespace"] == "curie"  # settings default
     # The lister was called with the release namespace + runner-sandbox selector.
-    assert body["pods"][0] == (
-        "curie:app.kubernetes.io/component=runner-sandbox:runner-a"
-    )
+    assert body["pods"][0] == ("curie:app.kubernetes.io/component=runner-sandbox:runner-a")
     assert "runner-b" in body["pods"]
 
 

@@ -69,9 +69,7 @@ def test_matrix_reflects_seeded_multi_version_scores(
     deadline = time.time() + 60
     cells: dict[tuple[str, str], str] = {}
     while time.time() < deadline:
-        resp = client.get(
-            "/evals/matrix", params={"suite": suite}, headers=auth_headers
-        )
+        resp = client.get("/evals/matrix", params={"suite": suite}, headers=auth_headers)
         assert resp.status_code == 200, resp.text
         body = resp.json()
         cells = {
@@ -79,9 +77,7 @@ def test_matrix_reflects_seeded_multi_version_scores(
             for row in body["rows"]
             for cell in row["cells"]
         }
-        ready = {
-            (c, v) for c in ("c1", "c2") for v in (sha_a, sha_b)
-        } <= set(cells)
+        ready = {(c, v) for c in ("c1", "c2") for v in (sha_a, sha_b)} <= set(cells)
         if ready and all(cells[k] != "missing" for k in cells):
             break
         time.sleep(2)

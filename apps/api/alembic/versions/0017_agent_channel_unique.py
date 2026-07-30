@@ -57,9 +57,7 @@ def upgrade() -> None:
             "inert. Re-point them to their own channels or delete them, then re-run "
             "this migration."
         )
-    op.create_unique_constraint(
-        CONSTRAINT, "agents", ["slack_channel"], schema=SCHEMA
-    )
+    op.create_unique_constraint(CONSTRAINT, "agents", ["slack_channel"], schema=SCHEMA)
 
 
 def downgrade() -> None:

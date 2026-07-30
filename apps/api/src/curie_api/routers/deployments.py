@@ -45,9 +45,7 @@ async def list_deployments(
 
 
 @router.get("/{deployment_id}", response_model=DeploymentOut)
-async def get_deployment(
-    deployment_id: uuid.UUID, session: SessionDep
-) -> DeploymentOut:
+async def get_deployment(deployment_id: uuid.UUID, session: SessionDep) -> DeploymentOut:
     deployment = await crud.get_deployment(session, deployment_id)
     if deployment is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")

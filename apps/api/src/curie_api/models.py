@@ -36,18 +36,14 @@ class ApprovalStatus(enum.StrEnum):
 class Agent(Base):
     __tablename__ = "agents"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(unique=True)
     # One agent per Slack channel (#38). The worker resolves a channel to an
     # agent, so a second agent bound to the same channel could never respond --
     # it would be silently shadowed. Enforced here so it fails at create time.
     slack_channel: Mapped[str] = mapped_column(unique=True)
     # The GitHub repo (owner/name) whose pushes deploy this agent (J1).
-    repo_full_name: Mapped[str | None] = mapped_column(
-        default=None, unique=True, index=True
-    )
+    repo_full_name: Mapped[str | None] = mapped_column(default=None, unique=True, index=True)
     # Per-agent budget (L1). Field names match the frozen ACI SessionConfig
     # CURIE_BUDGET so the worker passes them straight through at sandbox boot;
     # NULL means platform defaults apply.
@@ -64,17 +60,13 @@ class Agent(Base):
     # NULL means no packs (the platform default). The shape is validated by
     # schemas.BehaviorPacksConfig on write and parsed by
     # curie_worker.behaviorpacks.BehaviorPacks on read.
-    behavior_packs: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB, default=None
-    )
+    behavior_packs: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent permission gates (#245, ADR-0010): tool names whose calls
     # require human approval. Forwarded by the worker binding as
     # CURIE_APPROVAL_REQUIRED_TOOLS at sandbox boot; the runner's
     # can_use_tool callback blocks these calls and ends the turn
     # awaiting-approval. NULL means no permission gates (the bypass posture).
-    approval_required_tools: Mapped[list[str] | None] = mapped_column(
-        JSONB, default=None
-    )
+    approval_required_tools: Mapped[list[str] | None] = mapped_column(JSONB, default=None)
     # Per-agent approval route bindings (#247, ADR-0010): the workspace half of
     # the split policy. The bundle manifest declares gate points and route
     # NAMES (versioned with the agent); this maps each declared name to
@@ -83,9 +75,7 @@ class Agent(Base):
     # decide where the approval card goes (and therefore who the
     # channel-membership authorizer counts as approvers). NULL means no
     # bindings; an unbound route falls back to the requesting channel.
-    approval_routes: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB, default=None
-    )
+    approval_routes: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent connector secrets (ADR-0009, #429): the named secret VALUES the
     # bundle's authed MCP servers need (e.g. GITHUB_PERSONAL_ACCESS_TOKEN). The
     # bundle declares the NAMES (plugin-format `secrets`); values are supplied at
@@ -104,9 +94,7 @@ class Agent(Base):
 class AgentVersion(Base):
     __tablename__ = "agent_versions"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
     )
@@ -125,9 +113,7 @@ class AgentVersion(Base):
 class Deployment(Base):
     __tablename__ = "deployments"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
     )
@@ -158,9 +144,7 @@ class Approval(Base):
 
     __tablename__ = "approvals"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Nullable: a run without a deployment binding (the generic/dev path) can
     # still gate on a human decision.
     agent_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -229,9 +213,7 @@ class ApprovalAuditEntry(Base):
 
     __tablename__ = "approval_audit_entries"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     approval_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.approvals.id", ondelete="CASCADE"), index=True
     )
@@ -272,9 +254,7 @@ class WorkflowStateEntry(Base):
         UniqueConstraint("agent_id", "namespace", "key", name="uq_state_agent_ns_key"),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
     )
@@ -287,6 +267,4 @@ class WorkflowStateEntry(Base):
     # it last read, and the write is rejected if the stored version moved on.
     version: Mapped[int] = mapped_column(default=1)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        server_default=func.now(), onupdate=func.now()
-    )
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())

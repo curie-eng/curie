@@ -66,9 +66,7 @@ def _build_bare_repo(tmp_path: Path, files: dict[str, str]) -> tuple[str, str]:
     return f"file://{bare}", sha
 
 
-def _post(
-    client: Any, event: str, payload: dict[str, Any], secret: str = SECRET
-) -> Any:
+def _post(client: Any, event: str, payload: dict[str, Any], secret: str = SECRET) -> Any:
     body = json.dumps(payload).encode()
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return client.post(
@@ -140,14 +138,10 @@ def test_dev_push_deploys_dev_bot(
     assert body["commit_sha"] == sha
 
     # The version was built from the commit and its bundle is stored + fetchable.
-    version = client.get(
-        f"/agents/{agent_id}/versions", headers=auth_headers
-    ).json()[0]
+    version = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()[0]
     assert version["commit_sha"] == sha
     assert version["bundle_ref"] is not None
-    bundle = client.get(
-        f"/agents/{agent_id}/versions/{version['id']}/bundle", headers=auth_headers
-    )
+    bundle = client.get(f"/agents/{agent_id}/versions/{version['id']}/bundle", headers=auth_headers)
     assert bundle.status_code == 200
     assert len(bundle.content) > 0
 
@@ -165,12 +159,8 @@ def test_main_push_promotes_and_reuses_the_built_version(
     agent_id = _register_agent(client, auth_headers)
     clone_url, sha = _build_bare_repo(tmp_path, VALID_FILES)
 
-    dev = _post(
-        client, "push", _push_payload("refs/heads/dev", sha, clone_url)
-    ).json()
-    prod = _post(
-        client, "push", _push_payload("refs/heads/main", sha, clone_url)
-    ).json()
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
 
     assert prod["status"] == "promoted"
     assert prod["environment"] == "prod"
@@ -197,9 +187,7 @@ def test_partial_version_is_rebuilt_not_reused(
     assert resp.status_code == 200
     assert resp.json()["status"] == "deployed"
 
-    versions = client.get(
-        f"/agents/{agent_id}/versions", headers=auth_headers
-    ).json()
+    versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
     # The partial row was repaired in place (no duplicate) and now has a bundle.
     assert len(versions) == 1
     assert versions[0]["commit_sha"] == sha
@@ -221,9 +209,7 @@ def test_invalid_signature_is_401(
     assert resp.status_code == 401
 
 
-def test_ping_event_pongs(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
+def test_ping_event_pongs(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
     resp = _post(client, "ping", {"zen": "hi"})
     assert resp.status_code == 200
     assert resp.json()["status"] == "pong"
@@ -244,9 +230,7 @@ def test_non_deploy_branch_is_ignored(
 ) -> None:
     _register_agent(client, auth_headers)
     clone_url, sha = _build_bare_repo(tmp_path, VALID_FILES)
-    resp = _post(
-        client, "push", _push_payload("refs/heads/feature-x", sha, clone_url)
-    )
+    resp = _post(client, "push", _push_payload("refs/heads/feature-x", sha, clone_url))
     assert resp.status_code == 200
     assert resp.json()["status"] == "ignored"
 

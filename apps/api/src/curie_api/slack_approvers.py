@@ -50,9 +50,7 @@ class SlackChannelMembers:
     def __init__(self, approvers_channel: str | None) -> None:
         self._approvers_channel = approvers_channel
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         evidence: dict[str, Any] = {
             "kind": "channel_membership",
             "approvers_channel": self._approvers_channel,
@@ -87,9 +85,7 @@ class SlackUserGroupMembers:
         self._group_id = group_id
         self._source = source
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         if self._source is None:
             return self._undetermined("no Slack bot token is configured for the API")
         try:

@@ -66,8 +66,7 @@ class GitHubStatusReporter:
             # rejects (LocalProtocolError), which would 500 an otherwise
             # successful eval report.
             logger.info(
-                "no GitHub token configured; skipping commit-status post "
-                "for %s@%s (%s)",
+                "no GitHub token configured; skipping commit-status post for %s@%s (%s)",
                 repo_full_name,
                 sha,
                 description,
@@ -92,7 +91,5 @@ class GitHubStatusReporter:
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise GitHubReportError(
-                exc.response.status_code, exc.response.text.strip()
-            ) from exc
+            raise GitHubReportError(exc.response.status_code, exc.response.text.strip()) from exc
         return state

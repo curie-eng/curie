@@ -112,9 +112,7 @@ class BundleStore:
         await run_in_threadpool(self._put_sync, key, data, content_type)
 
     def _put_sync(self, key: str, data: bytes, content_type: str) -> None:
-        self._client.put_object(
-            Bucket=self._bucket, Key=key, Body=data, ContentType=content_type
-        )
+        self._client.put_object(Bucket=self._bucket, Key=key, Body=data, ContentType=content_type)
 
     async def get(self, key: str) -> bytes:
         return await run_in_threadpool(self._get_sync, key)

@@ -149,9 +149,7 @@ def test_report_unknown_repo_returns_404_not_500(
     # a clear 4xx, never a 500 (the audit MAJOR: report_eval 500s on stale/unknown
     # repo state). GitHub answers 404 -> the API answers 404 with a clear detail.
     app = create_app()
-    app.dependency_overrides[get_github_reporter] = (
-        lambda: _reporter_rejecting_with(404)
-    )
+    app.dependency_overrides[get_github_reporter] = lambda: _reporter_rejecting_with(404)
     with TestClient(app) as client:
         resp = client.post(
             "/evals/report",
@@ -173,9 +171,7 @@ def test_report_github_client_rejection_maps_to_422(
     # A non-404 GitHub client rejection (e.g. 422 bad sha, 403 token) is still a
     # caller/input fault, not an API server fault: map to 422, not 500.
     app = create_app()
-    app.dependency_overrides[get_github_reporter] = (
-        lambda: _reporter_rejecting_with(422)
-    )
+    app.dependency_overrides[get_github_reporter] = lambda: _reporter_rejecting_with(422)
     with TestClient(app) as client:
         resp = client.post(
             "/evals/report",

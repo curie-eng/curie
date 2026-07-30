@@ -73,9 +73,7 @@ class FakeLister:
     decide whether the pod is a genuine runner pod.
     """
 
-    def __init__(
-        self, pods: list[str], *, raises: Exception | None = None
-    ) -> None:
+    def __init__(self, pods: list[str], *, raises: Exception | None = None) -> None:
         self._pods = pods
         self._raises = raises
         self.calls: list[tuple[str, str]] = []

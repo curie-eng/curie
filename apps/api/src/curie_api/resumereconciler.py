@@ -210,9 +210,7 @@ class ResumeReconciler:
 
         count = 0
         try:
-            entries = await self._resume_queue.read_dead_letter(
-                count=self._dead_letter_scan_limit
-            )
+            entries = await self._resume_queue.read_dead_letter(count=self._dead_letter_scan_limit)
         except Exception:
             logger.warning(
                 "resume dead-letter scan read failed, skipping this pass",
@@ -232,8 +230,7 @@ class ResumeReconciler:
             if reopened:
                 count += 1
                 logger.info(
-                    "approval %s resume turn was dead-lettered; re-opened as an "
-                    "owed wake",
+                    "approval %s resume turn was dead-lettered; re-opened as an owed wake",
                     approval_id,
                 )
         return count

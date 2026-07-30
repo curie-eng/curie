@@ -32,9 +32,7 @@ class Settings(BaseSettings):
 
     # Postgres (async driver). Dedicated `curie` schema keeps our tables clear
     # of Langfuse's own tables on the same database.
-    database_url: str = (
-        "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
-    )
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
     db_schema: str = "curie"
 
     # Single shared API key. Dev-only default; override in any shared deployment.
@@ -146,9 +144,7 @@ class Settings(BaseSettings):
     # graveyard watcher tracks the SAME stream the worker dead-letters to. Empty
     # derives `<runs_stream>:dead`. DISTINCT from `resume_dead_letter_stream` below
     # (the narrower ResumeQueue-only override); this is the general graveyard name.
-    dead_letter_stream: str = Field(
-        default="", validation_alias=DEAD_LETTER_STREAM_ENV
-    )
+    dead_letter_stream: str = Field(default="", validation_alias=DEAD_LETTER_STREAM_ENV)
 
     def dead_letter_stream_name(self) -> str:
         return derive_dead_letter_stream_name(self.runs_stream, self.dead_letter_stream)
@@ -245,9 +241,7 @@ class Settings(BaseSettings):
     def valkey_dsn(self) -> str:
         if self.valkey_url:
             return self.valkey_url
-        return (
-            f"redis://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
-        )
+        return f"redis://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
 
     @model_validator(mode="after")
     def _refuse_dev_defaults_in_prod(self) -> "Settings":

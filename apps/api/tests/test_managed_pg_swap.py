@@ -110,15 +110,12 @@ def test_app_tables_are_schema_qualified(migrated: None) -> None:
     swap places the whole app footprint under `curie` on the managed target.
     """
 
-    public = _query(
-        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-    )
+    public = _query("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
     assert public == [], f"unexpected public tables: {public}"
 
     for table in _UUID_PK_TABLES:
         rows = _query(
-            "SELECT 1 FROM pg_tables WHERE schemaname = :schema "
-            "AND tablename = :table",
+            "SELECT 1 FROM pg_tables WHERE schemaname = :schema AND tablename = :table",
             schema=SCHEMA,
             table=table,
         )

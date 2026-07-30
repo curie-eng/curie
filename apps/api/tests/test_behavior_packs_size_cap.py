@@ -81,9 +81,7 @@ def test_put_behavior_packs_within_cap_ok(
         "help": {"enabled": True, "phrases": ["help"], "reply": "here is help"},
         "nav": {"enabled": True, "hub_label": "Help", "hub_command": "help"},
     }
-    resp = client.put(
-        f"/agents/{agent['id']}/behavior-packs", json=config, headers=auth_headers
-    )
+    resp = client.put(f"/agents/{agent['id']}/behavior-packs", json=config, headers=auth_headers)
     assert resp.status_code == 200, resp.text
 
     resp = client.get(f"/agents/{agent['id']}/behavior-packs", headers=auth_headers)
@@ -110,16 +108,12 @@ def test_put_behavior_packs_boundary_of_small_overridden_cap(
 
         # Comfortably under the 1000-byte cap (serialized total ~870 bytes).
         under = {"greeting": {"enabled": True, "phrases": [], "reply": "a" * 600}}
-        resp = client.put(
-            f"/agents/{agent['id']}/behavior-packs", json=under, headers=auth_headers
-        )
+        resp = client.put(f"/agents/{agent['id']}/behavior-packs", json=under, headers=auth_headers)
         assert resp.status_code == 200, resp.text
 
         # Comfortably over the 1000-byte cap (serialized total ~1170 bytes).
         over = {"greeting": {"enabled": True, "phrases": [], "reply": "a" * 900}}
-        resp = client.put(
-            f"/agents/{agent['id']}/behavior-packs", json=over, headers=auth_headers
-        )
+        resp = client.put(f"/agents/{agent['id']}/behavior-packs", json=over, headers=auth_headers)
         assert resp.status_code == 413, resp.text
     finally:
         get_settings.cache_clear()

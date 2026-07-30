@@ -80,7 +80,7 @@ def build_resume_turn(approval: Approval) -> QueuedTurn:
     decision = approval.status
     note = f" Note: {approval.resolution_note}." if approval.resolution_note else ""
     text = (
-        f"[approval resolved] The request \"{approval.summary}\" was {decision} "
+        f'[approval resolved] The request "{approval.summary}" was {decision} '
         f"by {approval.resolved_by}.{note} Continue the task accordingly: proceed "
         "with the approved action, or acknowledge the rejection and stop."
     )
@@ -107,7 +107,7 @@ def build_expiry_resume_turn(approval: Approval) -> QueuedTurn:
     """
 
     text = (
-        f"[approval expired] The request \"{approval.summary}\" was not approved "
+        f'[approval expired] The request "{approval.summary}" was not approved '
         "or rejected before its deadline and has expired. Do not perform the "
         "gated action. Continue the task down its timeout path: acknowledge the "
         "expiry and proceed or stop accordingly."
@@ -133,9 +133,7 @@ def resume_turn_for(approval: Approval) -> QueuedTurn:
         return build_expiry_resume_turn(approval)
     if approval.status in (ApprovalStatus.approved, ApprovalStatus.rejected):
         return build_resume_turn(approval)
-    raise ValueError(
-        f"approval {approval.id} status {approval.status} owes no resume turn"
-    )
+    raise ValueError(f"approval {approval.id} status {approval.status} owes no resume turn")
 
 
 class ResumeQueue:
@@ -169,9 +167,7 @@ class ResumeQueue:
         stream_id = await self._client.xadd(self._stream, fields)
         return stream_id.decode() if isinstance(stream_id, bytes) else str(stream_id)
 
-    async def read_dead_letter(
-        self, *, count: int
-    ) -> list[tuple[str, dict[str, str]]]:
+    async def read_dead_letter(self, *, count: int) -> list[tuple[str, dict[str, str]]]:
         """Read up to ``count`` MOST-RECENT graveyard rows, newest-first
         (READ-ONLY; never XDEL/XACK).
 
@@ -189,9 +185,7 @@ class ResumeQueue:
         entries = await self._client.xrevrange(self._dead_letter_stream, count=count)
         result: list[tuple[str, dict[str, str]]] = []
         for entry_id, fields in entries or []:
-            entry_id_str = (
-                entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
-            )
+            entry_id_str = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
             fields_str = {
                 (k.decode() if isinstance(k, bytes) else str(k)): (
                     v.decode() if isinstance(v, bytes) else str(v)

@@ -88,16 +88,12 @@ async def _remove_memory_update_gate() -> None:
             ON curie.workflow_state_entries
             """
         )
-        await connection.execute(
-            "DROP FUNCTION IF EXISTS curie.test_memory_update_gate()"
-        )
+        await connection.execute("DROP FUNCTION IF EXISTS curie.test_memory_update_gate()")
     finally:
         await connection.close()
 
 
-async def _wait_for_blocked_memory_requests(
-    minimum: int, requests: list[Future[Any]]
-) -> None:
+async def _wait_for_blocked_memory_requests(minimum: int, requests: list[Future[Any]]) -> None:
     connection = await asyncpg.connect(_asyncpg_dsn())
     try:
         deadline = time.monotonic() + 10
@@ -163,11 +159,7 @@ def _run_ordered_memory_requests(
             try:
                 asyncio.run(_wait_for_blocked_memory_requests(1, [first_request]))
                 second_request = executor.submit(second)
-                asyncio.run(
-                    _wait_for_blocked_memory_requests(
-                        2, [first_request, second_request]
-                    )
-                )
+                asyncio.run(_wait_for_blocked_memory_requests(2, [first_request, second_request]))
             finally:
                 release.set()
             first_response = first_request.result(timeout=10)
@@ -208,9 +200,7 @@ def test_list_memory_returns_entries_with_provenance(
             },
         },
     )
-    appended = _remember(
-        client, auth_headers, aid, {"content": "no-provenance lesson"}
-    )
+    appended = _remember(client, auth_headers, aid, {"content": "no-provenance lesson"})
 
     entries = _memory(client, auth_headers, aid)
     assert len(entries) == 2
@@ -396,9 +386,7 @@ def test_runner_append_makes_operator_edit_token_stale_without_losing_append(
     _remember(client, auth_headers, aid, {"content": "original lesson"})
     listed = _memory(client, auth_headers, aid)
 
-    appended = _remember(
-        client, auth_headers, aid, {"content": "runner learned another lesson"}
-    )
+    appended = _remember(client, auth_headers, aid, {"content": "runner learned another lesson"})
     response = client.put(
         f"/agents/{aid}/memory/0",
         json={
@@ -467,9 +455,7 @@ def test_oversized_edit_is_rejected_without_changing_memory(
         )
 
         assert response.status_code == 413, response.text
-        stored = client.get(
-            f"/agents/{aid}/state/memory/log", headers=auth_headers
-        ).json()
+        stored = client.get(f"/agents/{aid}/state/memory/log", headers=auth_headers).json()
         assert stored["version"] == seeded["version"]
         assert stored["value"] == seeded["value"]
     finally:

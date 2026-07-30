@@ -26,11 +26,7 @@ def test_build_matrix_pivots_cases_by_version() -> None:
     assert matrix.versions == ["shaB", "shaA"]  # most recent first
     assert matrix.cases == ["c1", "c2"]
 
-    cells = {
-        (row.case_id, cell.version): cell.status
-        for row in matrix.rows
-        for cell in row.cells
-    }
+    cells = {(row.case_id, cell.version): cell.status for row in matrix.rows for cell in row.cells}
     assert cells[("c1", "shaA")] == "pass"
     assert cells[("c1", "shaB")] == "pass"
     assert cells[("c2", "shaA")] == "fail"
@@ -134,9 +130,7 @@ def test_cells_carry_model_and_unlabelled_runs_sort_last() -> None:
     ]
     matrix = build_matrix(traces, "s", 5)
 
-    cell_models = {
-        cell.version: cell.model for row in matrix.rows for cell in row.cells
-    }
+    cell_models = {cell.version: cell.model for row in matrix.rows for cell in row.cells}
     assert cell_models["shaA"] == "opus"
     assert cell_models["shaB"] is None
     # Unlabelled (None) model rolls up too and sorts after named models.
@@ -191,9 +185,7 @@ def test_a_plumbing_cell_is_never_a_pass() -> None:
     ]
     matrix = build_matrix(traces, "s", 5)
 
-    cells = {
-        (row.case_id, cell.version): cell.status for row in matrix.rows for cell in row.cells
-    }
+    cells = {(row.case_id, cell.version): cell.status for row in matrix.rows for cell in row.cells}
     assert cells[("c1", "shaA")] == "plumbing_ok"
     assert cells[("c2", "shaA")] == "fail"
 
@@ -217,9 +209,7 @@ def test_the_outcome_wins_over_a_stale_passed_and_legacy_traces_still_render() -
     ]
     matrix = build_matrix(traces, "s", 5)
 
-    cells = {
-        (row.case_id, cell.version): cell.status for row in matrix.rows for cell in row.cells
-    }
+    cells = {(row.case_id, cell.version): cell.status for row in matrix.rows for cell in row.cells}
     assert cells[("c1", "shaA")] == "plumbing_ok"  # not "pass"
     assert cells[("c2", "shaA")] == "pass"
 
@@ -238,9 +228,7 @@ def test_a_later_plumbing_run_does_not_erase_an_earlier_graded_result() -> None:
     ]
     matrix = build_matrix(traces, "s", 5)
 
-    cells = {
-        (row.case_id, cell.version): cell for row in matrix.rows for cell in row.cells
-    }
+    cells = {(row.case_id, cell.version): cell for row in matrix.rows for cell in row.cells}
     assert cells[("c1", "shaA")].status == "pass"
     assert cells[("c1", "shaA")].model == "opus"  # the graded run's label, not the fake's
     assert cells[("c2", "shaA")].status == "plumbing_ok"
@@ -303,8 +291,7 @@ def test_a_real_zero_percent_model_is_completed_but_not_passed() -> None:
     assert opus.completed == 2  # every case reached a verdict; it just lost
 
 
-def test_a_model_that_never_completed_a_turn_is_distinct_from_a_real_zero(
-) -> None:
+def test_a_model_that_never_completed_a_turn_is_distinct_from_a_real_zero() -> None:
     """A FAIL whose turn never completed (classified failure, wrong terminal
     status, a transport error) carries `error` in its metadata (issue #622).
     `total > 0` and `completed == 0` is the "never answered" outcome the CLI
@@ -414,9 +401,7 @@ def test_per_version_summaries_scope_completed_to_each_sha() -> None:
     assert blended.total == 4
     assert blended.completed == 2  # the two old-sha completions -- the mask
 
-    per_version = {
-        (s.version, s.model): s for s in matrix.model_version_summaries
-    }
+    per_version = {(s.version, s.model): s for s in matrix.model_version_summaries}
     # The triggered sha's own row: never completed (total > 0, completed == 0).
     new = per_version[("shaNew", "opus")]
     assert new.total == 2
@@ -440,9 +425,7 @@ def test_per_version_summaries_surface_a_plumbing_only_row() -> None:
     ]
     matrix = build_matrix(traces, "s", 5)
 
-    per_version = {
-        (s.version, s.model): s for s in matrix.model_version_summaries
-    }
+    per_version = {(s.version, s.model): s for s in matrix.model_version_summaries}
     fake = per_version[("shaA", "fake")]
     assert fake.total == 0
     assert fake.plumbing == 2

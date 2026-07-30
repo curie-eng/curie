@@ -68,9 +68,7 @@ async def github_webhook(
 ) -> WebhookResult:
     settings = get_settings()
     body = await _read_bounded_body(request, settings.github_webhook_max_body_bytes)
-    if not verify_signature(
-        settings.github_webhook_secret, body, x_hub_signature_256
-    ):
+    if not verify_signature(settings.github_webhook_secret, body, x_hub_signature_256):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid signature")
 
     if x_github_event == "ping":
@@ -81,9 +79,7 @@ async def github_webhook(
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, "webhook body is not valid JSON"
-        ) from exc
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "webhook body is not valid JSON") from exc
 
     result = await process_push(session, store, settings, eval_queue, payload)
     _log_outcome(result, payload)

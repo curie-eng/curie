@@ -134,8 +134,6 @@ async def download_bundle(
 ) -> Response:
     version = await _load_version(session, agent_id, version_id)
     if version.bundle_ref is None:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "no bundle stored for this version"
-        )
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no bundle stored for this version")
     data = await store.get(version.bundle_ref)
     return Response(content=data, media_type=_content_type_for(version.bundle_ref))

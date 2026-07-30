@@ -33,9 +33,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setattr(
         github_router,
         "get_settings",
-        lambda: Settings(
-            github_webhook_secret=SECRET, github_webhook_max_body_bytes=MAX
-        ),
+        lambda: Settings(github_webhook_secret=SECRET, github_webhook_max_body_bytes=MAX),
     )
 
     async def _fake_push(*_args: Any, **_kwargs: Any) -> WebhookResult:

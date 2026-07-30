@@ -30,9 +30,7 @@ class _RecordingBackend:
             {"id": str(i), "name": f"curie-run:agent-A-thread-{i}"}
             for i in range(start, min(start + limit, self._total))
         ]
-        return httpx.Response(
-            200, json={"data": data, "meta": {"totalPages": total_pages}}
-        )
+        return httpx.Response(200, json={"data": data, "meta": {"totalPages": total_pages}})
 
 
 def _client(backend: _RecordingBackend) -> LangfuseClient:

@@ -47,9 +47,7 @@ class NullPodLogReader:
         tail_lines: int | None,
         previous: bool,
     ) -> str:
-        raise NoClusterConfigured(
-            "no kubernetes cluster configured for runner logs"
-        )
+        raise NoClusterConfigured("no kubernetes cluster configured for runner logs")
 
 
 class KubernetesPodLogReader:
@@ -82,9 +80,7 @@ class KubernetesPodLogReader:
             return logs
         except Exception as exc:  # kubernetes ApiException carries .status
             status = getattr(exc, "status", None)
-            raise PodLogError(
-                str(exc), status if isinstance(status, int) else None
-            ) from exc
+            raise PodLogError(str(exc), status if isinstance(status, int) else None) from exc
 
 
 class _SuppressExecCredentialError(logging.Filter):
@@ -128,9 +124,7 @@ class LazyPodLogReader:
         tail_lines: int | None,
         previous: bool,
     ) -> str:
-        return self._resolve().read(
-            namespace, pod, container, tail_lines, previous
-        )
+        return self._resolve().read(namespace, pod, container, tail_lines, previous)
 
 
 def build_pod_log_reader(kube_config_path: str | None) -> PodLogReader:
@@ -159,8 +153,7 @@ def build_pod_log_reader(kube_config_path: str | None) -> PodLogReader:
         return KubernetesPodLogReader(client.CoreV1Api())
     except Exception as exc:
         logger.warning(
-            "runner-logs proxy: no usable kubernetes cluster (%s); "
-            "pod-log reads will return 503",
+            "runner-logs proxy: no usable kubernetes cluster (%s); pod-log reads will return 503",
             exc,
         )
         return NullPodLogReader()
@@ -188,9 +181,7 @@ class NullPodLister:
     """Used when no cluster is configured; every list degrades to 503."""
 
     def list_runner_pods(self, namespace: str, label_selector: str) -> list[str]:
-        raise NoClusterConfigured(
-            "no kubernetes cluster configured for runner pods"
-        )
+        raise NoClusterConfigured("no kubernetes cluster configured for runner pods")
 
 
 class KubernetesPodLister:
@@ -210,9 +201,7 @@ class KubernetesPodLister:
             return names
         except Exception as exc:  # kubernetes ApiException carries .status
             status = getattr(exc, "status", None)
-            raise PodLogError(
-                str(exc), status if isinstance(status, int) else None
-            ) from exc
+            raise PodLogError(str(exc), status if isinstance(status, int) else None) from exc
 
 
 class LazyPodLister:
@@ -254,8 +243,7 @@ def build_pod_lister(kube_config_path: str | None) -> PodLister:
         return KubernetesPodLister(client.CoreV1Api())
     except Exception as exc:
         logger.warning(
-            "runner-pods list: no usable kubernetes cluster (%s); "
-            "pod listing will return 503",
+            "runner-pods list: no usable kubernetes cluster (%s); pod listing will return 503",
             exc,
         )
         return NullPodLister()

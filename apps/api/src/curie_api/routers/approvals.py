@@ -32,18 +32,15 @@ from ..wirebody import ApprovalRequestBody
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(
-    prefix="/approvals", tags=["approvals"], dependencies=[Depends(require_api_key)]
-)
+router = APIRouter(prefix="/approvals", tags=["approvals"], dependencies=[Depends(require_api_key)])
 
 
 def _expired(approval: Approval) -> bool:
     """True when a pending record's SLA has passed (naive-UTC comparison,
     matching the DateTime columns)."""
 
-    return (
-        approval.expires_at is not None
-        and approval.expires_at <= datetime.now(UTC).replace(tzinfo=None)
+    return approval.expires_at is not None and approval.expires_at <= datetime.now(UTC).replace(
+        tzinfo=None
     )
 
 
@@ -99,9 +96,7 @@ async def get_approval(approval_id: uuid.UUID, session: SessionDep) -> ApprovalO
 
 
 @router.get("/{approval_id}/audit", response_model=list[ApprovalAuditOut])
-async def get_approval_audit(
-    approval_id: uuid.UUID, session: SessionDep
-) -> list[ApprovalAuditOut]:
+async def get_approval_audit(approval_id: uuid.UUID, session: SessionDep) -> list[ApprovalAuditOut]:
     """The approval's audit trail (#247), oldest first: every resolution
     attempt with the authorizer snapshot that counted or refused it."""
 

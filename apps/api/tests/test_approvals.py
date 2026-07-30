@@ -138,10 +138,7 @@ def _read_provenance(approval_id: uuid.UUID) -> tuple[str | None, str | None]:
         try:
             async with engine.connect() as conn:
                 result = await conn.execute(
-                    text(
-                        "SELECT gate_kind, granted_tool FROM curie.approvals "
-                        "WHERE id = :id"
-                    ),
+                    text("SELECT gate_kind, granted_tool FROM curie.approvals WHERE id = :id"),
                     {"id": approval_id},
                 )
                 row = result.first()
@@ -189,9 +186,7 @@ def test_resolve_endpoint_stays_200_when_enqueue_fails(
     to 500 then 409-forever).
     """
 
-    created = approvals_client.post(
-        "/approvals", json=_payload(), headers=auth_headers
-    ).json()
+    created = approvals_client.post("/approvals", json=_payload(), headers=auth_headers).json()
 
     async def _boom(_turn: Any) -> str:
         raise RuntimeError("valkey unreachable")
@@ -221,9 +216,7 @@ def test_resolve_endpoint_stays_200_when_enqueue_fails(
 
 
 @pytest.fixture
-def reconciler_disabled_client(
-    _disposable_db: Any, runs_stream: str
-) -> Iterator[TestClient]:
+def reconciler_disabled_client(_disposable_db: Any, runs_stream: str) -> Iterator[TestClient]:
     """A TestClient built with the resume reconciler DISABLED, so a failed inline
     enqueue has no backstop. ``raise_server_exceptions=False`` lets the resulting
     500 be asserted as a response rather than re-raised into the test body."""
@@ -264,9 +257,7 @@ def test_resolve_reraises_when_reconciler_disabled(
     async def _boom(_turn: Any) -> str:
         raise RuntimeError("valkey unreachable")
 
-    monkeypatch.setattr(
-        reconciler_disabled_client.app.state.resume_queue, "enqueue", _boom
-    )
+    monkeypatch.setattr(reconciler_disabled_client.app.state.resume_queue, "enqueue", _boom)
 
     resolved = reconciler_disabled_client.post(
         f"/approvals/{created['id']}/resolve",
@@ -277,9 +268,7 @@ def test_resolve_reraises_when_reconciler_disabled(
 
     # The CAS committed -- the record is resolved -- but its wake is unrecoverably
     # owed (no reconciler) and nothing reached the stream.
-    record = reconciler_disabled_client.get(
-        f"/approvals/{created['id']}", headers=auth_headers
-    )
+    record = reconciler_disabled_client.get(f"/approvals/{created['id']}", headers=auth_headers)
     assert record.json()["status"] == "approved"
     assert _read_resumed_at(created["id"]) is None
     assert valkey.xrange(runs_stream) == []
@@ -296,9 +285,7 @@ def test_happy_path_resolve_marks_resumed(
     setting ``resumed_at``, so the reconciler's work-list excludes it. This adds
     to the resolve-once coverage without weakening the existing assertions."""
 
-    created = approvals_client.post(
-        "/approvals", json=_payload(), headers=auth_headers
-    ).json()
+    created = approvals_client.post("/approvals", json=_payload(), headers=auth_headers).json()
 
     resolved = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
@@ -366,9 +353,7 @@ def test_create_still_rejects_an_invalid_modelled_field(
 ) -> None:
     """Tolerance is for UNKNOWN fields only; a modelled field's constraint still binds."""
 
-    resp = approvals_client.post(
-        "/approvals", json=_payload(author=""), headers=auth_headers
-    )
+    resp = approvals_client.post("/approvals", json=_payload(author=""), headers=auth_headers)
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"][0]["loc"] == ["body", "author"]
 
@@ -443,9 +428,7 @@ def test_concurrent_resolvers_yield_exactly_one_winner(
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    created = approvals_client.post(
-        "/approvals", json=_payload(), headers=auth_headers
-    ).json()
+    created = approvals_client.post("/approvals", json=_payload(), headers=auth_headers).json()
 
     def attempt(actor: str) -> int:
         response = approvals_client.post(
@@ -472,9 +455,7 @@ def test_expired_approval_resolve_returns_410_and_resumes(
     runs_stream: str,
 ) -> None:
     payload = _payload(expires_in_seconds=1)
-    created = approvals_client.post(
-        "/approvals", json=payload, headers=auth_headers
-    ).json()
+    created = approvals_client.post("/approvals", json=payload, headers=auth_headers).json()
     assert created["expires_at"] is not None
     time.sleep(1.1)
 
@@ -520,9 +501,7 @@ def test_unknown_approval_is_404(
     assert missing.status_code == 404
 
 
-def test_requires_api_key(
-    approvals_client: TestClient, clean_db: None
-) -> None:
+def test_requires_api_key(approvals_client: TestClient, clean_db: None) -> None:
     denied = approvals_client.post("/approvals", json=_payload())
     assert denied.status_code in (401, 403)
 
@@ -538,9 +517,7 @@ def test_scoped_state_token_cannot_resolve_an_approval(
     forward its own state token to /approvals/{id}/resolve and self-approve its
     own gated tool call, defeating the server-side authorizer (ADR-0010)."""
 
-    created = approvals_client.post(
-        "/approvals", json=_payload(), headers=auth_headers
-    ).json()
+    created = approvals_client.post("/approvals", json=_payload(), headers=auth_headers).json()
     resolve_url = f"/approvals/{created['id']}/resolve"
 
     scoped = mint(
@@ -556,9 +533,7 @@ def test_scoped_state_token_cannot_resolve_an_approval(
     )
     assert denied.status_code == 401, denied.text
     # The record is untouched by the rejected attempt.
-    record = approvals_client.get(
-        f"/approvals/{created['id']}", headers=auth_headers
-    )
+    record = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers)
     assert record.json()["status"] == "pending"
 
     # The platform key still resolves it (no regression).
@@ -581,9 +556,7 @@ def test_authorizer_blocks_non_member_and_self_approval(
     attempt's channel, self-approval is blocked unconditionally, and a denied
     attempt neither resolves the record nor enqueues a resume turn."""
 
-    created = approvals_client.post(
-        "/approvals", json=_payload(), headers=auth_headers
-    ).json()
+    created = approvals_client.post("/approvals", json=_payload(), headers=auth_headers).json()
     resolve_url = f"/approvals/{created['id']}/resolve"
 
     # Wrong channel: not an approver.
@@ -697,9 +670,10 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
         "authority must never widen to the requesting channel when the manifest "
         f"declared a route: {requesting.text}"
     )
-    assert approvals_client.get(
-        f"/approvals/{created['id']}", headers=auth_headers
-    ).json()["status"] == "pending"
+    assert (
+        approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers).json()["status"]
+        == "pending"
+    )
     assert valkey.xrange(runs_stream) == []
 
     # The BOUND approver, from the bound channel: accepted.
@@ -758,9 +732,7 @@ def test_create_approval_persists_gate_kind_and_granted_tool(
 
     # An old runner emits neither: both stay NULL, which is the rolling-deploy
     # window the worker's prefix fallback covers (edge case 7).
-    legacy = approvals_client.post(
-        "/approvals", json=_payload(), headers=auth_headers
-    ).json()
+    legacy = approvals_client.post("/approvals", json=_payload(), headers=auth_headers).json()
     assert legacy["gate_kind"] is None
     assert legacy["granted_tool"] is None
 
@@ -796,9 +768,7 @@ def _isolated_migration_db() -> Iterator[None]:
     saved_url = os.environ.get("DATABASE_URL")
     asyncio.run(_admin(f'CREATE DATABASE "{run_db}"'))
     try:
-        os.environ["DATABASE_URL"] = base.set(database=run_db).render_as_string(
-            hide_password=False
-        )
+        os.environ["DATABASE_URL"] = base.set(database=run_db).render_as_string(hide_password=False)
         get_settings.cache_clear()
         yield
     finally:
@@ -837,9 +807,7 @@ def test_backfill_classifies_existing_rows() -> None:
         command.downgrade(cfg, "0014")
         permission_id = uuid.uuid4()
         policy_id = uuid.uuid4()
-        _seed_raw_approval(
-            permission_id, 'Tool call awaiting approval: Bash {"command": "deploy"}'
-        )
+        _seed_raw_approval(permission_id, 'Tool call awaiting approval: Bash {"command": "deploy"}')
         _seed_raw_approval(policy_id, "Give ACME a 20% discount")
         command.upgrade(cfg, "head")
 
@@ -951,9 +919,7 @@ def test_audit_log_records_attempts_with_authorizer_snapshots(
     an append-only audit entry naming the actor, the channel evidence, and the
     authorizer snapshot that counted (or refused) them."""
 
-    created = approvals_client.post(
-        "/approvals", json=_payload(), headers=auth_headers
-    ).json()
+    created = approvals_client.post("/approvals", json=_payload(), headers=auth_headers).json()
     resolve_url = f"/approvals/{created['id']}/resolve"
 
     denied = approvals_client.post(
@@ -975,9 +941,7 @@ def test_audit_log_records_attempts_with_authorizer_snapshots(
     )
     assert late.status_code == 409
 
-    audit = approvals_client.get(
-        f"/approvals/{created['id']}/audit", headers=auth_headers
-    )
+    audit = approvals_client.get(f"/approvals/{created['id']}/audit", headers=auth_headers)
     assert audit.status_code == 200
     entries = audit.json()
     assert [e["action"] for e in entries] == ["denied", "resolved", "race_lost"]
@@ -998,9 +962,7 @@ def test_audit_log_records_attempts_with_authorizer_snapshots(
     assert "already resolved by U9" in race_entry["reason"]
 
     # The audit endpoint 404s for an unknown approval.
-    missing = approvals_client.get(
-        f"/approvals/{uuid.uuid4()}/audit", headers=auth_headers
-    )
+    missing = approvals_client.get(f"/approvals/{uuid.uuid4()}/audit", headers=auth_headers)
     assert missing.status_code == 404
 
 
@@ -1053,12 +1015,8 @@ def test_sweeper_expires_lapsed_pending_and_enqueues_resume_turn(
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    payload = _payload(
-        expires_in_seconds=1, reply_endpoint="http://localhost:9999/api/"
-    )
-    created = approvals_client.post(
-        "/approvals", json=payload, headers=auth_headers
-    ).json()
+    payload = _payload(expires_in_seconds=1, reply_endpoint="http://localhost:9999/api/")
+    created = approvals_client.post("/approvals", json=payload, headers=auth_headers).json()
     assert created["expires_at"] is not None
 
     now = _naive_utc(2)
@@ -1072,9 +1030,7 @@ def test_sweeper_expires_lapsed_pending_and_enqueues_resume_turn(
     assert flipped == 1
 
     # DB state: flipped to expired by the platform, no human resolver recorded.
-    got = approvals_client.get(
-        f"/approvals/{created['id']}", headers=auth_headers
-    ).json()
+    got = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers).json()
     assert got["status"] == "expired"
     assert got["resolved_by"] is None
     assert got["resolved_at"] is not None
@@ -1094,9 +1050,7 @@ def test_sweeper_expires_lapsed_pending_and_enqueues_resume_turn(
     assert payload["summary"] in turn.text
 
     # The autonomous flip is audited consistently with #247.
-    audit = approvals_client.get(
-        f"/approvals/{created['id']}/audit", headers=auth_headers
-    )
+    audit = approvals_client.get(f"/approvals/{created['id']}/audit", headers=auth_headers)
     assert audit.status_code == 200
     entries_audit = audit.json()
     assert len(entries_audit) == 1
@@ -1136,9 +1090,7 @@ def test_sweeper_ignores_unexpired_and_unbounded_records(
     future = approvals_client.post(
         "/approvals", json=_payload(expires_in_seconds=3600), headers=auth_headers
     ).json()
-    unbounded = approvals_client.post(
-        "/approvals", json=_payload(), headers=auth_headers
-    ).json()
+    unbounded = approvals_client.post("/approvals", json=_payload(), headers=auth_headers).json()
     assert unbounded["expires_at"] is None
 
     now = _naive_utc()
@@ -1152,9 +1104,7 @@ def test_sweeper_ignores_unexpired_and_unbounded_records(
     assert flipped == 0
 
     for record in (future, unbounded):
-        got = approvals_client.get(
-            f"/approvals/{record['id']}", headers=auth_headers
-        ).json()
+        got = approvals_client.get(f"/approvals/{record['id']}", headers=auth_headers).json()
         assert got["status"] == "pending"
     assert valkey.xrange(runs_stream) == []
 
@@ -1186,9 +1136,7 @@ def test_sweeper_second_pass_is_a_no_op(
 
     # No double-flip, no second turn, no second audit row.
     assert len(valkey.xrange(runs_stream)) == 1
-    audit = approvals_client.get(
-        f"/approvals/{created['id']}/audit", headers=auth_headers
-    ).json()
+    audit = approvals_client.get(f"/approvals/{created['id']}/audit", headers=auth_headers).json()
     assert [e["action"] for e in audit] == ["expired"]
 
 
@@ -1222,9 +1170,7 @@ def test_sweeper_skips_already_resolved_records(
     flipped = asyncio.run(_scenario())
     assert flipped == 0
 
-    got = approvals_client.get(
-        f"/approvals/{created['id']}", headers=auth_headers
-    ).json()
+    got = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers).json()
     assert got["status"] == "approved"
 
     # Exactly the one resolve turn, authored by the human resolver; no expiry
@@ -1263,9 +1209,7 @@ def test_resolve_path_expiry_returns_410_even_if_enqueue_fails(
     """
 
     payload = _payload(expires_in_seconds=1)
-    created = approvals_client.post(
-        "/approvals", json=payload, headers=auth_headers
-    ).json()
+    created = approvals_client.post("/approvals", json=payload, headers=auth_headers).json()
     assert created["expires_at"] is not None
     time.sleep(1.1)
 
@@ -1279,9 +1223,7 @@ def test_resolve_path_expiry_returns_410_even_if_enqueue_fails(
     # Observe the real 500 the error middleware returns in production, rather
     # than letting TestClient (raise_server_exceptions=True) re-raise it -- the
     # regression being pinned is precisely "500 leaks out where 410 is owed".
-    monkeypatch.setattr(
-        approvals_client._transport, "raise_server_exceptions", False
-    )
+    monkeypatch.setattr(approvals_client._transport, "raise_server_exceptions", False)
 
     resolved = approvals_client.post(
         f"/approvals/{created['id']}/resolve",
@@ -1335,9 +1277,7 @@ def test_resolve_path_expiry_returns_410_when_the_resumed_mark_fails(
     """
 
     payload = _payload(expires_in_seconds=1)
-    created = approvals_client.post(
-        "/approvals", json=payload, headers=auth_headers
-    ).json()
+    created = approvals_client.post("/approvals", json=payload, headers=auth_headers).json()
     assert created["expires_at"] is not None
     time.sleep(1.1)
 
@@ -1454,9 +1394,7 @@ def test_sweeper_isolates_a_failing_record(
     # Both flips committed -- expire_approval commits before the enqueue runs, so
     # the record whose enqueue failed is still expired.
     for record in (first, second):
-        got = approvals_client.get(
-            f"/approvals/{record['id']}", headers=auth_headers
-        ).json()
+        got = approvals_client.get(f"/approvals/{record['id']}", headers=auth_headers).json()
         assert got["status"] == "expired"
 
     # Exactly one resume turn on the stream, for whichever record was second.
@@ -1513,9 +1451,7 @@ def test_run_expiry_sweeper_loop_sweeps_and_stops(
     async def _scenario() -> None:
         async with _sweeper_stack(runs_stream) as (sessionmaker, queue, client):
             stop = asyncio.Event()
-            task = asyncio.create_task(
-                run_expiry_sweeper(sessionmaker, queue, 0.05, stop)
-            )
+            task = asyncio.create_task(run_expiry_sweeper(sessionmaker, queue, 0.05, stop))
             try:
                 # Poll (bounded) until the loop observes the lapse and flips it.
                 status_deadline = asyncio.get_running_loop().time() + 5.0
@@ -1574,9 +1510,7 @@ _BROAD = "C0BROAD01"
 _ELSEWHERE = "C0ELSE001"
 
 
-def _agent_with_routes(
-    client: TestClient, headers: dict[str, str], routes: dict[str, Any]
-) -> str:
+def _agent_with_routes(client: TestClient, headers: dict[str, str], routes: dict[str, Any]) -> str:
     created = client.post(
         "/agents",
         json={
@@ -1591,9 +1525,7 @@ def _agent_with_routes(
 
 
 def _routed_payload(agent_id: str | None, **overrides: Any) -> dict[str, Any]:
-    return _payload(
-        agent_id=agent_id, route="managers", card_channel=_BROAD, **overrides
-    )
+    return _payload(agent_id=agent_id, route="managers", card_channel=_BROAD, **overrides)
 
 
 def _fake_slack(
@@ -1615,8 +1547,8 @@ def _fake_slack(
         httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
         token="xoxb-test",
     )
-    client.app.dependency_overrides[get_approver_sets] = lambda: (
-        SlackApproverSetSelector(group_client)
+    client.app.dependency_overrides[get_approver_sets] = lambda: SlackApproverSetSelector(
+        group_client
     )
 
 
@@ -1624,9 +1556,7 @@ def _no_slack_configured(client: TestClient) -> None:
     """A deployment with no SLACK_BOT_TOKEN: the selector is still wired (main
     always wires one), it just has no usergroup client behind it."""
 
-    client.app.dependency_overrides[get_approver_sets] = lambda: (
-        SlackApproverSetSelector(None)
-    )
+    client.app.dependency_overrides[get_approver_sets] = lambda: SlackApproverSetSelector(None)
 
 
 def _resolve(
@@ -1699,9 +1629,7 @@ def test_group_member_resolves_and_session_resumes(
         {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
     )
     payload = _routed_payload(agent_id)
-    created = approvals_client.post(
-        "/approvals", json=payload, headers=auth_headers
-    ).json()
+    created = approvals_client.post("/approvals", json=payload, headers=auth_headers).json()
 
     ok = _resolve(approvals_client, auth_headers, created["id"], _APPROVER)
     assert ok.status_code == 200, ok.text
@@ -1890,9 +1818,7 @@ def test_requester_cannot_self_approve_under_a_bound_channel_authorizer(
     landing on channel membership. The self-approval block must survive that
     route."""
 
-    agent_id = _agent_with_routes(
-        approvals_client, auth_headers, {"managers": {"channel": _BROAD}}
-    )
+    agent_id = _agent_with_routes(approvals_client, auth_headers, {"managers": {"channel": _BROAD}})
     created = approvals_client.post(
         "/approvals",
         json=_routed_payload(agent_id, author=_APPROVER),
@@ -1936,9 +1862,7 @@ def test_audit_names_authorizer_and_membership_evidence(
     assert _resolve(approvals_client, auth_headers, created["id"], _OTHER).status_code == 403
     assert _resolve(approvals_client, auth_headers, created["id"], _APPROVER).status_code == 200
 
-    entries = approvals_client.get(
-        f"/approvals/{created['id']}/audit", headers=auth_headers
-    ).json()
+    entries = approvals_client.get(f"/approvals/{created['id']}/audit", headers=auth_headers).json()
     assert [e["action"] for e in entries] == ["denied", "resolved"]
     denied_entry, resolved_entry = entries
 
@@ -2006,9 +1930,7 @@ def test_audit_evidence_for_a_channel_decision(
     """AC3 + AC4: the unchanged channel path gains evidence too, naming the
     channel that held the authority and the channel the click came from."""
 
-    agent_id = _agent_with_routes(
-        approvals_client, auth_headers, {"managers": {"channel": _BROAD}}
-    )
+    agent_id = _agent_with_routes(approvals_client, auth_headers, {"managers": {"channel": _BROAD}})
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
     ).json()
@@ -2054,9 +1976,7 @@ def test_expiry_sweeper_audit_rows_carry_no_evidence(
 
     assert asyncio.run(_scenario()) == 1
 
-    entries = approvals_client.get(
-        f"/approvals/{created['id']}/audit", headers=auth_headers
-    ).json()
+    entries = approvals_client.get(f"/approvals/{created['id']}/audit", headers=auth_headers).json()
     assert [e["action"] for e in entries] == ["expired"]
     assert entries[0]["authorizer"] == "ExpirySweeper"
     assert entries[0]["evidence"] is None
@@ -2126,9 +2046,7 @@ def test_group_lookup_failure_denies_and_audits_the_failure(
     assert "not an approver" not in denied.json()["detail"]
     assert calls != []
 
-    entries = approvals_client.get(
-        f"/approvals/{created['id']}/audit", headers=auth_headers
-    ).json()
+    entries = approvals_client.get(f"/approvals/{created['id']}/audit", headers=auth_headers).json()
     assert [e["action"] for e in entries] == ["denied"]
     row = entries[0]
     assert row["authorized"] is False
@@ -2157,9 +2075,7 @@ def test_binding_without_approvers_keeps_channel_membership(
     against ``card_channel`` -- anyone in the card channel, nobody outside it.
     Zero-setup stays zero-setup."""
 
-    agent_id = _agent_with_routes(
-        approvals_client, auth_headers, {"managers": {"channel": _BROAD}}
-    )
+    agent_id = _agent_with_routes(approvals_client, auth_headers, {"managers": {"channel": _BROAD}})
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
     ).json()
@@ -2229,9 +2145,7 @@ def test_unbound_route_name_keeps_channel_membership(
     ).json()
 
     # The OTHER route's allowlist must not leak onto this one.
-    listed_elsewhere = _resolve(
-        approvals_client, auth_headers, created["id"], _LISTED, _ELSEWHERE
-    )
+    listed_elsewhere = _resolve(approvals_client, auth_headers, created["id"], _LISTED, _ELSEWHERE)
     assert listed_elsewhere.status_code == 403, listed_elsewhere.text
 
     # AC2 survives the unbound-route path too.

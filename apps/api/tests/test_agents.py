@@ -14,9 +14,7 @@ def _create(client: Any, headers: dict[str, str], **fields: Any) -> Any:
     return client.post("/agents", json=fields, headers=headers)
 
 
-def test_duplicate_name_is_409(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
+def test_duplicate_name_is_409(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
     first = _create(client, auth_headers, name="dup-name", slack_channel="C0AAAAAA1")
     assert first.status_code == 201, first.text
 
@@ -25,9 +23,7 @@ def test_duplicate_name_is_409(
     assert dup.json()["detail"] == "an agent with that name already exists"
 
 
-def test_duplicate_repo_is_409(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
+def test_duplicate_repo_is_409(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
     first = _create(
         client,
         auth_headers,
@@ -314,9 +310,7 @@ def test_agent_approval_routes_rejects_bad_approvers(
             json={
                 "name": f"bad-approvers-{index}",
                 "slack_channel": "C000000C01",
-                "approval_routes": {
-                    "managers": {"channel": "C000000C02", "approvers": approvers}
-                },
+                "approval_routes": {"managers": {"channel": "C000000C02", "approvers": approvers}},
             },
             headers=auth_headers,
         )
@@ -403,9 +397,7 @@ def test_agent_approval_routes_patch_rejects_bad_approvers(
     patched = client.patch(
         f"/agents/{created.json()['id']}",
         json={
-            "approval_routes": {
-                "managers": {"channel": "C000000D02", "approvers": {"users": []}}
-            }
+            "approval_routes": {"managers": {"channel": "C000000D02", "approvers": {"users": []}}}
         },
         headers=auth_headers,
     )

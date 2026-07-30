@@ -152,9 +152,7 @@ def enforce_behavior_packs_size(config: BehaviorPacksConfig) -> None:
     byte length of the whole config, the unit ``behavior_packs_max_bytes`` is
     measured in (mirrors the durable-state ``_enforce_caps`` in state.py)."""
     limit = get_settings().behavior_packs_max_bytes
-    size = len(
-        json.dumps(config.model_dump(), separators=(",", ":")).encode("utf-8")
-    )
+    size = len(json.dumps(config.model_dump(), separators=(",", ":")).encode("utf-8"))
     if size > limit:
         raise HTTPException(
             413,
@@ -230,9 +228,7 @@ class _StoredWithoutNulls(BaseModel):
     """
 
     @model_serializer(mode="wrap")
-    def _dump_without_nulls(
-        self, handler: SerializerFunctionWrapHandler
-    ) -> dict[str, Any]:
+    def _dump_without_nulls(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         return {k: v for k, v in handler(self).items() if v is not None}
 
 
@@ -282,9 +278,7 @@ class ApprovalApprovers(_StoredWithoutNulls):
             # Neither "unset" (omit the key) nor "nobody may approve": as silent
             # config the latter is a footgun, since the approval could then only
             # ever expire.
-            raise ValueError(
-                "approvers users, when present, must contain at least one user ID"
-            )
+            raise ValueError("approvers users, when present, must contain at least one user ID")
         for user in value:
             if not _SLACK_USER_ID.match(user):
                 raise ValueError(
@@ -355,15 +349,9 @@ class AgentCreate(BaseModel):
     # sandbox by the worker binding. None means no connector secrets.
     secrets: dict[str, str] | None = None
 
-    _check_slack_channel = field_validator("slack_channel")(
-        _validate_slack_channel_id
-    )
-    _check_approval_tools = field_validator("approval_required_tools")(
-        _validate_tool_names
-    )
-    _check_approval_routes = field_validator("approval_routes")(
-        _validate_route_names
-    )
+    _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
+    _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
+    _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
 
 
@@ -386,15 +374,9 @@ class AgentUpdate(BaseModel):
     # unchanged; an explicit empty dict clears them.
     secrets: dict[str, str] | None = None
 
-    _check_slack_channel = field_validator("slack_channel")(
-        _validate_slack_channel_id
-    )
-    _check_approval_tools = field_validator("approval_required_tools")(
-        _validate_tool_names
-    )
-    _check_approval_routes = field_validator("approval_routes")(
-        _validate_route_names
-    )
+    _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
+    _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
+    _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
 
 
@@ -577,6 +559,22 @@ class ApprovalAuditOut(BaseModel):
     # written before the column existed.
     evidence: dict[str, Any] | None
     created_at: datetime
+
+
+class ConnectorManifests(BaseModel):
+    """Kubernetes objects derived from a version's ``connectors.yaml``.
+
+    The API renders; the caller applies. Rendering is a pure function of the
+    bundle plus the deployment context the caller supplies, so producing this
+    needs no cluster access and the API's read-only RBAC is untouched
+    (ADR-0086, #1063).
+    """
+
+    manifests: list[dict[str, Any]] = Field(default_factory=list)
+    # name -> the `.mcp.json` entry the agent should use. Derived from the
+    # Service in `manifests`, so an author never hand-writes a URL that
+    # resolves in one tier and not another.
+    mcp_entries: dict[str, Any] = Field(default_factory=dict)
 
 
 class WebhookResult(BaseModel):

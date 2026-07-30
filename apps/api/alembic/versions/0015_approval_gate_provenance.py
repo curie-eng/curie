@@ -95,8 +95,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Drop the CHECK before the columns it references.
-    op.drop_constraint(
-        "ck_approvals_gate_kind", "approvals", schema=SCHEMA, type_="check"
-    )
+    op.drop_constraint("ck_approvals_gate_kind", "approvals", schema=SCHEMA, type_="check")
     op.drop_column("approvals", "granted_tool", schema=SCHEMA)
     op.drop_column("approvals", "gate_kind", schema=SCHEMA)

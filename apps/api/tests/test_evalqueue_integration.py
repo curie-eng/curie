@@ -163,8 +163,7 @@ def _count_eval_entries_for_agent(agent_id: str) -> int:
         return sum(
             1
             for _id, fields in sync.xrevrange("curie:evals", count=200)
-            if json.loads(fields[STREAM_PAYLOAD_FIELD.encode()]).get("agent_id")
-            == agent_id
+            if json.loads(fields[STREAM_PAYLOAD_FIELD.encode()]).get("agent_id") == agent_id
         )
     finally:
         sync.close()
@@ -180,9 +179,7 @@ def test_dev_push_fans_out_prod_push_does_not(
     ).json()
     clone_url, sha = _build_bare_repo(tmp_path)
 
-    assert _post_push(client, "refs/heads/dev", sha, clone_url).json()["status"] == (
-        "deployed"
-    )
+    assert _post_push(client, "refs/heads/dev", sha, clone_url).json()["status"] == ("deployed")
     entry = _eval_entry_for(sha)
     assert entry is not None, "dev push should fan out an eval job"
     assert entry["agent_id"] == agent["id"]
@@ -194,9 +191,7 @@ def test_dev_push_fans_out_prod_push_does_not(
         before = len(sync.xrange("curie:evals"))
     finally:
         sync.close()
-    assert _post_push(client, "refs/heads/main", sha, clone_url).json()["status"] == (
-        "promoted"
-    )
+    assert _post_push(client, "refs/heads/main", sha, clone_url).json()["status"] == ("promoted")
     sync = redis.from_url(get_settings().valkey_dsn())
     try:
         after = len(sync.xrange("curie:evals"))
@@ -216,14 +211,10 @@ def test_redelivered_dev_push_does_not_refan_out(
     clone_url, sha = _build_bare_repo(tmp_path)
 
     # First delivery builds the bundle and fans out exactly one eval job.
-    assert _post_push(client, "refs/heads/dev", sha, clone_url).json()["status"] == (
-        "deployed"
-    )
+    assert _post_push(client, "refs/heads/dev", sha, clone_url).json()["status"] == ("deployed")
     assert _count_eval_entries_for_agent(agent["id"]) == 1
 
     # GitHub redelivers the same push. The version already has a stored bundle,
     # so the build is skipped and no second eval job may be enqueued.
-    assert _post_push(client, "refs/heads/dev", sha, clone_url).json()["status"] == (
-        "deployed"
-    )
+    assert _post_push(client, "refs/heads/dev", sha, clone_url).json()["status"] == ("deployed")
     assert _count_eval_entries_for_agent(agent["id"]) == 1

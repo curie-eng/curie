@@ -54,9 +54,7 @@ def _authorize(
 
     select = SlackApproverSetSelector(group_client)
     return asyncio.run(
-        authorize_approval(
-            approval, actor, actor_channel, approver_set=select(approval, binding)
-        )
+        authorize_approval(approval, actor, actor_channel, approver_set=select(approval, binding))
     )
 
 
@@ -135,9 +133,7 @@ def _slack(members: list[str], calls: list[httpx.Request] | None = None) -> Slac
     )
 
 
-def _contains(
-    approver_set: ApproverSet, actor: str, channel: str | None
-) -> MembershipVerdict:
+def _contains(approver_set: ApproverSet, actor: str, channel: str | None) -> MembershipVerdict:
     return asyncio.run(approver_set.contains(actor, channel))
 
 
@@ -427,9 +423,7 @@ def test_authorizer_falls_back_to_channel_membership_without_approvers() -> None
 
     binding = {"channel": _CARD_CHANNEL}
 
-    name, member = _authorize(
-        _bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=binding
-    )
+    name, member = _authorize(_bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=binding)
     assert name == "ChannelMembershipAuthorizer"
     assert member.allowed
     assert member.evidence is not None
@@ -437,9 +431,7 @@ def test_authorizer_falls_back_to_channel_membership_without_approvers() -> None
     assert member.evidence["approvers_channel"] == _CARD_CHANNEL
     assert member.evidence["actor_channel"] == _CARD_CHANNEL
 
-    _name, elsewhere = _authorize(
-        _bound_approval(), _OUTSIDER, "C0WRONG01", binding=binding
-    )
+    _name, elsewhere = _authorize(_bound_approval(), _OUTSIDER, "C0WRONG01", binding=binding)
     assert not elsewhere.allowed
     assert "not an approver" in elsewhere.reason
     assert elsewhere.evidence is not None
@@ -450,15 +442,11 @@ def test_authorizer_falls_back_to_channel_membership_without_a_binding() -> None
     """AC4: no binding at all (an agentless or unbound-route approval) is the
     zero-setup path and must keep resolving against the card channel."""
 
-    name, in_channel = _authorize(
-        _bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=None
-    )
+    name, in_channel = _authorize(_bound_approval(), _OUTSIDER, _CARD_CHANNEL, binding=None)
     assert name == "ChannelMembershipAuthorizer"
     assert in_channel.allowed
 
-    _name, elsewhere = _authorize(
-        _bound_approval(), _OUTSIDER, "C0WRONG01", binding=None
-    )
+    _name, elsewhere = _authorize(_bound_approval(), _OUTSIDER, "C0WRONG01", binding=None)
     assert not elsewhere.allowed
     assert "not an approver" in elsewhere.reason
 

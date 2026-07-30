@@ -11,6 +11,7 @@ pub mod channel;
 pub mod chat;
 pub mod commands;
 pub mod comms;
+pub mod connectors;
 pub mod discover;
 pub mod docker;
 pub mod eval_init;

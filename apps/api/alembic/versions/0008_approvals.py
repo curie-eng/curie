@@ -35,19 +35,13 @@ def upgrade() -> None:
         sa.Column("expires_at", sa.DateTime(), nullable=True),
         sa.Column("resolved_by", sa.String(), nullable=True),
         sa.Column("resolution_note", sa.String(), nullable=True),
-        sa.Column(
-            "created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False
-        ),
+        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
         sa.Column("resolved_at", sa.DateTime(), nullable=True),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], [f"{SCHEMA}.agents.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["agent_id"], [f"{SCHEMA}.agents.id"], ondelete="CASCADE"),
         sa.UniqueConstraint("dedupe_key", name="uq_approvals_dedupe_key"),
         schema=SCHEMA,
     )
-    op.create_index(
-        "ix_approvals_agent_id", "approvals", ["agent_id"], schema=SCHEMA
-    )
+    op.create_index("ix_approvals_agent_id", "approvals", ["agent_id"], schema=SCHEMA)
     op.create_index(
         "ix_approvals_conversation_id",
         "approvals",

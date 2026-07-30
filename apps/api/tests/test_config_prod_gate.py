@@ -36,9 +36,7 @@ def test_prod_with_real_secrets_boots() -> None:
         ({"github_webhook_secret": ""}, "GITHUB_WEBHOOK_SECRET"),
     ],
 )
-def test_prod_refuses_dev_default_or_empty_secret(
-    overrides: dict[str, str], offender: str
-) -> None:
+def test_prod_refuses_dev_default_or_empty_secret(overrides: dict[str, str], offender: str) -> None:
     with pytest.raises(ValidationError) as exc:
         _settings(**overrides)
     assert offender in str(exc.value)

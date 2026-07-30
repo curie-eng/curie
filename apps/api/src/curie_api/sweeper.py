@@ -132,8 +132,7 @@ async def sweep_expired_approvals(
                 "the reconciler will re-enqueue it past its grace horizon (a "
                 "redundant wake if it did land, which is the safe direction)"
                 if get_settings().resume_reconciler_enabled
-                else "nothing will retry it (resume reconciler disabled) and "
-                "the wakeup may be lost"
+                else "nothing will retry it (resume reconciler disabled) and the wakeup may be lost"
             )
             logger.exception(
                 "expiry sweep failed for approval %s after the flip; the resume "

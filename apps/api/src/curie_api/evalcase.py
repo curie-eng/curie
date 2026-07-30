@@ -86,9 +86,7 @@ def _last_user_input(value: Any) -> str:
     return _coerce_text(value)
 
 
-def extract_io(
-    trace: dict[str, Any], observations: list[dict[str, Any]]
-) -> tuple[str, str]:
+def extract_io(trace: dict[str, Any], observations: list[dict[str, Any]]) -> tuple[str, str]:
     """Best-effort (input, output) text for a trace.
 
     Prefers the trace-level ``input``/``output`` fields; falls back to the first

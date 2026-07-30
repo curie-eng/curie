@@ -31,9 +31,7 @@ def _column(sql: str) -> list[str]:
 
 
 def test_alembic_version_lives_in_app_schema(migrated: None) -> None:
-    schemas = _column(
-        "SELECT schemaname FROM pg_tables WHERE tablename = 'alembic_version'"
-    )
+    schemas = _column("SELECT schemaname FROM pg_tables WHERE tablename = 'alembic_version'")
     # Exactly one alembic_version, and it is in the curie schema (never public).
     assert schemas == [SCHEMA], schemas
 
@@ -41,7 +39,5 @@ def test_alembic_version_lives_in_app_schema(migrated: None) -> None:
 def test_public_schema_is_empty_after_migration(migrated: None) -> None:
     # The Langfuse Prisma baseline (P3005) refuses a non-empty public schema, so
     # our migrations must leave zero user tables there.
-    public_tables = _column(
-        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-    )
+    public_tables = _column("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
     assert public_tables == [], public_tables

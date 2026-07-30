@@ -295,9 +295,7 @@ def test_concurrent_lookups_of_distinct_groups_do_not_serialize() -> None:
             return httpx.Response(200, json={"ok": True, "users": by_group[group]})
 
         client = _async_client(_handler, calls=calls, ttl_s=60.0)
-        return await asyncio.gather(
-            client.members(_GROUP), client.members(_OTHER_GROUP)
-        )
+        return await asyncio.gather(client.members(_GROUP), client.members(_OTHER_GROUP))
 
     managers, legal = asyncio.run(_main())
 

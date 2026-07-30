@@ -23,11 +23,7 @@ from curie_api.schemas import EvalCaseOut, GraderOut
 from jsonschema import Draft202012Validator
 
 _SCHEMA_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "apps"
-    / "worker"
-    / "schema"
-    / "eval-cases.schema.json"
+    Path(__file__).resolve().parents[3] / "apps" / "worker" / "schema" / "eval-cases.schema.json"
 )
 
 

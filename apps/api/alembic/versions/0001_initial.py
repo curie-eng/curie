@@ -54,14 +54,10 @@ def upgrade() -> None:
             server_default=sa.func.now(),
             nullable=False,
         ),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], [f"{SCHEMA}.agents.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["agent_id"], [f"{SCHEMA}.agents.id"], ondelete="CASCADE"),
         schema=SCHEMA,
     )
-    op.create_index(
-        "ix_agent_versions_agent_id", "agent_versions", ["agent_id"], schema=SCHEMA
-    )
+    op.create_index("ix_agent_versions_agent_id", "agent_versions", ["agent_id"], schema=SCHEMA)
 
     op.create_table(
         "deployments",
@@ -69,18 +65,14 @@ def upgrade() -> None:
         sa.Column("agent_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("version_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("environment", environment, nullable=False),
-        sa.Column(
-            "status", sa.String(), server_default="active", nullable=False
-        ),
+        sa.Column("status", sa.String(), server_default="active", nullable=False),
         sa.Column(
             "deployed_at",
             sa.DateTime(timezone=True),
             server_default=sa.func.now(),
             nullable=False,
         ),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], [f"{SCHEMA}.agents.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["agent_id"], [f"{SCHEMA}.agents.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(
             ["version_id"],
             [f"{SCHEMA}.agent_versions.id"],
@@ -88,19 +80,13 @@ def upgrade() -> None:
         ),
         schema=SCHEMA,
     )
-    op.create_index(
-        "ix_deployments_agent_id", "deployments", ["agent_id"], schema=SCHEMA
-    )
-    op.create_index(
-        "ix_deployments_version_id", "deployments", ["version_id"], schema=SCHEMA
-    )
+    op.create_index("ix_deployments_agent_id", "deployments", ["agent_id"], schema=SCHEMA)
+    op.create_index("ix_deployments_version_id", "deployments", ["version_id"], schema=SCHEMA)
 
 
 def downgrade() -> None:
     op.drop_table("deployments", schema=SCHEMA)
     op.drop_table("agent_versions", schema=SCHEMA)
     op.drop_table("agents", schema=SCHEMA)
-    postgresql.ENUM(name="environment", schema=SCHEMA).drop(
-        op.get_bind(), checkfirst=True
-    )
+    postgresql.ENUM(name="environment", schema=SCHEMA).drop(op.get_bind(), checkfirst=True)
     op.execute(f"DROP SCHEMA IF EXISTS {SCHEMA}")

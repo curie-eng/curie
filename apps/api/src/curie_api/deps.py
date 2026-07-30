@@ -89,6 +89,4 @@ EvalQueueDep = Annotated[EvalQueue, Depends(get_eval_queue)]
 GitHubReporterDep = Annotated[GitHubStatusReporter, Depends(get_github_reporter)]
 ResumeQueueDep = Annotated[ResumeQueue, Depends(get_resume_queue)]
 ApproverSetSelectorDep = Annotated[ApproverSetSelector, Depends(get_approver_sets)]
-ThreadResetRequestsDep = Annotated[
-    ThreadResetRequests, Depends(get_thread_reset_requests)
-]
+ThreadResetRequestsDep = Annotated[ThreadResetRequests, Depends(get_thread_reset_requests)]

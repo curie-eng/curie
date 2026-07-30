@@ -32,18 +32,14 @@ class _EveryoneIsAMember:
 
     audit_name = "FakeApproverSet"
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(member=True, evidence={"kind": "fake", "actor": actor})
 
 
 class _NobodyIsAMember:
     audit_name = "FakeApproverSet"
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(
             member=False, reason="you are not an approver: fake set", evidence=None
         )
@@ -54,9 +50,7 @@ class _CannotTell:
 
     audit_name = "FakeApproverSet"
 
-    async def contains(
-        self, actor: str, actor_channel: str | None
-    ) -> MembershipVerdict:
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
         return MembershipVerdict(
             member=False,
             undetermined=True,
@@ -71,9 +65,7 @@ class _FakeSelector:
     def __init__(self, approver_set: ApproverSet) -> None:
         self._approver_set = approver_set
 
-    def __call__(
-        self, approval: Approval, binding: Mapping[str, Any] | None
-    ) -> ApproverSet:
+    def __call__(self, approval: Approval, binding: Mapping[str, Any] | None) -> ApproverSet:
         return self._approver_set
 
 

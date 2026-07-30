@@ -65,9 +65,7 @@ def test_put_then_get_round_trips(
         },
         "nav": {"enabled": True, "hub_label": "Help", "hub_command": "help"},
     }
-    resp = client.put(
-        f"/agents/{agent['id']}/behavior-packs", json=config, headers=auth_headers
-    )
+    resp = client.put(f"/agents/{agent['id']}/behavior-packs", json=config, headers=auth_headers)
     assert resp.status_code == 200, resp.text
 
     resp = client.get(f"/agents/{agent['id']}/behavior-packs", headers=auth_headers)

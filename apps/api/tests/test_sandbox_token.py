@@ -34,9 +34,7 @@ def _sign(api_key: str, payload_obj: object) -> str:
     module produces this byte sequence, and can forge validly-signed tokens with
     arbitrary (even malformed) payloads to probe verify's claim checks.
     """
-    payload_json = json.dumps(
-        payload_obj, separators=(",", ":"), sort_keys=True
-    ).encode()
+    payload_json = json.dumps(payload_obj, separators=(",", ":"), sort_keys=True).encode()
     payload_seg = base64.urlsafe_b64encode(payload_json).rstrip(b"=").decode()
     signing_input = f"sbx.{payload_seg}"
     sig = hmac.new(api_key.encode(), signing_input.encode(), hashlib.sha256).digest()
@@ -144,7 +142,5 @@ def test_the_two_module_copies_are_byte_identical() -> None:
     # this test file (parents[3] is the worktree root) rather than hardcoding.
     root = Path(__file__).resolve().parents[3]
     api_src = root / "apps" / "api" / "src" / "curie_api" / "sandbox_token.py"
-    worker_src = (
-        root / "apps" / "worker" / "src" / "curie_worker" / "sandbox_token.py"
-    )
+    worker_src = root / "apps" / "worker" / "src" / "curie_worker" / "sandbox_token.py"
     assert api_src.read_bytes() == worker_src.read_bytes()

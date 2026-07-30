@@ -84,9 +84,7 @@ async def require_state_access(
             return StateCaller.STATE
         if sandbox_token.verify(x_api_key, api_key, agent=agent, scope=STATE_APP_SCOPE):
             return StateCaller.APP
-    raise HTTPException(
-        status.HTTP_401_UNAUTHORIZED, detail="missing or invalid credential"
-    )
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="missing or invalid credential")
 
 
 async def forbid_reserved_namespace(
@@ -109,9 +107,7 @@ async def forbid_reserved_namespace(
         )
 
 
-router = APIRouter(
-    prefix="/agents", tags=["state"], dependencies=[Depends(require_state_access)]
-)
+router = APIRouter(prefix="/agents", tags=["state"], dependencies=[Depends(require_state_access)])
 
 
 def _json_size(value: Any) -> int:
@@ -228,8 +224,7 @@ async def put_state(
         if data.expected_version is not None and data.expected_version != entry.version:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"version mismatch: expected {data.expected_version}, "
-                f"stored {entry.version}",
+                f"version mismatch: expected {data.expected_version}, stored {entry.version}",
             )
         entry.value = data.value
         entry.version += 1
@@ -270,9 +265,7 @@ async def append_state(
     if entry is None:
         new_value = [data.item]
         await _enforce_caps(session, agent_id, namespace, key, new_value)
-        entry = WorkflowStateEntry(
-            agent_id=agent_id, namespace=namespace, key=key, value=new_value
-        )
+        entry = WorkflowStateEntry(agent_id=agent_id, namespace=namespace, key=key, value=new_value)
         session.add(entry)
     else:
         if not isinstance(entry.value, list):

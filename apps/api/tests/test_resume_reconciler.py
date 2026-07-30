@@ -95,9 +95,7 @@ def _run_async[T](
     async def _main() -> T:
         engine = create_async_engine(get_settings().database_url)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-        client = aioredis.Redis(
-            host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None
-        )
+        client = aioredis.Redis(host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None)
         queue = ResumeQueue(client, stream=stream)
         try:
             return await steps(sessionmaker, queue)
@@ -304,9 +302,7 @@ def test_resume_turn_selector_domain_matches_resumable_statuses() -> None:
     rejected = resume_turn_for(_detached_approval(ApprovalStatus.rejected))
     assert "[approval resolved]" in rejected.text
 
-    expired = resume_turn_for(
-        _detached_approval(ApprovalStatus.expired, resolved_by=None)
-    )
+    expired = resume_turn_for(_detached_approval(ApprovalStatus.expired, resolved_by=None))
     assert "[approval expired]" in expired.text
     assert expired.author == "system"
 
@@ -324,9 +320,7 @@ def test_reconciler_skips_pending_record(
 ) -> None:
     """A still-pending record (no ``resolved_at``) is never on the work-list."""
 
-    async def steps(
-        sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
-    ) -> int:
+    async def steps(sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue) -> int:
         await _insert_approval(
             sessionmaker,
             status=ApprovalStatus.pending,
@@ -366,9 +360,7 @@ def test_reconciler_ignores_backfilled_historical_row(
     database.
     """
 
-    async def steps(
-        sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
-    ) -> int:
+    async def steps(sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue) -> int:
         resolved = _naive(7200)
         await _insert_approval(
             sessionmaker,
@@ -427,9 +419,7 @@ def test_reconciler_grace_applies_to_expired_rows(
         # Backdate the expiry well past the grace horizon.
         async with sessionmaker() as session:
             await session.execute(
-                update(Approval)
-                .where(Approval.id == approval_id)
-                .values(resolved_at=_naive(7200))
+                update(Approval).where(Approval.id == approval_id).values(resolved_at=_naive(7200))
             )
             await session.commit()
 
@@ -474,9 +464,7 @@ def test_reconciler_respects_grace_window(
         # Backdate the resolution well past the grace horizon.
         async with sessionmaker() as session:
             await session.execute(
-                update(Approval)
-                .where(Approval.id == approval_id)
-                .values(resolved_at=_naive(7200))
+                update(Approval).where(Approval.id == approval_id).values(resolved_at=_naive(7200))
             )
             await session.commit()
 
@@ -611,9 +599,7 @@ def test_reconciler_skips_row_locked_by_concurrent_claim(
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
         lock_engine = create_async_engine(get_settings().database_url)
         lock_sessionmaker = async_sessionmaker(lock_engine, expire_on_commit=False)
-        client = aioredis.Redis(
-            host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None
-        )
+        client = aioredis.Redis(host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None)
         queue = ResumeQueue(client, stream=runs_stream)
         try:
             approval_id = await _insert_approval(
@@ -633,9 +619,7 @@ def test_reconciler_skips_row_locked_by_concurrent_claim(
             # A concurrent replica holds the row under FOR UPDATE, uncommitted.
             async with lock_sessionmaker() as holder:
                 await holder.execute(
-                    select(Approval)
-                    .where(Approval.id == approval_id)
-                    .with_for_update()
+                    select(Approval).where(Approval.id == approval_id).with_for_update()
                 )
                 # This pass must skip the locked row (0, nothing enqueued).
                 try:
@@ -766,9 +750,7 @@ def test_reopen_dead_lettered_resume_reenqueues_owed_wake(
     assert gap_resumed is not None
 
     # A graveyard row dead-lettered AFTER the wake was marked delivered.
-    _seed_graveyard_row(
-        valkey, runs_stream, approval_id, dead_lettered_at=_dl_iso(0)
-    )
+    _seed_graveyard_row(valkey, runs_stream, approval_id, dead_lettered_at=_dl_iso(0))
 
     async def reopen_then_reconcile(
         sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
@@ -828,9 +810,7 @@ def test_reopen_is_idempotent_against_persistent_graveyard_row(
 
     # Dead-lettered between the original wake (30m ago) and now, so the FIRST
     # reopen matches; the re-enqueue then re-marks resumed_at to now (> this).
-    _seed_graveyard_row(
-        valkey, runs_stream, approval_id, dead_lettered_at=_dl_iso(1500)
-    )
+    _seed_graveyard_row(valkey, runs_stream, approval_id, dead_lettered_at=_dl_iso(1500))
 
     async def reopen_reconcile_reopen(
         sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
@@ -889,9 +869,7 @@ def test_reopen_ignores_stale_graveyard_row(
         )
 
     approval_id = _run_async(insert, runs_stream)
-    _seed_graveyard_row(
-        valkey, runs_stream, approval_id, dead_lettered_at=_dl_iso(3600)
-    )
+    _seed_graveyard_row(valkey, runs_stream, approval_id, dead_lettered_at=_dl_iso(3600))
 
     async def reopen(
         sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue

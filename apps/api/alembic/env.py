@@ -34,16 +34,12 @@ def _relocate_legacy_version_table(connection: Connection) -> None:
     the transition is a no-op for the app and unblocks a Langfuse co-tenant. On a
     fresh database neither table exists yet and this is a no-op.
     """
-    public_tbl = connection.exec_driver_sql(
-        "SELECT to_regclass('public.alembic_version')"
-    ).scalar()
+    public_tbl = connection.exec_driver_sql("SELECT to_regclass('public.alembic_version')").scalar()
     schema_tbl = connection.exec_driver_sql(
         f"SELECT to_regclass('{SCHEMA}.alembic_version')"
     ).scalar()
     if public_tbl is not None and schema_tbl is None:
-        connection.exec_driver_sql(
-            f'ALTER TABLE public.alembic_version SET SCHEMA "{SCHEMA}"'
-        )
+        connection.exec_driver_sql(f'ALTER TABLE public.alembic_version SET SCHEMA "{SCHEMA}"')
 
 
 def do_run_migrations(connection: Connection) -> None:

@@ -146,9 +146,7 @@ async def put_budget(
 
 
 @router.get("/behavior-packs", response_model=BehaviorPacksConfig)
-async def get_behavior_packs(
-    agent_id: uuid.UUID, session: SessionDep
-) -> BehaviorPacksConfig:
+async def get_behavior_packs(agent_id: uuid.UUID, session: SessionDep) -> BehaviorPacksConfig:
     agent = await _load_agent(session, agent_id)
     # NULL (no packs configured) reads as the all-off default.
     if agent.behavior_packs is None:

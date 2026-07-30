@@ -8,9 +8,7 @@ null default, PATCH-to-set, and PATCH-leaves-unchanged.
 from typing import Any
 
 
-def _create_agent(
-    client: Any, auth_headers: dict[str, str], **body: Any
-) -> dict[str, Any]:
+def _create_agent(client: Any, auth_headers: dict[str, str], **body: Any) -> dict[str, Any]:
     resp = client.post(
         "/agents",
         json={"name": "model-bot", "slack_channel": "CMODEL001", **body},
@@ -42,9 +40,7 @@ def test_create_with_model_persists(
     assert resp.json()["model"] == "glm-5.2"
 
 
-def test_patch_sets_model(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
+def test_patch_sets_model(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
     agent = _create_agent(client, auth_headers)
     resp = client.patch(
         f"/agents/{agent['id']}",

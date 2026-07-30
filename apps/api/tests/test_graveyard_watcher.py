@@ -31,9 +31,7 @@ def _client() -> aioredis.Redis:
     )
 
 
-async def _dead_letter(
-    client: aioredis.Redis, stream: str, *, original: str, reason: str
-) -> str:
+async def _dead_letter(client: aioredis.Redis, stream: str, *, original: str, reason: str) -> str:
     return await client.xadd(
         stream,
         {

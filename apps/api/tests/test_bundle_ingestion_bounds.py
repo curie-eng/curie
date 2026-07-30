@@ -101,9 +101,7 @@ def test_oversized_upload_is_rejected_before_buffering(
     assert calls == []
 
     # Nothing was stored.
-    version = client.get(
-        f"/agents/{agent_id}/versions", headers=auth_headers
-    ).json()[0]
+    version = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()[0]
     assert version["bundle_ref"] is None
 
 
@@ -115,9 +113,7 @@ def test_upload_at_the_limit_is_accepted(
 ) -> None:
     files = {
         ".claude-plugin/plugin.json": MANIFEST.encode(),
-        "skills/greeter/SKILL.md": (
-            b"---\nname: greeter\ndescription: greets\n---\n"
-        ),
+        "skills/greeter/SKILL.md": (b"---\nname: greeter\ndescription: greets\n---\n"),
     }
     archive = _tar_plain(files)
     monkeypatch.setattr(
@@ -161,9 +157,7 @@ def test_zip_bomb_upload_is_refused_with_nothing_written(
     assert resp.status_code == 400, resp.text
     assert "compression ratio" in resp.json()["detail"]
 
-    version = client.get(
-        f"/agents/{agent_id}/versions", headers=auth_headers
-    ).json()[0]
+    version = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()[0]
     assert version["bundle_ref"] is None
 
 
@@ -207,9 +201,7 @@ def test_many_member_upload_is_refused_by_member_count_cap(
     assert resp.status_code == 400, resp.text
     assert "member-count" in resp.json()["detail"]
 
-    version = client.get(
-        f"/agents/{agent_id}/versions", headers=auth_headers
-    ).json()[0]
+    version = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()[0]
     assert version["bundle_ref"] is None
 
 
@@ -231,9 +223,7 @@ def _store_legacy_bundle(agent_id: str, version_id: str, data: bytes) -> None:
         async with maker() as session:
             version = await crud.get_version(session, uuid.UUID(version_id))
             assert version is not None
-            await crud.attach_bundle(
-                session, version, key, hashlib.sha256(data).hexdigest()
-            )
+            await crud.attach_bundle(session, version, key, hashlib.sha256(data).hexdigest())
         await engine.dispose()
 
     asyncio.run(_run())

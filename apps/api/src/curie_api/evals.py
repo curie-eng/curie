@@ -115,9 +115,7 @@ def _cost_of(trace: dict[str, Any]) -> float | None:
     return None
 
 
-def _supersedes(
-    trace: dict[str, Any], current: dict[str, Any] | None, ts: str
-) -> bool:
+def _supersedes(trace: dict[str, Any], current: dict[str, Any] | None, ts: str) -> bool:
     """Should ``trace`` replace ``current`` in its cell?
 
     Newest wins, with one exception: a graded result always beats a non-graded one
@@ -165,13 +163,11 @@ def build_matrix(
             version_last_seen[version] = ts
 
     # Columns: the most recently exercised versions, newest first, capped at N.
-    versions = sorted(
-        version_last_seen, key=lambda v: version_last_seen[v], reverse=True
-    )[:limit_versions]
+    versions = sorted(version_last_seen, key=lambda v: version_last_seen[v], reverse=True)[
+        :limit_versions
+    ]
     version_set = set(versions)
-    cases = sorted(
-        {case for (version, case) in latest if version in version_set}
-    )
+    cases = sorted({case for (version, case) in latest if version in version_set})
 
     def _status(version: str, case: str) -> Status:
         trace = latest.get((version, case))
@@ -201,9 +197,7 @@ def build_matrix(
         rows=rows,
         models=[s.model for s in summaries],
         model_summaries=summaries,
-        model_version_summaries=_model_version_summaries(
-            latest_by_model, version_set
-        ),
+        model_version_summaries=_model_version_summaries(latest_by_model, version_set),
     )
 
 

@@ -28,9 +28,7 @@ def upgrade() -> None:
         sa.Column("approval_routes", postgresql.JSONB(), nullable=True),
         schema=SCHEMA,
     )
-    op.add_column(
-        "approvals", sa.Column("route", sa.String(), nullable=True), schema=SCHEMA
-    )
+    op.add_column("approvals", sa.Column("route", sa.String(), nullable=True), schema=SCHEMA)
     op.add_column(
         "approvals",
         sa.Column("card_channel", sa.String(), nullable=True),
@@ -47,12 +45,8 @@ def upgrade() -> None:
         sa.Column("authorizer", sa.String(), nullable=False),
         sa.Column("authorized", sa.Boolean(), nullable=False),
         sa.Column("reason", sa.String(), nullable=True),
-        sa.Column(
-            "created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False
-        ),
-        sa.ForeignKeyConstraint(
-            ["approval_id"], [f"{SCHEMA}.approvals.id"], ondelete="CASCADE"
-        ),
+        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
+        sa.ForeignKeyConstraint(["approval_id"], [f"{SCHEMA}.approvals.id"], ondelete="CASCADE"),
         schema=SCHEMA,
     )
     op.create_index(
@@ -64,9 +58,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_approval_audit_entries_approval_id", "approval_audit_entries", schema=SCHEMA
-    )
+    op.drop_index("ix_approval_audit_entries_approval_id", "approval_audit_entries", schema=SCHEMA)
     op.drop_table("approval_audit_entries", schema=SCHEMA)
     op.drop_column("approvals", "card_channel", schema=SCHEMA)
     op.drop_column("approvals", "route", schema=SCHEMA)

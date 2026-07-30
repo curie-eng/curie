@@ -33,12 +33,8 @@ def _stack_up() -> bool:
 
 
 def _emit_three_level_trace() -> str:
-    provider = TracerProvider(
-        resource=Resource.create({"service.name": "b1-integration"})
-    )
-    provider.add_span_processor(
-        SimpleSpanProcessor(OTLPSpanExporter(endpoint=COLLECTOR_ENDPOINT))
-    )
+    provider = TracerProvider(resource=Resource.create({"service.name": "b1-integration"}))
+    provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter(endpoint=COLLECTOR_ENDPOINT)))
     tracer = provider.get_tracer("b1-integration")
     with tracer.start_as_current_span("agent.run", kind=SpanKind.SERVER) as root:
         root.set_attribute("langfuse.trace.name", "b1-integration-demo")
@@ -72,9 +68,7 @@ def test_proxy_returns_reconstructed_tree_for_seeded_trace(
     body: dict[str, Any] | None = None
     with TestClient(create_app()) as client:
         while time.time() < deadline:
-            resp = client.get(
-                f"/langfuse/traces/{trace_id}", headers=auth_headers
-            )
+            resp = client.get(f"/langfuse/traces/{trace_id}", headers=auth_headers)
             if resp.status_code == 200 and _max_depth(resp.json()["tree"]) >= 3:
                 body = resp.json()
                 break

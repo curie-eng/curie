@@ -28,20 +28,12 @@ def upgrade() -> None:
         sa.Column("key", sa.String(), nullable=False),
         sa.Column("value", postgresql.JSONB(), nullable=False),
         sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
-        sa.Column(
-            "created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False
-        ),
-        sa.Column(
-            "updated_at", sa.DateTime(), server_default=sa.func.now(), nullable=False
-        ),
-        sa.ForeignKeyConstraint(
-            ["agent_id"], [f"{SCHEMA}.agents.id"], ondelete="CASCADE"
-        ),
+        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
+        sa.ForeignKeyConstraint(["agent_id"], [f"{SCHEMA}.agents.id"], ondelete="CASCADE"),
         # The composite unique constraint's index also serves lookups by
         # agent_id and by (agent_id, namespace) prefix, so no extra index needed.
-        sa.UniqueConstraint(
-            "agent_id", "namespace", "key", name="uq_state_agent_ns_key"
-        ),
+        sa.UniqueConstraint("agent_id", "namespace", "key", name="uq_state_agent_ns_key"),
         schema=SCHEMA,
     )
 
