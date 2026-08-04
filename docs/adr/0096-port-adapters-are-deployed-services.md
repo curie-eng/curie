@@ -130,6 +130,29 @@ platform release on their own cadences behind a versioned wire. And it is
 **what the system already does** everywhere a second implementation exists, per
 the composition precedents in Context, so it adds no new operational concept.
 
+Composition is the mechanism, not the install experience, and the two must not
+be confused. What a third party ships is not a set of chart edits handed to an
+operator. It is an **adapter manifest**: a declarative description the platform
+composes from, naming which port the adapter implements, the contract version it
+targets, its container image reference, its config and secret schema, and the
+endpoints it exposes. The platform performs the composition, doing the same
+values wiring an operator could do by hand, so installing an adapter feels like
+bringing a plugin to your installation while the mechanism underneath stays a
+deployed service behind a wire contract. This is not a new idea here; it is
+[ADR-0086](0086-bundles-declare-connectors-the-platform-hosts-them.md)'s
+declare-and-host split moved up one scope, from agent-scoped connectors declared
+in a bundle to deployment-scoped adapters declared to the install, and
+[ADR-0090](0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md)'s
+reconciler is the delivery precedent for applying such a declaration without a
+`kubectl`-capable operator standing next to the cluster. Per the one-entry-point
+rule in `CLAUDE.md`, the operator surface is a `curie adapter` verb family (add,
+list, remove); its clap surface is issue material and is not specified here. The
+manifest is the product surface, not the only surface: hand-composed chart
+values, compose files, and endpoint config stay valid, because the contract is
+the wire and not the deployment, per the hosting paragraph below. Bring-your-own
+deployment remains a first-class way to run an adapter; the manifest is what
+makes the common case an install rather than a project.
+
 **3. A port is pluggable when its wire contract is published, versioned,
 drift-gated, and carries a conformance kit, not when a registry exists.** This
 generalizes ADR-0062: a registry proves an object was loaded, and a conformance
@@ -138,7 +161,12 @@ An `INTERFACE.md` documents where the code already draws the line. A contract
 package makes the line a schema, as `aci-protocol` and `channel-protocol`
 already do, which brings ADR-0017's tri-language drift gate and ADR-0036's
 reader policy with it. A conformance suite is then something a third party runs
-against its own adapter before it ever talks to us. Two rules bound every rung.
+against its own adapter before it ever talks to us. Alongside those three rungs a
+promoted port owes a fourth deliverable, its entry in decision 2's
+adapter-manifest schema, naming the config, secrets, and endpoints an
+implementation of that port declares; without it a third party can be conformant
+and still not installable, which is a port promoted on paper only. Two rules
+bound every rung.
 The trust rule from ADR-0040 decision 4 applies verbatim: **an adapter is a
 rendering and transport contract, never a trust boundary.** Approvals resolve
 solely through the API authorizer, an adapter's report of who clicked is input
@@ -215,7 +243,10 @@ a channel-neutral rename of the `slack_channel` binding surface and its
 validators; approval-card delivery through the neutral `OutboundMessage` path;
 assistant-thread status, which is `assistant_threads_setStatus` and Slack-only
 today with no neutral equivalent and no endpoint fallback
-(`apps/worker/src/curie_worker/slack_sink.py:404-423`); and trigger ingestion
+(`apps/worker/src/curie_worker/slack_sink.py:404-423`); the channel port's entry
+in the adapter-manifest schema of decision 2, plus the `curie adapter` install
+verb that consumes it, so a channel adapter is brought to an installation rather
+than wired into one; and trigger ingestion
 per [ADR-0079](0079-inbound-triggers-as-a-new-event-kind.md), whose
 `POST /hooks/{agent}/{hook}` is accepted but not yet built. Each lift owes an
 answer at every tier, the way ADR-0086 had to answer connector hosting for
@@ -279,7 +310,11 @@ channel-neutral reply contract is the destination, not the starting point.
   claiming any platform-facing field is an invented extension would prove too
   much: `connectors.yaml` and `deploy.yaml` are additive platform-facing
   declarations that already shipped, and they are fine because they declare
-  intent rather than supply the platform's implementation.
+  intent rather than supply the platform's implementation. What survives from
+  this alternative is its experience goal, that you bring a plugin to your
+  installation and it works; decision 2's adapter manifest delivers that
+  experience without inheriting the bundle format, the sandbox trust domain, or
+  the per-agent lifecycle.
 
 - **In-process dynamic loading as the general mechanism, that is, entry points
   everywhere.** This is the harness registry generalized without the exception
@@ -335,6 +370,15 @@ contract change, not a refactor. Each piece owes a `skill`/`local`/`cluster`
 answer as well, since the parity ladder grades a tier that cannot exercise a
 feature honestly rather than silently. What this ADR buys is that the work is
 done once against a published contract rather than once per asking vendor.
+
+**The install experience is part of the promise, not a nicety after it.** A port
+whose contract is published, versioned, and conformance-tested but which has no
+entry in the adapter-manifest schema is conformant and not adoptable, and decision
+3 counts that as an unfinished promotion rather than a finished one. That also
+gives decision 2 its acceptance test: the first external adapter's install flow,
+a manifest in and a running adapter out with zero chart edits and no operator
+hand-wiring. If that flow still requires editing values by hand, the manifest
+half of decision 2 has not been delivered, whatever the wire contract says.
 
 **Conformance becomes an obligation before the second adapter, not after.**
 Decision 3 makes the kit part of promoting a port rather than a follow-up, and
