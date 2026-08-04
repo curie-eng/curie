@@ -51,7 +51,7 @@ def test_two_agents_from_one_bundle_dial_different_servers(tmp_path: Path) -> No
     # per-boot is what makes one bundle serve both.
     root = _bundle(tmp_path, HOSTED)
     dev = derive_mcp_servers(root, release="curie", agent="acme-dev", namespace="curie")
-    prod = derive_mcp_servers(root, release="curie", agent="sre-prod", namespace="curie")
+    prod = derive_mcp_servers(root, release="curie", agent="acme-prod", namespace="curie")
     assert dev["grafana"]["url"] != prod["grafana"]["url"]
 
 

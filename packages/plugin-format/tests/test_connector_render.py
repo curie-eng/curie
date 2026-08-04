@@ -181,7 +181,7 @@ PROD = ConnectorSpec(image="grafana/mcp-grafana:0.17.2", env={"GRAFANA_URL": "ht
 
 def test_two_agents_in_one_release_do_not_share_object_names() -> None:
     # Curie runs many agents per release. Release-scoped names meant acme-dev and
-    # sre-prod both rendered `curie-mcp-grafana`, so deploying prod silently
+    # acme-prod both rendered `curie-mcp-grafana`, so deploying prod silently
     # repointed the DEV agent at the prod endpoint -- and, because the Secret was
     # release-scoped too, handed it the prod token. Nothing errored.
     dev = [
@@ -190,7 +190,7 @@ def test_two_agents_in_one_release_do_not_share_object_names() -> None:
     ]
     prod = [
         o["metadata"]["name"]
-        for o in r.render("curie", "sre-prod", "ns", "curie", "grafana", PROD, "s")
+        for o in r.render("curie", "acme-prod", "ns", "curie", "grafana", PROD, "s")
     ]
     assert not set(dev) & set(prod), f"agents share object names: {dev} vs {prod}"
 
@@ -205,7 +205,7 @@ def test_two_agents_do_not_share_pod_labels() -> None:
     )
     prod = next(
         o
-        for o in r.render("curie", "sre-prod", "ns", "curie", "grafana", PROD, "s")
+        for o in r.render("curie", "acme-prod", "ns", "curie", "grafana", PROD, "s")
         if o["kind"] == "Service"
     )
     assert dev["spec"]["selector"] != prod["spec"]["selector"]
@@ -213,7 +213,7 @@ def test_two_agents_do_not_share_pod_labels() -> None:
 
 def test_each_agent_gets_its_own_url() -> None:
     dev = r.mcp_entry("curie", "acme-dev", "ns", "grafana", DEV)["url"]
-    prod = r.mcp_entry("curie", "sre-prod", "ns", "grafana", PROD)["url"]
+    prod = r.mcp_entry("curie", "acme-prod", "ns", "grafana", PROD)["url"]
     assert dev != prod
 
 
@@ -268,7 +268,7 @@ def test_each_agent_gets_its_own_allowlist() -> None:
         a = _dep(agent)["spec"]["template"]["spec"]["containers"][0]["args"]
         return a[a.index("-allowed-hosts") + 1]
 
-    assert hosts("acme-dev") != hosts("sre-prod")
+    assert hosts("acme-dev") != hosts("acme-prod")
 
 
 def test_placeholders_expand_in_env_too() -> None:

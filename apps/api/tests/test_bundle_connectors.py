@@ -119,7 +119,7 @@ def test_two_agents_sharing_a_release_render_distinct_objects(tmp_path: Path) ->
     # overwrote the other's Deployment and credential.
     root = _bundle(tmp_path, HOSTED)
     dev = {o["metadata"]["name"] for o in _render(root, agent="acme-dev")}
-    prod = {o["metadata"]["name"] for o in _render(root, agent="sre-prod")}
+    prod = {o["metadata"]["name"] for o in _render(root, agent="acme-prod")}
     assert not dev & prod, f"agents collide: {dev} vs {prod}"
 
 
