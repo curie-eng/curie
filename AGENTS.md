@@ -211,11 +211,20 @@ itself (`curie-eng/curie`, and `curie-eng/agentos`, its former name).
 `example.com` is reserved for documentation (RFC 2606) and `*.svc.cluster.local`
 names no real host, so both are fine.
 
-This is enforced by `.gitleaks.toml`, which extends the default rules with
-identifier patterns and allowlists the placeholders above. If a check fires on
-something genuinely fake that the allowlist misses, add it to the allowlist with
-a reason -- do not annotate the line with `gitleaks:allow` to silence it, since
-that hides the next real one.
+**Five of the six rows are gated by `.gitleaks.toml`; one is not.** Slack ids,
+AWS accounts, EC2 ids, hostnames, and repo slugs each have a rule. **A real
+agent or deployment name has no rule and cannot get one** -- a regex that
+matches a specific name has to spell that name, in a public file, which is the
+disclosure the row exists to prevent. A generic `*-bot` pattern is the other
+direction and would fire on every placeholder in the table.
+
+So the agent-name row is convention, enforced at review, and it is the row that
+actually regressed. Treat it as the one you check by hand. Do not read the
+sentence above as "the gate has me covered" -- for that row it never will.
+
+If a check fires on something genuinely fake that the allowlist misses, add it
+to the allowlist with a reason -- do not annotate the line with `gitleaks:allow`
+to silence it, since that hides the next real one.
 
 **Redacting an identifier is a permitted edit to an Accepted ADR.**
 [ADR 0045](docs/adr/0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
