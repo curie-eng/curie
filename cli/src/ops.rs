@@ -1348,8 +1348,8 @@ mod stateful_guard_tests {
     fn components_come_from_the_render() {
         let rendered = format!(
             "{}\n---\n{}",
-            render("rustfs", "sre-bot-curie-rustfs"),
-            render("postgres", "sre-bot-curie-postgres")
+            render("rustfs", "acme-bot-curie-rustfs"),
+            render("postgres", "acme-bot-curie-postgres")
         );
         assert_eq!(
             parse_statefulset_components(&rendered),
@@ -1365,7 +1365,7 @@ mod stateful_guard_tests {
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: sre-bot-docs
+  name: acme-bot-docs
 data:
   example: |
     kind: StatefulSet
@@ -1379,31 +1379,32 @@ data:
     #[test]
     fn a_renamed_store_is_reported_as_a_removal() {
         let live = vec![
-            ("minio".to_string(), "sre-bot-minio".to_string()),
-            ("postgres".to_string(), "sre-bot-postgres".to_string()),
+            ("minio".to_string(), "acme-bot-minio".to_string()),
+            ("postgres".to_string(), "acme-bot-postgres".to_string()),
         ];
         let rendered = vec!["rustfs".to_string(), "postgres".to_string()];
         assert_eq!(
             removed_stateful_components(&live, &rendered),
-            vec!["sre-bot-minio"],
+            vec!["acme-bot-minio"],
             "only the renamed store is lost, and it is named as the operator sees it"
         );
     }
 
     /// The false positive that a live run exposed, pinned so it cannot return.
     ///
-    /// This release was installed with `nameOverride=sre-bot`, so every resource
-    /// is `sre-bot-<component>` while the chart renders `sre-bot-curie-<component>`.
+    /// The release was installed with a `nameOverride`, so every resource is
+    /// `<override>-<component>` while the chart renders
+    /// `<override>-curie-<component>`.
     /// Comparing NAMES reported all four as removals -- postgres, valkey and
     /// clickhouse included -- which would have taught the operator to pass
     /// --allow-stateful-removal by reflex and lose minio for real.
     #[test]
     fn a_name_override_does_not_make_every_component_look_removed() {
         let live = vec![
-            ("clickhouse".to_string(), "sre-bot-clickhouse".to_string()),
-            ("minio".to_string(), "sre-bot-minio".to_string()),
-            ("postgres".to_string(), "sre-bot-postgres".to_string()),
-            ("valkey".to_string(), "sre-bot-valkey".to_string()),
+            ("clickhouse".to_string(), "acme-bot-clickhouse".to_string()),
+            ("minio".to_string(), "acme-bot-minio".to_string()),
+            ("postgres".to_string(), "acme-bot-postgres".to_string()),
+            ("valkey".to_string(), "acme-bot-valkey".to_string()),
         ];
         // What the chart renders WITHOUT the override: different names entirely.
         let rendered = vec![
@@ -1414,7 +1415,7 @@ data:
         ];
         assert_eq!(
             removed_stateful_components(&live, &rendered),
-            vec!["sre-bot-minio"],
+            vec!["acme-bot-minio"],
             "differing resource names must not be mistaken for removed components"
         );
     }
@@ -1427,20 +1428,20 @@ data:
         let list = serde_json::json!({"items": [
             {
                 "metadata": {
-                    "name": "sre-bot-minio",
+                    "name": "acme-bot-minio",
                     "annotations": {"helm.sh/resource-policy": "keep"}
                 },
                 "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
             },
             {
-                "metadata": {"name": "sre-bot-postgres"},
+                "metadata": {"name": "acme-bot-postgres"},
                 "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "postgres"}}}
             }
         ]});
         let at_risk = stateful_components_from_list(&list);
         assert_eq!(
             at_risk,
-            vec![("postgres".to_string(), "sre-bot-postgres".to_string())],
+            vec![("postgres".to_string(), "acme-bot-postgres".to_string())],
             "a component annotated keep is not at risk and must not be listed"
         );
     }
@@ -1451,13 +1452,13 @@ data:
     fn an_unannotated_component_is_still_at_risk() {
         let list = serde_json::json!({"items": [
             {
-                "metadata": {"name": "sre-bot-minio"},
+                "metadata": {"name": "acme-bot-minio"},
                 "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
             }
         ]});
         assert_eq!(
             stateful_components_from_list(&list),
-            vec![("minio".to_string(), "sre-bot-minio".to_string())]
+            vec![("minio".to_string(), "acme-bot-minio".to_string())]
         );
     }
 

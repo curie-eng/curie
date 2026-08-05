@@ -1112,7 +1112,7 @@ mod diff_tests {
     }
 
     /// The classification tests below run against the REAL key set of the
-    /// sre-bot release (`helm get values`, key names only -- no values were
+    /// adopting agent's release (`helm get values`, key names only -- no values were
     /// read). A fixture I invented would have agreed with whatever I wrote;
     /// this one disagreed, and that is how the `Managed` bug was found.
     const LIVE_KEYS: &[&str] = &[
@@ -1354,7 +1354,7 @@ mod diff_tests {
             &declared,
             Some(&live(serde_json::json!({
                 "dispatcher": {"slack": {"appToken": "xapp-x", "botToken": "xoxb-y"}},
-                "api": {"githubAppId": "4475970", "apiKey": "generated"},
+                "api": {"githubAppId": "000000", "apiKey": "generated"},
                 "postgres": {"auth": {"password": "generated"}},
             }))),
         );
@@ -1424,12 +1424,13 @@ mod diff_tests {
     /// store to `rustfs`, so the live key matched no managed list. The store
     /// was still running.
     ///
-    /// The value here is a real-shaped random hex string rather than a token
-    /// the assertion could trivially find, because the original test's
-    /// "no secret in output" check passed against a plaintext it chose itself.
+    /// The value is a PLACEHOLDER of the same shape as a generated secret. It
+    /// must never be a real one: this repository is public, and a fixture is
+    /// exactly where a live credential gets committed by accident (it did --
+    /// see AGENTS.md on placeholder values).
     #[test]
     fn a_credential_key_no_managed_list_knows_is_still_masked() {
-        let leaked = "395f633e7f72be60b36cb19ced9d0889b1d55ede40c78893";
+        let leaked = "000000000000000000000000000000000000000000000000";
         let entries = diff_plan(
             &BTreeMap::new(),
             Some(&live(serde_json::json!({
@@ -1486,8 +1487,8 @@ mod diff_tests {
     #[test]
     fn a_chart_version_mismatch_is_reported() {
         let out = DiffOutput {
-            namespace: "sre-bot".into(),
-            release: "sre-bot".into(),
+            namespace: "acme-bot".into(),
+            release: "acme-bot".into(),
             release_exists: true,
             chart_deployed: Some("curie-0.5.1".into()),
             chart_target: "0.6.0".into(),
@@ -1504,8 +1505,8 @@ mod diff_tests {
     #[test]
     fn a_matching_chart_version_does_not_warn() {
         let out = DiffOutput {
-            namespace: "sre-bot".into(),
-            release: "sre-bot".into(),
+            namespace: "acme-bot".into(),
+            release: "acme-bot".into(),
             release_exists: true,
             chart_deployed: Some("curie-0.6.0".into()),
             chart_target: "0.6.0".into(),
@@ -1518,8 +1519,8 @@ mod diff_tests {
     #[test]
     fn an_unknown_deployed_chart_does_not_claim_a_mismatch() {
         let out = DiffOutput {
-            namespace: "sre-bot".into(),
-            release: "sre-bot".into(),
+            namespace: "acme-bot".into(),
+            release: "acme-bot".into(),
             release_exists: false,
             chart_deployed: None,
             chart_target: "0.6.0".into(),
