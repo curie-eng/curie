@@ -694,7 +694,7 @@ async fn complete_installation_plan(
 /// that would destroy the store, so an operator reading it deserves the same
 /// warning the real run would give.
 async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<()> {
-    let live = crate::ops::live_statefulsets(&up.common).await?;
+    let live = crate::ops::live_stateful_components(&up.common).await?;
     if live.is_empty() {
         // Fresh install, or no cluster to read. Nothing to lose either way.
         return Ok(());
@@ -706,7 +706,7 @@ async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<()> {
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
-    let rendered = crate::ops::chart_statefulsets(&up.chart, &up.common, &sets).await?;
+    let rendered = crate::ops::chart_stateful_components(&up.chart, &up.common, &sets).await?;
     let removed = crate::ops::removed_stateful_components(&live, &rendered);
     if removed.is_empty() {
         return Ok(());
