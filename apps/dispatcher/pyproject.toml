@@ -6,7 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
     "slack-bolt>=1.30.0",
-    "redis>=5.2",
+    "redis>=8.1.0",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "httpx>=0.28",

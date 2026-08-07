@@ -19,7 +19,7 @@ dependencies = [
     # GitHub App JWT signing (ADR-0092). Present transitively today; declared
     # because this package imports it directly.
     "pyjwt[crypto]>=2.10",
-    "redis>=5.0",
+    "redis>=8.1.0",
     "plugin-format",
     "aci-protocol",
 ]

@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "Curie shared test-support helpers (dev/test only)"
 requires-python = ">=3.13"
 dependencies = [
-    "redis>=5.0",
+    "redis>=8.1.0",
     "pytest>=8.3",
 ]
 
