@@ -125,4 +125,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0094 | [A bundle carries its own sealed connector keys](0094-a-bundle-carries-its-own-sealed-connector-keys.md) | Accepted |
 | 0097 | [One file declares an installation](0097-one-file-declares-an-installation.md) | Accepted |
 | 0098 | [Thinking depth is an operator knob, never a bundle one](0098-thinking-depth-is-an-operator-knob-never-a-bundle-one.md) | Accepted |
+| 0099 | [Hooks are bundle-declared turns the system starts](0099-hooks-are-bundle-declared-turns-the-system-starts.md) | Draft |
 <!-- END GENERATED: adr-index -->
