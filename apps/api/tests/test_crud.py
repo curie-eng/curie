@@ -156,16 +156,15 @@ def test_add_channel_binding_appends_and_leaves_the_first_alone(
 
     added = client.post(
         f"/agents/{agent['id']}/channels",
-        json={"kind": "email", "address": "ops@example.test",
-              "endpoint": "http://curie-mail-adapter:8080/", "adapter": "agentmail-sandbox"},
+        json={"kind": "slack", "address": "C0EXAMPLE1"},
         headers=auth_headers,
     )
     assert added.status_code == 201, added.text
 
     got = client.get(f"/agents/{agent['id']}", headers=auth_headers).json()
     assert got["channels"] == [
-        {"kind": "email", "address": "ops@example.test"},
         {"kind": "slack", "address": "C0000ADD01"},
+        {"kind": "slack", "address": "C0EXAMPLE1"},
     ]
 
 

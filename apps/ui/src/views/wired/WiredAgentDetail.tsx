@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { C } from "../../tokens";
 import { Button, Card, Chip, CliHint, Dot, Notice, cliCommand } from "../../primitives";
 import { SkillEditor } from "../../components/SkillEditor";
@@ -96,29 +96,57 @@ export function WiredAgentDetail() {
   const [promoteError, setPromoteError] = useState<string | null>(null);
 
   // Editable channel bindings (item 5, ADR-0107): one editor per binding, keyed
-  // by its current `${kind}:${address}` pair, since that is the selector a save
-  // must name. Seeded from the agent, re-seeded if its bindings change.
-  const [channelEdits, setChannelEdits] = useState<Record<string, string>>({});
-  const [savingChannel, setSavingChannel] = useState<Record<string, boolean>>({});
-  const [channelErrors, setChannelErrors] = useState<Record<string, string | null>>({});
+  // by ROW POSITION, not by `${kind}:${address}` (finding 3, #1525 review) --
+  // that pair is exactly what a save mutates, so keying state by it means the
+  // very next save reuses the just-retired selector until a refetch lands.
+  // `rowSelector` is the pair a save for that row must name; it starts synced
+  // from the agent and is rebased locally the instant a PATCH succeeds,
+  // without waiting on the refetch. `channelDirty` (a ref, not state -- it
+  // must not itself retrigger the reseed effect below) tracks rows with a
+  // typed-but-unsaved edit, so a refetch landing from one row's save can never
+  // clobber another row's in-progress edit.
+  const [channelEdits, setChannelEdits] = useState<Record<number, string>>({});
+  const [rowSelector, setRowSelector] = useState<Record<number, ChannelBinding>>({});
+  const [savingChannel, setSavingChannel] = useState<Record<number, boolean>>({});
+  const [channelErrors, setChannelErrors] = useState<Record<number, string | null>>({});
+  const channelDirty = useRef<Record<number, boolean>>({});
+  const lastAgentIdForChannels = useRef<string | null>(null);
 
   // Editable per-agent model (#254). Seeded from the agent; blank = platform default.
   const [model, setModel] = useState("");
   const [savingModel, setSavingModel] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
 
-  const channelKey = (b: ChannelBinding) => `${b.kind}:${b.address}`;
   // A stable string dep (not the array reference) so the reseed effect only
   // fires when a binding's identity actually changes.
-  const channelsDepKey = (agent?.channels ?? []).map(channelKey).join(",");
+  const channelsDepKey = (agent?.channels ?? []).map((b) => `${b.kind}:${b.address}`).join(",");
 
   useEffect(() => {
-    const map: Record<string, string> = {};
-    for (const b of agent?.channels ?? []) map[channelKey(b)] = b.address;
-    setChannelEdits(map);
+    const channels = agent?.channels ?? [];
+    // A fresh agent starts with no dirty rows -- stale row-index flags from a
+    // previous agent must not leak into this one's rows.
+    if (lastAgentIdForChannels.current !== (agent?.id ?? null)) {
+      channelDirty.current = {};
+      lastAgentIdForChannels.current = agent?.id ?? null;
+    }
+    const selectors: Record<number, ChannelBinding> = {};
+    channels.forEach((b, i) => {
+      selectors[i] = b;
+    });
+    setRowSelector(selectors);
+    setChannelEdits((prev) => {
+      const map: Record<number, string> = {};
+      channels.forEach((b, i) => {
+        // A dirty row keeps its unsaved text; everything else reseeds from
+        // the fresh agent (finding 3, #1525 review: a refetch triggered by
+        // ANY row's save must not clobber another row's unsaved edit).
+        map[i] = channelDirty.current[i] ? (prev[i] ?? b.address) : b.address;
+      });
+      return map;
+    });
     setChannelErrors({});
     // channelsDepKey mirrors agent?.channels; agent?.id covers a fresh agent
-    // whose bindings happen to collide with the previous one's key.
+    // whose bindings happen to collide with the previous one's row shape.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent?.id, channelsDepKey]);
 
@@ -157,27 +185,51 @@ export function WiredAgentDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [files.files]);
 
-  const saveChannel = async (binding: ChannelBinding) => {
-    const key = channelKey(binding);
-    const value = (channelEdits[key] ?? "").trim();
-    if (!agent || savingChannel[key] || value === "") return;
-    setSavingChannel((prev) => ({ ...prev, [key]: true }));
-    setChannelErrors((prev) => ({ ...prev, [key]: null }));
+  const saveChannel = async (rowIndex: number) => {
+    const binding = rowSelector[rowIndex];
+    const value = (channelEdits[rowIndex] ?? "").trim();
+    if (!agent || !binding || savingChannel[rowIndex] || value === "") return;
+    setSavingChannel((prev) => ({ ...prev, [rowIndex]: true }));
+    setChannelErrors((prev) => ({ ...prev, [rowIndex]: null }));
     try {
       // The console has no kind selector (E4/EB-20: "slack" is the only kind it
       // can create), so a channel-move PATCH preserves the binding's existing
       // kind and only replaces the address. `binding` (not the edited value) is
-      // the selector -- it names the row being moved, by its CURRENT pair.
-      await patchAgentChannel(agent.id, binding, { kind: binding.kind, address: value });
+      // the selector -- it names the row being moved, by its CURRENT pair
+      // (rebased below on every prior successful save, so this is never the
+      // just-retired pair even if a refetch is still in flight).
+      //
+      // PATCH replaces the whole binding definition server-side (crud.py's
+      // `update_channel_binding` overwrites endpoint/adapter unconditionally),
+      // so `endpoint`/`adapter` ride along unchanged from `binding` -- the
+      // editor only ever changes the address. Dropping them here would null
+      // out a non-Slack binding's reply route on every save (finding 1, #1525
+      // security review).
+      const next: ChannelBinding = {
+        kind: binding.kind,
+        address: value,
+        endpoint: binding.endpoint,
+        adapter: binding.adapter,
+      };
+      const updated = await patchAgentChannel(agent.id, binding, next);
+      // Rebase this row's selector onto the pair just saved (finding 3, #1525
+      // review): without this, a second immediate save on the same row still
+      // names the retired pair and 404s, because `agent.channels` (and thus
+      // `binding` above) does not reflect the move until the refetch below
+      // lands. Prefer the response's own record of the saved binding; fall
+      // back to the submitted values if the response shape ever omits it.
+      const saved = updated.channels.find((b) => b.kind === next.kind && b.address === next.address) ?? next;
+      setRowSelector((prev) => ({ ...prev, [rowIndex]: saved }));
+      channelDirty.current[rowIndex] = false;
       refetch(); // refresh the wired agent data so the displayed channel updates
       dispatch({ type: "toast", message: `Channel set to ${value}` });
     } catch (e) {
       setChannelErrors((prev) => ({
         ...prev,
-        [key]: e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e),
+        [rowIndex]: e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e),
       }));
     } finally {
-      setSavingChannel((prev) => ({ ...prev, [key]: false }));
+      setSavingChannel((prev) => ({ ...prev, [rowIndex]: false }));
     }
   };
 
@@ -293,27 +345,32 @@ export function WiredAgentDetail() {
           </Chip>
         ) : null}
         <div style={{ marginLeft: "auto", display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-          {(agent.channels ?? []).map((binding) => {
-            const key = channelKey(binding);
-            const value = channelEdits[key] ?? "";
+          {(agent.channels ?? []).map((binding, rowIndex) => {
+            // `rowSelector` (rebased on every successful save) is this row's
+            // source of truth once the component has mounted; `binding` from
+            // the just-rendered `agent.channels` is only the fallback for the
+            // very first render before the reseed effect has run.
+            const effective = rowSelector[rowIndex] ?? binding;
+            const value = channelEdits[rowIndex] ?? effective.address;
             const trimmed = value.trim();
             const blank = trimmed === "";
             // The Slack shape check only applies to slack-kind bindings; other
             // kinds (webhook, ms-teams, …) are governed by the API's generic
             // rule instead.
-            const looksOff = binding.kind === "slack" && trimmed !== "" && !SLACK_ADDRESS_RE.test(trimmed);
-            const saving = savingChannel[key] ?? false;
-            const error = channelErrors[key] ?? null;
+            const looksOff = effective.kind === "slack" && trimmed !== "" && !SLACK_ADDRESS_RE.test(trimmed);
+            const saving = savingChannel[rowIndex] ?? false;
+            const error = channelErrors[rowIndex] ?? null;
             return (
-              <div key={key} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+              <div key={rowIndex} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span style={{ fontSize: 11, color: C.muted, fontFamily: C.mono }}>{binding.kind}</span>
+                  <span style={{ fontSize: 11, color: C.muted, fontFamily: C.mono }}>{effective.kind}</span>
                   <input
                     data-testid="channel-input"
                     value={value}
                     onChange={(e) => {
-                      setChannelEdits((prev) => ({ ...prev, [key]: e.target.value }));
-                      setChannelErrors((prev) => ({ ...prev, [key]: null }));
+                      channelDirty.current[rowIndex] = true;
+                      setChannelEdits((prev) => ({ ...prev, [rowIndex]: e.target.value }));
+                      setChannelErrors((prev) => ({ ...prev, [rowIndex]: null }));
                     }}
                     placeholder="C0123ABCD"
                     style={{
@@ -334,7 +391,7 @@ export function WiredAgentDetail() {
                     testId="channel-save"
                     disabled={blank || saving}
                     title={blank ? "Enter the Slack channel ID first" : undefined}
-                    onClick={() => void saveChannel(binding)}
+                    onClick={() => void saveChannel(rowIndex)}
                   />
                 </div>
                 {looksOff ? (

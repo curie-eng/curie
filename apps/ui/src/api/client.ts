@@ -16,6 +16,14 @@ export interface AppConfig {
 export interface ChannelBinding {
   kind: string;
   address: string;
+  // The reply route (ADR-0096 phase 2). Absent from `AgentOut.channels` reads
+  // today, but `patchAgentChannel`'s body is a full-replace of the binding
+  // definition (crud.py's `update_channel_binding` overwrites both fields
+  // unconditionally), so ANY caller constructing a `next` binding must carry
+  // these through from the binding it is editing -- omitting them nulls out
+  // a live reply route silently (finding 1, #1525 security review).
+  endpoint?: string | null;
+  adapter?: string | null;
 }
 
 // The worker resolves an agent's binding against `channel.address`, not a

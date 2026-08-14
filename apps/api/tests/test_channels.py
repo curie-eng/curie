@@ -388,6 +388,16 @@ def test_the_ingress_refuses_an_unroutable_binding_for_the_platform_key_too(
     assert refused.status_code == 409, refused.text
     assert "no reply route" in refused.text, refused.text
     assert "endpoint" in refused.text and "adapter" in refused.text, refused.text
+    # The recovery instruction has to name a request the API still accepts: the
+    # binding subresource with its (kind, address) selector. It used to say
+    # "PATCH the agent's channel", and `AgentUpdate` now 422s that field, so a
+    # caller following the 409 got a second refusal and no way out.
+    for expected in (
+        "/agents/{agent_id}/channels",
+        "kind=email",
+        "address=unroutable@example.test",
+    ):
+        assert expected in refused.text, refused.text
     assert _turns_on(valkey, runs_stream) == []
 
     slack = _post_turn(

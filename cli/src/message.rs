@@ -416,25 +416,43 @@ pub fn local_api_base(api_url: Option<&str>) -> String {
     api_url.unwrap_or(DEFAULT_LOCAL_API_URL).to_string()
 }
 
-/// Pick the channel to send as: an explicit `--channel` wins; otherwise the sole
-/// deployed `(agent, channel)` PAIR. Selection counts pairs rather than agents
-/// (ADR-0107) because one agent may answer on several channels, and picking a
-/// channel is what this returns. Zero or multiple pairs is an error naming
-/// them and requiring `--channel`, because the worker binds a channel to an
-/// agent by exact equality -- guessing would silently route nowhere.
-pub fn select_channel(agents: &[Agent], explicit: Option<&str>) -> Result<String> {
-    if let Some(channel) = explicit {
-        return Ok(channel.to_string());
-    }
-    let pairs: Vec<(&str, &str)> = agents
+/// The one channel kind the `message` and `eval` send paths can target. Both
+/// mint a Slack turn (`synthetic_turn("slack", ...)`) and the worker resolves a
+/// binding by the `(kind, address)` PAIR (ADR-0107), so a binding of any other
+/// kind is simply not addressable from here -- however legal it is on the
+/// platform.
+const SENDABLE_CHANNEL_KIND: &str = "slack";
+
+/// The deployed `(agent name, address)` pairs this send path can actually
+/// target: Slack bindings only. An address is unique per `(kind, address)`
+/// rather than globally (ADR-0107), so a webhook and a Slack binding may legally
+/// share one address; selecting by address alone would hand a Slack turn an
+/// address that is only bound on some other kind and route nowhere.
+fn sendable_pairs(agents: &[Agent]) -> Vec<(&str, &str)> {
+    agents
         .iter()
         .flat_map(|a| {
             a.channels
                 .iter()
+                .filter(|c| c.kind == SENDABLE_CHANNEL_KIND)
                 .map(move |c| (a.name.as_str(), c.address.as_str()))
         })
-        .collect();
-    match pairs.as_slice() {
+        .collect()
+}
+
+/// Pick the channel to send as: an explicit `--channel` wins; otherwise the sole
+/// deployed Slack `(agent, channel)` PAIR. Selection counts pairs rather than
+/// agents (ADR-0107) because one agent may answer on several channels, and
+/// picking a channel is what this returns. Non-Slack bindings are not
+/// candidates: this path mints a Slack turn (see `SENDABLE_CHANNEL_KIND`). Zero
+/// or multiple pairs is an error naming them and requiring `--channel`, because
+/// the worker binds a channel to an agent by exact `(kind, address)` equality --
+/// guessing would silently route nowhere.
+pub fn select_channel(agents: &[Agent], explicit: Option<&str>) -> Result<String> {
+    if let Some(channel) = explicit {
+        return Ok(channel.to_string());
+    }
+    match sendable_pairs(agents).as_slice() {
         [] => bail!(
             "no agents are deployed on the platform API; deploy one with `curie local deploy` \
              or `curie cluster deploy`, or pass --channel <id>"
@@ -446,7 +464,10 @@ pub fn select_channel(agents: &[Agent], explicit: Option<&str>) -> Result<String
                 .map(|(name, address)| format!("{name} -> {address}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            bail!("multiple agents are deployed; pass --channel <id> to pick one ({listed})")
+            bail!(
+                "multiple Slack channels are bound across deployed agents; pass --channel <id> \
+                 to pick one of these (agent, channel) pairs ({listed})"
+            )
         }
     }
 }
@@ -527,7 +548,7 @@ pub fn dry_run_lines(opts: &MessageOpts, advertise_host: &str) -> Vec<String> {
     let channel = opts
         .channel
         .clone()
-        .unwrap_or_else(|| "<the sole deployed agent's channel>".to_string());
+        .unwrap_or_else(|| "<the sole bound (agent, Slack channel) pair>".to_string());
     lines.push(format!(
         "enqueue a synthetic QueuedTurn (reply endpoint {url}) for channel {channel} \
          on stream {}",
@@ -603,7 +624,8 @@ pub fn message_enqueued_json(channel: &str, thread: &str) -> serde_json::Value {
 /// The machine-readable descriptor for `local`/`cluster message --json --dry-run`
 /// (issue #354): what a real run would enqueue, without touching the network.
 /// `target` is `"local"` or `"cluster"`, `channel` is null when it would be
-/// resolved from the sole deployed agent. Pure so it stays contract-testable
+/// resolved from the sole bound (agent, Slack channel) pair. Pure so it stays
+/// contract-testable
 /// against `cli/schema/message.schema.json`.
 pub fn message_dry_run_json(
     target: &str,
@@ -933,7 +955,9 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
         let reply_endpoint = local_stub_reply_endpoint(&local_stub_binding().advertise_host);
         let channel_line = match opts.channel.as_deref() {
             Some(channel) => format!("channel {channel}"),
-            None => format!("channel <the sole deployed agent via {api_base}/agents>"),
+            None => format!(
+                "channel <the sole bound (agent, Slack channel) pair via {api_base}/agents>"
+            ),
         };
         let human_lines = vec![
             "local mode (compose stack; no kubectl/helm)".to_string(),
@@ -1004,7 +1028,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
         stub.base_api_url()
     ));
 
-    // Channel: explicit --channel, else the sole deployed agent from the compose
+    // Channel: explicit --channel, else the sole bound Slack pair from the compose
     // API (reached directly; routers mount at root, so the base carries no /api).
     // `agent_hint` is the sole agent's NAME when we resolved it (so an approval
     // resolve hint is copy-paste runnable), and `None` for an explicit --channel
@@ -1630,7 +1654,7 @@ fn connected_turn(
 }
 
 /// Resolve the target channel (and the sole-agent hint for resolve messages) for
-/// a cluster turn: an explicit `--channel`, else the sole deployed agent via a
+/// a cluster turn: an explicit `--channel`, else the sole bound Slack pair via a
 /// short-lived API port-forward (dropped once the lookup returns). Shared by the
 /// stub path and the connected-transport path.
 async fn resolve_cluster_channel(opts: &MessageOpts) -> Result<(String, Option<String>)> {
@@ -1792,7 +1816,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     )
     .await?;
 
-    // Channel: explicit --channel, else the sole deployed agent via a
+    // Channel: explicit --channel, else the sole bound Slack pair via a
     // short-lived API port-forward (#766). Shared with the connected path.
     let (channel, agent_hint) = resolve_cluster_channel(&opts).await?;
     ui.note(&format!("routing to channel {channel}"));
@@ -2134,7 +2158,7 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
         match opts.channel.as_deref() {
             Some(channel) => lines.push(format!("channel {channel}")),
             None => lines.push(format!(
-                "channel <the sole deployed agent via {api_base}/agents>"
+                "channel <the sole bound (agent, Slack channel) pair via {api_base}/agents>"
             )),
         }
     } else {
@@ -2305,15 +2329,44 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
 const SWEEP_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Resolve the target agent's id for the trigger plane. Mirrors `select_channel`
-/// (explicit `--channel` matches an agent's channel, else the sole
-/// deployed agent), but returns the agent id the trigger endpoint keys on.
+/// (explicit `--channel` matches an agent's SLACK channel, else the sole
+/// deployed agent), but returns the agent id the trigger endpoint keys on. The
+/// address match is scoped to `SENDABLE_CHANNEL_KIND` for the same reason
+/// `select_channel` is: an address is unique per `(kind, address)` pair, not
+/// globally, so an address shared by a Slack and a non-Slack binding must
+/// resolve to the Slack one.
 pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String> {
     if let Some(channel) = channel {
-        return agents
+        if let Some(agent) = agents.iter().find(|a| {
+            a.channels
+                .iter()
+                .any(|c| c.kind == SENDABLE_CHANNEL_KIND && c.address == channel)
+        }) {
+            return Ok(agent.id.clone());
+        }
+        // The address IS bound, but only on kinds this path cannot send as.
+        // Saying "no deployed agent has channel X" would be a lie the operator
+        // cannot act on, so name the kinds it is actually bound on.
+        let mut other_kinds: Vec<&str> = Vec::new();
+        for kind in agents
             .iter()
-            .find(|a| a.channels.iter().any(|c| c.address == channel))
-            .map(|a| a.id.clone())
-            .ok_or_else(|| anyhow::anyhow!("no deployed agent has channel {channel:?}"));
+            .flat_map(|a| a.channels.iter())
+            .filter(|c| c.address == channel)
+            .map(|c| c.kind.as_str())
+        {
+            if !other_kinds.contains(&kind) {
+                other_kinds.push(kind);
+            }
+        }
+        if !other_kinds.is_empty() {
+            bail!(
+                "channel {channel:?} is bound to a non-Slack channel kind ({}); this command \
+                 sends a Slack turn and cannot target it -- pass the address of a \
+                 {SENDABLE_CHANNEL_KIND} binding instead",
+                other_kinds.join(", ")
+            );
+        }
+        bail!("no deployed agent has {SENDABLE_CHANNEL_KIND} channel {channel:?}");
     }
     match agents {
         [] => bail!(
@@ -2322,16 +2375,15 @@ pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String
         ),
         [only] => Ok(only.id.clone()),
         many => {
-            let listed = many
+            let listed = sendable_pairs(many)
                 .iter()
-                .flat_map(|a| {
-                    a.channels
-                        .iter()
-                        .map(move |c| format!("{} -> {}", a.name, c.address))
-                })
+                .map(|(name, address)| format!("{name} -> {address}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            bail!("multiple agents are deployed; pass --channel <id> to pick one ({listed})")
+            bail!(
+                "multiple agents are deployed; pass --channel <id> to pick one of these \
+                 (agent, channel) pairs ({listed})"
+            )
         }
     }
 }
@@ -3012,14 +3064,22 @@ mod tests {
     }
 
     fn agent_bound_to(name: &str, channels: &[&str]) -> Agent {
+        let pairs: Vec<(&str, &str)> = channels.iter().map(|c| ("slack", *c)).collect();
+        agent_bound_to_kinds(name, &pairs)
+    }
+
+    /// Same as `agent_bound_to`, but each binding carries its own channel KIND,
+    /// so a test can express the legal `(kind, address)` collision ADR-0107
+    /// allows (one address bound on both `slack` and `webhook`).
+    fn agent_bound_to_kinds(name: &str, channels: &[(&str, &str)]) -> Agent {
         Agent {
             id: format!("id-{name}"),
             name: name.to_string(),
             channels: channels
                 .iter()
-                .map(|c| crate::api::ChannelBinding {
-                    kind: "slack".to_string(),
-                    address: c.to_string(),
+                .map(|(kind, address)| crate::api::ChannelBinding {
+                    kind: (*kind).to_string(),
+                    address: (*address).to_string(),
                 })
                 .collect(),
             repo_full_name: None,
@@ -3240,6 +3300,34 @@ mod tests {
         assert!(err.contains("--channel"), "{err}");
         assert!(err.contains("solo -> C0EXAMPLE1"), "{err}");
         assert!(err.contains("solo -> C0EXAMPLE2"), "{err}");
+        // D6: the text must speak in (agent, channel) PAIRS. One agent holding
+        // two bindings is not "multiple agents", and a user told that cannot
+        // work out that the thing to pick is a channel.
+        assert!(!err.contains("multiple agents"), "{err}");
+        assert!(err.contains("(agent, channel) pairs"), "{err}");
+    }
+
+    #[test]
+    fn select_channel_counts_only_slack_bindings_on_a_shared_address() {
+        // D4: `(kind, address)` is the unique pair, so a webhook binding may
+        // legally carry the same address as someone else's Slack binding. The
+        // send path mints a Slack turn, so only the Slack pair is a candidate --
+        // counting both would call one real Slack channel ambiguous.
+        let agents = [
+            agent_bound_to_kinds("hooked", &[("webhook", "C0EXAMPLE1")]),
+            agent_bound_to_kinds("chatty", &[("slack", "C0EXAMPLE1")]),
+        ];
+        assert_eq!(select_channel(&agents, None).unwrap(), "C0EXAMPLE1");
+    }
+
+    #[test]
+    fn select_channel_errors_when_every_binding_is_non_slack() {
+        // A platform bound only on kinds this path cannot send as has no
+        // candidate at all. One binding, so an unfiltered walk would find it
+        // unambiguous and enqueue a Slack turn against a webhook address.
+        let agents = [agent_bound_to_kinds("hooked", &[("webhook", "C0EXAMPLE1")])];
+        let err = select_channel(&agents, None).unwrap_err().to_string();
+        assert!(err.contains("--channel"), "{err}");
     }
 
     #[test]
@@ -3269,6 +3357,35 @@ mod tests {
         // two bindings is one agent, so it resolves with no flag. This is the
         // deliberate asymmetry with `select_channel` above -- do not "fix" it.
         assert_eq!(select_agent_id(&agents[..1], None).unwrap(), "id-one");
+    }
+
+    #[test]
+    fn select_agent_id_resolves_a_shared_address_to_the_slack_binding() {
+        // D4 on the trigger plane: the webhook owner is listed FIRST, so an
+        // address-only `.find` returns it. The turn this id triggers is a Slack
+        // turn, so the Slack owner is the only correct answer.
+        let agents = [
+            agent_bound_to_kinds("hooked", &[("webhook", "C0EXAMPLE1")]),
+            agent_bound_to_kinds("chatty", &[("slack", "C0EXAMPLE1")]),
+        ];
+        assert_eq!(
+            select_agent_id(&agents, Some("C0EXAMPLE1")).unwrap(),
+            "id-chatty"
+        );
+    }
+
+    #[test]
+    fn select_agent_id_errors_by_kind_when_the_address_is_only_bound_non_slack() {
+        let agents = [agent_bound_to_kinds("hooked", &[("webhook", "C0EXAMPLE1")])];
+        let err = select_agent_id(&agents, Some("C0EXAMPLE1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("C0EXAMPLE1"), "{err}");
+        assert!(err.contains("webhook"), "{err}");
+        assert!(err.contains("non-Slack"), "{err}");
+        // The address IS bound; reporting it as unbound would send the operator
+        // hunting for a binding that is right there.
+        assert!(!err.contains("no deployed agent has"), "{err}");
     }
 
     #[test]
@@ -3571,7 +3688,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("the sole deployed agent's channel")),
+                .any(|l| l.contains("the sole bound (agent, Slack channel) pair")),
             "channel placeholder when omitted: {lines:?}"
         );
     }
@@ -3738,7 +3855,9 @@ mod tests {
     fn local_eval_dry_run_names_the_channel_lookup_when_omitted() {
         let lines = eval_dry_run_lines(&eval_opts(true, None), "smoke", 1);
         assert!(
-            lines.iter().any(|l| l.contains("sole deployed agent")),
+            lines
+                .iter()
+                .any(|l| l.contains("the sole bound (agent, Slack channel) pair")),
             "channel placeholder when omitted: {lines:?}"
         );
     }

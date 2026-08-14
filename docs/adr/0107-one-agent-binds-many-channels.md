@@ -50,9 +50,10 @@ time; every later add, move, or remove goes through the subresource, not through
   out of scope for this decision (issue #1525 tracks that as follow-up work); every binding
   an agent holds shares the same memory, identity, and approval configuration today.
 - `generation` and channel-token semantics are unaffected: a token still claims one
-  `(channel_id, generation, kind, address, scope, exp)` row, and the move endpoint still
-  mutates that row in place. Adding a second binding to an agent does not touch the first
-  binding's tokens.
+  `(channel_id, generation, scope, exp)` row -- the binding-row id and its generation gate
+  the credential, and the routing `(kind, address)` pair lives on the binding row the id
+  names, not in the token itself. The move endpoint still mutates that row in place. Adding
+  a second binding to an agent does not touch the first binding's tokens.
 - The dev/prod contention #1070 named is fixable without minting a second agent: one agent
   can now hold both the dev and the prod channel, each routed to independently by the
   inbound turn's own address.

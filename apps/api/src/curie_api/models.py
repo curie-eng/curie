@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Enum, ForeignKey, UniqueConstraint, func
+from sqlalchemy import Enum, ForeignKey, Index, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -170,6 +170,13 @@ class AgentChannel(Base):
         # channel" is amended in part -- the (kind, address) constraint above is
         # still what stops two agents claiming the same channel; nothing stops
         # one agent from claiming several.
+        #
+        # PLAIN index on agent_id, because dropping that uniqueness dropped the
+        # column's only index with it (migration 0025 recreates it as this).
+        # `crud.lock_agent_bindings` filters and orders by agent_id under
+        # `FOR UPDATE` on every add, move and delete; unindexed, each of those
+        # scans the whole table while holding locks.
+        Index("ix_agent_channels_agent_id", "agent_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

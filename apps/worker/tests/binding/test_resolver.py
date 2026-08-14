@@ -635,9 +635,9 @@ def test_a_second_binding_does_not_shadow_the_first() -> None:
 
                 resolver = _resolver(engine)
                 assert await resolver.resolve("slack", unbound) is None
-                # And the kind still routes: the same addresses under a kind the
-                # agent is not bound under stay unreachable too.
-                assert await resolver.resolve("email", second) is None
+                # And the kind still routes: a bound address under a kind the
+                # agent is not bound under stays unreachable too.
+                assert await resolver.resolve("webhook", second) is None
                 # Both bound doors still open, so the None above is a real
                 # miss rather than a resolver that stopped resolving anything.
                 assert await resolver.resolve("slack", first) is not None

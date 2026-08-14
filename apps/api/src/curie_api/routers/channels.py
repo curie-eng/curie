@@ -277,9 +277,13 @@ def _unroutable(kind: str, address: str) -> HTTPException:
     return HTTPException(
         status.HTTP_409_CONFLICT,
         f"the binding for kind {kind!r} at address {address!r} has no reply "
-        "route: set its endpoint and adapter (PATCH the agent's channel) before "
-        "minting a token for it or posting turns to it, or its turns would be "
-        "enqueued with nowhere to reply and no credential to reply with.",
+        "route: set its endpoint and adapter before minting a token for it or "
+        "posting turns to it, or its turns would be enqueued with nowhere to "
+        "reply and no credential to reply with. Send them on "
+        "PATCH /agents/{agent_id}/channels, selecting this binding with "
+        f"?kind={kind}&address={address} -- or on POST /agents/{{agent_id}}"
+        "/channels when adding the binding. The agent-level `channel` field is "
+        "retired and rejects a binding write.",
     )
 
 

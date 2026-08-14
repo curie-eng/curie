@@ -47,6 +47,8 @@ OLD_CONSTRAINT = "agent_channels_agent_id_key"
 # NOT touched by this migration: two agents still cannot share one (kind,
 # address) pair (0023).
 KIND_ADDRESS_CONSTRAINT = "agent_channels_kind_address_key"
+# The plain replacement for the dropped constraint's backing index.
+AGENT_ID_INDEX = "ix_agent_channels_agent_id"
 
 
 def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
@@ -84,6 +86,33 @@ def _constraint_named(name: str) -> bool:
         {"name": name},
     )
     return bool(rows)
+
+
+def _agent_id_indexes() -> list[tuple[str, bool]]:
+    """Every single-column index on `agent_channels.agent_id`, name + uniqueness.
+
+    Asked as "what indexes this column", not "does this name exist", because
+    the property the revision owes is that the column stays indexed at all:
+    dropping the unique constraint takes its backing index with it, and that
+    index was the only one on `agent_id`.
+    """
+
+    rows = _sql(
+        """
+        SELECT i.relname AS name, ix.indisunique AS is_unique
+        FROM pg_index ix
+        JOIN pg_class t ON t.oid = ix.indrelid
+        JOIN pg_class i ON i.oid = ix.indexrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ix.indkey[0]
+        WHERE n.nspname = 'curie'
+          AND t.relname = 'agent_channels'
+          AND ix.indnatts = 1
+          AND a.attname = 'agent_id'
+        ORDER BY i.relname
+        """
+    )
+    return [(row.name, row.is_unique) for row in rows]
 
 
 def _seed_agent(name: str) -> uuid.UUID:
@@ -138,6 +167,50 @@ def test_upgrade_drops_only_the_agent_id_constraint(
 
     assert not _constraint_named(OLD_CONSTRAINT)
     assert _constraint_named(KIND_ADDRESS_CONSTRAINT)
+
+
+def test_agent_id_is_still_indexed_after_the_constraint_is_dropped(
+    isolated_migration_db: None,
+) -> None:
+    """[FAIL-FIRST] Dropping the unique constraint drops its backing index, and
+    that index was the ONLY one on `agent_id`. Every binding write locks the
+    agent's set first (`crud.lock_agent_bindings` filters and orders by
+    `agent_id` under `FOR UPDATE`), so an unindexed column turns each add, move
+    and delete into a full scan taken while holding locks -- widening the very
+    contention window this revision makes reachable.
+
+    Asserted as "what indexes this column", not "does this name exist": a
+    replacement created on the wrong column, or on `(agent_id, kind)` with
+    `kind` leading, would satisfy a by-name check and leave the lookup
+    unindexed. Uniqueness is asserted too -- a unique replacement would restore
+    the one-binding-per-agent restriction this revision exists to remove.
+    """
+
+    cfg = _at_below()
+    assert _agent_id_indexes() == [(OLD_CONSTRAINT, True)]
+
+    command.upgrade(cfg, REVISION)
+
+    assert _agent_id_indexes() == [(AGENT_ID_INDEX, False)]
+
+
+def test_downgrade_leaves_exactly_the_pre_0025_indexes(
+    isolated_migration_db: None,
+) -> None:
+    """[FAIL-FIRST] The downgrade's other half: the plain index must go back
+    out with the constraint coming back in. The restored unique constraint
+    brings its own index on the same column, so a downgrade that only recreated
+    the constraint would leave the pre-0025 schema carrying a duplicate index
+    it never had -- a write amplification that survives every later revision.
+    """
+
+    cfg = _at_below()
+    command.upgrade(cfg, REVISION)
+    _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
+
+    command.downgrade(cfg, BELOW)
+
+    assert _agent_id_indexes() == [(OLD_CONSTRAINT, True)]
 
 
 def test_two_bindings_for_one_agent_insert_after_upgrade(
@@ -202,9 +275,11 @@ def test_downgrade_refuses_by_name_when_an_agent_holds_two_bindings(
     """[FAIL-FIRST] 0023's downgrade discipline, applied to the agent_id
     constraint this time: once an agent holds two bindings there is no
     honest single row to collapse onto, so the downgrade pre-flights and
-    refuses BY NAME, listing every row for the offending agent, rather than
-    failing with a bare duplicate-key error that names one binding and hides
-    which agent it belongs to.
+    refuses BY NAME, naming the offending agent, its kind(s), and its row
+    count, rather than failing with a bare duplicate-key error that names
+    one binding and hides which agent it belongs to. The refusal must NOT
+    name the bound addresses -- those would otherwise land in deployment
+    logs (security).
     """
 
     cfg = _at_below()
@@ -218,8 +293,12 @@ def test_downgrade_refuses_by_name_when_an_agent_holds_two_bindings(
 
     message = str(caught.value)
     assert str(agent_id) in message, message
-    assert "C0EXAMPLE1" in message, message
-    assert "ops@example.test" in message, message
+    assert "email" in message, message
+    assert "slack" in message, message
+    assert "rows: 2" in message, message
+    # Redaction is pinned: the addresses never appear in the refusal.
+    assert "C0EXAMPLE1" not in message, message
+    assert "ops@example.test" not in message, message
     # The refusal was total: both bindings survive.
     assert (
         len(

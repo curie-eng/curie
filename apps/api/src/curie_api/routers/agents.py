@@ -3,11 +3,13 @@
 import functools
 import tempfile
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -258,6 +260,56 @@ def _conflict_message(owner: uuid.UUID | None, agent_id: uuid.UUID, kind: str, a
     return _UNIQUE_CONSTRAINT_MESSAGES["agent_channels_kind_address_key"]
 
 
+# Postgres SQLSTATE for `deadlock_detected`. asyncpg surfaces it as `sqlstate`
+# on the driver exception SQLAlchemy wraps in `DBAPIError` -- and NOT as an
+# `IntegrityError`, so the unique-violation recovery below never sees it.
+_DEADLOCK_DETECTED = "40P01"
+
+# The 409 a broken deadlock earns. Deliberately the same STATUS as a taken
+# pair: from the caller's side both mean "the binding set moved under you, the
+# write did not land, retry" -- and a deadlock victim is the one caller for
+# whom a retry is near-certain to succeed, since its opponent has by then
+# committed. Left as a 500 it reads as a server fault and an operator stops
+# retrying the one request that would work.
+_DEADLOCK_MESSAGE = (
+    "the binding set changed concurrently: another binding write was moving "
+    "the same channel pairs and the database broke the tie by aborting this "
+    "request. Nothing was changed -- retry it."
+)
+
+
+def _is_deadlock(exc: DBAPIError) -> bool:
+    """Whether this wrapped driver error is Postgres breaking a lock cycle."""
+
+    return getattr(exc.orig, "sqlstate", None) == _DEADLOCK_DETECTED
+
+
+@asynccontextmanager
+async def _deadlock_as_conflict() -> AsyncIterator[None]:
+    """Turn a broken lock cycle into a retryable 409 instead of a 500.
+
+    `lock_agent_bindings` locks ONE agent's rows, but a `(kind, address)` pair
+    is globally unique: two callers swapping their agents' pairs in opposite
+    directions each hold their own agent's rows and then wait on the other's
+    uncommitted index entry. That is a genuine cycle, Postgres aborts one side
+    with `40P01`, and without this the victim gets an unexplained 500 for a
+    race it can simply retry.
+
+    Wraps the WHOLE handler body rather than the savepoint alone: the cycle can
+    close on the locking read, on the flush, or on the commit, and all three are
+    the same answer to the caller. A non-deadlock `DBAPIError` (`IntegrityError`
+    included, since it is a subclass) is re-raised untouched -- the unique
+    violation still belongs to the owner-accurate recovery below.
+    """
+
+    try:
+        yield
+    except DBAPIError as exc:
+        if not _is_deadlock(exc):
+            raise
+        raise HTTPException(status.HTTP_409_CONFLICT, _DEADLOCK_MESSAGE) from exc
+
+
 async def _raise_binding_conflict(
     exc: IntegrityError, session: AsyncSession, agent_id: uuid.UUID, channel: ChannelBindingWrite
 ) -> NoReturn:
@@ -291,17 +343,18 @@ async def add_agent_channel(
 ) -> AgentOut:
     """Bind this agent to one more channel. Appends; never moves."""
 
-    agent = await _agent_or_404(session, agent_id)
-    # Taken before the insert even though nothing is read from the set: it
-    # serializes this add against a concurrent move or delete of the same
-    # agent's bindings, which is what keeps the last-binding guard sound.
-    await crud.lock_agent_bindings(session, agent_id)
-    try:
-        async with session.begin_nested():  # SAVEPOINT
-            await crud.add_channel_binding(session, agent_id, data)
-    except IntegrityError as exc:
-        await _raise_binding_conflict(exc, session, agent_id, data)
-    return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+    async with _deadlock_as_conflict():
+        agent = await _agent_or_404(session, agent_id)
+        # Taken before the insert even though nothing is read from the set: it
+        # serializes this add against a concurrent move or delete of the same
+        # agent's bindings, which is what keeps the last-binding guard sound.
+        await crud.lock_agent_bindings(session, agent_id)
+        try:
+            async with session.begin_nested():  # SAVEPOINT
+                await crud.add_channel_binding(session, agent_id, data)
+        except IntegrityError as exc:
+            await _raise_binding_conflict(exc, session, agent_id, data)
+        return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
 
 
 @router.patch("/{agent_id}/channels", response_model=AgentOut)
@@ -323,24 +376,25 @@ async def move_agent_channel(
     rebind it never saw.
     """
 
-    agent = await _agent_or_404(session, agent_id)
-    bindings = await crud.lock_agent_bindings(session, agent_id)
-    binding = _binding_for(bindings, kind, address)
-    if expected_generation is not None and expected_generation != binding.generation:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"generation mismatch: expected {expected_generation}, "
-            f"stored {binding.generation}",
-        )
-    try:
-        async with session.begin_nested():  # SAVEPOINT
-            await crud.update_channel_binding(session, binding, data)
-    except IntegrityError as exc:
-        # The same recovery as the add: a move onto a pair another agent (or
-        # this one) already holds raises the identical violation and needs the
-        # identical owner recheck, inside the same still-live transaction.
-        await _raise_binding_conflict(exc, session, agent_id, data)
-    return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+    async with _deadlock_as_conflict():
+        agent = await _agent_or_404(session, agent_id)
+        bindings = await crud.lock_agent_bindings(session, agent_id)
+        binding = _binding_for(bindings, kind, address)
+        if expected_generation is not None and expected_generation != binding.generation:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"generation mismatch: expected {expected_generation}, "
+                f"stored {binding.generation}",
+            )
+        try:
+            async with session.begin_nested():  # SAVEPOINT
+                await crud.update_channel_binding(session, binding, data)
+        except IntegrityError as exc:
+            # The same recovery as the add: a move onto a pair another agent (or
+            # this one) already holds raises the identical violation and needs the
+            # identical owner recheck, inside the same still-live transaction.
+            await _raise_binding_conflict(exc, session, agent_id, data)
+        return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
 
 
 @router.delete("/{agent_id}/channels", status_code=status.HTTP_204_NO_CONTENT)
@@ -356,18 +410,19 @@ async def remove_agent_channel(
     pairs cannot both read "two left" and leave the agent at zero.
     """
 
-    await _agent_or_404(session, agent_id)
-    bindings = await crud.lock_agent_bindings(session, agent_id)
-    binding = _binding_for(bindings, kind, address)
-    if len(bindings) <= 1:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"{kind}:{address} is this agent's last binding; an agent with no "
-            "binding cannot receive a turn. Add another binding first, or "
-            "delete the agent.",
-        )
-    await crud.delete_channel_binding(session, binding)
-    await session.commit()
+    async with _deadlock_as_conflict():
+        await _agent_or_404(session, agent_id)
+        bindings = await crud.lock_agent_bindings(session, agent_id)
+        binding = _binding_for(bindings, kind, address)
+        if len(bindings) <= 1:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{kind}:{address} is this agent's last binding; an agent with no "
+                "binding cannot receive a turn. Add another binding first, or "
+                "delete the agent.",
+            )
+        await crud.delete_channel_binding(session, binding)
+        await session.commit()
 
 
 @router.post(

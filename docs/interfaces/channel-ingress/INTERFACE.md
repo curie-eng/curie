@@ -56,8 +56,8 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   worker-local `TargetRoute`. Slack's edit-in-place `chat.update`, its assistant-thread
   status, and the mrkdwn dialect all sit BELOW that port, in `SlackReplyAdapter` and
   `to_mrkdwn` (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`).
-- **Binding** — a channel resolves to a deployment by `agent_channels.address`
-  equality in `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
+- **Binding** — a channel resolves to a deployment by `agent_channels.(kind, address)`
+  pair equality in `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
   The binding is written as a neutral `{kind, address}` pair (ADR-0096, #1459), so a second
   channel binds its agent without a schema change. An agent may hold several bindings
   (ADR-0107); ingress still resolves one inbound `{kind, address}` pair to exactly one row.
@@ -73,8 +73,7 @@ via `curie local message` / `cluster message` (`cli/src/chat.rs`, `cli/src/messa
 
 ## Known leakage
 
-Two ends and the binding surface were cleaned; what remains is egress semantics and a
-routing key that carries no kind.
+Two ends and the binding surface were cleaned; what remains is egress semantics.
 
 - **Fixed (#7).** The ingress field names were Slack's (`slack_event_id`, `thread_ts`,
   `placeholder_ts`); the payload was promoted into `packages/aci-protocol` as `QueuedTurn`

@@ -116,7 +116,7 @@ state on stdout --
 - `--json --dry-run` emits a planned-action descriptor `{"dry_run": true,
   "target": "local"|"cluster", "stream": ..., "channel": ...,
   "reply_endpoint": ...}` (`channel` is null when it would be resolved from
-  the sole deployed agent).
+  the sole bound `(agent, Slack channel)` pair).
 
 The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two
 exceptions still print human text instead of JSON on success (tracked in
@@ -322,8 +322,9 @@ curie local message "what changed in the last deploy?"
 Local mode drops every cluster-specific step -- no kubectl, no `helm upgrade`
 wiring, no port-forwards, no dispatcher guard -- and answers by claiming a
 runner container on the host Docker daemon instead of a Kubernetes sandbox.
-Channel comes from `--channel` or, when omitted, the sole deployed agent
-looked up on the compose API. `local message` composes with `--channel`,
+Channel comes from `--channel` or, when omitted, the sole `(agent, Slack
+channel)` pair bound across deployed agents, looked up on the compose API.
+`local message` composes with `--channel`,
 `--thread`, and `--timeout-secs`, and rejects the cluster-only flags
 (`--namespace`, `--release`, `--force-wire`, ...) with a clear error.
 
@@ -398,11 +399,14 @@ What it does: self-manages its own port-forwards and a local reply-stub the
 release can post back to, so no manual `kubectl port-forward` is needed. Then:
 
 - **Picks a channel.** With no `--channel`, it looks up the sole deployed
-  `(agent, channel)` PAIR via the API; zero or multiple pairs is an error
-  requiring `--channel` explicitly (the worker binds a channel to an agent by
-  exact equality, so guessing would route nowhere). Selection counts pairs, not
-  agents (ADR-0107), so a single deployed agent bound to two channels is
-  ambiguous too.
+  `(agent, Slack channel)` PAIR via the API; zero or multiple pairs is an error
+  naming the pairs and requiring `--channel` explicitly (the worker binds a
+  channel to an agent by exact `(kind, address)` equality, so guessing would
+  route nowhere). Selection counts pairs, not agents (ADR-0107), so a single
+  deployed agent bound to two channels is ambiguous too -- what you pick is a
+  channel, not an agent. Only Slack bindings are candidates, because this verb
+  sends a Slack turn; an address bound on another kind (webhook, email) is not
+  targetable here even though the platform allows the same address on both.
 - **Wires the worker at the stub** (`--wire`, the default) via a `helm
   upgrade`, and waits for the rollout. `--no-wire` instead refuses to run
   unless the worker is already wired, printing the exact command to apply.

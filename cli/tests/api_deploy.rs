@@ -3,7 +3,7 @@
 
 mod support;
 
-use curie::api::{ApiClient, DeployOutcome};
+use curie::api::{ApiClient, ChannelOutcome, DeployOutcome};
 use curie::bundle::pack_tar_gz;
 use curie::scaffold::scaffold;
 use support::{serve, MockServer, Response};
@@ -522,55 +522,50 @@ async fn redeploy_surfaces_a_409_when_another_agent_owns_the_pair() {
     );
 }
 
-// [FAIL-FIRST -- ENABLE WITH S4 IMPLEMENTATION] redeploy_reports_the_binding_set_it_ended_with
-//
-// `ChannelOutcome::Added` / `Unchanged { channels, passed }` do not exist yet
-// (S4.4 replaces `Updated { from, to }`), so this cannot compile today. It is
-// the summary-line half of the two tests above: they pin the WIRE, this pins
-// what the operator is told.
-//
-// #[tokio::test]
-// async fn redeploy_reports_the_binding_set_it_ended_with() {
-//     let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
-//         ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
-//         ("POST", p) if *p == channels_path() => Response::json(
-//             201,
-//             &agent_json_channels(AGENT_ID, AGENT_NAME, &[BOUND, OTHER], None),
-//         ),
-//         (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
-//     });
-//     let client = ApiClient::new(&server.base_url, "k").unwrap();
-//
-//     let added = run_deploy(&client, Some(OTHER), None).await;
-//     assert_eq!(
-//         added.channel,
-//         ChannelOutcome::Added {
-//             address: OTHER.to_string()
-//         },
-//         "an added binding reports the address it added, not a move"
-//     );
-//
-//     // No flag passed: every binding is reported, so an operator can see that
-//     // a second channel is live rather than only the one they last named.
-//     let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
-//         ("GET", "/agents") => existing_agents(&agent_json_channels(
-//             AGENT_ID,
-//             AGENT_NAME,
-//             &[BOUND, OTHER],
-//             None,
-//         )),
-//         (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
-//     });
-//     let client = ApiClient::new(&server.base_url, "k").unwrap();
-//     let unchanged = run_deploy(&client, None, None).await;
-//     assert_eq!(
-//         unchanged.channel,
-//         ChannelOutcome::Unchanged {
-//             channels: vec![BOUND.to_string(), OTHER.to_string()],
-//             passed: false,
-//         }
-//     );
-// }
+/// The summary-line half of the two tests above: they pin the WIRE, this pins
+/// what the operator is told.
+#[tokio::test]
+async fn redeploy_reports_the_binding_set_it_ended_with() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+        ("POST", p) if *p == channels_path() => Response::json(
+            201,
+            &agent_json_channels(AGENT_ID, AGENT_NAME, &[BOUND, OTHER], None),
+        ),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+
+    let added = run_deploy(&client, Some(OTHER), None).await;
+    assert_eq!(
+        added.channel,
+        ChannelOutcome::Added {
+            address: OTHER.to_string()
+        },
+        "an added binding reports the address it added, not a move"
+    );
+
+    // No flag passed: every binding is reported, so an operator can see that
+    // a second channel is live rather than only the one they last named.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json_channels(
+            AGENT_ID,
+            AGENT_NAME,
+            &[BOUND, OTHER],
+            None,
+        )),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let unchanged = run_deploy(&client, None, None).await;
+    assert_eq!(
+        unchanged.channel,
+        ChannelOutcome::Unchanged {
+            channels: vec![BOUND.to_string(), OTHER.to_string()],
+            passed: false,
+        }
+    );
+}
 
 #[tokio::test]
 async fn deploy_binds_an_unbound_agents_repo() {
