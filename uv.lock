@@ -570,14 +570,27 @@ requires-dist = [
 
 [[package]]
 name = "curie-channel-protocol"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "packages/channel-protocol" }
 dependencies = [
     { name = "pydantic" },
 ]
 
+[package.optional-dependencies]
+conformance = [
+    { name = "httpx" },
+    { name = "jsonschema" },
+    { name = "pyyaml" },
+]
+
 [package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.9" }]
+requires-dist = [
+    { name = "httpx", marker = "extra == 'conformance'", specifier = ">=0.27" },
+    { name = "jsonschema", marker = "extra == 'conformance'", specifier = ">=4.23" },
+    { name = "pydantic", specifier = ">=2.9" },
+    { name = "pyyaml", marker = "extra == 'conformance'", specifier = ">=6.0" },
+]
+provides-extras = ["conformance"]
 
 [[package]]
 name = "curie-dispatcher"

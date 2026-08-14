@@ -1,0 +1,141 @@
+{
+  "$defs": {
+    "AdapterConformance": {
+      "additionalProperties": false,
+      "description": "What this adapter claims about the reply wire it speaks.\n\n``wire_version`` is the reply wire (ADR-0096), imported from ``reply.py``\nand never re typed here. It is INDEPENDENT of the profile's own ``version``:\nconflating the two would let a wire bump silently invalidate every profile.",
+      "properties": {
+        "mints_reply_ref": {
+          "description": "Whether the adapter mints an opaque reply_ref the platform can address a later edit to. False means every reply is a fresh post.",
+          "title": "Mints Reply Ref",
+          "type": "boolean"
+        },
+        "wire_version": {
+          "const": "1.0",
+          "description": "The reply wire version this adapter speaks, from channel_protocol.reply.",
+          "title": "Wire Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wire_version",
+        "mints_reply_ref"
+      ],
+      "title": "AdapterConformance",
+      "type": "object"
+    },
+    "AdapterCredentials": {
+      "additionalProperties": false,
+      "description": "Which credential identities this adapter expects, by NAME only.\n\n``egress`` is a non binding SUGGESTION. It is authority for nothing: the\nworker's credential map is indexed by the slug the binding carries, so a\nprofile that named another adapter's slug would redirect that adapter's\nsecret. ``curie adapter bind`` therefore requires an operator supplied slug\nand the profile's value is only ever a default shown for confirmation.\n\n``egress_secret_env`` and ``ingress_token_env`` are DOCUMENTATION of what\nthe adapter itself reads. Nothing in Curie resolves them: the conformance\nkit and the CLI take a secret at the invocation boundary instead, so a\nprofile can never choose which of an operator's secrets gets read.",
+      "properties": {
+        "egress": {
+          "description": "The egress credential identity this adapter suggests. A SUGGESTION only: bind requires an operator supplied slug and never takes this value alone.",
+          "pattern": "^[a-z0-9]+(?:[-_][a-z0-9]+)*$",
+          "title": "Egress",
+          "type": "string"
+        },
+        "egress_secret_env": {
+          "description": "The environment variable the ADAPTER reads its egress secret from. Documentation only. Curie never resolves this name.",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "title": "Egress Secret Env",
+          "type": "string"
+        },
+        "ingress_token_env": {
+          "description": "The environment variable the ADAPTER reads its ingress token from. Documentation only. Curie never resolves this name.",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "title": "Ingress Token Env",
+          "type": "string"
+        }
+      },
+      "required": [
+        "egress",
+        "egress_secret_env",
+        "ingress_token_env"
+      ],
+      "title": "AdapterCredentials",
+      "type": "object"
+    },
+    "AdapterProfile": {
+      "additionalProperties": false,
+      "description": "One install's binding profile for one adapter.\n\nClosed by construction (``extra='forbid'``), so a typo'd key is refused\ninstead of silently ignored. Read it through ``load_profile``, never\nthrough ``model_validate`` directly: the version check has to run first.",
+      "properties": {
+        "address": {
+          "$ref": "#/$defs/AddressShape"
+        },
+        "conformance": {
+          "$ref": "#/$defs/AdapterConformance"
+        },
+        "credentials": {
+          "$ref": "#/$defs/AdapterCredentials"
+        },
+        "endpoint": {
+          "anyOf": [
+            {
+              "pattern": "^https?://[^\\s/?#@]+(?:[/?#][^\\s]*)?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The absolute http or https route this install's worker POSTs reply events to. OPTIONAL here: the verbs that need a concrete route (bind, token, smoke-test) require it at the verb boundary or take an override.",
+          "title": "Endpoint"
+        },
+        "kind": {
+          "description": "The channel kind this adapter owns, as a lowercase slug.",
+          "pattern": "^[a-z0-9]+(?:[-_][a-z0-9]+)*$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "description": "The adapter profile format version this file is written against.",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "kind",
+        "address",
+        "credentials",
+        "conformance"
+      ],
+      "title": "AdapterProfile",
+      "type": "object"
+    },
+    "AddressShape": {
+      "additionalProperties": false,
+      "description": "The address form this adapter owns, as a regex plus an operator legible example.\n\n``pattern`` is the tier 3 paired validator: the Rust ``regex`` dialect is\nthe floor, so a pattern Python ``re`` compiles and Rust refuses is rejected\nhere too. Without that, a profile would validate in the Python kit and fail\nin ``curie adapter validate`` with no shared rule to point at.",
+      "properties": {
+        "description": {
+          "description": "What this address identifies, in the channel's terms.",
+          "title": "Description",
+          "type": "string"
+        },
+        "example": {
+          "description": "A concrete address of this shape, for operator docs.",
+          "title": "Example",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "A regex the address must match. It has to compile in BOTH Python re and the Rust regex crate, so lookaround and backreferences are refused.",
+          "minLength": 1,
+          "title": "Pattern",
+          "type": "string"
+        }
+      },
+      "required": [
+        "description",
+        "pattern",
+        "example"
+      ],
+      "title": "AddressShape",
+      "type": "object"
+    }
+  },
+  "$id": "https://curietech.ai/schemas/adapter-profile.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "manifestVersion": "1.0",
+  "title": "Curie Adapter Manifest v1.0"
+}
