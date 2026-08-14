@@ -131,4 +131,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0102 | [Accepted alongside implementation with explicit approval](0102-accepted-alongside-implementation-with-explicit-approval.md) | Accepted |
 | 0103 | [Previous schema shape gate](0103-previous-schema-shape-gate.md) | Accepted |
 | 0104 | [A named security posture is computed from the layers that exist, never configured](0104-a-named-security-posture-is-computed-not-configured.md) | Draft |
+| 0105 | [One release owns a cluster's shared singletons; every other release declares what it needs from them](0105-one-release-owns-a-clusters-shared-singletons.md) | Draft |
 <!-- END GENERATED: adr-index -->
