@@ -407,6 +407,37 @@ def test_non_conformant_stub_fails_rule_6_when_it_double_sends_a_duplicate(
         assert rule_status(report, 6) == "fail", report.detail()
 
 
+def test_non_conformant_stub_fails_rule_6_when_it_rejects_a_finished_conversation(
+    tmp_path: Path, secret: str
+) -> None:
+    """Rule 6's second half, against an adapter that passes its first half.
+
+    This adapter dedupes perfectly: the exact duplicate event_id is tolerated
+    and answered once, so the whole probe the clause is named for reads clean.
+    What it refuses is a further completion for a conversation it has already
+    retired, which is what a second turn on that conversation looks like, and
+    what a sweeper draining a record after an outage looks like. A clause that
+    probes a FRESH conversation there reads this adapter as conformant, because
+    a conversation it has never seen is not one it has finished.
+    """
+
+    with _running(
+        non_conformant_stub(
+            "rejects_finished_conversation",
+            secret=secret,
+            state_path=tmp_path / "state.json",
+        )
+    ) as stub:
+        report = _report_for(stub, secret)
+
+        assert rule_status(report, 6) == "fail", report.detail()
+        assert report.automated_floor == "fail", report.detail()
+        # The dedupe half genuinely held, so the failure is attributable to the
+        # tolerance half and not to a break bleeding across the clause.
+        assert "already finished" in clause(report, "6").detail, report.detail()
+        assert "redelivered" not in clause(report, "6").detail, report.detail()
+
+
 def test_ack_of_exactly_the_cap_passes_and_one_byte_over_fails(
     tmp_path: Path, secret: str
 ) -> None:

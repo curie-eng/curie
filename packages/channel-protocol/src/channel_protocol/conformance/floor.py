@@ -599,11 +599,25 @@ def _rule_6(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> Floor
 
 
 def _clause_6(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> ClauseResult:
-    """A duplicate completion is acked but answered ONCE.
+    """A duplicate completion is acked but answered ONCE, and a finished
+    conversation still accepts a further completion.
 
-    Wire indistinguishable, which is the whole reason this needs a probe: an
-    adapter that answers the correspondent twice returns 200 to both posts,
-    exactly like one that suppressed the duplicate.
+    The first half is wire indistinguishable, which is the whole reason this
+    needs a probe: an adapter that answers the correspondent twice returns 200
+    to both posts, exactly like one that suppressed the duplicate.
+
+    The second half is about the SAME conversation, and it has to be, or it is
+    not the rule. The kit drives one conversation to a completed state through
+    the ordinary path, then posts another completion for THAT conversation
+    under a NEW event_id. Sending a fresh conversation instead would probe
+    whether the adapter tolerates a completion it has never seen, which no floor
+    rule asks for and which every adapter that fails this one still passes.
+
+    A new event_id on a finished conversation is ordinary traffic rather than a
+    redelivery: a conversation with more than one turn produces exactly this,
+    and so does a sweeper draining a record after an outage. An adapter that
+    treats its own retirement of a conversation as final breaks the platform
+    here, and it answers the duplicate perfectly while doing it.
     """
 
     if probe is None:
@@ -613,17 +627,20 @@ def _clause_6(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> Cla
             "no side effect probe was supplied, and both acks are 2xx whether or not "
             "the duplicate was suppressed",
         )
+    conversation = new_conversation_id()
     completed = turn_completed(
-        adapter, conversation_id=new_conversation_id(), event_id=new_event_id()
+        adapter, conversation_id=conversation, event_id=new_event_id()
     )
     try:
         before = probe()
         first = adapter.post_event(completed, secret=adapter.secret)
         second = adapter.post_event(completed, secret=adapter.secret)
         after = probe()
+        # The same conversation, which the two posts above have now finished,
+        # receiving a further completion under an event_id it has never seen.
         finished = adapter.post_event(
             turn_completed(
-                adapter, conversation_id=new_conversation_id(), event_id=new_event_id()
+                adapter, conversation_id=conversation, event_id=new_event_id()
             ),
             secret=adapter.secret,
         )
@@ -641,13 +658,16 @@ def _clause_6(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> Cla
         )
     if not _is_2xx(finished.status):
         problems.append(
-            f"answered {finished.status} to a turn.completed for a conversation it "
-            "has never seen"
+            f"answered {finished.status} to a further turn.completed for a "
+            "conversation it had already finished, so a later turn on a retired "
+            "conversation, and a sweeper draining a record after an outage, both "
+            "break against this adapter"
         )
     return _verdict(
         "6",
         problems,
-        f"a duplicate event_id moved the side effect count by {after - before}",
+        f"a duplicate event_id moved the side effect count by {after - before}, and a "
+        "further completion for the conversation it had just finished was accepted",
     )
 
 

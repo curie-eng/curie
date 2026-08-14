@@ -78,8 +78,12 @@ class StubBehavior:
     probe_chunked_bytes: int | None = None
     # Rule 5 (handles all four events).
     rejects_turn_status: bool = False
-    # Rule 6 (dedupe on event_id).
+    # Rule 6 (dedupe on event_id, and tolerate a finished conversation).
     double_sends_duplicate: bool = False
+    # Treats its own retirement of a conversation as final: the exact duplicate
+    # is tolerated, and a NEW event_id for that conversation is refused. A
+    # multi turn conversation and an outage sweeper both produce that traffic.
+    rejects_finished_conversation: bool = False
     # Rule 1 (stable delivery_id).
     fresh_delivery_id_per_retry: bool = False
     # How long the adapter waits before its FIRST attempt. Long enough and a
@@ -118,6 +122,7 @@ BREAKS: dict[str, StubBehavior] = {
     "empty_ack_body": StubBehavior(empty_ack_body=True),
     "rejects_turn_status": StubBehavior(rejects_turn_status=True),
     "double_sends_duplicate": StubBehavior(double_sends_duplicate=True),
+    "rejects_finished_conversation": StubBehavior(rejects_finished_conversation=True),
     "fresh_delivery_id_per_retry": StubBehavior(fresh_delivery_id_per_retry=True),
     "retries_after_202": StubBehavior(retries_after_202=True),
     "posts_an_unrelated_delivery": StubBehavior(posts_an_unrelated_delivery=True),
@@ -408,6 +413,7 @@ class StubAdapter:
         self.held: list[dict[str, str]] = []
         self.delivered: list[str] = []
         self.seen_event_ids: list[str] = []
+        self.finished_conversations: list[str] = []
         self.events: list[dict[str, Any]] = []
         self._posted_unrelated = False
 
@@ -503,6 +509,24 @@ class StubAdapter:
             if name == "turn.completed":
                 event_id = str(decoded.get("event_id"))
                 duplicate = event_id in self.seen_event_ids
+                target = decoded.get("target")
+                conversation = (
+                    str(target.get("conversation_id"))
+                    if isinstance(target, dict)
+                    else ""
+                )
+                if (
+                    self.behavior.rejects_finished_conversation
+                    and not duplicate
+                    and conversation in self.finished_conversations
+                ):
+                    # Rule 6's second half, and it is invisible to the first: the
+                    # exact duplicate is still tolerated, so the dedupe probe
+                    # reads this adapter as conformant. Only a completion for a
+                    # conversation it has already retired is refused.
+                    return "reject"
+                if conversation and conversation not in self.finished_conversations:
+                    self.finished_conversations.append(conversation)
                 if not duplicate:
                     self.seen_event_ids.append(event_id)
                 if not duplicate or self.behavior.double_sends_duplicate:
@@ -540,6 +564,7 @@ class StubAdapter:
                 "held": len(self.held),
                 "delivered": list(self.delivered),
                 "seen_event_ids": list(self.seen_event_ids),
+                "finished_conversations": list(self.finished_conversations),
                 "events": list(self.events),
                 "retired": sorted(self._retired),
             }
@@ -748,6 +773,7 @@ class StubAdapter:
                     "held": self.held,
                     "delivered": self.delivered,
                     "seen_event_ids": self.seen_event_ids,
+                    "finished_conversations": self.finished_conversations,
                     "events": self.events,
                     "retired": sorted(self._retired),
                 }
@@ -764,6 +790,7 @@ class StubAdapter:
         self.stale_credential = bool(state.get("stale_credential", False))
         self.delivered = list(state.get("delivered", []))
         self.seen_event_ids = list(state.get("seen_event_ids", []))
+        self.finished_conversations = list(state.get("finished_conversations", []))
         self.events = list(state.get("events", []))
         self._retired = set(state.get("retired", []))
         # A held delivery is what "did not silently drop it" means: it comes
