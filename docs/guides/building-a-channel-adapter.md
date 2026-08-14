@@ -261,11 +261,31 @@ Fields:
 - `credentials`: `egress` (a slug, a suggestion only, see below),
   `egress_secret_env` and `ingress_token_env` (documentation of what the
   adapter itself reads; Curie never resolves either name).
-- `conformance`: `wire_version` (the reply wire this adapter speaks) and
-  `mints_reply_ref`.
+- `conformance`: `wire_version`, the reply wire this adapter speaks.
 
 The schema is closed (`additionalProperties: false`), so a typo'd key is
 refused rather than silently ignored.
+
+### The address pattern's regex dialect
+
+`address.pattern` has to compile under two engines: Python `re`, used by the
+Python conformance kit, and the Rust `regex` crate, used by `curie adapter
+validate`. The Rust crate is the narrower of the two, so it is the one that
+decides what is portable. `curie adapter validate` refuses a pattern the
+crate cannot compile even when Python `re` accepts it, so an author never
+ends up with a pattern that behaves differently on the two paths.
+
+Refused constructs:
+
+- Lookahead and lookbehind, positive or negative: `(?=`, `(?!`, `(?<=`, `(?<!`
+- Named backreferences: `(?P=`
+- Atomic groups: `(?>`
+- Conditional groups: `(?(`
+- Inline comment groups: `(?#`
+- The Python only ASCII flag: `(?a`
+- The Python only `\Z` end of string anchor (the crate spells this `\z`)
+- The Python only `\N` named character escape, which the crate has no
+  equivalent for
 
 ### Compatibility policy
 
@@ -278,6 +298,10 @@ adapter profile 1.0; the file declares 1.1. That check has to run first: a
 false`, and the operator reads "additional property not allowed" instead of
 the version they actually have to act on. A missing `version` key gets the
 same refusal, never a default.
+
+`version` also has to be spelled canonically: plain digits, no leading zero.
+`01.0` or `1.00` are refused as malformed before the acceptance check even
+runs, rather than parsed as `1.0`.
 
 Acceptance is same major, less or equal minor: a 1.0 build refuses 1.1 (it
 cannot know the new field is optional) and refuses 2.0 outright; a 1.1 build
