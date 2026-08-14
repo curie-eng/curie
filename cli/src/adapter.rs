@@ -124,11 +124,14 @@ pub struct AdapterCredentials {
 }
 
 /// What this adapter claims about the reply wire it speaks.
+///
+/// `wire_version` is the reply wire and is INDEPENDENT of the profile's own
+/// `version`: conflating the two would let a wire bump silently invalidate every
+/// profile.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterConformance {
     pub wire_version: String,
-    pub mints_reply_ref: bool,
 }
 
 /// The committed profile schema compiled with its root pointed at
@@ -146,10 +149,28 @@ fn profile_validator() -> &'static jsonschema::Validator {
 }
 
 /// Every way the committed schema rejects this document, joined.
+///
+/// A validation error renders the INSTANCE it rejected, and the one instance in
+/// this document that can carry a credential is `endpoint`: the very profile the
+/// schema refuses for embedding userinfo is the one whose error text would
+/// otherwise read `https://user:password@host/hook`. The endpoint is therefore
+/// reduced to scheme, host and port everywhere it appears in a diagnostic, the
+/// same reduction the payloads and the human renders use. Scrubbing the VALUE
+/// rather than one instance path is deliberate: an error raised at the document
+/// root would echo the endpoint too, and a path based rule would miss it.
 fn schema_errors(raw: &serde_json::Value) -> Option<String> {
+    let secret_bearing = raw.get("endpoint").and_then(|e| e.as_str());
     let errors: Vec<String> = profile_validator()
         .iter_errors(raw)
-        .map(|e| format!("{e} (at instance path {})", e.instance_path()))
+        .map(|e| {
+            let rendered = format!("{e} (at instance path {})", e.instance_path());
+            match secret_bearing {
+                Some(endpoint) if !endpoint.is_empty() => {
+                    rendered.replace(endpoint, &redacted(endpoint))
+                }
+                _ => rendered,
+            }
+        })
         .collect();
     (!errors.is_empty()).then(|| errors.join("; "))
 }
@@ -173,16 +194,7 @@ pub fn load_profile(file: &Path) -> Result<AdapterProfile> {
     let value: serde_json::Value = serde_norway::from_str(&raw)
         .map_err(|err| usage(format!("{} is not valid YAML: {err}", file.display())))?;
 
-    if let Some(declared) = value.get("version").and_then(|v| v.as_str()) {
-        if declared != PROFILE_VERSION {
-            return Err(usage(format!(
-                "{} declares adapter profile version {declared}; this build understands \
-                 version {PROFILE_VERSION}. Rewrite the profile against {PROFILE_VERSION}, \
-                 or use a Curie build that speaks {declared}.",
-                file.display()
-            )));
-        }
-    }
+    check_declared_version(&value, file)?;
 
     if let Some(errors) = schema_errors(&value) {
         return Err(usage(format!(
@@ -200,6 +212,79 @@ pub fn load_profile(file: &Path) -> Result<AdapterProfile> {
 
     compile_pattern(&profile.address.pattern, file)?;
     Ok(profile)
+}
+
+/// The acceptance check that runs before the schema ever sees the document, in
+/// the same three branches `channel_protocol.manifest.read_profile_version`
+/// uses. Collapsing any two of them is what makes the diagnostic wrong.
+///
+/// - **Absent.** No key at all. Reporting this as a schema error would bury it
+///   under whatever else the closed schema found.
+/// - **Present but not a string.** Unquoted `version: 1.1` is a YAML float, so
+///   a check that asked only for a string view would skip the version branch
+///   entirely and report unrelated schema errors instead. Reporting it as a
+///   MISSING key is just as wrong: it sends the author hunting for a key that is
+///   sitting on line one of their file. The message therefore names the value it
+///   found, what type that value is, and the quoted form.
+/// - **Present, a string, and unacceptable.** Names both versions.
+fn check_declared_version(value: &serde_json::Value, file: &Path) -> Result<()> {
+    let quoted_form = format!("write version: \"{PROFILE_VERSION}\"");
+    let understood = format!("this build understands adapter profile version {PROFILE_VERSION}");
+    match value.get("version") {
+        None => Err(usage(format!(
+            "{} declares no version key; {understood}. A profile version is a quoted \
+             string, so {quoted_form}.",
+            file.display()
+        ))),
+        Some(serde_json::Value::String(declared)) if declared.is_empty() => Err(usage(format!(
+            "{} declares an empty version key; {understood}. A profile version is a quoted \
+             string, so {quoted_form}.",
+            file.display()
+        ))),
+        Some(serde_json::Value::String(declared)) => {
+            if declared == PROFILE_VERSION {
+                return Ok(());
+            }
+            Err(usage(format!(
+                "{} declares adapter profile version {declared}; this build understands \
+                 version {PROFILE_VERSION}. Rewrite the profile against {PROFILE_VERSION}, \
+                 or use a Curie build that speaks {declared}.",
+                file.display()
+            )))
+        }
+        Some(other) => Err(usage(format!(
+            "{} declares version {}, which is {} and not a string; {understood}. A profile \
+             version is a quoted string, so {quoted_form}.",
+            file.display(),
+            scalar_or_type(other),
+            json_type_name(other),
+        ))),
+    }
+}
+
+/// A scalar rendered as the author wrote it, or its type alone. A `version` key
+/// holding a whole mapping is a mistake worth naming, but echoing the mapping
+/// back would put an arbitrary slice of the file into an error string.
+fn scalar_or_type(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            json_type_name(value).to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// What a non string `version` value IS, in the terms an author reading YAML
+/// would recognise.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "a list",
+        serde_json::Value::Object(_) => "a mapping",
+    }
 }
 
 /// The paired half of the address rule: the Rust regex dialect is the floor, so
@@ -310,7 +395,6 @@ pub fn scaffold(opts: ScaffoldOpts) -> Result<AdapterScaffoldOutput> {
         },
         conformance: AdapterConformance {
             wire_version: "1.0".to_string(),
-            mints_reply_ref: false,
         },
     };
 
@@ -322,16 +406,31 @@ pub fn scaffold(opts: ScaffoldOpts) -> Result<AdapterScaffoldOutput> {
     }
     compile_pattern(&profile.address.pattern, &file)?;
 
-    if file.exists() {
-        return Err(usage(format!(
-            "{} already exists; scaffold never overwrites a profile",
-            file.display()
-        )));
-    }
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let yaml = serde_norway::to_string(&profile).context("rendering the profile as YAML")?;
     let contents = format!("{}{yaml}", scaffold_header(&opts.address));
-    std::fs::write(&file, contents).with_context(|| format!("writing {}", file.display()))?;
+
+    // The never overwrites rule is enforced by the CREATE itself, not by an
+    // `exists()` test followed by a write. Those are two operations, and the gap
+    // between them is a substitution window: `exists()` follows symlinks and
+    // answers false for a dangling one, and `fs::write` follows symlinks and
+    // truncates whatever it lands on, so a link planted in the gap (or already
+    // sitting there) redirects the write onto a victim path. `create_new` asks
+    // the kernel for exclusive creation, which refuses any existing entry
+    // INCLUDING a symlink, and there is no gap to race.
+    let mut handle = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file)
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::AlreadyExists => usage(format!(
+                "{} already exists; scaffold never overwrites a profile",
+                file.display()
+            )),
+            _ => anyhow::Error::new(err).context(format!("writing {}", file.display())),
+        })?;
+    std::io::Write::write_all(&mut handle, contents.as_bytes())
+        .with_context(|| format!("writing {}", file.display()))?;
 
     let display = file.display().to_string();
     Ok(AdapterScaffoldOutput {

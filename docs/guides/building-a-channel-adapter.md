@@ -358,6 +358,55 @@ rule floor:
 The exit code follows `automated_floor`: nothing short of a full strict pass
 exits 0, so a README cannot claim conformance off a partial run.
 
+### The ingress driver
+
+Rules 1, 2, and 7, plus clause 3b, need something only you can provide: a way
+to point your adapter at the kit's ingress, inject an upstream message under a
+known id, tell whether your adapter is done with that delivery, and restart
+your adapter with one credential swapped. You give the kit that access by
+implementing `IngressDriver` (`channel_protocol.conformance.driver`) and
+passing it in, or naming a zero argument factory for one on `--driver`.
+
+The methods, and what each has to guarantee:
+
+- **`start(*, ingress_url, token)`** points your already running adapter at
+  the kit's ingress. Configuration only: the kit refuses to check an adapter
+  that has to be edited to be checked, because that is not the adapter your
+  operator runs.
+- **`reserve() -> UpstreamIdentity`** declares the `delivery_id` the next
+  `release` will carry, before that message exists. This is the load bearing
+  method. The kit correlates an observed POST to a stimulus by matching the
+  wire's `delivery_id` against what `reserve` returned, because that is the
+  only correlation an adapter running in another process or another language
+  can satisfy; it never reads your private in process state. If your
+  `reserve` returns an id your adapter does not actually send, rules 1 and 2
+  fail naming the mismatch, the same as a genuinely nonconformant adapter
+  would.
+- **`release(identity)`** delivers the message `reserve` declared. Injection
+  is deliberately the second step: rule 2 has to arm the ingress to answer
+  202 for that one identity before the identity can reach it, and a single
+  call that both declared and injected would leave a window where a
+  different, unrelated delivery in flight consumes that response instead.
+- **`settled(identity) -> bool`** reports whether your adapter has retired
+  this delivery, having either delivered it or given up on it. Rule 2's
+  finality check waits on this rather than a fixed clock, because no timer
+  survives a retry schedule patient enough to outlast it. Answer `False` for
+  as long as your adapter might still retry; a driver that never reports
+  `True` leaves rule 2 with no finality evidence to judge.
+- **`restart(*, egress_secret=..., token=...)`** restarts your adapter,
+  optionally replacing one credential. Both arguments default to the
+  unchanged sentinel, `Ellipsis`, because `None` is itself meaningful for
+  each: clause 3b calls `restart(egress_secret=None)` to prove your adapter
+  refuses to serve with no egress secret of its own, and rule 7 calls
+  `restart(token=<fresh>)` to hand you an operator-issued replacement ingress
+  token without disturbing the egress secret.
+- **`stop()`** stops your adapter, called once at the end of a run.
+
+Without a driver, rules 1, 2, and 7 and clause 3b all report `not_run`, and
+`not_run` is nonconformant: the kit never reads missing evidence as a pass.
+Supply the driver to get a real verdict on your delivery_id stability, your
+handling of a final 202, and your stale credential recovery.
+
 ### Verdict semantics
 
 `automated_floor` is `pass` or `fail` over the automatable clauses only. Two

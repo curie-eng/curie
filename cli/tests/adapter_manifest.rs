@@ -10,9 +10,9 @@
 //! byte identical corpus. Every valid case must parse AND carry its parsed values
 //! back out through `curie adapter validate --json`, and the valid cases
 //! deliberately differ in `kind`, `endpoint` presence, `address.pattern`,
-//! `credentials.egress` and `conformance.mints_reply_ref`, so an implementation
-//! that returns a constant instead of the parsed value dies on the comparison
-//! rather than tracking a self updating expectation.
+//! `credentials.egress` and `credentials.egress_secret_env`, so an
+//! implementation that returns a constant instead of the parsed value dies on
+//! the comparison rather than tracking a self updating expectation.
 //!
 //! The corpus tags each invalid case with the mechanism that enforces it:
 //!
@@ -389,9 +389,9 @@ fn rust_accepts_every_valid_corpus_profile() {
                 .unwrap_or_default()
                 .to_string(),
         );
-        seen.entry("mints_reply_ref")
+        seen.entry("egress_secret_env")
             .or_default()
-            .insert(case["conformance"]["mints_reply_ref"].to_string());
+            .insert(case["credentials"]["egress_secret_env"].to_string());
     }
     for (field, values) in &seen {
         assert!(
@@ -441,8 +441,12 @@ fn rust_accepts_every_valid_corpus_profile() {
             "payload: {payload}"
         );
         assert_eq!(
-            parsed["conformance"]["mints_reply_ref"], case["conformance"]["mints_reply_ref"],
+            parsed["conformance"]["wire_version"], case["conformance"]["wire_version"],
             "payload: {payload}"
+        );
+        assert!(
+            parsed["conformance"].get("mints_reply_ref").is_none(),
+            "mints_reply_ref left the contract; no payload may still report it: {payload}"
         );
         // The endpoint is the one parsed field the payload REDUCES rather than
         // carries: a profile route can hold a token in its path or query, and
@@ -628,6 +632,329 @@ fn version_is_checked_before_schema_validation() {
         !message.contains("retries"),
         "the unknown key must NOT be reported: a schema for a version we do not \
          speak has no authority over this file\n{message}"
+    );
+}
+
+/// The corpus case whose `why` carries this fragment, so a test names the rule
+/// it is exercising rather than an array index that renumbers on the next edit.
+fn invalid_case_saying(fragment: &str) -> serde_json::Value {
+    invalid_cases()
+        .into_iter()
+        .find(|(why, _, _)| why.contains(fragment))
+        .unwrap_or_else(|| panic!("the corpus carries an invalid case whose why says {fragment:?}"))
+        .2
+}
+
+/// Unquoted `version: 1.1` is a YAML float, so a version check that asked only
+/// for a string view finds nothing, skips its own branch, and reports whatever
+/// the closed schema found instead. A check that treats it as a MISSING key is
+/// just as wrong: it sends the author hunting for a key sitting on line one.
+///
+/// The corpus case carries an unknown `future_field` alongside it precisely so
+/// the two failures compete, and the version has to win.
+///
+/// Mutation to run against the implementation: read the version with
+/// `value.get("version").and_then(|v| v.as_str())`. The unknown property leaks
+/// into the message and this reds.
+#[test]
+fn a_numeric_version_is_a_version_error_that_names_the_value_and_the_quoted_form() {
+    assert_verb_routes("validate");
+    let profile = invalid_case_saying("version is the NUMBER 1.1");
+    let dir = tempdir();
+    let path = write_profile(dir.path(), &profile);
+
+    let output = run(&["adapter", "validate", "-f", path.to_str().unwrap()]);
+    assert_eq!(code(&output), 2, "{}", text(&output));
+    let message = text(&output);
+
+    assert!(
+        message.contains("1.1"),
+        "the message must name the value it found\n{message}"
+    );
+    assert!(
+        message.contains("not a string") && message.contains("number"),
+        "the message must say the value is present and of the wrong type\n{message}"
+    );
+    assert!(
+        message.contains(&format!("version: \"{}\"", "1.0")),
+        "the message must name the quoted form the author has to write\n{message}"
+    );
+    assert!(
+        !message.contains("future_field"),
+        "the version refusal must WIN: a schema for a version we do not speak has \
+         no authority over this file\n{message}"
+    );
+    assert!(
+        !message.contains("no version key"),
+        "a present value of the wrong type is not a missing key, and reporting it \
+         as one sends the author looking for a key that is already there\n{message}"
+    );
+}
+
+/// The other two branches of the same check, kept distinct for the same reason.
+/// A missing key is refused BEFORE the schema, so the operator reads the version
+/// rule rather than `version is a required property` buried in a list.
+#[test]
+fn an_absent_and_an_empty_version_are_each_their_own_refusal() {
+    assert_verb_routes("validate");
+    let base = routed_valid_case();
+
+    let mut absent = base.clone();
+    absent.as_object_mut().unwrap().remove("version");
+    let mut empty = base.clone();
+    empty["version"] = serde_json::json!("");
+
+    for (profile, expected) in [(absent, "no version key"), (empty, "empty version key")] {
+        let dir = tempdir();
+        let path = write_profile(dir.path(), &profile);
+        let output = run(&["adapter", "validate", "-f", path.to_str().unwrap()]);
+        assert_eq!(code(&output), 2, "{}", text(&output));
+        let message = text(&output);
+        assert!(
+            message.contains(expected),
+            "the refusal must say {expected:?}\n{message}"
+        );
+        assert!(
+            message.contains(&format!("version: \"{}\"", "1.0")),
+            "every version refusal names the quoted form\n{message}"
+        );
+    }
+}
+
+// ─── The Rust regex dialect IS the tier 3 floor ──────────────────────────────
+
+/// Every construct `channel_protocol.manifest._RUST_UNSUPPORTED_GROUPS` and
+/// `_RUST_UNSUPPORTED_ESCAPES` name must actually be refused by the crate this
+/// CLI matches addresses with. The Python table is a hand written mirror of a
+/// crate's behaviour, so it can only be trusted against the crate itself: a
+/// construct listed there that `regex` in fact ACCEPTS would mean Python is
+/// refusing profiles `curie adapter validate` would take, which is drift in the
+/// direction no corpus case can catch.
+#[test]
+fn the_regex_crate_refuses_every_construct_python_lists_as_unsupported() {
+    let unsupported = [
+        ("lookahead", "^(?=.*@)[a-z0-9@.]+$"),
+        ("negative lookahead", "^(?!admin)[a-z]+$"),
+        ("lookbehind", "(?<=@)[a-z0-9.]+$"),
+        ("negative lookbehind", "(?<!@)[a-z0-9.]+$"),
+        ("backreference", r"^([a-z0-9]+)@\1\.example\.test$"),
+        ("named backreference", "^(?P<a>[a-z]+)(?P=a)$"),
+        ("atomic group", "^(?>a)$"),
+        (
+            "conditional group",
+            r"^([a-z]+)?(?(1)@example\.test|admin)$",
+        ),
+        (
+            "inline comment group",
+            r"^[a-z0-9]+(?#the local part)@example\.test$",
+        ),
+        ("ASCII flag", r"(?a)^[a-z0-9]+@example\.test$"),
+        ("end of string anchor", r"^[a-z0-9]+@example\.test\Z"),
+        (
+            "named character escape",
+            r"^[a-z0-9]+\N{COMMERCIAL AT}example\.test$",
+        ),
+    ];
+    for (name, pattern) in unsupported {
+        assert!(
+            regex::Regex::new(pattern).is_err(),
+            "the regex crate ACCEPTS {name} ({pattern:?}), so listing it as unsupported \
+             makes the Python validator refuse a profile this CLI would take"
+        );
+    }
+}
+
+/// The false positive control, and the reason the Python table's non entries are
+/// non entries. These four are accepted by the crate, so listing any of them
+/// would refuse a profile that is fine on both sides.
+#[test]
+fn the_regex_crate_accepts_the_constructs_python_deliberately_does_not_list() {
+    let supported = [
+        ("non capturing group", "^[a-z0-9]+(?:-[a-z0-9]+)*$"),
+        ("named group", "^(?P<local>[a-z]+)@example$"),
+        ("inline case insensitive flag", "(?i)^[a-z]+$"),
+        ("possessive quantifier", "^[a-z]++$"),
+    ];
+    for (name, pattern) in supported {
+        assert!(
+            regex::Regex::new(pattern).is_ok(),
+            "the regex crate refuses {name} ({pattern:?}); Python leaves it off the \
+             unsupported table, so the two validators now disagree"
+        );
+    }
+}
+
+/// The end to end half of the control: a valid corpus profile whose pattern uses
+/// an accepted construct still validates through the real binary, so the tier 3
+/// scan cannot be greened by refusing everything with a `(?` in it.
+#[test]
+fn a_profile_using_an_accepted_group_construct_still_validates() {
+    let profile = valid_cases()
+        .into_iter()
+        .find(|case| {
+            case["address"]["pattern"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("(?")
+        })
+        .expect("the corpus carries a valid pattern using a group construct");
+
+    let dir = tempdir();
+    let path = write_profile(dir.path(), &profile);
+    let output = run(&[
+        "adapter",
+        "validate",
+        "-f",
+        path.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(
+        code(&output),
+        0,
+        "an accepted construct must not be refused\n{}",
+        text(&output)
+    );
+    assert_eq!(stdout_json(&output)["ok"], serde_json::json!(true));
+}
+
+// ─── A schema diagnostic never echoes the endpoint ───────────────────────────
+
+/// The profile the schema refuses for embedding userinfo is exactly the one
+/// whose rejected instance value IS a credential. A validation error renders the
+/// instance it rejected, so the diagnostic has to carry the same reduction the
+/// payloads and the human renders carry.
+///
+/// Mutation to run against the implementation: format the errors as `{e}` with
+/// no scrub. This reds.
+#[test]
+fn a_schema_diagnostic_never_echoes_the_endpoints_credentials() {
+    assert_verb_routes("validate");
+    for (endpoint, secret) in [
+        (
+            "https://user:passw0rd@adapter.example.test/hook",
+            "passw0rd",
+        ),
+        (
+            "https://adapter.example.test/hook?ingress_token=qu3rys3cret",
+            "qu3rys3cret",
+        ),
+    ] {
+        let mut profile = routed_valid_case();
+        profile["endpoint"] = serde_json::json!(endpoint);
+        // Force a schema refusal that is NOT about the endpoint too, so the
+        // scrub is proven on a diagnostic the endpoint merely rides along in.
+        profile["kind"] = serde_json::json!("NotASlug");
+
+        let dir = tempdir();
+        let path = write_profile(dir.path(), &profile);
+        let output = run(&["adapter", "validate", "-f", path.to_str().unwrap()]);
+        assert_eq!(code(&output), 2, "{}", text(&output));
+
+        let message = text(&output);
+        assert!(
+            !message.contains(secret),
+            "a schema diagnostic must not echo the endpoint's credential {secret:?}\n{message}"
+        );
+        assert!(!message.contains("/hook"), "nor its path\n{message}");
+    }
+}
+
+// ─── `scaffold` creates exclusively, it does not check then write ────────────
+
+/// The no overwrite guarantee has to be the CREATE, not an `exists()` test
+/// followed by a write. Those are two operations, and a symlink slips between
+/// them: `Path::exists` FOLLOWS the link, so a DANGLING one answers false, and
+/// `fs::write` follows it too and creates the victim at the other end. The
+/// check passes, the write lands somewhere else, and the guarantee is gone
+/// without any race being needed.
+///
+/// A link to an existing file does not discriminate, because `exists()` happens
+/// to catch that one; the dangling case is the whole test.
+///
+/// Mutation to run against the implementation: restore the `file.exists()` check
+/// plus `std::fs::write`. The victim path gets created and this reds.
+#[test]
+#[cfg(unix)]
+fn scaffold_refuses_a_dangling_symlink_rather_than_writing_through_it() {
+    let dir = tempdir();
+    let victim = dir.path().join("victim.yaml");
+    assert!(!victim.exists(), "the victim must not exist yet");
+
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(root.join("demo")).expect("create the scaffold dir");
+    let planted = root.join("demo/adapter.yaml");
+    std::os::unix::fs::symlink(&victim, &planted).expect("plant the dangling symlink");
+
+    let output = run(&[
+        "adapter",
+        "scaffold",
+        "demo",
+        "--kind",
+        "email",
+        "--address",
+        "agent@example.test",
+        "--endpoint",
+        "https://h.example.test/curie",
+        "--adapter",
+        "demo-egress",
+        "--dir",
+        root.to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        code(&output),
+        2,
+        "an entry already at the destination is a usage error, a dangling symlink \
+         included\n{}",
+        text(&output)
+    );
+    assert!(
+        !victim.exists(),
+        "scaffold wrote THROUGH the link and created {}; exclusive creation is what \
+         makes the no overwrite rule true",
+        victim.display()
+    );
+    assert!(
+        text(&output).contains("never overwrites"),
+        "the refusal must name the rule\n{}",
+        text(&output)
+    );
+}
+
+/// The plain half of the same rule, so the symlink test above is not the only
+/// thing holding it up.
+#[test]
+fn scaffold_refuses_an_existing_profile() {
+    let dir = tempdir();
+    std::fs::create_dir_all(dir.path().join("demo")).expect("create the scaffold dir");
+    let existing = dir.path().join("demo/adapter.yaml");
+    std::fs::write(&existing, "mine\n").expect("write the existing profile");
+
+    let output = run(&[
+        "adapter",
+        "scaffold",
+        "demo",
+        "--kind",
+        "email",
+        "--address",
+        "agent@example.test",
+        "--endpoint",
+        "https://h.example.test/curie",
+        "--adapter",
+        "demo-egress",
+        "--dir",
+        dir.path().to_str().unwrap(),
+    ]);
+
+    assert_eq!(code(&output), 2, "{}", text(&output));
+    assert!(
+        text(&output).contains("never overwrites"),
+        "the refusal must name the rule\n{}",
+        text(&output)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&existing).expect("the profile survives"),
+        "mine\n"
     );
 }
 

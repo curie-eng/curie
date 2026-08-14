@@ -11,6 +11,7 @@ compares a value that survived parsing. None of them inspects an internal name.
 """
 
 import ast
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,10 +19,12 @@ from typing import Any
 
 import pytest
 from channel_protocol.manifest import (
+    PROFILE_VERSION,
     AdapterConformance,
     AdapterProfile,
     AddressShape,
     ProfileVersionError,
+    check_version,
     load_profile,
 )
 from channel_protocol.reply import REPLY_WIRE_VERSION
@@ -48,7 +51,7 @@ def _profile(**overrides: Any) -> dict[str, Any]:
             "egress_secret_env": "CURIE_EGRESS_SECRET",
             "ingress_token_env": "CURIE_INGRESS_TOKEN",
         },
-        "conformance": {"wire_version": "1.0", "mints_reply_ref": True},
+        "conformance": {"wire_version": "1.0"},
     }
     base.update(overrides)
     return base
@@ -82,7 +85,6 @@ def test_profile_round_trips() -> None:
     assert decoded.endpoint == "https://curie-mail-adapter.example.test/curie/reply"
     assert decoded.address.example == "agent@example.test"
     assert decoded.credentials.egress == "agentmail-sandbox"
-    assert decoded.conformance.mints_reply_ref is True
 
 
 def test_rejects_an_unknown_top_level_key() -> None:
@@ -155,31 +157,63 @@ def test_endpoint_is_optional() -> None:
 def test_rejects_a_pattern_rust_regex_cannot_compile() -> None:
     """The Rust regex dialect is the floor for ``address.pattern``.
 
-    Python ``re`` compiles lookaround and backreferences and the Rust ``regex``
-    crate refuses them, so a pattern that only Python accepts would be a silent
-    cross language divergence. This is the admitted paired validator: JSON
-    Schema cannot express the rule, so it lives in two implementations kept in
-    step by the shared corpus.
+    Python ``re`` compiles lookaround, backreferences, atomic and conditional
+    groups, inline comments, the ASCII flag, ``\\Z`` and ``\\N{...}``, and the
+    Rust ``regex`` crate refuses every one of them, so a pattern that only
+    Python accepts would be a silent cross language divergence. Each pattern
+    below was compiled against regex 1.13.1 to confirm it really is refused
+    there. This is the admitted paired validator: JSON Schema cannot express the
+    rule, so it lives in two implementations kept in step by the shared corpus.
     """
 
     address = _profile()["address"]
+
+    with pytest.raises(ValidationError):
+        AddressShape.model_validate(dict(address, pattern="^[a-z"))
+
     for pattern in (
-        "^[a-z",
         "^(?=.*@)[a-z0-9@.]+$",
+        "(?!x)[a-z0-9.]+$",
         "(?<=@)[a-z0-9.]+$",
+        "(?<!x)[a-z0-9.]+$",
         r"^([a-z0-9]+)@\1\.example\.test$",
+        r"^(?P<host>[a-z]+)@(?P=host)$",
+        "^(?>a)$",
+        r"^([a-z]+)?(?(1)@example\.test|admin)$",
+        r"^[a-z0-9]+(?#the local part)@example\.test$",
+        r"(?a)^[a-z0-9]+@example\.test$",
+        r"^[a-z0-9]+@example\.test\Z",
+        r"^[a-z0-9]+\N{COMMERCIAL AT}example\.test$",
     ):
+        re.compile(pattern)  # a divergence, not a plain syntax error Python also refuses
         with pytest.raises(ValidationError):
             AddressShape.model_validate(dict(address, pattern=pattern))
 
 
+def test_accepts_a_pattern_both_dialects_compile() -> None:
+    """The false positive control on the paired regex validator.
+
+    A scanner that refuses every ``(?`` would pass the rejection test above
+    while making non capturing groups and named groups, which the Rust ``regex``
+    crate compiles happily, unusable in a profile.
+    """
+
+    address = _profile()["address"]
+    for pattern in (
+        r"^(?:[a-z0-9]+)@example\.test$",
+        r"^(?P<local>[a-z0-9]+)@example\.test$",
+        r"(?i)^[A-Z0-9]+@example\.test$",
+        r"^[a-z0-9(?=)\\]+@example\.test$",
+        "^a*+$",
+    ):
+        assert AddressShape.model_validate(dict(address, pattern=pattern)).pattern == pattern
+
+
 def test_wire_version_is_the_reply_module_literal() -> None:
-    accepted = AdapterConformance.model_validate(
-        {"wire_version": REPLY_WIRE_VERSION, "mints_reply_ref": True}
-    )
+    accepted = AdapterConformance.model_validate({"wire_version": REPLY_WIRE_VERSION})
     assert accepted.wire_version == REPLY_WIRE_VERSION
     with pytest.raises(ValidationError):
-        AdapterConformance.model_validate({"wire_version": "2.0", "mints_reply_ref": True})
+        AdapterConformance.model_validate({"wire_version": "2.0"})
 
 
 def test_version_mismatch_is_refused_before_schema_validation() -> None:
@@ -202,8 +236,85 @@ def test_version_mismatch_is_refused_before_schema_validation() -> None:
 
     missing = _profile()
     del missing["version"]
-    with pytest.raises(ProfileVersionError):
+    with pytest.raises(ProfileVersionError) as absent:
         load_profile(missing)
+    assert "no version key" in str(absent.value)
+
+
+def test_a_non_string_version_names_the_value_it_found() -> None:
+    """A present key of the wrong type is not a missing key.
+
+    ``version: 1.1`` written unquoted is a YAML FLOAT, so the key is sitting on
+    line one of the file. Reporting that as "declares no version key" sends the
+    author looking for something already there, and reporting the unknown
+    property instead loses the version entirely.
+    """
+
+    with pytest.raises(ProfileVersionError) as numeric:
+        load_profile(_profile(version=1.1, future_field=True))
+    message = str(numeric.value)
+    assert "1.1" in message
+    assert "no version key" not in message
+    assert "future_field" not in message
+    assert '"1.0"' in message, "the message never states the quoted string form required"
+
+    with pytest.raises(ProfileVersionError) as boolean:
+        load_profile(_profile(version=True))
+    assert "no version key" not in str(boolean.value)
+
+    with pytest.raises(ProfileVersionError) as empty:
+        load_profile(_profile(version=""))
+    assert "no version key" not in str(empty.value)
+
+
+def test_a_non_canonical_version_spelling_is_refused_as_a_spelling() -> None:
+    """``01.0`` and ``1.00`` are refused, and the refusal says why.
+
+    The Rust CLI compares the declared string to ``1.0`` for equality, so a
+    Python side that parsed the two numbers and accepted these would take a
+    profile ``curie adapter validate`` refuses. Reporting them as a plain
+    mismatch leaves the operator staring at "understands 1.0, declares 01.0",
+    two versions that read as equal, with nothing to act on.
+    """
+
+    for spelling in ("01.0", "1.00", "1.0.0", "1", "v1.0", " 1.0"):
+        with pytest.raises(ProfileVersionError) as refused:
+            load_profile(_profile(version=spelling))
+        message = str(refused.value)
+        assert "canonical" in message, f"{spelling} was not refused as a spelling: {message}"
+        assert "leading zeros" in message
+
+    understood = load_profile(_profile(version=PROFILE_VERSION))
+    assert understood.version == PROFILE_VERSION
+
+    with pytest.raises(ProfileVersionError) as newer:
+        load_profile(_profile(version="1.1"))
+    assert "canonical" not in str(newer.value), (
+        "a version this build simply does not speak is being reported as a misspelling"
+    )
+
+
+def test_a_later_build_still_accepts_an_earlier_minor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The canonical spelling rule does not cost the compatible minor policy.
+
+    Same major and less or equal minor is what lets a third party keep a 1.0
+    profile we cannot force it to upgrade. Asserted by standing ``check_version``
+    up as a 1.1 build, because that policy is otherwise unobservable until the
+    day someone bumps ``PROFILE_VERSION``.
+    """
+
+    monkeypatch.setattr("channel_protocol.manifest.PROFILE_VERSION", "1.1")
+    check_version("1.0")
+    check_version("1.1")
+    with pytest.raises(ProfileVersionError) as older_build:
+        check_version("1.2")
+    assert "canonical" not in str(older_build.value)
+    with pytest.raises(ProfileVersionError):
+        check_version("2.0")
+    for spelling in ("01.1", "1.10.0", "1.01"):
+        with pytest.raises(ProfileVersionError) as misspelled:
+            check_version(spelling)
+        assert "canonical" in str(misspelled.value)
 
 
 def test_bare_import_pulls_no_http_client() -> None:

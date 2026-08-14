@@ -128,7 +128,6 @@ def test_valid_profiles_round_trip_compared_values() -> None:
         assert parsed.credentials.egress == profile["credentials"]["egress"]
         assert parsed.address.pattern == profile["address"]["pattern"]
         assert parsed.endpoint == profile.get("endpoint")
-        assert parsed.conformance.mints_reply_ref == profile["conformance"]["mints_reply_ref"]
         egress_values.add(profile["credentials"]["egress"])
         patterns.add(profile["address"]["pattern"])
 

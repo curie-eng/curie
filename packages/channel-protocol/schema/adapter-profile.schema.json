@@ -4,11 +4,6 @@
       "additionalProperties": false,
       "description": "What this adapter claims about the reply wire it speaks.\n\n``wire_version`` is the reply wire (ADR-0096), imported from ``reply.py``\nand never re typed here. It is INDEPENDENT of the profile's own ``version``:\nconflating the two would let a wire bump silently invalidate every profile.",
       "properties": {
-        "mints_reply_ref": {
-          "description": "Whether the adapter mints an opaque reply_ref the platform can address a later edit to. False means every reply is a fresh post.",
-          "title": "Mints Reply Ref",
-          "type": "boolean"
-        },
         "wire_version": {
           "const": "1.0",
           "description": "The reply wire version this adapter speaks, from channel_protocol.reply.",
@@ -17,8 +12,7 @@
         }
       },
       "required": [
-        "wire_version",
-        "mints_reply_ref"
+        "wire_version"
       ],
       "title": "AdapterConformance",
       "type": "object"
@@ -119,7 +113,7 @@
           "type": "string"
         },
         "pattern": {
-          "description": "A regex the address must match. It has to compile in BOTH Python re and the Rust regex crate, so lookaround and backreferences are refused.",
+          "description": "A regex the address must match. It has to compile in BOTH Python re and the Rust regex crate, so lookaround, backreferences, atomic and conditional groups, inline comments and Python only escapes are refused.",
           "minLength": 1,
           "title": "Pattern",
           "type": "string"

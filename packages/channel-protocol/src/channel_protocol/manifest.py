@@ -13,7 +13,13 @@ the version this build understands and the version the file declares. Run it
 the other way round and a 1.1 file trips the closed schema first, so the
 operator reads "additional property not allowed" instead of the version they
 actually have to act on. A missing ``version`` key is the same refusal, never a
-default.
+default, and a key PRESENT with a non string value is a THIRD refusal that
+names the value it found: unquoted ``version: 1.1`` is a YAML float, and
+reporting that as a missing key sends the author looking for a key that is
+already there. A non canonical SPELLING such as ``01.0`` is a FOURTH refusal
+that says so in those terms: the Rust CLI compares the declared string to
+``1.0`` for equality, so accepting it here would take a profile
+``curie adapter validate`` refuses.
 
 **Three validation tiers, unequally enforced, and the asymmetry is deliberate.**
 
@@ -70,30 +76,57 @@ _ENV_NAME_PATTERN = r"^[A-Z][A-Z0-9_]*$"
 # `_validate_channel_endpoint` remains the authority on what may be stored.
 _ENDPOINT_PATTERN = r"^https?://[^\s/?#@]+(?:[/?#][^\s]*)?$"
 
-# Constructs the Rust `regex` crate cannot compile. `(?:` and `(?<name>` are
-# both fine there, so the lookbehind forms are matched on their `=` and `!`
-# rather than on `(?<` alone.
+# Group openers the Rust `regex` crate cannot compile while Python `re` can.
+# `(?:`, `(?P<name>` and the `i m s x u` flag letters are fine on both sides, so
+# the lookbehind forms are matched on their `=` and `!` rather than on `(?<`
+# alone, and only the Python only `a` flag letter is listed. Every entry here
+# was checked against regex 1.13.1 by compiling it: a construct that crate in
+# fact accepts must not be listed, or this validator refuses a profile
+# `curie adapter validate` would take.
 _RUST_UNSUPPORTED_GROUPS = (
     ("(?=", "lookahead"),
     ("(?!", "negative lookahead"),
     ("(?<=", "lookbehind"),
     ("(?<!", "negative lookbehind"),
     ("(?P=", "a named backreference"),
+    ("(?>", "an atomic group"),
+    ("(?(", "a conditional group"),
+    ("(?#", "an inline comment group"),
+    ("(?a", "the Python only ASCII flag"),
 )
+
+# Escapes in the same class, keyed by the single character after the backslash.
+# `\Z` is Python's end of string anchor and the crate spells that `\z`; `\N` is
+# Python's named character escape and the crate has no equivalent. Both are
+# refused inside a character class too, which is correct: the crate rejects them
+# there as well.
+_RUST_UNSUPPORTED_ESCAPES = {
+    "Z": "the Python only \\Z anchor",
+    "N": "the Python only \\N named character escape",
+}
 
 
 class ProfileVersionError(Exception):
     """A profile declares a format version this build does not understand."""
 
 
+# The ONLY spelling of a profile version: two plain decimal numbers, neither
+# carrying a leading zero. Parsing `major.minor` numerically instead would make
+# `01.0` and `1.00` acceptable here, and the Rust CLI compares the declared
+# string to `1.0` for equality and refuses both. Python is the side that moves,
+# because `01.0` is malformed under any honest reading of the contract and
+# tightening here costs the Rust half nothing.
+_CANONICAL_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+
+
 def _version_parts(value: str) -> tuple[int, int]:
-    major, separator, minor = value.partition(".")
-    if not separator or not major.isdigit() or not minor.isdigit():
-        raise ValueError(f"{value!r} is not a major.minor profile version")
-    return int(major), int(minor)
+    match = _CANONICAL_VERSION.fullmatch(value)
+    if match is None:
+        raise ValueError(f"{value!r} is not a canonical major.minor profile version")
+    return int(match.group(1)), int(match.group(2))
 
 
-def _is_acceptable(declared: str) -> bool:
+def _is_acceptable(declared: tuple[int, int]) -> bool:
     """Same major, less or equal minor.
 
     A 1.0 build refuses 1.1 because it cannot know the property 1.1 added is
@@ -102,35 +135,59 @@ def _is_acceptable(declared: str) -> bool:
     to upgrade.
     """
 
-    understood_major, understood_minor = _version_parts(PROFILE_VERSION)
-    try:
-        declared_major, declared_minor = _version_parts(declared)
-    except ValueError:
-        return False
-    return declared_major == understood_major and declared_minor <= understood_minor
+    understood = _version_parts(PROFILE_VERSION)
+    return declared[0] == understood[0] and declared[1] <= understood[1]
 
 
 def read_profile_version(raw: Mapping[str, Any]) -> str:
-    """Read the raw ``version`` key, before anything else looks at the payload."""
+    """Read the raw ``version`` key, before anything else looks at the payload.
 
-    declared = raw.get("version")
-    if not isinstance(declared, str) or not declared:
+    A missing key and a key holding something other than a non empty string are
+    DIFFERENT refusals. Collapsing them reports ``version: 1.1`` (a YAML float,
+    because it was written unquoted) as "declares no version key", which sends
+    the author hunting for a key that is sitting on line one of their file.
+    """
+
+    understood = f"this curie understands adapter profile {PROFILE_VERSION}; "
+    if "version" not in raw:
+        raise ProfileVersionError(understood + "the profile declares no version key")
+    declared = raw["version"]
+    if not isinstance(declared, str):
         raise ProfileVersionError(
-            f"this curie understands adapter profile {PROFILE_VERSION}; "
-            "the profile declares no version key"
+            understood + f"the profile declares version {declared!r}, which is a "
+            f"{type(declared).__name__} and not a string. A profile version is a quoted "
+            f'string, so write version: "{PROFILE_VERSION}"'
+        )
+    if not declared:
+        raise ProfileVersionError(
+            understood + "the profile declares an empty version key. A profile version is "
+            f'a quoted string, so write version: "{PROFILE_VERSION}"'
         )
     return declared
 
 
 def check_version(declared: str) -> None:
-    """Refuse a version this build cannot read, naming BOTH versions."""
+    """Refuse a version this build cannot read, naming BOTH versions.
 
-    if _is_acceptable(declared):
+    A non canonical SPELLING is its own refusal, separate from a version this
+    build does not speak. An operator who typed ``01.0`` needs to be told the
+    spelling is wrong: told only "the profile declares 01.0" against an
+    understood 1.0, they read a version mismatch between two versions that look
+    equal and have nowhere to go.
+    """
+
+    understood = f"this curie understands adapter profile {PROFILE_VERSION}; "
+    try:
+        parts = _version_parts(declared)
+    except ValueError:
+        raise ProfileVersionError(
+            understood + f"the profile declares version {declared!r}, which is not a "
+            "canonical major.minor version. Both numbers are plain digits with no "
+            f'leading zeros, so write version: "{PROFILE_VERSION}"'
+        ) from None
+    if _is_acceptable(parts):
         return
-    raise ProfileVersionError(
-        f"this curie understands adapter profile {PROFILE_VERSION}; "
-        f"the profile declares {declared}"
-    )
+    raise ProfileVersionError(understood + f"the profile declares {declared}")
 
 
 def _rust_unsupported_construct(pattern: str) -> str | None:
@@ -150,6 +207,9 @@ def _rust_unsupported_construct(pattern: str) -> str | None:
                 return f"the backreference \\{following}"
             if following == "g":
                 return "a backreference"
+            unsupported = _RUST_UNSUPPORTED_ESCAPES.get(following)
+            if unsupported is not None:
+                return unsupported
             index += 2
             continue
         if in_class:
@@ -183,7 +243,8 @@ class AddressShape(BaseModel):
         min_length=1,
         description=(
             "A regex the address must match. It has to compile in BOTH Python re "
-            "and the Rust regex crate, so lookaround and backreferences are refused."
+            "and the Rust regex crate, so lookaround, backreferences, atomic and "
+            "conditional groups, inline comments and Python only escapes are refused."
         ),
     )
     example: str = Field(description="A concrete address of this shape, for operator docs.")
@@ -256,12 +317,6 @@ class AdapterConformance(BaseModel):
 
     wire_version: ReplyWireVersion = Field(
         description="The reply wire version this adapter speaks, from channel_protocol.reply."
-    )
-    mints_reply_ref: bool = Field(
-        description=(
-            "Whether the adapter mints an opaque reply_ref the platform can address "
-            "a later edit to. False means every reply is a fresh post."
-        )
     )
 
 

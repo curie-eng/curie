@@ -1866,7 +1866,7 @@ fn the_validate_payload_carries_the_parsed_profile() {
                 "egress_secret_env": "CURIE_EGRESS_SECRET",
                 "ingress_token_env": "CURIE_INGRESS_TOKEN",
             },
-            "conformance": {"wire_version": "1.0", "mints_reply_ref": true},
+            "conformance": {"wire_version": "1.0"},
         },
     });
     assert!(
@@ -1898,6 +1898,23 @@ fn the_validate_payload_carries_the_parsed_profile() {
         "an empty profile object must be rejected, or the parity comparison has \
          nothing to compare"
     );
+}
+
+/// `mints_reply_ref` left the profile contract: it was a fifth field with no
+/// consumer anywhere, `required` in a closed schema, so it was removed while
+/// removal was still free. Asserted across the whole adapter output surface
+/// rather than on the one schema that carried it, because a closed schema that
+/// re-declares it would make every profile written against the current contract
+/// invalid.
+#[test]
+fn no_adapter_payload_declares_the_retired_mints_reply_ref_field() {
+    for name in ADAPTER_SCHEMAS {
+        let declared = declared_property_names(&load_schema(name));
+        assert!(
+            !declared.contains("mints_reply_ref"),
+            "{name} still declares `mints_reply_ref`; declared {declared:?}"
+        );
+    }
 }
 
 /// The API refuses a non `slack` binding whose reply route is half set, so the

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/adapter-validate/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/adapter-validate/v1.json",
   "title": "curie adapter validate --json",
   "description": "The agent-facing payload of `curie adapter validate`: the profile it parsed, not just a verdict. The parsed values are what the cross language corpus compares against, so an implementation that returned a constant instead of carrying the parsed field through is caught. Credential IDENTITIES only, never a credential value.",
   "type": "object",
@@ -87,14 +87,10 @@
             "wire_version": {
               "type": "string",
               "description": "The reply wire version this adapter speaks, independent of the profile version."
-            },
-            "mints_reply_ref": {
-              "type": "boolean"
             }
           },
           "required": [
-            "wire_version",
-            "mints_reply_ref"
+            "wire_version"
           ]
         }
       },

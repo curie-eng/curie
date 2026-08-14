@@ -7,7 +7,7 @@
       "result": "AdapterBindOutput",
       "kind": "CliOutput",
       "schema": "adapter-bind.schema.json",
-      "version": "1.1"
+      "version": "1.0"
     },
     {
       "result": "AdapterScaffoldOutput",
@@ -31,7 +31,7 @@
       "result": "AdapterValidateOutput",
       "kind": "CliOutput",
       "schema": "adapter-validate.schema.json",
-      "version": "1.1"
+      "version": "1.0"
     },
     {
       "result": "ApplyOutput",

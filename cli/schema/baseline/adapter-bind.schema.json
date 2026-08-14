@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/adapter-bind/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/adapter-bind/v1.json",
   "title": "curie adapter bind --json",
   "description": "The agent-facing payload of `curie adapter bind`: the whole four field route that was written. The API refuses a non-slack binding whose reply route is half set, so all four fields are reported together. `adapter` is the operator supplied slug, never the profile's suggestion, because that slug selects which stored secret the worker sends.",
   "type": "object",

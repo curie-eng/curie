@@ -64,7 +64,7 @@ def _write_profile(tmp_path: Path) -> Path:
             "egress_secret_env": "CURIE_EGRESS_SECRET",
             "ingress_token_env": "CURIE_INGRESS_TOKEN",
         },
-        "conformance": {"wire_version": "1.0", "mints_reply_ref": True},
+        "conformance": {"wire_version": "1.0"},
     }
     path = tmp_path / "adapter.yaml"
     path.write_text(yaml.safe_dump(profile), encoding="utf-8")
