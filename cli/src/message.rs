@@ -417,23 +417,33 @@ pub fn local_api_base(api_url: Option<&str>) -> String {
 }
 
 /// Pick the channel to send as: an explicit `--channel` wins; otherwise the sole
-/// deployed agent's channel. Zero or multiple agents is an error naming
+/// deployed `(agent, channel)` PAIR. Selection counts pairs rather than agents
+/// (ADR-0107) because one agent may answer on several channels, and picking a
+/// channel is what this returns. Zero or multiple pairs is an error naming
 /// them and requiring `--channel`, because the worker binds a channel to an
 /// agent by exact equality -- guessing would silently route nowhere.
 pub fn select_channel(agents: &[Agent], explicit: Option<&str>) -> Result<String> {
     if let Some(channel) = explicit {
         return Ok(channel.to_string());
     }
-    match agents {
+    let pairs: Vec<(&str, &str)> = agents
+        .iter()
+        .flat_map(|a| {
+            a.channels
+                .iter()
+                .map(move |c| (a.name.as_str(), c.address.as_str()))
+        })
+        .collect();
+    match pairs.as_slice() {
         [] => bail!(
             "no agents are deployed on the platform API; deploy one with `curie local deploy` \
              or `curie cluster deploy`, or pass --channel <id>"
         ),
-        [only] => Ok(only.channel.address.clone()),
+        [(_, only)] => Ok((*only).to_string()),
         many => {
             let listed = many
                 .iter()
-                .map(|a| format!("{} -> {}", a.name, a.channel.address))
+                .map(|(name, address)| format!("{name} -> {address}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!("multiple agents are deployed; pass --channel <id> to pick one ({listed})")
@@ -2301,7 +2311,7 @@ pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String
     if let Some(channel) = channel {
         return agents
             .iter()
-            .find(|a| a.channel.address == channel)
+            .find(|a| a.channels.iter().any(|c| c.address == channel))
             .map(|a| a.id.clone())
             .ok_or_else(|| anyhow::anyhow!("no deployed agent has channel {channel:?}"));
     }
@@ -2314,7 +2324,11 @@ pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String
         many => {
             let listed = many
                 .iter()
-                .map(|a| format!("{} -> {}", a.name, a.channel.address))
+                .flat_map(|a| {
+                    a.channels
+                        .iter()
+                        .map(move |c| format!("{} -> {}", a.name, c.address))
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!("multiple agents are deployed; pass --channel <id> to pick one ({listed})")
@@ -2994,13 +3008,20 @@ mod tests {
     }
 
     fn agent(name: &str, channel: &str) -> Agent {
+        agent_bound_to(name, &[channel])
+    }
+
+    fn agent_bound_to(name: &str, channels: &[&str]) -> Agent {
         Agent {
             id: format!("id-{name}"),
             name: name.to_string(),
-            channel: crate::api::ChannelBinding {
-                kind: "slack".to_string(),
-                address: channel.to_string(),
-            },
+            channels: channels
+                .iter()
+                .map(|c| crate::api::ChannelBinding {
+                    kind: "slack".to_string(),
+                    address: c.to_string(),
+                })
+                .collect(),
             repo_full_name: None,
             approval_required_tools: None,
             approval_routes: None,
@@ -3194,81 +3215,61 @@ mod tests {
         assert!(err.contains("beta -> C2"), "{err}");
     }
 
-    // [FAIL-FIRST -- ENABLE WITH S4 IMPLEMENTATION] the pair-based `select_channel` trio
-    //
-    // None of these compile today: `Agent.channels` is `Vec<ChannelBinding>`
-    // only after S4.1, and the `agent_bound_to` fixture below needs it.
-    //
-    // When enabling, `agent(name, channel)` above becomes a one-binding wrapper
-    // over `agent_bound_to(name, &[channel])`, and the four existing
-    // `select_channel_*` tests keep their current assertions unchanged -- the
-    // pair list for one-binding agents reads exactly as the agent list did.
-    //
-    // fn agent_bound_to(name: &str, channels: &[&str]) -> Agent {
-    //     Agent {
-    //         id: format!("id-{name}"),
-    //         name: name.to_string(),
-    //         channels: channels
-    //             .iter()
-    //             .map(|c| crate::api::ChannelBinding {
-    //                 kind: "slack".to_string(),
-    //                 address: c.to_string(),
-    //             })
-    //             .collect(),
-    //         repo_full_name: None,
-    //         approval_required_tools: None,
-    //         approval_routes: None,
-    //         model: None,
-    //         thinking: None,
-    //     }
-    // }
-    //
-    // #[test]
-    // fn select_channel_uses_the_sole_bound_channel_across_agents() {
-    //     // Selection counts (agent, channel) PAIRS, not agents (D4). One pair
-    //     // across the whole platform is unambiguous however many agents are
-    //     // deployed, so an agent bound to nothing must not make the one real
-    //     // binding ambiguous.
-    //     let agents = [agent_bound_to("only", &["C0EXAMPLE1"]), agent_bound_to("idle", &[])];
-    //     assert_eq!(select_channel(&agents, None).unwrap(), "C0EXAMPLE1");
-    // }
-    //
-    // #[test]
-    // fn select_channel_errors_when_one_agent_has_two_channels_listing_both_pairs() {
-    //     // The heart of D4. Today's `[only]` arm returns `only.channel.address`
-    //     // and structurally CANNOT see a second binding, so a single deployed
-    //     // agent bound to two channels silently routes to whichever one the
-    //     // scalar column happened to hold. Two pairs is ambiguous, and the
-    //     // error must name BOTH so the operator can pick.
-    //     let agents = [agent_bound_to("solo", &["C0EXAMPLE1", "C0EXAMPLE2"])];
-    //     let err = select_channel(&agents, None).unwrap_err().to_string();
-    //     assert!(err.contains("--channel"), "{err}");
-    //     assert!(err.contains("solo -> C0EXAMPLE1"), "{err}");
-    //     assert!(err.contains("solo -> C0EXAMPLE2"), "{err}");
-    // }
-    //
-    // #[test]
-    // fn select_agent_id_matches_any_of_an_agents_channels() {
-    //     // `select_agent_id` resolves by channel too, and today's
-    //     // `.find(|a| a.channel.address == channel)` sees only the first
-    //     // binding: an explicit --channel naming the SECOND one would report
-    //     // "no deployed agent has channel ..." for an agent that plainly does.
-    //     let agents = [
-    //         agent_bound_to("one", &["C0EXAMPLE1", "C0EXAMPLE2"]),
-    //         agent_bound_to("two", &["C0EXAMPLE3"]),
-    //     ];
-    //     assert_eq!(select_agent_id(&agents, Some("C0EXAMPLE2")).unwrap(), "id-one");
-    //     assert_eq!(select_agent_id(&agents, Some("C0EXAMPLE3")).unwrap(), "id-two");
-    //     // An address bound to nobody still errors, naming it.
-    //     assert!(select_agent_id(&agents, Some("C0EXAMPLE9"))
-    //         .unwrap_err()
-    //         .to_string()
-    //         .contains("C0EXAMPLE9"));
-    //     // Agent selection still counts AGENTS, not pairs: a sole agent with
-    //     // two bindings is one agent, so it resolves with no flag. This is the
-    //     // deliberate asymmetry with `select_channel` above -- do not "fix" it.
-    //     assert_eq!(select_agent_id(&agents[..1], None).unwrap(), "id-one");
-    // }
+    #[test]
+    fn select_channel_uses_the_sole_bound_channel_across_agents() {
+        // Selection counts (agent, channel) PAIRS, not agents (D4). One pair
+        // across the whole platform is unambiguous however many agents are
+        // deployed, so an agent bound to nothing must not make the one real
+        // binding ambiguous.
+        let agents = [
+            agent_bound_to("only", &["C0EXAMPLE1"]),
+            agent_bound_to("idle", &[]),
+        ];
+        assert_eq!(select_channel(&agents, None).unwrap(), "C0EXAMPLE1");
+    }
+
+    #[test]
+    fn select_channel_errors_when_one_agent_has_two_channels_listing_both_pairs() {
+        // The heart of D4. Today's `[only]` arm returns `only.channel.address`
+        // and structurally CANNOT see a second binding, so a single deployed
+        // agent bound to two channels silently routes to whichever one the
+        // scalar column happened to hold. Two pairs is ambiguous, and the
+        // error must name BOTH so the operator can pick.
+        let agents = [agent_bound_to("solo", &["C0EXAMPLE1", "C0EXAMPLE2"])];
+        let err = select_channel(&agents, None).unwrap_err().to_string();
+        assert!(err.contains("--channel"), "{err}");
+        assert!(err.contains("solo -> C0EXAMPLE1"), "{err}");
+        assert!(err.contains("solo -> C0EXAMPLE2"), "{err}");
+    }
+
+    #[test]
+    fn select_agent_id_matches_any_of_an_agents_channels() {
+        // `select_agent_id` resolves by channel too, and today's
+        // `.find(|a| a.channel.address == channel)` sees only the first
+        // binding: an explicit --channel naming the SECOND one would report
+        // "no deployed agent has channel ..." for an agent that plainly does.
+        let agents = [
+            agent_bound_to("one", &["C0EXAMPLE1", "C0EXAMPLE2"]),
+            agent_bound_to("two", &["C0EXAMPLE3"]),
+        ];
+        assert_eq!(
+            select_agent_id(&agents, Some("C0EXAMPLE2")).unwrap(),
+            "id-one"
+        );
+        assert_eq!(
+            select_agent_id(&agents, Some("C0EXAMPLE3")).unwrap(),
+            "id-two"
+        );
+        // An address bound to nobody still errors, naming it.
+        assert!(select_agent_id(&agents, Some("C0EXAMPLE9"))
+            .unwrap_err()
+            .to_string()
+            .contains("C0EXAMPLE9"));
+        // Agent selection still counts AGENTS, not pairs: a sole agent with
+        // two bindings is one agent, so it resolves with no flag. This is the
+        // deliberate asymmetry with `select_channel` above -- do not "fix" it.
+        assert_eq!(select_agent_id(&agents[..1], None).unwrap(), "id-one");
+    }
 
     #[test]
     fn server_host_and_port_parses_scheme_host_port() {
@@ -3830,10 +3831,10 @@ mod tests {
             Agent {
                 id: "a1".into(),
                 name: "one".into(),
-                channel: crate::api::ChannelBinding {
+                channels: vec![crate::api::ChannelBinding {
                     kind: "slack".into(),
                     address: "C1".into(),
-                },
+                }],
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
@@ -3843,10 +3844,10 @@ mod tests {
             Agent {
                 id: "a2".into(),
                 name: "two".into(),
-                channel: crate::api::ChannelBinding {
+                channels: vec![crate::api::ChannelBinding {
                     kind: "slack".into(),
                     address: "C2".into(),
-                },
+                }],
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,

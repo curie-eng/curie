@@ -4,21 +4,25 @@ import functools
 import tempfile
 import uuid
 from pathlib import Path
+from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from .. import bundles, crud
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
+from ..models import Agent, AgentChannel
 from ..schemas import (
     AgentCreate,
     AgentOut,
     AgentUpdate,
     BundleFile,
     BundleFiles,
+    ChannelBindingWrite,
     ConnectorManifests,
     VersionCreate,
     VersionOut,
@@ -60,15 +64,11 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
         "agent per route (move or delete the other agent, or pick another "
         "address)"
     ),
-    # The reverse direction, which the old scalar column got for free and a
-    # child table would silently discard (ADR-0089: "one agent still binds one
-    # channel"). A different operator mistake from the one above, so a different
-    # message: sharing one message would misdiagnose both.
-    "agent_channels_agent_id_key": (
-        "that agent already has a channel binding; one agent binds one channel "
-        "(ADR-0089), so PATCH the agent's channel to move it rather than adding "
-        "a second binding"
-    ),
+    # No entry for `agent_channels_agent_id_key`: migration 0025 drops that
+    # constraint (ADR-0107), so its message can never fire again, and it said
+    # the opposite of what this API now does. A dead entry is worse than none --
+    # it reads as a protection. The pair constraint above is the ONLY binding
+    # conflict left.
 }
 
 
@@ -146,30 +146,13 @@ async def get_agent(agent_id: uuid.UUID, session: SessionDep) -> AgentOut:
 
 @router.patch("/{agent_id}", response_model=AgentOut)
 async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionDep) -> AgentOut:
-    # Lets a redeploy move an existing agent's channel (the CLI only sends this
-    # when a channel was passed explicitly). An omitted field is a no-op so the
-    # agent's current binding is preserved; an explicit null is refused by the
-    # schema rather than clearing it (there is no default binding to fall back
-    # to), so `is not None` here means exactly "the client sent a binding".
+    # No binding key here since ADR-0107: an agent may hold several bindings, so
+    # "move the agent's channel" has no referent and the write surface is the
+    # `/agents/{agent_id}/channels` subresource below. A caller still sending the
+    # retired key is refused by the schema (422), never ignored.
     agent = await crud.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    if data.channel is not None:
-        # The binding's address is unique (one agent per address, #38), so this is
-        # the one PATCHable field that can collide with another agent. Classify it
-        # the same way create does -- a caller conflict is a 409, not an opaque 500
-        # -- so the constraint cannot be sidestepped by creating on a free address
-        # and then moving onto a taken one. (Before #38 no PATCHable field was
-        # unique, which is why this path had no IntegrityError handler.)
-        try:
-            agent = await crud.update_agent_binding(session, agent, data.channel)
-        except IntegrityError as exc:
-            await session.rollback()
-            classified = classify_integrity_error(exc)
-            if classified is None:
-                raise
-            status_code, message = classified
-            raise HTTPException(status_code, message) from exc
     # Presence, not truthiness (#1310). `is not None` conflates "the client did
     # not mention this field" with "the client explicitly sent null", so setting
     # either override used to be a one-way door: nothing could put it back to the
@@ -217,6 +200,174 @@ async def delete_agent(agent_id: uuid.UUID, session: SessionDep) -> None:
             "agent has an active deployment; stop it before deleting",
         )
     await crud.delete_agent(session, agent_id)
+
+
+# --- the channel-binding subresource (ADR-0107, #1525) ------------------------
+#
+# One agent holds one or more `(kind, address)` bindings, so add, move and
+# remove are three verbs here instead of one overloaded `AgentUpdate.channel`
+# field, each with exactly one meaning. The pair selects the binding on PATCH
+# and DELETE, passed as QUERY parameters: it is the routing key every other
+# layer already uses (`binding._RESOLVE_SQL`, `agent_channels_kind_address_key`)
+# and an `address` is opaque per kind, so a `/` in one would have to survive as
+# `%2F` in a path segment -- a proxy hazard the query string does not have.
+
+
+async def _agent_or_404(session: AsyncSession, agent_id: uuid.UUID) -> Agent:
+    agent = await crud.get_agent(session, agent_id)
+    if agent is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    return agent
+
+
+def _binding_for(bindings: list[AgentChannel], kind: str, address: str) -> AgentChannel:
+    """Pick the pair's row out of THIS agent's locked set, or 404.
+
+    Selecting from the locked list rather than issuing a second, unlocked query
+    is what makes the lock load-bearing. It is also the authorization boundary:
+    a pair belonging to a DIFFERENT agent names no row here, so it reads as 404
+    rather than becoming a cross-agent write the caller sees a 200 for.
+    """
+
+    for binding in bindings:
+        if binding.kind == kind and binding.address == address:
+            return binding
+    raise HTTPException(
+        status.HTTP_404_NOT_FOUND,
+        f"this agent has no {kind}:{address} binding",
+    )
+
+
+def _conflict_message(owner: uuid.UUID | None, agent_id: uuid.UUID, kind: str, address: str) -> str:
+    """The 409 sentence for a taken pair, accurate about WHO holds it.
+
+    The generic map message says "another agent is already bound", which is
+    false -- and actively misleading -- when the duplicate is this agent's own:
+    it sends an operator looking for an agent that does not exist, and the CLI's
+    ensure-bound recheck cannot tell a satisfied desired state from a real
+    collision. A `None` owner means the winning row was deleted between the
+    failed insert and this lookup; the pair is free again, and the generic
+    sentence is the safe answer since either way the caller retries.
+    """
+
+    if owner is not None and owner == agent_id:
+        return (
+            f"this agent is already bound to {kind}:{address}; the binding you "
+            "asked for already exists, so nothing was changed"
+        )
+    return _UNIQUE_CONSTRAINT_MESSAGES["agent_channels_kind_address_key"]
+
+
+async def _raise_binding_conflict(
+    exc: IntegrityError, session: AsyncSession, agent_id: uuid.UUID, channel: ChannelBindingWrite
+) -> NoReturn:
+    """Turn a binding write's `IntegrityError` into an owner-accurate 409.
+
+    Runs after the SAVEPOINT rolled back -- and only the savepoint, so the outer
+    transaction and the row locks `lock_agent_bindings` took are still live and
+    the owner lookup reads the same serialized snapshot the guard above did. A
+    `session.rollback()` here would discard those locks and answer about a world
+    that may have moved again; no rollback would leave the session failed and
+    answer 500 `PendingRollbackError` on the lookup itself.
+
+    A non-unique violation (NOT NULL, FK) is a server fault, so it is re-raised
+    rather than dressed up as a conflict.
+    """
+
+    if classify_integrity_error(exc) is None:
+        raise exc
+    owner = await crud.agent_id_for_pair(session, channel.kind, channel.address)
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        _conflict_message(owner, agent_id, channel.kind, channel.address),
+    ) from exc
+
+
+@router.post(
+    "/{agent_id}/channels", response_model=AgentOut, status_code=status.HTTP_201_CREATED
+)
+async def add_agent_channel(
+    agent_id: uuid.UUID, data: ChannelBindingWrite, session: SessionDep
+) -> AgentOut:
+    """Bind this agent to one more channel. Appends; never moves."""
+
+    agent = await _agent_or_404(session, agent_id)
+    # Taken before the insert even though nothing is read from the set: it
+    # serializes this add against a concurrent move or delete of the same
+    # agent's bindings, which is what keeps the last-binding guard sound.
+    await crud.lock_agent_bindings(session, agent_id)
+    try:
+        async with session.begin_nested():  # SAVEPOINT
+            await crud.add_channel_binding(session, agent_id, data)
+    except IntegrityError as exc:
+        await _raise_binding_conflict(exc, session, agent_id, data)
+    return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+
+
+@router.patch("/{agent_id}/channels", response_model=AgentOut)
+async def move_agent_channel(
+    agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    data: ChannelBindingWrite,
+    session: SessionDep,
+    expected_generation: int | None = None,
+) -> AgentOut:
+    """Move (or re-assert) the binding the `(kind, address)` pair names.
+
+    `expected_generation` is an OPTIONAL compare-and-set, in the shape
+    `routers/state.py` uses for its versioned rows, so the two CAS surfaces read
+    alike. Optional because an operator moving a binding from the CLI has no
+    generation to quote; a channel adapter holding a token minted against
+    generation N does, and it is exactly the caller that must not overwrite a
+    rebind it never saw.
+    """
+
+    agent = await _agent_or_404(session, agent_id)
+    bindings = await crud.lock_agent_bindings(session, agent_id)
+    binding = _binding_for(bindings, kind, address)
+    if expected_generation is not None and expected_generation != binding.generation:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"generation mismatch: expected {expected_generation}, "
+            f"stored {binding.generation}",
+        )
+    try:
+        async with session.begin_nested():  # SAVEPOINT
+            await crud.update_channel_binding(session, binding, data)
+    except IntegrityError as exc:
+        # The same recovery as the add: a move onto a pair another agent (or
+        # this one) already holds raises the identical violation and needs the
+        # identical owner recheck, inside the same still-live transaction.
+        await _raise_binding_conflict(exc, session, agent_id, data)
+    return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+
+
+@router.delete("/{agent_id}/channels", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_agent_channel(
+    agent_id: uuid.UUID, kind: str, address: str, session: SessionDep
+) -> None:
+    """Unbind the pair, unless it is this agent's last binding.
+
+    The last one is refused: an agent with zero bindings is deployed,
+    healthy-looking and unable to receive a turn -- #38's silent-shadow state,
+    and the same reason `AgentCreate.channel` is required rather than optional.
+    The count comes from the locked set, so two concurrent deletes of different
+    pairs cannot both read "two left" and leave the agent at zero.
+    """
+
+    await _agent_or_404(session, agent_id)
+    bindings = await crud.lock_agent_bindings(session, agent_id)
+    binding = _binding_for(bindings, kind, address)
+    if len(bindings) <= 1:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{kind}:{address} is this agent's last binding; an agent with no "
+            "binding cannot receive a turn. Add another binding first, or "
+            "delete the agent.",
+        )
+    await crud.delete_channel_binding(session, binding)
+    await session.commit()
 
 
 @router.post(

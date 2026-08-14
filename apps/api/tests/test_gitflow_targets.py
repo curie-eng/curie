@@ -27,7 +27,7 @@ def agent(name: str, repo: str | None = REPO) -> Agent:
     return Agent(
         id=uuid.uuid4(),
         name=name,
-        channel=AgentChannel(kind="slack", address=f"C-{name}"),
+        channels=[AgentChannel(kind="slack", address=f"C-{name}")],
         repo_full_name=repo,
     )
 

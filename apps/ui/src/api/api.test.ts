@@ -3,8 +3,8 @@ import { bundleFileTree, buildBundleZip, bundleTreeFromFiles, nextVersionLabel }
 import {
   createAgent,
   updateAgent,
-  // [FAIL-FIRST] S5.2: patchAgentChannel does not exist yet; this import is
-  // undefined until the client adds it, so calling it below throws at runtime.
+  // ADR-0107 (S5.2): moves a single channel binding via the /channels
+  // subresource PATCH, naming the pair to move in the query string.
   patchAgentChannel,
   uploadBundle,
   BundleValidationError,
@@ -200,37 +200,41 @@ describe("agent-detail client calls", () => {
     expect(err.status).toBe(404);
   });
 
-  it("PATCHes the agent's channel binding and returns the updated agent", async () => {
+  // Channel binding moves now go through patchAgentChannel's subresource PATCH
+  // (below), not updateAgent -- ADR-0107 dropped `channel` from updateAgent's
+  // patch type entirely (the API 422s it). This exercises updateAgent's
+  // remaining mutable field, `model`, so the generic PATCH request shape
+  // (URL, method, body, headers) stays covered at the client-test layer.
+  it("PATCHes the agent's model and returns the updated agent", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(200, {
         id: "a1",
         name: "deal-desk",
-        channel: { kind: "slack", address: "C9999ZZZZ" },
+        channels: [{ kind: "slack", address: "C0123ABCD" }],
+        model: "glm-5.2",
         created_at: "now",
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const agent = await updateAgent("a1", { channel: { kind: "slack", address: "C9999ZZZZ" } });
-    expect(agent.channel.address).toBe("C9999ZZZZ");
+    const agent = await updateAgent("a1", { model: "glm-5.2" });
+    expect(agent.model).toBe("glm-5.2");
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/agents/a1");
     expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body)).toEqual({ channel: { kind: "slack", address: "C9999ZZZZ" } });
+    expect(JSON.parse(init.body)).toEqual({ model: "glm-5.2" });
     expect((init.headers as Record<string, string>)["X-API-Key"]).toBeTruthy();
   });
 
-  // [FAIL-FIRST] ADR-0107: an agent binds one-or-more channels, so AgentOut
-  // carries `channels: ChannelBinding[]`, ordered `(kind, address)`. This
-  // fixture mirrors today's real API response (a bare `channel` object, no
-  // `channels` key) -- the assertion fails until S3 lands the API contract
-  // and S5.1 widens the AgentOut type and its real fixtures accordingly.
+  // ADR-0107: an agent binds one-or-more channels, so AgentOut carries
+  // `channels: ChannelBinding[]`, ordered `(kind, address)` -- never a bare
+  // `channel` object.
   it("agent_out_carries_a_channels_array", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(200, [
         {
           id: "a1",
           name: "deal-desk",
-          channel: { kind: "slack", address: "C0EXAMPLE1" },
+          channels: [{ kind: "slack", address: "C0EXAMPLE1" }],
           model: null,
           created_at: "now",
         },
@@ -241,10 +245,10 @@ describe("agent-detail client calls", () => {
     expect(Array.isArray((agents[0] as unknown as { channels: unknown }).channels)).toBe(true);
   });
 
-  // [FAIL-FIRST] S5.2: patchAgentChannel does not exist on the client yet --
-  // it must PATCH the `/agents/{id}/channels` subresource, naming the binding
-  // to move via a `?kind=&address=` selector query string (never a body field,
-  // so the selector can never be confused with the replacement value).
+  // ADR-0107 (S5.2): patchAgentChannel PATCHes the `/agents/{id}/channels`
+  // subresource, naming the binding to move via a `?kind=&address=` selector
+  // query string (never a body field, so the selector can never be confused
+  // with the replacement value).
   it("patchAgentChannel_targets_the_subresource_with_the_pair_selector", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(200, {

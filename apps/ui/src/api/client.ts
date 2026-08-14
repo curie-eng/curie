@@ -8,11 +8,11 @@ export interface AppConfig {
   org_name: string;
 }
 
-// A channel-neutral binding: one agent binds exactly one channel (ADR-0089),
-// so the wire always carries a singular object, never an array or a plural
-// `channels` field. `kind` selects which address shape applies ("slack" is
-// the only kind the console can create today); `address` is the channel-kind
-// identifier the worker resolves against.
+// A channel-neutral binding: an agent binds one or more channels (ADR-0107),
+// so the wire carries a list, ordered `(kind, address)` server-side. `kind`
+// selects which address shape applies ("slack" is the only kind the console
+// can create today); `address` is the channel-kind identifier the worker
+// resolves against.
 export interface ChannelBinding {
   kind: string;
   address: string;
@@ -27,7 +27,9 @@ export const SLACK_ADDRESS_RE = /^[CDG][A-Z0-9]+$/;
 export interface AgentOut {
   id: string;
   name: string;
-  channel: ChannelBinding;
+  // One or more channel bindings (ADR-0107), ordered `(kind, address)`
+  // server-side.
+  channels: ChannelBinding[];
   // Per-agent model id, forwarded as CURIE_MODEL at boot (#254). null uses the
   // platform default model.
   model: string | null;
@@ -447,13 +449,34 @@ export async function getConfig(): Promise<AppConfig> {
 // platform default that clearing is supposed to restore.
 export async function updateAgent(
   agentId: string,
-  patch: { channel?: ChannelBinding; model?: string | null },
+  patch: { model?: string | null },
 ): Promise<AgentOut> {
   const resp = await fetch(url(`/agents/${agentId}`), {
     method: "PATCH",
     headers: headers({ "Content-Type": "application/json" }),
     body: JSON.stringify(patch),
   });
+  return jsonOrThrow<AgentOut>(resp);
+}
+
+// Move one channel binding to a new kind/address (ADR-0107). The pair being
+// moved is named by `selector` (its CURRENT kind/address) and rides in the
+// query string, never the body, so it can never be confused with `next`, the
+// replacement value. Returns the updated agent. There is no add/remove verb
+// here yet (FU-A) — this only ever moves an existing binding.
+export async function patchAgentChannel(
+  agentId: string,
+  selector: ChannelBinding,
+  next: ChannelBinding,
+): Promise<AgentOut> {
+  const resp = await fetch(
+    url(`/agents/${agentId}/channels${query({ kind: selector.kind, address: selector.address })}`),
+    {
+      method: "PATCH",
+      headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify(next),
+    },
+  );
   return jsonOrThrow<AgentOut>(resp);
 }
 

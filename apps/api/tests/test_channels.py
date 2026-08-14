@@ -1032,7 +1032,7 @@ def test_a_token_is_dead_after_the_binding_is_repointed(
 ) -> None:
     """T-C8 (finding 10). The generation half of D5.
 
-    `update_agent_binding` mutates the row IN PLACE, so without the generation a
+    `update_channel_binding` mutates the row IN PLACE, so without the generation a
     token minted before a rebind stays valid against the row's NEW owner. Both
     rebinds are asserted: a MOVE to another address, and a no-op PATCH that
     re-asserts the same values -- because an operator re-asserting a binding is
@@ -1063,8 +1063,9 @@ def test_a_token_is_dead_after_the_binding_is_repointed(
     noop_token = _mint(channels_client, auth_headers, kind="email", address="noop@example.test")
 
     patched = channels_client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": _email_channel("noop@example.test")},
+        f"/agents/{agent_id}/channels",
+        params={"kind": "email", "address": "noop@example.test"},
+        json=_email_channel("noop@example.test"),
         headers=auth_headers,
     )
     assert patched.status_code == 200, patched.text
@@ -1157,19 +1158,17 @@ def test_a_half_configured_route_is_rejected_on_create_and_on_patch(
         assert created.status_code == 422, created.text
         assert missing in created.text, created.text
 
+        whole = f"whole-{uuid.uuid4().hex[:6]}@example.test"
         agent_id = _bind(
             channels_client,
             auth_headers,
             name=f"whole-{uuid.uuid4().hex[:6]}",
-            channel=_email_channel(f"whole-{uuid.uuid4().hex[:6]}@example.test"),
+            channel=_email_channel(whole),
         )
         patched = channels_client.patch(
-            f"/agents/{agent_id}",
-            json={
-                "channel": _channel(
-                    "email", f"moved-{uuid.uuid4().hex[:6]}@example.test", **route
-                )
-            },
+            f"/agents/{agent_id}/channels",
+            params={"kind": "email", "address": whole},
+            json=_channel("email", f"moved-{uuid.uuid4().hex[:6]}@example.test", **route),
             headers=auth_headers,
         )
         assert patched.status_code == 422, patched.text
@@ -1211,7 +1210,7 @@ def test_a_route_less_binding_is_legal_at_rest_and_unmintable(
             channel=_channel(kind, address),
         )
         assert created.status_code == 201, created.text
-        assert created.json()["channel"] == {"kind": kind, "address": address}
+        assert created.json()["channels"] == [{"kind": kind, "address": address}]
 
         row = _binding_row(created.json()["id"])
         assert row["endpoint"] is None and row["adapter"] is None
@@ -1253,8 +1252,9 @@ def test_a_route_added_by_patch_makes_the_binding_mintable(
     assert unroutable.status_code == 409, unroutable.text
 
     patched = channels_client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": _email_channel("late@example.test")},
+        f"/agents/{agent_id}/channels",
+        params={"kind": "email", "address": "late@example.test"},
+        json=_email_channel("late@example.test"),
         headers=auth_headers,
     )
     assert patched.status_code == 200, patched.text
@@ -1316,7 +1316,7 @@ def test_a_valid_route_is_stored_and_never_leaks_into_the_response(
 
     fetched = channels_client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
-    assert fetched.json()["channel"] == {"kind": "email", "address": "routed@example.test"}
+    assert fetched.json()["channels"] == [{"kind": "email", "address": "routed@example.test"}]
 
     row = _binding_row(agent_id)
     assert row["endpoint"] == EMAIL_ENDPOINT

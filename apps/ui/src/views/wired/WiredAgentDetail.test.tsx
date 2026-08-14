@@ -12,7 +12,6 @@ import {
   listDeployments,
   getVersionFiles,
   updateAgent,
-  // [FAIL-FIRST] S5.2: does not exist on the client yet.
   patchAgentChannel,
   createDeployment,
   type AgentOut,
@@ -23,9 +22,10 @@ import {
 
 // Mock only the data-layer calls; preserve the real ApiError/BundleValidationError
 // classes (the hooks branch on `instanceof ApiError`) and the untouched helpers.
-// `updateAgent` is mocked for the channel-edit tests; `createDeployment` for the
-// promote-to-prod tests; createVersion/uploadBundle are stubbed so the deploy path
-// never hits the network even though these tests don't exercise it.
+// `patchAgentChannel` is mocked for the channel-edit tests; `updateAgent` for the
+// model-edit tests; `createDeployment` for the promote-to-prod tests;
+// createVersion/uploadBundle are stubbed so the deploy path never hits the
+// network even though these tests don't exercise it.
 vi.mock("../../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../api/client")>();
   return {
@@ -35,8 +35,6 @@ vi.mock("../../api/client", async (importOriginal) => {
     listDeployments: vi.fn(),
     getVersionFiles: vi.fn(),
     updateAgent: vi.fn(),
-    // [FAIL-FIRST] S5.2: not a real export on the current client; mocked here so
-    // the multi-channel test below can assert on it once the client adds it.
     patchAgentChannel: vi.fn(),
     createVersion: vi.fn(),
     uploadBundle: vi.fn(),
@@ -49,7 +47,7 @@ vi.mock("../../api/client", async (importOriginal) => {
 const AGENT: AgentOut = {
   id: "a1",
   name: "deal-desk",
-  channel: { kind: "slack", address: "C0123ABCD" },
+  channels: [{ kind: "slack", address: "C0123ABCD" }],
   model: null,
   created_at: "2026-07-01T00:00:00Z",
 };
@@ -99,7 +97,11 @@ beforeEach(() => {
   vi.mocked(listVersions).mockResolvedValue(VERSIONS);
   vi.mocked(listDeployments).mockResolvedValue(DEPLOYMENTS);
   vi.mocked(getVersionFiles).mockResolvedValue(FILES);
-  vi.mocked(updateAgent).mockResolvedValue({ ...AGENT, channel: { kind: "slack", address: "C9999ZZZZ" } });
+  vi.mocked(updateAgent).mockResolvedValue(AGENT);
+  vi.mocked(patchAgentChannel).mockResolvedValue({
+    ...AGENT,
+    channels: [{ kind: "slack", address: "C9999ZZZZ" }],
+  });
   vi.mocked(createDeployment).mockResolvedValue(deployment("v2", "prod", "2026-07-08T00:00:00Z"));
 });
 
@@ -131,7 +133,7 @@ function renderDetail() {
 }
 
 describe("WiredAgentDetail — channel edit (item 5)", () => {
-  it("saves an edited Slack channel via updateAgent and refetches the agent list", async () => {
+  it("saves an edited Slack channel via patchAgentChannel and refetches the agent list", async () => {
     const user = userEvent.setup();
     renderDetail();
 
@@ -147,15 +149,21 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     await user.type(input, "C9999ZZZZ");
     await user.click(screen.getByTestId("channel-save"));
 
-    // Exactly one PATCH, with the right args.
-    await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
-    expect(updateAgent).toHaveBeenCalledWith("a1", { channel: { kind: "slack", address: "C9999ZZZZ" } });
+    // Exactly one PATCH, with the right args: the selector names the binding's
+    // ORIGINAL pair, never updateAgent.
+    await waitFor(() => expect(patchAgentChannel).toHaveBeenCalledTimes(1));
+    expect(patchAgentChannel).toHaveBeenCalledWith(
+      "a1",
+      { kind: "slack", address: "C0123ABCD" },
+      { kind: "slack", address: "C9999ZZZZ" },
+    );
+    expect(updateAgent).not.toHaveBeenCalled();
 
     // Save triggers a refetch of the wired agent data (getAgents runs a 2nd time).
     await waitFor(() => expect(getAgents).toHaveBeenCalledTimes(2));
   });
 
-  it("blocks saving an empty channel (no updateAgent call)", async () => {
+  it("blocks saving an empty channel (no patchAgentChannel call)", async () => {
     const user = userEvent.setup();
     renderDetail();
 
@@ -165,7 +173,7 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     // Save is disabled / a no-op while the channel is empty.
     const save = screen.getByTestId("channel-save");
     await user.click(save).catch(() => {});
-    expect(updateAgent).not.toHaveBeenCalled();
+    expect(patchAgentChannel).not.toHaveBeenCalled();
   });
 
   it("warns on a non-Slack-ID channel but still allows saving (soft check)", async () => {
@@ -182,7 +190,11 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     // …but the value still saves.
     await user.click(screen.getByTestId("channel-save"));
     await waitFor(() =>
-      expect(updateAgent).toHaveBeenCalledWith("a1", { channel: { kind: "slack", address: "revenue-ops" } }),
+      expect(patchAgentChannel).toHaveBeenCalledWith(
+        "a1",
+        { kind: "slack", address: "C0123ABCD" },
+        { kind: "slack", address: "revenue-ops" },
+      ),
     );
   });
 
@@ -195,7 +207,7 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     // Slack binding it was written for (#143's guidance is the deliverable).
     const user = userEvent.setup();
     vi.mocked(getAgents).mockResolvedValue([
-      { ...AGENT, channel: { kind: "webhook", address: "acme-room-7" } },
+      { ...AGENT, channels: [{ kind: "webhook", address: "acme-room-7" }] },
     ]);
     renderDetail();
 
@@ -212,7 +224,11 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     // The kind rides along on the save, unchanged.
     await user.click(screen.getByTestId("channel-save"));
     await waitFor(() =>
-      expect(updateAgent).toHaveBeenCalledWith("a1", { channel: { kind: "webhook", address: "room/42" } }),
+      expect(patchAgentChannel).toHaveBeenCalledWith(
+        "a1",
+        { kind: "webhook", address: "acme-room-7" },
+        { kind: "webhook", address: "room/42" },
+      ),
     );
   });
 

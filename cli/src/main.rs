@@ -279,8 +279,9 @@ enum Command {
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
         api_key: String,
         /// Slack channel to bind the agent to. On first create it defaults to
-        /// C0LOCALDEV; on redeploy it is only moved when you pass this flag, so
-        /// omitting it leaves the deployed agent's channel untouched.
+        /// C0LOCALDEV; on redeploy the channel is ADDED when the agent is not
+        /// already bound to it, never moved and never removed, so omitting the
+        /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
@@ -937,9 +938,9 @@ enum LocalAction {
     Message {
         /// The user message text.
         text: String,
-        /// Slack channel id to send as; must match the target agent's
-        /// channel. Omit to use the sole deployed agent's channel (errors
-        /// if zero or multiple agents are deployed).
+        /// Slack channel id to send as; must match one of the target agent's
+        /// channels. Omit when exactly one channel is bound across all
+        /// deployed agents (errors on zero or several).
         #[arg(long)]
         channel: Option<String>,
         /// Existing thread ts to continue a conversation; omit to start a new
@@ -988,8 +989,9 @@ enum LocalAction {
         /// bundle's).
         #[arg(long)]
         cases: Option<PathBuf>,
-        /// Slack channel id to send as; must match the target agent's
-        /// channel. Omit to use the sole deployed agent's channel.
+        /// Slack channel id to send as; must match one of the target agent's
+        /// channels. Omit when exactly one channel is bound across all
+        /// deployed agents.
         #[arg(long)]
         channel: Option<String>,
         /// Valkey password (compose default `valkeypass`). Prefer the
@@ -1063,8 +1065,9 @@ enum LocalAction {
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
         api_key: String,
         /// Slack channel to bind the agent to. On first create it defaults to
-        /// C0LOCALDEV; on redeploy it is only moved when you pass this flag, so
-        /// omitting it leaves the deployed agent's channel untouched.
+        /// C0LOCALDEV; on redeploy the channel is ADDED when the agent is not
+        /// already bound to it, never moved and never removed, so omitting the
+        /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
@@ -1193,6 +1196,24 @@ enum LocalAction {
         api_key: String,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// List, add, or remove an agent's channel bindings
+    /// (`/agents/{id}/channels`).
+    ///
+    /// With no flags this lists. An agent holds one or more bindings
+    /// (ADR-0107), so exactly one `--add` OR one `--remove` is applied per
+    /// invocation: the API has no batch endpoint, and a half-applied batch
+    /// would leave the operator guessing what took.
+    Channels {
+        #[command(flatten)]
+        target: AgentTarget<LocalTier>,
+        /// Bind this channel too, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1).
+        #[arg(long, value_name = "KIND=ADDRESS")]
+        add: Option<String>,
+        /// Unbind this channel, as KIND=ADDRESS. The API refuses to remove an
+        /// agent's last binding.
+        #[arg(long, value_name = "KIND=ADDRESS", conflicts_with = "add")]
+        remove: Option<String>,
     },
     /// Set an agent's daily budget (`PUT /agents/{id}/budget`).
     Budget {
@@ -1506,9 +1527,9 @@ enum ClusterAction {
     Message {
         /// The user message text.
         text: String,
-        /// Slack channel id to send as; must match the target agent's
-        /// channel. Omit to use the sole deployed agent's channel (errors
-        /// if zero or multiple agents are deployed).
+        /// Slack channel id to send as; must match one of the target agent's
+        /// channels. Omit when exactly one channel is bound across all
+        /// deployed agents (errors on zero or several).
         #[arg(long)]
         channel: Option<String>,
         /// Existing thread ts to continue a conversation; omit to start a new
@@ -1583,8 +1604,9 @@ enum ClusterAction {
         /// bundle's).
         #[arg(long)]
         cases: Option<PathBuf>,
-        /// Slack channel id to send as; must match the target agent's
-        /// channel. Omit to use the sole deployed agent's channel.
+        /// Slack channel id to send as; must match one of the target agent's
+        /// channels. Omit when exactly one channel is bound across all
+        /// deployed agents.
         #[arg(long)]
         channel: Option<String>,
         /// Kubernetes namespace of the release. Default: curie.
@@ -1692,8 +1714,9 @@ enum ClusterAction {
         #[arg(long, env = "CURIE_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
         /// Slack channel to bind the agent to. On first create it defaults to
-        /// C0LOCALDEV; on redeploy it is only moved when you pass this flag, so
-        /// omitting it leaves the deployed agent's channel untouched.
+        /// C0LOCALDEV; on redeploy the channel is ADDED when the agent is not
+        /// already bound to it, never moved and never removed, so omitting the
+        /// flag leaves the deployed agent's binding set untouched.
         #[arg(long)]
         slack_channel: Option<String>,
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
@@ -1772,6 +1795,29 @@ enum ClusterAction {
         /// Clear the thinking override back to the platform default.
         #[arg(long)]
         clear_thinking: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List, add, or remove an agent's channel bindings
+    /// (`/agents/{id}/channels`).
+    ///
+    /// With no flags this lists. An agent holds one or more bindings
+    /// (ADR-0107), so exactly one `--add` OR one `--remove` is applied per
+    /// invocation: the API has no batch endpoint, and a half-applied batch
+    /// would leave the operator guessing what took.
+    Channels {
+        /// Agent name or id.
+        agent: String,
+        /// Bind this channel too, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1).
+        #[arg(long, value_name = "KIND=ADDRESS")]
+        add: Option<String>,
+        /// Unbind this channel, as KIND=ADDRESS. The API refuses to remove an
+        /// agent's last binding.
+        #[arg(long, value_name = "KIND=ADDRESS", conflicts_with = "add")]
+        remove: Option<String>,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -2449,6 +2495,17 @@ async fn run(command: Option<Command>) -> Result<()> {
                     },
                     commands::OverrideChange::resolve("model", model, clear_model)?,
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
+                )
+                .await?,
+            ),
+            LocalAction::Channels {
+                target,
+                add,
+                remove,
+            } => emit(
+                commands::channel_bindings(
+                    target.into(),
+                    commands::ChannelChange::resolve(add, remove)?,
                 )
                 .await?,
             ),
@@ -3146,6 +3203,32 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         model,
                         thinking,
+                    )
+                    .await?,
+                )
+            }
+            ClusterAction::Channels {
+                agent,
+                add,
+                remove,
+                conn,
+                dry_run,
+            } => {
+                // Resolve the flag pair BEFORE discovering the connection, for
+                // the same reason `Overrides` does: a mistyped pair must not
+                // cost a cluster lookup, nor be reported as a connection
+                // failure instead of the usage error it is.
+                let change = commands::ChannelChange::resolve(add, remove)?;
+                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                emit(
+                    commands::channel_bindings(
+                        AgentActionOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            dry_run,
+                        },
+                        change,
                     )
                     .await?,
                 )

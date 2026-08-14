@@ -28,6 +28,12 @@
       "version": "1.0"
     },
     {
+      "result": "ChannelsOutput",
+      "kind": "CliOutput",
+      "schema": "channels.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "CheckOutput",
       "kind": "CliOutput",
       "schema": "check.schema.json",

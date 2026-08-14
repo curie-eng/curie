@@ -305,6 +305,7 @@ the optional Slack dispatcher.
 | `curie local eval` | Run the bundle's `evals/cases.json` through the compose stack's enqueue -> worker -> sandbox -> reply path (one synthetic turn per case) and grade each captured reply with the SAME grader `skill eval` uses. Prints the identical per-case table + rollup; nonzero exit on failure.<br>• `--cases` overrides the file.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1 (sequential); values above 1 are refused for now (#709).<br>• Only the reply text is observed here, so a `tool_called` case always fails -- see "Using different tiers" above. |
 | `curie local deploy` | Package the bundle as tar.gz and push it to the compose platform API (`--api-url`, default `http://localhost:28000`). Auth via `--api-key` or `CURIE_API_KEY`. |
 | `curie local overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking]` | Read or change the agent's two nullable operator overrides via the compose platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it. |
+| `curie local channels <agent> [--add KIND=ADDRESS \| --remove KIND=ADDRESS]` | List, add, or remove the agent's channel bindings via the compose platform API (`/agents/{id}/channels`, ADR-0107).<br>• With no flags it LISTS and writes nothing.<br>• Exactly one `--add` OR one `--remove` per invocation (the API has no batch endpoint, so a half-applied batch would leave you guessing what took); the two together are a usage error before any request.<br>• `KIND=ADDRESS` splits on the FIRST `=`, so an address may contain one.<br>• The API refuses to remove an agent's last binding: an agent bound to nothing is deployed and answers nowhere. |
 | `curie local reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the compose platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 
 ##### `curie local message`: the same roundtrip against the compose stack
@@ -365,11 +366,12 @@ Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 | `curie cluster resume <agent>` | Resume a killed agent via the platform API (`POST /agents/{id}/resume`). |
 | `curie cluster budget <agent> --limit <n>` | Set the agent's daily spend cap in USD via the platform API (`PUT /agents/{id}/budget`, `BudgetConfig.max_usd_per_day`); the per-run token cap is left at the platform default. |
 | `curie cluster overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking]` | Read or change the agent's two nullable operator overrides via the platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it. |
+| `curie cluster channels <agent> [--add KIND=ADDRESS \| --remove KIND=ADDRESS]` | List, add, or remove the agent's channel bindings via the platform API (`/agents/{id}/channels`, ADR-0107).<br>• With no flags it LISTS and writes nothing.<br>• Exactly one `--add` OR one `--remove` per invocation (the API has no batch endpoint, so a half-applied batch would leave you guessing what took); the two together are a usage error settled before the release connection is even discovered.<br>• `KIND=ADDRESS` splits on the FIRST `=`, so an address may contain one.<br>• The API refuses to remove an agent's last binding: an agent bound to nothing is deployed and answers nowhere. |
 | `curie cluster reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 | `curie cluster delete <agent> --yes` | Delete an agent via the platform API (`DELETE /agents/{id}`). Destructive and irreversible: refuses without `--yes`. |
 
-The six lifecycle verbs (`kill`, `resume`, `budget`, `overrides`, `reset-thread`,
-`delete`)
+The seven lifecycle verbs (`kill`, `resume`, `budget`, `overrides`, `channels`,
+`reset-thread`, `delete`)
 act on a deployed release's agents through the same platform API, defaulting
 `--api-url` to `http://localhost:8000` (auth via `--api-key` or
 `CURIE_API_KEY`). Unlike `cluster deploy`, which self-plumbs a port-forward
@@ -396,9 +398,11 @@ What it does: self-manages its own port-forwards and a local reply-stub the
 release can post back to, so no manual `kubectl port-forward` is needed. Then:
 
 - **Picks a channel.** With no `--channel`, it looks up the sole deployed
-  agent's channel via the API; zero or multiple agents is an error requiring
-  `--channel` explicitly (the worker binds a channel to an agent by exact
-  equality, so guessing would route nowhere).
+  `(agent, channel)` PAIR via the API; zero or multiple pairs is an error
+  requiring `--channel` explicitly (the worker binds a channel to an agent by
+  exact equality, so guessing would route nowhere). Selection counts pairs, not
+  agents (ADR-0107), so a single deployed agent bound to two channels is
+  ambiguous too.
 - **Wires the worker at the stub** (`--wire`, the default) via a `helm
   upgrade`, and waits for the rollout. `--no-wire` instead refuses to run
   unless the worker is already wired, printing the exact command to apply.

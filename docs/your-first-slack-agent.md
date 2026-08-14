@@ -138,8 +138,9 @@ credentials.
 3. **Bind by channel ID (`C0…`), never `#name`.**
 4. **Run `cluster comms` after `cluster up`, not before.**
 5. **Renaming the bot in Slack rotates the bot token** — re-run `cluster comms`.
-6. **One agent binds one channel.** Pointing a second agent at an occupied
-   channel returns 409.
+6. **One channel binds one agent.** An agent may serve several channels
+   (`curie cluster channels <agent> --add slack=C0EXAMPLE2`), but pointing a
+   SECOND agent at an occupied channel still returns 409.
 
 ## Which rung do I want?
 

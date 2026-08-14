@@ -192,7 +192,9 @@ function LiveOverview({ agents }: { agents: AgentOut[] }) {
             >
               <Dot color={C.success} size={8} />
               <span style={{ flex: 1, fontFamily: C.mono, fontSize: 13 }}>{a.name}</span>
-              <span style={{ fontSize: 12, color: C.muted, fontFamily: C.mono }}>{a.channel.address}</span>
+              <span style={{ fontSize: 12, color: C.muted, fontFamily: C.mono }}>
+                {a.channels.map((c) => c.address).join(", ")}
+              </span>
             </button>
           ))}
         </Card>

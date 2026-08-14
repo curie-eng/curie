@@ -59,7 +59,8 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
 - **Binding** — a channel resolves to a deployment by `agent_channels.address`
   equality in `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
   The binding is written as a neutral `{kind, address}` pair (ADR-0096, #1459), so a second
-  channel binds its agent without a schema change.
+  channel binds its agent without a schema change. An agent may hold several bindings
+  (ADR-0107); ingress still resolves one inbound `{kind, address}` pair to exactly one row.
 
 ## Implementations today
 

@@ -19,18 +19,15 @@ vi.mock("./api/client", async (importOriginal) => {
   };
 });
 
-// [FIXTURE-ONLY] ADR-0107: AgentOut will carry `channels` (plural) once S5.1
-// lands; unused by any assertion in this file. Keeps the legacy singular
-// `channel` field too -- WiredOverview still renders `a.channel.address`
-// today, and dropping it would crash the render rather than fail a test.
+// [FIXTURE-ONLY] ADR-0107: AgentOut carries `channels` (plural); unused by any
+// assertion in this file.
 const AGENT: AgentOut = {
   id: "a1",
   name: "deal-desk",
-  channel: { kind: "slack", address: "C0123ABCD" },
   channels: [{ kind: "slack", address: "C0123ABCD" }],
   model: null,
   created_at: "2026-07-01T00:00:00Z",
-} as unknown as AgentOut;
+};
 
 beforeEach(() => {
   vi.clearAllMocks();

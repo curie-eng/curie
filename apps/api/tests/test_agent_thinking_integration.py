@@ -119,12 +119,16 @@ def test_patch_with_explicit_null_clears_the_override(
 def test_omitting_thinking_still_leaves_it_untouched(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # The other half of the distinction. If this regressed, every PATCH that
-    # renamed a channel would silently wipe the agent's thinking depth.
+    # The other half of the distinction. If this regressed, every write that
+    # renamed a channel would silently wipe the agent's thinking depth. The
+    # binding write is the channels subresource since ADR-0107, and it returns
+    # the whole agent, so the override still has to survive the response it
+    # rebuilds.
     agent = _create_agent(client, auth_headers, thinking="adaptive")
     resp = client.patch(
-        f"/agents/{agent['id']}",
-        json={"channel": {"kind": "slack", "address": "CTHINK009"}},
+        f"/agents/{agent['id']}/channels",
+        params={"kind": "slack", "address": "CTHINK001"},
+        json={"kind": "slack", "address": "CTHINK009"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text

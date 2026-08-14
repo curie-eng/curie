@@ -4,6 +4,13 @@ Date: 2026-07-31
 
 Status: Accepted
 
+**Amended in part by [ADR-0107](0107-one-agent-binds-many-channels.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the Consequences sentence below, "Nothing here relaxes #1070 -- one agent still binds one
+channel. Declaring two targets creates two agents; it does not let one agent serve two
+channels," no longer holds. 0107 lets one agent hold many bindings; the rest of this ADR,
+including one target naming one channel, stands unchanged.
+
 ## Context
 
 Issue #1166. A bundle declares what it needs to run —

@@ -14,11 +14,13 @@ import {
   uploadBundle,
   createDeployment,
   updateAgent,
+  patchAgentChannel,
   BundleValidationError,
   ApiError,
   SLACK_ADDRESS_RE,
   type BundleFile,
   type BundleIssue,
+  type ChannelBinding,
 } from "../../api/client";
 import { buildBundleZipFromFiles, nextVersionLabel } from "../../api/bundle";
 
@@ -93,29 +95,32 @@ export function WiredAgentDetail() {
   const [promoting, setPromoting] = useState(false);
   const [promoteError, setPromoteError] = useState<string | null>(null);
 
-  // Editable Slack channel (item 5). Seeded from the agent, re-seeded if it changes.
-  const [channel, setChannel] = useState("");
-  const [savingChannel, setSavingChannel] = useState(false);
-  const [channelError, setChannelError] = useState<string | null>(null);
+  // Editable channel bindings (item 5, ADR-0107): one editor per binding, keyed
+  // by its current `${kind}:${address}` pair, since that is the selector a save
+  // must name. Seeded from the agent, re-seeded if its bindings change.
+  const [channelEdits, setChannelEdits] = useState<Record<string, string>>({});
+  const [savingChannel, setSavingChannel] = useState<Record<string, boolean>>({});
+  const [channelErrors, setChannelErrors] = useState<Record<string, string | null>>({});
 
   // Editable per-agent model (#254). Seeded from the agent; blank = platform default.
   const [model, setModel] = useState("");
   const [savingModel, setSavingModel] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
-  const channelValue = channel.trim();
-  const channelBlank = channelValue === "";
-  // The worker resolves an agent's binding against the Slack channel ID, not the
-  // name. Soft check (mirrors NewAgentModal): a non-ID value warns but still saves;
-  // only an empty value blocks. Copied CLI-synthetic channels are arbitrary strings.
-  // The Slack shape check only applies to slack-kind bindings; other kinds
-  // (webhook, ms-teams, ...) are governed by the API's generic rule instead.
-  const channelLooksOff =
-    agent?.channel.kind === "slack" && channelValue !== "" && !SLACK_ADDRESS_RE.test(channelValue);
+
+  const channelKey = (b: ChannelBinding) => `${b.kind}:${b.address}`;
+  // A stable string dep (not the array reference) so the reseed effect only
+  // fires when a binding's identity actually changes.
+  const channelsDepKey = (agent?.channels ?? []).map(channelKey).join(",");
 
   useEffect(() => {
-    setChannel(agent?.channel.address ?? "");
-    setChannelError(null);
-  }, [agent?.id, agent?.channel.address]);
+    const map: Record<string, string> = {};
+    for (const b of agent?.channels ?? []) map[channelKey(b)] = b.address;
+    setChannelEdits(map);
+    setChannelErrors({});
+    // channelsDepKey mirrors agent?.channels; agent?.id covers a fresh agent
+    // whose bindings happen to collide with the previous one's key.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent?.id, channelsDepKey]);
 
   useEffect(() => {
     setModel(agent?.model ?? "");
@@ -152,21 +157,27 @@ export function WiredAgentDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [files.files]);
 
-  const saveChannel = async () => {
-    if (!agent || savingChannel || channelBlank) return;
-    setSavingChannel(true);
-    setChannelError(null);
+  const saveChannel = async (binding: ChannelBinding) => {
+    const key = channelKey(binding);
+    const value = (channelEdits[key] ?? "").trim();
+    if (!agent || savingChannel[key] || value === "") return;
+    setSavingChannel((prev) => ({ ...prev, [key]: true }));
+    setChannelErrors((prev) => ({ ...prev, [key]: null }));
     try {
       // The console has no kind selector (E4/EB-20: "slack" is the only kind it
       // can create), so a channel-move PATCH preserves the binding's existing
-      // kind and only replaces the address.
-      await updateAgent(agent.id, { channel: { kind: agent.channel.kind, address: channelValue } });
+      // kind and only replaces the address. `binding` (not the edited value) is
+      // the selector -- it names the row being moved, by its CURRENT pair.
+      await patchAgentChannel(agent.id, binding, { kind: binding.kind, address: value });
       refetch(); // refresh the wired agent data so the displayed channel updates
-      dispatch({ type: "toast", message: `Channel set to ${channelValue}` });
+      dispatch({ type: "toast", message: `Channel set to ${value}` });
     } catch (e) {
-      setChannelError(e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e));
+      setChannelErrors((prev) => ({
+        ...prev,
+        [key]: e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e),
+      }));
     } finally {
-      setSavingChannel(false);
+      setSavingChannel((prev) => ({ ...prev, [key]: false }));
     }
   };
 
@@ -282,52 +293,68 @@ export function WiredAgentDetail() {
           </Chip>
         ) : null}
         <div style={{ marginLeft: "auto", display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ fontSize: 11, color: C.muted, fontFamily: C.mono }}>channel</span>
-            <input
-              data-testid="channel-input"
-              value={channel}
-              onChange={(e) => {
-                setChannel(e.target.value);
-                setChannelError(null);
-              }}
-              placeholder="C0123ABCD"
-              style={{
-                background: C.input,
-                border: "1px solid " + (channelLooksOff ? C.warn : C.borderStrong),
-                borderRadius: 7,
-                padding: "5px 9px",
-                color: C.text,
-                fontFamily: C.mono,
-                fontSize: 12.5,
-                width: 150,
-              }}
-            />
-            <Button
-              label={savingChannel ? "Saving…" : "Save"}
-              variant="secondary"
-              size="sm"
-              testId="channel-save"
-              disabled={channelBlank || savingChannel}
-              title={channelBlank ? "Enter the Slack channel ID first" : undefined}
-              onClick={() => void saveChannel()}
-            />
-          </div>
-          {channelLooksOff ? (
-            <div data-testid="channel-warn" style={{ fontSize: 11, color: C.warn, maxWidth: 280, textAlign: "right", lineHeight: 1.4 }}>
-              That does not look like a channel ID (C…). Mentions match on the ID, not the name — save anyway if you are
-              using the CLI.
-            </div>
-          ) : null}
-          {channelError ? (
-            <div data-testid="channel-error" style={{ fontSize: 11, color: C.destructive, maxWidth: 280, textAlign: "right", lineHeight: 1.4 }}>
-              Could not update channel: {channelError}
-            </div>
-          ) : (
-            <div style={{ fontSize: 10.5, color: C.muted, maxWidth: 280, textAlign: "right", lineHeight: 1.4 }}>
-              Saved to the stored config; the live worker keeps its channel until the next deploy.
-            </div>
-          )}
+          {(agent.channels ?? []).map((binding) => {
+            const key = channelKey(binding);
+            const value = channelEdits[key] ?? "";
+            const trimmed = value.trim();
+            const blank = trimmed === "";
+            // The Slack shape check only applies to slack-kind bindings; other
+            // kinds (webhook, ms-teams, …) are governed by the API's generic
+            // rule instead.
+            const looksOff = binding.kind === "slack" && trimmed !== "" && !SLACK_ADDRESS_RE.test(trimmed);
+            const saving = savingChannel[key] ?? false;
+            const error = channelErrors[key] ?? null;
+            return (
+              <div key={key} style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 11, color: C.muted, fontFamily: C.mono }}>{binding.kind}</span>
+                  <input
+                    data-testid="channel-input"
+                    value={value}
+                    onChange={(e) => {
+                      setChannelEdits((prev) => ({ ...prev, [key]: e.target.value }));
+                      setChannelErrors((prev) => ({ ...prev, [key]: null }));
+                    }}
+                    placeholder="C0123ABCD"
+                    style={{
+                      background: C.input,
+                      border: "1px solid " + (looksOff ? C.warn : C.borderStrong),
+                      borderRadius: 7,
+                      padding: "5px 9px",
+                      color: C.text,
+                      fontFamily: C.mono,
+                      fontSize: 12.5,
+                      width: 150,
+                    }}
+                  />
+                  <Button
+                    label={saving ? "Saving…" : "Save"}
+                    variant="secondary"
+                    size="sm"
+                    testId="channel-save"
+                    disabled={blank || saving}
+                    title={blank ? "Enter the Slack channel ID first" : undefined}
+                    onClick={() => void saveChannel(binding)}
+                  />
+                </div>
+                {looksOff ? (
+                  <div data-testid="channel-warn" style={{ fontSize: 11, color: C.warn, maxWidth: 280, textAlign: "right", lineHeight: 1.4 }}>
+                    That does not look like a channel ID (C…). Mentions match on the ID, not the name — save anyway if
+                    you are using the CLI.
+                  </div>
+                ) : null}
+                {error ? (
+                  <div data-testid="channel-error" style={{ fontSize: 11, color: C.destructive, maxWidth: 280, textAlign: "right", lineHeight: 1.4 }}>
+                    Could not update channel: {error}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 10.5, color: C.muted, maxWidth: 280, textAlign: "right", lineHeight: 1.4 }}>
+                    Saved to the stored config; the live worker keeps its channel until the next deploy.
+                  </div>
+                )}
+              </div>
+            );
+          })}
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
             <span style={{ fontSize: 11, color: C.muted, fontFamily: C.mono }}>model</span>
             <input

@@ -568,7 +568,7 @@ async def ingest_turn(
     owner = f"pending:{secrets.token_hex(16)}"
 
     # The generation, re-read at the LAST moment before the claim. The row above
-    # was loaded at the top of the request, and `update_agent_binding` bumps the
+    # was loaded at the top of the request, and `update_channel_binding` bumps the
     # generation on a rebind, so a credential revoked mid-request would otherwise
     # still enqueue against the binding it no longer names. Re-reading here
     # narrows that race from the whole request to the gap below; it does NOT
