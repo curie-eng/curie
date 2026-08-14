@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/adapter-validate/v1.json",
+  "title": "curie adapter validate --json",
+  "description": "The agent-facing payload of `curie adapter validate`: the profile it parsed, not just a verdict. The parsed values are what the cross language corpus compares against, so an implementation that returned a constant instead of carrying the parsed field through is caught. Credential IDENTITIES only, never a credential value.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "const": true,
+      "description": "Always true: a refused profile is an exit 2 usage error, not a payload."
+    },
+    "file": {
+      "type": "string",
+      "description": "Path of the profile that was read."
+    },
+    "profile": {
+      "type": "object",
+      "description": "The parsed binding profile.",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string",
+          "description": "The profile format version this file is written against."
+        },
+        "kind": {
+          "type": "string",
+          "description": "The channel kind this adapter owns."
+        },
+        "endpoint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The reply route, or null. Optional in a profile and reported as an explicit null so a consumer can read it unconditionally."
+        },
+        "address": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string",
+              "description": "The regex an address must match. It compiles in both Python re and the Rust regex crate."
+            },
+            "example": {
+              "type": "string",
+              "description": "A concrete address of this shape, for operator docs. Authoring documentation, never live deployment state."
+            }
+          },
+          "required": [
+            "description",
+            "pattern",
+            "example"
+          ]
+        },
+        "credentials": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "egress": {
+              "type": "string",
+              "description": "The egress credential identity this adapter suggests. A suggestion only."
+            },
+            "egress_secret_env": {
+              "type": "string",
+              "description": "The environment variable the ADAPTER reads its egress secret from. Documentation only; Curie never resolves this name."
+            },
+            "ingress_token_env": {
+              "type": "string",
+              "description": "The environment variable the ADAPTER reads its ingress token from. Documentation only; Curie never resolves this name."
+            }
+          },
+          "required": [
+            "egress",
+            "egress_secret_env",
+            "ingress_token_env"
+          ]
+        },
+        "conformance": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "wire_version": {
+              "type": "string",
+              "description": "The reply wire version this adapter speaks, independent of the profile version."
+            },
+            "mints_reply_ref": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "wire_version",
+            "mints_reply_ref"
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "kind",
+        "endpoint",
+        "address",
+        "credentials",
+        "conformance"
+      ]
+    }
+  },
+  "required": [
+    "ok",
+    "file",
+    "profile"
+  ]
+}

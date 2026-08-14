@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/adapter-scaffold/v1.json",
+  "title": "curie adapter scaffold --json",
+  "description": "The agent-facing payload of `curie adapter scaffold`: the one binding profile it wrote, the values it wrote into it, and the commands to run next. Credential IDENTITIES only, never a credential value.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "file": {
+      "type": "string",
+      "description": "Path of the binding profile that was written."
+    },
+    "kind": {
+      "type": "string",
+      "description": "The channel kind the scaffolded adapter owns."
+    },
+    "address": {
+      "type": "string",
+      "description": "The concrete address the profile was scaffolded for, and the one its generated pattern matches."
+    },
+    "endpoint": {
+      "type": "string",
+      "description": "The reply route written into the profile."
+    },
+    "adapter": {
+      "type": "string",
+      "description": "The egress credential identity the profile suggests. A suggestion only: bind requires an operator supplied slug."
+    },
+    "next_steps": {
+      "type": "array",
+      "description": "The commands that take this profile from authored to bound.",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "file",
+    "kind",
+    "address",
+    "endpoint",
+    "adapter",
+    "next_steps"
+  ]
+}

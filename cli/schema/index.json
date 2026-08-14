@@ -4,6 +4,36 @@
   "discovery": "These schema files are bundled into released `curie` CLI binaries and printed on demand: `curie schema-index` emits this index, `curie schema-index <name>` emits a named schema. In a source checkout they live at cli/schema/.",
   "results": [
     {
+      "result": "AdapterBindOutput",
+      "kind": "CliOutput",
+      "schema": "adapter-bind.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "AdapterScaffoldOutput",
+      "kind": "CliOutput",
+      "schema": "adapter-scaffold.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "AdapterSmokeTestOutput",
+      "kind": "CliOutput",
+      "schema": "adapter-smoke-test.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "AdapterTokenOutput",
+      "kind": "CliOutput",
+      "schema": "adapter-token.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "AdapterValidateOutput",
+      "kind": "CliOutput",
+      "schema": "adapter-validate.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ApplyOutput",
       "kind": "CliOutput",
       "schema": "apply.schema.json",

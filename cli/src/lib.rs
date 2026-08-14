@@ -4,6 +4,7 @@
 //! local runner container (via the generated `curie-aci-protocol` crate) and
 //! the platform API's committed OpenAPI surface. Task I1.
 
+pub mod adapter;
 pub mod api;
 pub mod artifacts;
 pub mod bundle;

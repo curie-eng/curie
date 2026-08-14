@@ -1706,3 +1706,250 @@ fn a_new_family_schema_gate_has_teeth() {
         "kill schema must reject a Done object missing the required `killed` key"
     );
 }
+
+// ─── `curie adapter` result schemas (#1516) ──────────────────────────────────
+//
+// The five verbs' `--json` payloads are the agent-facing contract, and under
+// ADR-0101 as amended by ADR-0103 a property added later at an unchanged `$id`
+// is a red build. These gates lock the shapes that carry a decision: which
+// payload is allowed to hold a secret value, that a validated profile comes back
+// with its parsed fields rather than a bare verdict, that a bind reports the
+// whole four field route it wrote, and that the smoke-test verdict is machine
+// readable and never claims more than it checked.
+
+/// Every property name the schema declares, at any depth.
+fn declared_property_names(schema: &serde_json::Value) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let mut stack = vec![schema];
+    while let Some(node) = stack.pop() {
+        match node {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if key == "properties" {
+                        if let Some(props) = value.as_object() {
+                            found.extend(props.keys().cloned());
+                        }
+                    }
+                    stack.push(value);
+                }
+            }
+            serde_json::Value::Array(items) => stack.extend(items.iter()),
+            _ => {}
+        }
+    }
+    found
+}
+
+fn required_names(schema: &serde_json::Value) -> BTreeSet<String> {
+    schema["required"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+const ADAPTER_SCHEMAS: [&str; 5] = [
+    "adapter-scaffold.schema.json",
+    "adapter-validate.schema.json",
+    "adapter-bind.schema.json",
+    "adapter-token.schema.json",
+    "adapter-smoke-test.schema.json",
+];
+
+/// The five schemas are committed, compile, are closed, and discriminate. An
+/// empty object satisfying one of them would mean the gate is decorative.
+#[test]
+fn adapter_result_schemas_are_committed_closed_and_discriminating() {
+    for name in ADAPTER_SCHEMAS {
+        let schema = load_schema(name);
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "{name} must be closed"
+        );
+        assert!(
+            !required_names(&schema).is_empty(),
+            "{name} must require something"
+        );
+        let v = validator(&schema);
+        assert!(
+            !v.is_valid(&serde_json::json!({})),
+            "{name} must reject an empty object, or it gates nothing"
+        );
+    }
+}
+
+/// `adapter token` returns a bearer credential, so it is the single deliberate
+/// exception to the no-secrets-in-a-payload rule, and it declares itself as one.
+#[test]
+fn the_token_payload_is_the_one_that_declares_a_secret() {
+    let schema = load_schema("adapter-token.schema.json");
+    let required = required_names(&schema);
+    assert!(
+        required.contains("token") && required.contains("secret"),
+        "adapter-token must require both `token` and `secret`; required {required:?}"
+    );
+
+    let v = validator(&schema);
+    let payload = serde_json::json!({
+        "token": "chn_example",
+        "secret": true,
+        "kind": "email",
+        "address": "agent@example.test",
+        "ttl_s": 3600,
+    });
+    assert!(
+        v.is_valid(&payload),
+        "adapter-token must accept a token payload marked secret: {payload}"
+    );
+
+    let mut unmarked = payload.clone();
+    unmarked["secret"] = serde_json::json!(false);
+    assert!(
+        !v.is_valid(&unmarked),
+        "the secret marker must be pinned true, not merely present, or a consumer \
+         cannot branch on it"
+    );
+}
+
+/// The other four payloads carry credential IDENTITIES (`*_env` names and the
+/// adapter slug) and never a credential VALUE. Asserted as a shape rule on the
+/// committed contract rather than on one sampled payload, so a later property
+/// addition cannot open the hole.
+#[test]
+fn no_other_adapter_payload_declares_a_secret_value() {
+    for name in ADAPTER_SCHEMAS {
+        if name == "adapter-token.schema.json" {
+            continue;
+        }
+        let declared = declared_property_names(&load_schema(name));
+        for forbidden in ["token", "secret", "password", "credential", "api_key"] {
+            assert!(
+                !declared.contains(forbidden),
+                "{name} must declare no `{forbidden}` property; declared {declared:?}"
+            );
+        }
+    }
+}
+
+/// `validate` reports the profile it parsed, not just a verdict: the parsed
+/// values are what `cli/tests/adapter_manifest.rs` compares against the shared
+/// corpus, which is the only thing standing between a real parse and a constant.
+#[test]
+fn the_validate_payload_carries_the_parsed_profile() {
+    let schema = load_schema("adapter-validate.schema.json");
+    let required = required_names(&schema);
+    assert!(
+        required.contains("ok") && required.contains("profile"),
+        "adapter-validate must require `ok` and `profile`; required {required:?}"
+    );
+
+    let v = validator(&schema);
+    let mut payload = serde_json::json!({
+        "ok": true,
+        "file": "adapter.yaml",
+        "profile": {
+            "version": "1.0",
+            "kind": "email",
+            "endpoint": "https://mail.example.test/curie/reply",
+            "address": {
+                "description": "The mailbox this adapter owns.",
+                "pattern": "^[a-z]+@example\\.test$",
+                "example": "agent@example.test",
+            },
+            "credentials": {
+                "egress": "agentmail-sandbox",
+                "egress_secret_env": "CURIE_EGRESS_SECRET",
+                "ingress_token_env": "CURIE_INGRESS_TOKEN",
+            },
+            "conformance": {"wire_version": "1.0", "mints_reply_ref": true},
+        },
+    });
+    assert!(
+        v.is_valid(&payload),
+        "adapter-validate must accept a parsed profile: {payload}"
+    );
+
+    // `endpoint` is optional in the profile, so the payload reports it as an
+    // explicit null rather than dropping the key (#456: an agent consumer must
+    // be able to read it unconditionally).
+    payload["profile"]["endpoint"] = serde_json::Value::Null;
+    assert!(
+        v.is_valid(&payload),
+        "adapter-validate must accept a null endpoint: {payload}"
+    );
+
+    payload["profile"]
+        .as_object_mut()
+        .unwrap()
+        .remove("endpoint");
+    assert!(
+        !v.is_valid(&payload),
+        "a missing endpoint key must be rejected; absent is reported as null"
+    );
+
+    payload["profile"] = serde_json::json!({});
+    assert!(
+        !v.is_valid(&payload),
+        "an empty profile object must be rejected, or the parity comparison has \
+         nothing to compare"
+    );
+}
+
+/// The API refuses a non `slack` binding whose reply route is half set, so the
+/// payload reports the whole route that was written, `adapter` slug included.
+/// That slug is the operator's, never the profile's suggestion.
+#[test]
+fn the_bind_payload_reports_the_whole_route_it_wrote() {
+    let schema = load_schema("adapter-bind.schema.json");
+    let required = required_names(&schema);
+    for field in ["agent", "kind", "address", "endpoint", "adapter"] {
+        assert!(
+            required.contains(field),
+            "adapter-bind must require `{field}`; required {required:?}"
+        );
+    }
+
+    let v = validator(&schema);
+    let payload = serde_json::json!({
+        "agent": "demo",
+        "kind": "email",
+        "address": "agent@example.test",
+        "endpoint": "https://mail.example.test/curie/reply",
+        "adapter": "operator-owned",
+    });
+    assert!(v.is_valid(&payload), "adapter-bind must accept: {payload}");
+}
+
+/// The smoke-test verdict is machine readable in the same shape as the
+/// conformance kit's, and it never carries a field named `conformant`: the verb
+/// checks that this endpoint accepts the supplied secret and that the route
+/// fields are present, and neither of those is whole floor conformance.
+#[test]
+fn the_smoke_test_payload_is_machine_readable_and_never_claims_conformance() {
+    let name = "adapter-smoke-test.schema.json";
+    let required = required_names(&load_schema(name));
+    for field in ["verdict", "counts", "manual_review_required"] {
+        assert!(
+            required.contains(field),
+            "{name} must require `{field}`; required {required:?}"
+        );
+    }
+
+    let declared = declared_property_names(&load_schema(name));
+    assert!(
+        !declared.contains("conformant"),
+        "no field named `conformant` may exist anywhere in the output surface; \
+         declared {declared:?}"
+    );
+    for field in ["name", "ok", "status", "detail"] {
+        assert!(
+            declared.contains(field),
+            "{name} must report per check `{field}`; declared {declared:?}"
+        );
+    }
+}
