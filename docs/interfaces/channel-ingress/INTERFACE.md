@@ -70,6 +70,19 @@ protocol (not just the service) is the seam: the Rust CLI mints the exact
 (`cli/src/queue.rs`) and drives the whole deployed system with zero Slack contact
 via `curie local message` / `cluster message` (`cli/src/chat.rs`, `cli/src/message.rs`).
 
+A third party channel adapter sits outside this seam entirely, over the
+`POST /channels/turns` ingress and reply event egress described in
+`docs/guides/building-a-channel-adapter.md`. Two artifacts help an author
+build one: an `adapter.yaml` binding profile (a per install binding file
+naming the channel kind, address shape, reply endpoint, and credential
+identities; not the install agnostic composition manifest ADR-0096 decision 2
+describes, which is separate and later), read and written by the `curie
+adapter` verbs (`scaffold`, `validate`, `bind`, `token`, `smoke-test`); and
+the `channel-protocol[conformance]` kit, a black box HTTP checker against the
+seven rule wire floor, run either as an importable `run_floor` or as the
+`curie-adapter-conformance` console command. Both live in
+`packages/channel-protocol`.
+
 ## Known leakage
 
 Two ends and the binding surface were cleaned; what remains is egress semantics and a

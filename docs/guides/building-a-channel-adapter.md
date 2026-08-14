@@ -225,8 +225,160 @@ An adapter must:
 5. Handle all four events, and tolerate ones it does not use.
 6. Dedupe on `TurnCompleted.event_id`, at minimum in memory, and tolerate a
    completion arriving for a conversation it already considers finished.
-7. Re-mint its `chn` token rather than treating a 401 as fatal, since any
-   rebind invalidates it.
+7. Never treat a 401 as fatal: hold the delivery, stay alive, surface a loud
+   stale credential signal so the operator notices, and resume once the
+   operator supplies a replacement token. An adapter holds no platform key and
+   must never try to mint its own replacement (see section 3); the mint stays
+   platform key only.
+
+## 8. Building tooling: the binding profile, `curie adapter`, and the conformance kit
+
+Everything below reads or writes an `adapter.yaml` file. Scaffold one,
+validate it, bind it to an agent, mint a token against it, smoke test the
+deployed adapter, then run the full conformance kit before calling the
+adapter done.
+
+### The binding profile
+
+`adapter.yaml` is a **per install binding file**: the channel kind an adapter
+owns, the address shape it accepts, the endpoint this install's worker POSTs
+reply events to, and the names of the credentials involved. It is not the
+install agnostic composition manifest ADR-0096 decision 2 describes (image
+reference, config and secret schema, platform performed composition). That
+document is separate and later; nothing here pre-empts it.
+
+Fields:
+
+- `version`: the profile format version, checked before anything else (see
+  Compatibility below).
+- `kind`: the channel kind this adapter owns, a lowercase slug.
+- `endpoint`: the reply route. Optional here; `bind`, `token`, and
+  `smoke-test` need a concrete one and either read it off the profile or take
+  an override.
+- `address`: `description`, `pattern` (a regex that has to compile in both
+  Python `re` and the Rust `regex` crate, so no lookaround and no
+  backreferences), and `example`.
+- `credentials`: `egress` (a slug, a suggestion only, see below),
+  `egress_secret_env` and `ingress_token_env` (documentation of what the
+  adapter itself reads; Curie never resolves either name).
+- `conformance`: `wire_version` (the reply wire this adapter speaks) and
+  `mints_reply_ref`.
+
+The schema is closed (`additionalProperties: false`), so a typo'd key is
+refused rather than silently ignored.
+
+### Compatibility policy
+
+A third party commits an `adapter.yaml` you cannot force it to upgrade. Both
+`curie adapter validate` and the Python kit read the raw `version` key and
+check it before touching the schema. A version they do not accept is refused
+with a message naming both versions, for example: this curie understands
+adapter profile 1.0; the file declares 1.1. That check has to run first: a
+1.1 file checked against the closed schema trips `additionalProperties:
+false`, and the operator reads "additional property not allowed" instead of
+the version they actually have to act on. A missing `version` key gets the
+same refusal, never a default.
+
+Acceptance is same major, less or equal minor: a 1.0 build refuses 1.1 (it
+cannot know the new field is optional) and refuses 2.0 outright; a 1.1 build
+still accepts a 1.0 file.
+
+On a version you do not recognize: upgrade `curie`, or pin the older profile
+version. Never delete the `version` key to work around the refusal.
+
+The change class table, so an adapter author can predict the bump before a
+change lands:
+
+| Change | Bump | Why |
+|---|---|---|
+| Add an optional property | minor, 1.0 to 1.1 | The schema is closed, so a consumer on 1.0 rejects the new payload. |
+| Add a required property; remove or rename one; change a type; tighten a pattern; make an optional property required | major, 1.0 to 2.0 | Invalidates a file a conforming author previously wrote. |
+| Loosen a pattern, widen an enum, relax a bound | minor | Same closed schema reasoning as an added optional property. |
+| Edit a description, a title, or a comment | none | No shape change. |
+
+### `curie adapter` verbs
+
+All five read or write the profile at `--file` (default `adapter.yaml`).
+
+- **`scaffold <name>`** writes one `adapter.yaml` under `<dir>/<name>/`
+  (`--dir` defaults to the current directory) from `--kind`, `--address`,
+  `--endpoint`, and `--adapter`. The generated `address.pattern` matches
+  exactly the address it was scaffolded for; widen it by hand to the real
+  shape of the channel's addresses.
+- **`validate`** checks the version, then the schema, then the one rule the
+  schema cannot express: `address.pattern` has to compile with the Rust
+  `regex` crate as well as Python `re`. Pass `--address` to also check that a
+  concrete address matches the declared shape.
+- **`bind <agent>`** writes the agent's four field channel route. It takes an
+  explicit `--address` and an explicit `--adapter-slug`, both operator
+  supplied, never taken from the profile: `address.example` is authoring
+  documentation, not an operator confirmed value, and the profile's
+  `credentials.egress` is only a suggestion. Requires `--yes` to actually
+  write.
+- **`token`** mints a `chn` token for one concrete `(kind, address)` pair. It
+  also takes an explicit `--address`. `--ttl-s` defaults to 3600, and the API
+  accepts 1 to 604800.
+- **`smoke-test`** probes a deployed adapter from the outside: does it accept
+  the egress secret you supply, does it refuse a wrong one, are the route
+  fields present for this pair. It also takes an explicit `--address`, plus
+  `--secret-file` or `--secret-stdin` for the egress secret. It is a narrower
+  check than the conformance kit, not a replacement for it.
+
+`--address` and `--adapter-slug` are operator owned on all three verbs for the
+same reason: the worker's credential map is indexed by the route's adapter
+slug, so a profile that named the wrong slug, or a stale `address.example`,
+would point a real credential at the wrong destination. That is a security
+boundary, so the CLI asks a human to confirm it rather than trusting the
+file.
+
+`smoke-test` also never reads the egress secret from an environment variable
+the profile names. `credentials.egress_secret_env` documents what the adapter
+itself reads; Curie never resolves that name. The secret has to come from
+`--secret-file` or `--secret-stdin`, supplied at the command line, or the
+command refuses, because a hostile profile could otherwise name any
+environment variable on the operator's box and have its value read and sent.
+
+### The conformance kit
+
+`channel-protocol[conformance]` ships two front doors onto the same seven
+rule floor:
+
+- **The importable runner.** `from channel_protocol.conformance import
+  run_floor`. Call it with an `AdapterUnderTest`, an `IngressDriver`, and a
+  side effect probe, and assert `report.automated_floor == "pass"` in your own
+  test suite.
+- **The console script.** `curie-adapter-conformance --profile adapter.yaml
+  --endpoint <url> --secret-file <path>` (or `--secret-stdin`), the command a
+  vendor runs in its own repo and quotes in its own README. Add `--driver
+  module:attr` naming a zero argument factory for an `IngressDriver`, or rules
+  1, 2, and 7 and clause 3b report `not_run`. `--json` emits the report as
+  JSON; `--mode diagnostic` reports partial results while an adapter is still
+  being built and never reaches a passing verdict.
+
+The exit code follows `automated_floor`: nothing short of a full strict pass
+exits 0, so a README cannot claim conformance off a partial run.
+
+### Verdict semantics
+
+`automated_floor` is `pass` or `fail` over the automatable clauses only. Two
+clauses are outside that domain:
+
+- **3c**, that the egress secret is compared in constant time. No HTTP status
+  carries the answer, because two rejections that take different amounts of
+  wall time are indistinguishable from two rejections on a loaded box.
+- **7c**, that a stale ingress credential is signalled loudly. That signal is
+  for the adapter's own operator, in a log, a metric, or a page, so it never
+  crosses the wire the kit observes.
+
+Both are listed in `manual_review_required`, with why no check decides them
+and how to review them by hand. A `pass` does not assert either one: read the
+adapter's secret check yourself for 3c, and arm a 401 and confirm the signal
+for 7c.
+
+Missing evidence is never success. Any automatable clause that is not
+`pass`, including `not_run` from an unsupplied ingress driver or an adapter
+with no side effect probe, makes `automated_floor` fail. There is no
+`partial` status and no `skipped` status.
 
 ## Related
 
