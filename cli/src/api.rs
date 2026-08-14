@@ -1393,6 +1393,60 @@ mod tests {
         assert_eq!(both["repo_full_name"], "acme/bundle");
     }
 
+    // [FAIL-FIRST -- ENABLE WITH S4 IMPLEMENTATION] agent_update_body_never_emits_channel
+    //
+    // Cannot compile today: S4.2 drops `agent_update_body`'s channel arm, and
+    // with it the now-unused `slack_channel` parameter, so this calls the
+    // one-argument form that does not exist yet.
+    //
+    // When enabling, DELETE the channel halves of
+    // `agent_update_body_carries_only_what_was_asked` above rather than keeping
+    // both: `AgentUpdate.channel` is retired (ADR-0107) and a PATCH carrying it
+    // now 422s, so a test asserting the CLI emits it asserts a defect.
+    //
+    // #[test]
+    // fn agent_update_body_never_emits_channel() {
+    //     // `AgentUpdate.channel` is retired: bindings move through
+    //     // `POST /agents/{id}/channels`. A body that still carries the key does
+    //     // not merely send something unnecessary, it 422s the whole PATCH --
+    //     // taking the repo bind travelling beside it down with it.
+    //     for body in [
+    //         agent_update_body(None),
+    //         agent_update_body(Some("acme/bundle")),
+    //     ] {
+    //         assert!(
+    //             body.get("channel").is_none() && body.get("channels").is_none(),
+    //             "no binding key belongs in an AgentUpdate body: {body}"
+    //         );
+    //     }
+    //     assert_eq!(
+    //         agent_update_body(Some("acme/bundle")),
+    //         serde_json::json!({"repo_full_name": "acme/bundle"}),
+    //         "the repo bind is the only thing left in this body"
+    //     );
+    // }
+
+    // [FAIL-FIRST -- ENABLE WITH S4 IMPLEMENTATION] add_channel_body_shape
+    //
+    // Cannot compile today: `add_channel_body` is introduced by S4.2.
+    //
+    // #[test]
+    // fn add_channel_body_shape() {
+    //     // The subresource takes the PAIR and nothing else. Exact equality is
+    //     // the assertion, so a stray `agent_id` echoed back into the body, or a
+    //     // bare address string standing in for the pair, both fail.
+    //     assert_eq!(
+    //         add_channel_body("slack", "C0EXAMPLE1"),
+    //         serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1"})
+    //     );
+    //     // The kind is never inferred: a non-Slack ingress passes through
+    //     // verbatim, which is the whole point of a channel-neutral binding.
+    //     assert_eq!(
+    //         add_channel_body("email", "ops@example.com"),
+    //         serde_json::json!({"kind": "email", "address": "ops@example.com"})
+    //     );
+    // }
+
     #[test]
     fn https_is_always_secure() {
         assert!(!is_insecure_endpoint("https://api.example.com"));

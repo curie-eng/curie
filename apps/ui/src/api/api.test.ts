@@ -3,6 +3,9 @@ import { bundleFileTree, buildBundleZip, bundleTreeFromFiles, nextVersionLabel }
 import {
   createAgent,
   updateAgent,
+  // [FAIL-FIRST] S5.2: patchAgentChannel does not exist yet; this import is
+  // undefined until the client adds it, so calling it below throws at runtime.
+  patchAgentChannel,
   uploadBundle,
   BundleValidationError,
   ApiError,
@@ -13,6 +16,7 @@ import {
   listTraces,
   listRunnerPods,
   getConfig,
+  getAgents,
 } from "./client";
 
 afterEach(() => {
@@ -215,23 +219,52 @@ describe("agent-detail client calls", () => {
     expect((init.headers as Record<string, string>)["X-API-Key"]).toBeTruthy();
   });
 
-  // One agent binds exactly one channel (ADR-0089), so the wire carries a single
-  // binding object: never an array, and never a plural `channels` field.
-  it("sends the channel binding as a singular object, never an array or a plural field", async () => {
+  // [FAIL-FIRST] ADR-0107: an agent binds one-or-more channels, so AgentOut
+  // carries `channels: ChannelBinding[]`, ordered `(kind, address)`. This
+  // fixture mirrors today's real API response (a bare `channel` object, no
+  // `channels` key) -- the assertion fails until S3 lands the API contract
+  // and S5.1 widens the AgentOut type and its real fixtures accordingly.
+  it("agent_out_carries_a_channels_array", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(200, [
+        {
+          id: "a1",
+          name: "deal-desk",
+          channel: { kind: "slack", address: "C0EXAMPLE1" },
+          model: null,
+          created_at: "now",
+        },
+      ]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const agents = await getAgents();
+    expect(Array.isArray((agents[0] as unknown as { channels: unknown }).channels)).toBe(true);
+  });
+
+  // [FAIL-FIRST] S5.2: patchAgentChannel does not exist on the client yet --
+  // it must PATCH the `/agents/{id}/channels` subresource, naming the binding
+  // to move via a `?kind=&address=` selector query string (never a body field,
+  // so the selector can never be confused with the replacement value).
+  it("patchAgentChannel_targets_the_subresource_with_the_pair_selector", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(200, {
         id: "a1",
         name: "deal-desk",
-        channel: { kind: "slack", address: "C9999ZZZZ" },
+        channels: [{ kind: "slack", address: "C0EXAMPLE2" }],
+        model: null,
         created_at: "now",
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    await updateAgent("a1", { channel: { kind: "slack", address: "C9999ZZZZ" } });
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(Array.isArray(body.channel)).toBe(false);
-    expect(body.channel).toEqual({ kind: "slack", address: "C9999ZZZZ" });
-    expect(body.channels).toBeUndefined();
+    await patchAgentChannel(
+      "a1",
+      { kind: "slack", address: "C0EXAMPLE1" },
+      { kind: "slack", address: "C0EXAMPLE2" },
+    );
+    const [requestUrl, init] = fetchMock.mock.calls[0];
+    expect(init.method).toBe("PATCH");
+    expect(requestUrl).toBe("/api/agents/a1/channels?kind=slack&address=C0EXAMPLE1");
+    expect(JSON.parse(init.body)).toEqual({ kind: "slack", address: "C0EXAMPLE2" });
   });
 
   it("activates a version by POSTing a deployment", async () => {

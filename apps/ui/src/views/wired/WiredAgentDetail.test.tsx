@@ -12,6 +12,8 @@ import {
   listDeployments,
   getVersionFiles,
   updateAgent,
+  // [FAIL-FIRST] S5.2: does not exist on the client yet.
+  patchAgentChannel,
   createDeployment,
   type AgentOut,
   type VersionOut,
@@ -33,6 +35,9 @@ vi.mock("../../api/client", async (importOriginal) => {
     listDeployments: vi.fn(),
     getVersionFiles: vi.fn(),
     updateAgent: vi.fn(),
+    // [FAIL-FIRST] S5.2: not a real export on the current client; mocked here so
+    // the multi-channel test below can assert on it once the client adds it.
+    patchAgentChannel: vi.fn(),
     createVersion: vi.fn(),
     uploadBundle: vi.fn(),
     createDeployment: vi.fn(),
@@ -333,6 +338,54 @@ describe("WiredAgentDetail — promote-to-prod (item 6)", () => {
     await user.click(await screen.findByRole("button", { name: "Cancel" }));
 
     expect(vi.mocked(createDeployment)).not.toHaveBeenCalled();
+  });
+});
+
+describe("WiredAgentDetail — multi-channel edit (ADR-0107)", () => {
+  // [FAIL-FIRST] S5.3/S5.4: the current component renders exactly one channel
+  // editor, keyed off the singular `agent.channel`. Once channels go plural
+  // each binding gets its own editor keyed by `${kind}:${address}`, and
+  // saving one PATCHes only that binding via patchAgentChannel's pair
+  // selector -- the other row is untouched. Fails today: only one editor
+  // exists, so `findAllByTestId("channel-input")` never reaches length 2.
+  it("renders_one_editor_per_binding_and_saves_only_that_one", async () => {
+    const user = userEvent.setup();
+    const twoBindingAgent = {
+      ...AGENT,
+      channels: [
+        { kind: "slack", address: "C0EXAMPLE1" },
+        { kind: "slack", address: "C0EXAMPLE2" },
+      ],
+    } as unknown as AgentOut;
+    vi.mocked(getAgents).mockResolvedValue([twoBindingAgent]);
+    renderDetail();
+
+    expect(await screen.findByTestId("agent-detail-name")).toHaveTextContent("deal-desk");
+
+    const inputs = await screen.findAllByTestId("channel-input");
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0]).toHaveValue("C0EXAMPLE1");
+    expect(inputs[1]).toHaveValue("C0EXAMPLE2");
+
+    // Edit and save only the second binding's row.
+    await user.clear(inputs[1]);
+    await user.type(inputs[1], "C0EXAMPLE3");
+    const saves = screen.getAllByTestId("channel-save");
+    await user.click(saves[1]);
+
+    // The PATCH names the second pair as the selector and its new address as
+    // the replacement -- never a bare updateAgent call, and never the first
+    // binding's pair.
+    await waitFor(() => expect(patchAgentChannel).toHaveBeenCalledTimes(1));
+    expect(patchAgentChannel).toHaveBeenCalledWith(
+      "a1",
+      { kind: "slack", address: "C0EXAMPLE2" },
+      { kind: "slack", address: "C0EXAMPLE3" },
+    );
+    expect(updateAgent).not.toHaveBeenCalled();
+
+    // The first row is untouched by the second row's save.
+    expect(inputs[0]).toHaveValue("C0EXAMPLE1");
   });
 });
 

@@ -5,7 +5,7 @@ import { test, expect, type Page } from "@playwright/test";
 // the create-path sequence (POST version + PUT bundle + activate deployment).
 // The backend is stubbed with real-shaped responses, so this runs stackless.
 
-const AGENT = { id: "a1", name: "deal-desk", channel: { kind: "slack", address: "C0123ABCD" }, created_at: "2026-07-01T00:00:00Z" };
+const AGENT = { id: "a1", name: "deal-desk", channel: { kind: "slack", address: "C0123ABCD" }, channels: [{ kind: "slack", address: "C0123ABCD" }], created_at: "2026-07-01T00:00:00Z" };
 
 const SKILL_V1 =
   "---\nname: deal-desk\ndescription: Approves deals\ntools: [slack]\n---\n# Policy\nAuto-approve up to 15%.";
@@ -118,6 +118,35 @@ test("open an agent, edit its skill, and deploy a new version", async ({ page })
   await page.getByRole("button", { name: "← Agents" }).click();
   await expect(page.getByTestId("agent-card-name")).toBeVisible();
   await expect(page.getByRole("button", { name: "New agent" })).toBeVisible();
+});
+
+// [FAIL-FIRST] ADR-0107/S5.5: a two-binding agent renders every bound address
+// (`a.channels.map(c => c.address)`), not just `a.channel.address`. The
+// fixture keeps the legacy singular `channel` field too (today's WiredAgents
+// row reads it) so the render itself does not crash on the missing field --
+// only the assertion that BOTH addresses are visible should fail today.
+test("a two-binding agent renders both addresses", async ({ page }) => {
+  const json = (route: import("@playwright/test").Route, status: number, body: unknown) =>
+    route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
+  const twoBindingAgent = {
+    id: "a3",
+    name: "multi-channel-bot",
+    channel: { kind: "slack", address: "C0EXAMPLE1" },
+    channels: [
+      { kind: "slack", address: "C0EXAMPLE1" },
+      { kind: "slack", address: "C0EXAMPLE2" },
+    ],
+    created_at: "2026-07-01T00:00:00Z",
+  };
+  await page.route("**/api/agents", (route) => json(route, 200, [twoBindingAgent]));
+  await page.route("**/api/agents/*/versions", (route) => json(route, 200, []));
+  await page.route("**/api/deployments*", (route) => json(route, 200, []));
+
+  await page.goto("/?api=1");
+  await page.getByRole("navigation").getByText("Agents", { exact: true }).click();
+
+  await expect(page.getByText("C0EXAMPLE1")).toBeVisible();
+  await expect(page.getByText("C0EXAMPLE2")).toBeVisible();
 });
 
 test("an agent whose active version has no bundle shows an honest empty state", async ({ page }) => {

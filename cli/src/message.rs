@@ -3194,6 +3194,82 @@ mod tests {
         assert!(err.contains("beta -> C2"), "{err}");
     }
 
+    // [FAIL-FIRST -- ENABLE WITH S4 IMPLEMENTATION] the pair-based `select_channel` trio
+    //
+    // None of these compile today: `Agent.channels` is `Vec<ChannelBinding>`
+    // only after S4.1, and the `agent_bound_to` fixture below needs it.
+    //
+    // When enabling, `agent(name, channel)` above becomes a one-binding wrapper
+    // over `agent_bound_to(name, &[channel])`, and the four existing
+    // `select_channel_*` tests keep their current assertions unchanged -- the
+    // pair list for one-binding agents reads exactly as the agent list did.
+    //
+    // fn agent_bound_to(name: &str, channels: &[&str]) -> Agent {
+    //     Agent {
+    //         id: format!("id-{name}"),
+    //         name: name.to_string(),
+    //         channels: channels
+    //             .iter()
+    //             .map(|c| crate::api::ChannelBinding {
+    //                 kind: "slack".to_string(),
+    //                 address: c.to_string(),
+    //             })
+    //             .collect(),
+    //         repo_full_name: None,
+    //         approval_required_tools: None,
+    //         approval_routes: None,
+    //         model: None,
+    //         thinking: None,
+    //     }
+    // }
+    //
+    // #[test]
+    // fn select_channel_uses_the_sole_bound_channel_across_agents() {
+    //     // Selection counts (agent, channel) PAIRS, not agents (D4). One pair
+    //     // across the whole platform is unambiguous however many agents are
+    //     // deployed, so an agent bound to nothing must not make the one real
+    //     // binding ambiguous.
+    //     let agents = [agent_bound_to("only", &["C0EXAMPLE1"]), agent_bound_to("idle", &[])];
+    //     assert_eq!(select_channel(&agents, None).unwrap(), "C0EXAMPLE1");
+    // }
+    //
+    // #[test]
+    // fn select_channel_errors_when_one_agent_has_two_channels_listing_both_pairs() {
+    //     // The heart of D4. Today's `[only]` arm returns `only.channel.address`
+    //     // and structurally CANNOT see a second binding, so a single deployed
+    //     // agent bound to two channels silently routes to whichever one the
+    //     // scalar column happened to hold. Two pairs is ambiguous, and the
+    //     // error must name BOTH so the operator can pick.
+    //     let agents = [agent_bound_to("solo", &["C0EXAMPLE1", "C0EXAMPLE2"])];
+    //     let err = select_channel(&agents, None).unwrap_err().to_string();
+    //     assert!(err.contains("--channel"), "{err}");
+    //     assert!(err.contains("solo -> C0EXAMPLE1"), "{err}");
+    //     assert!(err.contains("solo -> C0EXAMPLE2"), "{err}");
+    // }
+    //
+    // #[test]
+    // fn select_agent_id_matches_any_of_an_agents_channels() {
+    //     // `select_agent_id` resolves by channel too, and today's
+    //     // `.find(|a| a.channel.address == channel)` sees only the first
+    //     // binding: an explicit --channel naming the SECOND one would report
+    //     // "no deployed agent has channel ..." for an agent that plainly does.
+    //     let agents = [
+    //         agent_bound_to("one", &["C0EXAMPLE1", "C0EXAMPLE2"]),
+    //         agent_bound_to("two", &["C0EXAMPLE3"]),
+    //     ];
+    //     assert_eq!(select_agent_id(&agents, Some("C0EXAMPLE2")).unwrap(), "id-one");
+    //     assert_eq!(select_agent_id(&agents, Some("C0EXAMPLE3")).unwrap(), "id-two");
+    //     // An address bound to nobody still errors, naming it.
+    //     assert!(select_agent_id(&agents, Some("C0EXAMPLE9"))
+    //         .unwrap_err()
+    //         .to_string()
+    //         .contains("C0EXAMPLE9"));
+    //     // Agent selection still counts AGENTS, not pairs: a sole agent with
+    //     // two bindings is one agent, so it resolves with no flag. This is the
+    //     // deliberate asymmetry with `select_channel` above -- do not "fix" it.
+    //     assert_eq!(select_agent_id(&agents[..1], None).unwrap(), "id-one");
+    // }
+
     #[test]
     fn server_host_and_port_parses_scheme_host_port() {
         assert_eq!(

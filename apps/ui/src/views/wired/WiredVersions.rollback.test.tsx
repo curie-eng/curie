@@ -57,13 +57,18 @@ const mkDep = (
   deployed_at,
 });
 
+// [FIXTURE-ONLY] ADR-0107: AgentOut will carry `channels` (plural) once S5.1
+// lands; unused by any assertion in this file. Keeps the legacy singular
+// `channel` field too -- WiredAgents still renders `a.channel.address`
+// today, and dropping it would crash the render rather than fail a test.
 const AGENT: AgentOut = {
   id: "a1",
   name: "deal-desk",
   channel: { kind: "slack", address: "#revenue-ops" },
+  channels: [{ kind: "slack", address: "#revenue-ops" }],
   model: null,
   created_at: "2026-06-01T00:00:00Z",
-};
+} as unknown as AgentOut;
 
 // v2 is the version the agent currently serves; v1 was previously deployed and is
 // no longer active. Both deployments live in the "dev" environment so the

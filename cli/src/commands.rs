@@ -7961,3 +7961,79 @@ mod overrides_tests {
         );
     }
 }
+
+// [FAIL-FIRST -- ENABLE WITH S4 IMPLEMENTATION] the `channels` verb's flag parse pair
+//
+// Neither test compiles today: `ChannelChange` is introduced by S4.8c/S4.8e.
+// They are written against `ChannelChange::resolve(add, remove)`, the shape
+// `OverrideChange::resolve` establishes for "turn a clap flag pair into one
+// intent, with usage errors raised before any I/O". If the implementer picks a
+// different constructor name, re-point the calls -- but the ASSERTED BEHAVIOR
+// (split on the FIRST `=`, reject a bare address) is the contract and must not
+// be relaxed.
+//
+// #[cfg(test)]
+// mod channels_tests {
+//     use super::ChannelChange;
+//
+//     #[test]
+//     fn channel_change_parses_kind_and_address_on_first_equals() {
+//         // KIND=ADDRESS splits on the FIRST `=` only. A kind may not contain
+//         // one; an address may -- an email-shaped or URL-shaped address for a
+//         // non-Slack ingress is the whole reason bindings went channel-neutral.
+//         // Splitting on the last `=`, or rejecting the second one, would make
+//         // those addresses unbindable through the CLI.
+//         let change = ChannelChange::resolve(Some("slack=C0EXAMPLE1".into()), None).unwrap();
+//         assert_eq!(
+//             change,
+//             ChannelChange::Add {
+//                 kind: "slack".into(),
+//                 address: "C0EXAMPLE1".into(),
+//             }
+//         );
+//
+//         let odd = ChannelChange::resolve(Some("email=ops+a=b@example.com".into()), None).unwrap();
+//         assert_eq!(
+//             odd,
+//             ChannelChange::Add {
+//                 kind: "email".into(),
+//                 address: "ops+a=b@example.com".into(),
+//             },
+//             "everything after the first `=` is the address, `=` included"
+//         );
+//
+//         // The same rule on the remove side: one parser, both flags.
+//         let removed = ChannelChange::resolve(None, Some("slack=C0EXAMPLE2".into())).unwrap();
+//         assert_eq!(
+//             removed,
+//             ChannelChange::Remove {
+//                 kind: "slack".into(),
+//                 address: "C0EXAMPLE2".into(),
+//             }
+//         );
+//
+//         // Neither flag is an inspect, not an error: `channels <agent>` lists.
+//         assert_eq!(ChannelChange::resolve(None, None).unwrap(), ChannelChange::List);
+//     }
+//
+//     #[test]
+//     fn channel_change_rejects_a_bare_address_with_no_kind() {
+//         // `--add C0EXAMPLE1` is the mistake this catches. Defaulting the kind
+//         // to "slack" would be the silent-wrong-thing: the operator learns the
+//         // kind is optional, and the first non-Slack ingress binds to the wrong
+//         // one. The error must exit USAGE, before any network call.
+//         let err = ChannelChange::resolve(Some("C0EXAMPLE1".into()), None).unwrap_err();
+//         let (class, _fix) = crate::exit::classify(&err);
+//         assert_eq!(class, crate::exit::ExitClass::Usage);
+//         assert!(err.to_string().contains("KIND=ADDRESS"), "{err}");
+//
+//         // An empty kind or an empty address is the same mistake wearing a
+//         // separator, and must not slip through as a half-empty pair.
+//         for bad in ["=C0EXAMPLE1", "slack=", "="] {
+//             assert!(
+//                 ChannelChange::resolve(Some(bad.into()), None).is_err(),
+//                 "{bad:?} must not resolve to a binding"
+//             );
+//         }
+//     }
+// }
