@@ -2347,23 +2347,18 @@ pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String
         // The address IS bound, but only on kinds this path cannot send as.
         // Saying "no deployed agent has channel X" would be a lie the operator
         // cannot act on, so name the kinds it is actually bound on.
-        let mut other_kinds: Vec<&str> = Vec::new();
-        for kind in agents
+        let other_kinds: std::collections::BTreeSet<&str> = agents
             .iter()
             .flat_map(|a| a.channels.iter())
             .filter(|c| c.address == channel)
             .map(|c| c.kind.as_str())
-        {
-            if !other_kinds.contains(&kind) {
-                other_kinds.push(kind);
-            }
-        }
+            .collect();
         if !other_kinds.is_empty() {
             bail!(
                 "channel {channel:?} is bound to a non-Slack channel kind ({}); this command \
                  sends a Slack turn and cannot target it -- pass the address of a \
                  {SENDABLE_CHANNEL_KIND} binding instead",
-                other_kinds.join(", ")
+                other_kinds.into_iter().collect::<Vec<_>>().join(", ")
             );
         }
         bail!("no deployed agent has {SENDABLE_CHANNEL_KIND} channel {channel:?}");
