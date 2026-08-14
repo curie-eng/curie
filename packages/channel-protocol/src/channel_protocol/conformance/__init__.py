@@ -32,7 +32,7 @@ from .floor import (
     ManualReviewItem,
     run_floor,
 )
-from .ingress import FakeIngress, ObservedRequest
+from .ingress import MAX_TURN_BODY_BYTES, FakeIngress, ObservedRequest
 from .transport import (
     ADAPTER_SECRET_HEADER,
     MAX_ACK_BODY_BYTES,
@@ -45,6 +45,7 @@ from .transport import (
 __all__ = [
     "ADAPTER_SECRET_HEADER",
     "MAX_ACK_BODY_BYTES",
+    "MAX_TURN_BODY_BYTES",
     "AdapterResponse",
     "AdapterUnderTest",
     "AdapterUnreachableError",

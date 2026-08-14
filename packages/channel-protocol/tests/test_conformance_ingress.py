@@ -25,15 +25,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from channel_protocol.conformance import AdapterUnderTest, FakeIngress, FloorReport, run_floor
+from channel_protocol.conformance import (
+    MAX_TURN_BODY_BYTES,
+    AdapterUnderTest,
+    FakeIngress,
+    FloorReport,
+    run_floor,
+)
 from conformance_stubs import (
     LyingIngressDriver,
+    RacingIngressDriver,
     StubAdapter,
     StubIngressDriver,
     SubprocessIngressDriver,
+    clause_status,
     conformant_stub,
     free_port,
     non_conformant_stub,
+    post_with_declared_length,
     random_secret,
     rule,
     rule_status,
@@ -193,16 +202,84 @@ def test_fake_ingress_reproduces_the_duplicate_matrix() -> None:
         assert other["duplicate"] is False
         assert other["event_id"] != first["event_id"]
 
-        ingress.arm_202()
+        # Armed for ONE identity. A different delivery arriving first must not
+        # be able to consume it, or rule 2 passes on a declared delivery that
+        # never saw the in flight claim its finality is about.
+        ingress.arm_202("dlv-2")
+        unrelated_status, _ = _post(
+            turns, dict(body, delivery_id="dlv-other"), api_key=ingress.token
+        )
+        assert unrelated_status == 200
+        assert ingress.armed_202() == "dlv-2"
+
         in_flight_status, in_flight = _post(
             turns, dict(body, delivery_id="dlv-2"), api_key=ingress.token
         )
         assert in_flight_status == 202
         assert in_flight["duplicate"] is True
+        assert ingress.armed_202() is None
         # Never the `pending:` sentinel: the real API answers null here, and
         # returning the sentinel would teach an author to parse a value
         # production never sends.
         assert in_flight["stream_id"] is None
+
+
+def test_a_request_the_ingress_cannot_frame_is_still_recorded() -> None:
+    """The adapter under test writes its own request headers.
+
+    Every ingress rule decides on which records landed in its window, and two of
+    them read absence as conformance, so a header the ingress cannot parse must
+    never be able to delete the observation. It is refused, and it is COUNTED.
+    """
+
+    with _fake_ingress() as ingress:
+        turn = post_with_declared_length(
+            f"{ingress.url}/channels/turns",
+            json.dumps({"kind": _KIND, "address": _ADDRESS, "delivery_id": "dlv-1"}).encode(),
+            {"Content-Type": "application/json", "X-API-Key": ingress.token},
+            declared_length="51x",
+        )
+        assert turn == 400
+
+        mint = post_with_declared_length(
+            f"{ingress.url}/channels/token",
+            json.dumps({"kind": _KIND, "address": _ADDRESS}).encode(),
+            {"Content-Type": "application/json"},
+            declared_length="0abc",
+        )
+        assert mint == 400
+
+        records = ingress.records()
+        assert [record.path for record in records] == [
+            "/channels/turns",
+            "/channels/token",
+        ], records
+        assert all(record.framing_error for record in records), records
+        # The trust boundary clause counts records on the mint route, so an
+        # unreadable mint attempt is still a mint attempt.
+        assert ingress.mint_attempts() == 1
+
+
+def test_an_oversize_declared_turn_body_is_refused_and_recorded() -> None:
+    """The bound is enforced on the DECLARED length, before a byte is read.
+
+    Same posture, and the same status, as the real API's ``_read_bounded_body``:
+    the ingress the kit points an untrusted adapter at must not be persuadable
+    into holding an arbitrary body on the kit's own heap.
+    """
+
+    with _fake_ingress() as ingress:
+        status = post_with_declared_length(
+            f"{ingress.url}/channels/turns",
+            b'{"delivery_id": "dlv-1"}',
+            {"Content-Type": "application/json", "X-API-Key": ingress.token},
+            declared_length=str(MAX_TURN_BODY_BYTES + 1),
+        )
+
+        assert status == 413
+        records = ingress.records()
+        assert len(records) == 1, records
+        assert records[0].framing_error, records[0]
 
 
 def test_fake_ingress_refuses_a_keyless_mint() -> None:
@@ -263,6 +340,31 @@ def test_rule_1_catches_a_fresh_delivery_id_per_retry(
 
     assert rule_status(report, 1) == "fail", report.detail()
     assert report.automated_floor == "fail"
+
+
+@pytest.mark.parametrize("driver_kind", DRIVER_KINDS)
+def test_rule_1_fails_an_adapter_that_never_met_the_outage_and_never_retried(
+    driver_kind: str, tmp_path: Path, secret: str
+) -> None:
+    """Rule 1 needs the FAILURE on the wire, not a window it was assumed in.
+
+    This adapter starts slowly and abandons a delivery the moment the transport
+    fails. A kit that takes the transport down for a fixed 200 ms and restores
+    it on a timer never overlaps with the adapter's first attempt at all: the
+    post lands afterwards, gets a 200, and rule 1 certifies a retry that never
+    happened off one successful delivery.
+    """
+
+    with _harness(
+        driver_kind,
+        tmp_path=tmp_path,
+        secret=secret,
+        behavior_name="slow_start_and_drops_on_transport_failure",
+    ) as harness:
+        report = _run(harness)
+
+    assert rule_status(report, 1) == "fail", report.detail()
+    assert report.automated_floor == "fail", report.detail()
 
 
 @pytest.mark.parametrize("driver_kind", DRIVER_KINDS)
@@ -327,6 +429,77 @@ def test_rule_2_catches_a_retry_after_a_202(
         report = _run(harness)
 
     assert rule_status(report, 2) == "fail", report.detail()
+
+
+@pytest.mark.parametrize("driver_kind", DRIVER_KINDS)
+def test_rule_2_catches_a_retry_after_a_202_hidden_behind_a_bad_content_length(
+    driver_kind: str, tmp_path: Path, secret: str
+) -> None:
+    """The same break as above, with the duplicate post made unreadable.
+
+    This adapter posts honestly, then re posts under a Content-Length no server
+    can parse. If a parse failure can cost the ingress an observation, the kit
+    sees one post, reports ``2 [pass] the adapter did not post it again``, and
+    certifies an adapter that treats a response as a retry signal.
+    """
+
+    with _harness(
+        driver_kind,
+        tmp_path=tmp_path,
+        secret=secret,
+        behavior_name="retries_after_202_evasively",
+    ) as harness:
+        report = _run(harness)
+
+    assert rule_status(report, 2) == "fail", report.detail()
+    assert report.automated_floor == "fail", report.detail()
+
+
+@pytest.mark.parametrize("driver_kind", DRIVER_KINDS)
+def test_rule_2_catches_a_retry_that_arrives_after_any_fixed_settle_window(
+    driver_kind: str, tmp_path: Path, secret: str
+) -> None:
+    """The same break, retried late enough to outlast a fixed window.
+
+    650 ms is not adversarial engineering, it is an ordinary backoff. A kit that
+    sleeps 500 ms and then decides records the conformant half of this adapter's
+    behavior and stops watching before the defect happens, so the verdict is
+    about the kit's timer rather than about the adapter.
+    """
+
+    with _harness(
+        driver_kind,
+        tmp_path=tmp_path,
+        secret=secret,
+        behavior_name="retries_late_after_202",
+    ) as harness:
+        report = _run(harness)
+
+    assert rule_status(report, 2) == "fail", report.detail()
+    assert report.automated_floor == "fail", report.detail()
+
+
+@pytest.mark.parametrize("driver_kind", DRIVER_KINDS)
+def test_rule_2_gives_the_202_to_the_declared_delivery_and_no_other(
+    driver_kind: str, tmp_path: Path, secret: str
+) -> None:
+    """The in flight claim has to reach the DECLARED delivery, or nothing was
+    tested.
+
+    ``RacingIngressDriver`` puts another, entirely legitimate delivery on the
+    wire first, which is what an upstream queue holding more than one message
+    looks like. Against a globally armed one shot that decoy consumes the 202
+    and the declared delivery only ever sees a 200, so the rule reports pass
+    having exercised finality against a response it never provoked. The verdict
+    stays pass here and the reason is what changed: the 202 went to the
+    identity the rule is about.
+    """
+
+    with _harness(driver_kind, tmp_path=tmp_path, secret=secret) as harness:
+        report = _run(harness, driver=RacingIngressDriver(harness.driver))
+
+    assert rule_status(report, 2) == "pass", report.detail()
+    assert "answered 202" in rule(report, 2).detail, rule(report, 2).detail
 
 
 @pytest.mark.parametrize("driver_kind", DRIVER_KINDS)
@@ -404,6 +577,55 @@ def test_rule_7_fails_an_adapter_that_tries_to_self_mint(
         report = _run(harness)
 
     assert rule_status(report, 7) == "fail", report.detail()
+
+
+@pytest.mark.parametrize("driver_kind", DRIVER_KINDS)
+def test_rule_7_fails_when_the_resumed_post_is_not_the_held_delivery(
+    driver_kind: str, tmp_path: Path, secret: str
+) -> None:
+    """"Something arrived after the restart" is not "the held delivery resumed".
+
+    This adapter discards the held delivery on the 401 and then posts an
+    entirely different one once it is back. A resume predicate that accepts any
+    later 2xx reports that the held delivery resumed, and the detail it prints
+    says so, about a turn the correspondent will never get an answer to.
+    """
+
+    with _harness(
+        driver_kind,
+        tmp_path=tmp_path,
+        secret=secret,
+        behavior_name="drops_on_401_and_posts_unrelated_after_restart",
+    ) as harness:
+        report = _run(harness)
+
+    assert clause_status(report, "7a") == "fail", report.detail()
+    assert report.automated_floor == "fail", report.detail()
+
+
+@pytest.mark.parametrize("driver_kind", DRIVER_KINDS)
+def test_rule_7_fails_a_self_mint_hidden_behind_a_bad_content_length(
+    driver_kind: str, tmp_path: Path, secret: str
+) -> None:
+    """The trust boundary clause, against an adapter that hides its mint.
+
+    Clause 7b decides on ``mint_attempts()``, which counts records, so an
+    unreadable mint POST that went unrecorded would report ``7b [pass] the
+    adapter never tried to mint its own replacement token`` about an adapter
+    that just did. This is the one verdict a vendor quotes.
+    """
+
+    with _harness(
+        driver_kind,
+        tmp_path=tmp_path,
+        secret=secret,
+        behavior_name="self_mints_on_401_evasively",
+    ) as harness:
+        report = _run(harness)
+
+    assert clause_status(report, "7b") == "fail", report.detail()
+    assert rule_status(report, 7) == "fail", report.detail()
+    assert report.automated_floor == "fail", report.detail()
 
 
 def test_rules_1_2_7_report_not_run_without_a_driver_and_the_report_is_nonconformant(

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/adapter-validate/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/adapter-validate/v1.1.json",
   "title": "curie adapter validate --json",
   "description": "The agent-facing payload of `curie adapter validate`: the profile it parsed, not just a verdict. The parsed values are what the cross language corpus compares against, so an implementation that returned a constant instead of carrying the parsed field through is caught. Credential IDENTITIES only, never a credential value.",
   "type": "object",
@@ -33,7 +33,7 @@
             "string",
             "null"
           ],
-          "description": "The reply route, or null. Optional in a profile and reported as an explicit null so a consumer can read it unconditionally."
+          "description": "The reply route reduced to scheme, host and port, or null. A profile's route can carry a token in its path or query, so the path and query are never reported. Optional in a profile and reported as an explicit null so a consumer can read it unconditionally."
         },
         "address": {
           "type": "object",

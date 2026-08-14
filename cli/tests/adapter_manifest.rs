@@ -46,6 +46,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use curie::adapter::{ADAPTER_SECRET_HEADER, MAX_ACK_BODY_BYTES};
 use support::{serve, MockServer, Request, Response};
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -258,6 +259,91 @@ fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
+/// The egress secret the smoke-test probes are given. Distinctive enough that a
+/// negative probe DERIVED from it (the real value plus a suffix) is detectable
+/// by substring, which is the whole assertion.
+const REAL_EGRESS_SECRET: &str = "operator-real-egress-secret-1516";
+
+/// Drive `adapter smoke-test` against a loopback endpoint and API, and hand back
+/// its `--json` payload. The verb exits non-zero whenever a check fails, so the
+/// code is deliberately not asserted here: the payload is the evidence, and it
+/// is emitted before the exit code is applied.
+fn smoke_test_payload(api: &MockServer, endpoint: &MockServer, secret: &str) -> serde_json::Value {
+    let dir = tempdir();
+    let mut profile = routed_valid_case();
+    profile["endpoint"] = serde_json::json!(endpoint.base_url.clone());
+    let path = write_profile(dir.path(), &profile);
+    let address = profile["address"]["example"].as_str().unwrap().to_string();
+    let secret_file = dir.path().join("egress.secret");
+    std::fs::write(&secret_file, secret).expect("write the egress secret");
+
+    let output = run(&[
+        "adapter",
+        "smoke-test",
+        "-f",
+        path.to_str().unwrap(),
+        "--address",
+        &address,
+        "--secret-file",
+        secret_file.to_str().unwrap(),
+        // The recorders are loopback http, and refusing cleartext is a
+        // separate, already covered rule.
+        "--allow-insecure",
+        "--yes",
+        "--api-url",
+        &api.base_url,
+        "--json",
+    ]);
+    stdout_json(&output)
+}
+
+/// Every value that reached the endpoint under the egress secret header, in
+/// order. This is the wire, not a log line, so a derived probe cannot hide.
+fn secrets_sent(server: &MockServer) -> Vec<String> {
+    server
+        .recorded()
+        .iter()
+        .filter_map(|req| req.header(ADAPTER_SECRET_HEADER).map(str::to_string))
+        .collect()
+}
+
+/// A syntactically valid JSON acknowledgement of EXACTLY `total` bytes, so the
+/// cap tests turn on size alone and never on a parse failure.
+fn json_body_of(total: usize) -> Response {
+    const OPEN: &str = "{\"pad\":\"";
+    const CLOSE: &str = "\"}";
+    let body = format!(
+        "{OPEN}{}{CLOSE}",
+        "a".repeat(total - OPEN.len() - CLOSE.len())
+    );
+    assert_eq!(
+        body.len(),
+        total,
+        "the fixture must be exactly {total} bytes"
+    );
+    Response {
+        status: 200,
+        content_type: "application/json".into(),
+        body: body.into_bytes(),
+    }
+}
+
+/// The scheme, host and port of a URL, computed with plain string operations.
+///
+/// Deliberately NOT `reqwest::Url`, which is the crate the implementation
+/// redacts with: an expectation computed by the code under test is the code
+/// under test agreeing with itself.
+fn origin_of(url: &str) -> String {
+    let (scheme, rest) = url
+        .split_once("://")
+        .unwrap_or_else(|| panic!("an endpoint carries a scheme: {url}"));
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .expect("a URL carries an authority");
+    format!("{scheme}://{authority}")
+}
+
 // ─── The corpus is the drift gate between the two validators ─────────────────
 
 /// Every valid corpus profile parses in Rust AND its parsed values come back out.
@@ -268,12 +354,18 @@ fn tempdir() -> tempfile::TempDir {
 /// what kills an implementation that hardcodes or drops one: a constant cannot
 /// satisfy `email` and `ms_teams` and `webhook` at once.
 ///
+/// `endpoint` is the one field compared in REDUCED form, because a profile route
+/// can carry a token in its path or query and this payload reaches CI artifacts
+/// and log aggregators. Its scheme, host and port still come from the corpus, so
+/// a constant returning implementation dies here just the same.
+///
 /// Mutation to run against the implementation: replace the parsed
-/// `credentials.egress` with a literal, or drop `endpoint` from the payload.
-/// Both must red here.
+/// `credentials.egress` with a literal, drop `endpoint` from the payload, or
+/// emit the endpoint whole. All three must red here.
 #[test]
 fn rust_accepts_every_valid_corpus_profile() {
     let cases = valid_cases();
+    let mut redactions_proven = 0usize;
     assert!(
         cases.len() >= 2,
         "value parity needs at least two differing valid cases"
@@ -352,14 +444,41 @@ fn rust_accepts_every_valid_corpus_profile() {
             parsed["conformance"]["mints_reply_ref"], case["conformance"]["mints_reply_ref"],
             "payload: {payload}"
         );
-        // Absent in the file must read back as JSON null, never a missing key,
-        // so a consumer can branch on it unconditionally.
-        let expected_endpoint = case
-            .get("endpoint")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        assert_eq!(parsed["endpoint"], expected_endpoint, "payload: {payload}");
+        // The endpoint is the one parsed field the payload REDUCES rather than
+        // carries: a profile route can hold a token in its path or query, and
+        // `--json` is the form that reaches CI artifacts and log aggregators.
+        // Absent in the file must still read back as JSON null, never a missing
+        // key, so a consumer can branch on it unconditionally.
+        match case.get("endpoint").and_then(|e| e.as_str()) {
+            Some(raw) => {
+                let origin = origin_of(raw);
+                assert_eq!(
+                    parsed["endpoint"],
+                    serde_json::json!(origin),
+                    "payload: {payload}"
+                );
+                let tail = &raw[origin.len()..];
+                if !tail.is_empty() {
+                    redactions_proven += 1;
+                    assert!(
+                        !payload.to_string().contains(tail),
+                        "no part of the endpoint's path or query may appear anywhere in \
+                         the payload; {tail:?} did: {payload}"
+                    );
+                }
+            }
+            None => assert!(
+                parsed["endpoint"].is_null(),
+                "an absent endpoint reads back as null: {payload}"
+            ),
+        }
     }
+
+    assert!(
+        redactions_proven > 0,
+        "the corpus must carry at least one endpoint with a path or query, or the \
+         redaction assertion above cannot tell a reduction from a passthrough"
+    );
 }
 
 /// Every invalid corpus case is refused by the verb, whatever its tier. This is
@@ -1132,6 +1251,209 @@ fn token_refuses_a_ttl_the_api_would_reject() {
         api.recorded().is_empty(),
         "an out of bounds ttl must never reach the API; saw {:?}",
         bodies(&api)
+    );
+}
+
+// ─── The reported endpoint is reduced, the written one is whole ──────────────
+
+/// `bind --json` is the form most likely to be redirected into a CI artifact, a
+/// ticket or a log aggregator, and an endpoint can carry a token in its path or
+/// query. The payload therefore reports scheme, host and port only, while the
+/// route WRITTEN to the API stays whole, because that is the route the worker
+/// has to POST to.
+///
+/// Mutation to run against the implementation: report `binding.endpoint`
+/// unreduced. The stdout half must red while the wire half stays green.
+#[test]
+fn bind_reports_a_reduced_endpoint_while_writing_the_whole_route() {
+    let api = api_recorder();
+    let mut profile = routed_valid_case();
+    let route = "https://adapter.example.test/curie/reply?ingress_token=s3cr3t-in-the-query";
+    profile["endpoint"] = serde_json::json!(route);
+
+    let dir = tempdir();
+    let path = write_profile(dir.path(), &profile);
+    let address = profile["address"]["example"].as_str().unwrap().to_string();
+
+    let output = run(&[
+        "adapter",
+        "bind",
+        "-f",
+        path.to_str().unwrap(),
+        "demo",
+        "--address",
+        &address,
+        "--adapter-slug",
+        "operator-owned",
+        "--yes",
+        "--api-url",
+        &api.base_url,
+        "--json",
+    ]);
+    assert_eq!(code(&output), 0, "{}", text(&output));
+
+    let payload = stdout_json(&output);
+    assert_eq!(
+        payload["endpoint"],
+        serde_json::json!(origin_of(route)),
+        "payload: {payload}"
+    );
+    let whole = text(&output);
+    for leaked in ["ingress_token", "s3cr3t-in-the-query", "/curie/reply"] {
+        assert!(
+            !whole.contains(leaked),
+            "no part of the endpoint's path or query may reach stdout or stderr; \
+             {leaked:?} did:\n{whole}"
+        );
+    }
+
+    // The false positive control: the reduction is a reporting decision, not a
+    // truncation of the route itself.
+    let body = recorded_body(&api, "PATCH", "/agents/");
+    assert_eq!(
+        body["channel"]["endpoint"],
+        serde_json::json!(route),
+        "the whole route must still be written: {body}"
+    );
+}
+
+// ─── The negative probe carries a constant, never the real secret ────────────
+
+/// An adapter's rejected-auth path is one of the likeliest places for a
+/// credential to be written to disk in plaintext ("rejected secret X"), and the
+/// adapter is third party infrastructure whose logs the operator does not
+/// control. The wrong secret the negative probe sends must therefore be a fixed
+/// constant, never the operator's real one with something appended.
+///
+/// Mutation to run against the implementation: build the wrong secret as
+/// `format!("{secret}-not-the-secret")`. The containment assertion must red
+/// while the refusal assertion stays green, which is the whole point: a derived
+/// value proves the same thing and leaks while doing it.
+#[test]
+fn the_negative_probe_sends_a_constant_that_does_not_carry_the_real_secret() {
+    assert_verb_routes("smoke-test");
+    let api = api_recorder();
+    let endpoint = serve(|req: &Request| {
+        if req.header(ADAPTER_SECRET_HEADER) == Some(REAL_EGRESS_SECRET) {
+            Response::json(200, r#"{"ok":true}"#)
+        } else {
+            Response::json(401, r#"{"detail":"rejected"}"#)
+        }
+    });
+
+    let payload = smoke_test_payload(&api, &endpoint, REAL_EGRESS_SECRET);
+
+    assert_eq!(
+        payload["egress_positive"]["ok"],
+        serde_json::json!(true),
+        "the endpoint accepts the real secret, so the positive probe must pass: {payload}"
+    );
+    assert_eq!(
+        payload["egress_negative"]["ok"],
+        serde_json::json!(true),
+        "a wrong secret must still be PROVEN refused: {payload}"
+    );
+    assert_eq!(
+        payload["egress_negative"]["status"],
+        serde_json::json!(401),
+        "the refusal must be the endpoint's, read off its answer: {payload}"
+    );
+
+    let sent = secrets_sent(&endpoint);
+    assert_eq!(
+        sent.len(),
+        2,
+        "the egress probes are one positive and one negative; saw {sent:?}"
+    );
+    assert_eq!(
+        sent.iter().filter(|s| *s == REAL_EGRESS_SECRET).count(),
+        1,
+        "exactly one probe may carry the real secret; saw {sent:?}"
+    );
+    for value in &sent {
+        assert!(
+            value == REAL_EGRESS_SECRET || !value.contains(REAL_EGRESS_SECRET),
+            "the wrong secret must not be derived from the real one, or a rejected \
+             auth log line at the adapter hands the real value back for the cost of \
+             stripping a suffix: {value:?}"
+        );
+    }
+}
+
+/// The false positive control for the test above: the negative check is a real
+/// check, so an endpoint that accepts ANY secret fails it. Without this, the
+/// refusal assertion would green against a probe that never happened.
+#[test]
+fn an_endpoint_that_accepts_any_secret_fails_the_negative_check() {
+    let api = api_recorder();
+    let endpoint = endpoint_recorder();
+
+    let payload = smoke_test_payload(&api, &endpoint, REAL_EGRESS_SECRET);
+
+    assert_eq!(
+        payload["egress_negative"]["ok"],
+        serde_json::json!(false),
+        "an endpoint answering 2xx to a wrong secret is not authenticating the \
+         platform at all: {payload}"
+    );
+    assert_eq!(
+        payload["verdict"],
+        serde_json::json!("fail"),
+        "a failed check must fail the verdict: {payload}"
+    );
+}
+
+// ─── The acknowledgement body is read under a cap ────────────────────────────
+
+/// The adapter under test is untrusted, so its answer is read with a running
+/// total and refused once it passes the cap. Reading it whole and measuring
+/// afterwards enforces nothing: the memory is already allocated by then, and a
+/// multi gigabyte chunked answer is an OOM of the operator's shell.
+///
+/// Oversize is a FAILURE and never a truncation, because judging the first N
+/// bytes of a body that was never sent whole hands the parser a value nobody
+/// produced. Asserted at the check verdict, which is the observable this test
+/// can hold; the streaming itself is pinned by the boundary control below.
+#[test]
+fn an_oversize_acknowledgement_body_fails_the_egress_check() {
+    let api = api_recorder();
+    let endpoint = serve(|_req: &Request| json_body_of(MAX_ACK_BODY_BYTES + 1024));
+
+    let payload = smoke_test_payload(&api, &endpoint, REAL_EGRESS_SECRET);
+
+    assert_eq!(
+        payload["egress_positive"]["status"],
+        serde_json::json!(200),
+        "the endpoint answered 2xx, so the failure below is about SIZE: {payload}"
+    );
+    assert_eq!(
+        payload["egress_positive"]["ok"],
+        serde_json::json!(false),
+        "an oversize acknowledgement must be refused: {payload}"
+    );
+    let detail = payload["egress_positive"]["detail"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        detail.contains(&MAX_ACK_BODY_BYTES.to_string()),
+        "the detail must name the cap that was exceeded: {detail}"
+    );
+}
+
+/// The boundary control: a body of EXACTLY the cap still passes, so the refusal
+/// above is a real ceiling and not a blanket refusal of any body large enough to
+/// arrive in more than one chunk.
+#[test]
+fn an_acknowledgement_body_exactly_at_the_cap_still_passes() {
+    let api = api_recorder();
+    let endpoint = serve(|_req: &Request| json_body_of(MAX_ACK_BODY_BYTES));
+
+    let payload = smoke_test_payload(&api, &endpoint, REAL_EGRESS_SECRET);
+
+    assert_eq!(
+        payload["egress_positive"]["ok"],
+        serde_json::json!(true),
+        "the worker refuses a body OVER the cap, so exactly the cap passes: {payload}"
     );
 }
 

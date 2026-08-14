@@ -36,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import EllipsisType
 from typing import Any
+from urllib.parse import urlsplit
 
 from channel_protocol.conformance import ClauseResult, FloorReport, FloorResult, UpstreamIdentity
 
@@ -49,17 +50,6 @@ SECRET_HEADER = "X-Curie-Adapter-Secret"
 _MAX_ATTEMPTS = 200
 _RETRY_DELAY = 0.05
 
-# The keys each reply event models, so the stub can report an UNMODELLED extra
-# key back to the test that asked whether the kit probes tolerance for one.
-_MODELLED_KEYS: dict[str, frozenset[str]] = {
-    "turn.status": frozenset({"version", "target", "event", "status"}),
-    "reply.update": frozenset(
-        {"version", "target", "event", "text", "message", "settled", "nav"}
-    ),
-    "reply.post": frozenset({"version", "target", "event", "message", "requested_by"}),
-    "turn.completed": frozenset({"version", "target", "event", "event_id", "outcome"}),
-}
-
 STUB_MAIN = Path(__file__).with_name("stub_adapter_main.py")
 
 
@@ -71,24 +61,48 @@ class StubBehavior:
     skips_secret_check: bool = False
     side_effect_then_401: bool = False
     accepts_when_secret_unset: bool = False
+    # The side effect a refused request performs ANYWAY, scheduled after the
+    # refusal has already been answered. The status is a conformant 401 and the
+    # correspondent was answered, so only a count taken after the work settles
+    # separates this from a correct adapter.
+    side_effect_delay_s: float = 0.0
+    # Clause 3b: with its OWN secret unset, refuse the request and serve it.
+    side_effect_when_secret_unset: bool = False
     # Rule 4 (ack shape).
     redirects: bool = False
     empty_ack_body: bool = False
     ack_body_bytes: int | None = None
     ack_chunked_bytes: int | None = None
+    # A valid probe payload padded past the ack cap, sent as small chunks. A kit
+    # that reads the probe with one unbounded call buffers the whole thing.
+    probe_chunked_bytes: int | None = None
     # Rule 5 (handles all four events).
     rejects_turn_status: bool = False
     # Rule 6 (dedupe on event_id).
     double_sends_duplicate: bool = False
     # Rule 1 (stable delivery_id).
     fresh_delivery_id_per_retry: bool = False
+    # How long the adapter waits before its FIRST attempt. Long enough and a
+    # fixed outage window is over before the adapter ever meets it.
+    slow_start_s: float = 0.0
+    drops_on_transport_failure: bool = False
     # Rule 2 (an ingress response is final).
     retries_after_202: bool = False
+    # How long after the 202 the retry goes out. Longer than any fixed finality
+    # window and the defect happens after the verdict was taken.
+    retry_after_202_delay_s: float = _RETRY_DELAY
     posts_an_unrelated_delivery: bool = False
+    # Rule 7: on restart, post something the kit never declared.
+    posts_unrelated_after_restart: bool = False
     # Rule 7 (stale credential handling).
     exits_on_401: bool = False
     drops_on_401: bool = False
     self_mints_on_401: bool = False
+    # Evidence suppression: the offending ingress post goes out under a
+    # Content-Length the ingress cannot use. The adapter under test writes its
+    # own request headers, so a kit that lets a header parse failure destroy the
+    # observation lets the adapter choose what the kit is able to see.
+    evades_with_bad_content_length: bool = False
 
 
 CONFORMANT = StubBehavior()
@@ -110,6 +124,30 @@ BREAKS: dict[str, StubBehavior] = {
     "exits_on_401": StubBehavior(exits_on_401=True),
     "drops_on_401": StubBehavior(drops_on_401=True),
     "self_mints_on_401": StubBehavior(self_mints_on_401=True),
+    # The two evasions: the same break, with the offending post hidden behind a
+    # Content-Length the ingress cannot parse. Each must reach the SAME verdict
+    # as the honest break above it.
+    "retries_after_202_evasively": StubBehavior(
+        retries_after_202=True, evades_with_bad_content_length=True
+    ),
+    "self_mints_on_401_evasively": StubBehavior(
+        self_mints_on_401=True, evades_with_bad_content_length=True
+    ),
+    # The timing evasions: the same defects, arranged so a kit deciding on a
+    # fixed wall clock window records the conformant half and stops watching.
+    "slow_start_and_drops_on_transport_failure": StubBehavior(
+        slow_start_s=0.25, drops_on_transport_failure=True
+    ),
+    "retries_late_after_202": StubBehavior(
+        retries_after_202=True, retry_after_202_delay_s=0.65
+    ),
+    "delayed_side_effect_then_401": StubBehavior(
+        side_effect_then_401=True, side_effect_delay_s=0.1
+    ),
+    "side_effect_when_secret_unset": StubBehavior(side_effect_when_secret_unset=True),
+    "drops_on_401_and_posts_unrelated_after_restart": StubBehavior(
+        drops_on_401=True, posts_unrelated_after_restart=True
+    ),
 }
 
 
@@ -120,6 +158,46 @@ def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def post_with_declared_length(
+    url: str, body: bytes, headers: dict[str, str], *, declared_length: str
+) -> int:
+    """POST with a Content-Length the CALLER chooses, honest or not.
+
+    ``urllib`` computes that header itself, so a raw connection is the only way
+    to send the framing a hostile or broken adapter would send. Returns the
+    status, and raises on a transport failure so a caller that expected an
+    answer cannot mistake a dead connection for one.
+    """
+
+    parsed = urlsplit(url)
+    connection = http.client.HTTPConnection(
+        parsed.hostname or "127.0.0.1", parsed.port, timeout=10
+    )
+    try:
+        connection.putrequest("POST", parsed.path)
+        for name, value in headers.items():
+            connection.putheader(name, value)
+        connection.putheader("Content-Length", declared_length)
+        connection.endheaders()
+        connection.send(body)
+        return int(connection.getresponse().status)
+    finally:
+        connection.close()
+
+
+def _post_unparseable_length(
+    url: str, body: bytes, headers: dict[str, str]
+) -> int | None:
+    """The evasion: a Content-Length no server can turn into a number."""
+
+    try:
+        return post_with_declared_length(
+            url, body, headers, declared_length=f"{len(body)}x"
+        )
+    except (OSError, http.client.HTTPException):
+        return None
 
 
 def padded_ack(size: int) -> bytes:
@@ -163,6 +241,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.route == "/_probe":
+            oversize = self.stub.behavior.probe_chunked_bytes
+            if oversize is not None:
+                # A VALID probe payload, just far too large. A kit that reads it
+                # unbounded returns the count and buffers the padding, so this
+                # break is only caught by a cap and never by a parse error.
+                self._chunked_json(b'{"side_effects": 0, "pad": "', oversize)
+                return
             self._json(200, self.stub.probe())
             return
         self._json(404, {"error": "not found"})
@@ -189,9 +274,8 @@ class _Handler(BaseHTTPRequestHandler):
             delivery_id = stub.inject(str(payload["upstream_id"]))
             self._json(200, {"delivery_id": delivery_id})
             return
-        if path == "/_control/transport":
-            stub.set_reachable(bool(payload["reachable"]))
-            self._json(200, {"ok": True})
+        if path == "/_control/retired":
+            self._json(200, {"retired": stub.is_retired(str(payload["delivery_id"]))})
             return
         self._json(404, {"error": "not found"})
 
@@ -204,6 +288,10 @@ class _Handler(BaseHTTPRequestHandler):
         if secret is None and not behavior.accepts_when_secret_unset:
             # Floor clause 3b: an adapter whose OWN secret is unset refuses
             # everything rather than serving unauthenticated.
+            if behavior.side_effect_when_secret_unset:
+                # The 3b break the status cannot show: the correspondent is
+                # answered and the response is a clean refusal.
+                stub.perform_side_effect(body)
             self._json(503, {"error": "egress secret is unset"})
             return
 
@@ -218,8 +306,9 @@ class _Handler(BaseHTTPRequestHandler):
             if behavior.side_effect_then_401:
                 # The break codex-7 named, and the reason clause 3a needs a
                 # probe: the side effect happens, THEN the rejection. The
-                # status is identical to the conformant one.
-                stub.handle_event(body)
+                # status is identical to the conformant one, and with a delay
+                # the count is identical too at the instant of the response.
+                stub.perform_side_effect(body)
             self._json(401, {"error": "unauthorized"})
             return
 
@@ -237,7 +326,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if behavior.ack_chunked_bytes is not None:
-            self._chunked_ack(behavior.ack_chunked_bytes)
+            self._chunked_json(b'{"ref": "x", "pad": "', behavior.ack_chunked_bytes)
             return
         if behavior.empty_ack_body:
             body = b""
@@ -252,19 +341,21 @@ class _Handler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
 
-    def _chunked_ack(self, size: int) -> None:
-        """An oversize ack with NO content length, sent as small chunks.
+    def _chunked_json(self, head: bytes, size: int) -> None:
+        """An oversize JSON body with NO content length, sent as small chunks.
 
         A kit that trusts ``Content-Length``, or that does one sized read,
         passes this. The worker's ``_read_capped`` is a loop for exactly this
-        reason, so the kit has to be one too.
+        reason, so every read the kit makes has to be one too. ``head`` opens
+        the object, so the same writer serves an acknowledgement and a side
+        effect probe response.
         """
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        first = b'{"ref": "x", "pad": "'
+        first = head
         self.wfile.write(f"{len(first):x}\r\n".encode() + first + b"\r\n")
         remaining = size - len(first) - 2
         block = b"a" * 8192
@@ -306,10 +397,11 @@ class StubAdapter:
         self._sender_thread: threading.Thread | None = None
         self._stopping = threading.Event()
         self._pending: list[dict[str, str]] = []
-        self._dead_url = f"http://127.0.0.1:{free_port()}"
+        self._retired: set[str] = set()
+        self._timers: list[threading.Timer] = []
+        self._starts = 0
         self.ingress_url: str | None = None
         self.token: str | None = None
-        self.reachable = True
         self.side_effects = 0
         self.dropped = 0
         self.stale_credential = False
@@ -332,6 +424,7 @@ class StubAdapter:
     def start(self) -> None:
         self._load_state()
         self._stopping = threading.Event()
+        self._starts += 1
         httpd = ThreadingHTTPServer(("127.0.0.1", self.port), _Handler)
         httpd.daemon_threads = True
         httpd.stub = self  # type: ignore[attr-defined]
@@ -341,9 +434,18 @@ class StubAdapter:
         self._serve_thread.start()
         self._sender_thread = threading.Thread(target=self._send_loop, daemon=True)
         self._sender_thread.start()
+        if self.behavior.posts_unrelated_after_restart and self._starts > 1:
+            # Rule 7's break that a bare "some 2xx arrived" predicate reads as a
+            # resume: the held delivery is gone and something else takes its
+            # place on the wire.
+            self.inject(f"unrelated-after-restart-{uuid.uuid4().hex[:8]}")
 
     def stop(self) -> None:
         self._stopping.set()
+        with self._lock:
+            timers, self._timers = self._timers, []
+        for timer in timers:
+            timer.cancel()
         httpd, self._httpd = self._httpd, None
         if httpd is not None:
             httpd.shutdown()
@@ -372,16 +474,14 @@ class StubAdapter:
         if not isinstance(token, EllipsisType):
             self.token = token
         self._pending = []
-        self.start()
+        # Restored BEFORE the send loop exists, so a resumed delivery never
+        # races the configuration it needs.
         self.ingress_url = ingress_url
+        self.start()
 
     def configure(self, *, ingress_url: str, token: str) -> None:
         self.ingress_url = ingress_url
         self.token = token
-        self.reachable = True
-
-    def set_reachable(self, reachable: bool) -> None:
-        self.reachable = reachable
 
     # -- egress ------------------------------------------------------------
 
@@ -394,13 +494,10 @@ class StubAdapter:
             decoded = None
         with self._lock:
             if not isinstance(decoded, dict):
-                self.events.append({"event": "<unparseable>", "extra_keys": []})
+                self.events.append({"event": "<unparseable>"})
                 return "ok"
             name = str(decoded.get("event"))
-            modelled = _MODELLED_KEYS.get(name, frozenset())
-            self.events.append(
-                {"event": name, "extra_keys": sorted(set(decoded) - modelled)}
-            )
+            self.events.append({"event": name})
             if name == "turn.status" and self.behavior.rejects_turn_status:
                 return "reject"
             if name == "turn.completed":
@@ -416,6 +513,24 @@ class StubAdapter:
             self._persist_locked()
             return "ok"
 
+    def perform_side_effect(self, body: bytes) -> None:
+        """Answer the correspondent, possibly AFTER the response has gone out.
+
+        A real adapter that hands the work to a queue does exactly this, so a
+        delay here is a plausible adapter and not a contrived one. It is also
+        invisible to any check that reads a count the moment a response lands.
+        """
+
+        delay = self.behavior.side_effect_delay_s
+        if not delay:
+            self.handle_event(body)
+            return
+        timer = threading.Timer(delay, self.handle_event, args=(body,))
+        timer.daemon = True
+        with self._lock:
+            self._timers.append(timer)
+        timer.start()
+
     def probe(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -426,6 +541,7 @@ class StubAdapter:
                 "delivered": list(self.delivered),
                 "seen_event_ids": list(self.seen_event_ids),
                 "events": list(self.events),
+                "retired": sorted(self._retired),
             }
 
     # -- ingress -----------------------------------------------------------
@@ -434,11 +550,12 @@ class StubAdapter:
         """Deliver one upstream message. Returns the delivery_id it will send.
 
         The derivation is documented and deterministic, which is what lets a
-        driver DECLARE the identity without reading anything back.
+        driver DECLARE the identity before this is ever called.
         """
 
         delivery_id = f"dlv-{upstream_id}"
         with self._lock:
+            self._retired.discard(delivery_id)
             self._pending.append(
                 {
                     "delivery_id": delivery_id,
@@ -449,6 +566,17 @@ class StubAdapter:
             )
         return delivery_id
 
+    def is_retired(self, delivery_id: str) -> bool:
+        """Whether this delivery is done: acknowledged, or given up on.
+
+        The stub's answer to the driver contract's quiescence barrier. It is set
+        only once ``_deliver`` has returned for that identity, so an adapter
+        still inside a retry (however slow) is never reported retired.
+        """
+
+        with self._lock:
+            return delivery_id in self._retired
+
     def _send_loop(self) -> None:
         while not self._stopping.is_set():
             with self._lock:
@@ -456,19 +584,43 @@ class StubAdapter:
             if item is None:
                 time.sleep(0.01)
                 continue
-            self._deliver(item)
+            try:
+                self._deliver(item)
+            finally:
+                # Retired means "this adapter is done with the identity", pass
+                # or fail. Set here rather than on the success path, so a
+                # delivery that was dropped still stops the kit waiting on it.
+                with self._lock:
+                    self._retired.add(item["delivery_id"])
+                    self._persist_locked()
 
     def _deliver(self, item: dict[str, str]) -> None:
         base = item["delivery_id"]
+        if self.behavior.slow_start_s:
+            # A first attempt late enough that a fixed outage window would be
+            # over before it happens.
+            time.sleep(self.behavior.slow_start_s)
         attempt = 0
         while attempt < _MAX_ATTEMPTS and not self._stopping.is_set():
+            if self._target() is None:
+                # Not yet pointed at an ingress. Waiting to be configured is not
+                # a delivery attempt, and counting it as one would make a
+                # restart consume an attempt and rename the delivery under
+                # `fresh_delivery_id_per_retry` before it ever touched the wire.
+                time.sleep(_RETRY_DELAY)
+                continue
             attempt += 1
             if attempt == 1 or not self.behavior.fresh_delivery_id_per_retry:
                 delivery_id = base
             else:
                 delivery_id = f"{base}-r{attempt}"
-            status = self._post_turn(delivery_id, item)
+            status = self._post_turn(delivery_id, item, evasive=False)
             if status is None:
+                if self.behavior.drops_on_transport_failure:
+                    with self._lock:
+                        self.dropped += 1
+                        self._persist_locked()
+                    return
                 time.sleep(_RETRY_DELAY)
                 continue
             self._on_status(status, delivery_id, item)
@@ -488,14 +640,20 @@ class StubAdapter:
             if status == 202 and self.behavior.retries_after_202:
                 # Rule 2's break: a 202 is a RESPONSE, so it is final. Posting
                 # again after one is the defect.
-                time.sleep(_RETRY_DELAY)
-                self._post_turn(delivery_id, item)
+                time.sleep(self.behavior.retry_after_202_delay_s)
+                self._post_turn(
+                    delivery_id,
+                    item,
+                    evasive=self.behavior.evades_with_bad_content_length,
+                )
             if self.behavior.posts_an_unrelated_delivery and not self._posted_unrelated:
                 # A legitimate upstream redelivery under an identity the kit
                 # never declared. It must not red rule 2.
                 self._posted_unrelated = True
                 unrelated = f"dlv-unrelated-{uuid.uuid4().hex[:8]}"
-                self._post_turn(unrelated, dict(item, conversation_id="conv-unrelated"))
+                self._post_turn(
+                    unrelated, dict(item, conversation_id="conv-unrelated"), evasive=False
+                )
             return
         with self._lock:
             self.dropped += 1
@@ -527,11 +685,11 @@ class StubAdapter:
         self.stop()
 
     def _target(self) -> str | None:
-        if self.ingress_url is None:
-            return None
-        return self.ingress_url if self.reachable else self._dead_url
+        return self.ingress_url
 
-    def _post_turn(self, delivery_id: str, item: dict[str, str]) -> int | None:
+    def _post_turn(
+        self, delivery_id: str, item: dict[str, str], *, evasive: bool
+    ) -> int | None:
         target = self._target()
         if target is None:
             return None
@@ -546,11 +704,11 @@ class StubAdapter:
                 "reply_ref": delivery_id,
             }
         ).encode()
+        headers = {"Content-Type": "application/json", "X-API-Key": self.token or ""}
+        if evasive:
+            return _post_unparseable_length(f"{target}/channels/turns", body, headers)
         request = urllib.request.Request(
-            f"{target}/channels/turns",
-            data=body,
-            headers={"Content-Type": "application/json", "X-API-Key": self.token or ""},
-            method="POST",
+            f"{target}/channels/turns", data=body, headers=headers, method="POST"
         )
         try:
             with urllib.request.urlopen(request, timeout=5) as response:
@@ -564,11 +722,13 @@ class StubAdapter:
         target = self._target()
         if target is None:
             return
+        body = json.dumps({"kind": "email", "address": "agent@example.test"}).encode()
+        headers = {"Content-Type": "application/json"}
+        if self.behavior.evades_with_bad_content_length:
+            _post_unparseable_length(f"{target}/channels/token", body, headers)
+            return
         request = urllib.request.Request(
-            f"{target}/channels/token",
-            data=json.dumps({"kind": "email", "address": "agent@example.test"}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+            f"{target}/channels/token", data=body, headers=headers, method="POST"
         )
         try:
             with urllib.request.urlopen(request, timeout=5):
@@ -589,6 +749,7 @@ class StubAdapter:
                     "delivered": self.delivered,
                     "seen_event_ids": self.seen_event_ids,
                     "events": self.events,
+                    "retired": sorted(self._retired),
                 }
             ),
             encoding="utf-8",
@@ -604,6 +765,7 @@ class StubAdapter:
         self.delivered = list(state.get("delivered", []))
         self.seen_event_ids = list(state.get("seen_event_ids", []))
         self.events = list(state.get("events", []))
+        self._retired = set(state.get("retired", []))
         # A held delivery is what "did not silently drop it" means: it comes
         # back out of the queue as soon as the adapter is running again.
         self._pending = list(state.get("held", []))
@@ -618,11 +780,15 @@ def conformant_stub(
     port: int | None = None,
     ack_body_bytes: int | None = None,
     ack_chunked_bytes: int | None = None,
+    probe_chunked_bytes: int | None = None,
 ) -> StubAdapter:
     """A stub that satisfies every floor rule the kit can assert."""
 
     behavior = dataclasses.replace(
-        CONFORMANT, ack_body_bytes=ack_body_bytes, ack_chunked_bytes=ack_chunked_bytes
+        CONFORMANT,
+        ack_body_bytes=ack_body_bytes,
+        ack_chunked_bytes=ack_chunked_bytes,
+        probe_chunked_bytes=probe_chunked_bytes,
     )
     return StubAdapter(behavior, secret=secret, state_path=state_path, port=port)
 
@@ -677,16 +843,20 @@ class StubIngressDriver:
     def start(self, *, ingress_url: str, token: str) -> None:
         self.stub.configure(ingress_url=ingress_url, token=token)
 
-    def stimulate(self) -> UpstreamIdentity:
+    def reserve(self) -> UpstreamIdentity:
         self._stimuli += 1
         upstream_id = uuid.uuid4().hex[:10]
-        delivery_id = self.stub.inject(upstream_id)
+        # DECLARED from the documented derivation, and nothing is injected: the
+        # kit arms its ingress for this identity before the message exists.
         return UpstreamIdentity(
-            stimulus_id=f"in-process-{self._stimuli}", delivery_id=delivery_id
+            stimulus_id=f"in-process-{self._stimuli}", delivery_id=f"dlv-{upstream_id}"
         )
 
-    def set_transport(self, *, reachable: bool) -> None:
-        self.stub.set_reachable(reachable)
+    def release(self, identity: UpstreamIdentity) -> None:
+        self.stub.inject(identity.delivery_id.removeprefix("dlv-"))
+
+    def settled(self, identity: UpstreamIdentity) -> bool:
+        return self.stub.is_retired(identity.delivery_id)
 
     def restart(
         self,
@@ -782,17 +952,26 @@ class SubprocessIngressDriver:
             self._spawn()
         control(self.base_url, "configure", {"ingress_url": ingress_url, "token": token})
 
-    def stimulate(self) -> UpstreamIdentity:
+    def reserve(self) -> UpstreamIdentity:
         self._stimuli += 1
         upstream_id = uuid.uuid4().hex[:10]
-        control(self.base_url, "stimulate", {"upstream_id": upstream_id})
         # DECLARED, not read back: the derivation is the documented contract.
         return UpstreamIdentity(
             stimulus_id=f"subprocess-{self._stimuli}", delivery_id=f"dlv-{upstream_id}"
         )
 
-    def set_transport(self, *, reachable: bool) -> None:
-        control(self.base_url, "transport", {"reachable": reachable})
+    def release(self, identity: UpstreamIdentity) -> None:
+        control(
+            self.base_url,
+            "stimulate",
+            {"upstream_id": identity.delivery_id.removeprefix("dlv-")},
+        )
+
+    def settled(self, identity: UpstreamIdentity) -> bool:
+        answer = control(
+            self.base_url, "retired", {"delivery_id": identity.delivery_id}
+        )
+        return bool(answer["retired"])
 
     def restart(
         self,
@@ -826,19 +1005,72 @@ class LyingIngressDriver:
 
     def __init__(self, inner: StubIngressDriver | SubprocessIngressDriver) -> None:
         self.inner = inner
+        # The lie is only in what it DECLARES. The message it injects is the
+        # honest one, so the adapter is exonerated and the driver is the finding.
+        self._honest: dict[str, UpstreamIdentity] = {}
 
     def start(self, *, ingress_url: str, token: str) -> None:
         self.inner.start(ingress_url=ingress_url, token=token)
 
-    def stimulate(self) -> UpstreamIdentity:
-        declared = self.inner.stimulate()
+    def reserve(self) -> UpstreamIdentity:
+        honest = self.inner.reserve()
+        self._honest[f"never-sent-{uuid.uuid4().hex[:8]}"] = honest
+        declared = list(self._honest)[-1]
         return UpstreamIdentity(
-            stimulus_id=declared.stimulus_id,
-            delivery_id=f"never-sent-{uuid.uuid4().hex[:8]}",
+            stimulus_id=honest.stimulus_id, delivery_id=declared
         )
 
-    def set_transport(self, *, reachable: bool) -> None:
-        self.inner.set_transport(reachable=reachable)
+    def release(self, identity: UpstreamIdentity) -> None:
+        self.inner.release(self._honest[identity.delivery_id])
+
+    def settled(self, identity: UpstreamIdentity) -> bool:
+        return self.inner.settled(self._honest[identity.delivery_id])
+
+    def restart(
+        self,
+        *,
+        egress_secret: str | None | EllipsisType = ...,
+        token: str | None | EllipsisType = ...,
+    ) -> None:
+        self.inner.restart(egress_secret=egress_secret, token=token)
+
+    def stop(self) -> None:
+        self.inner.stop()
+
+
+class RacingIngressDriver:
+    """A driver whose adapter already has ANOTHER delivery in flight.
+
+    Not a hostile driver: an upstream queue holding more than one message is the
+    ordinary case, and this is what it looks like from the ingress. It is also
+    the exact shape that drains a globally armed one shot 202 before the
+    declared delivery can reach it, which is why rule 2 arms for one identity.
+    The decoy is released once, on the first stimulus, so the later rules run
+    against an adapter with nothing extra in flight.
+    """
+
+    def __init__(self, inner: StubIngressDriver | SubprocessIngressDriver) -> None:
+        self.inner = inner
+        self._raced = False
+
+    def start(self, *, ingress_url: str, token: str) -> None:
+        self.inner.start(ingress_url=ingress_url, token=token)
+
+    def reserve(self) -> UpstreamIdentity:
+        return self.inner.reserve()
+
+    def release(self, identity: UpstreamIdentity) -> None:
+        if not self._raced:
+            self._raced = True
+            decoy = self.inner.reserve()
+            self.inner.release(decoy)
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not self.inner.settled(decoy):
+                time.sleep(0.02)
+        self.inner.release(identity)
+
+    def settled(self, identity: UpstreamIdentity) -> bool:
+        return self.inner.settled(identity)
 
     def restart(
         self,

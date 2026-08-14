@@ -6,17 +6,20 @@ over HTTP. It never imports the adapter, so the same kit works on an adapter
 written in Go.
 
 Every event the kit sends is built from a real ``channel_protocol.reply`` model
-and serialized with ``model_dump_json``, so the kit can never send a shape the
-worker could not send. The one deliberate exception is the unmodelled extra key
-probe, which takes a real event, dumps it, and adds one key: floor rule 5 asks
-whether an adapter tolerates a later wire revision, and a strict model cannot
-express that by construction.
+and serialized with ``model_dump_json``, with no exceptions, so the kit can
+never send a shape the worker could not send. A kit that hand built a payload
+would be free to assert a requirement the published floor never states.
+
+Every response the kit reads off the adapter is read in a LOOP with a running
+total and refused past the cap, the acknowledgement and the side effect probe
+alike. The adapter is untrusted by construction and both reads land on the
+kit's own heap.
 
 ``ADAPTER_SECRET_HEADER`` and ``MAX_ACK_BODY_BYTES`` are RE DECLARED here, never
 imported. ``apps/worker/src/curie_worker/reply_sink.py`` is the authoritative
 site for both, and importing it would invert the dependency: this package is a
 contract package and the worker imports IT. The copy is kept honest by
-``tests/test_conformance_egress.py::test_worker_constants_match``, which reads
+``tests/test_conformance_egress.py::test_platform_constants_match``, which reads
 both values back out of the worker source and fails on any drift.
 """
 
@@ -235,19 +238,6 @@ def turn_completed(
     )
 
 
-def body_with_extra_key(event: ReplyEvent, *, key: str, value: str) -> bytes:
-    """A real event carrying one key the current models do not define.
-
-    Floor rule 5 asks an adapter to tolerate a later wire revision adding an
-    optional key. The models are strict producers, so the only way to build the
-    probe is to dump a real event and add the key to the dumped payload.
-    """
-
-    payload: dict[str, Any] = json.loads(event.model_dump_json())
-    payload[key] = value
-    return json.dumps(payload).encode()
-
-
 def side_effect_probe(adapter: AdapterUnderTest) -> Callable[[], int] | None:
     """The adapter's side effect count, if it exposes one, else None.
 
@@ -256,15 +246,33 @@ def side_effect_probe(adapter: AdapterUnderTest) -> Callable[[], int] | None:
     honest report for that is ``not_run``, which is nonconformant. Returning a
     callable that would fail later would turn a missing probe into a crash
     halfway through a run instead.
+
+    The probe body is read under the SAME cap as an acknowledgement, streamed
+    with a running total, and redirects are not followed. This GET lands on the
+    same untrusted origin the acknowledgement comes from, it is issued once per
+    probed clause rather than once per run, and a probe that answered an
+    unbounded chunked body would OOM whatever CI box the vendor runs the kit on.
+    The count itself is one integer, so a payload near the cap is already orders
+    of magnitude past anything honest.
     """
 
     url = f"{adapter.origin}{SIDE_EFFECT_PROBE_PATH}"
 
     def read() -> int:
-        with httpx.Client(timeout=adapter.timeout_s) as client:
-            response = client.get(url)
-            response.raise_for_status()
-            payload = response.json()
+        with httpx.Client(timeout=adapter.timeout_s, follow_redirects=False) as client:
+            with client.stream("GET", url) as response:
+                response.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > MAX_ACK_BODY_BYTES:
+                        raise ValueError(
+                            "the side effect probe answered with more than "
+                            f"{MAX_ACK_BODY_BYTES} bytes, which the kit refuses to buffer"
+                        )
+                    chunks.append(chunk)
+        payload: dict[str, Any] = json.loads(b"".join(chunks))
         return int(payload[SIDE_EFFECT_PROBE_FIELD])
 
     try:

@@ -10,16 +10,30 @@ Without a driver those rules report ``not_run``, and ``not_run`` is
 nonconformant. There is no shape of run in which missing evidence reads as a
 pass.
 
-**The correlation rule is the load bearing half.** ``stimulate`` returns the
-``delivery_id`` the adapter will put on the wire for the message it just
-injected, and ``FakeIngress`` correlates an observed POST to that stimulus by
-matching the body's ``delivery_id`` against it. Correlation is therefore a
+**The correlation rule is the load bearing half.** ``reserve`` returns the
+``delivery_id`` the adapter will put on the wire for a message that has not been
+injected yet, and ``FakeIngress`` correlates an observed POST to that stimulus
+by matching the body's ``delivery_id`` against it. Correlation is therefore a
 property of the OBSERVED WIRE and never of private in process state, which is
 the only form an adapter in another process or another language can satisfy. A
-``stimulate`` that returns an id the adapter never sends is itself a finding:
+``reserve`` that returns an id the adapter never sends is itself a finding:
 rules 1 and 2 fail naming the identity nothing matched, because reading a driver
 that does not implement the contract as conformant would certify every broken
 vendor driver along with it.
+
+**Injection is two phase, and that is not a convenience.** Rule 2 has to arm the
+ingress to answer 202 for ONE named identity before that identity can reach it.
+A single call that both injects and declares leaves a window in which the
+message is already in flight, so the kit would have to arm a global one shot
+instead, and any other delivery arriving first would consume it. The rule then
+passes without the declared delivery ever receiving the response whose finality
+it is about. So ``reserve`` declares and ``release`` injects, in that order.
+
+**Quiescence is declared, never assumed.** No finite observation establishes
+that an adapter has stopped retrying, so ``settled`` is what retires a stimulus,
+and a driver that cannot answer it leaves rule 2 with no finality evidence and
+therefore nonpassing. A fixed wall clock window in its place would be a check
+any retry schedule evades by outlasting it.
 """
 
 from __future__ import annotations
@@ -62,17 +76,27 @@ class IngressDriver(Protocol):
         """
         ...
 
-    def stimulate(self) -> UpstreamIdentity:
-        """Deliver one upstream message, and declare the id it will carry."""
+    def reserve(self) -> UpstreamIdentity:
+        """Declare the id the NEXT released message will carry. Injects nothing.
+
+        Called before ``release``, so the kit can arm its ingress for this exact
+        identity while the message is still nowhere near the wire.
+        """
         ...
 
-    def set_transport(self, *, reachable: bool) -> None:
-        """Break, or restore, the adapter's path to ingress.
+    def release(self, identity: UpstreamIdentity) -> None:
+        """Deliver the message ``reserve`` declared. Injects, declares nothing."""
+        ...
 
-        Rule 1 is about retrying a TRANSPORT failure with the same delivery id,
-        so the failure has to be provoked below the response layer. Breaking it
-        here rather than at the ingress is deliberate: a failure the ingress
-        answered is a response, and a response is final under rule 2.
+    def settled(self, identity: UpstreamIdentity) -> bool:
+        """Whether the adapter has retired this delivery and will not retry it.
+
+        True once the adapter is done with the identity, whether it delivered it
+        or gave up on it. Rule 2 asks whether a response was treated as final,
+        and that question is only answerable once the adapter has stopped
+        working: a verdict taken on a timer is a verdict any retry schedule
+        evades by being slower than the timer. A driver that never reports an
+        identity retired leaves the rule nonpassing rather than passing.
         """
         ...
 

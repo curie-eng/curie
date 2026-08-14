@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/adapter-bind/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/adapter-bind/v1.1.json",
   "title": "curie adapter bind --json",
   "description": "The agent-facing payload of `curie adapter bind`: the whole four field route that was written. The API refuses a non-slack binding whose reply route is half set, so all four fields are reported together. `adapter` is the operator supplied slug, never the profile's suggestion, because that slug selects which stored secret the worker sends.",
   "type": "object",
@@ -20,7 +20,7 @@
     },
     "endpoint": {
       "type": "string",
-      "description": "The reply route that was written."
+      "description": "The reply route that was written, reduced to scheme, host and port. The route the API stores is the full value, but a route can carry a token in its path or query and this payload is the form most likely to reach a CI artifact or a log aggregator, so the path and query are never reported."
     },
     "adapter": {
       "type": "string",

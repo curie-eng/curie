@@ -50,11 +50,23 @@ const ADAPTER_PROFILE_SCHEMA: &str =
 pub const PROFILE_VERSION: &str = "1.0";
 
 /// The header the worker authenticates its egress with.
-const ADAPTER_SECRET_HEADER: &str = "X-Curie-Adapter-Secret";
+pub const ADAPTER_SECRET_HEADER: &str = "X-Curie-Adapter-Secret";
 
 /// The worker refuses an acknowledgement body OVER this many bytes, so exactly
 /// this many still passes.
-const MAX_ACK_BODY_BYTES: usize = 65536;
+pub const MAX_ACK_BODY_BYTES: usize = 65536;
+
+/// The secret the negative probe sends, as a fixed constant that is never
+/// derived from the operator's real one.
+///
+/// A rejected authentication is one of the likeliest lines for an adapter to log
+/// verbatim, and the adapter is third party infrastructure whose logs the
+/// operator does not control, so a value built by suffixing the real secret
+/// would put the real secret on disk in plaintext at the other end. A fixed
+/// constant also proves the refusal STRICTLY better, because it cannot collide
+/// with a value some install actually configured. The Python conformance kit
+/// sends its own fixed constant for the identical probe.
+const WRONG_SECRET: &str = "curie-smoke-test-deliberately-wrong-secret";
 
 /// `ChannelTokenRequest.ttl_s` is `gt=0, le=604800`; a value outside that is a
 /// usage error here rather than a 422 from the API.
@@ -417,13 +429,35 @@ pub struct AdapterValidateOutput {
     pub profile: AdapterProfile,
 }
 
+impl AdapterValidateOutput {
+    /// The profile's endpoint reduced to scheme, host and port, or `None` when
+    /// the profile declares no route at all.
+    ///
+    /// A profile's `endpoint` can carry a token in its path or query, and every
+    /// form this payload takes is a form that reaches a terminal, a log
+    /// aggregator or a CI artifact, so neither the JSON nor the human render
+    /// ever carries the full route. Nothing downstream needs it: the operator
+    /// already holds the file it was read from, and `bind` sends the full value
+    /// to the API without going through this output at all.
+    fn redacted_endpoint(&self) -> Option<String> {
+        self.profile.endpoint.as_deref().map(redacted)
+    }
+}
+
 impl CliOutput for AdapterValidateOutput {
     fn to_json(&self) -> serde_json::Value {
+        let mut profile =
+            serde_json::to_value(&self.profile).expect("a parsed adapter profile serializes");
+        // Absent stays an explicit null, so a consumer can still read the key
+        // unconditionally.
+        profile["endpoint"] = match self.redacted_endpoint() {
+            Some(endpoint) => serde_json::Value::String(endpoint),
+            None => serde_json::Value::Null,
+        };
         serde_json::json!({
             "ok": true,
             "file": self.file,
-            "profile": serde_json::to_value(&self.profile)
-                .expect("a parsed adapter profile serializes"),
+            "profile": profile,
         })
     }
 
@@ -433,7 +467,7 @@ impl CliOutput for AdapterValidateOutput {
         ui.kv("address", &self.profile.address.pattern);
         ui.kv(
             "endpoint",
-            self.profile.endpoint.as_deref().unwrap_or("unset"),
+            &self.redacted_endpoint().unwrap_or("unset".to_string()),
         );
         ui.kv("egress", &self.profile.credentials.egress);
     }
@@ -500,7 +534,7 @@ pub async fn bind(opts: BindOpts) -> Result<AdapterBindOutput> {
         agent: opts.agent,
         kind: binding.kind,
         address: binding.address,
-        endpoint: binding.endpoint,
+        endpoint: redacted(&binding.endpoint),
         adapter: binding.adapter,
     })
 }
@@ -512,6 +546,11 @@ pub struct AdapterBindOutput {
     pub agent: String,
     pub kind: String,
     pub address: String,
+    /// ALREADY redacted to scheme, host and port, at construction rather than at
+    /// each emit. An endpoint can carry a token in its path or query, and
+    /// `--json` is the form most likely to be redirected into a CI artifact or a
+    /// log aggregator, so the full value never enters this struct and no later
+    /// emitter can leak what it does not hold.
     pub endpoint: String,
     pub adapter: String,
 }
@@ -530,7 +569,7 @@ impl CliOutput for AdapterBindOutput {
     fn render(&self, ui: &Ui) {
         ui.payload(&format!("bound {} to {}", self.agent, self.kind));
         ui.kv("address", &self.address);
-        ui.kv("endpoint", &redacted(&self.endpoint));
+        ui.kv("endpoint", &self.endpoint);
         ui.kv("adapter", &self.adapter);
     }
 }
@@ -676,9 +715,8 @@ pub async fn smoke_test(opts: SmokeTestOpts) -> Result<()> {
     let event = status_event(&profile.kind, &opts.address, &conversation);
 
     let positive = probe_egress(&client, &endpoint, &secret, &event, "egress_positive").await;
-    let wrong = format!("{secret}-not-the-secret");
     let negative = refusal_of_a_wrong_secret(
-        probe_egress(&client, &endpoint, &wrong, &event, "egress_negative").await,
+        probe_egress(&client, &endpoint, WRONG_SECRET, &event, "egress_negative").await,
     );
 
     let (binding, minted) = probe_binding(&client, &opts, &profile).await;
@@ -813,7 +851,6 @@ async fn probe_egress(
         }
     };
     let status = response.status().as_u16();
-    let body = response.bytes().await.unwrap_or_default();
     let mut detail = format!("the endpoint answered {status}");
     let mut ok = (200..300).contains(&status);
     if (300..400).contains(&status) {
@@ -822,21 +859,66 @@ async fn probe_egress(
             "the endpoint answered {status} (a redirect), which the worker refuses rather \
              than replaying the egress credential at the redirect target"
         );
-    } else if ok && body.len() > MAX_ACK_BODY_BYTES {
-        ok = false;
-        detail = format!(
-            "the acknowledgement body is {} bytes, over the {MAX_ACK_BODY_BYTES} byte cap",
-            body.len()
-        );
-    } else if ok && serde_json::from_slice::<serde_json::Value>(&body).is_err() {
-        ok = false;
-        detail = format!("the endpoint answered {status} with a body that is not JSON");
+    } else {
+        match read_capped(response).await {
+            Err(CappedRead::Oversize) => {
+                ok = false;
+                detail = format!(
+                    "the endpoint answered {status} with an acknowledgement body over the \
+                     {MAX_ACK_BODY_BYTES} byte cap, which is refused rather than truncated"
+                );
+            }
+            Err(CappedRead::Transport(err)) => {
+                ok = false;
+                detail = format!("the endpoint answered {status} and then broke off: {err}");
+            }
+            Ok(body) => {
+                if ok && serde_json::from_slice::<serde_json::Value>(&body).is_err() {
+                    ok = false;
+                    detail = format!("the endpoint answered {status} with a body that is not JSON");
+                }
+            }
+        }
     }
     CheckResult {
         name: name.to_string(),
         ok,
         status: Some(status),
         detail,
+    }
+}
+
+/// Why a capped read gave up.
+#[derive(Debug)]
+enum CappedRead {
+    /// The peer sent MORE than the cap. A refusal, never a truncation: judging
+    /// the first N bytes of a body that was never sent whole would hand the
+    /// parser a value nobody produced.
+    Oversize,
+    /// The peer broke off mid body.
+    Transport(String),
+}
+
+/// Read a response body with a RUNNING total, refusing once it passes the cap.
+///
+/// `reqwest::Response::bytes()` buffers the whole body first and would let the
+/// cap be enforced only after the memory was already allocated, which is no cap
+/// at all against a peer that answers with a multi gigabyte chunked body. The
+/// worker's reply sink and the Python conformance kit both stream for exactly
+/// this reason; this is the third reader of the same untrusted surface.
+async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, CappedRead> {
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > MAX_ACK_BODY_BYTES {
+                    return Err(CappedRead::Oversize);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(body),
+            Err(err) => return Err(CappedRead::Transport(err.to_string())),
+        }
     }
 }
 
@@ -1121,6 +1203,15 @@ async fn post_channel_token(
         .await
         .context("POST /channels/token")?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = match read_capped(response).await {
+        Ok(body) => String::from_utf8_lossy(&body).into_owned(),
+        Err(CappedRead::Oversize) => {
+            return Err(anyhow::anyhow!(
+                "POST /channels/token answered with a body over the {MAX_ACK_BODY_BYTES} \
+                 byte cap, which is refused rather than buffered"
+            ))
+        }
+        Err(CappedRead::Transport(_)) => String::new(),
+    };
     Ok((status, body))
 }

@@ -42,13 +42,12 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from .driver import IngressDriver
-from .ingress import TURNS_PATH, FakeIngress, ObservedRequest
+from .ingress import NO_RESPONSE, TURNS_PATH, FakeIngress, ObservedRequest
 from .transport import (
     MAX_ACK_BODY_BYTES,
     WRONG_SECRET,
     AdapterUnderTest,
     AdapterUnreachableError,
-    body_with_extra_key,
     new_conversation_id,
     new_event_id,
     reply_post,
@@ -62,17 +61,31 @@ FloorMode = Literal["strict", "diagnostic"]
 
 _STRICT = ConfigDict(extra="forbid")
 
-# How long a controlled transport outage lasts before the kit heals it. Long
-# enough that the adapter's first attempt has certainly failed, short enough
-# that a run does not become a sleep.
-_OUTAGE_S = 0.2
-
 # How long the kit waits for an adapter to reach the ingress at all.
 _ARRIVAL_TIMEOUT_S = 15.0
 
-# How long rule 2 watches for a SECOND post after ingress answered the first.
-# A response is final, so any further attempt for that delivery is the defect.
-_FINALITY_SETTLE_S = 0.5
+# How long the kit waits for the driver to report a delivery RETIRED. This is
+# the finality barrier, and it is a bound on the driver's answer rather than a
+# window the verdict is taken at the end of: a driver that never answers leaves
+# rule 2 nonpassing.
+_QUIESCENCE_TIMEOUT_S = 20.0
+
+# A confirmation window AFTER the driver reported the delivery retired, so a
+# driver that retires an identity its adapter is still attempting is caught.
+# Deliberately short, because it is a check on the driver's claim and not the
+# evidence the verdict rests on.
+_POST_QUIESCENCE_S = 0.5
+
+# How long a side effect count has to hold still before the kit reads it as
+# final. The refusal and the side effect an adapter performs anyway are two
+# different events, and an adapter that answers 401 first and acts afterwards
+# is exactly what clause 3a exists to catch, so an immediate read is a read of
+# the wrong moment.
+_SIDE_EFFECT_QUIET_S = 1.0
+
+# The ceiling on that settling. A count that never stops moving is its own
+# finding, and the clause says so rather than waiting forever.
+_SIDE_EFFECT_SETTLE_TIMEOUT_S = 10.0
 
 # How long the kit lets a 401 settle before asking whether the adapter is still
 # serving. An adapter that treats a stale credential as fatal takes a moment to
@@ -84,8 +97,6 @@ _LIVENESS_SETTLE_S = 1.2
 _RESUME_TIMEOUT_S = 8.0
 
 _POLL_S = 0.02
-
-_EXTRA_KEY = "conformance_probe_unmodelled_key"
 
 
 class ClauseResult(BaseModel):
@@ -293,6 +304,37 @@ def _is_2xx(status: int) -> bool:
 # --- rule 3: verify the egress secret before any side effect -----------------
 
 
+def _settled_side_effects(probe: Callable[[], int]) -> int:
+    """The side effect count, read once it has stopped moving.
+
+    A bare read is a read of the wrong moment. The response and the side effect
+    are two different events, and the break clause 3a exists to catch is exactly
+    an adapter that answers 401 first and performs the effect a moment later, so
+    a count sampled the instant the response lands agrees with a conformant
+    adapter's count. The barrier waits for the value to hold still, and the
+    quiet window RESTARTS every time it moves, so it is not a deadline an
+    adapter beats by being slower than a constant. A count that never settles is
+    reported as itself rather than waited on forever.
+
+    A vendor probe is expected to be a barrier of its own, returning only once
+    work spawned by preceding requests has quiesced. This is what the kit can
+    enforce without taking the probe's word for it.
+    """
+
+    deadline = time.monotonic() + _SIDE_EFFECT_SETTLE_TIMEOUT_S
+    count = probe()
+    quiet_until = time.monotonic() + _SIDE_EFFECT_QUIET_S
+    while time.monotonic() < deadline:
+        time.sleep(_POLL_S)
+        current = probe()
+        if current != count:
+            count = current
+            quiet_until = time.monotonic() + _SIDE_EFFECT_QUIET_S
+        elif time.monotonic() >= quiet_until:
+            return count
+    return probe()
+
+
 def _rule_3(
     adapter: AdapterUnderTest,
     driver: IngressDriver | None,
@@ -303,7 +345,7 @@ def _rule_3(
         "verify the egress secret on every request, before any side effect",
         [
             _clause_3a(adapter, probe),
-            _clause_3b(adapter, driver),
+            _clause_3b(adapter, driver, probe),
             _manual_clause(
                 "3c",
                 "constant time comparison is not observable over HTTP; see "
@@ -320,6 +362,12 @@ def _clause_3a(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> Cl
     adapter that performs the side effect and then returns 401 answers
     identically to a correct one. Only a side effect count separates them, so
     without a probe this clause is ``not_run``.
+
+    Both counts are taken through the settling barrier rather than read off the
+    probe directly. The refusal and the effect are separate events, so an
+    adapter that answers 401 and acts a moment afterwards is indistinguishable
+    from a conformant one at the instant the response arrives, and reading the
+    count there is reading the wrong moment.
     """
 
     if probe is None:
@@ -341,14 +389,14 @@ def _clause_3a(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> Cl
                 f"the adapter answered {accepted.status} to its own configured secret, "
                 "so it refuses the platform rather than verifying it",
             )
-        before = probe()
+        before = _settled_side_effects(probe)
         wrong = adapter.post_event(
             turn_status(adapter, conversation_id=conversation), secret=WRONG_SECRET
         )
         absent = adapter.post_event(
             turn_status(adapter, conversation_id=conversation), secret=None
         )
-        after = probe()
+        after = _settled_side_effects(probe)
     except AdapterUnreachableError as error:
         return _clause("3a", "fail", str(error))
     problems: list[str] = []
@@ -369,12 +417,22 @@ def _clause_3a(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> Cl
     )
 
 
-def _clause_3b(adapter: AdapterUnderTest, driver: IngressDriver | None) -> ClauseResult:
+def _clause_3b(
+    adapter: AdapterUnderTest,
+    driver: IngressDriver | None,
+    probe: Callable[[], int] | None,
+) -> ClauseResult:
     """An adapter whose OWN egress secret is unset refuses everything.
 
     Serving unauthenticated is worse than not serving: anyone who can reach the
     endpoint could forge a completion. Restoring the real secret afterwards is
     part of the clause, or every rule that runs later is checking a deaf adapter.
+
+    "Refuses" is about the SIDE EFFECT and not only the status, exactly as in
+    clause 3a. An adapter that answers the correspondent and then returns 401
+    has served an unauthenticated request; its response says otherwise, and the
+    count is the only thing that separates the two. So this clause needs the
+    probe as much as 3a does, and without one it is ``not_run``.
     """
 
     if driver is None:
@@ -384,9 +442,18 @@ def _clause_3b(adapter: AdapterUnderTest, driver: IngressDriver | None) -> Claus
             "no ingress driver was supplied, so the adapter could not be restarted "
             "with its own egress secret unset",
         )
+    if probe is None:
+        return _clause(
+            "3b",
+            "not_run",
+            "no side effect probe was supplied, so an adapter that acts on an "
+            "unauthenticated request and then returns a refusal could not be told "
+            "from one that refuses it outright",
+        )
     try:
         driver.restart(egress_secret=None)
         try:
+            before = _settled_side_effects(probe)
             with_secret = adapter.post_event(
                 turn_status(adapter, conversation_id=new_conversation_id()),
                 secret=adapter.secret,
@@ -394,6 +461,7 @@ def _clause_3b(adapter: AdapterUnderTest, driver: IngressDriver | None) -> Claus
             without_secret = adapter.post_event(
                 turn_status(adapter, conversation_id=new_conversation_id()), secret=None
             )
+            after = _settled_side_effects(probe)
         except AdapterUnreachableError:
             return _clause(
                 "3b",
@@ -414,11 +482,17 @@ def _clause_3b(adapter: AdapterUnderTest, driver: IngressDriver | None) -> Claus
             f"with its own secret unset the adapter accepted an unauthenticated "
             f"request with {without_secret.status}"
         )
+    if after != before:
+        problems.append(
+            f"with its own secret unset the refused requests still moved the side "
+            f"effect count from {before} to {after}, so the adapter served them"
+        )
     return _verdict(
         "3b",
         problems,
         f"with its own secret unset the adapter refused both requests "
-        f"({with_secret.status} and {without_secret.status})",
+        f"({with_secret.status} and {without_secret.status}) and neither moved the "
+        "side effect count",
     )
 
 
@@ -478,12 +552,16 @@ def _rule_5(adapter: AdapterUnderTest) -> FloorResult:
 
 
 def _clause_5(adapter: AdapterUnderTest) -> ClauseResult:
-    """Every member of the four member union, plus one unmodelled extra key.
+    """Every member of the four member union, and only the four.
 
-    Only the four. The reply wire is a STRICT four member union, so a kit that
-    also sent an unknown discriminator would be asserting a requirement the
-    platform never made, and would teach authors to accept a shape the worker
-    cannot send. Forward event tolerance is a separate compatibility rule, not
+    The reply wire is a STRICT four member union, so a kit that also sent an
+    unknown discriminator would be asserting a requirement the platform never
+    made, and would teach authors to accept a shape the worker cannot send.
+
+    Rule 5 is about EVENTS: handle all four, and tolerate the ones this adapter
+    has no use for. It says nothing about unmodelled keys, and the kit does not
+    get to add to it. Forward tolerance, at the event level or the field level,
+    is a separate versioned compatibility rule with its own assertion, not
     something smuggled into the floor.
     """
 
@@ -502,25 +580,13 @@ def _clause_5(adapter: AdapterUnderTest) -> ClauseResult:
             response = adapter.post_event(event, secret=adapter.secret)
             if not _is_2xx(response.status):
                 problems.append(f"answered {response.status} to {event.event}")
-        tolerant = adapter.post_body(
-            body_with_extra_key(
-                reply_update(adapter, conversation_id=conversation),
-                key=_EXTRA_KEY,
-                value="a key a later wire revision could add",
-            ),
-            secret=adapter.secret,
-        )
     except AdapterUnreachableError as error:
         return _clause("5", "fail", str(error))
-    if not _is_2xx(tolerant.status):
-        problems.append(
-            f"answered {tolerant.status} to a reply.update carrying one unmodelled "
-            "key, so a later optional field would break it"
-        )
     return _verdict(
         "5",
         problems,
-        "all four events and an unmodelled extra key were accepted",
+        "all four reply events were accepted, including the ones this adapter "
+        "has no use for",
     )
 
 
@@ -623,6 +689,35 @@ def _turn_posts(ingress: FakeIngress, since: int) -> list[ObservedRequest]:
     return [record for record in ingress.records()[since:] if record.path == TURNS_PATH]
 
 
+def _framing_failure(
+    ingress: FakeIngress, since: int, clause_id: str
+) -> ClauseResult | None:
+    """A failure for any request in this window the ingress could not read.
+
+    Every ingress rule decides on which ``ObservedRequest`` values landed in its
+    window, and rule 2 and clause 7b decide on which ones did NOT. The adapter
+    under test writes its own request headers, so a request the ingress cannot
+    frame is a request the kit cannot attribute, and reading an unattributable
+    request as an absent one hands the adapter a switch over its own verdict.
+    Incomplete evidence is a failure of the rule whose window it landed in, the
+    same way missing evidence is never a pass anywhere else in this kit.
+    """
+
+    broken = [
+        record for record in ingress.records()[since:] if record.framing_error is not None
+    ]
+    if not broken:
+        return None
+    reasons = sorted({str(record.framing_error) for record in broken})
+    return _clause(
+        clause_id,
+        "fail",
+        f"the adapter sent {len(broken)} request(s) the ingress could not read "
+        f"({'; '.join(reasons)}), so those posts could not be attributed and this "
+        "rule would be deciding on evidence the adapter chose",
+    )
+
+
 def _wait_for(predicate: Callable[[], bool], *, timeout_s: float) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -637,7 +732,7 @@ def _unmatched(declared: str, posts: list[ObservedRequest]) -> str:
     return (
         f"no observed delivery matched the declared upstream identity {declared}; "
         f"the wire carried {observed}. Either the adapter derives its delivery_id "
-        "differently or the driver's stimulate does not return the id the adapter "
+        "differently or the driver's reserve does not return the id the adapter "
         "will send, and both are findings"
     )
 
@@ -645,33 +740,65 @@ def _unmatched(declared: str, posts: list[ObservedRequest]) -> str:
 def _rule_1(driver: IngressDriver, ingress: FakeIngress) -> FloorResult:
     """After a transport failure, the SAME delivery_id arrives.
 
-    The kit takes the transport down itself, so it knows a first attempt failed
-    without needing to observe it: the failure happened below the ingress and
-    was never answered, which is the only kind of failure rule 1 licenses a
-    retry for. What has to be observed is the id the retry carried, and it has
-    to be byte identical to the one the driver declared. A delivery_id minted
+    The failure is provoked at the KIT'S OWN ingress, which reads the request,
+    records it with the delivery id that was on it, and closes the connection
+    with nothing on it. That is a transport failure rather than a response, so
+    it is the only kind of failure rule 1 licenses a retry for, and it is the
+    only arrangement under which the kit can say the DECLARED delivery is the
+    one that met the outage. An outage arranged privately by the driver leaves
+    the kit sleeping for a fixed window instead, and an adapter whose first
+    attempt lands after that window is certified for a retry that never
+    happened, off a single successful post.
+
+    So the kit waits for the failed attempt rather than timing it, then heals
+    the transport and requires the SAME id to come back. A delivery_id minted
     per attempt answers the correspondent once per retry, because the platform's
     claim converges on the id and on nothing else.
     """
 
-    driver.set_transport(reachable=False)
+    identity = driver.reserve()
+    ingress.arm_blackhole()
     mark = len(ingress.records())
-    identity = driver.stimulate()
-    time.sleep(_OUTAGE_S)
-    driver.set_transport(reachable=True)
+    try:
+        driver.release(identity)
+        attempted = _wait_for(
+            lambda: any(
+                post.status == NO_RESPONSE and post.delivery_id == identity.delivery_id
+                for post in _turn_posts(ingress, mark)
+            ),
+            timeout_s=_ARRIVAL_TIMEOUT_S,
+        )
+    finally:
+        ingress.disarm_blackhole()
+    if not attempted:
+        seen = sorted(
+            {post.delivery_id or "<absent>" for post in _turn_posts(ingress, mark)}
+        )
+        return _result(1, _RULE_1_TITLE, [
+            _clause(
+                "1",
+                "fail",
+                f"the declared delivery {identity.delivery_id} never reached the "
+                "unavailable transport, so no failure occurred and there is no retry "
+                f"to judge; the wire carried {seen}",
+            )
+        ])
     arrived = _wait_for(
         lambda: any(_is_2xx(post.status) for post in _turn_posts(ingress, mark)),
         timeout_s=_ARRIVAL_TIMEOUT_S,
     )
-    posts = _turn_posts(ingress, mark)
+    posts = [post for post in _turn_posts(ingress, mark) if post.status != NO_RESPONSE]
+    framing = _framing_failure(ingress, mark, "1")
+    if framing is not None:
+        return _result(1, _RULE_1_TITLE, [framing])
     if not arrived:
         return _result(1, _RULE_1_TITLE, [
             _clause(
                 "1",
                 "fail",
-                f"no delivery arrived after the transport was restored, so the "
-                f"adapter did not retry a transport failure; the declared identity "
-                f"was {identity.delivery_id}",
+                f"the declared delivery {identity.delivery_id} met the unavailable "
+                "transport and nothing arrived once it was restored, so the adapter "
+                "did not retry a transport failure",
             )
         ])
     if not any(post.delivery_id == identity.delivery_id for post in posts):
@@ -696,34 +823,82 @@ def _rule_2(driver: IngressDriver, ingress: FakeIngress) -> FloorResult:
     control is what makes the rule usable, because an upstream redelivery under
     an identity the kit never declared is legitimate at least once behavior, so
     the assertion is about THIS delivery id and not about post counts.
+
+    Two properties carry the rule, and neither is a timer.
+
+    * The 202 is armed for the DECLARED identity and no other, which is why
+      injection is two phase. A global one shot is consumed by whichever
+      delivery reaches the ingress first, and the rule then passes on a declared
+      delivery that only ever saw a 200, having tested finality against nothing.
+    * The verdict is taken once the driver reports the delivery RETIRED, never
+      after a fixed settle. A fixed window is a check an adapter evades by
+      retrying more slowly than the window is wide, and no adapter has to be
+      hostile to do it. A driver that never retires the identity leaves the rule
+      with no finality evidence, and no evidence is never a pass.
     """
 
-    ingress.arm_202()
+    identity = driver.reserve()
+    ingress.arm_202(identity.delivery_id)
     mark = len(ingress.records())
-    identity = driver.stimulate()
+    driver.release(identity)
+    # Waited for on the DECLARED identity, never on "some post arrived": an
+    # adapter with another delivery already in flight satisfies the weaker
+    # predicate with the wrong message, and the rule would then decide the
+    # declared one absent before it had a chance to be sent.
     arrived = _wait_for(
-        lambda: bool(_turn_posts(ingress, mark)), timeout_s=_ARRIVAL_TIMEOUT_S
+        lambda: any(
+            post.delivery_id == identity.delivery_id
+            for post in _turn_posts(ingress, mark)
+        ),
+        timeout_s=_ARRIVAL_TIMEOUT_S,
     )
     if not arrived:
+        posts = _turn_posts(ingress, mark)
+        detail = (
+            f"no delivery arrived for the declared identity {identity.delivery_id}"
+            if not posts
+            else _unmatched(identity.delivery_id, posts)
+        )
+        return _result(2, _RULE_2_TITLE, [_clause("2", "fail", detail)])
+    retired = _wait_for(
+        lambda: driver.settled(identity), timeout_s=_QUIESCENCE_TIMEOUT_S
+    )
+    if not retired:
         return _result(2, _RULE_2_TITLE, [
             _clause(
                 "2",
                 "fail",
-                f"no delivery arrived for the declared identity {identity.delivery_id}",
+                f"the driver never reported {identity.delivery_id} retired within "
+                f"{_QUIESCENCE_TIMEOUT_S} seconds, so the kit cannot say the adapter "
+                "has stopped attempting it and there is no finality to judge",
             )
         ])
-    if not any(
-        post.delivery_id == identity.delivery_id for post in _turn_posts(ingress, mark)
-    ):
-        return _result(2, _RULE_2_TITLE, [
-            _clause("2", "fail", _unmatched(identity.delivery_id, _turn_posts(ingress, mark)))
-        ])
-    time.sleep(_FINALITY_SETTLE_S)
+    # A short confirmation AFTER the driver's claim, never in place of it: this
+    # catches a driver that retires an identity its adapter is still retrying,
+    # rather than being the window the verdict rests on.
+    time.sleep(_POST_QUIESCENCE_S)
+    framing = _framing_failure(ingress, mark, "2")
+    if framing is not None:
+        # The rule's pass branch is a statement about a post the ingress did NOT
+        # see, so an unreadable post inside the window is exactly what would
+        # make that statement false while leaving it true on the records.
+        return _result(2, _RULE_2_TITLE, [framing])
     matching = [
         post
         for post in _turn_posts(ingress, mark)
         if post.delivery_id == identity.delivery_id
     ]
+    still_armed = ingress.armed_202()
+    if still_armed is not None:
+        return _result(2, _RULE_2_TITLE, [
+            _clause(
+                "2",
+                "fail",
+                f"the ingress was armed to answer 202 for {still_armed} and that "
+                "delivery never arrived to receive it, so the adapter's handling of "
+                "an in flight claim was never exercised",
+            )
+        ])
     if len(matching) > 1:
         return _result(2, _RULE_2_TITLE, [
             _clause(
@@ -738,8 +913,8 @@ def _rule_2(driver: IngressDriver, ingress: FakeIngress) -> FloorResult:
         _clause(
             "2",
             "pass",
-            f"ingress answered {matching[0].status} and the adapter did not post "
-            f"{identity.delivery_id} again",
+            f"ingress answered {matching[0].status} to {identity.delivery_id} and the "
+            "adapter retired it without posting it again",
         )
     ])
 
@@ -763,13 +938,23 @@ def _rule_7(
     """
 
     ingress.arm_401()
+    identity = driver.reserve()
     mark = len(ingress.records())
-    identity = driver.stimulate()
+    driver.release(identity)
     refused = _wait_for(
-        lambda: any(post.status == 401 for post in _turn_posts(ingress, mark)),
+        lambda: any(
+            post.status == 401 and post.delivery_id == identity.delivery_id
+            for post in _turn_posts(ingress, mark)
+        ),
         timeout_s=_ARRIVAL_TIMEOUT_S,
     )
     clause_7a = _clause_7a(adapter, driver, ingress, identity.delivery_id, mark, refused)
+    # Computed after 7a, because the whole 401 window is what 7a spans, and the
+    # unreadable request is the more fundamental finding than whatever 7a
+    # concluded on the records it could read.
+    framing = _framing_failure(ingress, mark, "7a")
+    if framing is not None:
+        clause_7a = framing
     minted = ingress.mint_attempts()
     mint_problems: list[str] = []
     if minted:
@@ -813,17 +998,30 @@ def _clause_7a(
         )
     resume_mark = len(ingress.records())
     driver.restart(token=ingress.token)
+    # The resumed post has to carry the DECLARED identity. Any later 2xx would
+    # also be satisfied by an adapter that discarded the held delivery and then
+    # posted something else entirely, and the clause would then report that the
+    # held delivery resumed when it did not.
     resumed = _wait_for(
-        lambda: any(_is_2xx(post.status) for post in _turn_posts(ingress, resume_mark)),
+        lambda: any(
+            _is_2xx(post.status) and post.delivery_id == declared
+            for post in _turn_posts(ingress, resume_mark)
+        ),
         timeout_s=_RESUME_TIMEOUT_S,
     )
     if not resumed:
+        after_restart = sorted(
+            {
+                f"{post.delivery_id or '<absent>'}:{post.status}"
+                for post in _turn_posts(ingress, resume_mark)
+            }
+        )
         return _clause(
             "7a",
             "fail",
             f"the adapter survived the 401 but never delivered {declared} again after "
             "an operator supplied a replacement token, so the in flight delivery was "
-            "discarded",
+            f"discarded; after the restart the wire carried {after_restart}",
         )
     return _clause(
         "7a",

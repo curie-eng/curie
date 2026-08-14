@@ -21,9 +21,11 @@ import pytest
 from channel_protocol.conformance import (
     ADAPTER_SECRET_HEADER,
     MAX_ACK_BODY_BYTES,
+    MAX_TURN_BODY_BYTES,
     AdapterUnderTest,
     FloorReport,
     run_floor,
+    side_effect_probe,
 )
 from conformance_stubs import (
     SECRET_HEADER,
@@ -42,6 +44,7 @@ from conformance_stubs import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _REPLY_SINK = _REPO_ROOT / "apps" / "worker" / "src" / "curie_worker" / "reply_sink.py"
+_API_CONFIG = _REPO_ROOT / "apps" / "api" / "src" / "curie_api" / "config.py"
 
 _FOUR_EVENTS = {"turn.status", "reply.update", "reply.post", "turn.completed"}
 
@@ -108,33 +111,46 @@ def _literal(node: ast.expr) -> Any:
     raise AssertionError(f"{ast.unparse(node)} is not a constant expression")
 
 
-def _worker_constant(name: str) -> Any:
-    """One module level constant, read out of the worker's source.
+def _source_constant(path: Path, name: str) -> Any:
+    """One constant, read out of a first party module's source.
 
     Read rather than imported: ``channel_protocol`` must never depend on
-    ``curie_worker``, so the kit re declares these values and this is the gate
-    that keeps the copy honest.
+    ``curie_worker`` or ``curie_api``, so the kit re declares these values and
+    this is the gate that keeps the copies honest. Both a bare assignment and an
+    annotated settings field are accepted, because the two authoritative sites
+    write theirs differently.
     """
 
-    tree = ast.parse(_REPLY_SINK.read_text(encoding="utf-8"))
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and any(
             isinstance(target, ast.Name) and target.id == name for target in node.targets
         ):
             return _literal(node.value)
-    raise AssertionError(f"{name} is not assigned in {_REPLY_SINK}")
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+            and node.value is not None
+        ):
+            return _literal(node.value)
+    raise AssertionError(f"{name} is not assigned in {path}")
 
 
-def test_worker_constants_match() -> None:
-    """The kit's copies of the worker's egress constants cannot drift.
+def test_platform_constants_match() -> None:
+    """The kit's copies of the platform's wire constants cannot drift.
 
-    Change either one in the worker and this reds, which is the only thing
-    standing between a re declared constant and a kit that asserts the wrong
-    cap or sends the wrong header.
+    Change any of them at its authoritative site and this reds, which is the
+    only thing standing between a re declared constant and a kit that sends the
+    wrong header, asserts the wrong ack cap, or stands in for the ingress with a
+    body bound the real route does not have.
     """
 
-    assert ADAPTER_SECRET_HEADER == _worker_constant("ADAPTER_SECRET_HEADER")
-    assert MAX_ACK_BODY_BYTES == _worker_constant("MAX_ACK_BODY_BYTES")
+    assert ADAPTER_SECRET_HEADER == _source_constant(_REPLY_SINK, "ADAPTER_SECRET_HEADER")
+    assert MAX_ACK_BODY_BYTES == _source_constant(_REPLY_SINK, "MAX_ACK_BODY_BYTES")
+    assert MAX_TURN_BODY_BYTES == _source_constant(
+        _API_CONFIG, "channel_turn_max_body_bytes"
+    )
     # The stub reads the header name from the guide, independently of both.
     assert ADAPTER_SECRET_HEADER == SECRET_HEADER
 
@@ -250,6 +266,68 @@ def test_non_conformant_stub_fails_rule_3_clause_3a_when_it_performs_the_side_ef
         assert clause_status(report, "3a") == "fail", report.detail()
         # The probe is what saw it: the rejected requests moved the counter.
         assert read_probe(stub.base_url)["side_effects"] > 0
+
+
+def test_non_conformant_stub_fails_clause_3a_when_the_side_effect_lands_after_the_401(
+    tmp_path: Path, secret: str
+) -> None:
+    """The refusal and the side effect are two different events.
+
+    This adapter answers a conformant 401 and hands the work to a timer that
+    fires 100 ms later, which is what an adapter that queues its work actually
+    looks like. A count read the instant the refusal arrives is identical to a
+    correct adapter's, so the clause has to read the count once it has stopped
+    moving rather than the moment the response lands.
+    """
+
+    with _running(
+        non_conformant_stub(
+            "delayed_side_effect_then_401",
+            secret=secret,
+            state_path=tmp_path / "state.json",
+        )
+    ) as stub:
+        report = _report_for(stub, secret)
+
+        assert clause_status(report, "3a") == "fail", report.detail()
+        assert report.automated_floor == "fail", report.detail()
+        assert read_probe(stub.base_url)["side_effects"] > 0
+
+
+def test_non_conformant_stub_fails_clause_3b_when_it_serves_with_its_secret_unset(
+    tmp_path: Path, secret: str
+) -> None:
+    """With its own secret unset, refusing is about the SIDE EFFECT too.
+
+    This adapter answers a clean 503 to every request and answers the
+    correspondent anyway. Its statuses are indistinguishable from a conformant
+    adapter's, so a clause that inspects only the response certifies an adapter
+    that serves unauthenticated requests, which is the exact thing 3b exists to
+    forbid.
+    """
+
+    with _running(
+        non_conformant_stub(
+            "side_effect_when_secret_unset",
+            secret=secret,
+            state_path=tmp_path / "state.json",
+        )
+    ) as stub:
+        report = _report_for(stub, secret, with_driver=True)
+
+        assert clause_status(report, "3b") == "fail", report.detail()
+        assert report.automated_floor == "fail", report.detail()
+
+
+def test_clause_3b_is_not_run_without_a_side_effect_probe(
+    conformant: StubAdapter, secret: str
+) -> None:
+    """3b needs the probe as much as 3a does, and says so rather than passing."""
+
+    report = _report_for(conformant, secret, with_probe=False, with_driver=True)
+
+    assert clause_status(report, "3b") == "not_run", report.detail()
+    assert report.automated_floor == "fail", report.detail()
 
 
 def test_non_conformant_stub_fails_rule_3_clause_3b_when_it_accepts_with_its_secret_unset(
@@ -390,18 +468,34 @@ def test_rule_5_sends_only_the_four_union_members(
     assert observed == _FOUR_EVENTS, f"the kit sent {sorted(observed)}"
 
 
-def test_rule_5_probes_that_an_adapter_tolerates_an_unmodeled_extra_key(
-    conformant: StubAdapter, secret: str
+def test_a_hostile_side_effect_probe_response_is_refused_rather_than_buffered(
+    tmp_path: Path, secret: str
 ) -> None:
-    """A later wire revision adds optional keys, so the floor probe includes one
-    known event carrying a key the current models do not define."""
+    """The probe GET lands on the same untrusted origin the ack comes from.
 
-    _report_for(conformant, secret)
+    The payload here is VALID and merely enormous, so an unbounded read returns
+    the count and quietly buffers the padding. Only a cap catches it, and the
+    honest outcome of a refused probe is ``not_run`` on the two clauses that
+    need one, which is nonconformant.
+    """
 
-    events = read_probe(conformant.base_url)["events"]
-    assert any(entry["extra_keys"] for entry in events), (
-        "no request carried an unmodeled key, so tolerance was never probed"
-    )
+    with _running(
+        conformant_stub(
+            secret=secret,
+            state_path=tmp_path / "state.json",
+            probe_chunked_bytes=MAX_ACK_BODY_BYTES * 3,
+        )
+    ) as stub:
+        adapter = _adapter_for(stub, secret)
+
+        assert side_effect_probe(adapter) is None, (
+            "an oversize probe response was accepted, so the kit buffered it"
+        )
+
+        report = run_floor(adapter, driver=None, side_effect_probe=side_effect_probe(adapter))
+        assert clause_status(report, "3a") == "not_run", report.detail()
+        assert rule_status(report, 6) == "not_run", report.detail()
+        assert report.automated_floor == "fail", report.detail()
 
 
 def test_clause_3a_and_rule_6_report_not_run_without_a_side_effect_probe(
