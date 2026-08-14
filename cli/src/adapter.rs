@@ -1120,12 +1120,22 @@ async fn probe_round_trip(
             duplicate: None,
         };
     };
+    // One id, minted once and reused for every identity field in the body, which
+    // is what makes the SECOND post a re-post rather than a second delivery.
+    // `reply_ref` is opaque and adapter minted (a Slack `ts`, a mail
+    // `Message-Id`), so a probe with no real upstream message mints its own; the
+    // platform requires it and hands it back to the adapter to address the reply
+    // to. It has to be BYTE IDENTICAL across the two posts, and it is, because
+    // both posts send this one `body` value: a fresh handle on the second post
+    // would describe a different delivery and defeat the duplicate detection
+    // this probe exists to demonstrate.
     let delivery = format!("curie-smoke-{}", uuid::Uuid::new_v4());
     let body = serde_json::json!({
         "kind": profile.kind,
         "address": opts.address,
         "delivery_id": delivery,
         "conversation_id": delivery,
+        "reply_ref": delivery,
         "author": "curie-adapter-smoke-test",
         "text": "curie adapter smoke test",
     });

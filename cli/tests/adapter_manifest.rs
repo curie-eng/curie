@@ -297,6 +297,40 @@ fn smoke_test_payload(api: &MockServer, endpoint: &MockServer, secret: &str) -> 
     stdout_json(&output)
 }
 
+/// The same drive as [`smoke_test_payload`], with `--enqueue`, which is the only
+/// flag that makes the verb post a turn at all.
+fn smoke_test_payload_enqueuing(
+    api: &MockServer,
+    endpoint: &MockServer,
+    secret: &str,
+) -> serde_json::Value {
+    let dir = tempdir();
+    let mut profile = routed_valid_case();
+    profile["endpoint"] = serde_json::json!(endpoint.base_url.clone());
+    let path = write_profile(dir.path(), &profile);
+    let address = profile["address"]["example"].as_str().unwrap().to_string();
+    let secret_file = dir.path().join("egress.secret");
+    std::fs::write(&secret_file, secret).expect("write the egress secret");
+
+    let output = run(&[
+        "adapter",
+        "smoke-test",
+        "-f",
+        path.to_str().unwrap(),
+        "--address",
+        &address,
+        "--secret-file",
+        secret_file.to_str().unwrap(),
+        "--allow-insecure",
+        "--enqueue",
+        "--yes",
+        "--api-url",
+        &api.base_url,
+        "--json",
+    ]);
+    stdout_json(&output)
+}
+
 /// Every value that reached the endpoint under the egress secret header, in
 /// order. This is the wire, not a log line, so a derived probe cannot hide.
 fn secrets_sent(server: &MockServer) -> Vec<String> {
@@ -1781,6 +1815,349 @@ fn an_acknowledgement_body_exactly_at_the_cap_still_passes() {
         payload["egress_positive"]["ok"],
         serde_json::json!(true),
         "the worker refuses a body OVER the cap, so exactly the cap passes: {payload}"
+    );
+}
+
+// ─── The enqueued turn body is pinned to the API's own model ─────────────────
+
+/// The API router that DEFINES `TurnIn`, read as the authority it is.
+///
+/// There is no committed artifact describing `TurnIn`, and that is not an
+/// oversight to route around quietly. `POST /channels/turns` takes a bare
+/// `Request` so it can enforce its size bound BEFORE authentication and before
+/// JSON parsing, then parses `TurnIn` by hand; FastAPI therefore never sees a
+/// body model, emits no `requestBody`, and `TurnIn` is absent from the committed
+/// `apps/api/openapi.json` (which is generated and drift gated, and does carry
+/// `ChannelBinding`, `ChannelTokenRequest` and `TurnAccepted`).
+///
+/// So this reads the model's own source rather than restating its fields here.
+/// A hand written list of required fields is the drift that produced the bug
+/// this test exists for: the payload was written once against a model that later
+/// grew `reply_ref`, and nothing failed until a live install answered 422.
+/// Reading the authority cannot go stale; a second copy of it always can.
+const CHANNELS_ROUTER: &str = include_str!("../../apps/api/src/curie_api/routers/channels.py");
+
+/// The committed, drift gated OpenAPI export, for the half of the body that
+/// `TurnIn` inherits and that FastAPI DOES publish.
+const API_OPENAPI: &str = include_str!("../../apps/api/openapi.json");
+
+/// `(base class name, own required fields)` for a Pydantic model, read out of
+/// the router source.
+///
+/// A required field is an annotated attribute with no `=`: a default of any kind
+/// makes it optional, and `model_config` is an assignment rather than an
+/// annotation, so neither reaches the set.
+fn pydantic_model(source: &str, name: &str) -> (String, std::collections::BTreeSet<String>) {
+    let header = format!("\nclass {name}(");
+    let start = source
+        .find(&header)
+        .unwrap_or_else(|| panic!("{name} is defined in the router source"))
+        + 1;
+    let rest = &source[start..];
+    let base = rest[rest.find('(').expect("a class header has a base list") + 1..]
+        .split([')', ','])
+        .next()
+        .expect("a base list names a class")
+        .trim()
+        .to_string();
+    let body_start = rest.find('\n').expect("a class header ends") + 1;
+    let body = &rest[body_start..];
+    let end = body.find("\nclass ").unwrap_or(body.len());
+
+    let mut required = std::collections::BTreeSet::new();
+    for line in body[..end].lines() {
+        let Some(declaration) = line.strip_prefix("    ") else {
+            continue;
+        };
+        if declaration.starts_with(' ') || declaration.starts_with('#') {
+            continue;
+        }
+        let Some((field, annotation)) = declaration.split_once(": ") else {
+            continue;
+        };
+        if annotation.contains('=') || !field.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+            continue;
+        }
+        required.insert(field.to_string());
+    }
+    assert!(
+        !required.is_empty(),
+        "{name} parsed to no required fields, so this gate would pass on an empty body"
+    );
+    (base, required)
+}
+
+/// Every field `TurnIn` requires: its own, read from the model source, plus the
+/// ones it inherits, read from the committed OpenAPI export.
+fn turn_in_required_fields() -> std::collections::BTreeSet<String> {
+    let (base, mut required) = pydantic_model(CHANNELS_ROUTER, "TurnIn");
+    let openapi: serde_json::Value =
+        serde_json::from_str(API_OPENAPI).expect("apps/api/openapi.json is valid JSON");
+    let inherited = openapi["components"]["schemas"][&base]["required"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("the committed OpenAPI export declares {base}, which TurnIn inherits")
+        });
+    required.extend(
+        inherited
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string)),
+    );
+    required
+}
+
+/// A platform API stand-in that also answers the turn ingress, reporting the
+/// duplicate verdict the round trip probe reads.
+fn api_recorder_with_turns() -> MockServer {
+    let seen = std::sync::Mutex::new(std::collections::BTreeSet::<String>::new());
+    serve(move |req: &Request| {
+        if req.path.starts_with("/channels/token") {
+            return Response::json(200, r#"{"token":"chn_test_token_value"}"#);
+        }
+        if req.path.starts_with("/channels/turns") {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            // Stand in for the platform's real refusal: a body missing anything
+            // TurnIn requires is a 422, exactly as the live API answered.
+            let missing: Vec<String> = turn_in_required_fields()
+                .into_iter()
+                .filter(|field| body.get(field).is_none_or(serde_json::Value::is_null))
+                .collect();
+            if !missing.is_empty() {
+                return Response::json(
+                    422,
+                    &format!(r#"{{"detail":[{{"type":"missing","loc":{missing:?}}}]}}"#),
+                );
+            }
+            let delivery = body["delivery_id"].as_str().unwrap_or_default().to_string();
+            let duplicate = !seen.lock().expect("the recorder lock").insert(delivery);
+            return Response::json(
+                200,
+                &format!(r#"{{"event_id":"chn-x","stream_id":"1-0","duplicate":{duplicate}}}"#),
+            );
+        }
+        Response::json(
+            200,
+            r#"{"id":"demo","name":"demo","channel":{"kind":"email","address":"agent@example.test"}}"#,
+        )
+    })
+}
+
+/// The body `--enqueue` actually puts on the wire must satisfy every field the
+/// platform's own `TurnIn` requires.
+///
+/// This is the regression gate for a bug only a live install surfaced: the
+/// payload omitted `reply_ref`, the API answered 422 with
+/// `{"type":"missing","loc":["body","reply_ref"]}`, and the verb reported the
+/// round trip as failed. Nothing in the suite could see it, because nothing
+/// compared the request body against the model that judges it.
+///
+/// Mutation to run against the implementation: drop `reply_ref` from the body.
+/// This reds.
+#[test]
+fn the_enqueued_turn_body_carries_every_field_the_platform_requires() {
+    assert_verb_routes("smoke-test");
+    let api = api_recorder_with_turns();
+    let endpoint = endpoint_recorder();
+
+    let payload = smoke_test_payload_enqueuing(&api, &endpoint, REAL_EGRESS_SECRET);
+
+    let turns: Vec<serde_json::Value> = api
+        .recorded()
+        .iter()
+        .filter(|req| req.method == "POST" && req.path.starts_with("/channels/turns"))
+        .map(|req| serde_json::from_slice(&req.body).expect("the turn body is JSON"))
+        .collect();
+    assert_eq!(
+        turns.len(),
+        2,
+        "the round trip posts the same delivery twice; saw {turns:?}"
+    );
+
+    let required = turn_in_required_fields();
+    assert!(
+        required.contains("reply_ref"),
+        "the authority must still require reply_ref, or this gate proves nothing \
+         about the field the live 422 named; required {required:?}"
+    );
+    for (nth, body) in turns.iter().enumerate() {
+        for field in &required {
+            assert!(
+                body.get(field).is_some_and(|v| !v.is_null()),
+                "post {} omits {field:?}, which TurnIn requires; the platform answers \
+                 422 for exactly this. body: {body}",
+                nth + 1
+            );
+        }
+    }
+
+    // Byte identical across both posts, or the second describes a DIFFERENT
+    // delivery and the duplicate verdict below is meaningless.
+    assert_eq!(
+        turns[0], turns[1],
+        "both posts must send the identical body, or the platform is being asked \
+         to deduplicate two different deliveries"
+    );
+
+    assert_eq!(
+        payload["round_trip"]["duplicate"],
+        serde_json::json!(true),
+        "the re-post must be reported as the duplicate: {payload}"
+    );
+    assert_eq!(
+        payload["round_trip"]["ok"],
+        serde_json::json!(true),
+        "a body the platform accepts must produce a passing round trip: {payload}"
+    );
+}
+
+/// The control that keeps the test above honest: the recorder really does refuse
+/// a body missing a required field, so a green round trip is evidence and not an
+/// artifact of a permissive stand-in.
+#[test]
+fn the_turn_recorder_refuses_a_body_missing_a_required_field() {
+    let api = api_recorder_with_turns();
+    let required = turn_in_required_fields();
+
+    let mut complete = serde_json::json!({});
+    for field in &required {
+        complete[field] = serde_json::json!("x");
+    }
+
+    assert_eq!(
+        post_turn(&api, &complete),
+        200,
+        "a complete body must be accepted, or every refusal below is vacuous"
+    );
+
+    for field in &required {
+        let mut missing = complete.clone();
+        missing.as_object_mut().expect("an object").remove(field);
+        assert_eq!(
+            post_turn(&api, &missing),
+            422,
+            "a body missing {field:?} must be refused, or the gate above cannot see \
+             an omission"
+        );
+    }
+}
+
+/// POST one turn body to the recorder, returning its status.
+///
+/// Reads the STATUS LINE only and then drops the connection. The recorder keeps
+/// a connection open for pipelined requests, so reading to EOF would block until
+/// a close that never comes.
+fn post_turn(api: &MockServer, body: &serde_json::Value) -> u16 {
+    let encoded = serde_json::to_vec(body).expect("the body serializes");
+    let address: std::net::SocketAddr = api
+        .base_url
+        .trim_start_matches("http://")
+        .parse()
+        .expect("the recorder base url is an address");
+    let mut stream = std::net::TcpStream::connect(address).expect("connect to the recorder");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("a read timeout, so a stuck recorder fails the test instead of hanging it");
+
+    use std::io::{BufRead, Write};
+    let request = format!(
+        "POST /channels/turns HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        encoded.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write headers");
+    stream.write_all(&encoded).expect("write body");
+    stream.flush().expect("flush the request");
+
+    let mut status_line = String::new();
+    std::io::BufReader::new(&stream)
+        .read_line(&mut status_line)
+        .expect("read the status line");
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("the recorder answered a status line: {status_line:?}"))
+}
+
+// ─── A probe failure never escapes the report ────────────────────────────────
+
+/// Every dependency broken at once still produces a COMPLETE verdict, not an
+/// error path.
+///
+/// The Python kit's equivalent hazard (finding 12) is that probe discovery
+/// converts a failure to missing evidence while a LATER call of the same probe
+/// raises uncaught. The Rust verb has no discovery-then-reuse seam, and every
+/// probe converts its own transport error, non 2xx status and unreadable body
+/// into a `CheckResult` at the call site, so there is no `?` between the first
+/// probe and the emit. This pins that property behaviorally rather than by
+/// reading the code: with a dead endpoint AND an API answering 500, the verb
+/// must still emit every check, a `fail` verdict and the failure exit code.
+#[test]
+fn every_probe_failure_becomes_a_reported_check_rather_than_an_error_exit() {
+    let api = serve(|_req: &Request| Response::json(500, r#"{"detail":"boom"}"#));
+    // Bound then dropped, so the port answers nothing at all: a connection
+    // refused is the transport failure no status code can stand in for.
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        format!("http://{addr}")
+    };
+
+    let dir = tempdir();
+    let mut profile = routed_valid_case();
+    profile["endpoint"] = serde_json::json!(dead);
+    let path = write_profile(dir.path(), &profile);
+    let address = profile["address"]["example"].as_str().unwrap().to_string();
+    let secret_file = dir.path().join("egress.secret");
+    std::fs::write(&secret_file, REAL_EGRESS_SECRET).expect("write the secret");
+
+    let output = run(&[
+        "adapter",
+        "smoke-test",
+        "-f",
+        path.to_str().unwrap(),
+        "--address",
+        &address,
+        "--secret-file",
+        secret_file.to_str().unwrap(),
+        "--allow-insecure",
+        "--enqueue",
+        "--yes",
+        "--api-url",
+        &api.base_url,
+        "--json",
+    ]);
+
+    assert_eq!(
+        code(&output),
+        1,
+        "a failing probe is a FAILURE exit, never an error path that drops the \
+         report\n{}",
+        text(&output)
+    );
+    let payload = stdout_json(&output);
+    for check in [
+        "egress_positive",
+        "egress_negative",
+        "binding",
+        "round_trip",
+    ] {
+        assert!(
+            payload[check].is_object(),
+            "{check} must still be reported when everything is broken: {payload}"
+        );
+        assert_eq!(
+            payload[check]["ok"],
+            serde_json::json!(false),
+            "{check} must be reported as failed: {payload}"
+        );
+    }
+    assert_eq!(
+        payload["verdict"],
+        serde_json::json!("fail"),
+        "payload: {payload}"
     );
 }
 
