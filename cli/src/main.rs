@@ -1263,7 +1263,8 @@ enum LocalAction {
     ResetThread {
         /// Agent name or id (scopes the action; the release is thread-keyed).
         agent: String,
-        /// The thread key to reset (e.g. the Slack thread ts).
+        /// The worker's composed key: kind:channel:thread-ts (e.g.
+        /// slack:C0EXAMPLE1:1700000000.000100).
         #[arg(long, value_name = "THREAD_KEY")]
         thread_key: String,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
@@ -1846,7 +1847,8 @@ enum ClusterAction {
     ResetThread {
         /// Agent name or id (scopes the action; the release is thread-keyed).
         agent: String,
-        /// The thread key to reset (e.g. the Slack thread ts).
+        /// The worker's composed key: kind:channel:thread-ts (e.g.
+        /// slack:C0EXAMPLE1:1700000000.000100).
         #[arg(long, value_name = "THREAD_KEY")]
         thread_key: String,
         #[command(flatten)]

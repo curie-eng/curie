@@ -1868,7 +1868,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The thread key to reset (e.g. the Slack thread ts)",
+              "help": "The worker's composed key: kind:channel:thread-ts (e.g. slack:C0EXAMPLE1:1700000000.000100)",
               "id": "thread_key",
               "long": "thread-key",
               "positional": false,
@@ -3382,7 +3382,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The thread key to reset (e.g. the Slack thread ts)",
+              "help": "The worker's composed key: kind:channel:thread-ts (e.g. slack:C0EXAMPLE1:1700000000.000100)",
               "id": "thread_key",
               "long": "thread-key",
               "positional": false,
