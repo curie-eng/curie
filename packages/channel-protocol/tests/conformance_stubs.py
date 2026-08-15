@@ -80,6 +80,10 @@ class StubBehavior:
     rejects_turn_status: bool = False
     # Rule 6 (dedupe on event_id, and tolerate a finished conversation).
     double_sends_duplicate: bool = False
+    # How long after the redelivery the second correspondent effect lands. The
+    # ack is an immediate 200 either way, so a count sampled when it arrives
+    # reads a delta of one and the adapter answered the correspondent twice.
+    duplicate_side_effect_delay_s: float = 0.0
     # Treats its own retirement of a conversation as final: the exact duplicate
     # is tolerated, and a NEW event_id for that conversation is refused. A
     # multi turn conversation and an outage sweeper both produce that traffic.
@@ -150,6 +154,18 @@ BREAKS: dict[str, StubBehavior] = {
         side_effect_then_401=True, side_effect_delay_s=0.1
     ),
     "side_effect_when_secret_unset": StubBehavior(side_effect_when_secret_unset=True),
+    # The same three breaks, each delayed past any quiet window a kit could
+    # infer finality from. None of them is adversarial: an adapter that hands
+    # its work to a queue looks exactly like this.
+    "slowly_delayed_side_effect_then_401": StubBehavior(
+        side_effect_then_401=True, side_effect_delay_s=1.2
+    ),
+    "slowly_serves_when_secret_unset": StubBehavior(
+        side_effect_when_secret_unset=True, side_effect_delay_s=1.2
+    ),
+    "delayed_duplicate_side_effect": StubBehavior(
+        double_sends_duplicate=True, duplicate_side_effect_delay_s=0.2
+    ),
     "drops_on_401_and_posts_unrelated_after_restart": StubBehavior(
         drops_on_401=True, posts_unrelated_after_restart=True
     ),
@@ -529,13 +545,32 @@ class StubAdapter:
                     self.finished_conversations.append(conversation)
                 if not duplicate:
                     self.seen_event_ids.append(event_id)
-                if not duplicate or self.behavior.double_sends_duplicate:
+                if duplicate and self.behavior.duplicate_side_effect_delay_s:
+                    # Answered twice, with the second answer on a timer. The ack
+                    # for the redelivery is still an immediate 200.
+                    self._schedule_increment_locked(
+                        self.behavior.duplicate_side_effect_delay_s
+                    )
+                elif not duplicate or self.behavior.double_sends_duplicate:
                     self.side_effects += 1
                 self._persist_locked()
                 return "ok"
             self.side_effects += 1
             self._persist_locked()
             return "ok"
+
+    def _schedule_increment_locked(self, delay: float) -> None:
+        """Move the side effect count later. Caller already holds ``_lock``."""
+
+        def bump() -> None:
+            with self._lock:
+                self.side_effects += 1
+                self._persist_locked()
+
+        timer = threading.Timer(delay, bump)
+        timer.daemon = True
+        self._timers.append(timer)
+        timer.start()
 
     def perform_side_effect(self, body: bytes) -> None:
         """Answer the correspondent, possibly AFTER the response has gone out.
@@ -1098,6 +1133,86 @@ class RacingIngressDriver:
 
     def settled(self, identity: UpstreamIdentity) -> bool:
         return self.inner.settled(identity)
+
+    def restart(
+        self,
+        *,
+        egress_secret: str | None | EllipsisType = ...,
+        token: str | None | EllipsisType = ...,
+    ) -> None:
+        self.inner.restart(egress_secret=egress_secret, token=token)
+
+    def stop(self) -> None:
+        self.inner.stop()
+
+
+class EagerlySettledDriver:
+    """A driver that reports every delivery retired the moment it is asked.
+
+    The naive implementation, and the one a vendor writes first: it answers
+    from an empty active queue and does not know about the retry its adapter has
+    sitting on a timer. Not hostile, which is the point. The kit has to catch it
+    and say which half of the contract broke, because the vendor who wrote it is
+    the same person who wrote the adapter and will otherwise ship believing the
+    kit checked something.
+    """
+
+    def __init__(self, inner: StubIngressDriver | SubprocessIngressDriver) -> None:
+        self.inner = inner
+
+    def start(self, *, ingress_url: str, token: str) -> None:
+        self.inner.start(ingress_url=ingress_url, token=token)
+
+    def reserve(self) -> UpstreamIdentity:
+        return self.inner.reserve()
+
+    def release(self, identity: UpstreamIdentity) -> None:
+        self.inner.release(identity)
+
+    def settled(self, identity: UpstreamIdentity) -> bool:
+        return True
+
+    def restart(
+        self,
+        *,
+        egress_secret: str | None | EllipsisType = ...,
+        token: str | None | EllipsisType = ...,
+    ) -> None:
+        self.inner.restart(egress_secret=egress_secret, token=token)
+
+    def stop(self) -> None:
+        self.inner.stop()
+
+
+class BlockingSettledDriver:
+    """A driver whose ``settled`` waits for an event that never fires.
+
+    The shape a vendor reaches for when quiescence is signalled internally: wait
+    on the completion the adapter is supposed to publish. When the adapter never
+    publishes it, a kit that calls the callback inline never returns to its own
+    deadline, and the promised failure becomes a hang. The event is exposed so a
+    test can release the blocked thread during teardown instead of leaving it
+    sleeping.
+    """
+
+    def __init__(self, inner: StubIngressDriver | SubprocessIngressDriver) -> None:
+        self.inner = inner
+        self.released = threading.Event()
+        self.calls = 0
+
+    def start(self, *, ingress_url: str, token: str) -> None:
+        self.inner.start(ingress_url=ingress_url, token=token)
+
+    def reserve(self) -> UpstreamIdentity:
+        return self.inner.reserve()
+
+    def release(self, identity: UpstreamIdentity) -> None:
+        self.inner.release(identity)
+
+    def settled(self, identity: UpstreamIdentity) -> bool:
+        self.calls += 1
+        self.released.wait()
+        return True
 
     def restart(
         self,

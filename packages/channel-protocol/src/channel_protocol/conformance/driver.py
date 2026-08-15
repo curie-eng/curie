@@ -97,6 +97,19 @@ class IngressDriver(Protocol):
         working: a verdict taken on a timer is a verdict any retry schedule
         evades by being slower than the timer. A driver that never reports an
         identity retired leaves the rule nonpassing rather than passing.
+
+        **"Retired" means no attempt remains scheduled, not that the active
+        queue is empty.** A delivery removed from the queue with a retry sitting
+        on a timer is NOT retired, and reporting it as such is the naive
+        implementation this kit exists to catch. The kit keeps watching after
+        the claim and fails the rule, naming the harness, if a post for the
+        identity arrives afterwards, so an over eager answer here produces a
+        loud failure rather than a quiet pass.
+
+        Like every method on this Protocol it is called under a hard timeout and
+        must RETURN. Blocking, here or anywhere else in this interface, is
+        reported as a harness defect: a callback that never answers would
+        otherwise turn a verdict into a hang, which tells its reader nothing.
         """
         ...
 

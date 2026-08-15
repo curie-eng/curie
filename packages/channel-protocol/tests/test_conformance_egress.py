@@ -12,11 +12,13 @@ kit's assertion for that clause turns its case green and reds the suite.
 from __future__ import annotations
 
 import ast
+import itertools
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from channel_protocol.conformance import (
     ADAPTER_SECRET_HEADER,
@@ -319,6 +321,79 @@ def test_non_conformant_stub_fails_clause_3b_when_it_serves_with_its_secret_unse
         assert report.automated_floor == "fail", report.detail()
 
 
+def test_clauses_3a_and_3b_catch_a_side_effect_delayed_past_any_quiet_window(
+    tmp_path: Path, secret: str
+) -> None:
+    """A quiet window is not evidence, and 1.2 seconds is not adversarial.
+
+    Both breaks answer a clean refusal and hand the correspondent to a timer
+    that fires well after any interval a kit could call quiet. Inferring
+    finality from silence passes both of them; observing for a named window and
+    failing on ANY movement catches both, and the two clauses share the one
+    mechanism rather than each carrying its own constant to outlast.
+    """
+
+    with _running(
+        non_conformant_stub(
+            "slowly_delayed_side_effect_then_401",
+            secret=secret,
+            state_path=tmp_path / "3a.json",
+        )
+    ) as stub:
+        report = _report_for(stub, secret)
+        assert clause_status(report, "3a") == "fail", report.detail()
+        assert report.automated_floor == "fail", report.detail()
+
+    with _running(
+        non_conformant_stub(
+            "slowly_serves_when_secret_unset",
+            secret=secret,
+            state_path=tmp_path / "3b.json",
+        )
+    ) as stub:
+        report = _report_for(stub, secret, with_driver=True)
+        assert clause_status(report, "3b") == "fail", report.detail()
+        assert report.automated_floor == "fail", report.detail()
+
+
+def test_a_probe_that_stops_answering_fails_the_clause_instead_of_aborting_the_run(
+    conformant: StubAdapter, secret: str
+) -> None:
+    """Discovery proved the probe answered ONCE, and nothing more than that.
+
+    A probe that starts failing partway through used to escape as an httpx error
+    out of the middle of a clause and take the whole report with it, and the
+    observation windows read it many times per clause rather than twice, so
+    there are far more chances for it now. The honest outcome is a clause
+    failure that names the probe endpoint, so the vendor knows to look at their
+    probe rather than at their reply handling, and every other rule still
+    reaches a verdict.
+    """
+
+    honest = side_effect_probe_for(conformant.base_url)
+    reads = itertools.count()
+
+    def stops_answering() -> int:
+        if next(reads) < 1:
+            return honest()
+        raise httpx.ConnectError("the probe endpoint refused the connection")
+
+    report = run_floor(
+        _adapter_for(conformant, secret), driver=None, side_effect_probe=stops_answering
+    )
+
+    assert clause_status(report, "3a") == "fail", report.detail()
+    assert rule_status(report, 6) == "fail", report.detail()
+    assert report.automated_floor == "fail", report.detail()
+    detail = clause(report, "3a").detail
+    assert "side effect probe" in detail, detail
+    assert "clause 3a" in detail, detail
+    # The run still produced a report, and the rules that never touch the probe
+    # still reached their own verdicts rather than being lost with it.
+    assert rule_status(report, 4) == "pass", report.detail()
+    assert rule_status(report, 5) == "pass", report.detail()
+
+
 def test_clause_3b_is_not_run_without_a_side_effect_probe(
     conformant: StubAdapter, secret: str
 ) -> None:
@@ -405,6 +480,31 @@ def test_non_conformant_stub_fails_rule_6_when_it_double_sends_a_duplicate(
     ) as stub:
         report = _report_for(stub, secret)
         assert rule_status(report, 6) == "fail", report.detail()
+
+
+def test_non_conformant_stub_fails_rule_6_when_the_duplicate_effect_is_delayed(
+    tmp_path: Path, secret: str
+) -> None:
+    """The redelivery is acked 200 immediately and answered 200 ms later.
+
+    Both acks look identical to a deduping adapter's, and the count read the
+    instant the second ack lands shows a delta of one, so the whole rule passes
+    on an adapter that answered the correspondent twice. The count has to be
+    WATCHED across the window rather than sampled at the end of the exchange.
+    """
+
+    with _running(
+        non_conformant_stub(
+            "delayed_duplicate_side_effect",
+            secret=secret,
+            state_path=tmp_path / "state.json",
+        )
+    ) as stub:
+        report = _report_for(stub, secret)
+
+        assert rule_status(report, 6) == "fail", report.detail()
+        assert report.automated_floor == "fail", report.detail()
+        assert "answered twice" in clause(report, "6").detail, report.detail()
 
 
 def test_non_conformant_stub_fails_rule_6_when_it_rejects_a_finished_conversation(

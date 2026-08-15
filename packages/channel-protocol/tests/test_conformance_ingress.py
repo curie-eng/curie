@@ -16,6 +16,7 @@ claim semantics, and it is part of the kit rather than a mock of it.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -33,6 +34,8 @@ from channel_protocol.conformance import (
     run_floor,
 )
 from conformance_stubs import (
+    BlockingSettledDriver,
+    EagerlySettledDriver,
     LyingIngressDriver,
     RacingIngressDriver,
     StubAdapter,
@@ -477,6 +480,73 @@ def test_rule_2_catches_a_retry_that_arrives_after_any_fixed_settle_window(
 
     assert rule_status(report, 2) == "fail", report.detail()
     assert report.automated_floor == "fail", report.detail()
+
+
+@pytest.mark.parametrize("driver_kind", DRIVER_KINDS)
+def test_rule_2_fails_a_driver_that_reports_retired_with_a_retry_still_scheduled(
+    driver_kind: str, tmp_path: Path, secret: str
+) -> None:
+    """A driver claim is evidence about the driver, not a verdict about the adapter.
+
+    ``EagerlySettledDriver`` answers from an empty active queue while its
+    adapter still has a 650 ms retry on a timer, which is what a vendor writes
+    first. Taking the claim as authoritative and watching for another fixed
+    window is the original late retry evasion in new clothes: the retry lands
+    after the window and the adapter is certified. The kit has to keep watching
+    and name BOTH halves, because the vendor has an adapter bug and a harness
+    bug and needs to know about each.
+    """
+
+    with _harness(
+        driver_kind,
+        tmp_path=tmp_path,
+        secret=secret,
+        behavior_name="retries_late_after_202",
+    ) as harness:
+        report = _run(harness, driver=EagerlySettledDriver(harness.driver))
+
+    assert rule_status(report, 2) == "fail", report.detail()
+    assert report.automated_floor == "fail", report.detail()
+    detail = rule(report, 2).detail
+    assert "settled()" in detail, detail
+    assert "harness" in detail, detail
+
+
+def test_a_driver_callback_that_blocks_fails_the_rule_instead_of_hanging_the_kit(
+    tmp_path: Path, secret: str
+) -> None:
+    """The worst outcome available is a hang, and this is the test that forbids it.
+
+    ``_wait_for`` used to call the predicate inline, so a ``settled`` that never
+    returned never gave control back to the deadline that was supposed to bound
+    it. The promised failure was a hang, and a hang reads as a slow suite rather
+    than as a broken harness, so nobody is ever told anything.
+
+    The test itself must not be able to hang either, which is why it asserts on
+    elapsed time and releases the blocked callback in a finalizer. If the bound
+    ever regresses, this fails on the clock rather than stalling the run.
+    """
+
+    with _harness("in-process", tmp_path=tmp_path, secret=secret) as harness:
+        driver = BlockingSettledDriver(harness.driver)
+        # Released whatever happens, so the abandoned callback thread does not
+        # outlive the test still waiting.
+        try:
+            started = time.monotonic()
+            report = _run(harness, driver=driver)
+            elapsed = time.monotonic() - started
+        finally:
+            driver.released.set()
+
+    assert elapsed < 60.0, f"the kit took {elapsed:.1f}s, so the bound did not hold"
+    assert rule_status(report, 2) == "fail", report.detail()
+    assert report.automated_floor == "fail", report.detail()
+    detail = rule(report, 2).detail
+    assert "did not answer" in detail, detail
+    assert "harness" in detail, detail
+    # Asked once and not once per poll: a callback that has shown it does not
+    # answer must not be retried, or every poll leaks another blocked thread.
+    assert driver.calls == 1, driver.calls
 
 
 @pytest.mark.parametrize("driver_kind", DRIVER_KINDS)

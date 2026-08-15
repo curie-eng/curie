@@ -35,13 +35,14 @@ instead, and neither ever reads as ``pass``.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections.abc import Callable
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from .driver import IngressDriver
+from .driver import IngressDriver, UpstreamIdentity
 from .ingress import NO_RESPONSE, TURNS_PATH, FakeIngress, ObservedRequest
 from .transport import (
     MAX_ACK_BODY_BYTES,
@@ -70,22 +71,24 @@ _ARRIVAL_TIMEOUT_S = 15.0
 # rule 2 nonpassing.
 _QUIESCENCE_TIMEOUT_S = 20.0
 
-# A confirmation window AFTER the driver reported the delivery retired, so a
-# driver that retires an identity its adapter is still attempting is caught.
-# Deliberately short, because it is a check on the driver's claim and not the
-# evidence the verdict rests on.
-_POST_QUIESCENCE_S = 0.5
+# The hard bound on ANY vendor supplied driver callback. A callback that does
+# not answer is a harness defect and is reported as one; it is never allowed to
+# become a hang, because a hang reads as a slow test rather than as a broken
+# adapter and therefore tells nobody anything.
+_DRIVER_CALLBACK_TIMEOUT_S = 5.0
 
-# How long a side effect count has to hold still before the kit reads it as
-# final. The refusal and the side effect an adapter performs anyway are two
-# different events, and an adapter that answers 401 first and acts afterwards
-# is exactly what clause 3a exists to catch, so an immediate read is a read of
-# the wrong moment.
-_SIDE_EFFECT_QUIET_S = 1.0
-
-# The ceiling on that settling. A count that never stops moving is its own
-# finding, and the clause says so rather than waiting forever.
-_SIDE_EFFECT_SETTLE_TIMEOUT_S = 10.0
+# The one observation window this kit uses for every negative assertion, and
+# the reason there is only one of it: three bespoke constants were three
+# separate things to outlast.
+#
+# It is a DETECTOR window, not an inference window, and the difference is the
+# whole fix. The old shape asked "has anything happened recently" and concluded
+# from a quiet interval that nothing further ever would, which is not something
+# a timer can establish. This one runs AFTER a barrier that claims the work is
+# finished, and treats anything it sees as a failure of that claim, named and
+# attributed. A pass therefore reports what was actually observed rather than
+# an inference from silence, and the clause details say exactly that.
+_GRACE_S = 1.8
 
 # How long the kit lets a 401 settle before asking whether the adapter is still
 # serving. An adapter that treats a stale credential as fatal takes a moment to
@@ -218,7 +221,9 @@ def run_floor(
         if driver is not None:
             ingress = FakeIngress(kind=adapter.kind, address=adapter.address)
             ingress.start()
-            driver.start(ingress_url=ingress.url, token=ingress.token)
+            _bounded_call(
+                "start", lambda: driver.start(ingress_url=ingress.url, token=ingress.token)
+            )
         results = [
             _rule_3(adapter, driver, side_effect_probe),
             _rule_4(adapter),
@@ -233,13 +238,26 @@ def run_floor(
             # identity the kit never declared) is provoked by an adapter's FIRST
             # successful delivery, so a rule that consumed that delivery first
             # would leave the control asserting nothing.
-            rule_2 = _rule_2(driver, ingress)
-            rule_1 = _rule_1(driver, ingress)
-            rule_7 = _rule_7(adapter, driver, ingress)
+            rule_2 = _guarded(
+                2, _RULE_2_TITLE, "2", lambda: _rule_2(driver, ingress)
+            )
+            rule_1 = _guarded(
+                1, _RULE_1_TITLE, "1", lambda: _rule_1(driver, ingress)
+            )
+            rule_7 = _guarded(
+                7, _RULE_7_TITLE, "7a", lambda: _rule_7(adapter, driver, ingress)
+            )
             results.extend([rule_1, rule_2, rule_7])
     finally:
         if driver is not None:
-            driver.stop()
+            # Bounded, and its fault swallowed: the report is already assembled,
+            # so there is no clause left to fail, and a driver that will not stop
+            # must not be able to hold the run open or to keep the ingress
+            # listener alive behind it.
+            try:
+                _bounded_call("the driver's stop()", driver.stop)
+            except _HarnessFault:
+                pass
         if ingress is not None:
             ingress.stop()
     results.sort(key=lambda result: result.rule)
@@ -301,38 +319,141 @@ def _is_2xx(status: int) -> bool:
     return 200 <= status < 300
 
 
-# --- rule 3: verify the egress secret before any side effect -----------------
+# --- the two mechanisms every negative assertion in this kit is built on ------
 
 
-def _settled_side_effects(probe: Callable[[], int]) -> int:
-    """The side effect count, read once it has stopped moving.
+class _HarnessFault(RuntimeError):
+    """A vendor callback that did not answer, or answered by raising.
 
-    A bare read is a read of the wrong moment. The response and the side effect
-    are two different events, and the break clause 3a exists to catch is exactly
-    an adapter that answers 401 first and performs the effect a moment later, so
-    a count sampled the instant the response lands agrees with a conformant
-    adapter's count. The barrier waits for the value to hold still, and the
-    quiet window RESTARTS every time it moves, so it is not a deadline an
-    adapter beats by being slower than a constant. A count that never settles is
-    reported as itself rather than waited on forever.
+    Covers both halves of the harness the vendor supplies: the ingress driver
+    and the side effect probe. Carried as an exception so no call site can
+    forget it, and reported as a clause FAILURE naming the harness. Both are
+    written by the same party as the adapter, so this is rarely malice: it is a
+    vendor implementing a callback naively, and the outcome that must never
+    happen is that they read a pass and ship.
 
-    A vendor probe is expected to be a barrier of its own, returning only once
-    work spawned by preceding requests has quiesced. This is what the kit can
-    enforce without taking the probe's word for it.
+    ``reason`` is the bare cause, so a caller closer to the failure can say
+    where it happened without quoting a whole sentence inside its own.
     """
 
-    deadline = time.monotonic() + _SIDE_EFFECT_SETTLE_TIMEOUT_S
-    count = probe()
-    quiet_until = time.monotonic() + _SIDE_EFFECT_QUIET_S
-    while time.monotonic() < deadline:
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _bounded_call(what: str, call: Callable[[], Any]) -> Any:
+    """Run one vendor callback under a hard bound. Never inline.
+
+    The kit calls vendor callbacks inside timed rules, and a synchronous call to
+    one that blocks forever takes the whole run with it: the deadline the caller
+    thinks it has is never reached, because control never comes back to check
+    it. So every callback runs on a daemon thread that is joined with a timeout
+    and then ABANDONED. Abandoned deliberately: a blocked callback cannot be
+    made to return, and waiting for it during teardown would only move the hang
+    somewhere less visible. A daemon thread does not hold interpreter exit, so
+    the cost of abandoning it is bounded.
+
+    A callback that misses the bound is never retried. It has already shown it
+    does not answer, and polling it again would leak one blocked thread per
+    poll.
+
+    Raising is handled here too, and for the same reason: an exception out of
+    the middle of a clause aborts the whole report, so it becomes an
+    attributable clause failure instead.
+    """
+
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = call()
+        except BaseException as error:  # noqa: BLE001
+            outcome["error"] = f"{type(error).__name__}: {error}"
+
+    worker = threading.Thread(target=run, daemon=True, name="conformance-callback")
+    worker.start()
+    worker.join(_DRIVER_CALLBACK_TIMEOUT_S)
+    if worker.is_alive():
+        reason = (
+            f"did not answer within {_DRIVER_CALLBACK_TIMEOUT_S} seconds, so it is "
+            "holding the kit rather than answering it"
+        )
+        raise _HarnessFault(
+            f"{what} {reason}. This is a defect in the harness rather than in the "
+            "adapter: every vendor callback has to return, and one that blocks turns "
+            "a verdict into a hang",
+            reason=reason,
+        )
+    if "error" in outcome:
+        reason = f"raised {outcome['error']}"
+        raise _HarnessFault(
+            f"{what} {reason}, so the kit could not reach a verdict. This is a defect "
+            "in the harness rather than in the adapter",
+            reason=reason,
+        )
+    return outcome.get("value")
+
+
+def _probe_reader(probe: Callable[[], int], clause_id: str) -> Callable[[], int]:
+    """The side effect probe, wrapped so a failure mid run is a clause failure.
+
+    Discovery only ever established that the probe answered ONCE. A probe that
+    starts failing partway through a run used to escape as an httpx error or a
+    KeyError out of the middle of a clause and abort the entire report, and the
+    observation windows read it many times per clause rather than twice, so
+    there are far more chances for it to happen. Same mechanism as the driver
+    callbacks, and the same reason: an unexpected condition becomes an
+    attributable failure, never an escaped exception and never a silent pass.
+    """
+
+    def read() -> int:
+        try:
+            return int(_bounded_call("the side effect probe", probe))
+        except _HarnessFault as fault:
+            raise _HarnessFault(
+                f"the side effect probe {fault.reason} while clause {clause_id} was "
+                "in flight, so the count this clause decides on is unreadable. This "
+                "is the probe endpoint rather than the adapter's reply handling: "
+                "discovery proved only that it answered once, and a clause reads it "
+                "many times",
+                reason=fault.reason,
+            ) from None
+
+    return read
+
+
+def _guarded(
+    rule: int, title: str, clause_id: str, run: Callable[[], FloorResult]
+) -> FloorResult:
+    """Run one ingress rule, turning a driver fault into a clause failure."""
+
+    try:
+        return run()
+    except _HarnessFault as fault:
+        return _result(rule, title, [_clause(clause_id, "fail", str(fault))])
+
+
+def _side_effects_after(
+    probe: Callable[[], int], baseline: int, *, allowed: int
+) -> tuple[int, bool]:
+    """Watch the side effect count for the grace window. Returns (worst, exceeded).
+
+    A DETECTOR, not an inference. The clause has already sent everything it is
+    going to send, so the question is not "has the count settled" but "does it
+    stay inside its allowance", and any excess is a failure the moment it
+    appears rather than a miss. Exits early on an excess, so the break costs
+    less than the control does.
+    """
+
+    deadline = time.monotonic() + _GRACE_S
+    worst = probe() - baseline
+    while worst <= allowed and time.monotonic() < deadline:
         time.sleep(_POLL_S)
-        current = probe()
-        if current != count:
-            count = current
-            quiet_until = time.monotonic() + _SIDE_EFFECT_QUIET_S
-        elif time.monotonic() >= quiet_until:
-            return count
-    return probe()
+        worst = max(worst, probe() - baseline)
+    return worst, worst > allowed
+
+
+# --- rule 3: verify the egress secret before any side effect -----------------
 
 
 def _rule_3(
@@ -378,42 +499,53 @@ def _clause_3a(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> Cl
             "effect and then returns 401 could not be told from one that refuses first",
         )
     conversation = new_conversation_id()
+    read = _probe_reader(probe, "3a")
     try:
-        accepted = adapter.post_event(
-            turn_status(adapter, conversation_id=conversation), secret=adapter.secret
-        )
-        if accepted.status in (401, 403):
-            return _clause(
-                "3a",
-                "fail",
-                f"the adapter answered {accepted.status} to its own configured secret, "
-                "so it refuses the platform rather than verifying it",
-            )
-        before = _settled_side_effects(probe)
+        # The refused requests go FIRST, before this clause has sent the adapter
+        # anything it would accept. That is what makes the baseline trustworthy
+        # without a drain: nothing the kit has sent can still be in flight, so
+        # any movement during the window below was caused by a refusal and by
+        # nothing else. Checking the adapter's own secret first would leave its
+        # legitimate effect racing the window and cost a false failure.
+        baseline = read()
         wrong = adapter.post_event(
             turn_status(adapter, conversation_id=conversation), secret=WRONG_SECRET
         )
         absent = adapter.post_event(
             turn_status(adapter, conversation_id=conversation), secret=None
         )
-        after = _settled_side_effects(probe)
+        leaked, exceeded = _side_effects_after(read, baseline, allowed=0)
+        accepted = adapter.post_event(
+            turn_status(adapter, conversation_id=conversation), secret=adapter.secret
+        )
     except AdapterUnreachableError as error:
         return _clause("3a", "fail", str(error))
+    except _HarnessFault as fault:
+        return _clause("3a", "fail", str(fault))
+    if accepted.status in (401, 403):
+        return _clause(
+            "3a",
+            "fail",
+            f"the adapter answered {accepted.status} to its own configured secret, "
+            "so it refuses the platform rather than verifying it",
+        )
     problems: list[str] = []
     if _is_2xx(wrong.status):
         problems.append(f"a wrong secret was accepted with {wrong.status}")
     if _is_2xx(absent.status):
         problems.append(f"an absent secret was accepted with {absent.status}")
-    if after != before:
+    if exceeded:
         problems.append(
-            f"the refused requests moved the side effect count from {before} to {after}, "
-            "so the side effect happened before the rejection"
+            f"the refused requests moved the side effect count by {leaked} within "
+            f"{_GRACE_S} seconds of the refusal, so the adapter answered the "
+            "correspondent and rejected the request afterwards"
         )
     return _verdict(
         "3a",
         problems,
         f"a wrong secret answered {wrong.status}, an absent one answered "
-        f"{absent.status}, and neither moved the side effect count",
+        f"{absent.status}, and the side effect count did not move in the "
+        f"{_GRACE_S} seconds after either",
     )
 
 
@@ -450,10 +582,11 @@ def _clause_3b(
             "unauthenticated request and then returns a refusal could not be told "
             "from one that refuses it outright",
         )
+    read = _probe_reader(probe, "3b")
     try:
-        driver.restart(egress_secret=None)
+        _bounded_call("the driver's restart()", lambda: driver.restart(egress_secret=None))
         try:
-            before = _settled_side_effects(probe)
+            baseline = read()
             with_secret = adapter.post_event(
                 turn_status(adapter, conversation_id=new_conversation_id()),
                 secret=adapter.secret,
@@ -461,7 +594,7 @@ def _clause_3b(
             without_secret = adapter.post_event(
                 turn_status(adapter, conversation_id=new_conversation_id()), secret=None
             )
-            after = _settled_side_effects(probe)
+            served, exceeded = _side_effects_after(read, baseline, allowed=0)
         except AdapterUnreachableError:
             return _clause(
                 "3b",
@@ -469,8 +602,19 @@ def _clause_3b(
                 "with its own egress secret unset the adapter stopped answering "
                 "entirely, which refuses every request",
             )
+    except _HarnessFault as fault:
+        return _clause("3b", "fail", str(fault))
     finally:
-        driver.restart(egress_secret=adapter.secret)
+        # Bounded too, and outside the fault handler above: a driver that cannot
+        # put the secret back leaves every later rule checking a deaf adapter,
+        # and it must not be able to hang the run while doing it.
+        try:
+            _bounded_call(
+                "the driver's restart()",
+                lambda: driver.restart(egress_secret=adapter.secret),
+            )
+        except _HarnessFault:
+            pass
     problems: list[str] = []
     if _is_2xx(with_secret.status):
         problems.append(
@@ -482,17 +626,18 @@ def _clause_3b(
             f"with its own secret unset the adapter accepted an unauthenticated "
             f"request with {without_secret.status}"
         )
-    if after != before:
+    if exceeded:
         problems.append(
             f"with its own secret unset the refused requests still moved the side "
-            f"effect count from {before} to {after}, so the adapter served them"
+            f"effect count by {served} within {_GRACE_S} seconds, so the adapter "
+            "served them and answered a refusal afterwards"
         )
     return _verdict(
         "3b",
         problems,
         f"with its own secret unset the adapter refused both requests "
-        f"({with_secret.status} and {without_secret.status}) and neither moved the "
-        "side effect count",
+        f"({with_secret.status} and {without_secret.status}) and the side effect "
+        f"count did not move in the {_GRACE_S} seconds after either",
     )
 
 
@@ -628,16 +773,22 @@ def _clause_6(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> Cla
             "the duplicate was suppressed",
         )
     conversation = new_conversation_id()
+    read = _probe_reader(probe, "6")
     completed = turn_completed(
         adapter, conversation_id=conversation, event_id=new_event_id()
     )
     try:
-        before = probe()
+        before = read()
         first = adapter.post_event(completed, secret=adapter.secret)
         second = adapter.post_event(completed, secret=adapter.secret)
-        after = probe()
+        # Watched, never sampled. An adapter that answers the redelivery 200 and
+        # hands the second correspondent effect to a queue looks identical to a
+        # deduping one at the instant the ack arrives, and the count it moves is
+        # the only evidence there is that it answered the correspondent twice.
+        moved, exceeded = _side_effects_after(read, before, allowed=1)
         # The same conversation, which the two posts above have now finished,
         # receiving a further completion under an event_id it has never seen.
+        # Sent after the window closes, so its own effect is never counted here.
         finished = adapter.post_event(
             turn_completed(
                 adapter, conversation_id=conversation, event_id=new_event_id()
@@ -646,15 +797,18 @@ def _clause_6(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> Cla
         )
     except AdapterUnreachableError as error:
         return _clause("6", "fail", str(error))
+    except _HarnessFault as fault:
+        return _clause("6", "fail", str(fault))
     problems: list[str] = []
     if not _is_2xx(first.status):
         problems.append(f"answered {first.status} to a turn.completed")
     if not _is_2xx(second.status):
         problems.append(f"answered {second.status} to a redelivered turn.completed")
-    if after - before > 1:
+    if exceeded:
         problems.append(
-            f"the duplicate event_id moved the side effect count by {after - before}, "
-            "so the correspondent was answered twice"
+            f"the duplicate event_id moved the side effect count by {moved} within "
+            f"{_GRACE_S} seconds of the redelivery, so the correspondent was "
+            "answered twice"
         )
     if not _is_2xx(finished.status):
         problems.append(
@@ -666,8 +820,9 @@ def _clause_6(adapter: AdapterUnderTest, probe: Callable[[], int] | None) -> Cla
     return _verdict(
         "6",
         problems,
-        f"a duplicate event_id moved the side effect count by {after - before}, and a "
-        "further completion for the conversation it had just finished was accepted",
+        f"a duplicate event_id moved the side effect count by {moved} over the "
+        f"{_GRACE_S} seconds after it, and a further completion for the conversation "
+        "it had just finished was accepted",
     )
 
 
@@ -738,6 +893,29 @@ def _framing_failure(
     )
 
 
+def _posts_after(
+    ingress: FakeIngress, since: int, delivery_id: str
+) -> list[ObservedRequest]:
+    """Any post of this identity that arrives during the grace window.
+
+    The counterpart of ``_side_effects_after`` on the ingress side, and the same
+    shape for the same reason: it looks for activity that should not exist
+    rather than concluding from quiet that none ever will. Exits early on the
+    first offender.
+    """
+
+    deadline = time.monotonic() + _GRACE_S
+    while True:
+        late = [
+            post
+            for post in _turn_posts(ingress, since)
+            if post.delivery_id == delivery_id
+        ]
+        if late or time.monotonic() >= deadline:
+            return late
+        time.sleep(_POLL_S)
+
+
 def _wait_for(predicate: Callable[[], bool], *, timeout_s: float) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -776,11 +954,11 @@ def _rule_1(driver: IngressDriver, ingress: FakeIngress) -> FloorResult:
     claim converges on the id and on nothing else.
     """
 
-    identity = driver.reserve()
+    identity: UpstreamIdentity = _bounded_call("the driver's reserve()", driver.reserve)
     ingress.arm_blackhole()
     mark = len(ingress.records())
     try:
-        driver.release(identity)
+        _bounded_call("the driver's release()", lambda: driver.release(identity))
         attempted = _wait_for(
             lambda: any(
                 post.status == NO_RESPONSE and post.delivery_id == identity.delivery_id
@@ -857,10 +1035,10 @@ def _rule_2(driver: IngressDriver, ingress: FakeIngress) -> FloorResult:
       with no finality evidence, and no evidence is never a pass.
     """
 
-    identity = driver.reserve()
+    identity: UpstreamIdentity = _bounded_call("the driver's reserve()", driver.reserve)
     ingress.arm_202(identity.delivery_id)
     mark = len(ingress.records())
-    driver.release(identity)
+    _bounded_call("the driver's release()", lambda: driver.release(identity))
     # Waited for on the DECLARED identity, never on "some post arrived": an
     # adapter with another delivery already in flight satisfies the weaker
     # predicate with the wrong message, and the rule would then decide the
@@ -881,7 +1059,8 @@ def _rule_2(driver: IngressDriver, ingress: FakeIngress) -> FloorResult:
         )
         return _result(2, _RULE_2_TITLE, [_clause("2", "fail", detail)])
     retired = _wait_for(
-        lambda: driver.settled(identity), timeout_s=_QUIESCENCE_TIMEOUT_S
+        lambda: bool(_bounded_call("the driver's settled()", lambda: driver.settled(identity))),
+        timeout_s=_QUIESCENCE_TIMEOUT_S,
     )
     if not retired:
         return _result(2, _RULE_2_TITLE, [
@@ -893,10 +1072,25 @@ def _rule_2(driver: IngressDriver, ingress: FakeIngress) -> FloorResult:
                 "has stopped attempting it and there is no finality to judge",
             )
         ])
-    # A short confirmation AFTER the driver's claim, never in place of it: this
-    # catches a driver that retires an identity its adapter is still retrying,
-    # rather than being the window the verdict rests on.
-    time.sleep(_POST_QUIESCENCE_S)
+    # The claim is on the record now, and everything after it is evidence ABOUT
+    # the claim rather than an inference from silence. A driver that reports an
+    # identity retired while its adapter still has an attempt scheduled is the
+    # naive implementation this kit exists to catch, and it used to buy a pass.
+    claim_mark = len(ingress.records())
+    late = _posts_after(ingress, claim_mark, identity.delivery_id)
+    if late:
+        return _result(2, _RULE_2_TITLE, [
+            _clause(
+                "2",
+                "fail",
+                f"the driver reported {identity.delivery_id} retired and the adapter "
+                f"posted it again {len(late)} time(s) within {_GRACE_S} seconds of "
+                "that claim. Both halves of the contract broke here: the adapter "
+                "treated a response as a retry signal, and the driver's settled() "
+                "declared quiescence while an attempt was still scheduled, so the "
+                "harness needs fixing as well as the adapter",
+            )
+        ])
     framing = _framing_failure(ingress, mark, "2")
     if framing is not None:
         # The rule's pass branch is a statement about a post the ingress did NOT
@@ -933,8 +1127,9 @@ def _rule_2(driver: IngressDriver, ingress: FakeIngress) -> FloorResult:
         _clause(
             "2",
             "pass",
-            f"ingress answered {matching[0].status} to {identity.delivery_id} and the "
-            "adapter retired it without posting it again",
+            f"ingress answered {matching[0].status} to {identity.delivery_id}, the "
+            f"driver reported it retired, and no further post for it arrived in the "
+            f"{_GRACE_S} seconds after that claim",
         )
     ])
 
@@ -958,9 +1153,9 @@ def _rule_7(
     """
 
     ingress.arm_401()
-    identity = driver.reserve()
+    identity: UpstreamIdentity = _bounded_call("the driver's reserve()", driver.reserve)
     mark = len(ingress.records())
-    driver.release(identity)
+    _bounded_call("the driver's release()", lambda: driver.release(identity))
     refused = _wait_for(
         lambda: any(
             post.status == 401 and post.delivery_id == identity.delivery_id
@@ -1017,7 +1212,7 @@ def _clause_7a(
             "treated a stale ingress credential as fatal",
         )
     resume_mark = len(ingress.records())
-    driver.restart(token=ingress.token)
+    _bounded_call("the driver's restart()", lambda: driver.restart(token=ingress.token))
     # The resumed post has to carry the DECLARED identity. Any later 2xx would
     # also be satisfied by an adapter that discarded the held delivery and then
     # posted something else entirely, and the clause would then report that the

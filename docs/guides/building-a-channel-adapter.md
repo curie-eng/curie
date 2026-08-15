@@ -391,6 +391,14 @@ your adapter with one credential swapped. You give the kit that access by
 implementing `IngressDriver` (`channel_protocol.conformance.driver`) and
 passing it in, or naming a zero argument factory for one on `--driver`.
 
+Every method on `IngressDriver` runs under a hard bound (five seconds by
+default). The kit calls each one on its own thread and walks away the moment
+the bound expires; it never waits on a callback that has already shown it
+does not answer. A callback that misses the bound does not hang the run and
+does not pass silently either: it turns into a named clause FAILURE that
+tells you the defect is in your driver, not in your adapter, so you are not
+left debugging the wrong code.
+
 The methods, and what each has to guarantee:
 
 - **`start(*, ingress_url, token)`** points your already running adapter at
@@ -411,12 +419,22 @@ The methods, and what each has to guarantee:
   202 for that one identity before the identity can reach it, and a single
   call that both declared and injected would leave a window where a
   different, unrelated delivery in flight consumes that response instead.
-- **`settled(identity) -> bool`** reports whether your adapter has retired
-  this delivery, having either delivered it or given up on it. Rule 2's
-  finality check waits on this rather than a fixed clock, because no timer
-  survives a retry schedule patient enough to outlast it. Answer `False` for
-  as long as your adapter might still retry; a driver that never reports
-  `True` leaves rule 2 with no finality evidence to judge.
+- **`settled(identity) -> bool`** answers whether every attempt at this
+  delivery has been retired: none in flight, and none still scheduled.
+  "Retired" is that precise claim, not a description of the active queue
+  being empty; a delivery you pulled off the queue but left a retry sitting
+  on a timer is not retired, and answering `True` for it is the naive
+  implementation this method exists to catch. The kit does not take your
+  `True` on faith. Rule 2's finality check waits on it rather than a fixed
+  clock, because no timer survives a retry schedule patient enough to outlast
+  it, but once you claim retired the kit keeps watching the wire for a
+  bounded grace period afterward, and any post carrying that delivery id in
+  that window is reported as a failure of your claim, named as such, not a
+  quiet pass. Implementing `settled` as a short sleep will fail here, and
+  that is deliberate: only your adapter's own retry state can answer this
+  honestly. Answer `False` for as long as your adapter might still retry; a
+  driver that never reports `True` leaves rule 2 with no finality evidence to
+  judge.
 - **`restart(*, egress_secret=..., token=...)`** restarts your adapter,
   optionally replacing one credential. Both arguments default to the
   unchanged sentinel, `Ellipsis`, because `None` is itself meaningful for
