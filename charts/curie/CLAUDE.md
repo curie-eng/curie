@@ -11,6 +11,23 @@ component and rail detail in `charts/curie/README.md`.
   counts, and probe settings belong in `values.yaml` / a values overlay, not
   hardcoded in `templates/`. A value safe on a 4 GB scratch cluster can OOMKill
   on a smaller install.
+  - **One recorded exception: `templates/mail-adapter.yaml`**, which hardcodes
+    `replicas: 1` and `strategy: type: Recreate`. The reason is correctness, not
+    sizing: every routing map in that adapter (`seen`, `conversations`,
+    `replied_event_ids`, `in_flight`) is process-local and its Service has no
+    session affinity, so a second pod answers `turn.completed` for a
+    conversation it never saw. Any count other than 1 is wrong at every cluster
+    size, which is exactly what makes it unlike the resource limits and probe
+    settings the invariant is about, and `Recreate` is required for the same
+    reason (a rolling update runs two pods for the duration of every upgrade).
+    There is deliberately **no `mailAdapter.replicas` key**: a values key that
+    must never be changed advertises a knob that silently breaks reply routing,
+    which is worse than no knob. Pinned behaviorally by
+    `ci/mail-adapter-wiring-assertions.sh` assertion 10, which asserts
+    `spec.replicas` is 1 even under `--set mailAdapter.replicas=3`. Horizontal
+    scale for this adapter needs shared state and is a separate ticket; when it
+    lands, this exception is removed rather than extended. Do not generalize it
+    into a rule about stateful services -- one named file, one named reason.
 - **Every backing store follows the same toggle + BYO idiom.** `<store>.deploy`
   (default `true`) gates whether the in-chart resource renders; flipping it
   to `false` repoints consumers (Langfuse env, the collector config) at the

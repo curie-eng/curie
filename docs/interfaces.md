@@ -15,7 +15,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Substrate / SandboxClient | CLEAN | 2 (k8s, docker) | not separately graded | #86, #44 | [Substrate / SandboxClient](interfaces/substrate/INTERFACE.md) |
 | Harness in-proc / ModelSession | CLEAN | 1 + fake | A- | (folds into #25) | [Harness in-proc / ModelSession](interfaces/harness-modelsession/INTERFACE.md) |
 | ACI producer (frozen protocol) | CLEAN, frozen | 1 + reference | A- | #25, #47 | [ACI producer (frozen protocol)](interfaces/aci-producer/INTERFACE.md) |
-| Channel / ingress (Slack) | SOFT | 1 | C | #7, #19, #27, #38 | [Channel / ingress (Slack)](interfaces/channel-ingress/INTERFACE.md) |
+| Channel / ingress | SOFT | 2 (Slack, email) | C | #7, #19, #27, #38, #1515 | [Channel / ingress](interfaces/channel-ingress/INTERFACE.md) |
 | Channel interaction message | CLEAN | 2 renderers (Slack, terminal) | not separately graded | ADR-0020 | [Channel interaction message](interfaces/channel-interaction/INTERFACE.md) |
 | Model provider / credentials | SOFT | 2 prefix-routed (Anthropic, OpenRouter) + base-URL-selected provider-native endpoints (Zhipu, Moonshot, DeepSeek, Ollama) | not separately graded | #24, #46 | [Model provider / credentials](interfaces/model-provider/INTERFACE.md) |
 | Telemetry / OTEL | SOFT | 1 | B+ | #47 | [Telemetry / OTEL](interfaces/telemetry-otel/INTERFACE.md) |

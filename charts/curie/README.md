@@ -142,15 +142,18 @@ straight to Langfuse (Langfuse OTLP ingest is HTTP-only): `curie-otel-collector:
 First-party service images are published to GHCR by the `Release images`
 workflow (`.github/workflows/release.yaml`) on every push to `main`, as
 `ghcr.io/curie-eng/curie-<service>` tagged with the commit SHA and `latest`.
-All five first-party services build in the matrix: `curie-api`,
-`curie-dispatcher`, `curie-worker`, `curie-ui`, and `curie-runner`. The
-chart defaults every first-party image at its `ghcr.io/curie-eng/curie-*`
-`:latest`, so the bare install (above) pulls from GHCR with no image overrides.
+All six first-party services build in the matrix: `curie-api`,
+`curie-dispatcher`, `curie-mail-adapter`, `curie-worker`, `curie-ui`, and
+`curie-runner`. The chart defaults every first-party image at its
+`ghcr.io/curie-eng/curie-*` `:latest`, so the bare install (above) pulls from
+GHCR with no image overrides -- except `curie-mail-adapter`, whose Deployment is
+off by default (`mailAdapter.deploy`), so its image is published and defaulted
+but not pulled until an operator enables the email channel.
 
-- **Pull policy for the four Deployment-managed services** (api, dispatcher,
-  worker, ui): `imagePullPolicy: Always` -- they pull once per rollout, so
-  `Always` just keeps a fresh install from serving a stale `latest` a node
-  cached earlier.
+- **Pull policy for the five Deployment-managed services** (api, dispatcher,
+  mail-adapter, worker, ui): `imagePullPolicy: Always` -- they pull once per
+  rollout, so `Always` just keeps a fresh install from serving a stale `latest`
+  a node cached earlier.
 - **The runner image is the exception:** it uses `imagePullPolicy: IfNotPresent`
   because a sandbox pod is cold-created per Slack thread, and an `Always`
   (re-)pull inside that boot window blew past the worker's claim timeout and
@@ -177,19 +180,22 @@ is not anonymously pullable and the node needs credentials. Two supported paths:
 - **Public package.** In the GHCR package settings make the package public; then
   no pull Secret is needed and `imagePullSecrets` stays empty.
 
-For offline dev/e2e, `-f values-dev.yaml` overrides all five first-party images
+For offline dev/e2e, `-f values-dev.yaml` overrides all six first-party images
 back to locally-built, cluster-imported tags with `imagePullPolicy: Never`, so a
-disconnected cluster never attempts a GHCR pull. That path requires building and
-importing each image first:
+disconnected cluster never attempts a GHCR pull. `curie-mail-adapter` is
+overridden the same way even though `mailAdapter.deploy` is false in that
+profile, so `--set mailAdapter.deploy=true` on a disconnected cluster starts
+rather than hanging on a GHCR pull. That path requires building and importing
+each image first:
 
 ```bash
-for svc in api dispatcher worker ui; do
+for svc in api dispatcher mail-adapter worker ui; do
   docker build -f apps/$svc/Dockerfile -t curie-$svc:local .
 done
 docker build -f runner/Dockerfile -t curie-runner:latest .
 # import each into the cluster runtime, e.g. for k3s:
-for img in curie-api:local curie-dispatcher:local curie-worker:local \
-           curie-ui:local curie-runner:latest; do
+for img in curie-api:local curie-dispatcher:local curie-mail-adapter:local \
+           curie-worker:local curie-ui:local curie-runner:latest; do
   docker save "$img" | ssh <node> 'sudo k3s ctr images import -'
 done
 ```

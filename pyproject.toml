@@ -9,6 +9,7 @@ dependencies = [
     "plugin-format",
     "curie-api",
     "curie-dispatcher",
+    "curie-mail-adapter",
     "curie-worker",
     "curie-runner",
 ]
@@ -24,6 +25,7 @@ members = [
     "packages/test-support",
     "apps/api",
     "apps/dispatcher",
+    "apps/mail-adapter",
     "apps/worker",
     "runner",
     "tools/doclint",
@@ -37,6 +39,7 @@ plugin-format = { workspace = true }
 curie-test-support = { workspace = true }
 curie-api = { workspace = true }
 curie-dispatcher = { workspace = true }
+curie-mail-adapter = { workspace = true }
 curie-worker = { workspace = true }
 curie-runner = { workspace = true }
 curie-doclint = { workspace = true }
@@ -69,6 +72,7 @@ root_packages = [
     "curie_api",
     "curie_worker",
     "curie_dispatcher",
+    "curie_mail_adapter",
     "curie_runner",
     # The frozen contract packages (#961). Outside the graph, no contract could
     # ever fire on them, which left the worst possible place for an SDK import
@@ -87,7 +91,7 @@ include_external_packages = true
 # direction that is hardest to see in review.
 name = "The platform never imports a harness SDK"
 type = "forbidden"
-source_modules = ["curie_api", "curie_worker", "curie_dispatcher"]
+source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_mail_adapter"]
 forbidden_modules = ["claude_agent_sdk"]
 
 [[tool.importlinter.contracts]]
@@ -129,6 +133,7 @@ testpaths = [
     "packages/plugin-format/tests",
     "apps/api/tests",
     "apps/dispatcher/tests",
+    "apps/mail-adapter/tests",
     "apps/worker/tests",
     "runner/tests",
     "compose/tests",
@@ -171,6 +176,7 @@ mypy_path = [
     "packages/test-support/src",
     "apps/api/src",
     "apps/dispatcher/src",
+    "apps/mail-adapter/src",
     "apps/worker/src",
     "runner/src",
     "tools/doclint/src",
@@ -183,6 +189,7 @@ files = [
     "packages/test-support/src",
     "apps/api/src",
     "apps/dispatcher/src",
+    "apps/mail-adapter/src",
     "apps/worker/src",
     "runner/src",
     "tools/doclint/src",

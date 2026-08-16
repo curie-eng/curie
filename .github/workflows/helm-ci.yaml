@@ -216,6 +216,18 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/dispatcher-api-wiring-assertions.sh
 
+      # Prove the mail adapter's chart wiring (issue #1515): it does not render
+      # at all by default, it is told where the platform API is, it receives its
+      # channel token, egress secret and AgentMail key by reference only, and it
+      # receives NO CURIE_API_KEY -- the adapter authenticates with a token
+      # scoped to one channel binding and must hold no platform key. The same
+      # script pins the single-source-of-truth egress pair and the rotation
+      # annotations on both this Deployment and the worker.
+      - name: helm render assertions (mail adapter wiring)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/mail-adapter-wiring-assertions.sh
+
       # Prove the tenant capacity ceiling (issue #758, ADR-0059 decision 4): the
       # ResourceQuota scopes to the sandbox PriorityClass with the published
       # (overridable) hard ceilings, the LimitRange ships safe default-only

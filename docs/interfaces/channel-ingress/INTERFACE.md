@@ -1,7 +1,7 @@
 ---
-seam: Channel / ingress (Slack)
+seam: Channel / ingress
 kind: SOFT
-impls: 1
+impls: "2 (Slack, email)"
 grade: C
 vision_row: Communication
 epics:
@@ -9,13 +9,14 @@ epics:
   - "#19"
   - "#27"
   - "#38"
+  - "#1515"
 order: 4
 ---
-# INTERFACE: Channel / ingress (Slack)
+# INTERFACE: Channel / ingress
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 1 &nbsp;·&nbsp; **Swap-readiness grade:** C
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 2 (Slack, email) &nbsp;·&nbsp; **Swap-readiness grade:** C
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -29,14 +30,24 @@ routing, concurrency, sandboxing — is opinionated core and channel-agnostic. S
 #19 the ingress payload and the per-turn reply routing are channel-neutral, so this is no
 longer the least-clean seam by its wire contract, and #1459 took the Slack shape off the
 binding surface too; the remaining vendor shape is on the egress semantics
-(edit-in-place). One implementation
-today; the port is the wire + Protocol contract, extracted further only when a second
-channel demands it ("the second implementation teaches the interface").
+(edit-in-place). Two implementations today, Slack and email, and what the second one
+taught is that the seam boundary is the HTTP wire rather than only the in-process port:
+`apps/mail-adapter` is a service outside the core that neither constructs a `QueuedTurn`
+nor implements `ReplySink`.
 
 ## Current contract
 
-A second channel must produce the ingress payload and satisfy the egress Protocol:
+A channel joins at one of two boundaries: in process, producing the ingress payload and
+satisfying the egress Protocol, or out of process over the HTTP wire.
 
+- **Wire** — the out-of-process boundary, and the one a channel the core has never heard
+  of uses. Ingress is `POST /channels/turns` under a binding-scoped `chn` token; egress is
+  the same four reply events POSTed to the binding's `endpoint` with an
+  `X-Curie-Adapter-Secret` header, addressed by `target.reply_ref`, an opaque
+  adapter-minted handle the platform stores and hands back untouched.
+  [`docs/guides/building-a-channel-adapter.md`](../../guides/building-a-channel-adapter.md)
+  is normative for this boundary, down to the conformance floor an adapter must meet;
+  `apps/mail-adapter` is the worked example.
 - **Ingress** — `QueuedTurn` (`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`),
   a Pydantic model in the frozen ACI package with channel-neutral fields: `event_id`
   (idempotency key), `conversation_id` (the conversation/thread key routing keeps one live
@@ -64,9 +75,20 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
 
 ## Implementations today
 
-One: Slack. Ingress is `apps/dispatcher` (Bolt / Socket Mode); egress is
-`SlackReplyAdapter` (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack Web API. The swap proof that the
-protocol (not just the service) is the seam: the Rust CLI mints the exact
+Two: Slack and email.
+
+- **Slack.** Ingress is `apps/dispatcher` (Bolt / Socket Mode); egress is
+  `SlackReplyAdapter` (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on
+  the Slack Web API.
+- **Email (#1515).** Ingress and egress are one process outside the core,
+  `apps/mail-adapter`: it polls an AgentMail inbox and POSTs each new message to the
+  platform's channel ingress under a scoped `chn` token, then serves the four neutral
+  reply events on its own HTTP endpoint and sends one threaded reply per `turn.completed`,
+  addressed by the event's `target.reply_ref`. It holds no platform API key, no queue
+  credential and no database access, which is what makes it the seam's proof: everything
+  it needs is on the wire.
+
+The swap proof that the protocol (not just the service) is the seam: the Rust CLI mints the exact
 `QueuedTurn` wire payload with the same channel-neutral fields
 (`cli/src/queue.rs`) and drives the whole deployed system with zero Slack contact
 via `curie local message` / `cluster message` (`cli/src/chat.rs`, `cli/src/message.rs`).
@@ -88,7 +110,9 @@ routing key that carries no kind.
   refused rather than handed the platform bot token.
 - **Still leaks — egress semantics.** The reply model is edit-a-placeholder —
   `update(channel, ts, text)` on `chat.update`, not post-a-message — so any channel without
-  in-place edit must emulate it.
+  in-place edit must emulate it. Email is the datapoint: with no editable message, the mail
+  adapter accumulates the reply events per conversation and sends one threaded mail on
+  `turn.completed` (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.send_reply`).
 - **Fixed (#1459, ADR-0096).** The binding surface was Slack-typed in the control plane, not
   just at the channel edges: the agents table carried a `slack_channel` column, and agent
   create/update validated it as a Slack channel id, so binding any other channel kind took a

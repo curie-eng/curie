@@ -97,7 +97,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, worker, ui]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui]
         platform: [linux/amd64, linux/arm64]
         include:
           - name: runner
@@ -106,6 +106,8 @@ jobs:
             dockerfile: apps/api/Dockerfile
           - name: dispatcher
             dockerfile: apps/dispatcher/Dockerfile
+          - name: mail-adapter
+            dockerfile: apps/mail-adapter/Dockerfile
           - name: worker
             dockerfile: apps/worker/Dockerfile
           - name: ui
@@ -205,7 +207,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, worker, ui]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui]
     steps:
       - name: Download digests
         id: download_digests

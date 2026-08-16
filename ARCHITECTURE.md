@@ -2,7 +2,7 @@
 
 Curie (codename **Relay**) turns a Slack thread into a conversation with a
 versioned, sandboxed AI agent, and turns a git push into a deployment of that
-agent. Slack is the only wired channel today; the dispatcher sits behind a
+agent. Slack and email are the two wired channels today; both sit behind a
 channel-agnostic message port ([ADR 0020](docs/adr/0020-message-port-rendering-free-channel-interface.md)),
 so additional channels are additive, not a rewrite. This document is the as-built map. It covers:
 
@@ -70,11 +70,13 @@ focused diagram docs, each a single clean picture:
 ```mermaid
 flowchart TB
     Slack["Slack"]
+    Email["Email<br/>(AgentMail inbox)"]
     CLI["CLI / laptop"]
     GH["GitHub push"]
 
     subgraph core["Agent runner core (apps/)"]
         Dispatcher["dispatcher<br/>ingress + dedupe"]
+        MailAdapter["mail-adapter<br/>email ingress + threaded reply"]
         Queue["Valkey<br/>queue + routing"]
         Worker["worker kernel<br/>one session per thread"]
         API["api<br/>git-driven deploy · bundles · read proxy"]
@@ -94,10 +96,14 @@ flowchart TB
     end
 
     Slack --> Dispatcher
+    Email --> MailAdapter
     CLI -- XADD --> Queue
     CLI --> API
     GH --> API
     Dispatcher --> Queue --> Worker --> Sandbox --> Anthropic
+    MailAdapter -- channel ingress --> API
+    API -- channel turns --> Queue
+    Worker -- reply events --> MailAdapter
     API -- evals --> Queue
     Sandbox -. bundle-fetch .-> Store
     Worker -. bundle-fetch .-> Store
@@ -145,14 +151,15 @@ Curie leans on these systems rather than building its own (ADR-0007,
 - Langfuse (traces + evals)
 - Kubernetes Agent Sandbox (interactive runtime)
 - Slack Bolt (Socket Mode)
+- AgentMail (the email inbox, and the SPF/DKIM/DMARC filtering in front of it; see [`docs/operations.md`](docs/operations.md))
 - Valkey Streams (queue)
 - Postgres (app state)
 - the OTel Collector
 - **claude-agent-sdk** as the harness (ADR-0005) — one of the two most load-bearing adopt calls of all
 - **the Claude Code plugin format verbatim** — the other, which ADR-0007 calls "the distribution wedge — do not invent a format"
 
-Curie builds **six** things around that spine: the API, the dispatcher, the
-worker+runner glue, the UI, the CLI, and the umbrella Helm chart ([Deployment, CI, and release](#deployment-ci-and-release)). The
+Curie builds **seven** things around that spine: the API, the dispatcher, the mail
+adapter, the worker+runner glue, the UI, the CLI, and the umbrella Helm chart ([Deployment, CI, and release](#deployment-ci-and-release)). The
 chart is a built thing, not a packaging afterthought. The security rails are
 chart defaults, so the chart is where a rail either ships or does not.
 
@@ -407,12 +414,17 @@ no Slack workspace at all.
 
 The honest limit: the **per-turn payload** and the **binding surface** are both
 channel-neutral now (#1459, ADR-0096) — a deployment binds an agent by
-exact-match on a `{kind, address}` channel row, not a Slack-typed column. The
-catalog still grades the channel/ingress seam `C` with one implementation:
-Slack is the only registered `kind`, and there is no multi-channel adapter
-framework yet (#27). "The system does not care which channel" is true of a
-turn in flight and of how an agent gets bound to one; it is not yet true of
-how many channel kinds are wired up.
+exact-match on a `{kind, address}` channel row, not a Slack-typed column. Email
+is the second wired channel (#1515, [`apps/mail-adapter`](apps/mail-adapter)), so
+the catalog now carries two implementations of the channel/ingress seam, but it
+still grades the seam `C`: a second implementation is not a regrade, and there is
+no multi-channel adapter framework yet (#27). `slack` also remains the only kind
+with a registered address shape
+([`apps/api/src/curie_api/schemas.py::_validate_channel_binding`](apps/api/src/curie_api/schemas.py));
+`email` binds on the generic non-empty rule, which is ADR-0096 working as designed
+rather than a gap. "The system does not care which channel" is true of a turn in
+flight and of how an agent gets bound to one; two wired channels is still not the
+same as any channel.
 
 Net effect: a developer can run the entire product loop — real model call
 included — on a laptop with Docker, no cluster, and no Slack. The code
@@ -541,7 +553,8 @@ working around it — see [`CLAUDE.md`](CLAUDE.md).
 **The chart** ([`charts/curie`](charts/curie)) is an umbrella that brings up:
 
 - Postgres, Valkey, Langfuse, ClickHouse, RustFS, and the OTel Collector
-- Deployments/Services for api/dispatcher/worker/ui (the dispatcher has no inbound port and so no Service)
+- Deployments/Services for api/dispatcher/mail-adapter/worker/ui (the dispatcher has no inbound port and so no Service)
+- the mail adapter is **off by default** (`mailAdapter.deploy: false`) and, unlike the dispatcher, does get a Service: the worker POSTs reply events to it ([`charts/curie/templates/mail-adapter.yaml`](charts/curie/templates/mail-adapter.yaml))
 
 Templates live under [`charts/curie/templates/`](charts/curie/templates).
 Security rails are all chart defaults (ADR-0006,
@@ -587,14 +600,14 @@ ladder; see the workflow file for the complete, current list. Notable ones:
 
 - `python` (ruff + mypy + pytest) — the one that boots the full compose stack, runs real Alembic migrations on a virgin Postgres (`version_table_schema=curie`, [`apps/api/alembic/env.py::do_run_migrations`](apps/api/alembic/env.py)), and runs the whole workspace pytest suite against those live services
 - `rust`, `rust-build` (the release binary), `contracts-ts`, `ui` (lint + vitest + build + headless Playwright)
-- `images`, `worker-local-image`, `dispatcher-image-smoke` — the **image build gates**. An operator reading this list to know what protects a release needs them named, since a green `python` says nothing about whether the images build.
+- `images`, `worker-local-image`, `dispatcher-image-smoke`, `mail-adapter-image-smoke` — the **image build gates**. An operator reading this list to know what protects a release needs them named, since a green `python` says nothing about whether the images build.
 - `eval-falsifiability`, `commit-messages` (no AI attribution)
 - `e2e-ladder`, `e2e-ladder-release`, `e2e-ladder-cluster` — the parity ladder's three rungs, each its own job, gated by an internal `changes` path filter
 
 **Release** ([`.github/workflows/release.yaml`](.github/workflows/release.yaml))
-publishes `ghcr.io/curie-eng/curie-{runner,api,dispatcher,worker,ui}` as
+publishes `ghcr.io/curie-eng/curie-{runner,api,dispatcher,mail-adapter,worker,ui}` as
 multi-arch (`linux/amd64` + `linux/arm64`) manifests (both `latest` and long-SHA
-tags) on every push to `main`. It also publishes a sixth image,
+tags) on every push to `main`. It also publishes a seventh image,
 **`ghcr.io/curie-eng/curie-worker-local`** (the worker-local overlay, built and
 merged by its own `worker-local-build` / `worker-local-merge` jobs). A `v*` tag
 additionally cuts a GitHub Release with CLI binaries for
@@ -626,6 +639,7 @@ The following are built and verified:
 - ripping out the UI fixture/showroom surface (the code is still in the tree; wired-and-live is the target, [the UI section](#the-ui-always-the-real-api-no-demo-mode))
 - binding the UI's eval matrix view to the live `GET /evals/matrix` endpoint ([Pushing agent versions with git](#pushing-agent-versions-with-git-deploy-flow))
 - **running** the soak/chaos suite at N1 scale (the suite itself is 762 lines of real Python, env-gated on `CURIE_SOAK` — what is deferred is the run, not the code)
+- the **live cluster run** of the email channel (the adapter itself ships: [`apps/mail-adapter`](apps/mail-adapter) with its test suite, its `mail-adapter-image-smoke` gate and its chart wiring behind `mailAdapter.deploy`; what is deferred is the on-cluster send-and-reply rehearsal, so email is not yet in the live-verified list above)
 - the Interview-Me onboarding compiler
 - automatic memory generation
 - the **native OpenAI wire format**
