@@ -305,6 +305,74 @@ so the change takes effect immediately.
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).
 
+### Connecting email
+
+There is no `curie cluster comms --email` yet, so email is wired with `helm
+upgrade --set`. The mail adapter ships off by default
+([`apps/mail-adapter`](../apps/mail-adapter)).
+
+Two platform-side steps come first, in this order:
+
+1. **Bind the agent** to `{"kind": "email", "address": "<the inbox address>"}` with a
+   reply route: `endpoint` is the in-cluster Service the chart renders,
+   `http://<fullname>-mail-adapter:<mailAdapter.service.port>/`, and `adapter` is
+   `mail-adapter`. Neither half of that is a literal. `<fullname>` is the chart's
+   `curie.fullname` ([`charts/curie/templates/_helpers.tpl`](../charts/curie/templates/_helpers.tpl)):
+   it is the release name alone when the release name already contains `curie`, and
+   `<release>-curie` otherwise, so release `curie` renders `curie-mail-adapter` while
+   release `acme-bot` renders `acme-bot-curie-mail-adapter`. The port is
+   `mailAdapter.service.port` (default `8080`), not a fixed `8080`. Getting either
+   wrong points the reply route at nothing, and every completion retries and then
+   dead-letters. Read both off your own release instead of deriving them:
+
+   ```bash
+   kubectl get svc -n <ns> \
+     -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component=mail-adapter \
+     -o jsonpath='http://{.items[0].metadata.name}:{.items[0].spec.ports[0].port}/'
+   ```
+
+   The `adapter` value must equal `mailAdapter.adapterSlug`, because the worker looks
+   its egress credential up under that key.
+2. **Mint the channel token.** `POST /channels/token` with the platform key returns a
+   scoped `chn` token for that one binding. It refuses with 409 for a non-`slack`
+   binding that has no reply route, which is why the binding comes first.
+
+Then turn the adapter on:
+
+```bash
+helm upgrade <release> <chart> -n <ns> -f values.yaml \
+  --set mailAdapter.deploy=true \
+  --set mailAdapter.inbox=agent@yourdomain.example \
+  --set mailAdapter.agentmail.apiKey=<agentmail api key> \
+  --set mailAdapter.channelToken=<the chn token> \
+  --set mailAdapter.egressSecret=<a fresh random secret> \
+  --set 'mailAdapter.allowedSenders={alice@example.com,example.com}'
+```
+
+| Value | What it does |
+|---|---|
+| `mailAdapter.deploy` | Renders the Deployment and Service. Default `false`; nothing about email exists in a default install. |
+| `mailAdapter.inbox` | The AgentMail inbox this adapter polls and replies from. |
+| `mailAdapter.pollIntervalSeconds` | Seconds between polls of that inbox (default `5`). Zero or negative fails the boot gate rather than tight-looping a third-party API. |
+| `mailAdapter.allowedSenders` | Who may start a turn. Empty denies everyone, and with ingress on the pod refuses to boot rather than run an inbox that answers nobody; `*` is the explicit allow-all. |
+| `mailAdapter.ingressEnabled` | `false` serves egress while sending nothing inbound. That is the staged-cutover position while the platform side of a new binding is being wired. |
+| `mailAdapter.egressSecret` | The shared secret the worker presents on `X-Curie-Adapter-Secret` and the adapter checks before any side effect. |
+
+**Do not write `worker.adapterCredentials.mail-adapter` by hand.** The chart derives it
+from `mailAdapter.egressSecret`, so the pair cannot drift. An equal value is accepted; a
+conflicting one fails the render by design. Rotating `mailAdapter.channelToken`,
+`mailAdapter.egressSecret` or `mailAdapter.agentmail.apiKey` and running `helm upgrade`
+restarts the adapter pod on its own, with no `kubectl rollout restart`.
+
+Two things stay operator-relevant and are documented once, in the adapter's README
+rather than here: Curie authenticates no sender, so `mailAdapter.allowedSenders` filters
+an attacker-controlled `From` header and buys nothing unless every domain on it enforces
+DMARC ("Inbound security"), and three silent reliability defects are open in the shipped
+adapter, tracked together in #1584 ("Known reliability limitations"). Those sections, the
+AgentMail-specific parameter names, the full config surface and the boot gates all live in
+[`apps/mail-adapter/README.md`](../apps/mail-adapter/README.md); to build an adapter for a
+different channel, see [Building a channel adapter](guides/building-a-channel-adapter.md).
+
 ## Upgrading the chart
 
 A chart upgrade is a **full** upgrade: anything the new chart does not render is

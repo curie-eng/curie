@@ -72,7 +72,7 @@ on that table.
 | `SandboxClient` | [`apps/worker/src/curie_worker/sandbox/k8s.py`](../../apps/worker/src/curie_worker/sandbox/k8s.py) | k8s + docker | **CLEAN, 2 impls.** The strongest claim on this page: two real substrates. [Drawn in detail](kubernetes.md). |
 | ACI protocol | [`packages/aci-protocol`](../../packages/aci-protocol) | 1 + reference | **A-.** Versioned wire, tri-language, wire-lock gated. [See the ACI](aci.md). |
 | `ModelSession` | [`runner/src/curie_runner/adapter.py`](../../runner/src/curie_runner/adapter.py) | claude-agent-sdk + fake | **A-.** In-proc harness seam. |
-| Channel / ingress | [`interfaces/channel-ingress`](../interfaces/channel-ingress/INTERFACE.md) | Slack, CLI stub | **C, 1 impl.** The weakest line here. `QueuedTurn` is channel-neutral; egress is not. |
+| Channel / ingress | [`interfaces/channel-ingress`](../interfaces/channel-ingress/INTERFACE.md) | Slack, email | **C, 2 impls.** The weakest line here. `QueuedTurn` and `ReplySink` are both channel-neutral; only Slack's edit-in-place semantics remain vendor-specific. |
 | `SlackSink` | [`slack_sink.py`](../../apps/worker/src/curie_worker/slack_sink.py) | Slack `chat.update` | Egress assumes edit-in-place. A channel-neutral post/update sink is the open work. |
 | `StreamBroker` | [`broker.py`](../../apps/worker/src/curie_worker/broker.py) | redis-py / Valkey | **CLEAN, 1 impl.** Thin port at a non-sacred seam; second broker deferred by decision (ADR-0027). |
 | `ObjectStore` | [`storage.py`](../../apps/api/src/curie_api/storage.py) | RustFS / S3 | **B+.** The API's port: read + write. The non-S3 adapter is deferred until real demand (ADR-0026). |

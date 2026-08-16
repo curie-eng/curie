@@ -197,7 +197,7 @@ schema-scoped native enum (`apps/api/src/curie_api/db.py::SCHEMA`, the
 `Environment` enum). Both have portable SQLAlchemy equivalents if a
 non-Postgres target ever materializes.
 
-### 6. Communication channel (Slack today)
+### 6. Communication channel (Slack and email today)
 
 **Port:** the ingress half of this seam is now clean; the egress half is where
 it stays least clean. The ingress contract was promoted out of the dispatcher
@@ -206,14 +206,22 @@ into the channel-neutral `QueuedTurn`
 generic `event_id` idempotency key, a `conversation_id` conversation key, and a
 `ReplyHandle` (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`)
 carrying the channel and placeholder, so the Slack-shaped field names are gone
-from the core contract. The egress contract is the worker's `SlackSink` protocol
-(`apps/worker/src/curie_worker/slack_sink.py`), a single
-`update(channel, ts, text)` built on `chat.update`. The mrkdwn dialect is
-correctly confined to the sink (`mrkdwn.py`), but the kernel does assume the
-edit-a-placeholder reply shape, which is the remaining Slack coupling.
+from the core contract. The egress contract is the worker's `ReplySink` Protocol
+(`apps/worker/src/curie_worker/reply_sink.py::ReplySink`), four neutral events
+over a `TargetRoute`, with the vendor render below it in `SlackReplyAdapter`
+(`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) and `to_mrkdwn`
+(`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`). What keeps this seam at C
+is that the kernel still assumes the edit-a-placeholder reply shape, so a channel
+with no editable message emulates it.
 
-**Current adapter:** `apps/dispatcher` (Bolt, Socket Mode) on ingress,
-`AsyncSlackSink` on egress.
+**Current adapters:** two. Slack is `apps/dispatcher` (Bolt, Socket Mode) on
+ingress and `SlackReplyAdapter` on egress. Email (#1515) is `apps/mail-adapter`,
+one process outside the core that speaks only the HTTP wire: it POSTs each polled
+message to `POST /channels/turns` under a scoped `chn` token and serves the four
+reply events on its own endpoint behind `X-Curie-Adapter-Secret`, holding no
+platform key, queue credential or database access. A third channel follows
+[Building a channel adapter](guides/building-a-channel-adapter.md) and needs no
+patch to this repo.
 
 **Evidence the channel is already semi-swappable:** `curie local message` and
 `curie cluster message` (`cli/src/chat.rs`, `cli/src/message.rs`) drive the entire
@@ -222,14 +230,13 @@ deployed system with zero Slack contact by minting the exact
 Slack Web API. The Slack service swaps; the ingress payload is already
 channel-neutral, and the remaining Slack coupling is the egress reply shape.
 
-**What a channel-neutral port looks like:** the ingress half already matches this
-target — `QueuedTurn` carries `{event_id, conversation_id, author, text,
+**What a channel-neutral port looks like:** both halves match that target now.
+`QueuedTurn` carries `{event_id, conversation_id, author, text,
 reply_handle, received_at}` ([issue #7](https://github.com/curie-eng/curie/issues/7),
-landed). What remains is a `ReplySink` with post/update semantics per channel
-adapter. The remaining reshaping cost is bounded: the CLI's mirrored struct already
-tracks the promoted contract, while the kernel's thread-lock and marker keys and the
-channel-based deployment binding (`apps/worker/src/curie_worker/binding.py`) still
-assume Slack. Reply routing, by contrast, already landed per turn
+landed), `ReplySink` carries post/update semantics per adapter, and the deployment
+binding is a neutral `{kind, address}` pair
+(`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`, #1459,
+ADR-0096) rather than a Slack column. Reply routing landed per turn
 ([issue #19](https://github.com/curie-eng/curie/issues/19)): a turn's
 `ReplyHandle.endpoint` (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`)
 is the reply target, so a real Slack workspace and a no-Slack CLI stub can coexist on
@@ -249,6 +256,7 @@ increment; the interaction-primitive half is driven now by the approval interfac
 flowchart TB
     subgraph channel["Job 6: communication channel"]
         Slack["Slack via Bolt (today)"]
+        Mail["apps/mail-adapter (email, today)"]
         CLIStub["curie local message / cluster message stub (swap proof)"]
     end
 
@@ -289,6 +297,8 @@ flowchart TB
     end
 
     Slack -- "QueuedTurn" --> Dispatcher
+    Mail -- "POST /channels/turns" --> API
+    Worker -- "reply events" --> Mail
     CLIStub -- "same wire payload" --> Queue
     Runner -- "frozen ACI protocol" --> SDK
     Runner -- "OTLP HTTP" --> Collector
@@ -309,24 +319,26 @@ flowchart TB
 | Evals | Our stream schema + `EvalMatrix` DTO; store behind recorder | Langfuse traces + `eval_pass` scores | B: schema is ours; the case format converged into one frozen, drift-gated schema (#8, ADR-0019), leaving the `version:`/`suite:` tag convention as the unfrozen part | Freeze the tag convention into the schema, or record it as a deliberate soft contract |
 | Blob storage | S3 protocol (boto3 + AWS CLI, path-style, endpoint-configurable) | RustFS | B+: config-only within S3-compatible stores; the client is now built in one shared place (`packages/aci-protocol/src/aci_protocol/s3.py::build_s3_client`, #572), and the `ObjectStore` port (`apps/api/src/curie_api/storage.py::ObjectStore`) names the contract, but the second, non-S3 adapter is deferred by decision until a real demand lands (#282) | None needed until a non-S3 demand exists |
 | Relational DB | SQLAlchemy 2.0 + alembic | Postgres | A-: managed-Postgres swap is a DSN change; two Postgres-isms in models | Leave as is; note the `postgresql.UUID` and schema-scoped enum as the two things a non-Postgres target would touch |
-| Communication | `QueuedTurn` (channel-neutral, in `aci-protocol`) + `SlackSink` | Slack (Bolt + chat.update) | C: the ingress payload is now the channel-neutral `QueuedTurn` (#7), but egress still assumes Slack's edit-in-place `chat.update` reply shape; service swappable (CLI stub), egress protocol not | Route replies per turn (#19) and define a channel-neutral `ReplySink` post/update port so a second channel can coexist |
+| Communication | `QueuedTurn` (channel-neutral, in `aci-protocol`) + the `ReplySink` four-event wire | Slack (Bolt + chat.update) and email (`apps/mail-adapter`, out of process over HTTP) | C: both ends are channel-neutral and a second implementation ships (#1515), but the kernel still assumes an edit-in-place reply, so a channel with no editable message emulates it | Give the port an explicit post-once mode, so a channel that sends one message per turn is not modelled as an edit |
 
 ## What we deliberately do not abstract yet
 
-The second implementation teaches the interface. Every port above has exactly
-one implementation, and we resist writing adapter layers ahead of a real swap
-demand: a speculative `StorageInterface` or `ChannelAdapter` would encode
+The second implementation teaches the interface. Communication is the one port
+above with two (Slack and email, #1515); the rest have one, and we resist
+writing adapter layers ahead of a real swap demand: a speculative
+`StorageInterface` or `ChannelAdapter` would encode
 guesses about the second implementation's needs and would be wrong in the
 ways that matter. Concretely, we do not yet abstract:
 
 - A blob-storage interface beyond the S3 protocol. GCS-native support waits
   for a user who needs it; until then the protocol is the port.
-- A multi-channel adapter framework. The channel-neutral rename above is
-  cheap and worth doing; a pluggable channel registry is not, until a second
-  real channel exists. Nuance (ADR-0020): the approval interface (ADR-0010) is a
+- A multi-channel adapter framework. Email shipped as a service outside the
+  core against the documented HTTP wire, with no registry and no patch to this
+  repo, so the restraint stands (#27). Nuance (ADR-0020): the approval interface (ADR-0010) is a
   real forcing function that exists today, so the port's *interaction-primitive*
   half (semantic `Confirm`/`Choice` rendered per-adapter) is worth defining now;
-  the full pluggable registry still waits for a second real channel.
+  the full pluggable registry still waits for a demand the documented wire and a
+  self-owned adapter service cannot already serve.
 - A generic eval-store interface. The recorder is one file; the second store
   defines what the interface must be.
 - Cross-database portability. Managed Postgres is the swap that will actually
