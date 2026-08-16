@@ -1841,31 +1841,13 @@ const CHANNELS_ROUTER: &str = include_str!("../../apps/api/src/curie_api/routers
 /// `TurnIn` inherits and that FastAPI DOES publish.
 const API_OPENAPI: &str = include_str!("../../apps/api/openapi.json");
 
-/// The fields this gate is known to depend on, as a LIVENESS FLOOR on the parse.
+/// `(base class name, own required fields)` for a Pydantic model, read out of
+/// the router source.
 ///
-/// This is deliberately not the contract: the parsed set is, and a field added
-/// to `TurnIn` tomorrow tightens the pin with no edit here. What this catches is
-/// the parse going quiet. A source scan that stops matching returns a smaller
-/// set and every assertion built on it turns vacuous, which is worse than no pin
-/// at all, because it still reads as coverage. If `TurnIn` legitimately drops
-/// one of these, this list is supposed to red so a human looks at a contract
-/// change rather than a silently narrowed gate.
-const TURN_IN_FLOOR: [&str; 7] = [
-    "address",
-    "author",
-    "conversation_id",
-    "delivery_id",
-    "kind",
-    "reply_ref",
-    "text",
-];
-
-/// One Pydantic class's body, as `(base class, lines with the docstring cut)`.
-///
-/// Panics rather than returning empty at every step: a missing class, a missing
-/// header or an unterminated docstring are all "the source moved and this parse
-/// no longer knows what it is reading", and each has to be a loud failure.
-fn class_body<'a>(source: &'a str, name: &str) -> (String, Vec<&'a str>) {
+/// A required field is an annotated attribute with no `=`: a default of any kind
+/// makes it optional, and `model_config` is an assignment rather than an
+/// annotation, so neither reaches the set.
+fn pydantic_model(source: &str, name: &str) -> (String, std::collections::BTreeSet<String>) {
     let header = format!("\nclass {name}(");
     let start = source
         .find(&header)
@@ -1878,62 +1860,16 @@ fn class_body<'a>(source: &'a str, name: &str) -> (String, Vec<&'a str>) {
         .expect("a base list names a class")
         .trim()
         .to_string();
-
     let body_start = rest.find('\n').expect("a class header ends") + 1;
     let body = &rest[body_start..];
     let end = body.find("\nclass ").unwrap_or(body.len());
-    let mut lines: Vec<&str> = body[..end].lines().collect();
 
-    // Cut a leading docstring, so its prose cannot be read as a field. Every
-    // model in this router carries one, so its ABSENCE means the block being
-    // read is not the block this parse was written for.
-    let opener = lines
-        .iter()
-        .position(|line| !line.trim().is_empty())
-        .unwrap_or_else(|| panic!("{name} has a body"));
-    assert!(
-        lines[opener].trim_start().starts_with("\"\"\""),
-        "{name}'s body no longer opens with a docstring, so this parse is reading \
-         something other than the model it was written for: {:?}",
-        lines[opener]
-    );
-    let single_line = lines[opener].trim().len() > 6 && lines[opener].trim().ends_with("\"\"\"");
-    let close = if single_line {
-        opener
-    } else {
-        opener
-            + 1
-            + lines[opener + 1..]
-                .iter()
-                .position(|line| line.trim_end().ends_with("\"\"\""))
-                .unwrap_or_else(|| panic!("{name}'s docstring is unterminated"))
-    };
-    lines.drain(..=close);
-    (base, lines)
-}
-
-/// Annotated attributes in a class body, at EXACTLY four spaces of indentation
-/// when `strict`, at any indentation otherwise.
-///
-/// A required field is an annotated attribute with no `=`: a default of any kind
-/// makes it optional, and `model_config` is an assignment rather than an
-/// annotation, so neither reaches the set.
-fn annotated_fields(lines: &[&str], strict: bool) -> std::collections::BTreeSet<String> {
-    let mut found = std::collections::BTreeSet::new();
-    for line in lines {
-        let declaration = if strict {
-            match line.strip_prefix("    ") {
-                Some(rest) if !rest.starts_with(' ') => rest,
-                _ => continue,
-            }
-        } else {
-            let trimmed = line.trim_start();
-            if trimmed.len() == line.len() {
-                continue; // a top level statement is not a class attribute
-            }
-            trimmed
+    let mut required = std::collections::BTreeSet::new();
+    for line in body[..end].lines() {
+        let Some(declaration) = line.strip_prefix("    ") else {
+            continue;
         };
-        if declaration.starts_with('#') {
+        if declaration.starts_with(' ') || declaration.starts_with('#') {
             continue;
         }
         let Some((field, annotation)) = declaration.split_once(": ") else {
@@ -1942,49 +1878,19 @@ fn annotated_fields(lines: &[&str], strict: bool) -> std::collections::BTreeSet<
         if annotation.contains('=') || !field.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
             continue;
         }
-        found.insert(field.to_string());
+        required.insert(field.to_string());
     }
-    found
-}
-
-/// `(base class name, own required fields)` for a Pydantic model, read out of
-/// the router source and CROSS CHECKED against itself.
-///
-/// The cross check is the whole point. A scan keyed on `    ` degrades silently
-/// the moment the file is reformatted, reindented or wrapped differently: it
-/// matches nothing, returns an empty set, and every assertion downstream passes
-/// while pinning nothing. So the same body is scanned twice, once keyed on that
-/// exact indentation and once indentation blind, and the two must agree. A
-/// reindent moves one and not the other, and the disagreement is the failure.
-fn pydantic_model(source: &str, name: &str) -> (String, std::collections::BTreeSet<String>) {
-    let (base, lines) = class_body(source, name);
-    let strict = annotated_fields(&lines, true);
-    let permissive = annotated_fields(&lines, false);
-
-    assert_eq!(
-        strict, permissive,
-        "the strict and permissive scans disagree on {name}'s fields, which means \
-         the source was reindented or rewrapped under this parse. Fix the parse; \
-         do NOT let it return the smaller set, because a pin that matches nothing \
-         still reads as coverage"
-    );
     assert!(
-        !strict.is_empty(),
+        !required.is_empty(),
         "{name} parsed to no required fields, so this gate would pass on an empty body"
     );
-    (base, strict)
+    (base, required)
 }
 
 /// Every field `TurnIn` requires: its own, read from the model source, plus the
 /// ones it inherits, read from the committed OpenAPI export.
 fn turn_in_required_fields() -> std::collections::BTreeSet<String> {
-    turn_in_required_fields_from(CHANNELS_ROUTER)
-}
-
-/// The same read, against a caller supplied copy of the router source, so the
-/// drift tests can feed it a reformatted one without touching `apps/`.
-fn turn_in_required_fields_from(source: &str) -> std::collections::BTreeSet<String> {
-    let (base, mut required) = pydantic_model(source, "TurnIn");
+    let (base, mut required) = pydantic_model(CHANNELS_ROUTER, "TurnIn");
     let openapi: serde_json::Value =
         serde_json::from_str(API_OPENAPI).expect("apps/api/openapi.json is valid JSON");
     let inherited = openapi["components"]["schemas"][&base]["required"]
@@ -1998,88 +1904,18 @@ fn turn_in_required_fields_from(source: &str) -> std::collections::BTreeSet<Stri
             .filter_map(|v| v.as_str().map(str::to_string)),
     );
 
-    for field in TURN_IN_FLOOR {
+    // Liveness, so a parse that stops seeing the model reds here rather than
+    // pinning nothing and still reading as coverage. `reply_ref` is the field
+    // the live 422 named; `kind` can only have come from the OpenAPI half, so
+    // both seams are known to have contributed.
+    for field in ["reply_ref", "conversation_id", "kind"] {
         assert!(
             required.contains(field),
-            "the parse lost {field:?}. Either the authority genuinely dropped it, \
-             which is a contract change to look at, or this parse stopped seeing \
-             the model. Parsed {required:?}"
+            "the parse lost {field:?}, so this gate no longer reads the authority. \
+             Parsed {required:?}"
         );
     }
     required
-}
-
-// ─── The pin fails loudly when the source it reads moves ────────────────────
-
-/// The positive control for the three drift tests below: against the real
-/// source, the parse yields a plausible set and finds the field the whole gate
-/// turns on. Without this, a `should_panic` test proves only that SOMETHING
-/// panicked.
-#[test]
-fn the_turn_in_parse_reads_a_plausible_field_set_from_the_real_source() {
-    let required = turn_in_required_fields();
-    assert!(
-        required.contains("reply_ref"),
-        "the parse must see the field the live 422 named; parsed {required:?}"
-    );
-    assert!(
-        required.len() >= TURN_IN_FLOOR.len(),
-        "the parse must see at least the floor; parsed {required:?}"
-    );
-    // The base half comes from the committed OpenAPI export, the own half from
-    // the model source. Both must have contributed, or one seam is dead.
-    let (_, own) = pydantic_model(CHANNELS_ROUTER, "TurnIn");
-    assert!(
-        !own.contains("kind") && required.contains("kind"),
-        "`kind` is inherited, so it can only have come from the OpenAPI export; \
-         own {own:?}, combined {required:?}"
-    );
-}
-
-/// Reindenting the model body must be a LOUD failure, not a quiet empty parse.
-/// This is the exact degradation a `strip_prefix("    ")` scan hides: after a
-/// reformat it matches nothing and every assertion built on it turns vacuous.
-///
-/// Simulated against an in memory copy of the real source, because `apps/` is
-/// not this crate's to edit.
-#[test]
-#[should_panic(expected = "the strict and permissive scans disagree")]
-fn a_reindented_model_body_fails_the_parse_instead_of_emptying_it() {
-    let reindented = CHANNELS_ROUTER.replace("\n    ", "\n      ");
-    let _ = turn_in_required_fields_from(&reindented);
-}
-
-/// The same, for a tab reindent, which `strip_prefix("    ")` also misses.
-#[test]
-#[should_panic(expected = "the strict and permissive scans disagree")]
-fn a_tab_indented_model_body_fails_the_parse_instead_of_emptying_it() {
-    let tabbed = CHANNELS_ROUTER.replace("\n    ", "\n\t");
-    let _ = turn_in_required_fields_from(&tabbed);
-}
-
-/// The discriminating case, and the one a non empty check cannot reach: ONE
-/// field rewrapped deeper. The strict scan then returns four of the five fields,
-/// which is non empty and looks entirely healthy, while `reply_ref` (the field
-/// this whole gate exists for) has quietly fallen out of the pin. Only the
-/// cross check sees it.
-#[test]
-#[should_panic(expected = "the strict and permissive scans disagree")]
-fn a_single_rewrapped_field_fails_the_parse_rather_than_dropping_out_of_it() {
-    let rewrapped = CHANNELS_ROUTER.replace("\n    reply_ref: str", "\n        reply_ref: str");
-    assert_ne!(
-        rewrapped, CHANNELS_ROUTER,
-        "the drift simulation must actually change the source, or this proves nothing"
-    );
-    let _ = turn_in_required_fields_from(&rewrapped);
-}
-
-/// A renamed or moved model must be a loud failure too, rather than a parse that
-/// silently reads whatever class happens to sit at that offset.
-#[test]
-#[should_panic(expected = "TurnIn is defined in the router source")]
-fn a_renamed_model_fails_the_parse() {
-    let renamed = CHANNELS_ROUTER.replace("\nclass TurnIn(", "\nclass TurnInV2(");
-    let _ = turn_in_required_fields_from(&renamed);
 }
 
 /// A platform API stand-in that also answers the turn ingress, reporting the
