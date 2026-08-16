@@ -1,0 +1,24 @@
+# Per-Dockerfile ignore (BuildKit honors <dockerfile>.dockerignore over the
+# context-root .dockerignore). These app images build from the REPO ROOT to
+# reach the uv workspace, so this trims the root context to what the Python
+# build needs -- the uv.lock, member pyproject.tomls, and Python sources stay;
+# the heavy non-Python trees are dropped.
+.git
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.mypy_cache
+**/.pytest_cache
+**/.ruff_cache
+**/node_modules
+apps/ui/dist
+apps/ui/test-results
+apps/ui/playwright-report
+cli/target
+docs
+prototypes
+.github
+charts
+*.md
+**/*.md
+**/.env

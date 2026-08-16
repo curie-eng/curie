@@ -16,6 +16,7 @@ members = [
     "curie-channel-protocol",
     "curie-dispatcher",
     "curie-doclint",
+    "curie-mail-adapter",
     "curie-runner",
     "curie-test-support",
     "curie-wire-tolerance-gate",
@@ -618,6 +619,23 @@ requires-dist = [
 ]
 
 [[package]]
+name = "curie-mail-adapter"
+version = "0.0.0"
+source = { editable = "apps/mail-adapter" }
+dependencies = [
+    { name = "aci-protocol" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "pydantic", specifier = ">=2.10" },
+    { name = "pydantic-settings", specifier = ">=2.7" },
+]
+
+[[package]]
 name = "curie-runner"
 version = "0.0.0"
 source = { editable = "runner" }
@@ -710,6 +728,7 @@ dependencies = [
     { name = "curie-api" },
     { name = "curie-channel-protocol" },
     { name = "curie-dispatcher" },
+    { name = "curie-mail-adapter" },
     { name = "curie-runner" },
     { name = "curie-worker" },
     { name = "plugin-format" },
@@ -736,6 +755,7 @@ requires-dist = [
     { name = "curie-api", editable = "apps/api" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-dispatcher", editable = "apps/dispatcher" },
+    { name = "curie-mail-adapter", editable = "apps/mail-adapter" },
     { name = "curie-runner", editable = "runner" },
     { name = "curie-worker", editable = "apps/worker" },
     { name = "plugin-format", editable = "packages/plugin-format" },
