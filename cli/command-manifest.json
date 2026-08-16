@@ -3858,6 +3858,363 @@
       "name": "interactive"
     },
     {
+      "about": "Build, validate, bind and smoke-test a channel adapter against an install: `adapter <scaffold|validate|bind|token|smoke-test>`",
+      "hidden": false,
+      "long_about": "Build, validate, bind and smoke-test a channel adapter against an install: `adapter <scaffold|validate|bind|token|smoke-test>`.\n\nReads an `adapter.yaml` binding profile (kind, address shape, reply route, egress credential identity) validated against the committed `packages/channel-protocol` schema, so the CLI and the Python conformance kit agree on one contract instead of two mirrors.",
+      "name": "adapter",
+      "subcommands": [
+        {
+          "about": "Write one binding profile for a new adapter, plus the next steps",
+          "args": [
+            {
+              "global": false,
+              "help": "Adapter name. The profile is written to `<dir>/<name>/adapter.yaml`",
+              "id": "name",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Channel kind this adapter owns, as a lowercase slug (e.g. email)",
+              "id": "kind",
+              "long": "kind",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "A concrete address of the shape this adapter owns",
+              "id": "address",
+              "long": "address",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "The absolute http or https route the worker POSTs reply events to",
+              "id": "endpoint",
+              "long": "endpoint",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "The egress credential identity this adapter suggests, as a lowercase slug. A suggestion only: `adapter bind` asks an operator to confirm it",
+              "id": "adapter",
+              "long": "adapter",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Parent directory for the scaffolded adapter. Defaults to the current directory",
+              "id": "dir",
+              "long": "dir",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Write one binding profile for a new adapter, plus the next steps.\n\nDeliberately minimal: one `adapter.yaml` and nothing else. The generated `address.pattern` matches exactly the address it was scaffolded for, so the profile validates on the very next command; widen it by hand to the real shape of your channel's addresses.",
+          "name": "scaffold"
+        },
+        {
+          "about": "Accept or refuse a binding profile, and report the values it parsed",
+          "args": [
+            {
+              "default_values": [
+                "adapter.yaml"
+              ],
+              "global": false,
+              "help": "Path to the binding profile",
+              "id": "file",
+              "long": "file",
+              "positional": false,
+              "required": false,
+              "short": "f"
+            },
+            {
+              "global": false,
+              "help": "Also check that this concrete address matches the profile's declared shape",
+              "id": "address",
+              "long": "address",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Accept or refuse a binding profile, and report the values it parsed.\n\nThe version is checked first, then the committed schema, then the one rule a schema cannot express: `address.pattern` has to compile with the Rust regex crate as well as Python `re`, so no lookaround and no backreferences.",
+          "name": "validate"
+        },
+        {
+          "about": "Write an agent's four field channel route: kind, address, endpoint and the egress credential slug",
+          "args": [
+            {
+              "default_values": [
+                "adapter.yaml"
+              ],
+              "global": false,
+              "help": "Path to the binding profile",
+              "id": "file",
+              "long": "file",
+              "positional": false,
+              "required": false,
+              "short": "f"
+            },
+            {
+              "global": false,
+              "help": "Agent id to bind",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "The concrete address to bind, checked against the profile's shape",
+              "id": "address",
+              "long": "address",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "The egress credential identity to write. Operator owned",
+              "id": "adapter_slug",
+              "long": "adapter-slug",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Reply route override, for a profile that declares no endpoint",
+              "id": "endpoint",
+              "long": "endpoint",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Confirm the destination and the credential identity, and write",
+              "id": "yes",
+              "long": "yes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Write an agent's four field channel route: kind, address, endpoint and the egress credential slug.\n\n`--address` and `--adapter-slug` are operator inputs, never taken from the profile: `address.example` is authoring documentation, and the slug selects which stored secret the worker sends, so a profile chosen value could redirect another adapter's credential. A slug differing from the profile's suggestion is shown with both values before it is written.",
+          "name": "bind"
+        },
+        {
+          "about": "Mint a `chn` token for one concrete (kind, address) pair",
+          "args": [
+            {
+              "default_values": [
+                "adapter.yaml"
+              ],
+              "global": false,
+              "help": "Path to the binding profile",
+              "id": "file",
+              "long": "file",
+              "positional": false,
+              "required": false,
+              "short": "f"
+            },
+            {
+              "global": false,
+              "help": "The concrete address to mint for, checked against the profile's shape",
+              "id": "address",
+              "long": "address",
+              "positional": false,
+              "required": true
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "3600"
+              ],
+              "global": false,
+              "help": "Token lifetime in seconds. The API accepts 1 to 604800",
+              "id": "ttl_s",
+              "long": "ttl-s",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Mint a `chn` token for one concrete (kind, address) pair.\n\nThe only verb whose payload carries a credential value: it rides under `token` alongside `\"secret\": true`, on stdout and on no diagnostic stream.",
+          "name": "token"
+        },
+        {
+          "about": "Probe a deployed adapter from the outside: does this endpoint accept the egress secret you supply, does it refuse a wrong one, and are the route fields present for this pair",
+          "args": [
+            {
+              "default_values": [
+                "adapter.yaml"
+              ],
+              "global": false,
+              "help": "Path to the binding profile",
+              "id": "file",
+              "long": "file",
+              "positional": false,
+              "required": false,
+              "short": "f"
+            },
+            {
+              "global": false,
+              "help": "The concrete address to probe, checked against the profile's shape",
+              "id": "address",
+              "long": "address",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Reply route override, for a profile that declares no endpoint",
+              "id": "endpoint",
+              "long": "endpoint",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Read the egress secret from this file. One of the two accepted sources; the profile names the variable its own adapter reads and that name is never resolved here",
+              "id": "secret_file",
+              "long": "secret-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Read the egress secret from stdin instead",
+              "id": "secret_stdin",
+              "long": "secret-stdin",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Also post a real turn twice and assert the second is reported as a duplicate. This enqueues a REAL turn against the bound agent",
+              "id": "enqueue",
+              "long": "enqueue",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Probe a cleartext http endpoint anyway",
+              "id": "allow_insecure",
+              "long": "allow-insecure",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Confirm the destination and the credential identity, and probe",
+              "id": "yes",
+              "long": "yes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Probe a deployed adapter from the outside: does this endpoint accept the egress secret you supply, does it refuse a wrong one, and are the route fields present for this pair.\n\nThose two narrow claims are all it makes. It does not prove the running worker holds that slug or that value, and it is not the conformance floor: `curie-adapter-conformance` is the stricter check.",
+          "name": "smoke-test"
+        }
+      ]
+    },
+    {
       "about": "Store and manage local secrets in Curie private storage",
       "hidden": false,
       "name": "secrets",

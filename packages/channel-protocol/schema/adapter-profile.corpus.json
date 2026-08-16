@@ -1,0 +1,612 @@
+{
+  "_comment": "Cross language fixture for the adapter binding profile (#1516, following #490 and #1079). Three consumers read this file: the Pydantic models in channel_protocol.manifest, the exported schema/adapter-profile.schema.json, and the Rust CLI in cli/src/adapter.rs. Every invalid case is rejected by the Pydantic model and by the Rust CLI. The exported schema rejects tier 1 and tier 2 only: tier 3 is an admitted PAIRED validator (one in Python, one in Rust), because JSON Schema cannot express 'the Rust regex crate can compile this string'. The tier field on each invalid case declares which mechanism enforces the rule, and test_manifest_corpus.py asserts the declaration is truthful in both directions, so a tier 3 case the schema unexpectedly catches is as red as a tier 1 case it misses. Valid case values deliberately VARY (different kind, egress, address pattern and endpoint presence), so a consumer that returns a constant instead of carrying the parsed value through is killed by the comparison rather than tracking a self updating expectation.",
+  "valid": [
+    {
+      "version": "1.0",
+      "kind": "email",
+      "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+      "address": {
+        "description": "The mailbox this adapter owns.",
+        "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+        "example": "agent@example.test"
+      },
+      "credentials": {
+        "egress": "agentmail-sandbox",
+        "egress_secret_env": "CURIE_EGRESS_SECRET",
+        "ingress_token_env": "CURIE_INGRESS_TOKEN"
+      },
+      "conformance": {
+        "wire_version": "1.0"
+      }
+    },
+    {
+      "version": "1.0",
+      "kind": "ms_teams",
+      "endpoint": "http://ms-teams-adapter.internal.example.test:8080/reply",
+      "address": {
+        "description": "The Teams conversation this adapter owns.",
+        "pattern": "^19:[a-zA-Z0-9_-]+@thread\\.tacv2$",
+        "example": "19:abc_def@thread.tacv2"
+      },
+      "credentials": {
+        "egress": "ms_teams_egress",
+        "egress_secret_env": "MS_TEAMS_EGRESS_SECRET",
+        "ingress_token_env": "MS_TEAMS_INGRESS_TOKEN"
+      },
+      "conformance": {
+        "wire_version": "1.0"
+      }
+    },
+    {
+      "version": "1.0",
+      "kind": "webhook",
+      "address": {
+        "description": "The webhook route this adapter owns.",
+        "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*/[a-z0-9]+$",
+        "example": "team-alpha/inbox"
+      },
+      "credentials": {
+        "egress": "webhook-egress",
+        "egress_secret_env": "WEBHOOK_EGRESS_SECRET",
+        "ingress_token_env": "WEBHOOK_INGRESS_TOKEN"
+      },
+      "conformance": {
+        "wire_version": "1.0"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "why": "kind is uppercase, and a kind is a lowercase slug",
+      "tier": 1,
+      "profile": {
+        "version": "1.0",
+        "kind": "Email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "kind has a leading hyphen, so it is not a slug",
+      "tier": 1,
+      "profile": {
+        "version": "1.0",
+        "kind": "-email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "credentials.egress is uppercase, and an egress identity is the same slug shape as a kind",
+      "tier": 1,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "AgentMail-Sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "egress_secret_env is lowercase, and the field holds an environment variable NAME. The pattern is a legibility constraint and claims nothing about secrecy",
+      "tier": 1,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "curie_egress_secret",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "egress_secret_env carries hyphens, which no shell environment variable name may hold",
+      "tier": 1,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE-EGRESS-SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "ingress_token_env is empty, which names no variable at all",
+      "tier": 1,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": ""
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "an unknown top level key, which a closed profile refuses so a typo is never silently ignored",
+      "tier": 1,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "retries": 3,
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "a profile version this build does not understand, refused by the acceptance check before any schema validation runs",
+      "tier": 1,
+      "profile": {
+        "version": "1.1",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "conformance.wire_version names a reply wire this build does not speak, and it is independent of the profile version",
+      "tier": 1,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "2.0"
+        }
+      }
+    },
+    {
+      "why": "the endpoint embeds userinfo, which discloses a credential everywhere the route is read back",
+      "tier": 2,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://user:pw@curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "the endpoint is relative, so the worker has no host to POST the reply to",
+      "tier": 2,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "the endpoint scheme is not http or https, so it is not a route the worker can POST to",
+      "tier": 2,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "mailto:agent@example.test",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "address.pattern does not compile as a regex at all, in either dialect",
+      "tier": 3,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "address.pattern uses LOOKAHEAD, which Python re compiles and the Rust regex crate refuses. The most likely silent cross language divergence in this contract",
+      "tier": 3,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^(?=.*@)[a-z0-9@.]+$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "address.pattern uses LOOKBEHIND, which Python re compiles and the Rust regex crate refuses",
+      "tier": 3,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "(?<=@)[a-z0-9.]+$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "address.pattern uses a BACKREFERENCE, which Python re compiles and the Rust regex crate refuses",
+      "tier": 3,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^([a-z0-9]+)@\\1\\.example\\.test$",
+          "example": "agent@agent.example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "version is the NUMBER 1.1, which is what unquoted version: 1.1 parses to in YAML, and the profile also carries an unknown future_field. The version refusal has to win: it must name the value 1.1 and the quoted string form, and it must not report a missing version key or the unknown property",
+      "tier": 1,
+      "profile": {
+        "version": 1.1,
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "future_field": true,
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "address.pattern uses an ATOMIC GROUP, which Python re compiles and the Rust regex crate refuses",
+      "tier": 3,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The address this adapter owns.",
+          "pattern": "^(?>a)$",
+          "example": "a"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "address.pattern uses a CONDITIONAL GROUP, which Python re compiles and the Rust regex crate refuses",
+      "tier": 3,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^([a-z]+)?(?(1)@example\\.test|admin)$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "address.pattern uses an INLINE COMMENT GROUP, which Python re compiles and the Rust regex crate refuses",
+      "tier": 3,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9]+(?#the local part)@example\\.test$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "address.pattern opens with the Python only ASCII flag, which Python re compiles and the Rust regex crate refuses",
+      "tier": 3,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "(?a)^[a-z0-9]+@example\\.test$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "address.pattern anchors with Python's \\Z, which the Rust regex crate spells \\z and refuses as written",
+      "tier": 3,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9]+@example\\.test\\Z",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "address.pattern uses Python's \\N named character escape, which the Rust regex crate has no equivalent for and refuses",
+      "tier": 3,
+      "profile": {
+        "version": "1.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9]+\\N{COMMERCIAL AT}example\\.test$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "version carries a LEADING ZERO. The Rust CLI compares the declared string to 1.0 for equality and refuses this, so a Python side that parsed the numbers and accepted it would take a profile curie adapter validate rejects. The refusal has to name the spelling, not report a mismatch between two versions an operator reads as equal",
+      "tier": 1,
+      "profile": {
+        "version": "01.0",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    },
+    {
+      "why": "the version MINOR carries a leading zero, the same non canonical spelling as 01.0 on the other side of the dot",
+      "tier": 1,
+      "profile": {
+        "version": "1.00",
+        "kind": "email",
+        "endpoint": "https://curie-mail-adapter.example.test/curie/reply",
+        "address": {
+          "description": "The mailbox this adapter owns.",
+          "pattern": "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$",
+          "example": "agent@example.test"
+        },
+        "credentials": {
+          "egress": "agentmail-sandbox",
+          "egress_secret_env": "CURIE_EGRESS_SECRET",
+          "ingress_token_env": "CURIE_INGRESS_TOKEN"
+        },
+        "conformance": {
+          "wire_version": "1.0"
+        }
+      }
+    }
+  ]
+}

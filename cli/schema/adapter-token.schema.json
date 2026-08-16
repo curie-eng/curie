@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/adapter-token/v1.json",
+  "title": "curie adapter token --json",
+  "description": "The agent-facing payload of `curie adapter token`, the ONE result that carries a credential value and the one that declares itself as such. The token goes to stdout and to no diagnostic stream, so a caller can pipe stdout while keeping stderr in a log.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "token": {
+      "type": "string",
+      "description": "The minted chn token, scoped to the pair below for ttl_s seconds."
+    },
+    "secret": {
+      "type": "boolean",
+      "const": true,
+      "description": "Pinned true so a consumer can branch on it: this payload carries a credential value."
+    },
+    "kind": {
+      "type": "string",
+      "description": "The channel kind the token is scoped to."
+    },
+    "address": {
+      "type": "string",
+      "description": "The concrete address the token is scoped to. The API resolves on the pair, never the address alone."
+    },
+    "ttl_s": {
+      "type": "integer",
+      "description": "The token lifetime in seconds, between 1 and 604800."
+    }
+  },
+  "required": [
+    "token",
+    "secret",
+    "kind",
+    "address",
+    "ttl_s"
+  ]
+}

@@ -1,0 +1,99 @@
+{
+  "models": {
+    "AdapterConformance": {
+      "additionalProperties": false,
+      "properties": {
+        "wire_version": {
+          "const": "1.0",
+          "type": "string"
+        }
+      },
+      "required": [
+        "wire_version"
+      ]
+    },
+    "AdapterCredentials": {
+      "additionalProperties": false,
+      "properties": {
+        "egress": {
+          "pattern": "^[a-z0-9]+(?:[-_][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "egress_secret_env": {
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "type": "string"
+        },
+        "ingress_token_env": {
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "egress",
+        "egress_secret_env",
+        "ingress_token_env"
+      ]
+    },
+    "AdapterProfile": {
+      "additionalProperties": false,
+      "properties": {
+        "address": {
+          "$ref": "#/$defs/AddressShape"
+        },
+        "conformance": {
+          "$ref": "#/$defs/AdapterConformance"
+        },
+        "credentials": {
+          "$ref": "#/$defs/AdapterCredentials"
+        },
+        "endpoint": {
+          "anyOf": [
+            {
+              "pattern": "^https?://[^\\s/?#@]+(?:[/?#][^\\s]*)?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "pattern": "^[a-z0-9]+(?:[-_][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "version": {
+          "const": "1.0",
+          "type": "string"
+        }
+      },
+      "required": [
+        "address",
+        "conformance",
+        "credentials",
+        "kind",
+        "version"
+      ]
+    },
+    "AddressShape": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "example": {
+          "type": "string"
+        },
+        "pattern": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "description",
+        "example",
+        "pattern"
+      ]
+    }
+  },
+  "version": "1.0"
+}

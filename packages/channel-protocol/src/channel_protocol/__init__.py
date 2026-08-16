@@ -1,5 +1,12 @@
 """Rendering-neutral messages shared by Curie channel adapters."""
 
+from .manifest import (
+    PROFILE_VERSION,
+    AdapterConformance,
+    AdapterCredentials,
+    AdapterProfile,
+    AddressShape,
+)
 from .models import (
     MESSAGE_VERSION,
     Action,
@@ -27,8 +34,13 @@ from .reply import (
 
 __all__ = [
     "MESSAGE_VERSION",
+    "PROFILE_VERSION",
     "REPLY_WIRE_VERSION",
     "Action",
+    "AdapterConformance",
+    "AdapterCredentials",
+    "AdapterProfile",
+    "AddressShape",
     "ChannelCapability",
     "ChannelCapabilities",
     "ChoiceIntent",

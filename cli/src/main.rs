@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
+use curie::adapter;
 use curie::api;
 use curie::artifacts;
 use curie::commands::{
@@ -354,6 +355,17 @@ enum Command {
     /// memorizing the full command surface.
     #[command(alias = "ui", alias = "tui")]
     Interactive,
+    /// Build, validate, bind and smoke-test a channel adapter against an
+    /// install: `adapter <scaffold|validate|bind|token|smoke-test>`.
+    ///
+    /// Reads an `adapter.yaml` binding profile (kind, address shape, reply
+    /// route, egress credential identity) validated against the committed
+    /// `packages/channel-protocol` schema, so the CLI and the Python conformance
+    /// kit agree on one contract instead of two mirrors.
+    Adapter {
+        #[command(subcommand)]
+        action: AdapterAction,
+    },
     /// Store and manage local secrets in Curie private storage.
     Secrets {
         #[command(subcommand)]
@@ -573,6 +585,162 @@ enum SecretsAction {
     Unset {
         /// Environment-variable-style secret name.
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdapterAction {
+    /// Write one binding profile for a new adapter, plus the next steps.
+    ///
+    /// Deliberately minimal: one `adapter.yaml` and nothing else. The generated
+    /// `address.pattern` matches exactly the address it was scaffolded for, so
+    /// the profile validates on the very next command; widen it by hand to the
+    /// real shape of your channel's addresses.
+    Scaffold {
+        /// Adapter name. The profile is written to `<dir>/<name>/adapter.yaml`.
+        name: String,
+        /// Channel kind this adapter owns, as a lowercase slug (e.g. email).
+        #[arg(long)]
+        kind: String,
+        /// A concrete address of the shape this adapter owns.
+        #[arg(long)]
+        address: String,
+        /// The absolute http or https route the worker POSTs reply events to.
+        #[arg(long)]
+        endpoint: String,
+        /// The egress credential identity this adapter suggests, as a lowercase
+        /// slug. A suggestion only: `adapter bind` asks an operator to confirm it.
+        #[arg(long)]
+        adapter: String,
+        /// Parent directory for the scaffolded adapter. Defaults to the current
+        /// directory.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Accept or refuse a binding profile, and report the values it parsed.
+    ///
+    /// The version is checked first, then the committed schema, then the one
+    /// rule a schema cannot express: `address.pattern` has to compile with the
+    /// Rust regex crate as well as Python `re`, so no lookaround and no
+    /// backreferences.
+    Validate {
+        /// Path to the binding profile.
+        #[arg(short = 'f', long = "file", default_value = "adapter.yaml")]
+        file: PathBuf,
+        /// Also check that this concrete address matches the profile's declared
+        /// shape.
+        #[arg(long)]
+        address: Option<String>,
+    },
+    /// Write an agent's four field channel route: kind, address, endpoint and
+    /// the egress credential slug.
+    ///
+    /// `--address` and `--adapter-slug` are operator inputs, never taken from
+    /// the profile: `address.example` is authoring documentation, and the slug
+    /// selects which stored secret the worker sends, so a profile chosen value
+    /// could redirect another adapter's credential. A slug differing from the
+    /// profile's suggestion is shown with both values before it is written.
+    Bind {
+        /// Path to the binding profile.
+        #[arg(short = 'f', long = "file", default_value = "adapter.yaml")]
+        file: PathBuf,
+        /// Agent id to bind.
+        agent: String,
+        /// The concrete address to bind, checked against the profile's shape.
+        #[arg(long)]
+        address: String,
+        /// The egress credential identity to write. Operator owned.
+        #[arg(long)]
+        adapter_slug: String,
+        /// Reply route override, for a profile that declares no endpoint.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Platform API base URL.
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        /// Platform API key.
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Confirm the destination and the credential identity, and write.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Mint a `chn` token for one concrete (kind, address) pair.
+    ///
+    /// The only verb whose payload carries a credential value: it rides under
+    /// `token` alongside `"secret": true`, on stdout and on no diagnostic
+    /// stream.
+    Token {
+        /// Path to the binding profile.
+        #[arg(short = 'f', long = "file", default_value = "adapter.yaml")]
+        file: PathBuf,
+        /// The concrete address to mint for, checked against the profile's shape.
+        #[arg(long)]
+        address: String,
+        /// Platform API base URL.
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        /// Platform API key.
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Token lifetime in seconds. The API accepts 1 to 604800.
+        #[arg(long, default_value_t = 3600)]
+        ttl_s: u64,
+    },
+    /// Probe a deployed adapter from the outside: does this endpoint accept the
+    /// egress secret you supply, does it refuse a wrong one, and are the route
+    /// fields present for this pair.
+    ///
+    /// Those two narrow claims are all it makes. It does not prove the running
+    /// worker holds that slug or that value, and it is not the conformance
+    /// floor: `curie-adapter-conformance` is the stricter check.
+    #[command(name = "smoke-test")]
+    SmokeTest {
+        /// Path to the binding profile.
+        #[arg(short = 'f', long = "file", default_value = "adapter.yaml")]
+        file: PathBuf,
+        /// The concrete address to probe, checked against the profile's shape.
+        #[arg(long)]
+        address: String,
+        /// Reply route override, for a profile that declares no endpoint.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Platform API base URL.
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        /// Platform API key.
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Read the egress secret from this file. One of the two accepted
+        /// sources; the profile names the variable its own adapter reads and
+        /// that name is never resolved here.
+        #[arg(long)]
+        secret_file: Option<PathBuf>,
+        /// Read the egress secret from stdin instead.
+        #[arg(long)]
+        secret_stdin: bool,
+        /// Also post a real turn twice and assert the second is reported as a
+        /// duplicate. This enqueues a REAL turn against the bound agent.
+        #[arg(long)]
+        enqueue: bool,
+        /// Probe a cleartext http endpoint anyway.
+        #[arg(long)]
+        allow_insecure: bool,
+        /// Confirm the destination and the credential identity, and probe.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1972,6 +2140,93 @@ async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Install { update }) => commands::install(update).await,
         Some(Command::Update { image }) => commands::update(image).await,
         Some(Command::Interactive) => curie::interactive::run().await,
+        Some(Command::Adapter { action }) => match action {
+            AdapterAction::Scaffold {
+                name,
+                kind,
+                address,
+                endpoint,
+                adapter: slug,
+                dir,
+            } => emit(adapter::scaffold(adapter::ScaffoldOpts {
+                name,
+                kind,
+                address,
+                endpoint,
+                adapter: slug,
+                dir,
+            })?),
+            AdapterAction::Validate { file, address } => {
+                emit(adapter::validate(&file, address.as_deref())?)
+            }
+            AdapterAction::Bind {
+                file,
+                agent,
+                address,
+                adapter_slug,
+                endpoint,
+                api_url,
+                api_key,
+                yes,
+            } => emit(
+                adapter::bind(adapter::BindOpts {
+                    file,
+                    agent,
+                    address,
+                    adapter_slug,
+                    endpoint,
+                    api_url,
+                    api_key,
+                    yes,
+                })
+                .await?,
+            ),
+            AdapterAction::Token {
+                file,
+                address,
+                api_url,
+                api_key,
+                ttl_s,
+            } => emit(
+                adapter::token(adapter::TokenOpts {
+                    file,
+                    address,
+                    api_url,
+                    api_key,
+                    ttl_s,
+                })
+                .await?,
+            ),
+            // `smoke-test` emits its own report and then applies the exit-code
+            // side effect, the same shape `report_eval` uses: a failing verdict
+            // must still hand back the per-check detail before exiting non-zero.
+            AdapterAction::SmokeTest {
+                file,
+                address,
+                endpoint,
+                api_url,
+                api_key,
+                secret_file,
+                secret_stdin,
+                enqueue,
+                allow_insecure,
+                yes,
+            } => {
+                adapter::smoke_test(adapter::SmokeTestOpts {
+                    file,
+                    address,
+                    endpoint,
+                    api_url,
+                    api_key,
+                    secret_file,
+                    secret_stdin,
+                    enqueue,
+                    allow_insecure,
+                    yes,
+                })
+                .await
+            }
+        },
         Some(Command::Secrets { action }) => match action {
             SecretsAction::Set { name, from_env } => {
                 secrets::set(secrets::SetSecretOpts { name, from_env })

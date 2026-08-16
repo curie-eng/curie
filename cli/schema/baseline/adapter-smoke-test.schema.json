@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/adapter-smoke-test/v1.json",
+  "title": "curie adapter smoke-test --json",
+  "description": "The agent-facing payload of `curie adapter smoke-test`, machine readable in the same shape as the conformance kit's report. Two narrow claims only: the egress checks say whether THIS endpoint accepts the secret the operator supplied and refuses a wrong one, and the binding check says whether the route FIELDS are present for the pair. Neither says the running worker holds that slug or that value, and neither is whole floor conformance, which is why nothing here is named conformant and why manual_review_required is always reported. Credential IDENTITIES only, never a credential value; the endpoint is reduced to scheme, host and port.",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The check's stable identifier."
+        },
+        "ok": {
+          "type": "boolean",
+          "description": "Whether this check passed."
+        },
+        "status": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "The HTTP status observed, or null when nothing answered."
+        },
+        "detail": {
+          "type": "string",
+          "description": "What was observed, in the narrow terms this verb is allowed to claim."
+        }
+      },
+      "required": [
+        "name",
+        "ok",
+        "status",
+        "detail"
+      ]
+    }
+  },
+  "properties": {
+    "endpoint": {
+      "type": "string",
+      "description": "The probed reply route, reduced to scheme, host and port. An endpoint can carry a token in its path or query."
+    },
+    "kind": {
+      "type": "string",
+      "description": "The channel kind probed."
+    },
+    "address": {
+      "type": "string",
+      "description": "The concrete address probed, from --address."
+    },
+    "verdict": {
+      "enum": [
+        "pass",
+        "fail"
+      ],
+      "description": "pass only when every check that ran passed. It is not a conformance verdict."
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How many checks passed, failed, and did not run. A check that did not run is counted, never dropped, so no evidence never reads as evidence.",
+      "properties": {
+        "pass": {
+          "type": "integer"
+        },
+        "fail": {
+          "type": "integer"
+        },
+        "not_run": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pass",
+        "fail",
+        "not_run"
+      ]
+    },
+    "manual_review_required": {
+      "type": "array",
+      "description": "The floor clauses no wire probe can observe, which a human has to read the adapter's code for.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "egress_positive": {
+      "$ref": "#/$defs/check",
+      "description": "The endpoint accepted the operator supplied secret and answered inside the ack rules."
+    },
+    "egress_negative": {
+      "$ref": "#/$defs/check",
+      "description": "The endpoint refused a deliberately wrong secret. A 2xx here is a hard failure: the adapter is not authenticating the platform."
+    },
+    "binding": {
+      "$ref": "#/$defs/check",
+      "description": "The route fields are present for this pair: a 404 means unbound, a 409 means the reply route is unset."
+    },
+    "round_trip": {
+      "description": "The --enqueue check, or null when it did not run. It posts a REAL turn twice and asserts the second is reported as a duplicate.",
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "status": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "detail": {
+              "type": "string"
+            },
+            "duplicate": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "description": "What the platform reported for the second post of the same delivery_id."
+            }
+          },
+          "required": [
+            "name",
+            "ok",
+            "status",
+            "detail",
+            "duplicate"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "endpoint",
+    "kind",
+    "address",
+    "verdict",
+    "counts",
+    "manual_review_required",
+    "egress_positive",
+    "egress_negative",
+    "binding",
+    "round_trip"
+  ]
+}

@@ -75,6 +75,23 @@ pub struct ChannelBinding {
     pub address: String,
 }
 
+/// The four-field channel route `curie adapter bind` WRITES (#1516).
+///
+/// A separate write-side struct rather than `Option` fields on [`ChannelBinding`]:
+/// the route is write-only (an agent read returns exactly `{kind, address}`), so
+/// widening the read model would make it claim a shape the API never returns.
+/// All four fields travel together because the API refuses a non-`slack` binding
+/// whose reply route is half set, and the `adapter` slug is always the operator's
+/// `--adapter-slug` -- it selects which stored secret the worker sends, so a
+/// profile-supplied value never reaches this struct on its own.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChannelBindingWrite {
+    pub kind: String,
+    pub address: String,
+    pub endpoint: String,
+    pub adapter: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
     pub id: String,
@@ -631,6 +648,18 @@ impl ApiClient {
             .json()
             .await
             .context("decoding updated agent")
+    }
+
+    /// Write one agent's four-field channel route (#1516): `PATCH /agents/{id}`
+    /// with the whole [`ChannelBindingWrite`], since the API refuses a
+    /// non-`slack` binding whose reply route is half set.
+    pub async fn set_agent_channel(
+        &self,
+        agent_id: &str,
+        binding: &ChannelBindingWrite,
+    ) -> Result<Agent> {
+        self.update_agent(agent_id, &json!({ "channel": binding }))
+            .await
     }
 
     /// Bind the per-agent connector secrets (ADR-0009, #429). The values travel
