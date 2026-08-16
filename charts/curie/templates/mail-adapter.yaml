@@ -1,0 +1,162 @@
+{{- if .Values.mailAdapter.deploy }}
+{{/*
+The first-party email channel (#1515): the adapter polls an AgentMail inbox,
+posts each allowed message to the platform as a turn, and replies on the same
+mail thread when the worker delivers the turn's events back.
+
+Modeled on templates/dispatcher.yaml, with six deliberate divergences:
+
+ 1. A Service exists. The dispatcher dials Slack outbound over a websocket and
+    has no inbound port; this adapter receives reply.update / turn.completed
+    from the worker over HTTP, so the worker needs an address to deliver to.
+ 2. curie.env.api is deliberately NOT included. That helper renders a
+    CURIE_API_KEY secretKeyRef alongside the URL, and the adapter must hold no
+    platform API key: it authenticates with CURIE_CHANNEL_TOKEN, scoped to the
+    one channel binding it serves. CURIE_API_URL is therefore rendered here from
+    curie.api.url, the derivation curie.env.api itself uses, off
+    mailAdapter.apiBaseUrl. Include that helper, never a copy of its expression.
+ 3. An HTTP /healthz probe replaces curie.heartbeatProbes, which exists only for
+    the portless services (worker, dispatcher). GET /healthz is unauthenticated
+    and static; every POST still requires the egress secret.
+ 4. replicas is hardcoded 1 and the strategy is Recreate, neither of them a
+    value. Every routing map in the adapter (seen, conversations,
+    replied_event_ids, in_flight) is process-local and the Service has no
+    session affinity, so a second pod answers turn.completed for a conversation
+    it never saw and the reply lands on the wrong mail thread -- or nowhere.
+    Any count other than 1 is wrong at every cluster size, which is why there is
+    no mailAdapter.replicas key to set: a knob that must never be turned is
+    worse than no knob. Recreate is required for the same reason, because the
+    default rolling update runs two pods at once for the duration of every
+    upgrade. This is the one recorded exception to the values-not-templates
+    invariant in charts/curie/CLAUDE.md; horizontal scale needs shared state and
+    is a separate ticket, at which point the exception is removed, not extended.
+ 5. A checksum/mail-adapter-credentials pod-template annotation, the same idiom
+    as worker.yaml:96-110 (see its comment for the canonical rationale) and
+    otel-collector.yaml / clickhouse.yaml. Env is read once at boot, so without
+    it a `helm upgrade` that rotates an expired token leaves the pod 401ing at
+    AgentMail behind a green /healthz. Scoped to this adapter's own three
+    credentials so an unrelated key rotating in the shared Secret does not
+    restart it.
+ 6. The deploy gate is a bare `.Values.mailAdapter.deploy`, deliberately NOT the
+    dispatcher's three-way curie.dispatcher.enabled gate on deploy plus both
+    tokens. mailAdapter.deploy defaults to false, so an operator who sets it true
+    has made a deliberate choice and deserves a loud crash-loop naming the
+    missing variable (the adapter's own boot gates do exactly that), not a
+    Deployment that silently fails to render and leaves them hunting for a typo
+    in their values file. The same bare check appears in curie.adapterCredentials,
+    which derives this adapter's egress entry only when it is deployed.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "curie.fullname" . }}-mail-adapter
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail-adapter
+spec:
+  selector:
+    {{- include "curie.selectorLabels" (dict "root" . "component" "mail-adapter") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.mailAdapter.service.port }}
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "curie.fullname" . }}-mail-adapter
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail-adapter
+spec:
+  # Divergence 4 above: pinned, not configurable.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "mail-adapter") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/mail-adapter-credentials: {{ dict "channelToken" .Values.mailAdapter.channelToken "egressSecret" .Values.mailAdapter.egressSecret "agentmailApiKey" .Values.mailAdapter.agentmail.apiKey | toJson | sha256sum }}
+      labels:
+        {{- include "curie.labels" . | nindent 8 }}
+        {{- include "curie.selectorLabels" (dict "root" . "component" "mail-adapter") | nindent 8 }}
+    spec:
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.mailAdapter.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: mail-adapter
+          image: {{ include "curie.image" (dict "repository" .Values.mailAdapter.image.repository "tag" .Values.mailAdapter.image.tag "digest" .Values.mailAdapter.image.digest "defaultTag" .Chart.AppVersion) | quote }}
+          imagePullPolicy: {{ .Values.mailAdapter.image.pullPolicy }}
+          {{- with .Values.mailAdapter.containerSecurityContext }}
+          {{- include "curie.containerSecurityContext" . | nindent 10 }}
+          {{- end }}
+          env:
+            # Where the platform API lives. Empty mailAdapter.apiBaseUrl (the
+            # default) derives the in-chart API Service; a set value renders
+            # verbatim and is the only correct answer when api.deploy is false.
+            # The port comes from api.service.port so the two cannot drift.
+            # Deliberately not curie.env.api -- see divergence 2 above.
+            - name: CURIE_API_URL
+              value: {{ include "curie.api.url" (dict "root" . "baseUrl" .Values.mailAdapter.apiBaseUrl) | quote }}
+            # The three credentials, by reference only: an inline value would put
+            # them into `helm get manifest` output and into every rendered
+            # artifact CI uploads.
+            - name: CURIE_CHANNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: mailChannelToken
+            - name: CURIE_EGRESS_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: mailEgressSecret
+            - name: AGENTMAIL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: mailAgentmailApiKey
+            - name: AGENTMAIL_INBOX
+              value: {{ .Values.mailAdapter.inbox | quote }}
+            - name: AGENTMAIL_BASE_URL
+              value: {{ .Values.mailAdapter.agentmail.baseUrl | quote }}
+            - name: CURIE_MAIL_POLL_INTERVAL_SECONDS
+              value: {{ .Values.mailAdapter.pollIntervalSeconds | quote }}
+            - name: ADAPTER_INGRESS_ENABLED
+              value: {{ .Values.mailAdapter.ingressEnabled | quote }}
+            # Rendered even when the list is empty, and empty on purpose: the
+            # adapter's boot gate refuses an inbox that answers nobody, which is
+            # the honest signal. Omitting the variable instead would let the
+            # process fall back to its own default and start.
+            - name: CURIE_MAIL_ALLOWED_SENDERS
+              value: {{ join "," .Values.mailAdapter.allowedSenders | quote }}
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          resources:
+            {{- toYaml .Values.mailAdapter.resources | nindent 12 }}
+{{- end }}

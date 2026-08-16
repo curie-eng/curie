@@ -105,6 +105,26 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- printf "%s-langfuse-web" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* Base URL of the platform API for a first-party service that calls it. Call
+     with a dict: root (the top context) and baseUrl (that caller's own BYO
+     override, e.g. .Values.dispatcher.apiBaseUrl or
+     .Values.mailAdapter.apiBaseUrl). An empty override derives the in-chart API
+     Service; a set value renders verbatim and is the BYO answer, the only
+     correct one when api.deploy is false. The port comes from api.service.port
+     so the two sides cannot drift.
+
+     Split out of curie.env.api so the derivation exists once: a caller that
+     cannot use that helper wholesale (the mail adapter, which must hold no
+     platform API key) includes this instead of copying the expression.
+
+     Note the deliberate absence of a `required` call for the api.deploy=false
+     case that the sibling `X.host` helpers above use: an empty override with
+     api.deploy=false yields a CrashLoopBackOff by design (documented in
+     NOTES.txt and the README), not a render-time failure. */}}
+{{- define "curie.api.url" -}}
+{{- .baseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .root) .root.Values.api.service.port) -}}
+{{- end -}}
+
 {{/* base64("<publicKey>:<secretKey>") for the OTel Collector's Authorization
      header. Uses the operator override when set, otherwise derives it from the
      Langfuse init keys so the trace path authenticates with no manual step. */}}
@@ -242,14 +262,11 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
      curie.env.valkey do: the API URL env has now been forgotten three
      times on new callers, while the store envs never recurred, because those had
      a helper to include and this did not. Wire a new API caller by including
-     this rather than re-deriving the URL inline.
+     this rather than re-deriving the URL inline; a caller that must not receive
+     CURIE_API_KEY includes curie.api.url instead, never a copied expression.
 
-     The BYO override is .Values.dispatcher.apiBaseUrl. Note the deliberate
-     absence of a `required` call for the api.deploy=false case that the sibling
-     `X.host` helpers use: an empty override with api.deploy=false yields a
-     CrashLoopBackOff by design (documented in NOTES.txt and the README), not a
-     render-time failure. Include with `nindent 12` to land at a container's env
-     column. */}}
+     The BYO override is .Values.dispatcher.apiBaseUrl. Include with
+     `nindent 12` to land at a container's env column. */}}
 {{- define "curie.env.api" -}}
 # Where the platform API lives. The dispatcher POSTs an approval
 # resolve here when someone clicks Approve in Slack, so an unwired
@@ -260,7 +277,7 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 # the only correct one when api.deploy is false. The port comes from
 # api.service.port so the two sides cannot drift.
 - name: CURIE_API_URL
-  value: {{ .Values.dispatcher.apiBaseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .) .Values.api.service.port) | quote }}
+  value: {{ include "curie.api.url" (dict "root" . "baseUrl" .Values.dispatcher.apiBaseUrl) | quote }}
 # The same chart Secret key api.yaml consumes as API_KEY, so the
 # caller and the API cannot drift apart. By reference only: an inline
 # value would put the shared platform key into `helm get manifest`
@@ -479,6 +496,50 @@ true
 {{- if and .Values.dispatcher.deploy .Values.dispatcher.slack.appToken .Values.dispatcher.slack.botToken -}}
 true
 {{- end -}}
+{{- end -}}
+
+{{/* ---- Coalesced per-adapter egress credentials (ADR-0096 D4.2) ----
+     The JSON object the chart Secret stores under `adapterCredentials` and the
+     worker reads as CURIE_ADAPTER_CREDENTIALS. Two call sites, which must stay
+     in step or the rotation guarantee breaks:
+       templates/secrets.yaml  -- renders it as the Secret value
+       templates/worker.yaml   -- hashes it into checksum/adapter-credentials
+     Emits JSON already, so the worker's pipeline is `include ... | sha256sum`,
+     NOT `... | toJson | sha256sum`: double-encoding hashes something the Secret
+     never contained and rolls every worker on every upgrade.
+
+     The mail adapter's half of its egress pair is DERIVED here so
+     `mailAdapter.egressSecret` is the single source of truth for both sides
+     (decision 5). An operator who also hand-writes the same slug with the same
+     value is accepted unchanged, so a migration from hand-rolled manifests is
+     not blocked; a DIFFERENT value fails the render, because a mismatch is not
+     a preference. It is an operator who believes two things at once, and either
+     value shipping produces an install whose reply path 401s.
+
+     The map is deep-copied before the derived entry is set. Helm dicts are
+     references, and mutating a `.Values` subtree in place leaks into every
+     later template in the same render.
+
+     The map is per-slug but the derive-and-conflict-fail block below hardcodes
+     mailAdapter. That is correct at one first-party adapter and speculative to
+     parameterize now; the THIRD adapter is the point at which it generalizes,
+     because the second one copying about twelve lines including the fail message
+     is the signal, not the cost. */}}
+{{- define "curie.adapterCredentials" -}}
+{{- $creds := deepCopy (.Values.worker.adapterCredentials | default dict) -}}
+{{- if .Values.mailAdapter.deploy -}}
+{{- $slug := .Values.mailAdapter.adapterSlug -}}
+{{- $derived := .Values.mailAdapter.egressSecret -}}
+{{- if hasKey $creds $slug -}}
+{{- $existing := get $creds $slug -}}
+{{- if ne $existing $derived -}}
+{{- fail (printf "worker.adapterCredentials.%s and mailAdapter.egressSecret are set to DIFFERENT values. mailAdapter.egressSecret is the source of truth for both halves of the mail adapter's egress pair: the chart derives worker.adapterCredentials.%s from it. Fix it by deleting the hand-written worker.adapterCredentials.%s entry (mailAdapter.egressSecret then supplies both halves), or by setting that entry to the same value as mailAdapter.egressSecret. Neither value is printed here on purpose: both are live egress credentials and this message lands in terminal scrollback and CI logs." $slug $slug $slug) -}}
+{{- end -}}
+{{- else -}}
+{{- $_ := set $creds $slug $derived -}}
+{{- end -}}
+{{- end -}}
+{{- $creds | toJson -}}
 {{- end -}}
 
 {{/* ---- Sandbox container hardening (Rail 3) ----

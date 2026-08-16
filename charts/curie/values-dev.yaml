@@ -92,6 +92,17 @@ dispatcher:
     tag: local
     pullPolicy: Never
 
+# Off by default (mailAdapter.deploy stays false here), but the image override
+# must be in place for the offline profile: an operator who turns the email
+# channel on with `--set mailAdapter.deploy=true` on a disconnected cluster would
+# otherwise get the GHCR default on pullPolicy Always and an adapter that never
+# starts.
+mailAdapter:
+  image:
+    repository: curie-mail-adapter
+    tag: local
+    pullPolicy: Never
+
 worker:
   image:
     repository: curie-worker

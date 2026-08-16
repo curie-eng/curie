@@ -102,8 +102,12 @@ spec:
         # credential they believe they revoked. Same sha256sum-of-the-rendered-
         # value idiom as otel-collector.yaml and clickhouse.yaml. Scoped to this
         # value on purpose: annotating the whole Secret would restart the workers
-        # on any unrelated credential change in it.
-        checksum/adapter-credentials: {{ .Values.worker.adapterCredentials | toJson | sha256sum }}
+        # on any unrelated credential change in it. The hashed value is the map
+        # coalesced by curie.adapterCredentials; see _helpers.tpl for why. That
+        # helper already emits JSON: piping it through toJson again would hash
+        # something the Secret never contained and roll every worker on every
+        # upgrade.
+        checksum/adapter-credentials: {{ include "curie.adapterCredentials" . | sha256sum }}
       labels:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 8 }}

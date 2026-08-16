@@ -425,6 +425,8 @@ jobs:
             dockerfile: apps/api/Dockerfile
           - name: dispatcher
             dockerfile: apps/dispatcher/Dockerfile
+          - name: mail-adapter
+            dockerfile: apps/mail-adapter/Dockerfile
           - name: worker
             dockerfile: apps/worker/Dockerfile
           - name: ui
@@ -483,6 +485,24 @@ jobs:
         run: docker build -t curie-dispatcher:ci-smoke -f apps/dispatcher/Dockerfile .
       - name: Entrypoint imports resolve in the built image
         run: docker run --rm --entrypoint python curie-dispatcher:ci-smoke -c "import curie_dispatcher; import aci_protocol"
+
+  # Same gap, same shape (issue #428). The mail adapter image also builds with
+  # `uv sync --no-editable`, so it installs only the package's DECLARED
+  # dependencies: aci-protocol (a uv workspace member) and pydantic-settings
+  # stay importable from a source checkout while being absent from the isolated
+  # image venv, and the process crash-loops on startup. The build-only `images`
+  # job above never runs the image, so this is the one place that is observable.
+  mail-adapter-image-smoke:
+    name: Mail adapter image imports resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build the mail adapter image locally
+        run: docker build -t curie-mail-adapter:ci-smoke -f apps/mail-adapter/Dockerfile .
+      - name: Entrypoint imports resolve in the built image
+        run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_mail_adapter; import aci_protocol; import pydantic_settings"
 
   # FALSIFIABILITY gate for the committed eval suites (issue #619). This is NOT
   # an E2E test: it never runs a real agent or makes a model call. It boots the
