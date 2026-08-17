@@ -371,6 +371,10 @@ jobs:
             echo "weather case cannot be answered honestly without one" >&2
             exit 1
           fi
+          # FALSIFIABILITY PROBE ONLY (#1602, never merged): point the
+          # allowance at TEST-NET-1, where nothing listens, so the forecast
+          # fetch fails while every other variable stays identical.
+          addrs="192.0.2.1"
           routes=""
           for addr in $addrs; do
             routes="$routes --allow-web-egress $addr/32"
