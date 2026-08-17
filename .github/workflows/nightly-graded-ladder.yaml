@@ -340,43 +340,6 @@ jobs:
           for img in curie-api:local curie-worker:local curie-ui:local curie-runner:latest; do
             kind load docker-image "$img" --name curie-e2e
           done
-      # The graded case's skill (examples/weather) fetches a forecast PAGE and
-      # date-matches it, and forbids reporting a number that came only from a
-      # search-result summary. Search is served away from the pod; WebFetch
-      # egresses from it. So under provider-only egress the case is unanswerable:
-      # a rule-following agent refuses and the regex grader reds the refusal,
-      # while a green means the model broke its own skill rule (#1602). Open the
-      # national weather service the skill names as its preferred source, and
-      # nothing else -- the skill/local rungs already fetch this exact host
-      # (forecast.weather.gov/MapClick.php) on every green run.
-      #
-      # Resolved HERE rather than hardcoded, which is the same install-time
-      # resolve ADR-0032 defines for --allow-egress-host <provider>: the host is
-      # CDN-fronted, so its addresses rotate and a pinned literal decays. Every
-      # A record becomes its own /32, so the allowance stays host-scoped rather
-      # than opening the CDN's enclosing block, and the runner resolves the same
-      # names through the same recursive resolver minutes later. Re-running the
-      # job re-resolves, which is the documented recovery for a rotated address.
-      - name: Resolve the forecast-source egress routes
-        run: |
-          set -euo pipefail
-          # api.weather.gov and www.weather.gov share the forecast host's
-          # address set today; resolving all three is what keeps that an
-          # observation rather than an assumption.
-          addrs="$(for host in forecast.weather.gov www.weather.gov api.weather.gov; do
-                     getent ahostsv4 "$host" | awk '{print $1}'
-                   done | sort -u)"
-          if [[ -z "$addrs" ]]; then
-            echo "could not resolve any forecast-source address; the graded" >&2
-            echo "weather case cannot be answered honestly without one" >&2
-            exit 1
-          fi
-          routes=""
-          for addr in $addrs; do
-            routes="$routes --allow-web-egress $addr/32"
-          done
-          echo "forecast-source egress routes:$routes"
-          echo "CURIE_E2E_FORECAST_EGRESS=$routes" >> "$GITHUB_ENV"
       # The graded install. Unlike ci.yaml's cluster job (which seals the
       # install credential-free, the plumbing-only path ADR-0055 bounds), this
       # install is armed: no seal flag, the OpenRouter credential supplied via
@@ -385,9 +348,7 @@ jobs:
       # model (cluster up reads it from env; it has no --model flag), and
       # --allow-egress-host openrouter (the provider KEYWORD, resolved to a /32
       # host route at install time) so the default-deny runner sandbox can
-      # reach OpenRouter. CURIE_E2E_FORECAST_EGRESS carries the forecast-source
-      # /32s resolved above and is deliberately unquoted, because it is a flag
-      # list rather than one value. The --set overrides repoint every first-party image at
+      # reach OpenRouter. The --set overrides repoint every first-party image at
       # the just-loaded local tags with pullPolicy Never, force gVisor off (no
       # runsc on kind nodes -- a real-model install fails closed without this),
       # and drop the dispatcher (no Slack; its presence would trip the
@@ -404,7 +365,6 @@ jobs:
             --chart charts/curie \
             --dev \
             --allow-egress-host openrouter \
-            ${CURIE_E2E_FORECAST_EGRESS} \
             --set security.gvisor.mode=off \
             --set dispatcher.deploy=false \
             --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \

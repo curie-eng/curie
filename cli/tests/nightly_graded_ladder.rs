@@ -174,48 +174,6 @@ fn nightly_cluster_install_opens_openrouter_egress_and_never_seals() {
     );
 }
 
-/// The cluster install must ALSO open egress to the forecast source the graded
-/// weather case needs (#1602). Provider egress reaches the model and nothing
-/// else, and the skill fetches a forecast page before it will report a number,
-/// so with only `--allow-egress-host openrouter` a rule-following agent refuses
-/// and the regex grader reds the refusal -- the case can then only go green by
-/// the model breaking its own skill rule. The allowance must stay resolved at
-/// job time (`getent`) rather than hardcoded: the host is CDN-fronted, so a
-/// literal address decays, which is the same reason `--allow-egress-host`
-/// resolves its provider at install time (ADR-0032).
-#[test]
-fn nightly_cluster_install_opens_forecast_source_web_egress() {
-    let text = nightly();
-    assert!(
-        text.contains("${CURIE_E2E_FORECAST_EGRESS}"),
-        "the nightly workflow's cluster install must pass the resolved \
-         forecast-source routes to `cluster up`; without web egress the graded \
-         weather case cannot be answered honestly (#1602); file contents:\n{text}"
-    );
-    assert!(
-        text.contains("--allow-web-egress $addr/32"),
-        "the forecast-source allowance must render one `--allow-web-egress \
-         <addr>/32` per resolved address, so it stays host-scoped rather than \
-         opening the CDN's enclosing block; file contents:\n{text}"
-    );
-    assert!(
-        text.contains("forecast.weather.gov"),
-        "the forecast-source routes must be RESOLVED from the hostname at job \
-         time, not hardcoded as literal addresses that decay when the CDN \
-         remaps (ADR-0032's install-time-resolve rule); file contents:\n{text}"
-    );
-    for line in text.lines() {
-        if line.contains("--allow-web-egress") {
-            assert!(
-                !line.contains("/0"),
-                "the forecast-source allowance must stay narrow; a default \
-                 route removes the default-deny egress rail for a \
-                 prompt-injectable sandbox: {line}"
-            );
-        }
-    }
-}
-
 // --- Assertion group 3: sibling / negative parity (mandatory) --------------
 
 /// `ci.yaml`'s cluster ladder job DOES seal its install with `--fake-model`.
