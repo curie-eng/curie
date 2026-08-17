@@ -617,7 +617,8 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     if [[ "$LIVE" == "1" ]]; then
         echo
         echo "=== curie cluster eval ==="
-        local eval_args=(cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
+        # --json (unlike the other rungs) so a PASSING case's reply is logged too: #1602
+        local eval_args=(--json cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
         if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
             eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
         fi

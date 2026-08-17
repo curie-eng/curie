@@ -174,6 +174,48 @@ fn nightly_cluster_install_opens_openrouter_egress_and_never_seals() {
     );
 }
 
+/// The cluster install must ALSO open egress to the forecast source the graded
+/// weather case needs (#1602). Provider egress reaches the model and nothing
+/// else, and the skill fetches a forecast page before it will report a number,
+/// so with only `--allow-egress-host openrouter` a rule-following agent refuses
+/// and the regex grader reds the refusal -- the case can then only go green by
+/// the model breaking its own skill rule. The allowance must stay resolved at
+/// job time (`getent`) rather than hardcoded: the host is CDN-fronted, so a
+/// literal address decays, which is the same reason `--allow-egress-host`
+/// resolves its provider at install time (ADR-0032).
+#[test]
+fn nightly_cluster_install_opens_forecast_source_web_egress() {
+    let text = nightly();
+    assert!(
+        text.contains("${CURIE_E2E_FORECAST_EGRESS}"),
+        "the nightly workflow's cluster install must pass the resolved \
+         forecast-source routes to `cluster up`; without web egress the graded \
+         weather case cannot be answered honestly (#1602); file contents:\n{text}"
+    );
+    assert!(
+        text.contains("--allow-web-egress $addr/32"),
+        "the forecast-source allowance must render one `--allow-web-egress \
+         <addr>/32` per resolved address, so it stays host-scoped rather than \
+         opening the CDN's enclosing block; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("forecast.weather.gov"),
+        "the forecast-source routes must be RESOLVED from the hostname at job \
+         time, not hardcoded as literal addresses that decay when the CDN \
+         remaps (ADR-0032's install-time-resolve rule); file contents:\n{text}"
+    );
+    for line in text.lines() {
+        if line.contains("--allow-web-egress") {
+            assert!(
+                !line.contains("/0"),
+                "the forecast-source allowance must stay narrow; a default \
+                 route removes the default-deny egress rail for a \
+                 prompt-injectable sandbox: {line}"
+            );
+        }
+    }
+}
+
 // --- Assertion group 3: sibling / negative parity (mandatory) --------------
 
 /// `ci.yaml`'s cluster ladder job DOES seal its install with `--fake-model`.
@@ -299,7 +341,8 @@ fn live_cluster_rung_grades_weather_cases_with_the_message_listen_host() {
     if [[ "$LIVE" == "1" ]]; then
         echo
         echo "=== curie cluster eval ==="
-        local eval_args=(cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
+        # --json (unlike the other rungs) so a PASSING case's reply is logged too: #1602
+        local eval_args=(--json cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
         if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
             eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
         fi
@@ -310,6 +353,26 @@ fn live_cluster_rung_grades_weather_cases_with_the_message_listen_host() {
         "the live cluster rung must run cluster eval after its plumbing \
          assertion against the deployed weather bundle cases and forward the \
          message listen host; ladder contents:\n{text}"
+    );
+}
+
+/// The cluster rung's eval must run in `--json` mode. The human table prints a
+/// reply only for a RED case, so a green would carry no evidence of HOW it was
+/// earned -- and the weather case is precisely the one that can go green
+/// dishonestly (#1602): its regex grades that a temperature figure is present,
+/// not that the agent fetched one. The json payload carries `output` for every
+/// case, pass included, which is what makes an honest green checkable in the
+/// job log. Asserted for the cluster rung alone, since the sibling assertions
+/// above pin the other rungs to the plain table.
+#[test]
+fn live_cluster_rung_emits_the_graded_reply_for_passing_cases() {
+    let text = ladder();
+    assert!(
+        text.contains(r#"local eval_args=(--json cluster eval --cases"#),
+        "the live cluster rung must grade with `--json` so a PASSING case's \
+         reply text lands in the job log; without it a dishonest green (a \
+         fabricated temperature) is indistinguishable from an honest one; \
+         ladder contents:\n{text}"
     );
 }
 
@@ -333,7 +396,7 @@ case "$*" in
     "--json cluster message "*)
         printf '%s\n' '{"finalized":true,"reply":"live weather reply"}'
         ;;
-    "cluster eval --cases "*)
+    "--json cluster eval --cases "*)
         printf '%s\n' called > "$EVAL_MARKER"
         exit 42
         ;;
