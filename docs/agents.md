@@ -76,6 +76,15 @@ tier.
 never graded (ADR-0055), and `passed + failed + plumbing_ok == total`. A run
 that is all `plumbing_ok` is not a pass, it is an ungraded run.
 
+**To verify a ticket's acceptance criteria at the skill tier:** `curie scenario
+scenarios/ticket-1234.json --json` exits 0 and `verdict` is `"passed"`, with
+`identity_verified` true on the `skill` entry in `tiers`. A `verdict` of
+`"plumbing_ok"` is an ungraded run, not a pass. The `local` and `cluster` tiers
+are refused rather than degraded, because the platform API exposes no way to run
+a probe against a CLI-deployed version or to tear one down. The fixed weather
+ladder (`curie dev e2e-ladder`) is a separate platform smoke test and does not
+answer a ticket's criteria.
+
 **When a command is uncertain, `curie schema` is the authority.** Do not invoke
 a command you have not seen resolve there.
 

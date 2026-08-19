@@ -4,9 +4,9 @@
 //! platform API. Task I1; contracts are frozen in packages/aci-protocol and
 //! packages/plugin-format.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use curie::api;
 use curie::artifacts;
@@ -395,6 +395,20 @@ enum Command {
     /// The global `--json` emits a structured variant (data on stdout, human
     /// text on stderr).
     Guide,
+
+    /// Run a ticket scenario manifest against the tiers it selects and emit
+    /// criterion-bound structured evidence (one JSON object under `--json`).
+    ///
+    /// Packages the bundle once as a content-addressed snapshot, boots a runner
+    /// on exactly that snapshot, verifies from the Docker daemon that the
+    /// container mounted it, runs each probe as a real graded turn, and always
+    /// tears down with verified postconditions. Only the `skill` tier is
+    /// supported; `local` and `cluster` are refused (ADR-0041), never silently
+    /// degraded.
+    Scenario {
+        /// Path to the scenario manifest JSON.
+        manifest: PathBuf,
+    },
 
     /// Converge a cluster to a `curie.yaml` installation file (ADR-0097).
     ///
@@ -2044,7 +2058,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     artifacts::Channel::current(),
                     artifacts::version(),
                 );
-                commands::start(StartOpts {
+                let opts = StartOpts {
                     plugin_dir,
                     image,
                     port,
@@ -2059,8 +2073,18 @@ async fn run(command: Option<Command>) -> Result<()> {
                     secret,
                     env_file,
                     replace,
-                })
-                .await
+                };
+                // #1087: the skill tier executes an immutable, content-addressed
+                // snapshot, not the editable source -- matching what local and
+                // cluster already do. The packer is the deploy path's packer, so
+                // the digest is the same one the API records for this source.
+                // Packed AFTER `prepare_start` so a re-up of unchanged source
+                // (same digest, same directory) cannot have the snapshot it just
+                // created torn down again by the `--replace` teardown.
+                let plugin_dir = commands::prepare_start(&opts).await?;
+                let snapshot = curie::bundle::snapshot(&plugin_dir)
+                    .context("packaging the bundle snapshot for the runner")?;
+                commands::start(opts, snapshot).await
             }
             SkillAction::Check {
                 plugin_dir,
@@ -2113,7 +2137,10 @@ async fn run(command: Option<Command>) -> Result<()> {
             // the verb reports why and exits 4 (issue #459, ADR-0041).
             SkillAction::Versions => Err(commands::skill_versions_unavailable()),
             SkillAction::Memory => Err(commands::skill_memory_unavailable()),
-            SkillAction::Down { name } => commands::stop(name).await,
+            // The CWD is the directory `skill down`'s contract has always been
+            // documented against: it reads the record the bundle it is run from
+            // owns.
+            SkillAction::Down { name } => commands::stop(Path::new("."), name).await,
             SkillAction::Status { url } => commands::status(url).await,
             SkillAction::Message {
                 text,
@@ -3396,6 +3423,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             Ok(())
         }
         Some(Command::Guide) => curie::guide::run(),
+        Some(Command::Scenario { manifest }) => {
+            curie::scenario::run(curie::scenario::RunOpts { manifest }).await
+        }
         Some(Command::Apply {
             file,
             dry_run,

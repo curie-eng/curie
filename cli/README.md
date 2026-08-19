@@ -22,6 +22,7 @@ extend the platform's own code.
     - [Bundle packing exclusions](#bundle-packing-exclusions)
     - [Artifact resolution](#artifact-resolution)
   - [Managing secrets](#managing-secrets)
+  - [Verifying a ticket with `curie scenario`](#verifying-a-ticket-with-curie-scenario)
 - [For contributors](#for-contributors)
   - [`curie install`](#curie-install)
   - [`curie dev`](#curie-dev)
@@ -535,6 +536,69 @@ hydrates the process environment just long enough for Docker to forward `-e
 <NAME>` into the runner. The same lookup applies to saved model credentials
 (`CURIE_CREDENTIALS`, `ANTHROPIC_API_KEY`, or `CLAUDE_CODE_OAUTH_TOKEN`) for
 live `skill up` runs.
+
+### Verifying a ticket with `curie scenario`
+
+`curie scenario <MANIFEST>` runs a ticket's scenario manifest and emits
+criterion-bound evidence as one JSON object. It packages the bundle once as a
+content-addressed snapshot, boots a runner on exactly that snapshot, asks the
+Docker daemon which directory the container actually mounted at `/plugin` and
+which model it was booted on, runs every probe as a real graded turn, then tears
+the runner down and asserts the teardown's postconditions.
+
+```bash
+curie scenario scenarios/ticket-1234.json --json
+```
+
+The manifest is validated against
+`cli/schema/scenario-manifest.schema.json` and names the ticket, its acceptance
+criteria, the bundle, the tiers, the model mode, the probes and the teardown:
+
+```json
+{
+  "schema_version": 1,
+  "ticket": "curie#1234",
+  "acceptance_criteria": ["AC1"],
+  "bundle_path": "examples/weather",
+  "tiers": ["skill"],
+  "model_mode": "live",
+  "probes": [
+    {
+      "id": "ac1-positive",
+      "kind": "positive",
+      "acceptance_criteria": ["AC1"],
+      "prompt": "What is the weather in Oslo?",
+      "expect": { "grader": "contains", "value": "Oslo" }
+    },
+    {
+      "id": "ac1-negative",
+      "kind": "negative",
+      "acceptance_criteria": ["AC1"],
+      "prompt": "What is the weather in Oslo?",
+      "expect": { "grader": "contains", "value": "I cannot answer that" }
+    }
+  ],
+  "teardown": { "remove_runner": true }
+}
+```
+
+Rules the manifest cannot be written around, each refused at parse with exit 2:
+at least one positive probe and at least one negative control (a scenario with
+no control cannot be falsified), every acceptance criterion answered by at least
+one positive probe, a non-empty tier list, no unknown keys anywhere, and
+`teardown.remove_runner` fixed at `true` (teardown is unconditional).
+
+A negative probe passes only when its grader does NOT match; a control whose
+grader matches turns the whole run red, because the positive probes then prove
+nothing. Under `"model_mode": "fake"` nothing is graded at all: every probe is
+`plumbing_ok` and so is the roll-up, which is an ungraded run rather than a pass.
+
+Only the `skill` tier runs. `local` and `cluster` parse and are then refused
+with exit 4: the platform API exposes no route that runs a probe against a
+CLI-created version and none that ends a deployment, so a scenario there could
+neither grade a turn nor tear down the agent it created. The result schema is
+`cli/schema/scenario.schema.json`, and the same shape is emitted on the red path
+with `error` and `fix` filled in.
 
 ## For contributors
 

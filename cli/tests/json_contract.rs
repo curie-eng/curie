@@ -1776,3 +1776,201 @@ fn a_new_family_schema_gate_has_teeth() {
         "kill schema must reject a Done object missing the required `killed` key"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `curie scenario` result contract
+// ---------------------------------------------------------------------------
+//
+// Written test-first: `curie::scenario` does not exist yet, so this section does
+// not compile until the implementer builds it. The API it assumes is the result
+// contract of the plan, one Rust type per JSON object:
+//
+//   ScenarioOutput { ticket, bundle_path, source_commit: Option<String>,
+//                    artifact_digest, model_mode: ModelMode, verdict: Verdict,
+//                    error: Option<String>, fix: Option<String>,
+//                    tiers: Vec<TierReport> }
+//   TierReport     { tier: TierName, verdict: Verdict, identity_verified: bool,
+//                    mounted_snapshot_dir: Option<String>,
+//                    container_fake_model: Option<bool>, runner_url: String,
+//                    probes: Vec<ProbeReport>, teardown: TeardownReport,
+//                    error: Option<String>, fix: Option<String> }
+//   ProbeReport    { id, kind: ProbeKind, acceptance_criteria: Vec<String>,
+//                    outcome: CaseOutcome, passed: Option<bool>,
+//                    grader_matched: Option<bool>, reply: String }
+//   TeardownReport { attempted, container_removed, state_cleared,
+//                    snapshot_released, error: Option<String> }
+//
+// `outcome` reuses the frozen `evals::CaseOutcome` rather than minting a fourth
+// spelling of pass/fail/plumbing_ok. The four closed enums (`Verdict`,
+// `TierName`, `ProbeKind`, `ModelMode`) are `Copy + PartialEq`, as
+// `CaseOutcome` already is. `ModelMode` is imported under an alias here only
+// because this file already imports the unrelated `curie::local::ModelMode`.
+
+use curie::scenario::{
+    ModelMode as ScenarioModelMode, ProbeKind, ProbeReport, ScenarioOutput, TeardownReport,
+    TierName, TierReport, Verdict,
+};
+
+fn clean_teardown() -> TeardownReport {
+    TeardownReport {
+        attempted: true,
+        container_removed: true,
+        state_cleared: true,
+        snapshot_released: true,
+        error: None,
+    }
+}
+
+fn scenario_probe(id: &str, kind: ProbeKind, outcome: CaseOutcome) -> ProbeReport {
+    let (passed, grader_matched) = match outcome {
+        CaseOutcome::Pass => (Some(true), Some(kind == ProbeKind::Positive)),
+        CaseOutcome::Fail => (Some(false), Some(kind == ProbeKind::Negative)),
+        CaseOutcome::PlumbingOk => (None, None),
+    };
+    ProbeReport {
+        id: id.to_string(),
+        kind,
+        acceptance_criteria: vec!["AC1".to_string()],
+        outcome,
+        passed,
+        grader_matched,
+        reply: "It is 4C in Oslo.".to_string(),
+    }
+}
+
+fn scenario_output(
+    verdict: Verdict,
+    model_mode: ScenarioModelMode,
+    probes: Vec<ProbeReport>,
+    teardown: TeardownReport,
+    error: Option<&str>,
+) -> ScenarioOutput {
+    ScenarioOutput {
+        ticket: "curie#1234".to_string(),
+        bundle_path: "/abs/path/examples/weather".to_string(),
+        source_commit: Some("a1b2c3d".to_string()),
+        artifact_digest: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+            .to_string(),
+        model_mode,
+        verdict,
+        error: error.map(str::to_string),
+        fix: error.map(|_| "re-run after fixing the probe".to_string()),
+        tiers: vec![TierReport {
+            tier: TierName::Skill,
+            verdict,
+            identity_verified: true,
+            mounted_snapshot_dir: Some("/abs/path/.curie/snapshots/9f86d0".to_string()),
+            container_fake_model: Some(model_mode == ScenarioModelMode::Fake),
+            runner_url: "http://localhost:7245".to_string(),
+            probes,
+            teardown,
+            error: error.map(str::to_string),
+            fix: error.map(|_| "re-run after fixing the probe".to_string()),
+        }],
+    }
+}
+
+/// Every roll-up the verdict enum can produce must validate against the
+/// committed result schema, including the red one: the failure payload is the
+/// object an agent most needs to read, and a red run that emits an unparseable
+/// shape is the #456 failure mode wearing a different hat.
+#[test]
+fn scenario_json_validates_against_scenario_schema() {
+    let schema = load_schema("scenario.schema.json");
+    let v = validator(&schema);
+
+    let passed = scenario_output(
+        Verdict::Passed,
+        ScenarioModelMode::Live,
+        vec![
+            scenario_probe("ac1-positive", ProbeKind::Positive, CaseOutcome::Pass),
+            scenario_probe("ac1-negative", ProbeKind::Negative, CaseOutcome::Pass),
+        ],
+        clean_teardown(),
+        None,
+    )
+    .to_json();
+    assert!(v.is_valid(&passed), "a green run must validate: {passed}");
+    assert!(
+        passed["error"].is_null() && passed["fix"].is_null(),
+        "`error` and `fix` are always-present nullable keys: {passed}"
+    );
+
+    let failed = scenario_output(
+        Verdict::Failed,
+        ScenarioModelMode::Live,
+        vec![
+            scenario_probe("ac1-positive", ProbeKind::Positive, CaseOutcome::Pass),
+            scenario_probe("ac1-negative", ProbeKind::Negative, CaseOutcome::Fail),
+        ],
+        TeardownReport {
+            container_removed: false,
+            error: Some("container curie-runner-local survived docker rm".to_string()),
+            ..clean_teardown()
+        },
+        Some("probe ac1-negative: the negative control's grader matched"),
+    )
+    .to_json();
+    assert!(v.is_valid(&failed), "a red run must validate: {failed}");
+    assert!(
+        !failed["error"].is_null() && !failed["fix"].is_null(),
+        "a red run carries an actionable diagnosis: {failed}"
+    );
+    assert_eq!(
+        failed["tiers"][0]["probes"][1]["grader_matched"],
+        serde_json::json!(true),
+        "the raw grader result must survive the kind inversion: {failed}"
+    );
+
+    // ADR-0055: a fake-model run graded nothing, so every probe is `plumbing_ok`
+    // with a NULL `passed`, and the roll-up is `plumbing_ok` -- never `passed`.
+    let plumbing = scenario_output(
+        Verdict::PlumbingOk,
+        ScenarioModelMode::Fake,
+        vec![
+            scenario_probe("ac1-positive", ProbeKind::Positive, CaseOutcome::PlumbingOk),
+            scenario_probe("ac1-negative", ProbeKind::Negative, CaseOutcome::PlumbingOk),
+        ],
+        clean_teardown(),
+        None,
+    )
+    .to_json();
+    assert!(
+        v.is_valid(&plumbing),
+        "an ungraded run must validate: {plumbing}"
+    );
+    assert_eq!(plumbing["verdict"], serde_json::json!("plumbing_ok"));
+    assert!(
+        plumbing["tiers"][0]["probes"][0]["passed"].is_null(),
+        "a non-graded row claims neither verdict: {plumbing}"
+    );
+}
+
+/// Negative control: the result schema must actually discriminate. Without it,
+/// the three assertions above would pass against a vacuous `true` schema.
+#[test]
+fn scenario_schema_gate_has_teeth() {
+    let schema = load_schema("scenario.schema.json");
+    let v = validator(&schema);
+    let mut value = scenario_output(
+        Verdict::Passed,
+        ScenarioModelMode::Live,
+        vec![scenario_probe(
+            "ac1-positive",
+            ProbeKind::Positive,
+            CaseOutcome::Pass,
+        )],
+        clean_teardown(),
+        None,
+    )
+    .to_json();
+    value["tiers"][0]
+        .as_object_mut()
+        .expect("each tier row is a JSON object")
+        .remove("identity_verified");
+    assert!(
+        !v.is_valid(&value),
+        "the scenario schema must reject a tier row missing the required \
+         `identity_verified` key"
+    );
+}

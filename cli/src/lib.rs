@@ -35,6 +35,7 @@ pub mod render;
 pub mod retired;
 pub mod runner;
 pub mod scaffold;
+pub mod scenario;
 pub mod schema;
 pub mod schemas;
 pub mod seal;

@@ -1404,14 +1404,35 @@ async fn release_boot_scaffolding(
     let _ = crate::bundle::remove_snapshot(snapshot_dir, plugin_dir);
 }
 
-pub async fn start(opts: StartOpts) -> Result<()> {
+/// Everything `skill up` must do BEFORE the bundle is packed: every validation
+/// that can still abort for free, then the `--replace` teardown of the recorded
+/// runner. Returns the canonicalized bundle directory the caller packs.
+///
+/// Split out of [`start`] so the pack can happen between the two (#1087 packs a
+/// content-addressed snapshot, and a re-up of unchanged source resolves onto the
+/// same `<digest>/` directory, so packing before the `--replace` teardown would
+/// have that teardown delete the snapshot the run just created). Refusing is
+/// free but replacing tears down a live runner, so nothing here that can still
+/// abort may run after the teardown (#747).
+pub async fn prepare_start(opts: &StartOpts) -> Result<PathBuf> {
     let plugin_dir = opts
         .plugin_dir
         .canonicalize()
         .with_context(|| format!("plugin dir not found: {}", opts.plugin_dir.display()))?;
     // Fail fast on a directory that is not a bundle; the runner would reject
-    // it at boot anyway (real-model mode), with a worse error surface.
-    let (plugin_name, manifest_version) = read_manifest(&plugin_dir)?;
+    // it at boot anyway (real-model mode), with a worse error surface. A
+    // deterministic input error, so it carries the Usage class and the fix an
+    // agent consumer branches on rather than an untyped exit 1 (ADR-0021).
+    read_manifest(&plugin_dir).map_err(|err| {
+        crate::exit::CliError::usage(format!(
+            "{} is not a usable bundle: {err:#}",
+            plugin_dir.display()
+        ))
+        .with_fix(
+            "point this at a bundle directory holding a .claude-plugin/plugin.json with a string \
+             'name', or scaffold one with `curie init <name>`",
+        )
+    })?;
 
     if opts.local_model.is_some() && opts.fake_model {
         return Err(crate::exit::usage(
@@ -1433,10 +1454,17 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         opts.replace,
     );
     if recorded_plan == RecordedStatePlan::Refuse {
-        return Err(crate::exit::usage(format!(
-            "a local runner is already recorded in {}/.curie/runner.json; run 'curie skill down' there first",
-            plugin_dir.display()
-        )));
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage(format!(
+                "a local runner is already recorded in {}/.curie/runner.json",
+                plugin_dir.display()
+            ))
+            .with_fix(format!(
+                "run 'curie skill down' in {} to tear that runner down first; its record is \
+                 cleared with it",
+                plugin_dir.display()
+            )),
+        ));
     }
 
     // Parse (not just forward) the budget so a typo fails here, not in-container.
@@ -1488,6 +1516,25 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         stop_recorded(&plugin_dir, crate::ui::ui(), saved, live.as_ref()).await?;
     }
 
+    Ok(plugin_dir)
+}
+
+/// Boot a runner container on `snapshot`, the content-addressed artifact the
+/// caller already packed (#1087).
+///
+/// The snapshot is a REQUIRED argument rather than something this function
+/// packs, so the whole run has exactly one pack and the caller can assert the
+/// booted container mounted that exact directory. Call [`prepare_start`] first:
+/// it carries the validations and the `--replace` teardown that must happen
+/// before the pack.
+pub async fn start(opts: StartOpts, snapshot: crate::bundle::BundleSnapshot) -> Result<()> {
+    let plugin_dir = opts
+        .plugin_dir
+        .canonicalize()
+        .with_context(|| format!("plugin dir not found: {}", opts.plugin_dir.display()))?;
+    let (plugin_name, manifest_version) = read_manifest(&plugin_dir)?;
+    let ollama = format!("{}-ollama", opts.name);
+
     // Catch a leftover container of the same name here, before anything is
     // booted, so the operator gets the remedies instead of docker's raw
     // exit-125 conflict at the very end of the boot (#747).
@@ -1532,10 +1579,11 @@ pub async fn start(opts: StartOpts) -> Result<()> {
                 owned_network = Some(net.clone());
             }
         }
+        // Each abort here also releases the caller's snapshot: nothing has
+        // recorded it yet, so this is the only chance to (#1087).
         if let Err(err) = docker::run_ollama(&ollama, &net, DEFAULT_OLLAMA_IMAGE).await {
-            if let Some(net) = &owned_network {
-                let _ = docker::remove_network(net).await;
-            }
+            release_boot_scaffolding(None, owned_network.as_ref(), &snapshot.dir, &plugin_dir)
+                .await;
             return Err(docker::map_name_conflict(
                 err.context("starting local model container"),
                 &ollama,
@@ -1544,17 +1592,23 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             ));
         }
         if let Err(err) = docker::wait_ollama_ready(&ollama, Duration::from_secs(120)).await {
-            let _ = docker::remove_container(&ollama).await;
-            if let Some(net) = &owned_network {
-                let _ = docker::remove_network(net).await;
-            }
+            release_boot_scaffolding(
+                Some(&ollama),
+                owned_network.as_ref(),
+                &snapshot.dir,
+                &plugin_dir,
+            )
+            .await;
             return Err(err.context("waiting for local model container"));
         }
         if let Err(err) = docker::pull_model(&ollama, local_model).await {
-            let _ = docker::remove_container(&ollama).await;
-            if let Some(net) = &owned_network {
-                let _ = docker::remove_network(net).await;
-            }
+            release_boot_scaffolding(
+                Some(&ollama),
+                owned_network.as_ref(),
+                &snapshot.dir,
+                &plugin_dir,
+            )
+            .await;
             return Err(err.context("pulling local model"));
         }
         let url = format!("http://{ollama}:{OLLAMA_PORT}");
@@ -1621,27 +1675,6 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         );
         let passthrough = merge_secret_env(model_cred_names.clone(), &opts.secret);
         (model_cred_names, passthrough)
-    };
-
-    // #1087: the skill tier executes an immutable, content-addressed snapshot,
-    // not the editable source -- matching what local and cluster already do. The
-    // packer is the deploy path's packer, so the digest is the same one the API
-    // records for this source. Placed AFTER the --replace teardown above so a
-    // re-up of unchanged source (same digest, same directory) cannot have the
-    // snapshot it just created torn down again.
-    let snapshot = match crate::bundle::snapshot(&plugin_dir) {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            // Nothing of the runner exists yet, but the ollama sidecar above may:
-            // release it the same way every other abort on this path does.
-            if let Some(ollama) = &ollama_container {
-                let _ = docker::remove_container(ollama).await;
-            }
-            if let Some(net) = &owned_network {
-                let _ = docker::remove_network(net).await;
-            }
-            return Err(err.context("packaging the bundle snapshot for the runner"));
-        }
     };
 
     let spec = StartSpec {
@@ -1968,8 +2001,15 @@ async fn remove_container_tolerating_absence(
     Ok(())
 }
 
-pub async fn stop(name: Option<String>) -> Result<()> {
-    let dir = Path::new(".");
+/// Tear down the runner recorded for the bundle at `dir` (or the container
+/// `name` explicitly asks for).
+///
+/// `dir` is a REQUIRED parameter rather than the process CWD: a caller that
+/// knows which bundle it owns (`curie scenario` knows it from the manifest)
+/// must not tear down whatever runner record happens to sit in the working
+/// directory. `curie skill down` passes the CWD, which is the directory its
+/// contract has always been documented against.
+pub async fn stop(dir: &Path, name: Option<String>) -> Result<()> {
     let ui = crate::ui::ui();
     let saved = state::load(dir)?;
     let recorded = saved.as_ref().map(|s| s.container_name.clone());
@@ -5013,7 +5053,7 @@ fn unix_now() -> u64 {
 }
 
 /// Short git SHA of the plugin dir's checkout, for the version line.
-async fn git_short_sha(dir: &Path) -> Option<String> {
+pub(crate) async fn git_short_sha(dir: &Path) -> Option<String> {
     let output = tokio::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(dir)

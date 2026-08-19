@@ -1707,3 +1707,157 @@ fn cluster_deploy_json_single_target_shape_is_unchanged() {
     );
     assert_eq!(one_stdout_object(&output), expected_deploy("dev"));
 }
+
+// ---------------------------------------------------------------------------
+// `curie scenario` emit contract
+// ---------------------------------------------------------------------------
+//
+// Written test-first: `curie::scenario` does not exist yet, so this section does
+// not compile until the implementer builds it. See the matching section in
+// `cli/tests/json_contract.rs` for the exact shape of the types assumed here.
+
+use curie::evals::CaseOutcome;
+use curie::scenario::{
+    ModelMode as ScenarioModelMode, ProbeKind, ProbeReport, ScenarioOutput, TeardownReport,
+    TierName, TierReport, Verdict,
+};
+
+/// A one-tier, one-probe scenario result. `error`/`fix` are threaded so the same
+/// builder produces both the green and the red payload -- there is exactly one
+/// emitted shape, not a success shape and a separate failure shape.
+fn scenario_result(verdict: Verdict, error: Option<&str>) -> ScenarioOutput {
+    ScenarioOutput {
+        ticket: "curie#1234".to_string(),
+        bundle_path: "/abs/path/examples/weather".to_string(),
+        source_commit: None,
+        artifact_digest: "deadbeef00".to_string(),
+        model_mode: ScenarioModelMode::Live,
+        verdict,
+        error: error.map(str::to_string),
+        fix: error.map(|_| "re-run once the control no longer matches".to_string()),
+        tiers: vec![TierReport {
+            tier: TierName::Skill,
+            verdict,
+            identity_verified: true,
+            mounted_snapshot_dir: Some("/abs/path/.curie/snapshots/deadbeef00".to_string()),
+            container_fake_model: Some(false),
+            runner_url: "http://localhost:7245".to_string(),
+            probes: vec![ProbeReport {
+                id: "ac1-negative".to_string(),
+                kind: ProbeKind::Negative,
+                acceptance_criteria: vec!["AC1".to_string()],
+                outcome: if error.is_some() {
+                    CaseOutcome::Fail
+                } else {
+                    CaseOutcome::Pass
+                },
+                passed: Some(error.is_none()),
+                grader_matched: Some(error.is_some()),
+                reply: "I cannot answer that.".to_string(),
+            }],
+            teardown: TeardownReport {
+                attempted: true,
+                container_removed: true,
+                state_cleared: true,
+                snapshot_released: true,
+                error: None,
+            },
+            error: error.map(str::to_string),
+            fix: error.map(|_| "re-run once the control no longer matches".to_string()),
+        }],
+    }
+}
+
+/// Exact key-shape pin: renaming, dropping, OR adding a key fails here. The
+/// always-present nullable keys (`source_commit`, `error`, `fix`, and the
+/// tri-state `passed`) are pinned as explicit JSON nulls rather than omitted
+/// keys, the repo convention an agent consumer reads unconditionally.
+#[test]
+fn scenario_output_json_shape_is_pinned() {
+    assert_eq!(
+        scenario_result(Verdict::Passed, None).to_json(),
+        json!({
+            "ticket": "curie#1234",
+            "bundle_path": "/abs/path/examples/weather",
+            "source_commit": null,
+            "artifact_digest": "deadbeef00",
+            "model_mode": "live",
+            "verdict": "passed",
+            "error": null,
+            "fix": null,
+            "tiers": [{
+                "tier": "skill",
+                "verdict": "passed",
+                "identity_verified": true,
+                "mounted_snapshot_dir": "/abs/path/.curie/snapshots/deadbeef00",
+                "container_fake_model": false,
+                "runner_url": "http://localhost:7245",
+                "probes": [{
+                    "id": "ac1-negative",
+                    "kind": "negative",
+                    "acceptance_criteria": ["AC1"],
+                    "outcome": "pass",
+                    "passed": true,
+                    "grader_matched": false,
+                    "reply": "I cannot answer that.",
+                }],
+                "teardown": {
+                    "attempted": true,
+                    "container_removed": true,
+                    "state_cleared": true,
+                    "snapshot_released": true,
+                    "error": null,
+                },
+                "error": null,
+                "fix": null,
+            }],
+        })
+    );
+}
+
+/// The red path emits the SAME shape as the green one. Without this, a failing
+/// run could emit an object no consumer can parse -- and the failure payload is
+/// the one an agent most needs to read (#456, #1078).
+#[test]
+fn the_failure_payload_matches_the_success_schema() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/schema/scenario.schema.json");
+    let raw = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("committed schema {path} must exist: {e}"));
+    let schema: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("schema {path} must be JSON: {e}"));
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+
+    let failed = scenario_result(
+        Verdict::Failed,
+        Some("probe ac1-negative: the control matched"),
+    )
+    .to_json();
+    assert!(
+        validator.is_valid(&failed),
+        "the failure payload must validate against the SAME committed schema as \
+         the success payload: {failed}"
+    );
+
+    // Key-for-key identical to the green payload: only the values differ. A red
+    // run that dropped or added a key would be a second, undocumented contract.
+    let green = scenario_result(Verdict::Passed, None).to_json();
+    let keys = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_object()
+            .expect("the payload is a JSON object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(keys(&failed), keys(&green), "top-level keys must match");
+    assert_eq!(
+        keys(&failed["tiers"][0]),
+        keys(&green["tiers"][0]),
+        "tier keys must match"
+    );
+    assert_eq!(
+        keys(&failed["tiers"][0]["probes"][0]),
+        keys(&green["tiers"][0]["probes"][0]),
+        "probe keys must match"
+    );
+}

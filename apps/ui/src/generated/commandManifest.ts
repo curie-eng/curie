@@ -4040,6 +4040,21 @@ export const commandManifest = {
       "name": "guide"
     },
     {
+      "about": "Run a ticket scenario manifest against the tiers it selects and emit criterion-bound structured evidence (one JSON object under `--json`)",
+      "args": [
+        {
+          "global": false,
+          "help": "Path to the scenario manifest JSON",
+          "id": "manifest",
+          "positional": true,
+          "required": true
+        }
+      ],
+      "hidden": false,
+      "long_about": "Run a ticket scenario manifest against the tiers it selects and emit criterion-bound structured evidence (one JSON object under `--json`).\n\nPackages the bundle once as a content-addressed snapshot, boots a runner on exactly that snapshot, verifies from the Docker daemon that the container mounted it, runs each probe as a real graded turn, and always tears down with verified postconditions. Only the `skill` tier is supported; `local` and `cluster` are refused (ADR-0041), never silently degraded.",
+      "name": "scenario"
+    },
+    {
       "about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097)",
       "args": [
         {

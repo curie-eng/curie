@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "ticket": "curie#1237",
+  "acceptance_criteria": ["AC1"],
+  "bundle_path": "BUNDLE_PATH",
+  "tiers": ["skill"],
+  "model_mode": "live",
+  "probes": [
+    {
+      "id": "ac1-positive",
+      "kind": "positive",
+      "acceptance_criteria": ["AC1"],
+      "prompt": "What is the weather in Oslo?",
+      "expect": { "grader": "contains", "value": "Oslo" }
+    },
+    {
+      "id": "ac1-positive-again",
+      "kind": "positive",
+      "acceptance_criteria": ["AC1"],
+      "prompt": "And in Bergen?",
+      "expect": { "grader": "contains", "value": "Bergen" }
+    }
+  ],
+  "teardown": { "remove_runner": true }
+}

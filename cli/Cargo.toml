@@ -26,6 +26,10 @@ crossterm = "0.29"
 # exports. Non-overriding load: a real shell export always wins over a file.
 dotenvy = "0.15"
 flate2 = "1"
+# `flock(2)` for the scenario runner's lifecycle lock: the exclusion has to be
+# held by the KERNEL on an open descriptor, so a SIGKILLed run releases it
+# instead of leaving a file that wedges the bundle forever. Already in the tree
+# via tokio; named directly because this is a first-party call.
 futures-util = "0.3"
 indicatif = "0.18"
 reqwest = { version = "0.12", default-features = false, features = [

@@ -262,12 +262,13 @@ pub fn snapshot(source: &Path) -> Result<BundleSnapshot> {
 /// Materialize a throwaway snapshot of `source` at
 /// `<source>/.curie/snapshots/sweep-<secs>-<pid>-<seq>/`.
 ///
-/// Owned by one `eval --model` sweep and deleted when that sweep ends. The
-/// directory name is unique per call by construction and is deliberately NOT
-/// the canonical `<digest>/` path: a sweep on unchanged source would otherwise
-/// resolve onto the very directory a live `skill up` runner has mounted at
-/// `/plugin`, and the sweep's own cleanup would delete it out from under a
-/// healthy container. Do not "simplify" this back onto the digest path.
+/// Owned by one `eval --model` sweep or one `curie scenario` run, and deleted
+/// when that sweep or run ends. The directory name is unique per call by
+/// construction and is deliberately NOT the canonical `<digest>/` path: a sweep
+/// or a scenario on unchanged source would otherwise resolve onto the very
+/// directory a live `skill up` runner has mounted at `/plugin`, and its own
+/// cleanup would delete it out from under a healthy container. Do not
+/// "simplify" this back onto the digest path.
 pub fn snapshot_ephemeral(source: &Path) -> Result<BundleSnapshot> {
     // Seconds plus pid read well in a directory listing but collide for two
     // sweeps in the same second in the same process, so the counter is what

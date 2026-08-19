@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/scenario-manifest/v1.0.json",
+  "title": "curie scenario manifest",
+  "description": "The INPUT contract of `curie scenario <MANIFEST>`: a ticket's acceptance criteria, the bundle that answers them, and the probes that prove it. Every rule expressible here is enforced twice, in this schema and in `parse_manifest`, because a hand-written manifest never passes through a validator. The one rule this schema cannot express is cross-field: every top-level acceptance criterion must be answered by at least one POSITIVE probe, which the parser refuses by naming the uncovered criteria.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ticket",
+    "acceptance_criteria",
+    "bundle_path",
+    "tiers",
+    "model_mode",
+    "probes",
+    "teardown"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "ticket": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The ticket this scenario answers, e.g. `curie#1234`."
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "The criterion ids the run reports against. Each must be answered by at least one positive probe."
+    },
+    "bundle_path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to the bundle under test, resolved against the manifest's own directory."
+    },
+    "tiers": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "skill",
+          "local",
+          "cluster"
+        ]
+      },
+      "description": "The tiers to run. Only `skill` is supported today; `local` and `cluster` are known values that are refused (exit 4) rather than degraded."
+    },
+    "model_mode": {
+      "enum": [
+        "fake",
+        "live"
+      ],
+      "description": "The model the runner must be booted on, asserted against the live container. Under `fake` nothing is graded and the run rolls up as `plumbing_ok` (ADR-0055)."
+    },
+    "probes": {
+      "type": "array",
+      "minItems": 2,
+      "description": "The graded turns. At least one positive probe and at least one negative control: a scenario with no control cannot be falsified.",
+      "items": {
+        "$ref": "#/$defs/probe"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "positive"
+              }
+            }
+          },
+          "minContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "negative"
+              }
+            }
+          },
+          "minContains": 1
+        }
+      ]
+    },
+    "teardown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "remove_runner"
+      ],
+      "properties": {
+        "remove_runner": {
+          "const": true,
+          "description": "Constrained to true: a scenario run always destroys the runner it booted. The field exists so the author acknowledges that in the checked-in artifact, not so it can be declined."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "acceptance_criteria",
+        "prompt",
+        "expect"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "positive",
+            "negative"
+          ],
+          "description": "A positive probe asserts the required behavior is present; a negative one is the control, and passes only when its grader does NOT match."
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expect": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "grader",
+            "value"
+          ],
+          "description": "A concrete grader mirroring the frozen `evals::Grader`, so a probe is judged by exactly the code `curie skill eval` uses.",
+          "properties": {
+            "grader": {
+              "enum": [
+                "exact",
+                "contains",
+                "regex",
+                "tool_called"
+              ]
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The text to match for the text graders, or the tool NAME that must have been invoked for `tool_called`."
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/scenario/v1.0.json",
+  "title": "curie scenario --json",
+  "description": "The agent-facing payload of `curie scenario <MANIFEST> --json`: the ticket, the artifact that was run, and one entry per selected tier carrying its runtime-identity readings, its graded probes and its verified teardown. The SAME shape is emitted on the red path, where `error` and `fix` are non-null.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ticket",
+    "bundle_path",
+    "source_commit",
+    "artifact_digest",
+    "model_mode",
+    "verdict",
+    "error",
+    "fix",
+    "tiers"
+  ],
+  "properties": {
+    "ticket": {
+      "type": "string",
+      "description": "The ticket the scenario answers, verbatim from the manifest."
+    },
+    "bundle_path": {
+      "type": "string",
+      "description": "The resolved absolute path of the bundle that was packaged."
+    },
+    "source_commit": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The bundle tree's commit. Always present; null outside a git tree, never fabricated."
+    },
+    "artifact_digest": {
+      "type": "string",
+      "description": "sha256 of the tar.gz the run packed once and booted on, computed exactly the way `apps/api` computes it on deploy."
+    },
+    "model_mode": {
+      "enum": [
+        "fake",
+        "live"
+      ],
+      "description": "The model the manifest declares, asserted against the live container before any probe runs."
+    },
+    "verdict": {
+      "$ref": "#/$defs/verdict"
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The run's diagnosis, or null. Always present so an agent consumer can read it unconditionally."
+    },
+    "fix": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The actionable remedy for `error`, or null."
+    },
+    "tiers": {
+      "type": "array",
+      "description": "One entry per selected tier, accumulated in order: a later failure never erases an earlier tier's result.",
+      "items": {
+        "$ref": "#/$defs/tier"
+      }
+    }
+  },
+  "$defs": {
+    "verdict": {
+      "enum": [
+        "passed",
+        "failed",
+        "plumbing_ok"
+      ],
+      "description": "`plumbing_ok` is a third state, not a shade of pass: the turns completed on the fake model and were therefore never graded (ADR-0055)."
+    },
+    "tier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tier",
+        "verdict",
+        "identity_verified",
+        "mounted_snapshot_dir",
+        "container_fake_model",
+        "runner_url",
+        "probes",
+        "teardown",
+        "error",
+        "fix"
+      ],
+      "properties": {
+        "tier": {
+          "enum": [
+            "skill",
+            "local",
+            "cluster"
+          ]
+        },
+        "verdict": {
+          "$ref": "#/$defs/verdict"
+        },
+        "identity_verified": {
+          "type": "boolean",
+          "description": "Whether the booted container was proved to be running the artifact this run packed. False fails closed: no probe runs against an unverified container."
+        },
+        "mounted_snapshot_dir": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The source path the Docker DAEMON reports bound at /plugin, not our own record. Null when the container reports no such mount, which is a mismatch rather than a pass."
+        },
+        "container_fake_model": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Whether the live container carries CURIE_FAKE_MODEL, read back from the daemon. Null when the read failed."
+        },
+        "runner_url": {
+          "type": "string"
+        },
+        "probes": {
+          "type": "array",
+          "description": "One row per probe, in manifest order. Empty when identity verification aborted the tier before any turn was sent.",
+          "items": {
+            "$ref": "#/$defs/probe"
+          }
+        },
+        "teardown": {
+          "$ref": "#/$defs/teardown"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "This tier's diagnosis. A teardown failure never overwrites it; that one is carried in `teardown.error`."
+        },
+        "fix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "acceptance_criteria",
+        "outcome",
+        "passed",
+        "grader_matched",
+        "reply"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "positive",
+            "negative"
+          ],
+          "description": "A negative probe is the falsifiability control: it passes only when its grader does NOT match."
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The ticket criteria this probe answers, so every row is bound to what it proves."
+        },
+        "outcome": {
+          "enum": [
+            "pass",
+            "fail",
+            "plumbing_ok"
+          ],
+          "description": "The probe's verdict, after the positive/negative inversion. Reuses the frozen eval-case vocabulary."
+        },
+        "passed": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Tri-state view of `outcome`: true for pass, false for fail, null for plumbing_ok. A non-graded row claims neither verdict."
+        },
+        "grader_matched": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The RAW grader result, BEFORE the kind inversion, so a red control is diagnosable without a re-run. Null when nothing was graded."
+        },
+        "reply": {
+          "type": "string",
+          "description": "The graded answer text. `<no reply text>` when the turn produced none."
+        }
+      }
+    },
+    "teardown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempted",
+        "container_removed",
+        "state_cleared",
+        "snapshot_released",
+        "error"
+      ],
+      "properties": {
+        "attempted": {
+          "type": "boolean",
+          "description": "Teardown is unconditional: a tier that booted a container owns one whatever went wrong afterwards."
+        },
+        "container_removed": {
+          "type": "boolean",
+          "description": "Asserted against the daemon after the removal, never assumed from a `docker rm` that exited 0. A stranded container turns the run red."
+        },
+        "state_cleared": {
+          "type": "boolean",
+          "description": "Asserted on the filesystem: the bundle's runner record is gone."
+        },
+        "snapshot_released": {
+          "type": "boolean",
+          "description": "Asserted on the filesystem: the snapshot directory this run packed is gone."
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The teardown's own diagnosis, carried separately so it never overwrites the reason the tier was already red."
+        }
+      }
+    }
+  }
+}
