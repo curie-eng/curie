@@ -134,4 +134,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0103 | [Previous schema shape gate](0103-previous-schema-shape-gate.md) | Accepted |
 | 0104 | [A named security posture is computed from the layers that exist, never configured](0104-a-named-security-posture-is-computed-not-configured.md) | Accepted |
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
+| 0112 | [A turn source names what caused the turn, not the channel it arrived on](0112-a-turn-source-names-what-caused-the-turn.md) | Draft |
 <!-- END GENERATED: adr-index -->
