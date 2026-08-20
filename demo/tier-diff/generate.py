@@ -2,7 +2,8 @@
 
 Why a generator rather than committed JSON: hand-written artifacts would prove
 only that the differ can parse a file someone typed. These artifacts are produced
-by ``curie_worker.eval.runner.EvalRunner`` talking real HTTP to a scripted runner,
+by ``curie_worker.eval.runner.EvalRunner`` talking real loopback HTTP to a
+scripted runner (an aiohttp test server on 127.0.0.1),
 so the graders, the sampling reduction, the result construction, and the
 trajectory capture are all the production code paths. The single synthetic part
 is the model's replies, which is what a fixture is for.
@@ -18,7 +19,7 @@ per-tier ``provenance`` string on every artifact says so in the artifact itself,
 so a reader who never opens this file still cannot mistake it for a cluster run.
 
 Usage:
-    uv run --directory apps/worker python ../../demo/tier-diff/generate.py
+    uv run --project apps/worker python demo/tier-diff/generate.py
 """
 
 from __future__ import annotations

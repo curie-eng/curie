@@ -239,15 +239,204 @@ class TestFlake:
         assert delta.flake_rate == "1/3 repeats disagreed"
         assert report.flaky_count == 1
 
-    def test_a_flaky_row_is_not_also_counted_as_a_change(self) -> None:
-        """Crying wolf is the failure mode that gets a report ignored."""
+    @pytest.mark.parametrize("reversed_order", [False, True])
+    def test_a_flaky_row_is_not_also_counted_as_a_change(self, reversed_order) -> None:
+        """Crying wolf is the failure mode that gets a report ignored.
+
+        Both orders are asserted deliberately. An earlier version of this test
+        listed the steady observation first and passed for that reason alone:
+        reversing the two made the flaky row land in ``changed_count``, which the
+        ADR forbids and which this test claimed to prevent.
+        """
         base = _uniform("v1", [_result("a")])
-        report = diff_observations(
-            base,
-            [_uniform("v2", [_result("a")]), _uniform("v2", [_result("a", EvalOutcome.FAIL)])],
-        )
+        steady = _uniform("v2", [_result("a")])
+        odd = _uniform("v2", [_result("a", EvalOutcome.FAIL)])
+        candidates = [odd, steady] if reversed_order else [steady, odd]
+        report = diff_observations(base, candidates)
         assert report.flaky_count == 1
         assert report.changed_count == 0
+
+    def test_a_flaky_row_is_counted_only_as_flaky(self) -> None:
+        """Every rollup skips a flaky row, not just the changed count.
+
+        The majority here is deliberately a REAL finding, two repeats out of three,
+        so the skip is the only thing keeping these counts at zero. An earlier
+        version of this test used a two-way tie, where the tie-break happened to
+        land on ``unchanged`` and the counts were zero whether the rollups skipped
+        flaky rows or not.
+        """
+        base = _uniform("v1", [_result("a")])
+        steady = _uniform("v2", [_result("a")])
+        disagreeing = _observation(
+            "v2",
+            {
+                Tier.SKILL: [_result("a")],
+                Tier.LOCAL: [_result("a")],
+                Tier.CLUSTER: [_result("a", EvalOutcome.FAIL, error="nothing recognizable")],
+            },
+        )
+        report = diff_observations(base, [disagreeing, disagreeing, steady])
+        delta = _only(report, "a")
+        assert delta.flaky is True
+        # The majority classification is carried, and is a finding on both axes.
+        assert delta.change is ChangeKind.CONFOUNDED
+        assert delta.tier_agreement is TierAgreement.DISAGREE
+        # And none of it is counted, because it did not reproduce.
+        assert report.flaky_count == 1
+        assert report.changed_count == 0
+        assert report.confounded_count == 0
+        assert report.disagreement_count == 0
+        assert report.unclassified_count == 0
+
+    def test_a_flaky_majority_that_is_a_real_change_is_still_not_counted(self) -> None:
+        """The case where the skip is the only thing holding the count at zero.
+
+        Two repeats out of three show a uniform verdict flip on every tier, which is
+        a genuine `changed` classification, and the third does not. Without the skip
+        this lands in ``changed_count`` while the row is flaky, which is exactly what
+        the ADR forbids.
+        """
+        base = _uniform("v1", [_result("a")])
+        flipped = _uniform("v2", [_result("a", EvalOutcome.FAIL)])
+        held = _uniform("v2", [_result("a")])
+        report = diff_observations(base, [flipped, flipped, held])
+        delta = _only(report, "a")
+        assert delta.flaky is True
+        assert delta.change is ChangeKind.VERDICT
+        assert report.changed_count == 0
+
+    def test_a_stable_row_reports_the_same_evidence_whatever_the_order(self) -> None:
+        """Identical classification does not mean identical evidence.
+
+        Every repeat here reports a tier disagreement, so the row is not flaky, but
+        each names a different host. Taking the first repeat's evidence would make
+        the host in the report, and the remedy command printed under it, depend on
+        the order the artifacts were listed in.
+        """
+        import itertools
+
+        base = _uniform("v1", [_result("a")])
+        candidates = [
+            _observation(
+                "v2",
+                {
+                    Tier.SKILL: [_result("a")],
+                    Tier.LOCAL: [_result("a")],
+                    Tier.CLUSTER: [_result("a", EvalOutcome.FAIL, error=f"egress denied to {host}")],
+                },
+            )
+            for host in ("alpha.example.com", "bravo.example.com", "charlie.example.com")
+        ]
+        rendered = {
+            render_terminal(diff_observations(base, list(order)))
+            for order in itertools.permutations(candidates)
+        }
+        assert len(rendered) == 1, "the reported host depended on argument order"
+
+    @pytest.mark.parametrize(
+        "first,second",
+        [
+            (ChangeKind.UNCHANGED, ChangeKind.VERDICT),
+            (ChangeKind.VERDICT, ChangeKind.TRAJECTORY),
+            (ChangeKind.CONFOUNDED, ChangeKind.UNCOMPARABLE),
+            (ChangeKind.NEW, ChangeKind.REMOVED),
+            (ChangeKind.TRAJECTORY, ChangeKind.UNCHANGED),
+        ],
+    )
+    def test_a_tie_goes_to_the_signature_that_sorts_first(self, first, second) -> None:
+        """The rule, asserted directly, over several pairs.
+
+        One pair is a weak guard: choosing from an unordered set can coincide with
+        the sorted answer for that particular pair, and measurement showed it doing
+        exactly that for the pair this fold actually hits. Several pairs make the
+        coincidence unlikely rather than assumed.
+        """
+        from curie_worker.eval.tierdiff import _majority
+
+        counts = {
+            (first, TierAgreement.AGREE): 1,
+            (second, TierAgreement.AGREE): 1,
+        }
+        expected = min([(first, TierAgreement.AGREE), (second, TierAgreement.AGREE)])
+        assert _majority(counts) == expected
+
+    def test_a_tie_is_broken_the_same_way_in_a_fresh_process(self, tmp_path) -> None:
+        """A tie resolves identically under different hash seeds.
+
+        Scoped honestly: this checks cross-process determinism end to end, and it is
+        NOT a sufficient guard against choosing from an unordered set. Measurement
+        across six seeds showed the unsorted choice agreeing with the sorted one for
+        the pair this fold hits, so the test above is what pins the rule and this one
+        checks that nothing else in the path has become seed-dependent.
+        """
+        import os
+        import subprocess
+        import sys
+
+        script = tmp_path / "tie.py"
+        script.write_text(
+            "from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult\n"
+            "from curie_worker.eval.tierdiff import Observation, Tier, TierRun, diff_observations\n"
+            "def r(o):\n"
+            "    return EvalCaseResult(case_id='a', outcome=o, output='', latency_ms=1.0)\n"
+            "def obs(v, o):\n"
+            "    return Observation(version=v, tiers=tuple(\n"
+            "        TierRun(tier=t, provenance='x',\n"
+            "                run=EvalRunResult(version=v, suite='s', results=[r(o)])) for t in Tier))\n"
+            "base = obs('v1', EvalOutcome.PASS)\n"
+            "steady = obs('v2', EvalOutcome.PASS)\n"
+            "odd = obs('v2', EvalOutcome.FAIL)\n"
+            "print(diff_observations(base, [steady, odd]).model_dump_json())\n",
+            encoding="utf-8",
+        )
+        outputs = set()
+        for seed in ("0", "1", "7", "12345"):
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            done = subprocess.run(
+                [sys.executable, str(script)],
+                capture_output=True, text=True, env=env, check=True,
+            )
+            outputs.add(done.stdout)
+        assert len(outputs) == 1, "the tie broke differently under a different hash seed"
+
+    def test_a_tied_flake_resolves_the_same_way_whatever_the_order(self) -> None:
+        """A two-way tie is where an unsorted max stops being deterministic."""
+        base = _uniform("v1", [_result("a")])
+        steady = _uniform("v2", [_result("a")])
+        odd = _uniform("v2", [_result("a", EvalOutcome.FAIL)])
+        forward = diff_observations(base, [steady, odd])
+        backward = diff_observations(base, [odd, steady])
+        assert forward.model_dump_json() == backward.model_dump_json()
+
+    def test_the_report_is_a_function_of_the_candidate_set_not_its_order(self) -> None:
+        """The guard for the whole class of defect the fold used to have.
+
+        Three repeats, every permutation, one rendered report. Anything that reads
+        ``per_repeat[0]``, or takes ``max`` over an unsorted set of ties, makes the
+        headline depend on the order the artifacts were listed in, which tells the
+        reader about their argv rather than about their bundle.
+        """
+        import itertools
+
+        base = _uniform("v1", [_result("steady"), _result("wobbly")])
+        good = _uniform("v2", [_result("steady"), _result("wobbly")])
+        bad = _observation(
+            "v2",
+            {
+                Tier.SKILL: [_result("steady"), _result("wobbly")],
+                Tier.LOCAL: [_result("steady"), _result("wobbly")],
+                Tier.CLUSTER: [
+                    _result("steady"),
+                    _result("wobbly", EvalOutcome.FAIL, error="egress denied to api.example.com"),
+                ],
+            },
+        )
+        reports = [diff_observations(base, list(order)) for order in itertools.permutations([good, good, bad])]
+        # The MODEL, not just the rendering. A flaky row deliberately renders only its
+        # rate, so a rendering-only assertion cannot see the fields the fold picks and
+        # would pass while the JSON output still depended on argument order.
+        assert len({report.model_dump_json() for report in reports}) == 1
+        assert len({render_terminal(report) for report in reports}) == 1
 
     def test_a_reproducible_delta_is_not_called_flaky(self) -> None:
         base = _uniform("v1", [_result("a")])
@@ -402,7 +591,8 @@ class TestTheRunnerActuallyRecordsTheRoute:
     """The one claim the diff engine cannot prove about itself.
 
     Everything above tests the differ against results built in the test. These
-    tests drive the real eval runner over real HTTP against a scripted runner, so
+    tests drive the real eval runner over real loopback HTTP against a scripted
+    runner, so
     a regression that stopped recording the trajectory would turn them red rather
     than quietly reducing every route diff to "unchanged".
     """

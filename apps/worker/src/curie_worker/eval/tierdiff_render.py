@@ -82,8 +82,13 @@ def _evidence(delta: CaseDelta) -> list[tuple[str, bool]]:
         place instead of leaving the renderer to guess from the text.
     """
     lines: list[tuple[str, bool]] = []
-    if delta.flake_rate:
-        lines.append((f"{delta.flake_rate}; reported as suite instability, not as a change", True))
+    if delta.flaky:
+        # A flaky row renders its rate and stops. Everything else on the row came from
+        # one repeat, and which repeat that is depends on the order the caller listed
+        # them in; printing a per-tier grid or a cause here would present that as the
+        # candidate's behavior when the repeats did not agree it was.
+        rate = delta.flake_rate or "repeats disagreed"
+        return [(f"{rate}; reported as suite instability, not as a change", True)]
     if delta.change is ChangeKind.CONFOUNDED:
         lines.append(("behavior not measurable here: the environment moved too. Fix the tier gap first.", True))
     if delta.change is ChangeKind.VERDICT:

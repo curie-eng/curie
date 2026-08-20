@@ -9,11 +9,16 @@ The **diff engine is real**: `curie_worker.eval.tierdiff` plus its renderers, wi
 tests in `apps/worker/tests/eval/test_tierdiff.py`.
 
 The **artifacts are produced by the real eval runner**. `generate.py` starts a
-scripted runner over real HTTP and drives
+scripted runner over real loopback HTTP and drives
 `curie_worker.eval.runner.EvalRunner` against it, so the graders, the sampling
 reduction, the result construction, and the new trajectory capture are all
 production code paths. Only the model's replies are scripted, which is what a
 fixture is.
+
+The HTTP is real and it is **loopback only**: an aiohttp test server on 127.0.0.1.
+The client, the server, the streaming and the framing are all real; no network, no
+TLS, no proxy and no Microsoft endpoint are involved. "Real HTTP" on its own would
+invite the wrong reading.
 
 The **artifacts are not cluster runs**. No Kubernetes was involved, and the
 `cluster` tier's egress denial text was scripted rather than emitted by a real
@@ -24,7 +29,7 @@ run.
 ## Regenerate the artifacts
 
 ```bash
-uv run --directory apps/worker python demo/tier-diff/generate.py
+uv run --project apps/worker python demo/tier-diff/generate.py
 ```
 
 Writes `artifacts/deployed-v0.7.0.json` and three repeats of

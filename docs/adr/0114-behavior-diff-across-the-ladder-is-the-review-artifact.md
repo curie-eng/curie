@@ -74,8 +74,24 @@ report. A confidently wrong cause costs a reviewer more than an admitted unknown
 **5. A difference that does not reproduce is reported as suite instability, not
 as a change.** The diff takes several repeats of the candidate. A row whose
 classification is identical in every repeat is a finding; a row that classifies
-differently is `flaky`, carries its disagreement rate, and is excluded from the
-change count.
+differently is `flaky` and carries its disagreement rate. A flaky row is counted
+ONLY as flaky: it is excluded from the changed, not-measurable, disagreement and
+unclassified counts alike, because a classification that did not reproduce has
+not been shown to be any of those things. It renders its rate and nothing else,
+since every other field on the row came from one repeat that the others
+contradicted.
+
+**7. The report is a function of the candidate SET, not of its order.** Two
+consequences, both of which were defects in the first implementation and were
+found in review rather than by the suite. A flaky row's classification is the
+majority across repeats, with a tie broken by sorting rather than by choosing
+from an unordered collection, because for `StrEnum` keys that is string hashing
+and therefore varies between processes. A stable row's EVIDENCE is chosen
+canonically too: its classification is identical in every repeat by definition,
+but two repeats can both report a tier disagreement while naming different
+hosts, and taking the first would put the caller's argument order into the
+remedy command. A report that changes when the same three artifacts are listed
+differently is telling the reader about their argv.
 
 **6. The surface is `curie dev tier-diff`, reading run artifacts.** It does not
 run evals; it reads artifacts the platform produces, so it is offline and needs no
@@ -112,6 +128,12 @@ Three weaknesses are accepted and must be stated whenever this is presented.
   happen to emit today. It will miss causes, and its entries can go stale when a
   message changes. That is why `unclassified` is a designed outcome with its own
   headline count, and why no catch-all entry is permitted.
+
+One correction worth recording, because it is the same class of error twice. The
+first implementation let a flaky row reach the change count, and the test written
+to forbid exactly that passed only because of the order its two arguments were
+listed in. A guard test asserts something weaker than the rule and the weaker
+thing can hold by accident; reordering the inputs is now part of writing one.
 
 Debts this ADR does not pay, named so they are not mistaken for done:
 

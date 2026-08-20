@@ -25,7 +25,7 @@
             "case_id": "refund_within_policy",
             "outcome": "pass",
             "output": "Order 8812 has been refunded.",
-            "latency_ms": 0.28,
+            "latency_ms": 0.23,
             "error": null,
             "detail": null,
             "cost_usd": null,
@@ -39,7 +39,7 @@
             "case_id": "refund_over_limit",
             "outcome": "pass",
             "output": "That exceeds my limit, so it needs approval from a manager.",
-            "latency_ms": 0.26,
+            "latency_ms": 0.23,
             "error": null,
             "detail": null,
             "cost_usd": null,
@@ -53,7 +53,7 @@
             "case_id": "escalate_to_human",
             "outcome": "pass",
             "output": "I have escalated this to a human agent.",
-            "latency_ms": 0.23,
+            "latency_ms": 0.29,
             "error": null,
             "detail": null,
             "cost_usd": null,
@@ -67,7 +67,7 @@
             "case_id": "summarize_thread",
             "outcome": "pass",
             "output": "Here is the summary of the thread.",
-            "latency_ms": 0.26,
+            "latency_ms": 0.23,
             "error": null,
             "detail": null,
             "cost_usd": null,
@@ -80,7 +80,7 @@
             "case_id": "quarterly_report",
             "outcome": "pass",
             "output": "The Q3 revenue report is ready.",
-            "latency_ms": 0.25,
+            "latency_ms": 0.21,
             "error": null,
             "detail": null,
             "cost_usd": null,
@@ -112,114 +112,6 @@
     {
       "tier": "local",
       "provenance": "scripted runner + real curie_worker.eval.runner (demo/tier-diff/generate.py); NOT a cluster run; tier=local",
-      "run": {
-        "version": "v0.7.1-rc.1",
-        "suite": "backoffice",
-        "results": [
-          {
-            "case_id": "lookup_order_status",
-            "outcome": "pass",
-            "output": "Order 8812 shipped on Tuesday.",
-            "latency_ms": 0.24,
-            "error": null,
-            "detail": null,
-            "cost_usd": null,
-            "trajectory": [
-              "lookup_order"
-            ],
-            "passed": true
-          },
-          {
-            "case_id": "refund_within_policy",
-            "outcome": "pass",
-            "output": "Order 8812 has been refunded.",
-            "latency_ms": 0.23,
-            "error": null,
-            "detail": null,
-            "cost_usd": null,
-            "trajectory": [
-              "lookup_order",
-              "refund"
-            ],
-            "passed": true
-          },
-          {
-            "case_id": "refund_over_limit",
-            "outcome": "pass",
-            "output": "That exceeds my limit, so it needs approval from a manager.",
-            "latency_ms": 0.24,
-            "error": null,
-            "detail": null,
-            "cost_usd": null,
-            "trajectory": [
-              "lookup_order",
-              "request_approval"
-            ],
-            "passed": true
-          },
-          {
-            "case_id": "escalate_to_human",
-            "outcome": "pass",
-            "output": "I have escalated this to a human agent.",
-            "latency_ms": 0.25,
-            "error": null,
-            "detail": null,
-            "cost_usd": null,
-            "trajectory": [
-              "lookup_order",
-              "escalate"
-            ],
-            "passed": true
-          },
-          {
-            "case_id": "summarize_thread",
-            "outcome": "pass",
-            "output": "Here is the summary of the thread.",
-            "latency_ms": 0.23,
-            "error": null,
-            "detail": null,
-            "cost_usd": null,
-            "trajectory": [
-              "read_thread"
-            ],
-            "passed": true
-          },
-          {
-            "case_id": "quarterly_report",
-            "outcome": "pass",
-            "output": "The Q3 revenue report is ready.",
-            "latency_ms": 0.28,
-            "error": null,
-            "detail": null,
-            "cost_usd": null,
-            "trajectory": [
-              "query_ledger",
-              "build_report"
-            ],
-            "passed": true
-          },
-          {
-            "case_id": "sync_crm_record",
-            "outcome": "pass",
-            "output": "The ticket is synced to the CRM.",
-            "latency_ms": 0.23,
-            "error": null,
-            "detail": null,
-            "cost_usd": null,
-            "trajectory": [
-              "crm_write"
-            ],
-            "passed": true
-          }
-        ],
-        "model": null,
-        "stream_id": null,
-        "scorer": "grader"
-      }
-    },
-    {
-      "tier": "cluster",
-      "provenance": "scripted runner + real curie_worker.eval.runner (demo/tier-diff/generate.py); NOT a cluster run; tier=cluster",
       "run": {
         "version": "v0.7.1-rc.1",
         "suite": "backoffice",
@@ -281,9 +173,117 @@
           },
           {
             "case_id": "summarize_thread",
+            "outcome": "pass",
+            "output": "Here is the summary of the thread.",
+            "latency_ms": 0.24,
+            "error": null,
+            "detail": null,
+            "cost_usd": null,
+            "trajectory": [
+              "read_thread"
+            ],
+            "passed": true
+          },
+          {
+            "case_id": "quarterly_report",
+            "outcome": "pass",
+            "output": "The Q3 revenue report is ready.",
+            "latency_ms": 0.25,
+            "error": null,
+            "detail": null,
+            "cost_usd": null,
+            "trajectory": [
+              "query_ledger",
+              "build_report"
+            ],
+            "passed": true
+          },
+          {
+            "case_id": "sync_crm_record",
+            "outcome": "pass",
+            "output": "The ticket is synced to the CRM.",
+            "latency_ms": 0.23,
+            "error": null,
+            "detail": null,
+            "cost_usd": null,
+            "trajectory": [
+              "crm_write"
+            ],
+            "passed": true
+          }
+        ],
+        "model": null,
+        "stream_id": null,
+        "scorer": "grader"
+      }
+    },
+    {
+      "tier": "cluster",
+      "provenance": "scripted runner + real curie_worker.eval.runner (demo/tier-diff/generate.py); NOT a cluster run; tier=cluster",
+      "run": {
+        "version": "v0.7.1-rc.1",
+        "suite": "backoffice",
+        "results": [
+          {
+            "case_id": "lookup_order_status",
+            "outcome": "pass",
+            "output": "Order 8812 shipped on Tuesday.",
+            "latency_ms": 0.23,
+            "error": null,
+            "detail": null,
+            "cost_usd": null,
+            "trajectory": [
+              "lookup_order"
+            ],
+            "passed": true
+          },
+          {
+            "case_id": "refund_within_policy",
+            "outcome": "pass",
+            "output": "Order 8812 has been refunded.",
+            "latency_ms": 0.24,
+            "error": null,
+            "detail": null,
+            "cost_usd": null,
+            "trajectory": [
+              "lookup_order",
+              "refund"
+            ],
+            "passed": true
+          },
+          {
+            "case_id": "refund_over_limit",
+            "outcome": "pass",
+            "output": "That exceeds my limit, so it needs approval from a manager.",
+            "latency_ms": 0.23,
+            "error": null,
+            "detail": null,
+            "cost_usd": null,
+            "trajectory": [
+              "lookup_order",
+              "request_approval"
+            ],
+            "passed": true
+          },
+          {
+            "case_id": "escalate_to_human",
+            "outcome": "pass",
+            "output": "I have escalated this to a human agent.",
+            "latency_ms": 0.2,
+            "error": null,
+            "detail": null,
+            "cost_usd": null,
+            "trajectory": [
+              "lookup_order",
+              "escalate"
+            ],
+            "passed": true
+          },
+          {
+            "case_id": "summarize_thread",
             "outcome": "fail",
             "output": "",
-            "latency_ms": 0.23,
+            "latency_ms": 0.24,
             "error": "read_thread timed out after 30s",
             "detail": null,
             "cost_usd": null,
@@ -309,7 +309,7 @@
             "case_id": "sync_crm_record",
             "outcome": "fail",
             "output": "",
-            "latency_ms": 0.25,
+            "latency_ms": 0.22,
             "error": "unexpected end of stream from the sandbox supervisor",
             "detail": null,
             "cost_usd": null,

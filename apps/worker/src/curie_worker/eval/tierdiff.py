@@ -226,7 +226,14 @@ class CaseDelta(BaseModel):
 
 
 class DiffReport(BaseModel):
-    """The whole comparison: every row, plus the rollups a reviewer reads first."""
+    """The whole comparison: every row, plus the rollups a reviewer reads first.
+
+    One rule governs every rollup below: **a flaky row is counted only as flaky.**
+    A classification that did not reproduce across repeats has not been shown to be
+    anything else, so letting it also land in the changed, not-measurable,
+    disagreement or unclassified counts would report suite instability as a finding
+    about the bundle. That is the failure mode that gets a report ignored.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -251,17 +258,23 @@ class DiffReport(BaseModel):
         as a regression in their prompt.
         """
         moved = {ChangeKind.VERDICT, ChangeKind.TRAJECTORY}
-        return sum(1 for delta in self.deltas if delta.change in moved)
+        return sum(1 for delta in self.deltas if not delta.flaky and delta.change in moved)
 
     @property
     def confounded_count(self) -> int:
         """Count rows where bundle and environment both moved, so neither is provable."""
-        return sum(1 for delta in self.deltas if delta.change is ChangeKind.CONFOUNDED)
+        return sum(
+            1 for delta in self.deltas if not delta.flaky and delta.change is ChangeKind.CONFOUNDED
+        )
 
     @property
     def disagreement_count(self) -> int:
         """Count rows where the candidate's own tiers disagree."""
-        return sum(1 for delta in self.deltas if delta.tier_agreement is TierAgreement.DISAGREE)
+        return sum(
+            1
+            for delta in self.deltas
+            if not delta.flaky and delta.tier_agreement is TierAgreement.DISAGREE
+        )
 
     @property
     def flaky_count(self) -> int:
@@ -279,7 +292,9 @@ class DiffReport(BaseModel):
         return sum(
             1
             for delta in self.deltas
-            if delta.tier_agreement is TierAgreement.DISAGREE and delta.attribution is None
+            if not delta.flaky
+            and delta.tier_agreement is TierAgreement.DISAGREE
+            and delta.attribution is None
         )
 
 
@@ -538,6 +553,27 @@ def _repeat_delta(
     )
 
 
+def _majority(
+    counts: Mapping[tuple[ChangeKind, TierAgreement], int],
+) -> tuple[ChangeKind, TierAgreement]:
+    """Pick the winning classification, breaking a tie by a rule rather than by luck.
+
+    Extracted and named because the tie is the interesting case and it needs to be
+    testable on its own. Choosing from an unordered collection breaks a tie by hash
+    order, which for StrEnum keys is string hashing and therefore varies between
+    processes: the same three artifacts could then produce two different reports on
+    two machines. Sorting first makes the tie-break a property of the data.
+
+    Args:
+        counts: How many repeats produced each classification.
+
+    Returns:
+        The classification with the most repeats. A tie goes to the one that sorts
+        first, which is arbitrary but fixed, and fixed is the whole requirement.
+    """
+    return max(sorted(counts), key=lambda signature: counts[signature])
+
+
 def diff_observations(
     baseline: Observation,
     candidates: Sequence[Observation],
@@ -582,19 +618,32 @@ def diff_observations(
         # The classification pair is the identity of a finding. Evidence text can
         # legitimately vary between repeats (a different host in a message, say)
         # without the finding itself being unstable, so folding compares the pair.
-        signatures = {(delta.change, delta.tier_agreement) for delta in per_repeat}
-        first = per_repeat[0]
-        if len(signatures) == 1:
-            deltas.append(first)
+        counts: dict[tuple[ChangeKind, TierAgreement], int] = {}
+        for delta in per_repeat:
+            key = (delta.change, delta.tier_agreement)
+            counts[key] = counts.get(key, 0) + 1
+        if len(counts) == 1:
+            # Every repeat classified this case identically, so the row's verdict is
+            # settled. Its EVIDENCE is not: two repeats can both report a tier
+            # disagreement while naming different hosts, and taking the first would
+            # make the reported host depend on argument order. The canonical choice
+            # is arbitrary on purpose; what matters is that it is the same for any
+            # ordering of the same repeats.
+            deltas.append(min(per_repeat, key=lambda delta: delta.model_dump_json()))
             continue
-        majority = max(signatures, key=lambda sig: sum(1 for d in per_repeat if (d.change, d.tier_agreement) == sig))
-        agreeing = sum(1 for delta in per_repeat if (delta.change, delta.tier_agreement) == majority)
+        majority = _majority(counts)
+        agreeing = counts[majority]
+        change, agreement = majority
         deltas.append(
-            first.model_copy(
-                update={
-                    "flaky": True,
-                    "flake_rate": f"{repeats - agreeing}/{repeats} repeats disagreed",
-                }
+            CaseDelta(
+                case_id=case_id,
+                # The majority classification, not one repeat's. It is carried for
+                # information only: every rollup below skips a flaky row, because a
+                # classification that did not reproduce is a fact about the suite.
+                change=change,
+                tier_agreement=agreement,
+                flaky=True,
+                flake_rate=f"{repeats - agreeing}/{repeats} repeats disagreed",
             )
         )
 
