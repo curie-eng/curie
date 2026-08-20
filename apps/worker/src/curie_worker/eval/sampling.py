@@ -115,6 +115,7 @@ def aggregate(
             latency_ms=total_latency,
             detail=rep.detail,
             cost_usd=cost,
+            trajectory=rep.trajectory,
         )
 
     graded = [s for s in samples if s.outcome is not EvalOutcome.PLUMBING_OK]
@@ -142,4 +143,9 @@ def aggregate(
         error=None if green else f"variance-aware grading failed: {variance}",
         detail=representative.detail,
         cost_usd=cost,
+        # An aggregate of n samples has no single route: the samples may each have
+        # taken a different one. Carrying the representative sample's trajectory
+        # keeps the route consistent with the `output` and `detail` beside it,
+        # rather than inventing a union that no turn actually walked.
+        trajectory=representative.trajectory,
     )

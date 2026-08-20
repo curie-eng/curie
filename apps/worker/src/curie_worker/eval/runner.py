@@ -183,6 +183,9 @@ class EvalRunner:
                 outcome=EvalOutcome.FAIL,
                 output="",
                 latency_ms=_elapsed_ms(start),
+                # The route the turn actually took, kept rather than discarded so a
+                # consumer can diff behavior and not just pass-rate.
+                trajectory=tuple(trajectory),
                 # A bare asyncio.TimeoutError stringifies to "", which would
                 # otherwise read downstream as a completed turn; keep it non-empty.
                 error=str(exc) or type(exc).__name__,
@@ -201,6 +204,9 @@ class EvalRunner:
                 outcome=EvalOutcome.FAIL,
                 output=output,
                 latency_ms=_elapsed_ms(start),
+                # The route the turn actually took, kept rather than discarded so a
+                # consumer can diff behavior and not just pass-rate.
+                trajectory=tuple(trajectory),
                 error=error_detail or "runner reported a classified failure",
                 # A classified-failure turn (budget/model error) can burn heavy
                 # input tokens before it fails -- attribute that cost (#854).
@@ -220,6 +226,9 @@ class EvalRunner:
                 outcome=EvalOutcome.FAIL,
                 output=output,
                 latency_ms=_elapsed_ms(start),
+                # The route the turn actually took, kept rather than discarded so a
+                # consumer can diff behavior and not just pass-rate.
+                trajectory=tuple(trajectory),
                 error=f"turn ended {final_status}, expected status {expected.value!r}",
                 # A wrong-terminal-status turn still ran the model and stamped
                 # usage on its Final -- attribute that cost too (#854).
@@ -238,6 +247,9 @@ class EvalRunner:
                 outcome=EvalOutcome.PLUMBING_OK,
                 output=output,
                 latency_ms=_elapsed_ms(start),
+                # The route the turn actually took, kept rather than discarded so a
+                # consumer can diff behavior and not just pass-rate.
+                trajectory=tuple(trajectory),
                 # No cost_usd on purpose: the fake tier has no real spend, so
                 # pricing it would fabricate a cost (#854).
             )
@@ -250,6 +262,9 @@ class EvalRunner:
             outcome=EvalOutcome.PASS if verdict.passed else EvalOutcome.FAIL,
             output=output,
             latency_ms=_elapsed_ms(start),
+            # The route the turn actually took, kept rather than discarded so a
+            # consumer can diff behavior and not just pass-rate.
+            trajectory=tuple(trajectory),
             detail=verdict.detail,
             # Real token usage x model pricing (#390). None when the model is
             # unpriced or the runner reported no usage, so the matrix omits this

@@ -526,6 +526,27 @@ enum DevAction {
     /// goes RED -- the falsifiability gate's real-path negative control (#619,
     /// `bash cli/scripts/eval-falsifiability.sh`). Offline, no credential.
     EvalFalsifiability,
+    /// Diff a candidate bundle's BEHAVIOR against the deployed bundle, across the
+    /// ladder (`bash cli/scripts/tier-diff.sh`). Reports which eval cases changed
+    /// verdict or changed tool-call route, which cases the tiers disagree about,
+    /// and a flake rate over repeats. Offline: it reads run artifacts, it does not
+    /// run evals. Finding a difference is a successful run and exits 0 unless
+    /// `--fail-on-change` is passed.
+    TierDiff {
+        /// Run artifact for the deployed bundle (the baseline).
+        #[arg(long, value_name = "ARTIFACT")]
+        deployed: String,
+        /// Run artifact for the candidate bundle. Repeat for repeats of the same
+        /// version; a single repeat cannot detect flake at all.
+        #[arg(long, value_name = "ARTIFACT", required = true)]
+        candidate: Vec<String>,
+        /// Output surface: terminal, markdown for a PR comment, or json.
+        #[arg(long, default_value = "terminal")]
+        format: String,
+        /// Exit non-zero when any row is noteworthy. For a CI gate; off by default.
+        #[arg(long)]
+        fail_on_change: bool,
+    },
     /// Assert every `Deserialize` struct in `cli/src/api.rs` is declared in
     /// `cli/api-mirrors.json` and covers its API model's fields (#691,
     /// `bash cli/scripts/check-field-parity.sh`). Offline, no credential.
@@ -2007,6 +2028,41 @@ async fn run(command: Option<Command>) -> Result<()> {
                     &[change.as_str(), selector.as_str()],
                 )
                 .await
+            }
+            DevAction::TierDiff {
+                deployed,
+                candidate,
+                format,
+                fail_on_change,
+            } => {
+                // Artifact paths are resolved against the CALLER's directory here,
+                // because `dev_script` runs from the repo root: a relative path
+                // that the user could see in their shell would otherwise resolve
+                // somewhere else and report a missing file that plainly exists. A
+                // path that cannot be resolved is passed through unchanged so the
+                // engine reports it, rather than this layer inventing an error.
+                let resolve = |p: String| {
+                    std::fs::canonicalize(&p)
+                        .map(|abs| abs.to_string_lossy().into_owned())
+                        .unwrap_or(p)
+                };
+                // Built as owned strings first: the engine takes --candidate once
+                // per repeat, so the flag count is not known at compile time.
+                let mut args: Vec<String> = vec![
+                    "--deployed".into(),
+                    resolve(deployed),
+                    "--format".into(),
+                    format,
+                ];
+                for path in candidate {
+                    args.push("--candidate".into());
+                    args.push(resolve(path));
+                }
+                if fail_on_change {
+                    args.push("--fail-on-change".into());
+                }
+                let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/tier-diff.sh", &borrowed).await
             }
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,

@@ -142,4 +142,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0110 | [Deterministic security posture classification distinguishes manifest declarations from operator gates](0110-deterministic-security-posture-classification.md) | Draft |
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
 | 0113 | [Bundles declare connector build inputs and tiers deliver pinned images](0113-bundles-declare-connector-build-inputs-and-tiers-deliver-pinned-images.md) | Accepted |
+| 0114 | [A cross-tier behavior diff is the review artifact for a bundle change](0114-behavior-diff-across-the-ladder-is-the-review-artifact.md) | Draft |
 <!-- END GENERATED: adr-index -->

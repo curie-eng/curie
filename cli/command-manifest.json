@@ -3973,6 +3973,52 @@
           "name": "eval-falsifiability"
         },
         {
+          "about": "Diff a candidate bundle's BEHAVIOR against the deployed bundle, across the ladder (`bash cli/scripts/tier-diff.sh`). Reports which eval cases changed verdict or changed tool-call route, which cases the tiers disagree about, and a flake rate over repeats. Offline: it reads run artifacts, it does not run evals. Finding a difference is a successful run and exits 0 unless `--fail-on-change` is passed",
+          "args": [
+            {
+              "global": false,
+              "help": "Run artifact for the deployed bundle (the baseline)",
+              "id": "deployed",
+              "long": "deployed",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Run artifact for the candidate bundle. Repeat for repeats of the same version; a single repeat cannot detect flake at all",
+              "id": "candidate",
+              "long": "candidate",
+              "positional": false,
+              "required": true
+            },
+            {
+              "default_values": [
+                "terminal"
+              ],
+              "global": false,
+              "help": "Output surface: terminal, markdown for a PR comment, or json",
+              "id": "format",
+              "long": "format",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Exit non-zero when any row is noteworthy. For a CI gate; off by default",
+              "id": "fail_on_change",
+              "long": "fail-on-change",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "tier-diff"
+        },
+        {
           "about": "Assert every `Deserialize` struct in `cli/src/api.rs` is declared in `cli/api-mirrors.json` and covers its API model's fields (#691, `bash cli/scripts/check-field-parity.sh`). Offline, no credential",
           "hidden": false,
           "name": "field-parity"

@@ -214,6 +214,14 @@ class EvalCaseResult(BaseModel):
     turn failed. Runtime and transport failures remain in ``error``. This keeps
     a deterministic trajectory mismatch distinct from a broken execution.
 
+    ``trajectory`` is the ordered tool names the turn actually invoked. The
+    runner already computes it to feed the scorer; keeping it on the result is what
+    lets a consumer ask what ROUTE the agent took, not merely whether it passed.
+    Two bundles can both pass every case while calling entirely different tools,
+    and a pass-rate is structurally unable to show that. Empty is honest for a turn
+    that invoked nothing, and for a reader of an older artifact that never carried
+    the field.
+
     ``cost_usd`` is the dollar cost the runner attributed to this case's turn
     when the harness reported usage/pricing; it is ``None`` when cost is not
     available (e.g. the fake-model path, or a provider that reports no usage), so
@@ -229,6 +237,7 @@ class EvalCaseResult(BaseModel):
     error: str | None = None
     detail: str | None = None
     cost_usd: float | None = None
+    trajectory: tuple[str, ...] = ()
 
     @computed_field  # type: ignore[prop-decorator]
     @property
