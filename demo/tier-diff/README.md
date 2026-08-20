@@ -33,6 +33,14 @@ with identical content apart from latency numbers.
 
 ## The four shots
 
+The `curie` on PATH is likely a released build without this verb. Put this
+branch's binary in front of it for the current shell only:
+
+```bash
+export PATH="$PWD/cli/target/debug:$PATH"
+curie --version   # expect 0.7.0-rc.2
+```
+
 Run from the repository root. Artifact paths are resolved against the directory
 you are standing in, so these work from anywhere.
 
