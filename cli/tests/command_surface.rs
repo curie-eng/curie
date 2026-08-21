@@ -286,6 +286,69 @@ fn process_dev_help_lists_verify_fix_pin() {
     );
 }
 
+/// `curie dev remote-dev-spike` is the EXPERIMENTAL THROWAWAY remote-development
+/// prototype. It is only useful if it is reachable from the one entry point the
+/// repo documents, so assert the verb is listed and that it takes pass-through
+/// arguments (the mode selector: `run`, `follow-up`, `down`).
+#[test]
+fn process_dev_help_lists_the_remote_dev_spike() {
+    let output = run_help(&["dev"]);
+    assert!(
+        output.status.success(),
+        "expected success for dev help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        help_lists_subcommand(&text, "remote-dev-spike"),
+        "missing remote-dev-spike\n{text}"
+    );
+
+    let leaf = run_help(&["dev", "remote-dev-spike"]);
+    assert!(
+        leaf.status.success(),
+        "expected success for remote-dev-spike help\n{}",
+        output_text(&leaf)
+    );
+    let leaf_text = output_text(&leaf);
+    assert!(
+        leaf_text.contains("[ARGS]"),
+        "remote-dev-spike help must accept pass-through args\n{leaf_text}"
+    );
+}
+
+/// `curie dev remote-dev-session` is the EXPERIMENTAL developer-facing remote
+/// development session loop. Same reachability contract as the spike above: it
+/// is only useful if it is listed under the one entry point the repo documents,
+/// and it must take pass-through arguments (the verb selector: `start`, `turn`,
+/// `status`, `finish`, `down`).
+#[test]
+fn process_dev_help_lists_the_remote_dev_session() {
+    let output = run_help(&["dev"]);
+    assert!(
+        output.status.success(),
+        "expected success for dev help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        help_lists_subcommand(&text, "remote-dev-session"),
+        "missing remote-dev-session\n{text}"
+    );
+
+    let leaf = run_help(&["dev", "remote-dev-session"]);
+    assert!(
+        leaf.status.success(),
+        "expected success for remote-dev-session help\n{}",
+        output_text(&leaf)
+    );
+    let leaf_text = output_text(&leaf);
+    assert!(
+        leaf_text.contains("[ARGS]"),
+        "remote-dev-session help must accept pass-through args\n{leaf_text}"
+    );
+}
+
 /// The checked-in manifest must equal what `curie schema` emits from the live
 /// clap grammar. This is the generated-artifact + CI drift gate (mirroring the
 /// schema-export discipline for `packages/aci-protocol` / `packages/plugin-format`):

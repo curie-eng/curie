@@ -493,7 +493,11 @@ services:
       - /tmp/curie-bundles:/tmp/curie-bundles
     environment:
       - CURIE_SANDBOX_SUBSTRATE=docker
-      - CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:latest
+      # Default is unchanged (the published runner image); the override exists
+      # only so a dev flow -- e.g. the throwaway remote-dev spike, which needs a
+      # runner image with git baked in -- can boot a derived image without
+      # editing this file.
+      - CURIE_RUNNER_IMAGE=${CURIE_RUNNER_IMAGE:-ghcr.io/curie-eng/curie-runner:latest}
       - TMPDIR=/tmp/curie-bundles
       - VALKEY_HOST=localhost
       - VALKEY_PORT=26379

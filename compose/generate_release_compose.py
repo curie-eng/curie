@@ -15,11 +15,13 @@ via three ordered text transforms:
       does not try to interpolate the collector's own env references), and repoint
       the otel-collector service from the host bind-mount to that config.
 
-  T3  Pin every `ghcr.io/curie-eng/curie-*:latest` image tag to the release
-      version (this also pins the worker-local image introduced by T1). Also
-      collapses the `:${CURIE_BASE_TAG:-latest}` override form (issue #698)
-      to the same literal pin, since the release asset has no shell to resolve
-      that override in.
+  T3  Collapse the `${CURIE_RUNNER_IMAGE:-...}` override the worker's env carries
+      to its default, then pin every `ghcr.io/curie-eng/curie-*:latest` image tag
+      to the release version (this also pins the worker-local image introduced by
+      T1). Also collapses the `:${CURIE_BASE_TAG:-latest}` override form (issue
+      #698) to the same literal pin. Same reason in all three cases: the release
+      asset has no shell to resolve an override in, and an interpolation left
+      standing would let ambient env swing a released binary's images.
 
 Each transform locates its anchor explicitly and raises ValueError if it is
 missing: this runs unattended at publish time, so a silent no-op would ship a
@@ -67,6 +69,18 @@ CURIE_LATEST_RE = re.compile(
     r"(ghcr\.io/curie-eng/curie-[a-z-]+):(?:latest|\$\{CURIE_BASE_TAG:-latest\})"
 )
 
+# compose.dev.yaml wraps the worker's runner image in a `${CURIE_RUNNER_IMAGE:-...}`
+# override so a dev flow (the throwaway remote-dev spike) can boot a derived,
+# git-bearing runner without editing the file. The release asset must NOT honour
+# that: an exported CURIE_RUNNER_IMAGE would silently replace the runner image a
+# released binary ships with, and nothing downstream would notice. Collapse the
+# whole interpolation to its default BEFORE the tag pin runs, so what ships is a
+# literal, version-pinned ref -- the same treatment CURIE_BASE_TAG gets above.
+RUNNER_IMAGE_OVERRIDE = (
+    "CURIE_RUNNER_IMAGE=${CURIE_RUNNER_IMAGE:-ghcr.io/curie-eng/curie-runner:latest}"
+)
+RUNNER_IMAGE_LITERAL = "CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:latest"
+
 DEV_COMPOSE = Path("compose.dev.yaml")
 OTEL_CONFIG = Path("otel/collector-config.yaml")
 
@@ -96,7 +110,15 @@ def generate(dev_text: str, otel_text: str, version: str) -> str:
         )
     text = text.replace(OTEL_VOLUME_BLOCK, OTEL_CONFIGS_REF, 1)
 
-    # T3: pin every curie-* image tag to the release version (worker-local too).
+    # T3a: collapse the CURIE_RUNNER_IMAGE override to its default, before the
+    # pin below rewrites the tag inside it.
+    if RUNNER_IMAGE_OVERRIDE not in text:
+        raise ValueError(
+            "T3: CURIE_RUNNER_IMAGE override line not found in compose.dev.yaml"
+        )
+    text = text.replace(RUNNER_IMAGE_OVERRIDE, RUNNER_IMAGE_LITERAL, 1)
+
+    # T3b: pin every curie-* image tag to the release version (worker-local too).
     text = CURIE_LATEST_RE.sub(rf"\1:{version}", text)
 
     return text

@@ -1,0 +1,10 @@
+{
+  "name": "coder",
+  "description": "The remote development agent plugin.",
+  "version": "0.1.0",
+  "starterPrompts": [
+    "What is checked out in this session, and where does it live?",
+    "Add a short usage section to the README and tell me exactly what you changed.",
+    "Rename the helper in the module I just described, then list the files you touched."
+  ]
+}

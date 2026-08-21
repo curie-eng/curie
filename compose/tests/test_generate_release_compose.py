@@ -203,6 +203,23 @@ def test_invariants_preserved_from_dev():
     assert service_names(out) == service_names(DEV_TEXT)
 
 
+def test_runner_image_override_collapses_to_a_literal_pin():
+    """A released binary's runner image cannot be swung by ambient env.
+
+    compose.dev.yaml wraps the worker's CURIE_RUNNER_IMAGE in a
+    `${CURIE_RUNNER_IMAGE:-...}` override so a dev flow can boot a derived runner
+    image. The release asset has no shell to resolve that in, and honouring it
+    would let an exported CURIE_RUNNER_IMAGE silently replace the runner a
+    release ships with. The generator collapses the whole interpolation to its
+    default before the version pin runs, so the shipped value is literal.
+    """
+    generate = load_generate()
+    out = generate(DEV_TEXT, OTEL_TEXT, version="9.9.9")
+
+    assert "CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:9.9.9" in out
+    assert "${CURIE_RUNNER_IMAGE" not in out
+
+
 def test_default_version_latest_leaves_latest_tags():
     generate = load_generate()
     out = generate(DEV_TEXT, OTEL_TEXT, version="latest")

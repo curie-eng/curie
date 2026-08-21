@@ -582,6 +582,36 @@ enum DevAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// EXPERIMENTAL THROWAWAY prototype for the remote development spike: claim
+    /// a managed Agent Sandbox, clone a test repo into it, run a coding turn,
+    /// and return the resulting git diff
+    /// (`bash cli/scripts/remote-dev-spike.sh`).
+    ///
+    /// Not a gate, not an E2E test, and not a supported surface: it exists to
+    /// falsify one product thesis and is expected to be deleted with the spike.
+    /// Modes: `run` (default), `follow-up`, `down`.
+    RemoteDevSpike {
+        /// Arguments passed straight through to the spike script, e.g.
+        /// `run --keep`, `follow-up`, `down`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// EXPERIMENTAL developer-facing remote development session loop over an
+    /// already-installed cluster release: deploy the session bundle, claim a
+    /// managed Agent Sandbox, clone a repository into it, drive coding turns,
+    /// and carry the resulting diff back out as a branch
+    /// (`bash cli/scripts/remote-dev-session.sh`).
+    ///
+    /// Never runs `cluster up` and never uninstalls anything: the release, the
+    /// namespace, and the sandbox pod belong to the platform. Verbs: `start`,
+    /// `turn`, `status`, `finish`, `down`.
+    RemoteDevSession {
+        /// Arguments passed straight through to the session script, e.g.
+        /// `start --namespace curie --channel C0CODER ...`, `turn "<text>"`,
+        /// `status`, `finish --push`, `down`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2137,6 +2167,14 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::BumpVersion { version, dry_run } => {
                 commands::bump_version(&version, dry_run).await
+            }
+            DevAction::RemoteDevSpike { args } => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/remote-dev-spike.sh", &args).await
+            }
+            DevAction::RemoteDevSession { args } => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/remote-dev-session.sh", &args).await
             }
         },
         Some(Command::Skill { action }) => match action {

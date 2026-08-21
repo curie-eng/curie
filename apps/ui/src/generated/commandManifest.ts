@@ -4259,6 +4259,44 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "bump-version"
+        },
+        {
+          "about": "EXPERIMENTAL THROWAWAY prototype for the remote development spike: claim a managed Agent Sandbox, clone a test repo into it, run a coding turn, and return the resulting git diff (`bash cli/scripts/remote-dev-spike.sh`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Arguments passed straight through to the spike script, e.g. `run --keep`, `follow-up`, `down`",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "EXPERIMENTAL THROWAWAY prototype for the remote development spike: claim a managed Agent Sandbox, clone a test repo into it, run a coding turn, and return the resulting git diff (`bash cli/scripts/remote-dev-spike.sh`).\n\nNot a gate, not an E2E test, and not a supported surface: it exists to falsify one product thesis and is expected to be deleted with the spike. Modes: `run` (default), `follow-up`, `down`.",
+          "name": "remote-dev-spike"
+        },
+        {
+          "about": "EXPERIMENTAL developer-facing remote development session loop over an already-installed cluster release: deploy the session bundle, claim a managed Agent Sandbox, clone a repository into it, drive coding turns, and carry the resulting diff back out as a branch (`bash cli/scripts/remote-dev-session.sh`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Arguments passed straight through to the session script, e.g. `start --namespace curie --channel C0CODER ...`, `turn \"<text>\"`, `status`, `finish --push`, `down`",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "EXPERIMENTAL developer-facing remote development session loop over an already-installed cluster release: deploy the session bundle, claim a managed Agent Sandbox, clone a repository into it, drive coding turns, and carry the resulting diff back out as a branch (`bash cli/scripts/remote-dev-session.sh`).\n\nNever runs `cluster up` and never uninstalls anything: the release, the namespace, and the sandbox pod belong to the platform. Verbs: `start`, `turn`, `status`, `finish`, `down`.",
+          "name": "remote-dev-session"
         }
       ]
     },
