@@ -55,3 +55,39 @@ The connector does not report prior state today. `scale_deployment` does not
 exist yet, and `restart_deployment` reads the Deployment before patching it and
 discards what it read. The probe scripts the result a cooperating connector would
 return, which is the first task of the plan and is not evidence on its own.
+
+## Round trip: `probe_roundtrip.py`
+
+```bash
+uv run --project runner python prototypes/adr-0117-action-ledger/probe_roundtrip.py
+```
+
+The second probe runs the whole loop with real code at every step but the
+Kubernetes API server, which is a dict holding one number:
+
+```
+world before   public/api replicas = 3
+[1] real connector scales it            reply carries prior {"spec": {"replicas": 3}}
+[2] real translate seam                 record.prior captured, undoable = True
+[3] world-moved check passes, undo      world back to 3
+[4] the irreversible tool               prose reply, result None, undoable = False
+[5] a human sets it to 7 by hand        REFUSED, world stays 7
+```
+
+Step 5 is the rule worth having. A refused undo changes nothing, so somebody's
+manual fix survives an undo pressed after they made it.
+
+## What is real here and what is not
+
+Real: `examples/sre-bot/connectors/k8s-scale/server.py` including its allowlist,
+ceiling, subresource path and refusal paths; the `claude_agent_sdk` message
+types; `curie_runner.translate.translate_message`.
+
+Not real: the Kubernetes API server. No cluster, no network, no model, no
+platform. The receipt at the end is printed by the probe to show the shape the
+design proposes, not rendered by any card code, which does not exist yet.
+
+Also not real yet: the runner still drops the tool result. The probe calls
+`translate_message` on the `UserMessage` to show it returns nothing, then
+assembles the record itself. Making the runner do that assembly is Task 3 of the
+plan.
