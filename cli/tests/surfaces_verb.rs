@@ -200,7 +200,7 @@ fn local_surfaces_add_forwards_a_write_only_reply_route() {
         "surfaces",
         AGENT_NAME,
         "--add",
-        "discord=123456789012345678",
+        "discord=111111111111111111",
         "--endpoint",
         "https://discord-adapter.example.com/replies",
         "--adapter",
@@ -227,7 +227,7 @@ fn local_surfaces_add_forwards_a_write_only_reply_route() {
         body,
         serde_json::json!({
             "kind": "discord",
-            "address": "123456789012345678",
+            "address": "111111111111111111",
             "endpoint": "https://discord-adapter.example.com/replies",
             "adapter": "discord-main",
         })

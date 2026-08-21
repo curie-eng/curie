@@ -62,6 +62,10 @@ def _qevent(
     )
 
 
+def _thread_key(thread: str) -> str:
+    return f"slack:C1:{thread}"
+
+
 async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -864,7 +868,7 @@ def test_interrupt_hard_stops_the_live_turn(make_harness) -> None:
             t1 = asyncio.create_task(h.kernel.process_event(e1))
             await _wait_until(lambda: h.runner.turn_active)
 
-            signalled = await h.kernel.interrupt_thread("tI", "user stop")
+            signalled = await h.kernel.interrupt_thread(_thread_key("tI"), "user stop")
             assert signalled is True
             assert h.runner.interrupts == 1
 
@@ -897,7 +901,7 @@ def test_interrupt_agent_signals_other_threads_past_a_wedged_runner(
             threads = ("tKillA", "tKillB", "tKillC")
             for thread in threads:
                 await h.kernel.process_event(_qevent("hi", thread=thread))
-            h.kernel._active_by_agent[agent_id] = set(threads)
+            h.kernel._active_by_agent[agent_id] = {_thread_key(t) for t in threads}
 
             monkeypatch.setattr(kernel_module, "_KILL_INTERRUPT_TIMEOUT_S", 0.2)
 
@@ -988,7 +992,7 @@ def test_suspended_thread_is_resumed_not_forked(make_harness) -> None:
             await h.kernel.process_event(_qevent("first", thread="tR"))
 
             # Suspend the thread (records a rehydrate ref on the route).
-            await asyncio.to_thread(h.substrate.suspend, "tR", history_ref="hist-1")
+            await asyncio.to_thread(h.substrate.suspend, _thread_key("tR"), history_ref="hist-1")
 
             # A new event on a suspended thread must resume (carry the history)
             # rather than silently fork a fresh, history-less session.
@@ -1014,7 +1018,7 @@ def test_live_route_reuse_refreshes_ttl(make_harness) -> None:
             h.runner.default_script = [Final(text="one", status=DONE)]
             await h.kernel.process_event(_qevent("first", thread="tTTL"))
 
-            route_key = await _route_key(h.async_redis, "tTTL")
+            route_key = await _route_key(h.async_redis, _thread_key("tTTL"))
             # Simulate time passing by dropping the TTL low.
             await h.async_redis.expire(route_key, 5)
             assert await h.async_redis.ttl(route_key) <= 5
@@ -1126,7 +1130,7 @@ def test_kernel_delivers_claim_token_as_bearer_header(make_harness) -> None:
             assert h.runner.steer_headers[-1].get("Authorization") == "Bearer tok-24"
 
             # Interrupt path: the explicit hard stop carries it as well.
-            await h.kernel.interrupt_thread("tTok", "user stop")
+            await h.kernel.interrupt_thread(_thread_key("tTok"), "user stop")
             assert h.runner.interrupt_headers
             assert h.runner.interrupt_headers[-1].get("Authorization") == "Bearer tok-24"
 
@@ -1310,11 +1314,11 @@ def test_release_thread_force_releases_a_live_route(make_harness) -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("hi", thread="tRelease"))
-            assert h.substrate.lookup("tRelease") is not None  # the route is live
+            assert h.substrate.lookup(_thread_key("tRelease")) is not None  # the route is live
 
-            released = await h.kernel.release_thread("tRelease")
+            released = await h.kernel.release_thread(_thread_key("tRelease"))
             assert released is True
-            assert h.substrate.lookup("tRelease") is None  # gone: next claim is fresh
+            assert h.substrate.lookup(_thread_key("tRelease")) is None  # gone: next claim is fresh
 
     asyncio.run(go())
 
@@ -1379,7 +1383,7 @@ def test_release_thread_interrupts_a_live_turn_first(make_harness) -> None:
             t1 = asyncio.create_task(h.kernel.process_event(e1))
             await _wait_until(lambda: h.runner.turn_active)
 
-            released = await h.kernel.release_thread("tReleaseMidTurn")
+            released = await h.kernel.release_thread(_thread_key("tReleaseMidTurn"))
             assert released is True
             assert h.runner.interrupts == 1  # interrupted, not silently abandoned
 
@@ -1409,7 +1413,7 @@ def test_release_thread_releases_when_the_runner_never_answers_the_interrupt(
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("hi", thread="tWedged"))
-            assert h.substrate.lookup("tWedged") is not None  # the route is live
+            assert h.substrate.lookup(_thread_key("tWedged")) is not None  # the route is live
 
             monkeypatch.setattr(kernel_module, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
 
@@ -1420,10 +1424,13 @@ def test_release_thread_releases_when_the_runner_never_answers_the_interrupt(
 
             monkeypatch.setattr(h.kernel._runner, "interrupt", never_answers)
 
-            released = await asyncio.wait_for(h.kernel.release_thread("tWedged"), timeout=2.0)
+            released = await asyncio.wait_for(
+                h.kernel.release_thread(_thread_key("tWedged")), timeout=2.0
+            )
 
             assert released is True
-            assert h.substrate.lookup("tWedged") is None  # released despite the wedged runner
+            # released despite the wedged runner
+            assert h.substrate.lookup(_thread_key("tWedged")) is None
 
     asyncio.run(go())
 
@@ -1438,17 +1445,17 @@ def test_release_thread_releases_when_the_interrupt_raises(make_harness, monkeyp
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("hi", thread="tInterruptBoom"))
-            assert h.substrate.lookup("tInterruptBoom") is not None
+            assert h.substrate.lookup(_thread_key("tInterruptBoom")) is not None
 
             async def boom(base_url: str, reason: str, token: str | None = None) -> None:
                 raise RunnerError("/v1/interrupt -> 500: runner is wedged")
 
             monkeypatch.setattr(h.kernel._runner, "interrupt", boom)
 
-            released = await h.kernel.release_thread("tInterruptBoom")
+            released = await h.kernel.release_thread(_thread_key("tInterruptBoom"))
 
             assert released is True
-            assert h.substrate.lookup("tInterruptBoom") is None
+            assert h.substrate.lookup(_thread_key("tInterruptBoom")) is None
 
     asyncio.run(go())
 
@@ -1484,7 +1491,7 @@ def test_release_serializes_against_a_concurrent_turn_start(make_harness) -> Non
 
             # Establish a live route with a concrete, idle sandbox.
             await h.kernel.process_event(_qevent("first", thread="tRace"))
-            old = h.substrate.lookup("tRace")
+            old = h.substrate.lookup(_thread_key("tRace"))
             assert old is not None
             old_claim = old.claim_name
 
@@ -1501,7 +1508,7 @@ def test_release_serializes_against_a_concurrent_turn_start(make_harness) -> Non
 
             h.substrate.release = gated_release  # type: ignore[method-assign]
 
-            reset = asyncio.create_task(h.kernel.release_thread("tRace"))
+            reset = asyncio.create_task(h.kernel.release_thread(_thread_key("tRace")))
             await _wait_until(release_entered.is_set)  # release now holds the lock
 
             # A new message for the same thread races the reset. It must block on
@@ -1517,7 +1524,7 @@ def test_release_serializes_against_a_concurrent_turn_start(make_harness) -> Non
             await turn
 
             assert h.runner.opened == ["first", "second"]  # the turn did run
-            fresh = h.substrate.lookup("tRace")
+            fresh = h.substrate.lookup(_thread_key("tRace"))
             assert fresh is not None
             assert fresh.claim_name != old_claim  # a fresh sandbox, not the released one
             assert old_claim not in h.fake_k8s.claims  # the released claim is gone
@@ -1542,7 +1549,7 @@ def test_claim_latency_is_logged(make_harness, caplog) -> None:
             matches = [
                 r.getMessage()
                 for r in caplog.records
-                if "claim latency for tLatency" in r.getMessage()
+                if f"claim latency for {_thread_key('tLatency')}" in r.getMessage()
             ]
             assert matches, caplog.text
             # "claim latency for tLatency: <N> ms" -- non-negative integer duration.
@@ -1566,7 +1573,9 @@ def test_lock_acquire_timeout_is_a_retryable_turn_start_failure(make_harness) ->
         async with make_harness(lock_acquire_timeout_s=0.2) as h:
             thread = "tLockTimeout"
             # A foreign holder of the route lock, outliving the acquire deadline.
-            await h.async_redis.set(h.config.lock_key(thread), "another-worker", nx=True, px=60000)
+            await h.async_redis.set(
+                h.config.lock_key(_thread_key(thread)), "another-worker", nx=True, px=60000
+            )
 
             released: list[bool] = []
 
