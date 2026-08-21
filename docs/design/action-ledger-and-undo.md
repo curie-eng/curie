@@ -42,7 +42,7 @@ of not discarding what is already computed.
 
 - **The ACI frame already names the tool.** `SideEffectFlag` carries `tool` and an
   optional `detail`. The runner fills them at
-  [`translate.py:164`](../../runner/src/curie_runner/translate.py):
+  [`runner/src/curie_runner/translate.py::_translate_assistant`](../../runner/src/curie_runner/translate.py):
 
   ```python
   SideEffectFlag(tool=block.name, detail="non-idempotent tool executed")
@@ -70,7 +70,7 @@ of not discarding what is already computed.
   evidence blob."
 
 - **Cards with buttons on a channel already work.** `ApprovalCardStore` and
-  `blocks.py` in the worker render and track interactive cards, and the API
+  `apps/worker/src/curie_worker/blocks.py` in the worker render and track interactive cards, and the API
   exposes `GET /{approval_id}`, `GET /{approval_id}/audit`, and
   `POST /{approval_id}/resolve`. A receipt with an Undo button is that machinery
   pointed at a different row.
@@ -191,7 +191,7 @@ evidence requirements are the same:
 | column | why |
 | --- | --- |
 | `id`, `agent_id`, `conversation_id`, `turn_id` | identity and the turn it belongs to |
-| `tool`, `arguments` | what was called; arguments redacted through `redact.py` |
+| `tool`, `arguments` | what was called; arguments redacted through `runner/src/curie_runner/redact.py` |
 | `target` | the declared key of the thing changed, so two actions on one resource can be reasoned about |
 | `snapshot`, `snapshot_status` | prior state, or why there is none |
 | `outcome`, `outcome_detail` | whether the call succeeded; a failed call still gets a row |
