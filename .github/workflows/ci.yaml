@@ -445,7 +445,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Build (no push)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -699,7 +699,7 @@ jobs:
       # layers from cache alone (58s -> 15s) after wiping the builder.
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves compose FROM, #803)
         id: laddercache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
@@ -780,7 +780,7 @@ jobs:
       # documents in full.
       - name: Set up a cache-only buildx builder (named, NOT the default -- #803)
         id: releasecache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
@@ -949,7 +949,7 @@ jobs:
       # cluster round trip actually needs; the dispatcher is not deployed.
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: clustercache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the api image locally
