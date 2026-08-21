@@ -4,7 +4,7 @@ import { test, expect, type Page } from "@playwright/test";
 // agent's deployments (environment / status / deployed_at), no Eval column, and
 // a ComingSoon fallback when the backend is unreachable.
 
-const AGENT = { id: "ag-1", name: "deal-desk", channel: { kind: "slack", address: "C0DEAL" }, created_at: "2026-07-01T00:00:00Z" };
+const AGENT = { id: "ag-1", name: "deal-desk", channels: [{ kind: "slack", address: "C0DEAL" }], created_at: "2026-07-01T00:00:00Z" };
 
 function json(status: number, body: unknown) {
   return { status, contentType: "application/json", body: JSON.stringify(body) };

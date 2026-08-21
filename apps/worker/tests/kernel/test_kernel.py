@@ -102,7 +102,14 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
         async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
             return WorkspaceResolved()
 
-        def boot_env(self, _resolved: object, _thread_key: str) -> dict[str, str]:
+        def boot_env(
+            self,
+            _resolved: object,
+            _thread_key: str,
+            *,
+            kind: str | None = None,
+            address: str | None = None,
+        ) -> dict[str, str]:
             return {}
 
         def packs_for(self, _resolved: object) -> BehaviorPacks:
@@ -122,7 +129,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
                     author: str,
                     repo_full_name: str | None,
                 ) -> str:
-                    assert thread_key == "tRepo"
+                    assert thread_key == _thread_key("tRepo")
                     assert author == "U1"
                     if self.selected is None:
                         assert repo_full_name is not None
@@ -179,7 +186,14 @@ def test_workspace_selection_precedes_fresh_thread_greeting(make_harness) -> Non
         async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
             return WorkspaceResolved()
 
-        def boot_env(self, _resolved: object, _thread_key: str) -> dict[str, str]:
+        def boot_env(
+            self,
+            _resolved: object,
+            _thread_key: str,
+            *,
+            kind: str | None = None,
+            address: str | None = None,
+        ) -> dict[str, str]:
             return {}
 
         def packs_for(self, _resolved: object) -> BehaviorPacks:

@@ -26,9 +26,9 @@
 ### Task 1: Multi Binding Persistence
 
 **Files:**
-- Create: `apps/api/alembic/versions/0028_agent_channels_multi_binding.py`
+- Create: `apps/api/alembic/versions/0029_agent_channels_multi_binding.py`
 - Modify: `apps/api/src/curie_api/models.py`
-- Test: `apps/api/tests/test_migration_0028_agent_channels_multi_binding.py`
+- Test: `apps/api/tests/test_migration_0029_agent_channels_multi_binding.py`
 - Test: `apps/api/tests/test_agent_model_integration.py`
 
 **Interfaces:**
@@ -37,9 +37,10 @@
 
 - [ ] **Step 1: Run the fail first migration and ORM tests**
 
-Run: `uv run pytest -q apps/api/tests/test_migration_0028_agent_channels_multi_binding.py apps/api/tests/test_agent_model_integration.py`
+<!-- doclint:ignore-line -->
+Run: `uv run pytest -q apps/api/tests/test_migration_0029_agent_channels_multi_binding.py apps/api/tests/test_agent_model_integration.py`
 
-Expected: failure because revision `0028` does not exist and `Agent.channel` is singular.
+Expected: failure because revision `0029` does not exist and `Agent.channel` is singular.
 
 - [ ] **Step 2: Add the widening migration and plural relationship**
 
@@ -53,13 +54,14 @@ channels: Mapped[list["AgentChannel"]] = relationship(
 
 - [ ] **Step 3: Re-run the focused tests**
 
-Run: `uv run pytest -q apps/api/tests/test_migration_0028_agent_channels_multi_binding.py apps/api/tests/test_agent_model_integration.py`
+<!-- doclint:ignore-line -->
+Run: `uv run pytest -q apps/api/tests/test_migration_0029_agent_channels_multi_binding.py apps/api/tests/test_agent_model_integration.py`
 
 Expected: pass.
 
 - [ ] **Step 4: Commit**
 
-Run: `git add apps/api/alembic/versions/0028_agent_channels_multi_binding.py apps/api/src/curie_api/models.py apps/api/tests/test_migration_0028_agent_channels_multi_binding.py apps/api/tests/test_agent_model_integration.py && git commit -m "Allow agents to own multiple surface bindings"`
+Run: `git add apps/api/alembic/versions/0029_agent_channels_multi_binding.py apps/api/src/curie_api/models.py apps/api/tests/test_migration_0029_agent_channels_multi_binding.py apps/api/tests/test_agent_model_integration.py && git commit -m "Allow agents to own multiple surface bindings"`
 
 ### Task 2: Binding Subresource and Safe Concurrent Writes
 
@@ -82,6 +84,7 @@ Run: `git add apps/api/alembic/versions/0028_agent_channels_multi_binding.py app
 
 - [ ] **Step 1: Run the fail first API tests**
 
+<!-- doclint:ignore-line -->
 Run: `uv run pytest -q apps/api/tests/test_agent_channels_subresource.py apps/api/tests/test_agent_channels_locking.py apps/api/tests/test_agents.py apps/api/tests/test_channels.py`
 
 Expected: failures because the plural schema and subresource CRUD do not exist.
@@ -92,6 +95,7 @@ Use `SELECT ... WHERE agent_id = :id ORDER BY id FOR UPDATE` with `populate_exis
 
 - [ ] **Step 3: Re-run the API tests**
 
+<!-- doclint:ignore-line -->
 Run: `uv run pytest -q apps/api/tests/test_agent_channels_subresource.py apps/api/tests/test_agent_channels_locking.py apps/api/tests/test_agents.py apps/api/tests/test_channels.py`
 
 Expected: pass, including deterministic lock contention and duplicate pair outcomes.
@@ -115,6 +119,7 @@ Run: `git add apps/api && git commit -m "Add the agent surfaces subresource"`
 
 - [ ] **Step 1: Run the fail first worker tests**
 
+<!-- doclint:ignore-line -->
 Run: `uv run pytest -q apps/worker/tests/binding/test_resolver.py apps/worker/tests/kernel/test_multi_channel_respond_in_kind.py apps/dispatcher/tests/test_dispatch.py`
 
 Expected: failure when two kinds share an address or when state uses an unscoped address.
@@ -125,6 +130,7 @@ Resolve deployments with `WHERE channel.kind = :kind AND channel.address = :addr
 
 - [ ] **Step 3: Re-run focused worker and dispatcher tests**
 
+<!-- doclint:ignore-line -->
 Run: `uv run pytest -q apps/worker/tests/binding/test_resolver.py apps/worker/tests/kernel/test_multi_channel_respond_in_kind.py apps/dispatcher/tests/test_dispatch.py`
 
 Expected: pass.
@@ -159,6 +165,7 @@ Run: `git add apps/worker apps/dispatcher/tests/test_dispatch.py && git commit -
 
 Run: `cd cli && cargo test --test surfaces_verb`
 
+<!-- doclint:ignore-line -->
 Run: `cd apps/ui && pnpm test -- src/api/api.test.ts src/views/wired/WiredAgentDetail.test.tsx`
 
 Expected: failures because the `surfaces` verb and plural editor are absent.
@@ -240,6 +247,7 @@ Document implicit opt in, the `surfaces` commands, Discord configuration, suppor
 
 - [ ] **Step 2: Run repository checks**
 
+<!-- doclint:ignore-line -->
 Run: `uv lock --check && uv run ruff check . && uv run mypy && uv run lint-imports && bash scripts/check-docs.sh`
 
 Run the relevant full Python, Rust, and UI suites after the focused suites pass.
@@ -251,4 +259,3 @@ Start the core stack and Slack dispatcher, register one Slack and one Discord su
 - [ ] **Step 4: Commit**
 
 Run: `git add ARCHITECTURE.md docs && git commit -m "Document multi surface operation"`
-

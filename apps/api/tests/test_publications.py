@@ -974,7 +974,14 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
                 max_output_tokens_per_run=None,
             )
 
-        def boot_env(self, resolved: Any, thread: str) -> dict[str, str]:
+        def boot_env(
+            self,
+            resolved: Any,
+            thread: str,
+            *,
+            kind: str | None = None,
+            address: str | None = None,
+        ) -> dict[str, str]:
             return {"CURIE_SESSION_ID": f"session-{thread}"}
 
         def packs_for(self, resolved: Any) -> BehaviorPacks:

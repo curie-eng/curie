@@ -417,6 +417,41 @@ def test_an_agent_cannot_exist_without_a_binding(
     ), refused.text
 
 
+def test_a_multi_surface_hook_requires_and_honors_an_explicit_reply_surface(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    agent_id = _bind(hooks_client, auth_headers, name="multihookagent")
+    added = hooks_client.post(
+        f"/agents/{agent_id}/channels",
+        json={"kind": "slack", "address": "C0EXAMPLE9"},
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+    body = b"{}"
+    headers = {
+        "X-Curie-Signature-256": _sign(_secret_for(agent_id), body),
+        "X-Curie-Delivery-Id": "multi-hook-1",
+    }
+
+    ambiguous = hooks_client.post(f"/hooks/{agent_id}/issues", content=body, headers=headers)
+    assert ambiguous.status_code == 409, ambiguous.text
+    assert "kind" in ambiguous.text and "address" in ambiguous.text
+
+    selected = hooks_client.post(
+        f"/hooks/{agent_id}/issues?kind=slack&address=C0EXAMPLE9",
+        content=body,
+        headers=headers,
+    )
+    assert selected.status_code == 200, selected.text
+    (turn,) = _queued(valkey, runs_stream)
+    assert turn.reply_handle.kind == "slack"
+    assert turn.reply_handle.channel == "C0EXAMPLE9"
+
+
 # --- idempotency --------------------------------------------------------------
 
 

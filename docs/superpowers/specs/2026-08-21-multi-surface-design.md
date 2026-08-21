@@ -102,7 +102,7 @@ the same route and never redirects to another surface.
 
 ## Persistence and migration
 
-Migration `0028_agent_channels_multi_binding.py` performs four operations:
+Migration `0029_agent_channels_multi_binding.py` performs four operations:
 
 1. Drop `agent_channels_agent_id_key`.
 2. Create a nonunique `ix_agent_channels_agent_id` index.

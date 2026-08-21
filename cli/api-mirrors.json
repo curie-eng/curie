@@ -273,8 +273,8 @@
           "why": "Same reason as `channel`: a routing fact owned by the git-flow binding (ADR-0091), not part of the override pair this result is about."
         },
         {
-          "field": "channel",
-          "why": "The verb reads and writes the two nullable model/thinking overrides; an agent's channel binding (kind + address) is a different concern with its own surface (`deploy --slack-channel`), and emitting it here would imply this verb can change it."
+          "field": "channels",
+          "why": "The verb reads and writes the two nullable model/thinking overrides; an agent's channel bindings (kind + address) are a different concern with their own surface (`<tier> surfaces`), and emitting them here would imply this verb can change them."
         }
       ]
     }

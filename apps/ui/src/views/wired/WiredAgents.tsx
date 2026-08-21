@@ -89,7 +89,9 @@ export function WiredAgents() {
               >
                 {a.name}
               </button>
-              <span style={{ marginLeft: "auto", fontSize: 12, color: C.muted, fontFamily: C.mono }}>{a.channel.address}</span>
+              <span style={{ marginLeft: "auto", fontSize: 12, color: C.muted, fontFamily: C.mono }}>
+                {a.channels.map((c) => c.address).join(", ")}
+              </span>
             </div>
             <div
               style={{
@@ -103,7 +105,11 @@ export function WiredAgents() {
             >
               <div>
                 <div style={{ fontSize: 11, color: C.muted, marginBottom: 3 }}>channel</div>
-                <div style={{ fontFamily: C.mono, fontSize: 13 }}>{a.channel.address}</div>
+                {a.channels.map((c) => (
+                  <div key={`${c.kind}:${c.address}`} style={{ fontFamily: C.mono, fontSize: 13 }}>
+                    {c.address}
+                  </div>
+                ))}
               </div>
               <div>
                 <div style={{ fontSize: 11, color: C.muted, marginBottom: 3 }}>created</div>

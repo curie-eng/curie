@@ -8,7 +8,7 @@ function json(status: number, body: unknown) {
   return { status, contentType: "application/json", body: JSON.stringify(body) };
 }
 
-const AGENT = { id: "a1", name: "deal-desk", channel: { kind: "slack", address: "#revenue-ops" }, created_at: "2026-07-01T00:00:00Z" };
+const AGENT = { id: "a1", name: "deal-desk", channels: [{ kind: "slack", address: "#revenue-ops" }], created_at: "2026-07-01T00:00:00Z" };
 
 // deleteStatus 204 => the card disappears on refetch; 409 => it survives.
 async function stubAgents(page: Page, deleteStatus: 204 | 409) {

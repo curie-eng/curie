@@ -58,7 +58,7 @@ from ..delivery import (
 )
 from ..deps import SessionDep
 from ..graveyardwatcher import _text
-from ..models import Agent
+from ..models import Agent, AgentChannel
 from ..wirebody import read_bounded_body
 
 logger = logging.getLogger(__name__)
@@ -144,18 +144,24 @@ def _hook_text(hook: str, body: bytes) -> str:
 
 
 async def _load_agent(session: SessionDep, agent_id: uuid.UUID) -> Agent | None:
-    """Load the agent and its single channel binding, or None."""
+    """Load the agent and every surface binding, or None."""
 
     # Annotated rather than returned bare: `session.scalar` is typed Any, and the
     # local annotation is how the rest of this package pins it (see `crud.py` and
     # `channels._resolve_binding`).
     agent: Agent | None = await session.scalar(
-        select(Agent).where(Agent.id == agent_id).options(selectinload(Agent.channel))
+        select(Agent).where(Agent.id == agent_id).options(selectinload(Agent.channels))
     )
     return agent
 
 
-def _mint_turn(agent: Agent, hook: str, event_id: str, body: bytes) -> QueuedTurn:
+def _mint_turn(
+    agent: Agent,
+    binding: AgentChannel,
+    hook: str,
+    event_id: str,
+    body: bytes,
+) -> QueuedTurn:
     """Build the ``QueuedTurn`` a verified hook delivery becomes.
 
     The reply route comes wholly from the agent's binding row, never from the
@@ -176,7 +182,6 @@ def _mint_turn(agent: Agent, hook: str, event_id: str, body: bytes) -> QueuedTur
         The queued turn.
     """
 
-    binding = agent.channel
     return QueuedTurn(
         event_id=event_id,
         conversation_id=_conversation_id(agent.id, hook),
@@ -204,6 +209,8 @@ async def ingest_hook(
     session: SessionDep,
     agent_id: uuid.UUID,
     hook: str,
+    kind: str | None = None,
+    address: str | None = None,
     x_curie_signature_256: Annotated[str | None, Header()] = None,
     x_curie_delivery_id: Annotated[str | None, Header()] = None,
 ) -> HookAccepted:
@@ -254,6 +261,35 @@ async def ingest_hook(
             "agent twice",
         )
 
+    if (kind is None) != (address is None):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "hook reply surface requires both kind and address",
+        )
+    if kind is None:
+        if len(agent.channels) != 1:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "this agent has multiple surfaces; select the hook reply surface "
+                "with both kind and address query parameters",
+            )
+        binding = agent.channels[0]
+    else:
+        selected = next(
+            (
+                candidate
+                for candidate in agent.channels
+                if candidate.kind == kind and candidate.address == address
+            ),
+            None,
+        )
+        if selected is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "this agent has no binding for the selected kind and address",
+            )
+        binding = selected
+
     # No unbound-agent branch, deliberately. `AgentCreate.channel` is required and
     # `crud.update_agent_binding` mutates the row in place rather than clearing
     # it, so an agent with no binding is not a reachable state and a branch for it
@@ -295,7 +331,7 @@ async def ingest_hook(
                     "too many new hook deliveries for this agent; retry later",
                     headers={"Retry-After": str(settings.hook_backlog_window_s)},
                 )
-            turn = _mint_turn(agent, hook, event_id, raw)
+            turn = _mint_turn(agent, binding, hook, event_id, raw)
             enqueued, current = await enqueue_owned(
                 client,
                 key=key,
