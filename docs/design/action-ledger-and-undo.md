@@ -151,7 +151,60 @@ receipt card on the channel ....... reuses ApprovalCardStore + blocks.py
 The turn path gains one hook and one field. Everything after the flag is new but
 sits on machinery that already exists.
 
-### Where the snapshot runs, and why not in the connector
+### Where the snapshot runs (revised after a spike)
+
+The first draft put the snapshot in `can_use_tool`, on the reasoning that it runs
+before the tool and cannot be skipped by the model. **A spike showed that seam
+cannot reach a snapshot.** The runner never invokes an MCP tool outside the model
+loop: MCP servers are handed to the SDK
+([`runner/src/curie_runner/adapter.py`](../../runner/src/curie_runner/adapter.py)),
+the SDK owns those client sessions, and every out-of-loop call the runner does
+make ([`runner/src/curie_runner/state.py`](../../runner/src/curie_runner/state.py),
+[`runner/src/curie_runner/memory.py`](../../runner/src/curie_runner/memory.py),
+[`runner/src/curie_runner/history.py`](../../runner/src/curie_runner/history.py))
+is plain HTTP to the platform API. Taking a snapshot there would mean building a
+second MCP client inside the runner, which is a large new mechanism for the one
+job.
+
+The spike also found the snapshot is already being taken. The example's write
+tool reads the resource before patching it and then discards what it read:
+
+```python
+# examples/sre-bot/connectors/k8s-write/server.py::restart_deployment
+existing = client.get(path)
+if existing.status_code == 404: ...
+```
+
+And tool results already reach the runner. They arrive as `UserMessage` content
+and are dropped on purpose:
+
+```python
+# runner/src/curie_runner/translate.py, _translate_message
+# UserMessage, SystemMessage, and StreamEvent carry no outbound-visible
+# content in the v0.1 contract; they are intentionally dropped.
+```
+
+**So the snapshot is taken by the connector and travels in its tool result.** The
+connector already holds the prior state; it returns prose today and returns prose
+plus a structured prior-state block instead. The runner stops dropping tool
+results for side-effecting tools and forwards what it finds. No new MCP client,
+no new pre-execution hook, and the platform still never asks a model what
+happened.
+
+The cost of the revision is honest and matches the deny-by-default posture: a
+connector that does not report prior state produces an action that is not
+undoable. Third-party MCP servers will not report it, and that is exactly the
+`undeclared` case the receipt already has to render.
+
+### One flag per turn is not enough
+
+`_translate_assistant` emits at most one `SideEffectFlag` per turn, guarded by
+`state.side_effect_emitted`, because its only consumer is a boolean. A ledger
+needs one record per action, so that cap is lifted and the flag becomes
+per-call. This is the change with the widest blast radius in the runner and the
+one to review hardest, because the existing no-retry rule reads the same signal.
+
+### Why not in the connector alone
 
 The snapshot must be taken by something that runs before the tool and cannot be
 skipped by the model. `can_use_tool` is that thing. Putting the snapshot inside
