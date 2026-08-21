@@ -26,7 +26,10 @@ async function stubBackend(page: Page) {
   const agents: {
     id: string;
     name: string;
-    channel: { kind: string; address: string };
+    // The console still creates with a singular `channel` on the wire (plan
+    // keeps create-binds-one), but AgentOut -- what GET /agents returns and
+    // the Agents list renders -- carries `channels` (plural, ADR-0116).
+    channels: { kind: string; address: string }[];
     created_at: string;
   }[] = [];
   const posted: { name: string; channel: { kind: string; address: string } }[] = [];
@@ -35,7 +38,7 @@ async function stubBackend(page: Page) {
     if (route.request().method() === "POST") {
       const body = JSON.parse(route.request().postData() ?? "{}");
       posted.push(body);
-      const agent = { id: "ag-" + (agents.length + 1), name: body.name, channel: body.channel, created_at: "2026-07-05T00:00:00Z" };
+      const agent = { id: "ag-" + (agents.length + 1), name: body.name, channels: [body.channel], created_at: "2026-07-05T00:00:00Z" };
       agents.push(agent);
       return route.fulfill(json(201, agent));
     }

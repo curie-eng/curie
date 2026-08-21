@@ -105,6 +105,10 @@ def _qevent(
     )
 
 
+def _thread_key(thread: str, *, kind: str = "slack") -> str:
+    return f"{kind}:C1:{thread}"
+
+
 def _awaiting_script(summary: str) -> list:
     return [
         TextDelta(text="Requesting sign-off"),
@@ -129,7 +133,7 @@ async def _pause_awaiting_approval(h, thread: str) -> None:
 
     h.runner.default_script = _awaiting_script("Refund order 42")
     await h.kernel.process_event(_qevent("refund?", thread=thread))
-    assert await h.async_redis.exists(h.config.approval_card_key(thread))
+    assert await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
 
 async def _peek_card_ref(h, thread: str) -> dict | None:
@@ -139,7 +143,7 @@ async def _peek_card_ref(h, thread: str) -> dict | None:
     ref goes to the key directly.
     """
 
-    raw = await h.async_redis.get(h.config.approval_card_key(thread))
+    raw = await h.async_redis.get(h.config.approval_card_key(_thread_key(thread)))
     return None if raw is None else json.loads(raw)
 
 
@@ -166,7 +170,7 @@ def test_awaiting_approval_creates_record_and_suspends(make_harness) -> None:
             # The sandbox was suspended and the route flipped to SUSPENDED.
             modes = [s.operating_mode for s in h.fake_k8s.sandboxes.values()]
             assert modes == ["Suspended"]
-            record = h.substrate._affinity.get(ev.conversation_id)
+            record = h.substrate._affinity.get(_thread_key(ev.conversation_id))
             assert record is not None and record.state is RouteState.SUSPENDED
 
             # The placeholder carries the pending notice with the record id,
@@ -488,14 +492,14 @@ def test_pending_state_survives_worker_restart_and_resumes_on_resolve(
         async with make_harness(approvals=approvals) as h:
             h.runner.default_script = _awaiting_script("Refund order 42")
             await h.kernel.process_event(_qevent("refund?", thread=thread))
-            record = h.substrate._affinity.get(thread)
+            record = h.substrate._affinity.get(_thread_key(thread))
             assert record is not None and record.state is RouteState.SUSPENDED
 
         # "Restart": a brand-new kernel/substrate/runner (nothing in-process
         # survives) over the same Valkey affinity keys. The suspended route is
         # still there because it lives in Valkey, not worker memory.
         async with make_harness(approvals=approvals) as h2:
-            record = h2.substrate._affinity.get(thread)
+            record = h2.substrate._affinity.get(_thread_key(thread))
             assert record is not None and record.state is RouteState.SUSPENDED
 
             # The resolution turn (what the API enqueues on resolve): the
@@ -511,7 +515,7 @@ def test_pending_state_survives_worker_restart_and_resumes_on_resolve(
 
             # The suspended claim was retired and a fresh one created; the
             # route is LIVE again and the reply landed.
-            record = h2.substrate._affinity.get(thread)
+            record = h2.substrate._affinity.get(_thread_key(thread))
             assert record is not None and record.state is RouteState.LIVE
             assert h2.sink.last_text == "Refund processed."
             assert h2.runner.opened == ["[approval resolved] approved by U9"]
@@ -536,7 +540,7 @@ def test_resume_injects_boot_env_into_replacement_claim(make_harness) -> None:
                 "CURIE_BUNDLE_REF": "bundles/agent-v7.tgz",
                 "CURIE_BUDGET": '{"max_output_tokens_per_run": 1, "max_usd_per_day": 1.0}',
             }
-            handle = await h.kernel._claim_or_resume(thread, boot_env)
+            handle = await h.kernel._claim_or_resume(_thread_key(thread), boot_env)
             assert handle is not None
 
             resumed_env = h.fake_k8s.claim_envs[-1]
@@ -1022,7 +1026,7 @@ def test_expiry_resume_disables_the_approval_card(make_harness) -> None:
             # The live card was posted and its location remembered, because an
             # expiry (unlike a resolve) carries no click to locate the card.
             assert len(h.sink.posts) == 1
-            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
             card_ts = "posted-1"  # the FakeSink's returned ts for the first post
 
             # The expiry resume turn the sweeper enqueues (author "system").
@@ -1050,7 +1054,7 @@ def test_expiry_resume_disables_the_approval_card(make_harness) -> None:
             assert message.text == "Give ACME a 20% discount"
 
             # The memory was consumed (GETDEL), so a redelivery no-ops.
-            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert not await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
             # The continuation still streamed into the placeholder.
             assert h.sink.last_text == "Acknowledged the expiry."
@@ -1108,7 +1112,7 @@ def test_resolve_resume_stamps_the_card_from_the_record(make_harness) -> None:
             assert reader.reads == ["appr-1"]
 
             # The memory is still consumed, so a later approval cannot collide.
-            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert not await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
     asyncio.run(go())
 
@@ -1150,7 +1154,7 @@ def test_a_resolve_resume_leaves_the_card_alone_when_the_record_cannot_be_read(
             # blip), so consuming it here would permanently strand a card with
             # live-looking Approve/Reject buttons that no later pass can settle.
             # The ref is only spent once a stamp is actually attempted.
-            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
     asyncio.run(go())
 
@@ -1216,7 +1220,7 @@ def test_resolve_authored_by_a_system_named_actor_does_not_expire_the_card(
             # spending it on a pass that settled nothing would strand a card
             # whose buttons still look live. (This asserted the opposite until
             # #1199, when the pop moved behind the record read.)
-            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
     asyncio.run(go())
 
@@ -1267,7 +1271,7 @@ def test_a_transient_record_read_leaves_the_ref_for_a_later_pass(make_harness) -
             # Nothing was stamped, which is correct: the kernel must not guess a
             # verdict. But the ref SURVIVES, which is the whole point of #1199.
             assert h.sink.card_updates == []
-            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
             # Pass 2 is the bounded-reclaim redelivery (ADR-0039, #505): the
             # worker died before ``mark_done``, so the entry is redelivered and
@@ -1291,7 +1295,7 @@ def test_a_transient_record_read_leaves_the_ref_for_a_later_pass(make_harness) -
             assert settled.requested_by == "U1"
 
             # And NOW the ref is consumed, because a stamp was made.
-            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert not await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
     asyncio.run(go())
 
@@ -1326,7 +1330,7 @@ def test_a_redelivery_after_a_successful_stamp_still_finds_nothing(make_harness)
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(resume)
             assert len(h.sink.card_updates) == 1
-            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert not await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
             # The redelivery, in the same crash-before-done shape the reclaim loop
             # delivers, so the done short-circuit cannot mask the assertion.
@@ -1336,7 +1340,7 @@ def test_a_redelivery_after_a_successful_stamp_still_finds_nothing(make_harness)
             # Nothing further happened to the card: exactly one stamp across both
             # passes, and the ref stays absent.
             assert len(h.sink.card_updates) == 1
-            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert not await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
     asyncio.run(go())
 
@@ -1479,7 +1483,7 @@ def test_a_mismatched_ref_is_put_back_so_its_own_approval_can_settle(
             assert settled.resolver == "U9"
             # The stamp spent the ref, so idempotence is unchanged by the
             # put-back: one stamp per card, ever.
-            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert not await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
     asyncio.run(go())
 
@@ -1511,7 +1515,7 @@ def test_an_expiry_resume_for_another_approval_stamps_nothing_and_keeps_the_ref(
         async with make_harness(approvals=RecordingApprovals()) as h:
             h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
             await h.kernel.process_event(_qevent("please discount", thread=thread))
-            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
             # The #412 sweeper's expiry resume, but for a DIFFERENT approval --
             # the shape the cross-worker overwrite window and a stale ref both
@@ -1571,7 +1575,7 @@ def test_a_ref_remembered_before_the_pairing_existed_still_stamps(
             # Overwrite the entry with the exact shape the pre-#1199 worker
             # wrote: same keys, no ``approval_id``.
             await h.async_redis.set(
-                h.config.approval_card_key(thread),
+                h.config.approval_card_key(_thread_key(thread)),
                 json.dumps(
                     {
                         "channel": "C1",
@@ -1604,7 +1608,7 @@ def test_a_ref_remembered_before_the_pairing_existed_still_stamps(
             assert settled.resolver == "U9"
             assert settled.requested_by == "U1"
             # And the ref was consumed, because a stamp was made.
-            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert not await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
 
     asyncio.run(go())
 
@@ -1646,7 +1650,7 @@ def test_a_present_but_null_approval_id_is_corrupt_not_pre_upgrade(
             # Written straight into Valkey because ``remember`` cannot emit this
             # shape (and, per the store-level test below, must never learn to).
             await h.async_redis.set(
-                h.config.approval_card_key(thread),
+                h.config.approval_card_key(_thread_key(thread)),
                 json.dumps(
                     {
                         "channel": "C1",
@@ -1755,7 +1759,7 @@ def test_a_resolve_with_no_reader_leaves_the_ref_and_stamps_nothing(
             assert h.sink.card_updates == []
             # The ref survives, because the pop is claimed only when a stamp is
             # actually attempted.
-            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert await h.async_redis.exists(h.config.approval_card_key(_thread_key(thread)))
             # The run continued regardless: the stamp is an enrichment.
             assert h.sink.updates, "the resume must still produce a reply"
 

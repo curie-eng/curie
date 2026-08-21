@@ -7,8 +7,10 @@ read-only query layer over the same tables via a SQLAlchemy async engine: one
 parameterized SELECT joining agents -> agent_channels -> deployments ->
 agent_versions.
 
-Resolution rule: an agent is bound to a channel via a row in ``agent_channels``
-(ADR-0096, #1459), one binding per agent. The run uses that agent's active
+Resolution rule: an agent holds one or more rows in ``agent_channels``
+(ADR-0096, #1459; ADR-0116). Resolution is from the ``(kind, address)`` pair to
+the agent, so the count of bindings per agent never affects the predicate. The
+run uses that agent's active
 deployment (deployments.status = 'active'); when both a prod and a dev
 deployment are active, prod wins, then the most recent. An address with no
 agent, or an agent with no active deployment, resolves to None -- the kernel

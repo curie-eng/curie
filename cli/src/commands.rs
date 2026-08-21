@@ -2610,6 +2610,331 @@ impl crate::ui::CliOutput for StatusOutput {
     }
 }
 
+/// What one `curie <tier> surfaces <agent>` invocation does to the agent's
+/// binding set: nothing (list), add one pair, or remove one pair.
+///
+/// Exactly one mutation per invocation, never a batch: the API has no batch
+/// endpoint, so a half-applied run would leave the operator guessing what took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelChange {
+    /// No flags: read the agent's bindings and write nothing.
+    List,
+    Add {
+        kind: String,
+        address: String,
+        endpoint: Option<String>,
+        adapter: Option<String>,
+    },
+    Remove {
+        kind: String,
+        address: String,
+    },
+}
+
+impl ChannelChange {
+    /// Resolve the `--add` / `--remove` flag pair into one intent.
+    ///
+    /// clap already refuses the two together (`conflicts_with`), so this parses
+    /// whichever arrived. Usage errors are raised here, before any I/O, so a
+    /// mistyped pair costs no network round trip.
+    ///
+    /// Args:
+    ///   add: the `--add KIND=ADDRESS` value, if passed.
+    ///   remove: the `--remove KIND=ADDRESS` value, if passed.
+    ///
+    /// Returns:
+    ///   The intent, or a usage error when the pair is malformed.
+    pub fn resolve(
+        add: Option<String>,
+        remove: Option<String>,
+        endpoint: Option<String>,
+        adapter: Option<String>,
+    ) -> Result<Self> {
+        match (add, remove) {
+            (Some(spec), _) => {
+                let (kind, address) = parse_channel_pair(&spec)?;
+                Ok(ChannelChange::Add {
+                    kind,
+                    address,
+                    endpoint,
+                    adapter,
+                })
+            }
+            (None, Some(spec)) => {
+                let (kind, address) = parse_channel_pair(&spec)?;
+                Ok(ChannelChange::Remove { kind, address })
+            }
+            (None, None) => Ok(ChannelChange::List),
+        }
+    }
+}
+
+/// Split `KIND=ADDRESS` on the FIRST `=` only. A kind may not contain one; an
+/// address may (an email- or URL-shaped address for a non-Slack ingress is the
+/// whole reason bindings went channel-neutral), so everything after the first
+/// separator is the address, `=` included.
+fn parse_channel_pair(spec: &str) -> Result<(String, String)> {
+    let malformed = || {
+        crate::exit::usage(format!(
+            "--add/--remove takes KIND=ADDRESS (e.g. slack=C0EXAMPLE1), got {spec:?}. \
+             The kind is never inferred: a binding names the ingress explicitly"
+        ))
+    };
+    let (kind, address) = spec.split_once('=').ok_or_else(malformed)?;
+    if kind.is_empty() || address.is_empty() {
+        return Err(malformed());
+    }
+    Ok((kind.to_string(), address.to_string()))
+}
+
+/// Output of `<tier> surfaces <agent>`: the dry-run plan, or the agent's
+/// binding set as the API stored it. Owns its data so it outlives the
+/// `ApiClient`.
+///
+/// `channels` carries the PAIRS, not bare addresses, so an agent consumer reads
+/// the kind without guessing it. `changed` distinguishes a list from a
+/// mutation, so a consumer can tell "this is what it is" from "this is what it
+/// now is" without diffing.
+#[derive(Debug)]
+pub enum ChannelsOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Done {
+        agent: String,
+        channels: Vec<crate::api::ChannelBinding>,
+        changed: bool,
+    },
+}
+
+impl crate::ui::CliOutput for ChannelsOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            ChannelsOutput::DryRun(plan) => plan.to_json(),
+            ChannelsOutput::Done {
+                agent,
+                channels,
+                changed,
+            } => serde_json::json!({
+                "agent": agent,
+                // Delegated to `Serialize` rather than hand-picked: a
+                // hand-projection could drop a field and would need its own
+                // `emits` declaration for the emit-parity gate (cli/CLAUDE.md).
+                "surfaces": serde_json::to_value(channels).unwrap_or(serde_json::Value::Null),
+                "changed": changed,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            ChannelsOutput::DryRun(plan) => plan.render(ui),
+            ChannelsOutput::Done {
+                agent,
+                channels,
+                changed,
+            } => {
+                let verb = if *changed { " now" } else { "" };
+                let bound = if channels.is_empty() {
+                    "none".to_string()
+                } else {
+                    channels
+                        .iter()
+                        .map(|c| format!("{}:{}", c.kind, c.address))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                ui.payload(&format!("surfaces for {agent}{verb}: {bound}"));
+            }
+        }
+    }
+}
+
+/// `curie <tier> surfaces <agent> [--add KIND=ADDRESS | --remove KIND=ADDRESS]`.
+///
+/// With no flags this LISTS: one `GET`-resolved agent, no write. With one flag
+/// it adds or removes exactly that binding, then reports the set as the API
+/// holds it, so the operator sees what took rather than what was intended.
+///
+/// Args:
+///   opts: api url/key, the agent name or id, and the dry-run flag.
+///   change: the intent already parsed from the flag pair.
+///
+/// Returns:
+///   The agent's bindings, or the dry-run plan.
+///
+/// Named `channel_bindings` rather than `channels` after the verb: the
+/// emit-parity gate's reachability walk follows a `to_json` body's bare
+/// identifiers to same-named free functions (`cli/tests/support/emit_parity.rs`),
+/// and `channels` is now a field identifier several unrelated bodies mention,
+/// so a free fn by that name gets pulled into their keysets and reports
+/// omissions on other verbs as stale.
+pub async fn channel_bindings(
+    opts: AgentActionOpts,
+    change: ChannelChange,
+) -> Result<ChannelsOutput> {
+    let ui = crate::ui::ui();
+    if opts.dry_run {
+        let plan =
+            match &change {
+                ChannelChange::List => format!(
+                    "GET {}/agents  (read-only: would resolve agent {:?} and print its surfaces)",
+                    opts.api_url, opts.agent
+                ),
+                ChannelChange::Add {
+                    kind,
+                    address,
+                    endpoint,
+                    adapter,
+                } => format!(
+                "POST {}/agents/<id>/channels  {{\"kind\":\"{kind}\",\"address\":\"{address}\"}}  \
+                 (would resolve agent {:?} first; reply route: {})",
+                opts.api_url,
+                opts.agent,
+                if endpoint.is_some() && adapter.is_some() { "configured" } else { "implicit" }
+            ),
+                ChannelChange::Remove { kind, address } => format!(
+                    "DELETE {}/agents/<id>/channels?kind={kind}&address={address}  \
+                 (would resolve agent {:?} first)",
+                    opts.api_url, opts.agent
+                ),
+            };
+        return Ok(ChannelsOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![plan],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let (kind, address, adding) = match &change {
+        ChannelChange::List => {
+            // find_agent already carries the bindings, so there is nothing
+            // further to fetch and nothing to write.
+            return Ok(ChannelsOutput::Done {
+                agent: agent.name,
+                channels: agent.channels,
+                changed: false,
+            });
+        }
+        ChannelChange::Add { kind, address, .. } => (kind, address, true),
+        ChannelChange::Remove { kind, address } => (kind, address, false),
+    };
+    let cl = ui.checklist();
+    let verb = if adding { "adding" } else { "removing" };
+    let step = cl.step(&format!(
+        "{verb} {kind}:{address} on {name}",
+        name = agent.name
+    ));
+    let saved = if adding {
+        let (endpoint, adapter) = match &change {
+            ChannelChange::Add {
+                endpoint, adapter, ..
+            } => (endpoint.as_deref(), adapter.as_deref()),
+            _ => (None, None),
+        };
+        client
+            .add_agent_channel(&agent.id, kind, address, endpoint, adapter)
+            .await
+    } else {
+        // The DELETE answers 204 with no body, so the remaining set comes from
+        // a fresh read rather than from locally subtracting the pair -- the CLI
+        // reports what the API holds, never what it assumes it holds.
+        match client.remove_agent_channel(&agent.id, kind, address).await {
+            Ok(()) => client.get_agent(&agent.id).await,
+            Err(err) => Err(err),
+        }
+    };
+    let saved = match saved {
+        Ok(saved) => {
+            step.done(if adding { "added" } else { "removed" });
+            saved
+        }
+        Err(err) => {
+            step.fail("failed");
+            return Err(err);
+        }
+    };
+    Ok(ChannelsOutput::Done {
+        agent: saved.name,
+        channels: saved.channels,
+        changed: true,
+    })
+}
+
+#[cfg(test)]
+mod channels_tests {
+    use super::ChannelChange;
+
+    #[test]
+    fn channel_change_parses_kind_and_address_on_first_equals() {
+        // KIND=ADDRESS splits on the FIRST `=` only. A kind may not contain
+        // one; an address may -- an email-shaped or URL-shaped address for a
+        // non-Slack ingress is the whole reason bindings went channel-neutral.
+        // Splitting on the last `=`, or rejecting the second one, would make
+        // those addresses unbindable through the CLI.
+        let change =
+            ChannelChange::resolve(Some("slack=C0EXAMPLE1".into()), None, None, None).unwrap();
+        assert_eq!(
+            change,
+            ChannelChange::Add {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                endpoint: None,
+                adapter: None,
+            }
+        );
+
+        let odd =
+            ChannelChange::resolve(Some("email=ops+a=b@example.com".into()), None, None, None)
+                .unwrap();
+        assert_eq!(
+            odd,
+            ChannelChange::Add {
+                kind: "email".into(),
+                address: "ops+a=b@example.com".into(),
+                endpoint: None,
+                adapter: None,
+            },
+            "everything after the first `=` is the address, `=` included"
+        );
+
+        // The same rule on the remove side: one parser, both flags.
+        let removed =
+            ChannelChange::resolve(None, Some("slack=C0EXAMPLE2".into()), None, None).unwrap();
+        assert_eq!(
+            removed,
+            ChannelChange::Remove {
+                kind: "slack".into(),
+                address: "C0EXAMPLE2".into(),
+            }
+        );
+
+        // Neither flag is an inspect, not an error: `channels <agent>` lists.
+        assert_eq!(
+            ChannelChange::resolve(None, None, None, None).unwrap(),
+            ChannelChange::List
+        );
+    }
+
+    #[test]
+    fn channel_change_rejects_a_bare_address_with_no_kind() {
+        // `--add C0EXAMPLE1` is the mistake this catches. Defaulting the kind
+        // to "slack" would be the silent-wrong-thing: the operator learns the
+        // kind is optional, and the first non-Slack ingress binds to the wrong
+        // one. The error must exit USAGE, before any network call.
+        let err = ChannelChange::resolve(Some("C0EXAMPLE1".into()), None, None, None).unwrap_err();
+        let (class, _fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("KIND=ADDRESS"), "{err}");
+
+        // An empty kind or an empty address is the same mistake wearing a
+        // separator, and must not slip through as a half-empty pair.
+        for bad in ["=C0EXAMPLE1", "slack=", "="] {
+            assert!(
+                ChannelChange::resolve(Some(bad.into()), None, None, None).is_err(),
+                "{bad:?} must not resolve to a binding"
+            );
+        }
+    }
+}
+
 pub async fn send(
     text: &str,
     user: &str,
@@ -3907,12 +4232,13 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
 
     let channel = match &outcome.channel {
         ChannelOutcome::Created(channel) => channel.clone(),
-        ChannelOutcome::Updated { from, to } => format!("updated to {to} (was {from})"),
-        ChannelOutcome::Unchanged { channel, passed } => {
+        ChannelOutcome::Added { address } => format!("added {address}"),
+        ChannelOutcome::Unchanged { channels, passed } => {
+            let bound = channels.join(", ");
             if *passed {
-                format!("unchanged ({channel})")
+                format!("unchanged ({bound})")
             } else {
-                format!("unchanged ({channel}); pass --slack-channel to move it")
+                format!("unchanged ({bound}); pass --slack-channel to bind another")
             }
         }
     };

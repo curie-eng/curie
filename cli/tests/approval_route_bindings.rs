@@ -31,14 +31,14 @@ const AGENT_ID: &str = "ag_1";
 /// `GET /agents` payload: the handler resolves the agent by name first.
 fn agents_list(routes_json: &str) -> String {
     format!(
-        r#"[{{"id":"{AGENT_ID}","name":"deal-desk","channel":{{"kind":"slack","address":"C0INTAKE00"}},"approval_required_tools":null,"approval_routes":{routes_json}}}]"#
+        r#"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"C0INTAKE00"}}],"approval_required_tools":null,"approval_routes":{routes_json}}}]"#
     )
 }
 
 /// `PATCH /agents/{id}` echo: the updated agent the CLI renders from.
 fn patched_agent(routes_json: &str) -> String {
     format!(
-        r#"{{"id":"{AGENT_ID}","name":"deal-desk","channel":{{"kind":"slack","address":"C0INTAKE00"}},"approval_required_tools":null,"approval_routes":{routes_json}}}"#
+        r#"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"C0INTAKE00"}}],"approval_required_tools":null,"approval_routes":{routes_json}}}"#
     )
 }
 

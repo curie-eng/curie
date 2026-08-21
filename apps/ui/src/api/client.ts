@@ -8,26 +8,36 @@ export interface AppConfig {
   org_name: string;
 }
 
-// A channel-neutral binding: one agent binds exactly one channel (ADR-0089),
-// so the wire always carries a singular object, never an array or a plural
-// `channels` field. `kind` selects which address shape applies ("slack" is
-// the only kind the console can create today); `address` is the channel-kind
-// identifier the worker resolves against.
+// A channel-neutral binding: an agent binds one or more channels (ADR-0116),
+// so the wire carries a list, ordered `(kind, address)` server-side. `kind`
+// selects which address shape applies; `address` is the channel-kind identifier
+// the worker resolves against. Non-Slack reply routing is supplied only on the
+// write shape below.
 export interface ChannelBinding {
   kind: string;
   address: string;
 }
 
+// Reply routing is accepted on writes but deliberately never returned by the
+// API. Keeping the write shape separate prevents a refetch from being mistaken
+// for a source of adapter credentials.
+export interface ChannelBindingWrite extends ChannelBinding {
+  endpoint?: string;
+  adapter?: string;
+}
+
 // The worker resolves an agent's binding against `channel.address`, not a
 // bare `slack_channel` column. This is the console's fast local check for the
-// one kind it can create; it is a soft check (warns, never blocks) because
+// Slack kind; it is a soft check (warns, never blocks) because
 // the authoritative gate lives server-side (apps/api schemas.py).
 export const SLACK_ADDRESS_RE = /^[CDG][A-Z0-9]+$/;
 
 export interface AgentOut {
   id: string;
   name: string;
-  channel: ChannelBinding;
+  // One or more channel bindings (ADR-0116), ordered `(kind, address)`
+  // server-side.
+  channels: ChannelBinding[];
   // Per-agent model id, forwarded as CURIE_MODEL at boot (#254). null uses the
   // platform default model.
   model: string | null;
@@ -447,7 +457,7 @@ export async function getConfig(): Promise<AppConfig> {
 // platform default that clearing is supposed to restore.
 export async function updateAgent(
   agentId: string,
-  patch: { channel?: ChannelBinding; model?: string | null },
+  patch: { model?: string | null },
 ): Promise<AgentOut> {
   const resp = await fetch(url(`/agents/${agentId}`), {
     method: "PATCH",
@@ -455,6 +465,52 @@ export async function updateAgent(
     body: JSON.stringify(patch),
   });
   return jsonOrThrow<AgentOut>(resp);
+}
+
+// Move one surface binding to a new kind/address (ADR-0116). The pair being
+// moved is named by `selector` (its CURRENT kind/address) and rides in the
+// query string, never the body, so it can never be confused with `next`, the
+// replacement value. Reply route fields are write only and omitted here, which
+// tells the API to preserve them. Returns the updated agent.
+export async function patchAgentChannel(
+  agentId: string,
+  selector: ChannelBinding,
+  next: ChannelBinding,
+): Promise<AgentOut> {
+  const resp = await fetch(
+    url(`/agents/${agentId}/channels${query({ kind: selector.kind, address: selector.address })}`),
+    {
+      method: "PATCH",
+      headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify(next),
+    },
+  );
+  return jsonOrThrow<AgentOut>(resp);
+}
+
+export async function addAgentSurface(
+  agentId: string,
+  surface: ChannelBindingWrite,
+): Promise<AgentOut> {
+  const resp = await fetch(url(`/agents/${agentId}/channels`), {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify(surface),
+  });
+  return jsonOrThrow<AgentOut>(resp);
+}
+
+export async function removeAgentSurface(
+  agentId: string,
+  surface: ChannelBinding,
+): Promise<void> {
+  const resp = await fetch(
+    url(`/agents/${agentId}/channels${query({ kind: surface.kind, address: surface.address })}`),
+    { method: "DELETE", headers: headers() },
+  );
+  if (resp.ok) return;
+  const body = await resp.json().catch(() => null);
+  throw new ApiError(resp.status, describeError(body) ?? resp.statusText);
 }
 
 // Delete an agent (cascades its versions/deployments server-side; 204 No Content

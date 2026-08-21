@@ -12,6 +12,9 @@ import {
   listDeployments,
   getVersionFiles,
   updateAgent,
+  patchAgentChannel,
+  addAgentSurface,
+  removeAgentSurface,
   createDeployment,
   type AgentOut,
   type VersionOut,
@@ -21,9 +24,10 @@ import {
 
 // Mock only the data-layer calls; preserve the real ApiError/BundleValidationError
 // classes (the hooks branch on `instanceof ApiError`) and the untouched helpers.
-// `updateAgent` is mocked for the channel-edit tests; `createDeployment` for the
-// promote-to-prod tests; createVersion/uploadBundle are stubbed so the deploy path
-// never hits the network even though these tests don't exercise it.
+// `patchAgentChannel` is mocked for the channel-edit tests; `updateAgent` for the
+// model-edit tests; `createDeployment` for the promote-to-prod tests;
+// createVersion/uploadBundle are stubbed so the deploy path never hits the
+// network even though these tests don't exercise it.
 vi.mock("../../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../api/client")>();
   return {
@@ -33,6 +37,9 @@ vi.mock("../../api/client", async (importOriginal) => {
     listDeployments: vi.fn(),
     getVersionFiles: vi.fn(),
     updateAgent: vi.fn(),
+    patchAgentChannel: vi.fn(),
+    addAgentSurface: vi.fn(),
+    removeAgentSurface: vi.fn(),
     createVersion: vi.fn(),
     uploadBundle: vi.fn(),
     createDeployment: vi.fn(),
@@ -44,7 +51,7 @@ vi.mock("../../api/client", async (importOriginal) => {
 const AGENT: AgentOut = {
   id: "a1",
   name: "deal-desk",
-  channel: { kind: "slack", address: "C0123ABCD" },
+  channels: [{ kind: "slack", address: "C0123ABCD" }],
   model: null,
   created_at: "2026-07-01T00:00:00Z",
 };
@@ -94,7 +101,13 @@ beforeEach(() => {
   vi.mocked(listVersions).mockResolvedValue(VERSIONS);
   vi.mocked(listDeployments).mockResolvedValue(DEPLOYMENTS);
   vi.mocked(getVersionFiles).mockResolvedValue(FILES);
-  vi.mocked(updateAgent).mockResolvedValue({ ...AGENT, channel: { kind: "slack", address: "C9999ZZZZ" } });
+  vi.mocked(updateAgent).mockResolvedValue(AGENT);
+  vi.mocked(patchAgentChannel).mockResolvedValue({
+    ...AGENT,
+    channels: [{ kind: "slack", address: "C9999ZZZZ" }],
+  });
+  vi.mocked(addAgentSurface).mockResolvedValue(AGENT);
+  vi.mocked(removeAgentSurface).mockResolvedValue();
   vi.mocked(createDeployment).mockResolvedValue(deployment("v2", "prod", "2026-07-08T00:00:00Z"));
 });
 
@@ -126,7 +139,7 @@ function renderDetail() {
 }
 
 describe("WiredAgentDetail — channel edit (item 5)", () => {
-  it("saves an edited Slack channel via updateAgent and refetches the agent list", async () => {
+  it("saves an edited Slack channel via patchAgentChannel and refetches the agent list", async () => {
     const user = userEvent.setup();
     renderDetail();
 
@@ -142,15 +155,21 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     await user.type(input, "C9999ZZZZ");
     await user.click(screen.getByTestId("channel-save"));
 
-    // Exactly one PATCH, with the right args.
-    await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
-    expect(updateAgent).toHaveBeenCalledWith("a1", { channel: { kind: "slack", address: "C9999ZZZZ" } });
+    // Exactly one PATCH, with the right args: the selector names the binding's
+    // ORIGINAL pair, never updateAgent.
+    await waitFor(() => expect(patchAgentChannel).toHaveBeenCalledTimes(1));
+    expect(patchAgentChannel).toHaveBeenCalledWith(
+      "a1",
+      { kind: "slack", address: "C0123ABCD" },
+      { kind: "slack", address: "C9999ZZZZ" },
+    );
+    expect(updateAgent).not.toHaveBeenCalled();
 
     // Save triggers a refetch of the wired agent data (getAgents runs a 2nd time).
     await waitFor(() => expect(getAgents).toHaveBeenCalledTimes(2));
   });
 
-  it("blocks saving an empty channel (no updateAgent call)", async () => {
+  it("blocks saving an empty channel (no patchAgentChannel call)", async () => {
     const user = userEvent.setup();
     renderDetail();
 
@@ -160,7 +179,7 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     // Save is disabled / a no-op while the channel is empty.
     const save = screen.getByTestId("channel-save");
     await user.click(save).catch(() => {});
-    expect(updateAgent).not.toHaveBeenCalled();
+    expect(patchAgentChannel).not.toHaveBeenCalled();
   });
 
   it("warns on a non-Slack-ID channel but still allows saving (soft check)", async () => {
@@ -177,7 +196,11 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     // …but the value still saves.
     await user.click(screen.getByTestId("channel-save"));
     await waitFor(() =>
-      expect(updateAgent).toHaveBeenCalledWith("a1", { channel: { kind: "slack", address: "revenue-ops" } }),
+      expect(patchAgentChannel).toHaveBeenCalledWith(
+        "a1",
+        { kind: "slack", address: "C0123ABCD" },
+        { kind: "slack", address: "revenue-ops" },
+      ),
     );
   });
 
@@ -190,7 +213,7 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     // Slack binding it was written for (#143's guidance is the deliverable).
     const user = userEvent.setup();
     vi.mocked(getAgents).mockResolvedValue([
-      { ...AGENT, channel: { kind: "webhook", address: "acme-room-7" } },
+      { ...AGENT, channels: [{ kind: "webhook", address: "acme-room-7" }] },
     ]);
     renderDetail();
 
@@ -207,7 +230,38 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     // The kind rides along on the save, unchanged.
     await user.click(screen.getByTestId("channel-save"));
     await waitFor(() =>
-      expect(updateAgent).toHaveBeenCalledWith("a1", { channel: { kind: "webhook", address: "room/42" } }),
+      expect(patchAgentChannel).toHaveBeenCalledWith(
+        "a1",
+        { kind: "webhook", address: "acme-room-7" },
+        { kind: "webhook", address: "room/42" },
+      ),
+    );
+  });
+
+  it("moves a surface without reading or echoing its write-only reply route", async () => {
+    // AgentOut intentionally exposes only the routing pair. PATCH omission is
+    // the server-side preserve gesture, so the console must send only what it
+    // can honestly know instead of manufacturing secret route fields.
+    const user = userEvent.setup();
+    vi.mocked(getAgents).mockResolvedValue([
+      {
+        ...AGENT,
+        channels: [{ kind: "webhook", address: "acme-room-7" }],
+      },
+    ]);
+    renderDetail();
+
+    const input = await screen.findByTestId("channel-input");
+    await user.clear(input);
+    await user.type(input, "acme-room-8");
+    await user.click(screen.getByTestId("channel-save"));
+
+    await waitFor(() =>
+      expect(patchAgentChannel).toHaveBeenCalledWith(
+        "a1",
+        { kind: "webhook", address: "acme-room-7" },
+        { kind: "webhook", address: "acme-room-8" },
+      ),
     );
   });
 
@@ -222,6 +276,48 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
     await user.clear(input);
     await user.type(input, "revenue-ops");
     expect(screen.getByTestId("channel-warn")).toBeInTheDocument();
+  });
+
+  it("adds a second surface and thereby opts the agent in", async () => {
+    const user = userEvent.setup();
+    renderDetail();
+
+    await user.type(await screen.findByTestId("surface-kind-new"), "discord");
+    await user.type(screen.getByTestId("surface-address-new"), "123456789012345678");
+    await user.type(screen.getByTestId("surface-endpoint-new"), "https://discord-adapter.example.com/replies");
+    await user.type(screen.getByTestId("surface-adapter-new"), "discord");
+    await user.click(screen.getByTestId("surface-add"));
+
+    await waitFor(() =>
+      expect(addAgentSurface).toHaveBeenCalledWith("a1", {
+        kind: "discord",
+        address: "123456789012345678",
+        endpoint: "https://discord-adapter.example.com/replies",
+        adapter: "discord",
+      }),
+    );
+  });
+
+  it("removes a selected surface but leaves final-surface enforcement to the API", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getAgents).mockResolvedValue([
+      {
+        ...AGENT,
+        channels: [
+          { kind: "slack", address: "C0123ABCD" },
+          { kind: "discord", address: "123456789012345678" },
+        ],
+      },
+    ]);
+    renderDetail();
+
+    await user.click(await screen.findByTestId("surface-remove-1"));
+    await waitFor(() =>
+      expect(removeAgentSurface).toHaveBeenCalledWith("a1", {
+        kind: "discord",
+        address: "123456789012345678",
+      }),
+    );
   });
 });
 
@@ -333,6 +429,149 @@ describe("WiredAgentDetail — promote-to-prod (item 6)", () => {
     await user.click(await screen.findByRole("button", { name: "Cancel" }));
 
     expect(vi.mocked(createDeployment)).not.toHaveBeenCalled();
+  });
+});
+
+describe("WiredAgentDetail — multi-channel edit (ADR-0116)", () => {
+  // [FAIL-FIRST] S5.3/S5.4: the current component renders exactly one channel
+  // editor, keyed off the singular `agent.channel`. Once channels go plural
+  // each binding gets its own editor keyed by `${kind}:${address}`, and
+  // saving one PATCHes only that binding via patchAgentChannel's pair
+  // selector -- the other row is untouched. Fails today: only one editor
+  // exists, so `findAllByTestId("channel-input")` never reaches length 2.
+  it("renders_one_editor_per_binding_and_saves_only_that_one", async () => {
+    const user = userEvent.setup();
+    const twoBindingAgent = {
+      ...AGENT,
+      channels: [
+        { kind: "slack", address: "C0EXAMPLE1" },
+        { kind: "slack", address: "C0EXAMPLE2" },
+      ],
+    } as unknown as AgentOut;
+    vi.mocked(getAgents).mockResolvedValue([twoBindingAgent]);
+    renderDetail();
+
+    expect(await screen.findByTestId("agent-detail-name")).toHaveTextContent("deal-desk");
+
+    const inputs = await screen.findAllByTestId("channel-input");
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0]).toHaveValue("C0EXAMPLE1");
+    expect(inputs[1]).toHaveValue("C0EXAMPLE2");
+
+    // Edit and save only the second binding's row.
+    await user.clear(inputs[1]);
+    await user.type(inputs[1], "C0EXAMPLE3");
+    const saves = screen.getAllByTestId("channel-save");
+    await user.click(saves[1]);
+
+    // The PATCH names the second pair as the selector and its new address as
+    // the replacement -- never a bare updateAgent call, and never the first
+    // binding's pair.
+    await waitFor(() => expect(patchAgentChannel).toHaveBeenCalledTimes(1));
+    expect(patchAgentChannel).toHaveBeenCalledWith(
+      "a1",
+      { kind: "slack", address: "C0EXAMPLE2" },
+      { kind: "slack", address: "C0EXAMPLE3" },
+    );
+    expect(updateAgent).not.toHaveBeenCalled();
+
+    // The first row is untouched by the second row's save.
+    expect(inputs[0]).toHaveValue("C0EXAMPLE1");
+  });
+
+  // [FAIL-FIRST] finding 3, #1525 code review: the retired-selector bug. The
+  // fix is only real if the second save still resolves correctly while the
+  // refetch triggered by the first save is still in flight -- so `getAgents`
+  // is wired to hang past its first (initial-load) call, and only the row's
+  // own save response can rebase the selector.
+  it("rebases a row's selector onto the just-saved pair, and an in-flight refetch does not clobber another row's unsaved edit", async () => {
+    const user = userEvent.setup();
+    const twoBindingAgent = {
+      ...AGENT,
+      channels: [
+        { kind: "slack", address: "C0EXAMPLE1" },
+        { kind: "slack", address: "C0EXAMPLE2" },
+      ],
+    } as unknown as AgentOut;
+
+    // Call 1 (initial load) resolves immediately. Every later call (the
+    // refetches fired by each save) hangs until the test explicitly resolves
+    // it, so "immediately save again" genuinely races an unresolved refetch
+    // instead of a fast mock that happens to beat it.
+    const refetchResolvers: Array<(agents: AgentOut[]) => void> = [];
+    let getAgentsCalls = 0;
+    vi.mocked(getAgents).mockImplementation(() => {
+      getAgentsCalls += 1;
+      if (getAgentsCalls === 1) return Promise.resolve([twoBindingAgent]);
+      return new Promise<AgentOut[]>((resolve) => refetchResolvers.push(resolve));
+    });
+
+    // Save 1: move the second binding C0EXAMPLE2 -> C0EXAMPLE3.
+    vi.mocked(patchAgentChannel).mockResolvedValueOnce({
+      ...twoBindingAgent,
+      channels: [
+        { kind: "slack", address: "C0EXAMPLE1" },
+        { kind: "slack", address: "C0EXAMPLE3" },
+      ],
+    });
+
+    renderDetail();
+    expect(await screen.findByTestId("agent-detail-name")).toHaveTextContent("deal-desk");
+
+    const inputs = await screen.findAllByTestId("channel-input");
+    expect(inputs).toHaveLength(2);
+    const saves = screen.getAllByTestId("channel-save");
+
+    await user.clear(inputs[1]);
+    await user.type(inputs[1], "C0EXAMPLE3");
+    await user.click(saves[1]);
+    await waitFor(() => expect(patchAgentChannel).toHaveBeenCalledTimes(1));
+    // The refetch save 1 triggered is now hanging (getAgentsCalls === 2).
+    await waitFor(() => expect(getAgentsCalls).toBe(2));
+
+    // Type an unsaved edit into the OTHER (untouched) row -- it must survive
+    // the pending refetch from save 1's completion.
+    await user.clear(inputs[0]);
+    await user.type(inputs[0], "C0EXAMPLE9");
+
+    // Save 2: immediately edit and save the SAME row again, before save 1's
+    // refetch has landed.
+    vi.mocked(patchAgentChannel).mockResolvedValueOnce({
+      ...twoBindingAgent,
+      channels: [
+        { kind: "slack", address: "C0EXAMPLE1" },
+        { kind: "slack", address: "C0EXAMPLE4" },
+      ],
+    });
+    await user.clear(inputs[1]);
+    await user.type(inputs[1], "C0EXAMPLE4");
+    await user.click(saves[1]);
+
+    // The second PATCH's selector names the pair from save 1 (C0EXAMPLE3) --
+    // not the retired C0EXAMPLE2 that agent.channels is still stuck on while
+    // save 1's refetch hangs. Fails against the current code, which reuses
+    // the (stale) `agent.channels` entry as the selector.
+    await waitFor(() => expect(patchAgentChannel).toHaveBeenCalledTimes(2));
+    expect(patchAgentChannel).toHaveBeenNthCalledWith(
+      2,
+      "a1",
+      { kind: "slack", address: "C0EXAMPLE3" },
+      { kind: "slack", address: "C0EXAMPLE4" },
+    );
+
+    // Now let save 1's refetch land with server-fresh data, while row 0's
+    // unsaved "C0EXAMPLE9" edit is still sitting in the input. Its completion
+    // must not stomp that unsaved edit back to the server's C0EXAMPLE1.
+    refetchResolvers[0]([
+      {
+        ...twoBindingAgent,
+        channels: [
+          { kind: "slack", address: "C0EXAMPLE1" },
+          { kind: "slack", address: "C0EXAMPLE3" },
+        ],
+      },
+    ]);
+    await waitFor(() => expect(inputs[0]).toHaveValue("C0EXAMPLE9"));
   });
 });
 

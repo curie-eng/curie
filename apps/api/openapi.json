@@ -143,8 +143,12 @@
             ],
             "title": "Behavior Packs"
           },
-          "channel": {
-            "$ref": "#/components/schemas/ChannelBinding"
+          "channels": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelBinding"
+            },
+            "title": "Channels",
+            "type": "array"
           },
           "created_at": {
             "format": "date-time",
@@ -211,7 +215,7 @@
         "required": [
           "id",
           "name",
-          "channel",
+          "channels",
           "repo_full_name",
           "behavior_packs",
           "model",
@@ -254,9 +258,6 @@
               }
             ],
             "title": "Approval Routes"
-          },
-          "channel": {
-            "$ref": "#/components/schemas/ChannelBindingWrite"
           },
           "model": {
             "anyOf": [
@@ -1013,7 +1014,7 @@
       },
       "ChannelBinding": {
         "additionalProperties": false,
-        "description": "Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).\n\nSingular wherever it appears -- one agent binds one channel (ADR-0089) --\nso `AgentCreate`, `AgentUpdate` and `AgentOut` all carry a `channel` OBJECT\nand there is no plural surface anywhere on this API.\n\n`kind` names the adapter that owns the binding, selects the address-shape\ncheck, AND routes: since ADR-0096 phase 2 the worker resolves on the\n`(kind, address)` PAIR, so the two together are the routing key the worker\nmatches on equality (a Slack channel id for `kind=\"slack\"`). One address can\ntherefore be bound twice under two different kinds.",
+        "description": "Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).\n\nAn agent holds ONE OR MORE of these (ADR-0116, #1525, amending ADR-0089's\nsingular clause). `AgentCreate` still carries one `channel` OBJECT -- the\nfirst binding, required, since an agent with none cannot receive a turn --\n`AgentOut` carries the `channels` LIST, and every write after the create\ngoes through the `/agents/{id}/channels` subresource. `AgentUpdate` carries\nno binding key at all.\n\n`kind` names the adapter that owns the binding, selects the address-shape\ncheck, AND routes: since ADR-0096 phase 2 the worker resolves on the\n`(kind, address)` PAIR, so the two together are the routing key the worker\nmatches on equality (a Slack channel id for `kind=\"slack\"`). One address can\ntherefore be bound twice under two different kinds.",
         "properties": {
           "address": {
             "title": "Address",
@@ -1031,9 +1032,51 @@
         "title": "ChannelBinding",
         "type": "object"
       },
+      "ChannelBindingPatch": {
+        "additionalProperties": false,
+        "description": "A binding move with partial semantics for the write only reply route.\n\n`kind` and `address` always describe the replacement routing key. Omitting\nboth route fields preserves their stored values because callers cannot read\nthem back. Supplying both fields replaces them, including the explicit\n`null` pair that clears the route.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ChannelBindingPatch",
+        "type": "object"
+      },
       "ChannelBindingWrite": {
         "additionalProperties": false,
-        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because that one doubles as\n`AgentOut.channel` in RESPONSES, and the public read contract is exactly\n`{kind, address}` (ADR-0096 phase 2, EB-A18 as relocated). `endpoint` and\n`adapter` are server-controlled facts an operator configures at bind time --\nwhere this kind's replies go back through, and which egress credential\nauthenticates them -- so they are durable on the row and ABSENT from every\nread. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThree rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_pair_ck` states the first of\nthem at the database for out-of-band writers:\n\n- **Both or neither.** A half-configured route is an operator error that\n  would otherwise surface as a fail-closed escalation mid-turn, in the\n  worker, far from the request that caused it.\n- **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,\n  migration 0024 backfills every existing row to exactly that, and the\n  cutover binds the agent first and PATCHes the route in later. The gate for\n  an unroutable binding is `POST /channels/token`, which refuses (409) to\n  mint for a non-`slack` binding with no route -- `slack`'s route is\n  legitimately implicit (the worker's configured Slack origin).\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
+        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because that one doubles as the\nelement type of `AgentOut.channels` in RESPONSES, and the read contract is\nexactly\n`{kind, address}` (ADR-0096 phase 2, EB-A18 as relocated). `endpoint` and\n`adapter` are server-controlled facts an operator configures at bind time --\nwhere this kind's replies go back through, and which egress credential\nauthenticates them -- so they are durable on the row and ABSENT from every\nread. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThree rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_pair_ck` states the first of\nthem at the database for out-of-band writers:\n\n- **Both or neither.** A half-configured route is an operator error that\n  would otherwise surface as a fail-closed escalation mid-turn, in the\n  worker, far from the request that caused it.\n- **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,\n  migration 0024 backfills every existing row to exactly that, and the\n  cutover binds the agent first and PATCHes the route in later. The gate for\n  an unroutable binding is `POST /channels/token`, which refuses (409) to\n  mint for a non-`slack` binding with no route -- `slack`'s route is\n  legitimately implicit (the worker's configured Slack origin).\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -3545,6 +3588,247 @@
         "summary": "Put Budget",
         "tags": [
           "control"
+        ]
+      }
+    },
+    "/agents/{agent_id}/channels": {
+      "delete": {
+        "description": "Unbind the pair, unless it is this agent's last binding.\n\nThe last one is refused: an agent with zero bindings is deployed,\nhealthy-looking and unable to receive a turn -- #38's silent-shadow state,\nand the same reason `AgentCreate.channel` is required rather than optional.\nThe count comes from the locked set, so two concurrent deletes of different\npairs cannot both read \"two left\" and leave the agent at zero.",
+        "operationId": "remove_agent_channel_agents__agent_id__channels_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Agent Channel",
+        "tags": [
+          "agents"
+        ]
+      },
+      "patch": {
+        "description": "Move (or re-assert) the binding the `(kind, address)` pair names.\n\n`expected_generation` is an OPTIONAL compare-and-set, in the shape\n`routers/state.py` uses for its versioned rows, so the two CAS surfaces read\nalike. Optional because an operator moving a binding from the CLI has no\ngeneration to quote; a channel adapter holding a token minted against\ngeneration N does, and it is exactly the caller that must not overwrite a\nrebind it never saw.",
+        "operationId": "move_agent_channel_agents__agent_id__channels_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "title": "Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Expected Generation"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelBindingPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Move Agent Channel",
+        "tags": [
+          "agents"
+        ]
+      },
+      "post": {
+        "description": "Bind this agent to one more channel. Appends; never moves.",
+        "operationId": "add_agent_channel_agents__agent_id__channels_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelBindingWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Agent Channel",
+        "tags": [
+          "agents"
         ]
       }
     },
@@ -6377,6 +6661,38 @@
             "schema": {
               "title": "Hook",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "address",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Address"
             }
           },
           {

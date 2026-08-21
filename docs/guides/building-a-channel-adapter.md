@@ -1,5 +1,9 @@
 # Building a channel adapter
 
+For a complete production-shaped example, see
+[`adapters/discord`](../../adapters/discord/) and
+[`Connect one Curie agent to Discord and Slack`](discord-adapter.md).
+
 How to put Curie on a channel it has never heard of (a mail server, a support
 desk, a webhook bus) without changing the platform. Since ADR-0096 phase 2 the
 channel port is neutral: the platform never learns your channel's shape, and you
@@ -23,8 +27,11 @@ shipped component, but its shape is the shape being described here.
 
 ## 2. Bind an agent
 
-A binding is four fields, written through the agent write path (`POST /agents`
-or `PATCH /agents/{agent_id}`, both platform key over `X-API-Key`):
+A binding is four fields. `POST /agents` writes the agent's first binding at
+creation time (platform key over `X-API-Key`); every later add, move, or
+remove goes through the binding subresource, `POST` / `PATCH` / `DELETE
+/agents/{agent_id}/channels` (ADR-0116) -- `PATCH /agents/{agent_id}` no
+longer accepts a `channel` key and 422s if you send one:
 
 ```json
 {
@@ -54,7 +61,8 @@ the agent first and PATCH the route in later. `slack` is the one kind exempt
 from needing them, because its replies go through the worker's configured Slack
 origin.
 
-The route is write-only. Agent reads return exactly `{kind, address}`.
+The route is write-only. Agent reads return a list of `{kind, address}`,
+ordered by `(kind, address)` -- an agent may hold more than one binding.
 
 ## 3. Get credentials
 

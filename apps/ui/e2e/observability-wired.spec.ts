@@ -171,7 +171,7 @@ test("Logs tab aggregates logs across all runner pods by default", async ({ page
 });
 
 test("an agent's View traces opens the Traces list pre-filtered to that agent", async ({ page }) => {
-  const agent = { id: "ag-77", name: "billing-bot", channel: { kind: "slack", address: "C0BILL" }, created_at: "2026-07-05T00:00:00Z" };
+  const agent = { id: "ag-77", name: "billing-bot", channels: [{ kind: "slack", address: "C0BILL" }], created_at: "2026-07-05T00:00:00Z" };
   await page.route(/\/api\/agents(\?.*)?$/, (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([agent]) }));
 
   const traceUrls: string[] = [];
@@ -202,7 +202,7 @@ test("an agent's View traces opens the Traces list pre-filtered to that agent", 
 // live and already consumed on the agent detail page; the tab reuses that panel
 // behind an agent selector. Stub the agents list + the per-agent memory log.
 test("Memory tab lists an agent's learned memory with provenance and supports delete", async ({ page }) => {
-  const agent = { id: "ag-mem", name: "deal-desk", channel: { kind: "slack", address: "#revenue-ops" }, created_at: "2026-07-05T00:00:00Z" };
+  const agent = { id: "ag-mem", name: "deal-desk", channels: [{ kind: "slack", address: "#revenue-ops" }], created_at: "2026-07-05T00:00:00Z" };
   await page.route(/\/api\/agents(\?.*)?$/, (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([agent]) }),
   );

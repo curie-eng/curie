@@ -319,8 +319,8 @@ async def _seed_binding(
 async def _repoint_binding(
     sessionmaker: async_sessionmaker[AsyncSession], *, address: str, kind: str
 ) -> None:
-    """Re-point a live binding to another kind, as `crud.update_agent_binding`
-    does in place on an ordinary PATCH."""
+    """Re-point a live binding to another kind, as `crud.update_channel_binding`
+    does in place on an ordinary binding move."""
 
     async with sessionmaker() as session:
         await session.execute(

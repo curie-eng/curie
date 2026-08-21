@@ -131,3 +131,9 @@ ab80948feb8fee545ac7a755d8242904f9b031d3:CLAUDE.md:curl-auth-user:75
 # generic-api-key rule inside this file, which .gitleaks.toml exempts for itself
 # but not for this one.
 de945b33ecb0930990c5af669c52d26b6fa2cfd3:apps/ui/src/views/obs/RealMetrics.tsx:generic-api-key:11
+
+# A fake Discord snowflake in the surfaces CLI test, ascending digits
+# (123456789012345678), not a real bot/client id. A later commit on this same
+# branch swapped it for a zero-entropy placeholder; this commit is immutable, so
+# the full-history sweep still reads the old fixture id out of it.
+fc211a288aad285277413e684e96fbae063d27cf:cli/tests/surfaces_verb.rs:discord-client-id:203

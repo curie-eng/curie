@@ -224,9 +224,13 @@ def _unroutable(kind: str, address: str) -> HTTPException:
     return HTTPException(
         status.HTTP_409_CONFLICT,
         f"the binding for kind {kind!r} at address {address!r} has no reply "
-        "route: set its endpoint and adapter (PATCH the agent's channel) before "
-        "minting a token for it or posting turns to it, or its turns would be "
-        "enqueued with nowhere to reply and no credential to reply with.",
+        "route: set its endpoint and adapter before minting a token for it or "
+        "posting turns to it, or its turns would be enqueued with nowhere to "
+        "reply and no credential to reply with. Send them on "
+        "PATCH /agents/{agent_id}/channels, selecting this binding with "
+        f"?kind={kind}&address={address} -- or on POST /agents/{{agent_id}}"
+        "/channels when adding the binding. The agent-level `channel` field is "
+        "retired and rejects a binding write.",
     )
 
 
@@ -440,7 +444,7 @@ async def ingest_turn(
     owner = f"pending:{secrets.token_hex(16)}"
 
     # The generation, re-read at the LAST moment before the claim. The row above
-    # was loaded at the top of the request, and `update_agent_binding` bumps the
+    # was loaded at the top of the request, and `update_channel_binding` bumps the
     # generation on a rebind, so a credential revoked mid-request would otherwise
     # still enqueue against the binding it no longer names. Re-reading here
     # narrows that race from the whole request to the gap below; it does NOT

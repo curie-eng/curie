@@ -59,15 +59,20 @@ def test_patch_without_model_leaves_it_unchanged(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     agent = _create_agent(client, auth_headers, model="deepseek-v4")
-    # A PATCH touching only channel must not clear the model.
+    # A binding write must not clear the model. Since ADR-0116 the binding is
+    # written through its own subresource, so this is no longer a PATCH field
+    # that could be co-cleared by a partial-update bug -- but the response still
+    # carries the whole agent, and a handler that rebuilt it from the binding
+    # write alone would drop the override just as silently.
     resp = client.patch(
-        f"/agents/{agent['id']}",
-        json={"channel": {"kind": "slack", "address": "CMOVED001"}},
+        f"/agents/{agent['id']}/channels",
+        params={"kind": "slack", "address": "CMODEL001"},
+        json={"kind": "slack", "address": "CMOVED001"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["channel"] == {"kind": "slack", "address": "CMOVED001"}
+    assert body["channels"] == [{"kind": "slack", "address": "CMOVED001"}]
     assert body["model"] == "deepseek-v4"
 
 

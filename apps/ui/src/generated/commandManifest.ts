@@ -988,7 +988,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel (errors if zero or multiple agents are deployed)",
+              "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents (errors on zero or several)",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -1106,7 +1106,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel",
+              "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -1269,7 +1269,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy it is only moved when you pass this flag, so omitting it leaves the deployed agent's channel untouched",
+              "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy the channel is ADDED when the agent is not already bound to it, never moved and never removed, so omitting the flag leaves the deployed agent's binding set untouched",
               "id": "slack_channel",
               "long": "slack-channel",
               "positional": false,
@@ -1688,6 +1688,86 @@ export const commandManifest = {
           "name": "overrides"
         },
         {
+          "about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Add this surface, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1)",
+              "id": "add",
+              "long": "add",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Reply HTTP endpoint for a non-Slack adapter. Requires --adapter",
+              "id": "endpoint",
+              "long": "endpoint",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Worker credential selector for the reply adapter. Requires --endpoint",
+              "id": "adapter",
+              "long": "adapter",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove this surface, as KIND=ADDRESS. The API refuses to remove an agent's final surface",
+              "id": "remove",
+              "long": "remove",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`).\n\nWith no flags this lists. An agent holds one or more bindings (ADR-0116), so exactly one `--add` OR one `--remove` is applied per invocation: the API has no batch endpoint, and a half-applied batch would leave the operator guessing what took.",
+          "name": "surfaces"
+        },
+        {
           "about": "Set an agent's daily budget (`PUT /agents/{id}/budget`)",
           "args": [
             {
@@ -1860,7 +1940,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The thread key to reset (e.g. the Slack thread ts)",
+              "help": "The worker's composed key: kind:channel:thread-ts (e.g. slack:C0EXAMPLE1:1700000000.000100)",
               "id": "thread_key",
               "long": "thread-key",
               "positional": false,
@@ -2574,7 +2654,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel (errors if zero or multiple agents are deployed)",
+              "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents (errors on zero or several)",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -2744,7 +2824,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel",
+              "help": "Slack channel id to send as; must match one of the target agent's channels. Omit when exactly one channel is bound across all deployed agents",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -2986,7 +3066,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy it is only moved when you pass this flag, so omitting it leaves the deployed agent's channel untouched",
+              "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy the channel is ADDED when the agent is not already bound to it, never moved and never removed, so omitting the flag leaves the deployed agent's binding set untouched",
               "id": "slack_channel",
               "long": "slack-channel",
               "positional": false,
@@ -3287,6 +3367,106 @@ export const commandManifest = {
           "name": "overrides"
         },
         {
+          "about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Add this surface, as KIND=ADDRESS (e.g. slack=C0EXAMPLE1)",
+              "id": "add",
+              "long": "add",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Reply HTTP endpoint for a non-Slack adapter. Requires --adapter",
+              "id": "endpoint",
+              "long": "endpoint",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Worker credential selector for the reply adapter. Requires --endpoint",
+              "id": "adapter",
+              "long": "adapter",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove this surface, as KIND=ADDRESS. The API refuses to remove an agent's final surface",
+              "id": "remove",
+              "long": "remove",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "List, add, or remove an agent's surfaces (`/agents/{id}/channels`).\n\nWith no flags this lists. An agent holds one or more bindings (ADR-0116), so exactly one `--add` OR one `--remove` is applied per invocation: the API has no batch endpoint, and a half-applied batch would leave the operator guessing what took.",
+          "name": "surfaces"
+        },
+        {
           "about": "Set an agent's budget via the platform API (`PUT /agents/{id}/budget`)",
           "args": [
             {
@@ -3373,7 +3553,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The thread key to reset (e.g. the Slack thread ts)",
+              "help": "The worker's composed key: kind:channel:thread-ts (e.g. slack:C0EXAMPLE1:1700000000.000100)",
               "id": "thread_key",
               "long": "thread-key",
               "positional": false,
@@ -3945,7 +4125,7 @@ export const commandManifest = {
         },
         {
           "global": false,
-          "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy it is only moved when you pass this flag, so omitting it leaves the deployed agent's channel untouched",
+          "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy the channel is ADDED when the agent is not already bound to it, never moved and never removed, so omitting the flag leaves the deployed agent's binding set untouched",
           "id": "slack_channel",
           "long": "slack-channel",
           "positional": false,

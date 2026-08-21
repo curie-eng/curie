@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Enum, ForeignKey, UniqueConstraint, func
+from sqlalchemy import Enum, ForeignKey, Index, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -115,19 +115,26 @@ class Agent(Base):
     versions: Mapped[list["AgentVersion"]] = relationship(
         back_populates="agent", cascade="all, delete-orphan"
     )
-    # The agent's channel binding (ADR-0096, #1459). SINGULAR: one agent binds
-    # one channel (ADR-0089), so this is `uselist=False` rather than a list, and
-    # the API surface is an object rather than an array.
+    # The agent's channel bindings (ADR-0096, #1459; PLURAL since ADR-0116,
+    # migration 0028): an agent may hold more than one, so the API surface is a
+    # list rather than an object.
+    #
+    # `order_by` is load-bearing, not cosmetic: `agent_channels` has no
+    # `created_at` to fall back on, so without an explicit order the serialized
+    # list's element order is whatever Postgres happens to return, and two
+    # identical GETs could differ. `(kind, address)` is used because it is the
+    # pair every other layer already treats as the binding's identity
+    # (`binding._RESOLVE_SQL`, `agent_channels_kind_address_key`).
     #
     # `lazy="selectin"` is load-bearing, not a preference: every read path builds
     # `AgentOut` from this attribute after its session has been handed back, and
     # the default lazy strategy RAISES on attribute access outside an await under
     # asyncio instead of loading. Dropping it turns all three read endpoints into
     # 500s while the crud-level tests, which hold a live session, stay green.
-    channel: Mapped["AgentChannel"] = relationship(
+    channels: Mapped[list["AgentChannel"]] = relationship(
         back_populates="agent",
         cascade="all, delete-orphan",
-        uselist=False,
+        order_by="(AgentChannel.kind, AgentChannel.address)",
         lazy="selectin",
     )
 
@@ -151,7 +158,7 @@ class AgentChannel(Base):
     `endpoint`/`adapter` are the server-controlled reply route: where this kind's
     replies go back through, and which egress credential authenticates them. They
     are set here by the platform and never accepted from an ingress request body.
-    `generation` counts rebinds: `update_agent_binding` mutates this row IN PLACE,
+    `generation` counts rebinds: `update_channel_binding` mutates this row IN PLACE,
     so the row id is a stable identity and the generation is the only thing that
     makes a rebind observable to a credential minted before it.
     """
@@ -170,12 +177,18 @@ class AgentChannel(Base):
         # exists to close, which is why the cutover proves no old worker pod is
         # running before migration 0023 applies.
         UniqueConstraint("kind", "address", name="agent_channels_kind_address_key"),
-        # One binding per agent (ADR-0089: "one agent still binds one channel.
-        # Declaring two targets creates two agents; it does not let one agent
-        # serve two channels."). The old scalar column got this for free; a child
-        # table silently discards it unless it is re-established, and nothing
-        # fails until an operator binds a second channel and finds one dead.
-        UniqueConstraint("agent_id", name="agent_channels_agent_id_key"),
+        # No agent_id uniqueness here (ADR-0116, migration 0028): an agent may
+        # hold more than one binding now. ADR-0089's "one agent still binds one
+        # channel" is amended in part -- the (kind, address) constraint above is
+        # still what stops two agents claiming the same channel; nothing stops
+        # one agent from claiming several.
+        #
+        # PLAIN index on agent_id, because dropping that uniqueness dropped the
+        # column's only index with it (migration 0028 recreates it as this).
+        # `crud.lock_agent_bindings` filters and orders by agent_id under
+        # `FOR UPDATE` on every add, move and delete; unindexed, each of those
+        # scans the whole table while holding locks.
+        Index("ix_agent_channels_agent_id", "agent_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -195,7 +208,7 @@ class AgentChannel(Base):
     # with this route" gesture that should invalidate outstanding credentials.
     generation: Mapped[int] = mapped_column(server_default="0", default=0)
 
-    agent: Mapped[Agent] = relationship(back_populates="channel")
+    agent: Mapped[Agent] = relationship(back_populates="channels")
 
 
 class AgentVersion(Base):

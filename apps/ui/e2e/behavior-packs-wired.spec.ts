@@ -5,7 +5,7 @@ import { test, expect, type Page, type Route } from "@playwright/test";
 // config with the edit applied. Backend stubbed with real-shaped responses, so
 // this runs stackless (chromium project).
 
-const AGENT = { id: "a1", name: "deal-desk", channel: { kind: "slack", address: "C0123ABCD" }, model: null, created_at: "2026-07-01T00:00:00Z" };
+const AGENT = { id: "a1", name: "deal-desk", channels: [{ kind: "slack", address: "C0123ABCD" }], model: null, created_at: "2026-07-01T00:00:00Z" };
 
 const DEFAULT_PACKS = {
   load: { enabled: false, lines: [] as string[] },

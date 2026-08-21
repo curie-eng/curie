@@ -65,10 +65,10 @@ pub struct ConnectorManifests {
     pub mcp_entries: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-/// One agent's channel binding (ADR-0096, #1459): `kind` names the ingress
-/// (`"slack"` today) and `address` is the kind-specific identifier the worker
-/// resolver matches turns against. Singular per ADR-0089's one-agent-one-channel
-/// rule, mirroring the committed `ChannelBinding`.
+/// One of an agent's channel bindings (ADR-0116, #1525): `kind` names the
+/// ingress (`"slack"` today) and `address` is the kind-specific identifier the
+/// worker resolver matches turns against. An agent holds one or more, so the
+/// pair -- never the address alone -- identifies a binding.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChannelBinding {
     pub kind: String,
@@ -79,7 +79,10 @@ pub struct ChannelBinding {
 pub struct Agent {
     pub id: String,
     pub name: String,
-    pub channel: ChannelBinding,
+    /// Every channel this agent answers on, ordered by `(kind, address)`
+    /// server-side. One or more (ADR-0116): the API refuses to remove the last
+    /// one, because an agent bound to nothing is deployed and answers nowhere.
+    pub channels: Vec<ChannelBinding>,
     /// The repository whose pushes deploy this agent (ADR-0014). Set at
     /// creation via `--repo`, or bound later by PATCH since `AgentUpdate`
     /// carries the field (#1194). ADR-0091 dropped the unique index, so
@@ -239,12 +242,15 @@ pub struct ApprovalRecord {
 pub enum ChannelOutcome {
     /// A new agent was created bound to this channel.
     Created(String),
-    /// An existing agent's channel was moved.
-    Updated { from: String, to: String },
-    /// An existing agent's channel was left as-is. `passed` records whether a
-    /// `--slack-channel` was supplied (and merely matched) so the caller can hint
-    /// how to move it when none was given.
-    Unchanged { channel: String, passed: bool },
+    /// An existing agent gained a binding it did not hold. Never a move: a
+    /// deploy only ever ADDS (ADR-0116), so the agent's other channels stay
+    /// routed.
+    Added { address: String },
+    /// An existing agent's binding set was left as-is, and carries every
+    /// address in it. `passed` records whether a `--slack-channel` was supplied
+    /// (and merely matched) so the caller can hint how to bind another when
+    /// none was given.
+    Unchanged { channels: Vec<String>, passed: bool },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -526,16 +532,27 @@ fn agent_create_body(
 /// and Pydantic decodes a `null` and an absent key to the same `None`, so a
 /// `null` would read as "omitted" while looking on the wire like an intent to
 /// clear (#1071, the same trap documented on [`ApiClient::set_approval_routes`]).
-fn agent_update_body(
-    slack_channel: Option<&str>,
-    repo_full_name: Option<&str>,
-) -> serde_json::Value {
+fn agent_update_body(repo_full_name: Option<&str>) -> serde_json::Value {
     let mut body = json!({});
-    if let Some(channel) = slack_channel {
-        body["channel"] = json!({"kind": "slack", "address": channel});
-    }
     if let Some(repo) = repo_full_name {
         body["repo_full_name"] = json!(repo);
+    }
+    body
+}
+
+/// The `POST /agents/{id}/channels` body: the binding PAIR and nothing else.
+/// Pure so the shape is testable without a live API. The kind is never
+/// inferred -- a channel-neutral binding carries it explicitly.
+fn add_channel_body(
+    kind: &str,
+    address: &str,
+    endpoint: Option<&str>,
+    adapter: Option<&str>,
+) -> serde_json::Value {
+    let mut body = json!({"kind": kind, "address": address});
+    if let (Some(endpoint), Some(adapter)) = (endpoint, adapter) {
+        body["endpoint"] = json!(endpoint);
+        body["adapter"] = json!(adapter);
     }
     body
 }
@@ -665,6 +682,94 @@ impl ApiClient {
             .context("decoding updated agent")
     }
 
+    /// `GET /agents/{id}`: the agent row as the API holds it right now. Used by
+    /// the ensure-bound recheck, which must read a FRESH row rather than the
+    /// one resolution already had.
+    pub async fn get_agent(&self, agent_id: &str) -> Result<Agent> {
+        let resp = self
+            .http
+            .get(format!("{}/agents/{agent_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("GET /agents/{id}")?;
+        Self::expect_ok(resp, "reading the agent")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent")
+    }
+
+    /// Add one channel binding: `POST /agents/{id}/channels` (201 with the
+    /// agent as stored).
+    ///
+    /// A 409 is AMBIGUOUS: the pair's uniqueness is platform-wide, so the
+    /// conflict may be another agent holding it (a real error) or this very
+    /// agent, when a concurrent deploy won the race to add the same pair. This
+    /// is ensure-bound, a statement about the END STATE, so the conflict is
+    /// rechecked against a fresh read and answered as success only when this
+    /// agent now owns the pair.
+    pub async fn add_agent_channel(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        address: &str,
+        endpoint: Option<&str>,
+        adapter: Option<&str>,
+    ) -> Result<Agent> {
+        let resp = self
+            .http
+            .post(format!("{}/agents/{agent_id}/channels", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json(&add_channel_body(kind, address, endpoint, adapter))
+            .send()
+            .await
+            .context("POST /agents/{id}/channels")?;
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            let conflict = Self::expect_ok(resp, "adding the channel binding")
+                .await
+                .expect_err("a 409 is never a success");
+            let agent = self.get_agent(agent_id).await?;
+            if agent
+                .channels
+                .iter()
+                .any(|b| b.kind == kind && b.address == address)
+            {
+                return Ok(agent);
+            }
+            return Err(conflict);
+        }
+        Self::expect_ok(resp, "adding the channel binding")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent after the channel add")
+    }
+
+    /// Remove one channel binding: `DELETE /agents/{id}/channels?kind=&address=`
+    /// (204, no body). The PAIR travels, never the address alone: on a
+    /// multi-binding agent an address-only removal would drop the wrong row.
+    ///
+    /// The API refuses to remove an agent's LAST binding with a 409, which
+    /// [`Self::expect_ok`] surfaces with the reason intact.
+    pub async fn remove_agent_channel(
+        &self,
+        agent_id: &str,
+        kind: &str,
+        address: &str,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .delete(format!("{}/agents/{agent_id}/channels", self.base_url))
+            .query(&[("kind", kind), ("address", address)])
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("DELETE /agents/{id}/channels")?;
+        Self::expect_ok(resp, "removing the channel binding").await?;
+        Ok(())
+    }
+
     /// Bind the per-agent connector secrets (ADR-0009, #429). The values travel
     /// in the JSON request body (over the API's X-API-Key channel), never in
     /// argv; the API stores them and returns the agent with names only.
@@ -716,7 +821,16 @@ impl ApiClient {
                 // than sent away to be built again from scratch (#1212). An
                 // agent already bound elsewhere is NOT moved: a deploy must not
                 // silently reroute which repository's pushes reach it.
-                let channel_move = slack_channel.filter(|c| *c != agent.channel.address.as_str());
+                // ENSURE-BOUND (ADR-0116): `--slack-channel` states a binding
+                // the agent must HOLD, not the one binding it may have. An
+                // address it already answers on is nothing to do; anything else
+                // is added beside what is there, never on top of it.
+                let channel_add = slack_channel.filter(|c| {
+                    !agent
+                        .channels
+                        .iter()
+                        .any(|b| b.kind == "slack" && b.address == **c)
+                });
                 let current_repo = agent.repo_full_name.as_deref();
                 let (repo_bind, mut repo_note) = match (repo_full_name, current_repo) {
                     (Some(want), None) => (Some(want), None),
@@ -733,14 +847,22 @@ impl ApiClient {
                     ),
                     _ => (None, None),
                 };
-                // One request rather than two removes the client-side window
-                // where the channel moved and a second call then failed, and
-                // the channel-uniqueness 409 aborts before repo_full_name is
-                // reached. The server still commits per field, so the two
-                // fields are not applied atomically.
-                let previous_channel = channel_move.map(|_| agent.channel.address.clone());
-                let agent = if channel_move.is_some() || repo_bind.is_some() {
-                    let body = agent_update_body(channel_move, repo_bind);
+                // TWO requests, not one: the binding lives on its own
+                // subresource now that `AgentUpdate.channel` is retired
+                // (ADR-0116), so the repo bind stays a separate PATCH. A
+                // failure between them therefore leaves the channel added and
+                // the repo unbound -- which is why the channel goes FIRST. A
+                // bound channel with no repo still answers a turn; a bound repo
+                // with no channel does not.
+                let agent = match channel_add {
+                    Some(address) => {
+                        self.add_agent_channel(&agent.id, "slack", address, None, None)
+                            .await?
+                    }
+                    None => agent,
+                };
+                let agent = if repo_bind.is_some() {
+                    let body = agent_update_body(repo_bind);
                     self.update_agent(&agent.id, &body).await?
                 } else {
                     agent
@@ -761,13 +883,12 @@ impl ApiClient {
                         stored = bound.unwrap_or("no binding")
                     ));
                 }
-                let outcome = match previous_channel {
-                    Some(from) => ChannelOutcome::Updated {
-                        from,
-                        to: agent.channel.address.clone(),
+                let outcome = match channel_add {
+                    Some(address) => ChannelOutcome::Added {
+                        address: address.to_string(),
                     },
                     None => ChannelOutcome::Unchanged {
-                        channel: agent.channel.address.clone(),
+                        channels: agent.channels.iter().map(|b| b.address.clone()).collect(),
                         passed: slack_channel.is_some(),
                     },
                 };
@@ -776,7 +897,14 @@ impl ApiClient {
             None => {
                 let channel = slack_channel.unwrap_or(DEFAULT_SLACK_CHANNEL);
                 let agent = self.create_agent(name, channel, repo_full_name).await?;
-                let outcome = ChannelOutcome::Created(agent.channel.address.clone());
+                // `AgentCreate` still carries the singular channel, so a created
+                // agent holds exactly the one binding it was created with.
+                let outcome = ChannelOutcome::Created(
+                    agent
+                        .channels
+                        .first()
+                        .map_or_else(|| channel.to_string(), |b| b.address.clone()),
+                );
                 Ok((agent, outcome, None))
             }
         }
@@ -1403,7 +1531,7 @@ impl ApiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_create_body, agent_update_body, is_insecure_endpoint};
+    use super::{add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint};
 
     #[test]
     fn create_agent_body_omits_repo_unless_asked() {
@@ -1429,7 +1557,7 @@ mod tests {
     fn agent_update_body_omits_both_when_neither_is_asked() {
         // Omission is how the wire says "leave this alone", so a PATCH with
         // nothing to change carries nothing at all.
-        let body = agent_update_body(None, None);
+        let body = agent_update_body(None);
         assert!(
             body.as_object().expect("an object").is_empty(),
             "was {body}"
@@ -1442,19 +1570,47 @@ mod tests {
         // guards both fields behind `is not None`, and Pydantic decodes a null
         // and an omitted key identically, so a null would read as "omitted"
         // while looking on the wire like an intent to clear (#1071).
-        let channel = agent_update_body(Some("C123"), None);
-        assert_eq!(channel["channel"]["kind"], "slack");
-        assert_eq!(channel["channel"]["address"], "C123");
-        assert!(channel.get("repo_full_name").is_none(), "was {channel}");
-
-        let repo = agent_update_body(None, Some("acme/bundle"));
+        let repo = agent_update_body(Some("acme/bundle"));
         assert_eq!(repo["repo_full_name"], "acme/bundle");
-        assert!(repo.get("channel").is_none(), "was {repo}");
+    }
 
-        let both = agent_update_body(Some("C123"), Some("acme/bundle"));
-        assert_eq!(both["channel"]["kind"], "slack");
-        assert_eq!(both["channel"]["address"], "C123");
-        assert_eq!(both["repo_full_name"], "acme/bundle");
+    #[test]
+    fn agent_update_body_never_emits_channel() {
+        // `AgentUpdate.channel` is retired: bindings move through
+        // `POST /agents/{id}/channels`. A body that still carries the key does
+        // not merely send something unnecessary, it 422s the whole PATCH --
+        // taking the repo bind travelling beside it down with it.
+        for body in [
+            agent_update_body(None),
+            agent_update_body(Some("acme/bundle")),
+        ] {
+            assert!(
+                body.get("channel").is_none() && body.get("channels").is_none(),
+                "no binding key belongs in an AgentUpdate body: {body}"
+            );
+        }
+        assert_eq!(
+            agent_update_body(Some("acme/bundle")),
+            serde_json::json!({"repo_full_name": "acme/bundle"}),
+            "the repo bind is the only thing left in this body"
+        );
+    }
+
+    #[test]
+    fn add_channel_body_shape() {
+        // The subresource takes the PAIR and nothing else. Exact equality is
+        // the assertion, so a stray `agent_id` echoed back into the body, or a
+        // bare address string standing in for the pair, both fail.
+        assert_eq!(
+            add_channel_body("slack", "C0EXAMPLE1", None, None),
+            serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1"})
+        );
+        // The kind is never inferred: a non-Slack ingress passes through
+        // verbatim, which is the whole point of a channel-neutral binding.
+        assert_eq!(
+            add_channel_body("email", "ops@example.com", None, None),
+            serde_json::json!({"kind": "email", "address": "ops@example.com"})
+        );
     }
 
     #[test]

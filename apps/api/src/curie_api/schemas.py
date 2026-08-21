@@ -566,9 +566,10 @@ def _reject_retired_binding_keys(data: Any) -> Any:
 
     - `slack_channel` WAS the agent's binding until migration 0021 replaced it
       with `channel: {kind, address}`.
-    - `channels` (plural) never was: ADR-0096/ADR-0089 fix the binding as
-      singular (one agent, one channel), so a caller sending the plural key
-      is describing a shape this API has never had.
+    - `channels` (plural) is not a CREATE field: a create binds exactly one
+      channel and every binding after it is written through the
+      `/agents/{id}/channels` subresource (ADR-0116), so the plural key here
+      describes a shape this endpoint has never had.
 
     These models inherit pydantic's `extra="ignore"`, so without this a
     `PATCH /agents/{id}` carrying either key validates into an EMPTY
@@ -598,39 +599,55 @@ def _reject_retired_binding_keys(data: Any) -> Any:
             )
         if "channels" in data:
             raise ValueError(
-                "channels is not an agent field: an agent binds exactly one "
-                "channel (ADR-0089), so sending the plural key would leave "
-                'the agent bound where it already was. Send channel: {"kind": '
-                '"slack", "address": "C0123ABCD"} instead.'
+                "channels is not an agent field: a create binds exactly ONE "
+                'channel, so send channel: {"kind": "slack", "address": '
+                '"C0123ABCD"} here and add the rest through POST '
+                "/agents/{id}/channels (ADR-0116). Creating with no binding at "
+                "all would leave the agent unable to receive a turn."
             )
     return data
 
 
-def _channel_schema_omittable_not_null(schema: dict[str, Any]) -> None:
-    """Publish `AgentUpdate.channel` as omittable but NOT nullable.
+def _reject_retired_update_binding_key(data: Any) -> Any:
+    """Refuse `channel` on an agent UPDATE (ADR-0116, #1525).
 
-    The annotation is `ChannelBinding | None` because `None` is how an OMITTED
-    field arrives, but `_reject_explicit_null_channel` 422s an explicit null. Left
-    alone, generation reads the annotation literally and the committed
-    `openapi.json` advertises `channel: null` as valid -- so a generated client
-    sends the value the published contract blessed and gets a validation error.
-    Collapsing the `anyOf` (and dropping the `null` default with it) makes the
-    exported schema say what the model actually accepts.
+    Separate from `_reject_retired_binding_keys` rather than a flag on it,
+    because `AgentCreate` must keep ACCEPTING `channel` -- a create still binds
+    exactly one. Only the update surface withdrew the key.
+
+    `PATCH /agents/{id}` with `channel: {...}` meant "move the agent's only
+    binding". With several bindings that sentence has no referent, and widening
+    it to "add, or move, depending" would silently turn a redeploy against a
+    different channel into an accumulate. Left merely undeclared it would be
+    worse still: `extra="ignore"` parses the retired key into an AgentUpdate
+    with nothing set, so the caller is told 200 while the agent keeps answering
+    on its old address -- #38's silent misroute, reached by a caller who read
+    last release's docs.
+
+    Runs `mode="before"`, since by `mode="after"` the extra key is already gone.
     """
 
-    options = [option for option in schema.get("anyOf", []) if option.get("type") != "null"]
-    if len(options) == 1:
-        schema.pop("anyOf")
-        schema.pop("default", None)
-        schema.update(options[0])
+    if isinstance(data, dict) and "channel" in data:
+        raise ValueError(
+            "channel is no longer an agent field: an agent may hold several "
+            "bindings (ADR-0116), so moving 'the' binding has no referent. Use "
+            "the subresource, where each verb means one thing: POST "
+            "/agents/{id}/channels to add a binding, PATCH "
+            "/agents/{id}/channels?kind=&address= to move the one that pair "
+            "names, DELETE /agents/{id}/channels?kind=&address= to remove it."
+        )
+    return data
 
 
 class ChannelBinding(BaseModel):
     """Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).
 
-    Singular wherever it appears -- one agent binds one channel (ADR-0089) --
-    so `AgentCreate`, `AgentUpdate` and `AgentOut` all carry a `channel` OBJECT
-    and there is no plural surface anywhere on this API.
+    An agent holds ONE OR MORE of these (ADR-0116, #1525, amending ADR-0089's
+    singular clause). `AgentCreate` still carries one `channel` OBJECT -- the
+    first binding, required, since an agent with none cannot receive a turn --
+    `AgentOut` carries the `channels` LIST, and every write after the create
+    goes through the `/agents/{id}/channels` subresource. `AgentUpdate` carries
+    no binding key at all.
 
     `kind` names the adapter that owns the binding, selects the address-shape
     check, AND routes: since ADR-0096 phase 2 the worker resolves on the
@@ -659,8 +676,9 @@ class ChannelBinding(BaseModel):
 class ChannelBindingWrite(ChannelBinding):
     """The WRITE side of a binding: the public pair plus its reply ROUTE.
 
-    A separate model from `ChannelBinding` because that one doubles as
-    `AgentOut.channel` in RESPONSES, and the public read contract is exactly
+    A separate model from `ChannelBinding` because that one doubles as the
+    element type of `AgentOut.channels` in RESPONSES, and the read contract is
+    exactly
     `{kind, address}` (ADR-0096 phase 2, EB-A18 as relocated). `endpoint` and
     `adapter` are server-controlled facts an operator configures at bind time --
     where this kind's replies go back through, and which egress credential
@@ -727,6 +745,28 @@ class ChannelBindingWrite(ChannelBinding):
         return self
 
 
+class ChannelBindingPatch(ChannelBindingWrite):
+    """A binding move with partial semantics for the write only reply route.
+
+    `kind` and `address` always describe the replacement routing key. Omitting
+    both route fields preserves their stored values because callers cannot read
+    them back. Supplying both fields replaces them, including the explicit
+    `null` pair that clears the route.
+    """
+
+    @model_validator(mode="after")
+    def _check_route_presence(self) -> "ChannelBindingPatch":
+        endpoint_sent = "endpoint" in self.model_fields_set
+        adapter_sent = "adapter" in self.model_fields_set
+        if endpoint_sent != adapter_sent:
+            missing = "adapter" if endpoint_sent else "endpoint"
+            raise ValueError(
+                f"channel route patch must send endpoint and adapter together; "
+                f"{missing} was omitted"
+            )
+        return self
+
+
 class AgentCreate(BaseModel):
     name: str
     # Required, and singular. Every create path supplies exactly one binding
@@ -735,7 +775,8 @@ class AgentCreate(BaseModel):
     # answering nothing, which is #38's silent-shadow failure.
     #
     # The WRITE model: a create may also configure the reply route (ADR-0096
-    # phase 2). `AgentOut.channel` stays the read-only `{kind, address}` pair.
+    # phase 2). `AgentOut.channels` stays a list of read-only `{kind, address}`
+    # pairs. Additional bindings are added through the subresource, never here.
     channel: ChannelBindingWrite
     repo_full_name: str | None = None
     behavior_packs: BehaviorPacksConfig | None = None
@@ -779,21 +820,11 @@ class AgentUpdate(BaseModel):
     many agents now, so binding is a routing fact, not a name.
     """
 
-    # The agent's channel binding (ADR-0096, #1459). OMITTED leaves the current
-    # binding unchanged; a value REPLACES it (an agent holds exactly one).
+    # No binding key, in either number (ADR-0116, #1525). The binding's write
+    # surface is `/agents/{id}/channels`, where add, move and remove are three
+    # verbs instead of one overloaded field; `_reject_retired_update_binding_key`
+    # refuses the withdrawn `channel` key loudly rather than ignoring it.
     #
-    # Explicit JSON null is REJECTED, deliberately breaking the convention its
-    # neighbours `model` and `thinking` follow two fields down. Their null means
-    # "fall back to the platform default"; there is no default binding to fall
-    # back to, so a null here would strand the agent -- deployed,
-    # healthy-looking, and unable to receive a turn. `None` is therefore only
-    # ever "omitted", never "sent as null" (see `_reject_explicit_null_channel`).
-    # `json_schema_extra` keeps the PUBLISHED contract honest about that: the
-    # annotation has to admit `None` for the omitted case, but the exported
-    # OpenAPI must not offer `null` as a value a client may send.
-    channel: ChannelBindingWrite | None = Field(
-        default=None, json_schema_extra=_channel_schema_omittable_not_null
-    )
     # New per-agent model id (#254). OMITTED leaves the current model unchanged;
     # explicit null clears it back to the platform default (#1310).
     model: str | None = None
@@ -823,26 +854,11 @@ class AgentUpdate(BaseModel):
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
-
-    @model_validator(mode="after")
-    def _reject_explicit_null_channel(self) -> "AgentUpdate":
-        """Refuse `{"channel": null}`; see the field comment for why.
-
-        Keyed on `model_fields_set` for the same reason the router is (#1310):
-        `is None` alone cannot tell "the client did not mention this field" from
-        "the client explicitly sent null", and here those two must not mean the
-        same thing.
-        """
-
-        if "channel" in self.model_fields_set and self.channel is None:
-            raise ValueError(
-                "channel must not be null: unlike model and thinking, there is "
-                "no platform-default binding to fall back to, so clearing it "
-                "would leave the agent unable to receive a turn. Omit the field "
-                "to leave the binding unchanged, or send a new "
-                "{kind, address} to move it."
-            )
-        return self
+    # The update-only half: a withdrawn `channel` here is refused, while the
+    # same key stays required on `AgentCreate`.
+    _reject_retired_channel_key = model_validator(mode="before")(
+        _reject_retired_update_binding_key
+    )
 
 
 class AgentOut(BaseModel):
@@ -850,11 +866,13 @@ class AgentOut(BaseModel):
 
     id: uuid.UUID
     name: str
-    # Serialized from the singular `Agent.channel` relationship. Ordering is
-    # moot because there is exactly one, which is a second reason the surface is
-    # an object rather than a list; the LOADING strategy is not moot, and lives
-    # on the relationship (`models.Agent.channel`, lazy="selectin").
-    channel: ChannelBinding
+    # Serialized from the plural `Agent.channels` relationship (ADR-0116).
+    # Ordering is NOT moot now that there can be more than one: it is
+    # `(kind, address)`, enforced on the relationship, because `agent_channels`
+    # has no `created_at` and an unordered list makes two identical GETs differ
+    # -- which re-renders the console's rows on every poll. The LOADING strategy
+    # lives on the relationship too (`models.Agent.channels`, lazy="selectin").
+    channels: list[ChannelBinding]
     repo_full_name: str | None
     behavior_packs: dict[str, Any] | None
     model: str | None

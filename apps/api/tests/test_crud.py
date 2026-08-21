@@ -74,7 +74,7 @@ def test_full_round_trip(
 
     got_agent = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert got_agent.status_code == 200
-    assert got_agent.json()["channel"] == {"kind": "slack", "address": "C0TRIAGE01"}
+    assert got_agent.json()["channels"] == [{"kind": "slack", "address": "C0TRIAGE01"}]
 
     listed_versions = client.get(
         f"/agents/{agent_id}/versions", headers=auth_headers
@@ -283,11 +283,14 @@ def test_version_for_missing_agent_returns_404(
     assert resp.status_code == 404
 
 
-def test_patch_agent_moves_slack_channel(
+def test_update_channel_binding_moves_the_channel(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     # A redeploy that passes a new --slack-channel must actually move the channel
     # of the existing agent (the audit MAJOR: the channel was silently ignored).
+    # The seam moved from `crud.update_agent_binding` to
+    # `crud.update_channel_binding` behind the subresource (ADR-0116); it is
+    # driven here through HTTP because that is where the round trip is real.
     agent = client.post(
         "/agents",
         json={"name": "mover", "channel": {"kind": "slack", "address": "C000000OLD"}},
@@ -296,16 +299,91 @@ def test_patch_agent_moves_slack_channel(
     agent_id = agent["id"]
 
     resp = client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": {"kind": "slack", "address": "C000000NEW"}},
+        f"/agents/{agent_id}/channels",
+        params={"kind": "slack", "address": "C000000OLD"},
+        json={"kind": "slack", "address": "C000000NEW"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["channel"] == {"kind": "slack", "address": "C000000NEW"}
+    assert resp.json()["channels"] == [{"kind": "slack", "address": "C000000NEW"}]
 
     # The change is persisted, not just echoed back.
     got = client.get(f"/agents/{agent_id}", headers=auth_headers).json()
-    assert got["channel"] == {"kind": "slack", "address": "C000000NEW"}
+    assert got["channels"] == [{"kind": "slack", "address": "C000000NEW"}]
+
+
+def test_add_channel_binding_appends_and_leaves_the_first_alone(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # `crud.add_channel_binding`, through the subresource: appending must not be
+    # a disguised move. An add that silently replaced would leave the operator
+    # believing the agent listens on two channels while one of them is dead --
+    # #38's shadow state reached through the very verb meant to prevent it.
+    agent = client.post(
+        "/agents",
+        json={"name": "adder", "channel": {"kind": "slack", "address": "C0000ADD01"}},
+        headers=auth_headers,
+    ).json()
+
+    added = client.post(
+        f"/agents/{agent['id']}/channels",
+        json={"kind": "slack", "address": "C0EXAMPLE1"},
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+
+    got = client.get(f"/agents/{agent['id']}", headers=auth_headers).json()
+    assert got["channels"] == [
+        {"kind": "slack", "address": "C0000ADD01"},
+        {"kind": "slack", "address": "C0EXAMPLE1"},
+    ]
+
+
+def test_delete_channel_binding_removes_only_the_named_row(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # `crud.delete_channel_binding`, through the subresource. The agent keeps
+    # every other binding, and the freed pair is genuinely free -- a row deleted
+    # from the response but not from the table would hold its address hostage
+    # against every future agent.
+    agent = client.post(
+        "/agents",
+        json={"name": "remover", "channel": {"kind": "slack", "address": "C0000DEL01"}},
+        headers=auth_headers,
+    ).json()
+    assert (
+        client.post(
+            f"/agents/{agent['id']}/channels",
+            json={"kind": "slack", "address": "C0000DEL02"},
+            headers=auth_headers,
+        ).status_code
+        == 201
+    )
+
+    removed = client.request(
+        "DELETE",
+        f"/agents/{agent['id']}/channels",
+        params={"kind": "slack", "address": "C0000DEL02"},
+        headers=auth_headers,
+    )
+    assert removed.status_code == 204, removed.text
+
+    got = client.get(f"/agents/{agent['id']}", headers=auth_headers).json()
+    assert got["channels"] == [{"kind": "slack", "address": "C0000DEL01"}]
+    assert (
+        _count(
+            "SELECT count(*) FROM curie.agent_channels WHERE agent_id = :aid",
+            agent["id"],
+        )
+        == 1
+    )
+
+    reused = client.post(
+        "/agents",
+        json={"name": "reuses", "channel": {"kind": "slack", "address": "C0000DEL02"}},
+        headers=auth_headers,
+    )
+    assert reused.status_code == 201, reused.text
 
 
 def test_patch_agent_omitted_field_is_noop(
@@ -320,7 +398,7 @@ def test_patch_agent_omitted_field_is_noop(
         f"/agents/{agent['id']}", json={}, headers=auth_headers
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["channel"] == {"kind": "slack", "address": "C0000KEEP1"}
+    assert resp.json()["channels"] == [{"kind": "slack", "address": "C0000KEEP1"}]
 
 
 def test_create_agent_rejects_non_id_channel(
@@ -340,11 +418,14 @@ def test_create_agent_rejects_non_id_channel(
     assert [a["id"] for a in client.get("/agents", headers=auth_headers).json()] == []
 
 
-def test_patch_agent_rejects_non_id_channel(
+def test_binding_writes_reject_a_non_id_channel(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # A redeploy that PATCHes a #name channel onto an existing agent must be
+    # A redeploy that moves an existing agent onto a #name channel must be
     # rejected too, and must not clobber the agent's current (valid) channel.
+    # Both binding verbs are checked: the address validator lives on the write
+    # schema, and a subresource that reached the database on ADD while only
+    # PATCH validated would persist a dead binding through the other door.
     agent = client.post(
         "/agents",
         json={"name": "patch-bad", "channel": {"kind": "slack", "address": "C000GOOD01"}},
@@ -352,17 +433,26 @@ def test_patch_agent_rejects_non_id_channel(
     ).json()
     agent_id = agent["id"]
 
-    resp = client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": {"kind": "slack", "address": "general"}},
+    moved = client.patch(
+        f"/agents/{agent_id}/channels",
+        params={"kind": "slack", "address": "C000GOOD01"},
+        json={"kind": "slack", "address": "general"},
         headers=auth_headers,
     )
-    assert resp.status_code == 422, resp.text
-    assert "slack channel" in resp.text.lower()
+    assert moved.status_code == 422, moved.text
+    assert "slack channel" in moved.text.lower()
 
-    # The rejected PATCH left the original channel intact.
+    added = client.post(
+        f"/agents/{agent_id}/channels",
+        json={"kind": "slack", "address": "general"},
+        headers=auth_headers,
+    )
+    assert added.status_code == 422, added.text
+    assert "slack channel" in added.text.lower()
+
+    # The rejected writes left the original channel intact, and added nothing.
     got = client.get(f"/agents/{agent_id}", headers=auth_headers).json()
-    assert got["channel"] == {"kind": "slack", "address": "C000GOOD01"}
+    assert got["channels"] == [{"kind": "slack", "address": "C000GOOD01"}]
 
 
 def test_patch_missing_agent_returns_404(
@@ -371,10 +461,43 @@ def test_patch_missing_agent_returns_404(
     missing = "00000000-0000-0000-0000-000000000000"
     resp = client.patch(
         f"/agents/{missing}",
-        json={"channel": {"kind": "slack", "address": "C000000X01"}},
+        json={"model": "claude-sonnet-5"},
         headers=auth_headers,
     )
     assert resp.status_code == 404
+
+
+def test_binding_writes_for_a_missing_agent_return_404(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The subresource is agent-scoped, so an unknown agent is a 404 on all three
+    # verbs -- never a 422 about the pair, which would send the caller looking
+    # for a problem with the address they sent.
+    #
+    # NOT a fail-first test, and deliberately recorded as such: an ABSENT route
+    # answers 404 too, so this passes vacuously until the subresource exists. It
+    # becomes load-bearing the moment it does, which is why it is written now
+    # rather than after -- an agent-scoped route that resolved a pair before
+    # checking the agent would answer 422 or 200 here.
+    missing = "00000000-0000-0000-0000-000000000000"
+    pair = {"kind": "slack", "address": "C000000X01"}
+
+    assert (
+        client.post(f"/agents/{missing}/channels", json=pair, headers=auth_headers).status_code
+        == 404
+    )
+    assert (
+        client.patch(
+            f"/agents/{missing}/channels", params=pair, json=pair, headers=auth_headers
+        ).status_code
+        == 404
+    )
+    assert (
+        client.request(
+            "DELETE", f"/agents/{missing}/channels", params=pair, headers=auth_headers
+        ).status_code
+        == 404
+    )
 
 
 def test_delete_agent_removes_it_and_cascades_versions(

@@ -121,6 +121,32 @@ async def _seed_agent(
     return agent_id
 
 
+async def _seed_binding(
+    engine: AsyncEngine,
+    *,
+    agent_id: uuid.UUID,
+    channel: str,
+    kind: str = "slack",
+    schema: str = _SCHEMA,
+) -> None:
+    """Add ANOTHER binding row to an agent that already has one (#1525).
+
+    Separate from ``_seed_agent`` on purpose: that helper seeds an agent and its
+    first binding together, and the property under test here is the SECOND row.
+    Against the pre-0025 schema this insert is refused by
+    ``agent_channels_agent_id_key`` -- which is the red these tests are written
+    to record, not a fixture bug to work around.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                f"INSERT INTO {schema}.agent_channels (id, agent_id, kind, address) "
+                "VALUES (:id, :agent_id, :kind, :address)"
+            ),
+            {"id": uuid.uuid4(), "agent_id": agent_id, "kind": kind, "address": channel},
+        )
+
+
 async def _seed_deployment(
     engine: AsyncEngine,
     *,
@@ -502,6 +528,128 @@ def test_second_agent_on_a_bound_channel_is_refused() -> None:
     asyncio.run(go())
 
 
+def test_two_bindings_on_one_agent_both_resolve_to_the_same_deployment() -> None:
+    """AC2 at the worker layer (#1525): one agent, two channels, one deployment.
+
+    The mirror image of ``test_second_agent_on_a_bound_channel_is_refused``: what
+    stays refused is a second AGENT on one pair; what must become allowed is a
+    second PAIR on one agent. Both resolves must land on the same agent AND the
+    same version, because a multi-bound agent is one deployment reachable from
+    two doors -- an implementation that resolved the second address to a
+    different (or no) version would answer the second channel with the wrong
+    bundle.
+
+    FAIL-FIRST, and the red is a seed failure rather than an assertion failure:
+    against the pre-0025 schema ``agent_channels_agent_id_key`` refuses the
+    second binding row, so ``_seed_binding`` raises ``IntegrityError``. That is
+    the AC6 property observed from the worker's side, and it is deliberately NOT
+    wrapped in ``pytest.raises`` -- doing so would turn the constraint that must
+    be dropped into a passing test that defends it.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+
+            token = uuid.uuid4().hex[:8]
+            # The placeholder ids the plan pins, namespaced per run: the
+            # `(kind, address)` pair stays globally unique, so two copies of this
+            # file running against the shared developer Postgres cannot collide
+            # and a killed run leaves nothing that blocks the next one.
+            first = f"C0EXAMPLE1-{token}"
+            second = f"C0EXAMPLE2-{token}"
+            agent_id = await _seed_agent(
+                engine, channel=first, name=f"multi-{token}", max_usd=None, max_tokens=None
+            )
+            try:
+                await _seed_deployment(
+                    engine,
+                    agent_id=agent_id,
+                    environment="prod",
+                    bundle_ref=f"bundles/{token}.zip",
+                )
+                await _seed_binding(engine, agent_id=agent_id, channel=second)
+
+                resolver = _resolver(engine)
+                from_first = await resolver.resolve("slack", first)
+                from_second = await resolver.resolve("slack", second)
+
+                assert from_first is not None
+                assert from_second is not None
+                assert from_first.agent_id == agent_id
+                assert from_second.agent_id == agent_id
+                # Same deployment, not merely same agent: the version id is what
+                # picks the bundle the sandbox boots.
+                assert from_first.version_id == from_second.version_id
+                assert from_first.bundle_ref == from_second.bundle_ref == f"bundles/{token}.zip"
+            finally:
+                await _cleanup(engine, [agent_id])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_a_second_binding_does_not_shadow_the_first() -> None:
+    """The negative half of the multi-binding property (#1525).
+
+    Adding a second door must not widen the agent's reach: an address nobody
+    bound still resolves to None. The mutation this catches is a predicate that
+    starts matching on ``agent_id`` (or drops the address predicate entirely)
+    once an agent can own more than one row -- which would make every unbound
+    address answer with whichever agent happens to be multi-bound.
+
+    FAIL-FIRST for the same reason as its sibling above: the second binding row
+    cannot be seeded against the pre-0025 schema.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+
+            token = uuid.uuid4().hex[:8]
+            first = f"C0EXAMPLE1-{token}"
+            second = f"C0EXAMPLE2-{token}"
+            unbound = f"C0EXAMPLE3-{token}"
+            agent_id = await _seed_agent(
+                engine, channel=first, name=f"multi-nb-{token}", max_usd=None, max_tokens=None
+            )
+            try:
+                await _seed_deployment(
+                    engine,
+                    agent_id=agent_id,
+                    environment="prod",
+                    bundle_ref=f"bundles/{token}.zip",
+                )
+                await _seed_binding(engine, agent_id=agent_id, channel=second)
+
+                resolver = _resolver(engine)
+                assert await resolver.resolve("slack", unbound) is None
+                # And the kind still routes: a bound address under a kind the
+                # agent is not bound under stays unreachable too.
+                assert await resolver.resolve("webhook", second) is None
+                # Both bound doors still open, so the None above is a real
+                # miss rather than a resolver that stopped resolving anything.
+                assert await resolver.resolve("slack", first) is not None
+                assert await resolver.resolve("slack", second) is not None
+            finally:
+                await _cleanup(engine, [agent_id])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
 def test_resolve_warns_when_two_agents_are_bound_to_one_channel(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -771,6 +919,34 @@ def test_warn_if_multiple_agents_bound_is_quiet_for_one_agent() -> None:
     with unittest.mock.patch.object(logger, "warning") as warned:
         warn_if_multiple_agents_bound("slack", "C-single", rows)
     warned.assert_not_called()
+
+
+def test_warn_if_multiple_agents_bound_is_silent_for_one_agent_with_two_bindings() -> None:
+    """BASELINE-GREEN false-positive guard for #1525, and nothing more.
+
+    Passes today, because the helper already counts DISTINCT agents rather than
+    rows. It is pinned because multi-binding is the change that makes "one agent
+    appearing more than once" ordinary: each of an agent's bindings is looked up
+    on its own pair, and both lookups must be silent. A helper "fixed" to warn on
+    row count would turn every multi-bound agent into a shadowing warning on
+    every turn -- an operator-visible false alarm about the feature working.
+
+    An implementer must NOT make this test fail: it is not a change driver, and
+    the shadowing behavior it guards (two DIFFERENT agents on one pair) is
+    covered by ``test_warn_if_multiple_agents_bound_names_the_shadowed_agent``.
+    """
+
+    agent_id = uuid.uuid4()
+    logger = logging.getLogger("curie_worker.binding")
+
+    for address in ("C0EXAMPLE1", "C0EXAMPLE2"):
+        # Three rows, ONE agent: the shape a multi-bound agent produces once its
+        # bindings join the deployment rows. Row count is deliberately >1 so a
+        # helper mutated to count rows instead of distinct agents fails here.
+        rows = [{"agent_id": agent_id}, {"agent_id": agent_id}, {"agent_id": agent_id}]
+        with unittest.mock.patch.object(logger, "warning") as warned:
+            warn_if_multiple_agents_bound("slack", address, rows)
+        warned.assert_not_called()
 
 
 def test_deployment_pointing_at_another_agents_version_does_not_resolve() -> None:

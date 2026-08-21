@@ -35,6 +35,10 @@ def _qevent(text: str, *, thread: str = "th-1", event_id: str | None = None) -> 
     )
 
 
+def _thread_key(thread: str) -> str:
+    return f"slack:C1:{thread}"
+
+
 async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -241,18 +245,19 @@ def test_maintenance_tick_drains_pending_thread_reset_requests(make_harness) -> 
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("hi", thread="tDrain"))
-            assert h.substrate.lookup("tDrain") is not None
+            thread_key = _thread_key("tDrain")
+            assert h.substrate.lookup(thread_key) is not None
 
             consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
-            await h.async_redis.sadd(THREAD_RESET_SET, "tDrain")
+            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
 
             await consumer._drain_thread_reset_requests()
 
-            assert h.substrate.lookup("tDrain") is None  # released
+            assert h.substrate.lookup(thread_key) is None  # released
             assert await h.async_redis.scard(THREAD_RESET_SET) == 0  # popped, not left behind
             # #812: the in-progress marker is cleared only after the release
             # actually lands, so a successful drain leaves nothing pending.
-            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, "tDrain")
+            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
 
     asyncio.run(go())
 
@@ -306,7 +311,8 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("hi", thread="tWedgedDrain"))
-            assert h.substrate.lookup("tWedgedDrain") is not None
+            thread_key = _thread_key("tWedgedDrain")
+            assert h.substrate.lookup(thread_key) is not None
 
             monkeypatch.setattr(kernel_module, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
 
@@ -318,11 +324,11 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
             monkeypatch.setattr(h.kernel._runner, "interrupt", never_answers)
 
             consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
-            await h.async_redis.sadd(THREAD_RESET_SET, "tWedgedDrain")
+            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
 
             await asyncio.wait_for(consumer._drain_thread_reset_requests(), timeout=2.0)
 
-            assert h.substrate.lookup("tWedgedDrain") is None  # the reset was not lost
+            assert h.substrate.lookup(thread_key) is None  # the reset was not lost
 
     asyncio.run(go())
 
@@ -436,7 +442,8 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
         async with make_harness() as h:
             h.runner.default_script = [Final(text="hi", status=DONE)]
             await h.kernel.process_event(_qevent("hi", thread="tHangRelease"))
-            assert h.substrate.lookup("tHangRelease") is not None
+            thread_key = _thread_key("tHangRelease")
+            assert h.substrate.lookup(thread_key) is not None
 
             monkeypatch.setattr(kernel_module, "_RESET_RELEASE_TIMEOUT_S", 0.2)
 
@@ -447,7 +454,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
             monkeypatch.setattr(h.substrate, "release", hanging_release)
 
             consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
-            await h.async_redis.sadd(THREAD_RESET_SET, "tHangRelease")
+            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
 
             # Must finish well under the 5s hang, bounded instead by the
             # (monkeypatched) release timeout.

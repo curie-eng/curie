@@ -23,7 +23,7 @@ fn agents_response() -> Response {
     Response::json(
         200,
         &format!(
-            r##"[{{"id":"{AGENT_ID}","name":"weather","channel":{{"kind":"slack","address":"#weather"}},"approval_required_tools":[]}}]"##
+            r##"[{{"id":"{AGENT_ID}","name":"weather","channels":[{{"kind":"slack","address":"#weather"}}],"approval_required_tools":[]}}]"##
         ),
     )
 }

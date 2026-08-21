@@ -474,7 +474,9 @@ no Slack workspace at all.
 
 The honest limit: the **per-turn payload** and the **binding surface** are both
 channel-neutral now (#1459, ADR-0096) — a deployment binds an agent by
-exact-match on a `{kind, address}` channel row, not a Slack-typed column. The
+exact-match on a `{kind, address}` channel row, not a Slack-typed column, and
+an agent may hold several such rows (ADR-0116): a reply routes on the pair the
+inbound turn arrived on, never on any other channel the agent also serves. The
 catalog still grades the channel/ingress seam `C` with one implementation:
 Slack is the only registered `kind`, and there is no multi-channel adapter
 framework yet (#27). "The system does not care which channel" is true of a

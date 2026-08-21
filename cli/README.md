@@ -120,7 +120,7 @@ state on stdout --
 - `--json --dry-run` emits a planned-action descriptor `{"dry_run": true,
   "target": "local"|"cluster", "stream": ..., "channel": ...,
   "reply_endpoint": ...}` (`channel` is null when it would be resolved from
-  the sole deployed agent).
+  the sole bound `(agent, Slack channel)` pair).
 
 The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two
 exceptions still print human text instead of JSON on success (tracked in

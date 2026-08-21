@@ -5,9 +5,14 @@ throwaway database per run); name and repo_full_name are unique columns, so a
 collision must surface as a caller conflict, not an opaque server error.
 
 An agent's channel binding is the neutral `{kind, address}` object of ADR-0096
-(#1459), carried on a SINGULAR `channel` field. Cardinality is 1:1 on ADR-0089's
-authority ("one agent still binds one channel"), so there is no plural surface
-and no list anywhere on this API.
+(#1459). Cardinality stopped being 1:1 in ADR-0116 (#1525), which amends
+ADR-0089's "one agent still binds one channel" clause: a create still supplies
+exactly ONE binding through the singular `channel` key, reads carry a
+`channels` LIST ordered by `(kind, address)`, and every binding after the first
+is written through the `/agents/{id}/channels` subresource -- covered by
+`test_agent_channels_subresource.py`, not here. `AgentUpdate` carries no
+binding key at all, which is why the retired shapes are refused below rather
+than ignored.
 """
 
 import asyncio
@@ -163,9 +168,10 @@ def test_duplicate_address_is_409_on_create(
 def test_patch_onto_taken_address_is_409(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """T3, PATCH half. The update seam is fenced identically to create (#143's
+    """T3, move half. The write seam is fenced identically to create (#143's
     posture): the constraint cannot be sidestepped by creating on a free address
-    and then PATCHing onto a taken one."""
+    and then moving onto a taken one. The seam is now the channels subresource
+    (ADR-0116), so the move goes there; the 409 it must answer is unchanged."""
 
     first = _create(client, auth_headers, name="patch-chan-a", channel=_slack("C0FFFFFF6"))
     assert first.status_code == 201, first.text
@@ -173,8 +179,9 @@ def test_patch_onto_taken_address_is_409(
     assert second.status_code == 201, second.text
 
     moved = client.patch(
-        f"/agents/{second.json()['id']}",
-        json={"channel": _slack("C0FFFFFF6")},
+        f"/agents/{second.json()['id']}/channels",
+        params={"kind": "slack", "address": "C0FFFFFF7"},
+        json=_slack("C0FFFFFF6"),
         headers=auth_headers,
     )
     assert moved.status_code == 409, moved.text
@@ -196,9 +203,12 @@ def test_a_non_slack_kind_binds_and_reads_back_through_the_api(
     no registered address shape, so it validates on the generic rule; that is
     exactly what makes "without schema changes" true rather than aspirational.
 
-    The read-back asserts the binding is a singular OBJECT. A list would satisfy
-    "the binding round-trips" while breaking ADR-0089's one-agent-one-channel
-    rule, so the shape is asserted, not just the values.
+    The read-back asserts the binding surface is a LIST. ADR-0116 amends
+    ADR-0089's singular clause, so an object here would satisfy "the binding
+    round-trips" while making the second binding of #1525 unrepresentable in
+    the response an operator and the console both read. The shape is asserted,
+    not just the values, in both directions: a create still SENDS one object,
+    and the read returns a one-element list.
     """
 
     created = _create(
@@ -208,24 +218,30 @@ def test_a_non_slack_kind_binds_and_reads_back_through_the_api(
         channel={"kind": "webhook", "address": "acme-room-7"},
     )
     assert created.status_code == 201, created.text
-    assert created.json()["channel"] == {"kind": "webhook", "address": "acme-room-7"}
+    assert created.json()["channels"] == [{"kind": "webhook", "address": "acme-room-7"}]
 
     fetched = client.get(f"/agents/{created.json()['id']}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
-    binding = fetched.json()["channel"]
-    assert not isinstance(binding, list), binding
-    assert binding == {"kind": "webhook", "address": "acme-room-7"}
+    bindings = fetched.json()["channels"]
+    assert isinstance(bindings, list), bindings
+    assert bindings == [{"kind": "webhook", "address": "acme-room-7"}]
 
 
 def test_a_plural_channels_payload_is_rejected(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """T1's singular-contract pin. ADR-0089: "one agent still binds one channel.
-    Declaring two targets creates two agents; it does not let one agent serve two
-    channels." A create that names `channels` is therefore not a partially-honored
-    request, it is a misunderstanding of the contract, and it must be refused
-    rather than silently creating an agent with no binding at all -- which would
-    look deployed and answer nothing, #38's exact failure mode.
+    """CREATE binds exactly one channel, even under ADR-0116.
+
+    Plural bindings arrive through `POST /agents/{id}/channels`, never through
+    the create body: a create that names `channels` is not a partially-honored
+    request, it is a caller describing a shape this endpoint has never had, and
+    accepting it silently would create an agent with no binding at all -- which
+    looks deployed and answers nothing, #38's exact failure mode.
+
+    The guidance is asserted, not just the 422, and it is what changed with
+    ADR-0116: the message must now point at the subresource, because "send the
+    singular key instead" is only half the answer for an operator who genuinely
+    wants two bindings and would otherwise read the 422 as a flat refusal.
 
     Two payloads, because they fail for different reasons: the first omits the
     required `channel` entirely, the second sends a list where an object belongs.
@@ -238,6 +254,10 @@ def test_a_plural_channels_payload_is_rejected(
         channels=[{"kind": "slack", "address": "C0EXAMPLE1"}],
     )
     assert plural.status_code == 422, plural.text
+    # The new guidance: not "the plural surface does not exist" (it does now),
+    # but "not on create -- bind one here and add the rest over there".
+    assert "/channels" in plural.text, plural.text
+    assert "channels is not an agent field" in plural.text, plural.text
 
     listed = _create(
         client,
@@ -260,7 +280,7 @@ def test_the_slack_address_shape_check_survives_the_rename(
 
     ok = _create(client, auth_headers, name="slack-ok", channel=_slack("C0123ABCD"))
     assert ok.status_code == 201, ok.text
-    assert ok.json()["channel"] == {"kind": "slack", "address": "C0123ABCD"}
+    assert ok.json()["channels"] == [{"kind": "slack", "address": "C0123ABCD"}]
 
     bad = _create(client, auth_headers, name="slack-bad", channel=_slack("#general"))
     assert bad.status_code == 422, bad.text
@@ -303,7 +323,7 @@ def test_the_pair_is_identity_and_the_address_alone_is_not(
         channel={"kind": "email", "address": "C0EXAMPLE1"},
     )
     assert other_kind.status_code == 201, other_kind.text
-    assert other_kind.json()["channel"] == {"kind": "email", "address": "C0EXAMPLE1"}
+    assert other_kind.json()["channels"] == [{"kind": "email", "address": "C0EXAMPLE1"}]
 
     # And the pair itself is still identity: the SAME pair still conflicts, with
     # the guidance that names the fix (#38's error map), not a bare 500.
@@ -318,24 +338,27 @@ def test_the_pair_is_identity_and_the_address_alone_is_not(
     free = _create(client, auth_headers, name="kind-d", channel=_slack("C0EXAMPLE2"))
     assert free.status_code == 201, free.text
     moved = client.patch(
-        f"/agents/{free.json()['id']}",
-        json={"channel": _slack("C0EXAMPLE1")},
+        f"/agents/{free.json()['id']}/channels",
+        params={"kind": "slack", "address": "C0EXAMPLE2"},
+        json=_slack("C0EXAMPLE1"),
         headers=auth_headers,
     )
     assert moved.status_code == 409, moved.text
     assert "already bound" in moved.json()["detail"]
 
 
-def test_one_agent_cannot_hold_a_second_binding(
+def test_patching_a_binding_moves_it_rather_than_adding_a_second(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """T4, the reverse direction of the uniqueness (edge case E3).
+    """T4, rewritten for ADR-0116: the two verbs stay distinct.
 
-    Migration 0017 got one-binding-per-agent for free from the column being
-    scalar; a child table silently discards it unless it is re-established. So
-    PATCHing a binding MOVES the agent's single binding, and never adds a second.
-    Losing this is the quiet regression the rename invites: nothing fails until
-    an operator binds a second channel and finds one of them dead.
+    Adding a binding is `POST /agents/{id}/channels`; PATCH still MOVES the row
+    it names and never appends. Collapsing the two would make the move silently
+    additive, leaving the agent listening on an address the operator believed
+    they had left -- and holding that pair against every other agent.
+
+    The freed-pair assertion is the observable half: if the PATCH had appended,
+    the create below would collide with the row it left behind.
     """
 
     created = _create(client, auth_headers, name="single-binding", channel=_slack("C0EXAMPLE1"))
@@ -343,12 +366,13 @@ def test_one_agent_cannot_hold_a_second_binding(
     agent_id = created.json()["id"]
 
     moved = client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": {"kind": "webhook", "address": "moved-here"}},
+        f"/agents/{agent_id}/channels",
+        params={"kind": "slack", "address": "C0EXAMPLE1"},
+        json={"kind": "webhook", "address": "moved-here"},
         headers=auth_headers,
     )
     assert moved.status_code == 200, moved.text
-    assert moved.json()["channel"] == {"kind": "webhook", "address": "moved-here"}
+    assert moved.json()["channels"] == [{"kind": "webhook", "address": "moved-here"}]
 
     # The move REPLACED the binding; the old address is now free for another
     # agent. If the PATCH had appended, this create would collide.
@@ -356,7 +380,7 @@ def test_one_agent_cannot_hold_a_second_binding(
     assert reuse.status_code == 201, reuse.text
 
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
-    assert fetched.json()["channel"] == {"kind": "webhook", "address": "moved-here"}
+    assert fetched.json()["channels"] == [{"kind": "webhook", "address": "moved-here"}]
 
 
 def test_every_rebind_bumps_the_generation_including_a_no_op_patch(
@@ -365,7 +389,7 @@ def test_every_rebind_bumps_the_generation_including_a_no_op_patch(
     """T-A13 / AC13 (plan D5, EB-A16, finding 10).
 
     A `chn` ingress token claims `{channel_id, generation}`, not `(kind,
-    address)`, because `update_agent_binding` mutates the binding row IN PLACE:
+    address)`, because `update_channel_binding` mutates the binding row IN PLACE:
     without a generation, a token minted before a rebind stays valid against the
     row's NEW owner. The generation is what makes a rebind observable to a token
     that never saw it.
@@ -387,8 +411,9 @@ def test_every_rebind_bumps_the_generation_including_a_no_op_patch(
     assert fresh["generation"] == 0, "a newly created binding starts at generation 0"
 
     moved = client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": {"kind": "email", "address": "ops@example.test"}},
+        f"/agents/{agent_id}/channels",
+        params={"kind": "slack", "address": "C0EXAMPLE1"},
+        json={"kind": "email", "address": "ops@example.test"},
         headers=auth_headers,
     )
     assert moved.status_code == 200, moved.text
@@ -396,17 +421,18 @@ def test_every_rebind_bumps_the_generation_including_a_no_op_patch(
     assert after_move["generation"] == 1
     assert after_move["kind"] == "email"
 
-    # A PATCH that changes nothing at all still counts.
+    # A move that changes nothing at all still counts.
     same = client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": {"kind": "email", "address": "ops@example.test"}},
+        f"/agents/{agent_id}/channels",
+        params={"kind": "email", "address": "ops@example.test"},
+        json={"kind": "email", "address": "ops@example.test"},
         headers=auth_headers,
     )
     assert same.status_code == 200, same.text
     assert _binding_row(agent_id)["generation"] == 2
 
-    # A PATCH that does not touch the binding at all does NOT bump it: the
-    # generation tracks rebinds, and bumping on every unrelated write would
+    # An agent PATCH that does not touch the binding at all does NOT bump it:
+    # the generation tracks rebinds, and bumping on every unrelated write would
     # invalidate live adapter tokens on a model change.
     unrelated = client.patch(
         f"/agents/{agent_id}", json={"model": "claude-sonnet-5"}, headers=auth_headers
@@ -418,11 +444,18 @@ def test_every_rebind_bumps_the_generation_including_a_no_op_patch(
 def test_an_explicit_null_channel_is_rejected_on_patch(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """Edge case E1. `model` and `thinking` treat explicit null as "clear back to
-    the platform default", and this field deliberately does NOT follow that
-    neighbouring convention: there is no default binding to fall back to, so a
-    null would strand the agent -- deployed, healthy-looking, unable to receive a
-    turn. Omitted still means unchanged.
+    """Edge case E1, still 422 but for a stronger reason under ADR-0116.
+
+    It used to be refused by a dedicated validator: `model` and `thinking` treat
+    explicit null as "clear back to the platform default", and the binding
+    deliberately did not follow that neighbouring convention, because there is
+    no default binding to fall back to and a null would strand the agent --
+    deployed, healthy-looking, unable to receive a turn.
+
+    `AgentUpdate` now carries no binding key at all, so the null is refused as a
+    retired key rather than as a null. Kept, not deleted: the OUTCOME an
+    operator sees is the thing that must not regress, and `extra="ignore"` would
+    turn this exact payload back into a 200 that changed nothing.
     """
 
     created = _create(client, auth_headers, name="null-channel", channel=_slack("C0EXAMPLE1"))
@@ -436,7 +469,7 @@ def test_an_explicit_null_channel_is_rejected_on_patch(
         f"/agents/{agent_id}", json={"model": "claude-sonnet-5"}, headers=auth_headers
     )
     assert untouched.status_code == 200, untouched.text
-    assert untouched.json()["channel"] == _slack("C0EXAMPLE1")
+    assert untouched.json()["channels"] == [_slack("C0EXAMPLE1")]
 
 
 def test_a_legacy_slack_channel_patch_is_rejected_not_silently_ignored(
@@ -471,44 +504,44 @@ def test_a_legacy_slack_channel_patch_is_rejected_not_silently_ignored(
     # And the refusal was total: nothing moved, so a caller cannot read the
     # response as "partially applied" either.
     after = client.get(f"/agents/{agent_id}", headers=auth_headers)
-    assert after.json()["channel"] == _slack("C0EXAMPLE1")
+    assert after.json()["channels"] == [_slack("C0EXAMPLE1")]
 
 
-def test_a_plural_channels_patch_is_rejected_not_silently_ignored(
+def test_a_singular_channel_patch_is_rejected_not_silently_ignored(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """The plural surface never existed, and PATCH is where saying so matters.
+    """D1's no-silently-accepted-retired-shape test, replacing the plural one.
 
-    On create, `channels` already fails loudly, but only as collateral: the
-    required singular `channel` is missing, so the 422 names the ABSENT field
-    and says nothing about the plural one the caller actually sent. PATCH has no
-    required field, so the same payload is an ignored unknown key and returns
-    200 having changed nothing -- a caller who believes they just rebound the
-    agent, and an agent still answering on its old address.
+    `channel` on `PATCH /agents/{id}` is the shape that was withdrawn by
+    ADR-0116, and PATCH is where saying so matters. Pydantic's default
+    `extra="ignore"` makes the retired key parse into an AgentUpdate with
+    NOTHING set, so the request returns 200 having done nothing at all: every
+    layer agrees the rebind succeeded (the API says 200, the operator's script
+    exits 0) while the agent keeps answering on its old address. That is the #38
+    silent-misroute failure, reached by a caller who read last release's docs.
 
-    Rejecting it is not pedantry about a typo: `channels: [...]` is a caller
-    acting on ADR-0089's rejected model (one agent serving several channels).
-    The error must name the plural key and point at the singular one, or the
-    operator reads the 422 as "my JSON was malformed" and retries the same
-    shape.
+    Deleting the field is therefore not enough on its own, and a grep for
+    `AgentUpdate.channel` cannot prove this: the 422 has to be asserted, and it
+    has to NAME the subresource, or the operator reads it as "my JSON was
+    malformed" and retries the same shape.
     """
 
-    created = _create(client, auth_headers, name="plural-patch", channel=_slack("C0EXAMPLE1"))
+    created = _create(client, auth_headers, name="singular-patch", channel=_slack("C0EXAMPLE1"))
     assert created.status_code == 201, created.text
     agent_id = created.json()["id"]
 
-    plural = client.patch(
+    retired = client.patch(
         f"/agents/{agent_id}",
-        json={"channels": [{"kind": "slack", "address": "C0EXAMPLE2"}]},
+        json={"channel": {"kind": "slack", "address": "C0EXAMPLE2"}},
         headers=auth_headers,
     )
-    assert plural.status_code == 422, plural.text
-    body = plural.text
-    assert "channels" in body, body
-    assert "channel" in body, body
+    assert retired.status_code == 422, retired.text
+    body = retired.text
+    assert "channel is no longer an agent field" in body, body
+    assert "/channels" in body, body
 
     after = client.get(f"/agents/{agent_id}", headers=auth_headers)
-    assert after.json()["channel"] == _slack("C0EXAMPLE1")
+    assert after.json()["channels"] == [_slack("C0EXAMPLE1")]
 
 
 def test_a_legacy_slack_channel_create_is_rejected(
@@ -536,23 +569,21 @@ def test_a_legacy_slack_channel_create_is_rejected(
     assert alongside.status_code == 422, alongside.text
 
 
-def test_the_published_schema_does_not_advertise_a_nullable_channel() -> None:
+def test_the_published_agent_update_has_no_channel_property_at_all() -> None:
     """A contract pin on the exported artifact, because the artifact IS the
-    contract.
+    contract. Replaces the nullable-channel pin, which died with the field.
 
-    `AgentUpdate.channel` is `ChannelBinding | None` in Python, and Pydantic
-    exports that as `anyOf: [$ref ChannelBinding, {type: null}]` -- publishing
-    "null is a valid value for this field". It is not: an explicit null is
-    refused with a 422, deliberately, because unlike `model` and `thinking`
-    there is no platform default binding to fall back to and a null would strand
-    the agent. So the published schema promises something the server refuses.
+    The old test existed because the published `AgentUpdate.channel` advertised
+    `null` as a value the server refused. ADR-0116 removes the field outright,
+    and the same generated-client argument now runs the other way: generated
+    clients and the CLI's field-parity gate read this file, not the Python, so a
+    `channel` property left in the document hands their users a call that always
+    422s -- and no runtime test catches it, because no runtime test sends the
+    shape a generated client would.
 
-    That gap is not cosmetic. Generated clients and the CLI's field-parity gate
-    read this file, not the Python: a generated client types the field as
-    nullable and hands its users a call that always 422s, and no runtime test
-    catches it because no runtime test sends the null a generated client would.
-    Optional (omittable) and nullable are different things, and only the first
-    is true here.
+    `AgentOut.channels` is asserted beside it, since a document that retired the
+    write key while still publishing a singular read key would describe an API
+    that never existed.
 
     A structural assertion on the JSON is the right shape ONLY here, where the
     published document is itself the deliverable. Everything else in this file
@@ -560,17 +591,23 @@ def test_the_published_schema_does_not_advertise_a_nullable_channel() -> None:
     """
 
     schemas = json.loads(OPENAPI.read_text(encoding="utf-8"))["components"]["schemas"]
-    field = schemas["AgentUpdate"]["properties"]["channel"]
+    update = schemas["AgentUpdate"]["properties"]
 
-    variants = field.get("anyOf", field.get("oneOf", [field]))
-    assert {"type": "null"} not in variants, (
-        "openapi.json advertises null as a valid AgentUpdate.channel, but the "
-        "API refuses an explicit null with 422 (a binding has no platform "
-        f"default to clear back to). Published shape: {field!r}"
+    assert "channel" not in update, (
+        "openapi.json still publishes AgentUpdate.channel, but the API refuses "
+        "that key with a 422 naming the /agents/{id}/channels subresource "
+        f"(ADR-0116). Published properties: {sorted(update)}"
     )
-    # The field still resolves to the binding object, so this cannot be
-    # satisfied by deleting the property or loosening it to a bare object.
-    assert json.dumps(field).count("#/components/schemas/ChannelBinding") == 1, field
+    assert "channels" not in update, (
+        "the binding is not an AgentUpdate field in either number; the plural "
+        f"write surface is the subresource. Published properties: {sorted(update)}"
+    )
+
+    read = schemas["AgentOut"]["properties"]["channels"]
+    assert read.get("type") == "array", read
+    # Still the binding object, one element type: this cannot be satisfied by
+    # loosening the read surface to a bare list of anything.
+    assert json.dumps(read).count("#/components/schemas/ChannelBinding") == 1, read
 
 
 @pytest.fixture
@@ -609,16 +646,26 @@ def test_the_binding_serializes_on_every_read_endpoint(
 
     created = _create(client, auth_headers, name="reader-a", channel=_slack("C0EXAMPLE1"))
     assert created.status_code == 201, created.text
-    assert created.json()["channel"] == _slack("C0EXAMPLE1")
+    assert created.json()["channels"] == [_slack("C0EXAMPLE1")]
     agent_id = created.json()["id"]
+
+    # A second binding, because the plural relationship is a DIFFERENT loading
+    # problem from the singular one: an eager strategy that survives one row can
+    # still raise, or truncate, on a collection.
+    added = client.post(
+        f"/agents/{agent_id}/channels", json=_slack("C0EXAMPLE2"), headers=auth_headers
+    )
+    assert added.status_code == 201, added.text
 
     listed = client.get("/agents", headers=auth_headers)
     assert listed.status_code == 200, listed.text
-    assert [a["channel"] for a in listed.json()] == [_slack("C0EXAMPLE1")]
+    assert [a["channels"] for a in listed.json()] == [
+        [_slack("C0EXAMPLE1"), _slack("C0EXAMPLE2")]
+    ]
 
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
-    assert fetched.json()["channel"] == _slack("C0EXAMPLE1")
+    assert fetched.json()["channels"] == [_slack("C0EXAMPLE1"), _slack("C0EXAMPLE2")]
 
 
 def test_listing_agents_does_not_issue_a_query_per_agent(

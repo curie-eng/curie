@@ -111,7 +111,7 @@ fn platform_server_with_matrix(
                 &serde_json::json!([{
                     "id": AGENT_ID,
                     "name": "acme-bot",
-                    "channel": {"kind": "slack", "address": CHANNEL},
+                    "channels": [{"kind": "slack", "address": CHANNEL}],
                     "created_at": "2026-08-19T00:00:00Z",
                 }])
                 .to_string(),

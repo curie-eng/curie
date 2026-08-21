@@ -24,6 +24,7 @@ from .models import (
 from .schemas import (
     AgentCreate,
     ApprovalRequest,
+    ChannelBindingPatch,
     ChannelBindingWrite,
     DeploymentCreate,
     VersionCreate,
@@ -34,16 +35,19 @@ async def get_version(session: AsyncSession, version_id: uuid.UUID) -> AgentVers
     return await session.get(AgentVersion, version_id)
 
 
-async def _refresh_with_channel(session: AsyncSession, agent: Agent) -> Agent:
-    """Commit, then refresh the agent and name the `channel` relationship explicitly.
+async def refresh_with_channels(session: AsyncSession, agent: Agent) -> Agent:
+    """Commit, then refresh the agent and name the `channels` relationship explicitly.
 
-    The response model reads `agent.channel` after this session is done with, and
-    an unloaded relationship RAISES under asyncio rather than lazy-loading, so
-    the endpoint 500s where a crud-level test (holding a live session) passes.
+    The response model reads `agent.channels` after this session is done with,
+    and an unloaded relationship RAISES under asyncio rather than lazy-loading,
+    so the endpoint 500s where a crud-level test (holding a live session) passes.
+    Naming the collection also re-reads it from the database, so a binding
+    inserted or deleted around the relationship is reflected rather than served
+    from the stale loaded collection (`expire_on_commit=False`).
     """
     await session.commit()
     await session.refresh(agent)
-    await session.refresh(agent, ["channel"])
+    await session.refresh(agent, ["channels"])
     return agent
 
 
@@ -72,12 +76,16 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         # configured later, both set together otherwise. The write schema has
         # already refused a half-configured pair, and
         # `agent_channels_route_pair_ck` refuses one from an out-of-band writer.
-        channel=AgentChannel(
-            kind=data.channel.kind,
-            address=data.channel.address,
-            endpoint=data.channel.endpoint,
-            adapter=data.channel.adapter,
-        ),
+        # A create binds exactly ONE channel (ADR-0116 keeps the create
+        # singular); the rest arrive through `add_channel_binding`.
+        channels=[
+            AgentChannel(
+                kind=data.channel.kind,
+                address=data.channel.address,
+                endpoint=data.channel.endpoint,
+                adapter=data.channel.adapter,
+            )
+        ],
         repo_full_name=data.repo_full_name,
         model=data.model,
         thinking=data.thinking,
@@ -93,7 +101,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         secrets=data.secrets,
     )
     session.add(agent)
-    return await _refresh_with_channel(session, agent)
+    return await refresh_with_channels(session, agent)
 
 
 async def list_agents(session: AsyncSession) -> list[Agent]:
@@ -102,7 +110,7 @@ async def list_agents(session: AsyncSession) -> list[Agent]:
     # correct AND unboundedly slow, so a hundred-agent install would pay a
     # hundred round trips to render one page.
     result = await session.scalars(
-        select(Agent).options(selectinload(Agent.channel)).order_by(Agent.created_at)
+        select(Agent).options(selectinload(Agent.channels)).order_by(Agent.created_at)
     )
     return list(result)
 
@@ -132,15 +140,69 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
     await session.commit()
 
 
-async def update_agent_binding(
-    session: AsyncSession, agent: Agent, channel: ChannelBindingWrite
-) -> Agent:
-    """Move the agent's single binding to a new kind/address (ADR-0096, #1459).
+async def lock_agent_bindings(session: AsyncSession, agent_id: uuid.UUID) -> list[AgentChannel]:
+    """`SELECT ... FOR UPDATE` the agent's WHOLE binding set, ordered as it reads.
 
-    Mutated IN PLACE rather than replaced: an agent holds exactly one binding
-    (`agent_channels_agent_id_key`), and assigning a fresh row would make the
+    Every mutating binding handler opens with this, and then picks its target
+    out of the returned list rather than issuing a second, unlocked query --
+    which is what makes the lock load-bearing instead of decorative.
+
+    Without it the last-binding guard is unsound: an agent with two bindings and
+    two concurrent DELETEs of DIFFERENT pairs has both requests read count=2,
+    both pass the guard, and the agent lands at ZERO bindings -- deployed,
+    healthy-looking, answering nothing (#38). Under the lock the second delete
+    re-reads count=1 and conflicts. The lock also serializes `generation += 1`
+    into an increment instead of a lost update.
+
+    `populate_existing` is load-bearing: the handler has already loaded the
+    agent (for its 404), so its bindings are in the session's identity map, and
+    a plain locking SELECT would hand those STALE objects back -- the row would
+    be locked while the generation the caller compares against came from before
+    the winner's commit.
+
+    Known and accepted conservatism: `FOR UPDATE` locks rows that exist; it does
+    not block a concurrent INSERT. A DELETE racing an ADD may therefore 409 as
+    "last binding" even though a second binding commits moments later. That
+    direction is safe (a retry succeeds) and is cheaper than the predicate lock
+    that would close it -- it is accepted, not overlooked.
+    """
+
+    result = await session.scalars(
+        select(AgentChannel)
+        .where(AgentChannel.agent_id == agent_id)
+        .order_by(AgentChannel.kind, AgentChannel.address)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return list(result)
+
+
+async def agent_id_for_pair(session: AsyncSession, kind: str, address: str) -> uuid.UUID | None:
+    """Which agent holds this `(kind, address)` pair, if any.
+
+    Named rather than inlined at its one call site: it answers the question a
+    binding write's 409 has to answer accurately -- is the duplicate THIS
+    agent's or another's -- and an inline `select` there reads as an incidental
+    query the next reader deletes.
+    """
+
+    owner: uuid.UUID | None = await session.scalar(
+        select(AgentChannel.agent_id).where(
+            AgentChannel.kind == kind, AgentChannel.address == address
+        )
+    )
+    return owner
+
+
+async def update_channel_binding(
+    session: AsyncSession, binding: AgentChannel, channel: ChannelBindingPatch
+) -> AgentChannel:
+    """Move ONE binding row to a new kind/address (ADR-0096, #1459; ADR-0116).
+
+    Mutated IN PLACE rather than replaced: assigning a fresh row would make the
     insert of the replacement race the delete of the original inside one flush,
-    tripping that constraint on a move that is perfectly legal.
+    tripping `agent_channels_kind_address_key` on a move that is perfectly
+    legal.
 
     That in-place mutation is exactly why `generation` exists (ADR-0096 D5): the
     row id is a stable identity, so a credential minted against this binding
@@ -151,18 +213,58 @@ async def update_agent_binding(
     think something is wrong with this route" gesture that should invalidate
     outstanding credentials, and guarding the bump on a value change would leave
     that case silently valid.
+
+    FLUSHES rather than commits, so the caller can run it inside a SAVEPOINT:
+    the unique violation this raises has to be recoverable without discarding
+    the outer transaction's `FOR UPDATE` locks.
     """
 
-    agent.channel.kind = channel.kind
-    agent.channel.address = channel.address
-    # The reply route moves WITH the binding (ADR-0096 phase 2): a PATCH that
+    binding.kind = channel.kind
+    binding.address = channel.address
+    # The reply route moves WITH the pair (ADR-0096 phase 2): a move that
     # re-points the pair and leaves the old endpoint/adapter behind would send
     # the new route's replies to the previous adapter, authenticated as it. This
-    # is also the cutover's step 10 -- bind first, PATCH the route in later.
-    agent.channel.endpoint = channel.endpoint
-    agent.channel.adapter = channel.adapter
-    agent.channel.generation += 1
-    return await _refresh_with_channel(session, agent)
+    # is also the cutover's step 10 -- bind first, move the route in later.
+    if "endpoint" in channel.model_fields_set:
+        binding.endpoint = channel.endpoint
+        binding.adapter = channel.adapter
+    binding.generation += 1
+    await session.flush()
+    return binding
+
+
+async def add_channel_binding(
+    session: AsyncSession, agent_id: uuid.UUID, channel: ChannelBindingWrite
+) -> AgentChannel:
+    """Append a binding to an agent (ADR-0116). Appends; never moves.
+
+    A new row, so its `generation` starts at 0 and no credential can exist for
+    it yet. Flushes for the same savepoint reason as `update_channel_binding`.
+    """
+
+    binding = AgentChannel(
+        agent_id=agent_id,
+        kind=channel.kind,
+        address=channel.address,
+        endpoint=channel.endpoint,
+        adapter=channel.adapter,
+    )
+    session.add(binding)
+    await session.flush()
+    return binding
+
+
+async def delete_channel_binding(session: AsyncSession, binding: AgentChannel) -> None:
+    """Remove one binding row, after the caller proved under the lock that it is
+    not the agent's last one.
+
+    Deleting the row invalidates its outstanding channel tokens by construction:
+    a `chn` claim names `channel_id`, and the id no longer resolves. The
+    siblings' tokens are untouched, because the counters and ids are per-row.
+    """
+
+    await session.delete(binding)
+    await session.flush()
 
 
 async def update_agent_model(session: AsyncSession, agent: Agent, model: str | None) -> Agent:

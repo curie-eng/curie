@@ -127,7 +127,7 @@ def test_v0_6_x_database_reaches_head_with_its_bindings_carried_over(
 
     command.upgrade(_alembic_config(), "head")
 
-    assert _stamped_revision() == "0027"
+    assert _stamped_revision() == "0028"
 
     # The backfill IS the migration: an empty table here is every agent
     # deployed, healthy looking and unroutable.
@@ -151,7 +151,7 @@ def test_v0_6_x_database_reaches_head_with_its_bindings_carried_over(
 
     # Re-running the upgrade against the already-upgraded database is a no-op.
     command.upgrade(_alembic_config(), "head")
-    assert _stamped_revision() == "0027"
+    assert _stamped_revision() == "0028"
     assert len(_sql("SELECT 1 FROM curie.agent_channels")) == len(BINDINGS)
 
 

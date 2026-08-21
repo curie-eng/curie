@@ -260,9 +260,15 @@ def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
 ) -> None:
     """A PATCH that omits repo_full_name must leave an existing binding alone.
 
-    This is the guarantee a channel-only redeploy PATCH depends on: the CLI
-    sends slack_channel by itself whenever --repo was not passed, and that
-    must never wipe the repository the agent is already bound to.
+    This is the guarantee a channel-only redeploy depends on: the CLI writes the
+    channel by itself whenever --repo was not passed, and that must never wipe
+    the repository the agent is already bound to.
+
+    Since ADR-0116 the channel write is a different REQUEST (the channels
+    subresource), so the sibling assertion needs two calls to say what one used
+    to: the channel write must take effect, and the repo binding must survive
+    it. Both are kept, because dropping either turns this into a test of one
+    endpoint rather than of the interaction between them.
     """
 
     created = client.post(
@@ -279,21 +285,22 @@ def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
     assert created.json()["repo_full_name"] == REPO, "bound at creation"
 
     patched = client.patch(
-        f"/agents/{agent_id}",
-        json={"channel": {"kind": "slack", "address": "C0EXAMPLE4"}},
+        f"/agents/{agent_id}/channels",
+        params={"kind": "slack", "address": "C0EXAMPLE3"},
+        json={"kind": "slack", "address": "C0EXAMPLE4"},
         headers=auth_headers,
     )
     assert patched.status_code == 200, patched.text
 
     # Read back through a separate request, so the assertion cannot be
-    # satisfied by the PATCH response echoing stale input.
+    # satisfied by the write response echoing stale input.
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
     assert fetched.json()["repo_full_name"] == REPO, (
-        "omitting repo_full_name from the PATCH must leave the binding unchanged"
+        "a channel write must leave the repository binding unchanged"
     )
-    assert fetched.json()["channel"] == {"kind": "slack", "address": "C0EXAMPLE4"}, (
-        "the channel PATCH must still take effect"
+    assert fetched.json()["channels"] == [{"kind": "slack", "address": "C0EXAMPLE4"}], (
+        "the channel write must still take effect"
     )
 
 

@@ -34,10 +34,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use curie::api::{ApprovalRecord, MemoryEntry, Version};
+use curie::api::{ApprovalRecord, ChannelBinding, MemoryEntry, Version};
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, DeleteOutput, KillOutput, MemoryOutput, OverridesOutput,
-    ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, VersionsOutput,
+    ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
+    OverridesOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, VersionsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -218,6 +218,23 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 agent: "a".to_string(),
                 model: Some("kimi-k2".to_string()),
                 thinking: Some("adaptive".to_string()),
+                changed: true,
+            },
+        ],
+    );
+    m.insert(
+        "ChannelsOutput",
+        samples![
+            "DryRun" => ChannelsOutput::DryRun(plan()),
+            // Two bindings, because one is the case that hid the whole defect
+            // class: a payload shaped right for a single binding says nothing
+            // about the plural surface ADR-0116 introduced.
+            "Done" => ChannelsOutput::Done {
+                agent: "a".to_string(),
+                channels: vec![
+                    ChannelBinding { kind: "slack".to_string(), address: "C0EXAMPLE1".to_string() },
+                    ChannelBinding { kind: "slack".to_string(), address: "C0EXAMPLE2".to_string() },
+                ],
                 changed: true,
             },
         ],

@@ -291,7 +291,7 @@ exit 64
                 ("POST", "/agents") => Response::json(
                     201,
                     &format!(
-                        r##"{{"id":"{AGENT_ID}","name":"sre-bot","channel":{{"kind":"slack","address":"#local-dev"}},"created_at":"2026-08-21T00:00:00Z"}}"##
+                        r##"{{"id":"{AGENT_ID}","name":"sre-bot","channels":[{{"kind":"slack","address":"#local-dev"}}],"created_at":"2026-08-21T00:00:00Z"}}"##
                     ),
                 ),
                 ("POST", path) if path == format!("/agents/{AGENT_ID}/versions") => Response::json(

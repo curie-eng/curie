@@ -8,7 +8,7 @@ grow, escalate rather than widen the primitive" -- is why this module exists at
 all, so a test here also pins that `sandbox_token`'s own claim set did NOT grow.
 
 The claims are `{channel_id, generation, scope, exp}` (plan D5, EB-C1):
-deliberately NOT `(kind, address)`. `crud.update_agent_binding` mutates the
+deliberately NOT `(kind, address)`. `crud.update_channel_binding` mutates the
 binding row in place and `delete_agent` frees the pair for reuse, so a token
 claiming the pair goes live again against a NEW owner (E12). The row id plus a
 rebind counter is what makes a rebind observable to a credential minted before

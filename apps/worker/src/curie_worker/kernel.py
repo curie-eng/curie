@@ -30,6 +30,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
+from urllib.parse import quote
 
 import aiohttp
 from aci_protocol import (
@@ -112,6 +113,39 @@ def _target_for(qevent: QueuedTurn) -> ReplyTarget:
         address=handle.channel,
         conversation_id=qevent.conversation_id,
         reply_ref=handle.placeholder,
+    )
+
+
+def _thread_key_for(qevent: QueuedTurn) -> str:
+    """This turn's INTERNAL thread identity: its channel pair plus its conversation.
+
+    An adapter's conversation id is unique only within one address -- a Slack
+    ``thread_ts`` is a per-channel timestamp, and the dispatcher mints it onto
+    the turn verbatim -- so with one agent reachable on several addresses
+    (ADR-0096 phase 2) the bare id is no longer an identity. Two channels can
+    hand the worker the same conversation id for two unrelated conversations.
+
+    This key names every piece of worker-internal state a thread owns: its
+    sandbox route (and with it the transcript/history ref the sandbox boots
+    against), its per-thread Valkey lock and in-process order lock, and its
+    approval-card slot. Keying any of those on the bare id lets the second
+    channel's turn adopt the first channel's live session, inheriting its
+    transcript and its bundle.
+
+    It is never what goes on the wire. ``ReplyTarget.conversation_id`` keeps the
+    BARE adapter id, because adapters thread their replies on it -- the Slack
+    sink sends it straight back as ``thread_ts`` -- so a scoped id there would
+    reply into a thread that does not exist. Same reason the dispatcher keeps
+    minting bare ids: the scoping is the worker's own, and it starts here.
+
+    Each segment is percent-encoded, so the triple maps to exactly one key and
+    no (kind, address, conversation) combination can collide with another by
+    moving a separator. The key is only ever compared, never parsed back.
+    """
+    handle = qevent.reply_handle
+    return ":".join(
+        quote(part, safe="")
+        for part in (handle.kind, handle.channel, qevent.conversation_id)
     )
 
 
@@ -562,7 +596,7 @@ class Kernel:
         now posts a message when there is none to edit and edits it thereafter.
         """
         event_id = qevent.event_id
-        thread = qevent.conversation_id
+        thread_key = _thread_key_for(qevent)
         # The turn's route starts as the one the server minted onto the wire and
         # is REPLACED by the binding row's once this turn resolves (EB-B2's two
         # sanctioned sources, in precedence order). Everything before resolution
@@ -576,7 +610,7 @@ class Kernel:
         # event's turn is started or steered (``_release_order`` in _attempt), so
         # streaming and steering are never blocked; holding it across the marker
         # checks is what keeps those awaits from reordering arrivals.
-        entry = self._acquire_order_entry(thread)
+        entry = self._acquire_order_entry(thread_key)
         await entry.lock.acquire()
         release_state = {"done": False}
 
@@ -584,7 +618,7 @@ class Kernel:
             if not release_state["done"]:
                 release_state["done"] = True
                 entry.lock.release()
-                self._release_order_entry(thread, entry)
+                self._release_order_entry(thread_key, entry)
 
         try:
             if await self._markers.is_terminal(event_id):
@@ -686,7 +720,10 @@ class Kernel:
                     )
                     return
                 agent_id = resolved.agent_id
-                boot_env = self._binding.boot_env(resolved, thread)
+                # The scoped key, not the bare conversation id: this mints the
+                # sandbox's history ref and session id, so two channels sharing
+                # a conversation id must not rehydrate one another's transcript.
+                boot_env = self._binding.boot_env(resolved, thread_key)
                 # One-shot post-approval allowance (#430, ADR-0035): when THIS turn is the
                 # resume of a genuinely-approved permission-gate approval, deliver a single
                 # gated-tool grant so the approved action completes once; the gate re-arms
@@ -828,18 +865,18 @@ class Kernel:
             # address a message the rest of the turn had already adopted.
             self._minted_refs.pop(event_id, None)
 
-    def _acquire_order_entry(self, thread: str) -> _LockEntry:
-        entry = self._order_locks.get(thread)
+    def _acquire_order_entry(self, thread_key: str) -> _LockEntry:
+        entry = self._order_locks.get(thread_key)
         if entry is None:
             entry = _LockEntry(asyncio.Lock())
-            self._order_locks[thread] = entry
+            self._order_locks[thread_key] = entry
         entry.refs += 1
         return entry
 
-    def _release_order_entry(self, thread: str, entry: _LockEntry) -> None:
+    def _release_order_entry(self, thread_key: str, entry: _LockEntry) -> None:
         entry.refs -= 1
-        if entry.refs == 0 and self._order_locks.get(thread) is entry:
-            del self._order_locks[thread]
+        if entry.refs == 0 and self._order_locks.get(thread_key) is entry:
+            del self._order_locks[thread_key]
 
     async def reap_orphans(self) -> list[str]:
         """Periodic tick: delete substrate claims no live route references."""
@@ -988,37 +1025,39 @@ class Kernel:
         failure is surfaced via logging rather than swallowed."""
         threads = list(self._active_by_agent.get(agent_id, set()))
 
-        async def _interrupt_one(thread: str) -> bool:
+        async def _interrupt_one(thread_key: str) -> bool:
             try:
                 return await asyncio.wait_for(
-                    self.interrupt_thread(thread, f"agent {agent_id} killed by operator"),
+                    self.interrupt_thread(thread_key, f"agent {agent_id} killed by operator"),
                     _KILL_INTERRUPT_TIMEOUT_S,
                 )
             except Exception:
                 logger.error(
                     "kill: interrupt did not land for thread %s of agent %s (timed out "
                     "or errored); continuing to signal its other live threads",
-                    thread,
+                    thread_key,
                     agent_id,
                     exc_info=True,
                 )
                 return False
 
-        results = await asyncio.gather(*(_interrupt_one(thread) for thread in threads))
+        results = await asyncio.gather(*(_interrupt_one(key) for key in threads))
         signalled = sum(results)
         logger.info("kill: interrupted %d live turn(s) for agent %s", signalled, agent_id)
         return signalled
 
-    def _register_run(self, agent_id: uuid.UUID | None, thread: str) -> None:
+    def _register_run(self, agent_id: uuid.UUID | None, thread_key: str) -> None:
+        # Keyed by the scoped thread key, because the kill fan-out hands each
+        # entry straight to ``interrupt_thread`` -> ``substrate.lookup``.
         if agent_id is not None:
-            self._active_by_agent.setdefault(agent_id, set()).add(thread)
+            self._active_by_agent.setdefault(agent_id, set()).add(thread_key)
 
-    def _unregister_run(self, agent_id: uuid.UUID | None, thread: str) -> None:
+    def _unregister_run(self, agent_id: uuid.UUID | None, thread_key: str) -> None:
         if agent_id is None:
             return
         threads = self._active_by_agent.get(agent_id)
         if threads is not None:
-            threads.discard(thread)
+            threads.discard(thread_key)
             if not threads:
                 del self._active_by_agent[agent_id]
 
@@ -1330,7 +1369,7 @@ class Kernel:
         nav: NavAffordance | None = None,
         packs: BehaviorPacks | None = None,
     ) -> TurnOutcome:
-        thread = qevent.conversation_id
+        thread_key = _thread_key_for(qevent)
 
         # Surface a booting state on the placeholder so the (up to claim_timeout)
         # cold-boot wait is not silent. Best-effort and outside the per-thread lock:
@@ -1357,9 +1396,9 @@ class Kernel:
         # next same-thread event can route, and release the Valkey lock before
         # streaming so a follow-up can steer.
         try:
-            async with self._lock.hold(self._config.lock_key(thread)):
+            async with self._lock.hold(self._config.lock_key(thread_key)):
                 routed = await self._route_and_start(
-                    thread, event, boot_env, packs, source=qevent.source
+                    thread_key, event, boot_env, packs, source=qevent.source
                 )
         except CapacityExhaustedError as exc:
             release_order()
@@ -1432,7 +1471,7 @@ class Kernel:
         assert routed.handle is not None and routed.turn is not None
         # Register this owner turn so a kill for its agent interrupts it, then
         # stream; unregister when the turn ends.
-        self._register_run(agent_id, thread)
+        self._register_run(agent_id, thread_key)
         try:
             # Close the precheck-vs-register race: a kill that landed between the
             # is_killed precheck and this registration would have interrupted zero
@@ -1442,14 +1481,14 @@ class Kernel:
                 and self._killswitch is not None
                 and await self._killswitch.is_killed(agent_id)
             ):
-                await self.interrupt_thread(thread, f"agent {agent_id} killed by operator")
+                await self.interrupt_thread(thread_key, f"agent {agent_id} killed by operator")
             return await self._consume(qevent, route, routed.turn, nav)
         finally:
-            self._unregister_run(agent_id, thread)
+            self._unregister_run(agent_id, thread_key)
 
     async def _route_and_start(
         self,
-        thread: str,
+        thread_key: str,
         event: Event,
         boot_env: dict[str, str] | None,
         packs: BehaviorPacks | None = None,
@@ -1466,7 +1505,7 @@ class Kernel:
         if packs is not None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None:
-                existing = await asyncio.to_thread(self._substrate.lookup, thread)
+                existing = await asyncio.to_thread(self._substrate.lookup, thread_key)
                 if existing is None:
                     return _RouteResult(steered=False, canned_reply=reply)
         # claim() adopts the thread's live sandbox and refreshes its route TTL
@@ -1484,9 +1523,9 @@ class Kernel:
         # all -- the runner's own per-turn logging starts only once its
         # process is already up, so it cannot see the wait that got it there.
         claim_started = time.monotonic()
-        handle = await self._claim_or_resume(thread, boot_env)
+        handle = await self._claim_or_resume(thread_key, boot_env)
         claim_ms = round((time.monotonic() - claim_started) * 1000)
-        logger.info("claim latency for %s: %d ms", thread, claim_ms)
+        logger.info("claim latency for %s: %d ms", thread_key, claim_ms)
         if source.is_job:
             # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
             # a webhook must never fold itself into whatever a person is currently
@@ -1506,7 +1545,7 @@ class Kernel:
             # and the start.
             if await self._turn_active(handle):
                 raise ThreadBusyError(
-                    f"thread {thread} has a live session; deferring the {source} turn"
+                    f"thread {thread_key} has a live session; deferring the {source} turn"
                 )
         elif await self._runner.steer(handle.base_url, event, token=handle.token or None):
             return _RouteResult(steered=True)
@@ -1545,15 +1584,17 @@ class Kernel:
             return True
         return active
 
-    async def _claim_or_resume(self, thread: str, boot_env: dict[str, str] | None) -> SandboxHandle:
+    async def _claim_or_resume(
+        self, thread_key: str, boot_env: dict[str, str] | None
+    ) -> SandboxHandle:
         try:
-            return await asyncio.to_thread(self._substrate.claim, thread, env=boot_env)
+            return await asyncio.to_thread(self._substrate.claim, thread_key, env=boot_env)
         except SuspendedThreadError:
             # Resume with the same bound boot env a fresh claim gets (bundle
             # ref, budget, refs): a suspended pod was deleted (ADR-0003), so
             # the replacement boots from env alone; without this it would come
             # up generic, without the agent's bundle.
-            return await asyncio.to_thread(self._substrate.resume, thread, env=boot_env)
+            return await asyncio.to_thread(self._substrate.resume, thread_key, env=boot_env)
 
     @staticmethod
     def _is_approval_resume(event_id: str) -> bool:
@@ -1635,6 +1676,11 @@ class Kernel:
         # facts coincide only by way of the early return below: soften that
         # return and an APPROVED card whose record blipped would render EXPIRED.
         is_expiry = qevent.text.startswith(_EXPIRY_RESUME_MARKER)
+        # The card ref is worker-internal state, so it is filed under the scoped
+        # thread key like the sandbox and the lock: two channels sharing a
+        # conversation id must not pop each other's card. Outside the try because
+        # the failure log below names it.
+        thread_key = _thread_key_for(qevent)
         try:
             # Expiry states only that nobody decided, so it needs no record read;
             # a resolve states what was decided, and that comes from the record.
@@ -1657,10 +1703,10 @@ class Kernel:
                     logger.info(
                         "no readable approval outcome for thread %s -- "
                         "leaving its card ref in place, not stamped",
-                        qevent.conversation_id,
+                        thread_key,
                     )
                     return
-            ref = await self._card_store.pop(qevent.conversation_id)
+            ref = await self._card_store.pop(thread_key)
             if ref is None:
                 return
             # The ref is keyed by thread, so this is what tells "my card" from a
@@ -1674,12 +1720,12 @@ class Kernel:
             if ref.approval_id and ref.approval_id != resume_approval_id:
                 # Put back conditionally so the approval it really belongs to can
                 # still settle its own card; a newer entry, if one arrived, wins.
-                await self._card_store.restore(qevent.conversation_id, ref)
+                await self._card_store.restore(thread_key, ref)
                 # Logged because a deliberate non-stamp otherwise looks
                 # identical to there having been no card at all.
                 logger.info(
                     "approval card for thread %s belongs to approval %s, not %s -- not stamped",
-                    qevent.conversation_id,
+                    thread_key,
                     ref.approval_id,
                     resume_approval_id,
                 )
@@ -1727,11 +1773,11 @@ class Kernel:
                     adapter=ref.adapter if ref.kind else route.adapter,
                 ),
             )
-            logger.info("settled approval card for thread %s", qevent.conversation_id)
+            logger.info("settled approval card for thread %s", thread_key)
         except Exception as exc:  # noqa: BLE001 - card teardown is best-effort
             logger.warning(
                 "approval card teardown failed for thread %s: %s",
-                qevent.conversation_id,
+                thread_key,
                 exc,
             )
 
@@ -1792,7 +1838,13 @@ class Kernel:
         the failure AC2 closes. No approval is created in that case.
         """
 
+        # Both identities are live in this function and they are not
+        # interchangeable: ``thread`` is the BARE adapter conversation id, which
+        # the durable record persists and the resume turn carries back onto the
+        # wire; ``thread_key`` is the worker's scoped key, which names the
+        # sandbox this suspends and the card slot it remembers.
         thread = qevent.conversation_id
+        thread_key = _thread_key_for(qevent)
         summary = outcome.approval_summary or outcome.text or "Approval requested"
 
         # Resolve the manifest route NAME (#247) to its workspace channel. A named
@@ -1855,6 +1907,10 @@ class Kernel:
             created = await self._approvals.create(
                 ApprovalRequest(
                     agent_id=agent_id,
+                    # BARE, with the pair below it: the API replays this value as
+                    # the resume turn's conversation_id and the adapter threads
+                    # the reply on it. The worker re-derives its scoped key from
+                    # the same triple when that turn arrives.
                     conversation_id=thread,
                     author=qevent.author,
                     summary=summary,
@@ -1903,12 +1959,12 @@ class Kernel:
             return
 
         try:
-            await asyncio.to_thread(self._substrate.suspend, thread, history_ref=None)
+            await asyncio.to_thread(self._substrate.suspend, thread_key, history_ref=None)
         except SandboxError as exc:
             # Non-fatal: the record is durable and the resume path cold-claims a
             # fresh sandbox either way; a still-live sandbox is just reaped when
             # its route expires.
-            logger.warning("suspend failed for thread %s: %s", thread, exc)
+            logger.warning("suspend failed for thread %s: %s", thread_key, exc)
 
         # The notice is a control string the CLI parses by splitting on blank
         # lines and requiring the marker-leading block (cli/src/chat.rs
@@ -2035,7 +2091,7 @@ class Kernel:
             if card_ts and self._card_store is not None:
                 try:
                     await self._card_store.remember(
-                        thread,
+                        thread_key,
                         channel=card_channel,
                         ts=card_ts,
                         summary=summary,
@@ -2063,7 +2119,7 @@ class Kernel:
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort memory
                     logger.warning("remembering approval card for %s failed: %s", created.id, exc)
-        logger.info("thread %s suspended awaiting approval %s", thread, created.id)
+        logger.info("thread %s suspended awaiting approval %s", thread_key, created.id)
 
     async def _consume(
         self,

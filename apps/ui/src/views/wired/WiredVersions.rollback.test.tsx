@@ -57,10 +57,12 @@ const mkDep = (
   deployed_at,
 });
 
+// [FIXTURE-ONLY] ADR-0116: AgentOut carries `channels` (plural); unused by any
+// assertion in this file.
 const AGENT: AgentOut = {
   id: "a1",
   name: "deal-desk",
-  channel: { kind: "slack", address: "#revenue-ops" },
+  channels: [{ kind: "slack", address: "#revenue-ops" }],
   model: null,
   created_at: "2026-06-01T00:00:00Z",
 };

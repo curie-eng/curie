@@ -18,7 +18,7 @@ fn agent_list() -> Response {
     Response::json(
         200,
         &format!(
-            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channel":{{"kind":"slack","address":"#x"}},"created_at":"2026-07-05T00:00:00Z"}}]"##
+            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"created_at":"2026-07-05T00:00:00Z"}}]"##
         ),
     )
 }
@@ -525,7 +525,7 @@ fn agent_list_with_overrides() -> Response {
     Response::json(
         200,
         &format!(
-            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channel":{{"kind":"slack","address":"#x"}},"model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z"}}]"##
+            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z"}}]"##
         ),
     )
 }
@@ -573,7 +573,7 @@ async fn overrides_set_patches_only_the_field_named() {
         ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
             200,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channel":{{"kind":"slack","address":"#x"}},"model":null,"thinking":"enabled:2000"}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":"enabled:2000"}}"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -621,7 +621,7 @@ async fn overrides_clear_sends_explicit_null_not_an_empty_string() {
         ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
             200,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channel":{{"kind":"slack","address":"#x"}},"model":null,"thinking":null}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null}}"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),

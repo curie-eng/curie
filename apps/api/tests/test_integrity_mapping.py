@@ -29,7 +29,7 @@ the implementation must read.
 
 from typing import Any
 
-from curie_api.routers.agents import classify_integrity_error
+from curie_api.routers.agents import _UNIQUE_CONSTRAINT_MESSAGES, classify_integrity_error
 from sqlalchemy.exc import IntegrityError
 
 # Real Postgres SQLSTATE codes (see apps/api/tests conftest for the live
@@ -138,3 +138,33 @@ def test_classifies_repo_full_name_unique_violation_via_cause_chain() -> None:
     code, message = classify_integrity_error(exc)
     assert code == 409
     assert "several agents" in message
+
+
+def test_the_map_no_longer_carries_the_retired_one_binding_per_agent_entry() -> None:
+    """[FAIL-FIRST] Migration 0025 drops `agent_channels_agent_id_key`, so the
+    message keyed on it can no longer fire.
+
+    A dead entry is worse than no entry: it READS as a protection. Its text
+    ("one agent binds one channel (ADR-0089), so PATCH the agent's channel to
+    move it rather than adding a second binding") is the exact instruction
+    ADR-0116 reverses, so a reader auditing what this API refuses would conclude
+    the second binding is still forbidden, and the next person to touch the
+    subresource would build to that.
+
+    The pair constraint's entry is asserted present in the same breath: it is
+    the only binding conflict left, and deleting both is the plausible
+    over-correction. `ix_agents_repo_full_name` is the precedent for keeping a
+    dropped constraint's message -- but only because a pre-0018 database still
+    HAS that constraint, and no database will ever carry `agent_channels_agent_id_key`
+    while also serving a platform that offers the subresource.
+    """
+
+    assert "agent_channels_agent_id_key" not in _UNIQUE_CONSTRAINT_MESSAGES, (
+        "the one-binding-per-agent constraint is dropped by migration 0028 "
+        "(ADR-0116); its 409 message can never fire again and tells an operator "
+        "the opposite of what the API now does"
+    )
+    assert "agent_channels_kind_address_key" in _UNIQUE_CONSTRAINT_MESSAGES, (
+        "one agent per route (#38) is unchanged and is now the ONLY binding "
+        "conflict; dropping its message turns that 409 into a bare fallback"
+    )

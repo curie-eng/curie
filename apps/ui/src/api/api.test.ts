@@ -3,6 +3,11 @@ import { bundleFileTree, buildBundleZip, bundleTreeFromFiles, nextVersionLabel }
 import {
   createAgent,
   updateAgent,
+  // ADR-0116 (S5.2): moves a single channel binding via the /channels
+  // subresource PATCH, naming the pair to move in the query string.
+  patchAgentChannel,
+  addAgentSurface,
+  removeAgentSurface,
   uploadBundle,
   BundleValidationError,
   ApiError,
@@ -13,6 +18,7 @@ import {
   listTraces,
   listRunnerPods,
   getConfig,
+  getAgents,
 } from "./client";
 
 afterEach(() => {
@@ -196,42 +202,112 @@ describe("agent-detail client calls", () => {
     expect(err.status).toBe(404);
   });
 
-  it("PATCHes the agent's channel binding and returns the updated agent", async () => {
+  // Channel binding moves now go through patchAgentChannel's subresource PATCH
+  // (below), not updateAgent -- ADR-0116 dropped `channel` from updateAgent's
+  // patch type entirely (the API 422s it). This exercises updateAgent's
+  // remaining mutable field, `model`, so the generic PATCH request shape
+  // (URL, method, body, headers) stays covered at the client-test layer.
+  it("PATCHes the agent's model and returns the updated agent", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(200, {
         id: "a1",
         name: "deal-desk",
-        channel: { kind: "slack", address: "C9999ZZZZ" },
+        channels: [{ kind: "slack", address: "C0123ABCD" }],
+        model: "glm-5.2",
         created_at: "now",
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const agent = await updateAgent("a1", { channel: { kind: "slack", address: "C9999ZZZZ" } });
-    expect(agent.channel.address).toBe("C9999ZZZZ");
+    const agent = await updateAgent("a1", { model: "glm-5.2" });
+    expect(agent.model).toBe("glm-5.2");
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/agents/a1");
     expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body)).toEqual({ channel: { kind: "slack", address: "C9999ZZZZ" } });
+    expect(JSON.parse(init.body)).toEqual({ model: "glm-5.2" });
     expect((init.headers as Record<string, string>)["X-API-Key"]).toBeTruthy();
   });
 
-  // One agent binds exactly one channel (ADR-0089), so the wire carries a single
-  // binding object: never an array, and never a plural `channels` field.
-  it("sends the channel binding as a singular object, never an array or a plural field", async () => {
+  // ADR-0116: an agent binds one-or-more channels, so AgentOut carries
+  // `channels: ChannelBinding[]`, ordered `(kind, address)` -- never a bare
+  // `channel` object.
+  it("agent_out_carries_a_channels_array", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(200, [
+        {
+          id: "a1",
+          name: "deal-desk",
+          channels: [{ kind: "slack", address: "C0EXAMPLE1" }],
+          model: null,
+          created_at: "now",
+        },
+      ]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const agents = await getAgents();
+    expect(Array.isArray((agents[0] as unknown as { channels: unknown }).channels)).toBe(true);
+  });
+
+  // ADR-0116 (S5.2): patchAgentChannel PATCHes the `/agents/{id}/channels`
+  // subresource, naming the binding to move via a `?kind=&address=` selector
+  // query string (never a body field, so the selector can never be confused
+  // with the replacement value).
+  it("patchAgentChannel_targets_the_subresource_with_the_pair_selector", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(200, {
         id: "a1",
         name: "deal-desk",
-        channel: { kind: "slack", address: "C9999ZZZZ" },
+        channels: [{ kind: "slack", address: "C0EXAMPLE2" }],
+        model: null,
         created_at: "now",
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    await updateAgent("a1", { channel: { kind: "slack", address: "C9999ZZZZ" } });
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(Array.isArray(body.channel)).toBe(false);
-    expect(body.channel).toEqual({ kind: "slack", address: "C9999ZZZZ" });
-    expect(body.channels).toBeUndefined();
+    await patchAgentChannel(
+      "a1",
+      { kind: "slack", address: "C0EXAMPLE1" },
+      { kind: "slack", address: "C0EXAMPLE2" },
+    );
+    const [requestUrl, init] = fetchMock.mock.calls[0];
+    expect(init.method).toBe("PATCH");
+    expect(requestUrl).toBe("/api/agents/a1/channels?kind=slack&address=C0EXAMPLE1");
+    expect(JSON.parse(init.body)).toEqual({ kind: "slack", address: "C0EXAMPLE2" });
+  });
+
+  it("adds and removes one surface through the binding subresource", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(201, {
+        id: "a1",
+        name: "deal-desk",
+        channels: [
+          { kind: "slack", address: "C0EXAMPLE1" },
+          { kind: "discord", address: "123456789012345678" },
+        ],
+        model: null,
+        created_at: "now",
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await addAgentSurface("a1", {
+      kind: "discord",
+      address: "123456789012345678",
+      endpoint: "https://discord-adapter.example.com/replies",
+      adapter: "discord",
+    });
+    await removeAgentSurface("a1", { kind: "slack", address: "C0EXAMPLE1" });
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/agents/a1/channels");
+    expect(fetchMock.mock.calls[0][1].method).toBe("POST");
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      kind: "discord",
+      address: "123456789012345678",
+      endpoint: "https://discord-adapter.example.com/replies",
+      adapter: "discord",
+    });
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "/api/agents/a1/channels?kind=slack&address=C0EXAMPLE1",
+    );
+    expect(fetchMock.mock.calls[1][1].method).toBe("DELETE");
   });
 
   it("activates a version by POSTing a deployment", async () => {

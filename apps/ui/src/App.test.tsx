@@ -19,10 +19,12 @@ vi.mock("./api/client", async (importOriginal) => {
   };
 });
 
+// [FIXTURE-ONLY] ADR-0116: AgentOut carries `channels` (plural); unused by any
+// assertion in this file.
 const AGENT: AgentOut = {
   id: "a1",
   name: "deal-desk",
-  channel: { kind: "slack", address: "C0123ABCD" },
+  channels: [{ kind: "slack", address: "C0123ABCD" }],
   model: null,
   created_at: "2026-07-01T00:00:00Z",
 };

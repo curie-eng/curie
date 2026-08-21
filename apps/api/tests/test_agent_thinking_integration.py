@@ -59,17 +59,21 @@ def test_patch_sets_thinking(client: Any, auth_headers: dict[str, str], clean_db
 def test_patch_without_thinking_leaves_it_unchanged(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # Omitted means "unchanged", the same convention `model` and channel
-    # follow -- a PATCH that renames an agent must not silently clear its
-    # thinking depth.
+    # Omitted means "unchanged", the same convention `model` follows -- a write
+    # that moves an agent's binding must not silently clear its thinking depth.
+    # The binding write is the channels subresource since ADR-0116; the subject
+    # of this test is the untouched override beside it, which is why the
+    # assertion is on `thinking` and not on the binding.
     agent = _create_agent(client, auth_headers, thinking="adaptive")
     resp = client.patch(
-        f"/agents/{agent['id']}",
-        json={"channel": {"kind": "slack", "address": "CTHINK002"}},
+        f"/agents/{agent['id']}/channels",
+        params={"kind": "slack", "address": "CTHINK001"},
+        json={"kind": "slack", "address": "CTHINK002"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["thinking"] == "adaptive"
+    assert resp.json()["channels"] == [{"kind": "slack", "address": "CTHINK002"}]
 
 
 def test_the_api_stores_the_value_verbatim_and_does_not_validate_it(
@@ -115,12 +119,16 @@ def test_patch_with_explicit_null_clears_the_override(
 def test_omitting_thinking_still_leaves_it_untouched(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # The other half of the distinction. If this regressed, every PATCH that
-    # renamed a channel would silently wipe the agent's thinking depth.
+    # The other half of the distinction. If this regressed, every write that
+    # renamed a channel would silently wipe the agent's thinking depth. The
+    # binding write is the channels subresource since ADR-0116, and it returns
+    # the whole agent, so the override still has to survive the response it
+    # rebuilds.
     agent = _create_agent(client, auth_headers, thinking="adaptive")
     resp = client.patch(
-        f"/agents/{agent['id']}",
-        json={"channel": {"kind": "slack", "address": "CTHINK009"}},
+        f"/agents/{agent['id']}/channels",
+        params={"kind": "slack", "address": "CTHINK001"},
+        json={"kind": "slack", "address": "CTHINK009"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text

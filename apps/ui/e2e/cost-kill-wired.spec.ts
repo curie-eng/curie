@@ -4,7 +4,7 @@ import { test, expect, type Page } from "@playwright/test";
 // ?api=1 mode with the L1 endpoints stubbed via route interception (mutable
 // state so PUT/POST transitions are reflected on refetch). No backend needed.
 
-const AGENT = { id: "a1", name: "deal-desk", channel: { kind: "slack", address: "#revenue-ops" }, created_at: "2026-07-01T00:00:00Z" };
+const AGENT = { id: "a1", name: "deal-desk", channels: [{ kind: "slack", address: "#revenue-ops" }], created_at: "2026-07-01T00:00:00Z" };
 
 interface StubState {
   cost: { start: string; end: string; total_usd: number; points: { ts: string; value: number }[] };
