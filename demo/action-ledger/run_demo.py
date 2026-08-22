@@ -4,8 +4,16 @@ Real connector, real ACI translate seam, real API against a real Postgres, real
 receipt card. The only stand-in is the Kubernetes API server, which is a dict
 holding one number.
 """
-import importlib.util, json, os, sys, tempfile, time, urllib.error, urllib.request, uuid
+import importlib.util
+import json
+import os
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
+
 import yaml
 from claude_agent_sdk import AssistantMessage, ToolResultBlock, ToolUseBlock, UserMessage
 from curie_runner.side_effects import CLAUDE_READONLY_TOOLS, SideEffectClassifier
@@ -22,32 +30,48 @@ TOOL = "mcp__k8s-scale__scale_deployment"
 TURN = f"turn-{uuid.uuid4().hex[:8]}"
 
 
-def say(text=""): print(text, flush=True); time.sleep(0.35)
+def say(text: str = "") -> None:
+    print(text, flush=True)
+    time.sleep(0.35)
 
 
 class _Resp:
-    def __init__(s, code, payload=None): s.status_code, s._p = code, payload or {}
-    def json(s): return s._p
+    def __init__(s, code, payload=None):
+        s.status_code, s._p = code, payload or {}
+
+    def json(s):
+        return s._p
 
 class _Api:
     """The Kubernetes API server, as a dict."""
-    def __init__(s, t): s.t = t
-    def __enter__(s): return s
-    def __exit__(s, *e): return False
-    def get(s, path): return _Resp(200, {"spec": {"replicas": CLUSTER[s.t]}})
+    def __init__(s, t):
+        s.t = t
+
+    def __enter__(s):
+        return s
+
+    def __exit__(s, *e):
+        return False
+
+    def get(s, path):
+        return _Resp(200, {"spec": {"replicas": CLUSTER[s.t]}})
+
     def patch(s, path, body):
-        CLUSTER[s.t] = body["spec"]["replicas"]; return _Resp(200, {})
+        CLUSTER[s.t] = body["spec"]["replicas"]
+        return _Resp(200, {})
 
 
 def load_connector():
-    tmp = Path(tempfile.mkdtemp()); cfg = tmp / "kubeconfig"
+    tmp = Path(tempfile.mkdtemp())
+    cfg = tmp / "kubeconfig"
     cfg.write_text(yaml.safe_dump({"clusters": [{"cluster": {"server": "https://k8s:6443"}}],
                                    "users": [{"user": {"token": "t"}}]}), encoding="utf-8")
     os.environ.update(KUBECONFIG_PATH=str(cfg), K8S_SCALE_ALLOWLIST="public/api",
                       K8S_SCALE_MAX_REPLICAS="50")
     spec = importlib.util.spec_from_file_location(
         "demo_k8s_scale", ROOT / "examples/sre-bot/connectors/k8s-scale/server.py")
-    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
     m._client = lambda: _Api("public/api")
     return m
 
@@ -84,7 +108,11 @@ def record(call_flag, result_flag, tool):
         "arguments": call_flag.arguments, "target": r.get("target"),
         "snapshot": r.get("prior"),
         "snapshot_status": "captured" if r.get("prior") else "absent",
-        "post_state": {"spec": {"replicas": call_flag.arguments.get("replicas")}} if ok and r.get("prior") else None,
+        "post_state": (
+            {"spec": {"replicas": call_flag.arguments.get("replicas")}}
+            if ok and r.get("prior")
+            else None
+        ),
         "outcome": "succeeded" if ok else "failed",
         "irreversible_reason": None if r.get("prior") else "restarting pods cannot be undone",
         "dedupe_key": f"{TURN}-{uuid.uuid4().hex[:8]}",
@@ -117,8 +145,11 @@ def main():
                                 "restart triggered for public/api")
     restarted = record(c2, r2, "mcp__k8s-write__restart_deployment")
     say(f"    {C['c']}POST /actions{C['x']} -> {restarted['id']}")
-    say(f"    snapshot = null                       undoable = "
-        f"{C['r']}{restarted['undoable']}{C['x']}  {C['d']}(prose reply, nothing to restore){C['x']}")
+    say(
+        f"    snapshot = null                       undoable = "
+        f"{C['r']}{restarted['undoable']}{C['x']}"
+        f"  {C['d']}(prose reply, nothing to restore){C['x']}"
+    )
     say()
 
     say(f"{C['b']}[3] the receipt the on-call sees{C['x']}")
@@ -155,8 +186,14 @@ def main():
     say(f"    {C['y']}a human sets it to 7{C['x']}")
     code, out = api("POST", f"/actions/{second['id']}/undo",
                     {"actor": "U_ONCALL", "observed_state": {"spec": {"replicas": 7}}})
-    say(f"    {C['c']}POST /actions/{{id}}/undo{C['x']} -> {C['r']}{code}{C['x']} {out.get('detail','')}")
-    say(f"    {C['g']}public/api = {CLUSTER['public/api']}{C['x']}  {C['d']}the manual fix survives{C['x']}")
+    say(
+        f"    {C['c']}POST /actions/{{id}}/undo{C['x']} -> "
+        f"{C['r']}{code}{C['x']} {out.get('detail', '')}"
+    )
+    say(
+        f"    {C['g']}public/api = {CLUSTER['public/api']}{C['x']}"
+        f"  {C['d']}the manual fix survives{C['x']}"
+    )
     _, audit = api("GET", f"/actions/{second['id']}/audit")
     say(f"    {C['d']}audit: {audit[0]['action']} -- {json.dumps(audit[0]['evidence'])}{C['x']}")
 
