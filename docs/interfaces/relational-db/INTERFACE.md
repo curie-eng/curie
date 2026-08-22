@@ -66,13 +66,18 @@ is a judgement call, not something derivable from the tree.
    column is a native Postgres `Enum(Environment, name="environment", schema=SCHEMA)`
    (`apps/api/src/curie_api/models.py::Deployment`), which materializes as a `CREATE TYPE` in the `curie` schema.
 3. **`JSONB` column type** — `apps/api/src/curie_api/models.py::JSONB` is imported from
-   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **six** columns:
+   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **11** columns:
    `behavior_packs`, `approval_required_tools`, `approval_routes` and `secrets` on
    `apps/api/src/curie_api/models.py::Agent`, `evidence` on
-   `apps/api/src/curie_api/models.py::ApprovalAuditEntry`, and `value` on
-   `apps/api/src/curie_api/models.py::WorkflowStateEntry`. The last one is load-bearing
-   rather than incidental: the workflow-state store exists precisely because Postgres
-   JSONB meant no new datastore was needed (see that class's docstring).
+   `apps/api/src/curie_api/models.py::ApprovalAuditEntry`, `value` on
+   `apps/api/src/curie_api/models.py::WorkflowStateEntry`, `arguments`, `target`,
+   `snapshot` and `post_state` on `apps/api/src/curie_api/models.py::AgentAction`, and
+   `evidence` on `apps/api/src/curie_api/models.py::ActionAuditEntry`. The
+   workflow-state one is load-bearing rather than incidental: that store exists
+   precisely because Postgres JSONB meant no new datastore was needed (see that class's
+   docstring). The four on `AgentAction` are the same bet made again: an action's
+   arguments and the state it read are shaped by whichever tool ran, so the column that
+   holds them cannot have a fixed schema.
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
    is written by hand in `apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL` (executed
    through `text(...)` in `apps/api/src/curie_api/commitpoller.py::CommitPoller.poll_once`)
