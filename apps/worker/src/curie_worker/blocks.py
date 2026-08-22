@@ -437,3 +437,64 @@ def expired_approval_card(*, summary: str) -> tuple[str, list[dict[str, Any]]]:
         ),
     ]
     return fallback, blocks
+
+
+# The dispatcher's click-to-undo contract, defined here beside the renderer that
+# emits it. A click carries the durable action id in the button's ``value``, the
+# same way an approval click carries its record id.
+UNDO_ACTION_ID = "curie_undo_action"
+
+_RECEIPT_SUMMARY_MAX = 200
+
+
+def receipt_card(actions: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    """What this turn did to the world, one line per action.
+
+    Both kinds of line are on the card on purpose. A receipt that listed only the
+    undoable actions would be a receipt that hides the ones that matter most: the
+    value of showing "restarting pods cannot be undone" next to "scaled 3 to 10,
+    undo" is that an operator can see the system knows the difference.
+
+    Each row is a dict from the ledger's ``ActionOut``: ``id``, ``tool``,
+    ``undoable``, an optional ``summary``, and an optional
+    ``irreversible_reason``. A row with neither a summary nor a reason still
+    renders, naming the tool, because an action nobody can describe is still an
+    action that happened.
+    """
+
+    undoable = [a for a in actions if a.get("undoable")]
+    header = (
+        f"Did {len(actions)} thing{'s' if len(actions) != 1 else ''} to your systems"
+        f"{f', {len(undoable)} undoable' if undoable else ''}"
+    )
+    blocks: list[dict[str, Any]] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{header}*"}}
+    ]
+    lines: list[str] = []
+    for action in actions:
+        described = action.get("summary") or f"called `{action.get('tool', 'a tool')}`"
+        text = _truncate(to_mrkdwn(str(described)), _RECEIPT_SUMMARY_MAX)
+        if action.get("undoable"):
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": text},
+                    "accessory": {
+                        **_button("Undo", UNDO_ACTION_ID),
+                        "value": str(action.get("id", "")),
+                    },
+                }
+            )
+            lines.append(f"{described} (undoable)")
+        else:
+            # The stated reason, or the honest absence of one. An undeclared tool
+            # is not the same as a tool that explained itself, and the card says
+            # which happened rather than flattening both to "cannot be undone".
+            reason = action.get("irreversible_reason") or (
+                "cannot be undone: nothing reported a prior state"
+            )
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+            blocks.append(_context_block(_truncate(str(reason), _RECEIPT_SUMMARY_MAX)))
+            lines.append(f"{described} ({reason})")
+    fallback = _truncate(header + ": " + "; ".join(lines), _SLACK_TEXT_MAX)
+    return fallback, blocks
