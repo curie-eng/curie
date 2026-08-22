@@ -1,0 +1,220 @@
+{
+ "arm_a_hold": {
+  "label": "[A] shipped behaviour: hold the sandbox after the turn",
+  "n": 14,
+  "hold": 45,
+  "ok": 14,
+  "quota_blocked": 6,
+  "wall_s": 121.17423770899768,
+  "served_per_min": 6.932166571720273,
+  "records": [
+   {
+    "i": 1,
+    "claim_s": 7.207436542004871,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 2,
+    "claim_s": 5.388618208002299,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 3,
+    "claim_s": 5.284836083999835,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 4,
+    "claim_s": 5.347989667003276,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 5,
+    "claim_s": 4.603626999996777,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 6,
+    "claim_s": 4.546993292002298,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 7,
+    "claim_s": 5.455145583997364,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 8,
+    "claim_s": 4.525325624999823,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 9,
+    "claim_s": 45.46564145800221,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": true
+   },
+   {
+    "i": 10,
+    "claim_s": 45.78016041600495,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": true
+   },
+   {
+    "i": 11,
+    "claim_s": 45.88236629199673,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": true
+   },
+   {
+    "i": 12,
+    "claim_s": 25.39388470799895,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": true
+   },
+   {
+    "i": 13,
+    "claim_s": 25.46422937499301,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": true
+   },
+   {
+    "i": 14,
+    "claim_s": 25.585906500004057,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": true
+   }
+  ]
+ },
+ "arm_b_release": {
+  "label": "[B] decision 5: release when the turn ends",
+  "n": 14,
+  "hold": 0,
+  "ok": 14,
+  "quota_blocked": 0,
+  "wall_s": 44.698759583996434,
+  "served_per_min": 18.79246779592395,
+  "records": [
+   {
+    "i": 1,
+    "claim_s": 4.872970249998616,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 2,
+    "claim_s": 4.75891324999975,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 3,
+    "claim_s": 4.912870667001698,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 4,
+    "claim_s": 4.963009874998534,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 5,
+    "claim_s": 4.895891874999506,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 6,
+    "claim_s": 4.941100999996706,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 7,
+    "claim_s": 5.199057249999896,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 8,
+    "claim_s": 5.1524070000014035,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 9,
+    "claim_s": 5.244081417004054,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 10,
+    "claim_s": 5.155477000000246,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 11,
+    "claim_s": 6.392677083000308,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 12,
+    "claim_s": 5.3096565829982865,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 13,
+    "claim_s": 5.286646291002398,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   },
+   {
+    "i": 14,
+    "claim_s": 5.47140716699505,
+    "ok": true,
+    "status": "done",
+    "quota_blocked": false
+   }
+  ]
+ }
+}

@@ -1,0 +1,10 @@
+{
+ "pod_a": "iso-pool-44nb6",
+ "uid_a": "0dc8eb2b-781f-4f2b-aa7c-33a19a32d03e",
+ "pod_b": "iso-pool-9dc79",
+ "uid_b": "6d959e0c-f38d-43b0-a46f-baee6a0a1e7a",
+ "a_destroyed_on_release": true,
+ "same_uid": false,
+ "marker_leaked": false,
+ "pass": true
+}

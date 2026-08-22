@@ -1,0 +1,480 @@
+{
+ "arm_a": {
+  "label": "[A] today: cold create per conversation (per-claim env)",
+  "n": 24,
+  "conc": 5,
+  "wall_s": 29.826008957999875,
+  "ok": 24,
+  "failed": 0,
+  "deadline_exceeded": 0,
+  "claim_p50": 5.2549207500014745,
+  "claim_p95": 7.555802041999414,
+  "claim_max": 8.156057916003192,
+  "throughput_per_min": 48.28000963949841,
+  "records": [
+   {
+    "i": 1,
+    "claim_s": 7.555802041999414,
+    "turn_s": 0.25463862499964307,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 2,
+    "claim_s": 5.595649082999444,
+    "turn_s": 0.14595491700310959,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 3,
+    "claim_s": 5.592468332997669,
+    "turn_s": 0.1458130840001104,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 4,
+    "claim_s": 5.592856167000718,
+    "turn_s": 0.1446689999975206,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 5,
+    "claim_s": 5.584743999999773,
+    "turn_s": 0.1489538329988136,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 6,
+    "claim_s": 4.859778666999773,
+    "turn_s": 0.1439626249994035,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 7,
+    "claim_s": 4.861956374999863,
+    "turn_s": 0.1416787080015638,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 8,
+    "claim_s": 8.156057916003192,
+    "turn_s": 0.14376645799711696,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 9,
+    "claim_s": 4.857294249999541,
+    "turn_s": 0.14445849999901839,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 10,
+    "claim_s": 7.062828791000356,
+    "turn_s": 0.14147516699813423,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 11,
+    "claim_s": 6.0715041249968635,
+    "turn_s": 0.1755556250027439,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 12,
+    "claim_s": 5.2549207500014745,
+    "turn_s": 0.16500312499920256,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 13,
+    "claim_s": 5.115291040998272,
+    "turn_s": 0.2097217919981631,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 14,
+    "claim_s": 4.955790833999345,
+    "turn_s": 0.1491134999996575,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 15,
+    "claim_s": 5.185200625001016,
+    "turn_s": 0.16722612499870593,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 16,
+    "claim_s": 4.954459832999419,
+    "turn_s": 0.18254995799725293,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 17,
+    "claim_s": 4.93058145899704,
+    "turn_s": 0.18568195899933926,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 18,
+    "claim_s": 5.2857727499977045,
+    "turn_s": 0.17335820900188992,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 19,
+    "claim_s": 5.138959249998152,
+    "turn_s": 0.17887295900072786,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 20,
+    "claim_s": 4.968280583001615,
+    "turn_s": 0.1462031669980206,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 21,
+    "claim_s": 5.053035875000205,
+    "turn_s": 0.14105908299825387,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 22,
+    "claim_s": 6.018169167000451,
+    "turn_s": 0.17505720899862354,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 23,
+    "claim_s": 6.007240332997753,
+    "turn_s": 0.18450870899687288,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 24,
+    "claim_s": 4.986506583998562,
+    "turn_s": 0.1267716250004014,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   }
+  ]
+ },
+ "arm_b": {
+  "label": "[B] pre-bound: bind from a version-keyed pool (no env)",
+  "n": 24,
+  "conc": 5,
+  "wall_s": 30.8153377919989,
+  "ok": 24,
+  "failed": 0,
+  "deadline_exceeded": 0,
+  "claim_p50": 6.217411040997831,
+  "claim_p95": 11.403098749997298,
+  "claim_max": 13.222972499999742,
+  "throughput_per_min": 46.729976147588786,
+  "records": [
+   {
+    "i": 1,
+    "claim_s": 0.19733979200100293,
+    "turn_s": 0.14235716700204648,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 2,
+    "claim_s": 0.18798783300007926,
+    "turn_s": 0.15258049999829382,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 3,
+    "claim_s": 0.19546120800077915,
+    "turn_s": 0.14278716699845972,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 4,
+    "claim_s": 7.33874058299989,
+    "turn_s": 0.2911721659984323,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 5,
+    "claim_s": 7.341439209001692,
+    "turn_s": 0.2813406660025066,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 6,
+    "claim_s": 6.999268916999426,
+    "turn_s": 0.26057870899967384,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 7,
+    "claim_s": 7.071730749998096,
+    "turn_s": 0.3356487500022922,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 8,
+    "claim_s": 7.065952917000686,
+    "turn_s": 0.3336648750009772,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 9,
+    "claim_s": 1.8016332500010321,
+    "turn_s": 0.24923812500128406,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 10,
+    "claim_s": 2.035308582999278,
+    "turn_s": 0.20582166699750815,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 11,
+    "claim_s": 1.792246625002008,
+    "turn_s": 0.2553959169999871,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 12,
+    "claim_s": 9.319177792000119,
+    "turn_s": 0.14529145899723517,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 13,
+    "claim_s": 11.31017008300114,
+    "turn_s": 0.17866883399983635,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 14,
+    "claim_s": 11.403098749997298,
+    "turn_s": 0.23969695800042246,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 15,
+    "claim_s": 10.49968404199899,
+    "turn_s": 0.22047787500196137,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 16,
+    "claim_s": 6.181654084000911,
+    "turn_s": 0.16102262500135112,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 17,
+    "claim_s": 0.15193941699908464,
+    "turn_s": 0.14805404099752195,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 18,
+    "claim_s": 0.12332654199781246,
+    "turn_s": 0.16617158399822074,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 19,
+    "claim_s": 0.1784610419999808,
+    "turn_s": 0.12463399999978719,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 20,
+    "claim_s": 13.222972499999742,
+    "turn_s": 0.13248358400232974,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 21,
+    "claim_s": 9.339607207999506,
+    "turn_s": 0.13756204200035427,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 22,
+    "claim_s": 6.217411040997831,
+    "turn_s": 0.15796241700081737,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 23,
+    "claim_s": 4.941773333001038,
+    "turn_s": 0.15279570799975772,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   },
+   {
+    "i": 24,
+    "claim_s": 4.068421124997258,
+    "turn_s": 0.15316304199950537,
+    "ok": true,
+    "status": "done",
+    "deadline_exceeded": false,
+    "frames": 5
+   }
+  ]
+ },
+ "quota": {
+  "hard": {
+   "limits.cpu": "8",
+   "limits.memory": "16Gi",
+   "pods": "50",
+   "requests.cpu": "4",
+   "requests.memory": "8Gi"
+  },
+  "used": {
+   "limits.cpu": "0",
+   "limits.memory": "0",
+   "pods": "0",
+   "requests.cpu": "0",
+   "requests.memory": "0"
+  }
+ }
+}
