@@ -197,6 +197,10 @@ manage yourself, so it never passes through helm values or release history:
 
   api.githubAppExistingSecret: my-github-app
 
-  Create it with kubectl, External Secrets, or Sealed Secrets. See
-  charts/curie/README.md#secrets-at-rest.
+  The model credential, the Slack tokens, and five other direct-passthrough
+  keys carry the same escape (issue #1759): <field>ExistingSecret plus
+  <field>ExistingSecretKey, one pair per key. See
+  charts/curie/README.md#secrets-at-rest for the full list.
+
+  Create any of them with kubectl, External Secrets, or Sealed Secrets.
 ─────────────────────────────────────────────────────────────────────────────

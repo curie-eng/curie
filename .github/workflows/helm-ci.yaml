@@ -117,6 +117,19 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/litellm-sidecar-assertions.sh
 
+      # Prove the direct-passthrough existingSecret escape (issue #1759): the
+      # eight keys that previously had none now resolve to the chart's own
+      # Secret by default and to an operator-named Secret when
+      # <field>ExistingSecret is set, in EVERY consumer of a multi-consumer
+      # key (agentCredentials, slackBotToken) and winning over a stale inline
+      # value; and the two parity-seam gates the escape would otherwise trip
+      # (curie.dispatcher.enabled, the agentCredentials render gate) now open
+      # on a BYO-only credential too.
+      - name: helm render assertions (direct-passthrough existingSecret)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/direct-passthrough-existing-secret-assertions.sh
+
       # Prove ClickHouse's own telemetry stays bounded: logger at `warning`, the
       # four firehose system log tables removed, and whatever remains carrying a
       # TTL. At image defaults ClickHouse logs at `trace` and keeps 30 days of

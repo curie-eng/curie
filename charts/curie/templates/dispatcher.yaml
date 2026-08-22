@@ -2,10 +2,10 @@
 {{/*
 The dispatcher runs Slack in Socket Mode: it dials Slack outbound over a
 websocket, so there is no inbound port and therefore no Service and no HTTP
-probe. It deploys only when both Slack tokens are set (see
-curie.dispatcher.enabled); a token-less default install skips it entirely
-rather than crash-looping the reconnect supervisor, and NOTES.txt prints the
-`helm upgrade` command to connect Slack later.
+probe. It deploys only when both Slack tokens are set, plain or via their
+existingSecret (see curie.dispatcher.enabled); a token-less default install
+skips it entirely rather than crash-looping the reconnect supervisor, and
+NOTES.txt prints the `helm upgrade` command to connect Slack later.
 */}}
 apiVersion: apps/v1
 kind: Deployment
@@ -54,18 +54,32 @@ spec:
             - name: SLACK_APP_TOKEN
               valueFrom:
                 secretKeyRef:
+                  {{- /* BYO (issue #1759): the token never passes through
+                         helm values on this path. */}}
+                  {{- if .Values.dispatcher.slack.appTokenExistingSecret }}
+                  name: {{ .Values.dispatcher.slack.appTokenExistingSecret | quote }}
+                  key: {{ .Values.dispatcher.slack.appTokenExistingSecretKey | quote }}
+                  {{- else }}
                   name: {{ include "curie.secretName" . }}
                   key: slackAppToken
+                  {{- end }}
+            # Same shared secret reference api.yaml and worker.yaml resolve
+            # (issue #1759, curie.secretRef.slackBotToken), so the three
+            # cannot drift apart.
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: slackBotToken
+                  {{- include "curie.secretRef.slackBotToken" . | nindent 18 }}
             - name: SLACK_SIGNING_SECRET
               valueFrom:
                 secretKeyRef:
+                  {{- if .Values.dispatcher.slack.signingSecretExistingSecret }}
+                  name: {{ .Values.dispatcher.slack.signingSecretExistingSecret | quote }}
+                  key: {{ .Values.dispatcher.slack.signingSecretExistingSecretKey | quote }}
+                  {{- else }}
                   name: {{ include "curie.secretName" . }}
                   key: slackSigningSecret
+                  {{- end }}
             {{- include "curie.env.api" . | nindent 12 }}
             # Heartbeat file a background daemon thread in the dispatcher touches
             # each tick; the exec probes below read this same path so template and

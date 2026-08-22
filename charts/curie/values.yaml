@@ -427,9 +427,18 @@ clickhouse:
 # regenerate and keep it in whatever holds your other irreplaceable secrets.
 sealing:
   privateKey: ""
+  # BYO secret (issue #1759, the same idiom every backing store and
+  # api.githubAppExistingSecret use). Wins over privateKey when set. Not yet
+  # preserved by a plain `curie cluster up` (issue #1801) -- until that lands,
+  # re-supply it (or keep it declared in your values file) on every upgrade.
+  privateKeyExistingSecret: ""
+  privateKeyExistingSecretKey: sealingPrivateKey
   # Set only during a rotation, so values sealed to the old key keep opening
   # while repositories are resealed. Remove it once every repository is resealed.
   previousPrivateKey: ""
+  # Same BYO escape and preservation caveat as privateKeyExistingSecret above.
+  previousPrivateKeyExistingSecret: ""
+  previousPrivateKeyExistingSecretKey: sealingPreviousPrivateKey
 
 rustfs:
   deploy: true
@@ -624,6 +633,13 @@ api:
   # to helm, but a token typed on the command line is still in curie's own
   # argv, so it does reach your shell history and the process table.
   githubToken: ""
+  # BYO secret (issue #1759, the same idiom githubAppExistingSecret below
+  # uses). Wins over githubToken when set. Not yet preserved by a plain
+  # `curie cluster up` (issue #1801) -- until that lands, re-supply it (or keep
+  # it declared in your values file) on every upgrade, same as any other
+  # values key the CLI does not manage.
+  githubTokenExistingSecret: ""
+  githubTokenExistingSecretKey: githubToken
   # GitHub App identity (ADR-0092). The scalable alternative to githubToken
   # above: the platform mints a one-hour token scoped to the single repository
   # being cloned, so there is nothing to rotate, no human owner, and adding the
@@ -799,8 +815,22 @@ dispatcher:
   # resolves once at pod start.
   slack:
     appToken: ""
+    # BYO secret pair (issue #1759, the same idiom githubAppExistingSecret
+    # uses), one per token. Each wins over its plain value when set. curie.
+    # dispatcher.enabled treats a token as present whether it arrives as the
+    # plain value or via its existingSecret, so a dispatcher configured
+    # entirely through BYO Secrets still deploys. Not yet preserved by a plain
+    # `curie cluster up` (issue #1801) -- `curie cluster comms` does not know
+    # about these fields yet, so re-supply them (or keep them declared in your
+    # values file) on every upgrade.
+    appTokenExistingSecret: ""
+    appTokenExistingSecretKey: slackAppToken
     botToken: ""
+    botTokenExistingSecret: ""
+    botTokenExistingSecretKey: slackBotToken
     signingSecret: ""
+    signingSecretExistingSecret: ""
+    signingSecretExistingSecretKey: slackSigningSecret
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 256Mi }
@@ -955,6 +985,14 @@ worker:
   # be impersonated. Stored in the chart Secret (key adapterCredentials), never
   # inlined into a manifest.
   adapterCredentials: {}
+  # BYO secret (issue #1759, the same idiom githubAppExistingSecret uses).
+  # Wins over adapterCredentials when set -- the referenced key must hold the
+  # already-JSON-encoded slug -> secret map, not a YAML map, since the chart
+  # never re-serializes a BYO Secret's contents. Not yet preserved by a plain
+  # `curie cluster up` (issue #1801) -- re-supply it (or keep it declared in
+  # your values file) on every upgrade.
+  adapterCredentialsExistingSecret: ""
+  adapterCredentialsExistingSecretKey: adapterCredentials
   # Extra env for the worker container, list of {name, value}. For SLACK_API_BASE_URL
   # prefer the first-class slackApiBaseUrl above; use extraEnv for any other
   # worker override the fixed env block does not cover.
@@ -1182,6 +1220,15 @@ agentSandbox:
     # ServiceAccount note below), so a global one is opt-in. When set it is stored
     # in the chart Secret (key agentCredentials), never inlined into a manifest.
     credentials: ""
+    # BYO secret (issue #1759, the same idiom githubAppExistingSecret uses),
+    # for the credential that authorizes the model provider -- the most
+    # sensitive value most installs carry. Wins over credentials when set.
+    # Not yet preserved by a plain `curie cluster up` (issue #1801) --
+    # `cluster up --credentials`/CURIE_MODEL_CREDENTIALS re-supply the plain
+    # value across upgrades but do not yet know about this field, so
+    # re-supply it (or keep it declared in your values file) on every upgrade.
+    credentialsExistingSecret: ""
+    credentialsExistingSecretKey: agentCredentials
     pluginDir: /unused
     budget:
       maxOutputTokensPerRun: 100000

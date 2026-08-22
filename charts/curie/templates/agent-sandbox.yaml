@@ -506,14 +506,15 @@ spec:
             - name: ANTHROPIC_BASE_URL
               value: http://localhost:{{ $runner.liteLLM.port }}
             {{- end }}
-            {{- if $runner.credentials }}
+            {{- if or $runner.credentials $runner.credentialsExistingSecret }}
             # Warm-pod fallback credential; the worker's per-claim Overrides
             # injection carries the (per-agent) credential on a bound run.
+            # Same shared secret reference worker.yaml resolves (issue #1759,
+            # curie.secretRef.agentCredentials), so the two cannot drift apart.
             - name: CURIE_CREDENTIALS
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: agentCredentials
+                  {{- include "curie.secretRef.agentCredentials" . | nindent 18 }}
             {{- end }}
             - name: CURIE_PLUGIN_DIR
               value: {{ $runner.pluginDir | quote }}

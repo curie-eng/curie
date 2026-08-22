@@ -97,8 +97,16 @@ spec:
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
+                  {{- /* BYO (issue #1759, same idiom as GITHUB_APP_PRIVATE_KEY
+                         below): the token never passes through helm values on
+                         this path. */}}
+                  {{- if .Values.api.githubTokenExistingSecret }}
+                  name: {{ .Values.api.githubTokenExistingSecret | quote }}
+                  key: {{ .Values.api.githubTokenExistingSecretKey | quote }}
+                  {{- else }}
                   name: {{ include "curie.secretName" . }}
                   key: githubToken
+                  {{- end }}
             # GitHub App identity (ADR-0092). When both are set the platform
             # mints a one-hour token scoped to the single repository it is
             # cloning, instead of using GITHUB_TOKEN above. Both empty is fine:
@@ -171,16 +179,15 @@ spec:
               value: {{ .Values.api.resumeReconciler.batchLimit | quote }}
             # Slack bot token for the approval user-group authorizer (#420): the
             # API resolves usergroups.users.list itself rather than trusting a
-            # caller-asserted membership claim (ADR-0034). Same shared secret key
-            # the dispatcher and worker read, so no new secret material. Rendered
-            # unconditionally, mirroring worker.yaml's ref to the same key; a
-            # declared approver group with no token then fails closed at resolve
-            # time, which is the intended posture.
+            # caller-asserted membership claim (ADR-0034). Same shared secret
+            # reference dispatcher.yaml and worker.yaml resolve (issue #1759,
+            # curie.secretRef.slackBotToken), so the three cannot drift apart.
+            # Rendered unconditionally; a declared approver group with no token
+            # then fails closed at resolve time, which is the intended posture.
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: slackBotToken
+                  {{- include "curie.secretRef.slackBotToken" . | nindent 18 }}
             # Expiry sweeper cadence (#412). Rendered unconditionally, not behind
             # an optional-value guard, because the disable value 0 is falsy in Go
             # templates and would be silently dropped, leaving the app default

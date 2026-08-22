@@ -28,6 +28,10 @@ oauth.env
 # render-assertion script, not secret material. Without this the `*secret*` rule
 # drops it and the CI step that runs it goes red on a missing file.
 !charts/curie/ci/otel-collector-langfuse-secret-assertions.sh
+# Same exception for the direct-passthrough existingSecret assertions (#1759):
+# a render-assertion script, not secret material. Without this the `*secret*`
+# rule drops it and the CI step that runs it goes red on a missing file.
+!charts/curie/ci/direct-passthrough-existing-secret-assertions.sh
 
 # Python
 __pycache__/

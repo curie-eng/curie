@@ -741,12 +741,59 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/* ---- BYO existingSecret escapes for direct-passthrough credentials
+     (issue #1759) ----
+
+     Eight keys (agentCredentials, adapterCredentials, githubToken,
+     sealingPrivateKey, sealingPreviousPrivateKey, slackAppToken,
+     slackBotToken, slackSigningSecret) each grew a per-field
+     `<field>ExistingSecret` / `<field>ExistingSecretKey` pair mirroring
+     api.githubAppExistingSecret (ADR-0092): set, it wins over the plain
+     value and the consumer's secretKeyRef points straight at the operator's
+     Secret, so a BYO Secret missing the key fails that pod loudly with
+     CreateContainerConfigError instead of the chart emitting an empty
+     credential. Six of the eight have exactly one consumer template and are
+     inlined there with the same if/else githubAppPrivateKey uses; the two
+     with more than one consumer get a shared helper here so the consumers
+     cannot resolve the escape differently -- exactly the parity-seam trap
+     `curie.env.postgres`/`curie.env.valkey` already exist to avoid for the
+     backing stores. */}}
+
+{{/* agentCredentials: read by both agent-sandbox.yaml (the warm-pod
+     fallback) and worker.yaml (the per-claim injection). */}}
+{{- define "curie.secretRef.agentCredentials" -}}
+{{- if .Values.agentSandbox.runner.credentialsExistingSecret -}}
+name: {{ .Values.agentSandbox.runner.credentialsExistingSecret | quote }}
+key: {{ .Values.agentSandbox.runner.credentialsExistingSecretKey | quote }}
+{{- else -}}
+name: {{ include "curie.secretName" . }}
+key: agentCredentials
+{{- end -}}
+{{- end -}}
+
+{{/* slackBotToken: read by dispatcher.yaml, api.yaml (the approval
+     user-group authorizer), and worker.yaml (the Slack placeholder editor). */}}
+{{- define "curie.secretRef.slackBotToken" -}}
+{{- if .Values.dispatcher.slack.botTokenExistingSecret -}}
+name: {{ .Values.dispatcher.slack.botTokenExistingSecret | quote }}
+key: {{ .Values.dispatcher.slack.botTokenExistingSecretKey | quote }}
+{{- else -}}
+name: {{ include "curie.secretName" . }}
+key: slackBotToken
+{{- end -}}
+{{- end -}}
+
 {{/* ---- Dispatcher gating ----
      The Slack dispatcher only deploys when it has both tokens; without them it
      would crash-loop the reconnect supervisor forever, so a token-less default
-     install skips the Deployment entirely (NOTES prints the connect command). */}}
+     install skips the Deployment entirely (NOTES prints the connect command).
+     A token counts as present whether it arrives as the plain value or via its
+     *ExistingSecret (issue #1759) -- a dispatcher configured entirely through
+     BYO Secrets must still deploy. */}}
 {{- define "curie.dispatcher.enabled" -}}
-{{- if and .Values.dispatcher.deploy .Values.dispatcher.slack.appToken .Values.dispatcher.slack.botToken -}}
+{{- $appTokenSet := or .Values.dispatcher.slack.appToken .Values.dispatcher.slack.appTokenExistingSecret -}}
+{{- $botTokenSet := or .Values.dispatcher.slack.botToken .Values.dispatcher.slack.botTokenExistingSecret -}}
+{{- if and .Values.dispatcher.deploy $appTokenSet $botTokenSet -}}
 true
 {{- end -}}
 {{- end -}}
