@@ -14,6 +14,7 @@ from curie_runner import RunnerConfig
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import APPROVAL_SERVER_NAME
 from curie_runner.connectors import build_mcp_servers, derive_mcp_servers
+from curie_runner.delegate import DELEGATE_SERVER_NAME
 from curie_runner.state import STATE_SERVER_NAME
 from plugin_format.connectors import RESERVED_CONNECTOR_NAMES
 
@@ -255,6 +256,12 @@ BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 def _boot_env(monkeypatch, tmp_path: Path, suffix: str) -> dict[str, str]:
     monkeypatch.setenv("CURIE_STATE_URL", "http://state.invalid/agents/a/state")
     monkeypatch.setenv("CURIE_STATE_TOKEN", "t")
+    # PROTOTYPE (Draft ADR-0115): curie-delegate is conditionally mounted on
+    # CURIE_DELEGATE_URL, so its condition is set here too -- per this file's
+    # own rule, a conditionally-mounted platform server left unset here makes
+    # the reserved-list pin below go blind to it.
+    monkeypatch.setenv("CURIE_DELEGATE_URL", "http://api.invalid/agents/a/delegate/calls")
+    monkeypatch.setenv("CURIE_DELEGATE_TOKEN", "t")
     return {
         "CURIE_PLUGIN_DIR": str(_bundle(tmp_path)),
         "CURIE_SESSION_ID": f"s-{suffix}",
@@ -311,6 +318,7 @@ def test_every_platform_mcp_server_the_boot_path_mounts_is_reserved(tmp_path, mo
 
     assert APPROVAL_SERVER_NAME in mounted
     assert STATE_SERVER_NAME in mounted
+    assert DELEGATE_SERVER_NAME in mounted
     # The bundle declares no connectors, so every remaining key is a platform
     # key by construction. A third platform server added later reddens this
     # until it is reserved -- which is why the fence is two exact names and not
@@ -359,4 +367,8 @@ def test_the_reserved_list_matches_the_runner_constants() -> None:
     # plugin_format re-enumerates these names because runner depends on it and
     # never the reverse. This is the pin that keeps the copy honest: rename
     # either constant here and the deploy-time guard stops fencing it.
-    assert RESERVED_CONNECTOR_NAMES == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+    assert RESERVED_CONNECTOR_NAMES == {
+        APPROVAL_SERVER_NAME,
+        STATE_SERVER_NAME,
+        DELEGATE_SERVER_NAME,
+    }

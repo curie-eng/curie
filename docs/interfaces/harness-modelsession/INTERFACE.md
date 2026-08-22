@@ -23,9 +23,9 @@ epic_note: folds into
 Inside the runner the model harness is reached through one in-process port: the
 `ModelSession` Protocol. Everything above it (ACI translation, budget, side-effect
 flagging, NDJSON, the HTTP layer) is written against the Protocol. The port itself is
-CLEAN, but the SDK is not yet confined to one module: nine runner modules still import
+CLEAN, but the SDK is not yet confined to one module: 10 runner modules still import
 `claude_agent_sdk` today (`check.py`, `session.py`, `hooks.py`, `adapter.py`, `fake.py`,
-`approval.py`, `translate.py`, `plugin.py`, `state.py`), and the value that crosses the port is
+`approval.py`, `translate.py`, `plugin.py`, `state.py`, `delegate.py`), and the value that crosses the port is
 currently the raw SDK message union rather than a runner-owned neutral type. The
 runner-owned `TurnEvent` model that was once going to draw that line is withdrawn, not
 pending: issue #307 is closed as superseded and its PR #315 was closed unmerged (the
@@ -109,7 +109,7 @@ The port is CLEAN as a code interface but leaks harness shape where the SDK is n
 walled off, called out in vision-doc Job 1:
 
 - **SDK-shaped message payload.** The value crossing the port is the concrete
-  `claude_agent_sdk` message union, and `claude_agent_sdk` is imported across nine
+  `claude_agent_sdk` message union, and `claude_agent_sdk` is imported across 10
   runner modules rather than one harness package. The runner-owned `TurnEvent` model that
   was to draw the neutral line is withdrawn (issue #307 closed as superseded, its PR #315
   closed unmerged and kept only as mining material for the package-shaped redesign);

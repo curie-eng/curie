@@ -28,10 +28,12 @@ from collections.abc import Mapping
 from typing import Protocol
 
 import aiohttp
+import httpx
 from channel_protocol.reply import ReplyAck, ReplyEvent
 from pydantic import BaseModel, ConfigDict
 
 from .config import WorkerConfig
+from .delegate_client import DelegateBackendError, DelegateClient
 from .slack_sink import SlackReplyAdapter, _redacted
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,9 @@ logger = logging.getLogger(__name__)
 ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 
 SLACK_KIND = "slack"
+
+# PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+DELEGATION_KIND = "delegation"
 
 # The most acknowledgement body the worker will read off an adapter. The ack
 # carries one optional ``ref`` string, so 64 KiB is orders of magnitude more than
@@ -271,6 +276,46 @@ def _ref_from(payload: bytes) -> str | None:
     return str(ref) if isinstance(ref, str) and ref else None
 
 
+class DelegationReplyAdapter:
+    """PROTOTYPE (Draft ADR-0115, not accepted): routes a delegate target's
+    replies back to the calling agent, over HTTP to the (prototype) API delegate
+    routes -- never a real outbound egress adapter, since ``kind="delegation"``
+    is a platform-internal route, not an operator-configured one.
+
+    ``event.target.address`` is the target agent's own id (the binding this
+    turn's ``ReplyHandle.channel`` was bound to when the operator armed it);
+    ``event.target.conversation_id`` is ``f"delegate:{call_id}"`` (the turn's own
+    conversation id, minted by the create-call route). Together they are enough
+    to call back into the API with no extra wire field.
+    """
+
+    def __init__(self, client: DelegateClient) -> None:
+        self._client = client
+
+    @staticmethod
+    def _call_id(event: ReplyEvent) -> str:
+        conversation_id = event.target.conversation_id or ""
+        return conversation_id.removeprefix("delegate:")
+
+    async def emit(
+        self,
+        event: ReplyEvent,
+        *,
+        route: TargetRoute,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        del route, best_effort_unreachable  # unused: this adapter carries its own credential
+        call_id = self._call_id(event)
+        if event.event == "reply.update" and event.text is not None:
+            await self._client.progress(event.target.address, call_id, event.text)
+        elif event.event == "turn.completed":
+            try:
+                await self._client.complete(event.target.address, call_id, event.outcome)
+            except DelegateBackendError as exc:
+                raise RejectedAdapterResponseError(str(exc)) from exc
+        return ReplyAck(ref=None)
+
+
 class ReplySinkRouter:
     """Picks the adapter for an event's ``kind``. The ONLY switch on kind."""
 
@@ -303,15 +348,29 @@ class ReplySinkRouter:
                 await closer()
 
 
-def build_reply_sink(config: WorkerConfig) -> ReplySinkRouter:
-    """The worker's sink: Slack below its own origin, everything else over HTTP."""
-    return ReplySinkRouter(
-        adapters={
-            SLACK_KIND: SlackReplyAdapter(
-                config.slack_bot_token,
-                base_url=config.slack_api_base_url or None,
-                trusted_origins=config.slack_trusted_origins,
+def build_reply_sink(
+    config: WorkerConfig, *, http_client: httpx.AsyncClient | None = None
+) -> ReplySinkRouter:
+    """The worker's sink: Slack below its own origin, everything else over HTTP.
+
+    ``http_client``: PROTOTYPE (Draft ADR-0115). When supplied, wires the
+    ``delegation`` kind to ``DelegationReplyAdapter``, reusing the caller's
+    shared ``httpx.AsyncClient`` (the same one the approval writer and eval-lane
+    reporters already share in ``run.py``) rather than opening a new one.
+    Omitted callers (existing tests) get the pre-prototype adapter set
+    unchanged.
+    """
+    adapters: dict[str, ReplySink] = {
+        SLACK_KIND: SlackReplyAdapter(
+            config.slack_bot_token,
+            base_url=config.slack_api_base_url or None,
+            trusted_origins=config.slack_trusted_origins,
+        )
+    }
+    if http_client is not None:
+        adapters[DELEGATION_KIND] = DelegationReplyAdapter(
+            DelegateClient(
+                api_base_url=config.api_base_url, api_key=config.api_key, client=http_client
             )
-        },
-        default=HttpReplyAdapter(config.adapter_credentials),
-    )
+        )
+    return ReplySinkRouter(adapters=adapters, default=HttpReplyAdapter(config.adapter_credentials))

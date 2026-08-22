@@ -258,8 +258,9 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     )
     engine = create_async_engine(config.database_url, pool_pre_ping=True)
     binding = BindingResolver(engine, config)
-    # One API-lane HTTP client shared by the approval writer (#244) and the two
-    # eval-lane reporters below; httpx.AsyncClient is task-safe.
+    # One API-lane HTTP client shared by the approval writer (#244), the two
+    # eval-lane reporters below, and (PROTOTYPE, Draft ADR-0115) the delegation
+    # reply adapter; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
     approval_client = ApprovalClient(
         api_base_url=config.api_base_url,
@@ -269,7 +270,9 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         # defers card settlement without changing creation or shared clients.
         read_timeout_s=2.0,
     )
-    sink = build_reply_sink(config)
+    # PROTOTYPE (Draft ADR-0115): the delegation reply adapter shares this same
+    # client, like the approval writer above.
+    sink = build_reply_sink(config, http_client=eval_http)
     kernel = Kernel(
         substrate=substrate,
         runner=runner,
