@@ -54,13 +54,32 @@ the `curie local message` call all hit the same real endpoints.
    (`POST /delegate/grants`, `GET /agents/{id}/delegate/calls`), not a real
    clap surface — a real subcommand needs command-manifest and mirror-file
    regeneration that only makes sense for code headed to `main`.
-6. **The offline fake model can't reason about tool descriptions.** Since
-   this demo runs with no live model credential, `runner/src/curie_runner/fake.py`
-   adds a `[fake:delegate:<agent>]` marker (mirroring the existing
-   `[fake:request-approval]` marker) that scripts a real
-   `mcp__curie-delegate__call_agent` tool call — the decision to call is
-   faked, but the call itself is real, the same "fake decision, real side
-   effect" shape `request_approval`'s own fake-tier handling already uses.
+6. **Neither side of the call is a model.** The demo runs with no model
+   credential, so `runner/src/curie_runner/fake.py` stands in at both ends, and
+   the two halves fail differently — worth keeping straight when reading the
+   gif:
+   - **Caller.** A `[fake:delegate:<agent>]` marker (mirroring the existing
+     `[fake:request-approval]` marker) scripts a real
+     `mcp__curie-delegate__call_agent` tool call. The *decision* to call is
+     faked; the call itself is real — the same "fake decision, real side
+     effect" shape `request_approval`'s fake-tier handling already uses. A real
+     model would decide this from the skill, so the demo does **not** show that
+     an agent will choose to delegate.
+   - **Target.** A deterministic responder solves a two-operand integer
+     expression by regex and answers `idk` for anything else, replacing the
+     canned `all done`, which read as a visible non-answer to whatever was
+     asked. It is arithmetic, not reasoning, and it never guesses — the `idk`
+     beat in the gif exists to make that boundary visible rather than to imply
+     a model is thinking. `eval` is deliberately not used: the input is an
+     inbound message from another agent, and handing that to the interpreter
+     would be arbitrary code execution in the sandbox for a fixture's
+     convenience.
+
+   Both stay inside the `CURIE_FAKE_MODEL` offline guarantee (ADR-0055, the
+   fake model is a plumbing fixture): no model call, no network. The target
+   responder is scoped to turns whose conversation id is `delegate:<call id>`,
+   so an ordinary fake boot keeps `default_turn()` verbatim and no existing
+   test changes behavior.
 7. **`GET /agents/{id}/delegate/calls[/{call_id}]` is a demo/ops convenience**
    with no equivalent in the ADR's design — added so the round trip could be
    inspected without a direct database connection.

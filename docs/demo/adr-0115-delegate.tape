@@ -9,10 +9,13 @@
 # Requires: a Curie API + worker reachable at $API (this recording used a
 # hand-run isolated stack on http://localhost:38000 -- a clean single-developer
 # machine would just use `curie local up` and the default :28000), running
-# this branch's code, and `jq` on PATH. CURIE_FAKE_MODEL=1 on the worker: the
-# offline fake model cannot reason about tool descriptions, so alice's bundle
-# uses a `[fake:delegate:bob]` marker to script the curie-delegate tool call --
-# see runner/src/curie_runner/fake.py.
+# this branch's code, and `jq` on PATH. CURIE_FAKE_MODEL=1 on the worker, which
+# shapes both sides of the call and is worth knowing before reading the output:
+# the offline fake model cannot reason about tool descriptions, so alice's bundle
+# uses a `[fake:delegate:bob]` marker to script the curie-delegate tool call,
+# and bob answers through a deterministic arithmetic responder (regex, no model
+# call, no network) that says "idk" for anything it cannot solve. Both live in
+# runner/src/curie_runner/fake.py.
 
 Output docs/demo/adr-0115-delegate.gif
 
@@ -28,6 +31,16 @@ Hide
 Type "export API=http://localhost:38000 KEY=curie-dev-key"
 Enter
 Type "cd /Users/alexrao/curietech/agentos/.claude/worktrees/prototype-adr-0115-agent-delegate"
+Enter
+# This branch's own CLI, ahead of any `curie` already on PATH. The recording
+# machine had one built from a different branch whose agent schema differs, so
+# pinning it here is what makes the tape reproducible rather than dependent on
+# whichever branch last ran `curie update`.
+Type "export PATH=$PWD/cli/target/release:$PATH"
+Enter
+# The runs stream is namespaced so the demo can share a Valkey with whatever
+# else is running on the machine without either consuming the other's turns.
+Type "export CURIE_STREAM=curie:runs:adr0115"
 Enter
 Sleep 500ms
 Show
@@ -78,9 +91,21 @@ Sleep 4s
 # by the time the tool call returned "Asking bob about that." Bob's turn has
 # since run and the round trip has already landed -- the durable call record
 # (not part of the ADR's design; a demo/ops convenience this prototype adds)
-# shows it: status "delivered", bob's answer captured, resolved in well under
-# a second, no third party anywhere in the path.
+# shows request_text next to bob's actual answer, resolved in well under a
+# second, with no third party anywhere in the path.
 
-Type `curl -s "$API/agents/$ALICE/delegate/calls" -H "X-API-Key: $KEY" | jq .`
+Type `curl -s "$API/agents/$ALICE/delegate/calls" -H "X-API-Key: $KEY" | jq '.[0] | {request_text, result_text, status}'`
+Enter
+Sleep 3s
+
+# --- And the responder does not bluff: a question it cannot solve comes back
+# "idk" rather than a fabricated answer, so the reply text above is worth
+# trusting. ---
+
+Type `curie local message --channel C0AGENT001 --api-url $API "[fake:delegate:bob] who wrote Dune?"`
+Enter
+Sleep 4s
+
+Type `curl -s "$API/agents/$ALICE/delegate/calls" -H "X-API-Key: $KEY" | jq -r '.[] | "\(.request_text)  ->  \(.result_text)"'`
 Enter
 Sleep 3s
