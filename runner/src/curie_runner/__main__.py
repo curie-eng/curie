@@ -30,6 +30,7 @@ from .connectors import build_mcp_servers, derive_mcp_servers
 from .delegate import (
     DELEGATE_SERVER_NAME,
     build_delegate_server,
+    is_delegate_target_boot,
     resolve_delegate_client,
 )
 from .fake import FakeModelSession
@@ -223,6 +224,11 @@ def build_runner(
                 # PROTOTYPE (Draft ADR-0115): a scripted [fake:delegate:<agent>]
                 # marker makes a REAL delegate call through this client, offline.
                 delegate_client=delegate_client,
+                # PROTOTYPE (Draft ADR-0115): on the TARGET side of a delegate
+                # call, answer a delegated arithmetic question deterministically
+                # instead of returning the canned "all done", which reads as a
+                # non-answer to whatever was actually asked.
+                answer_arithmetic=is_delegate_target_boot(os.environ),
             )
         plugins = compiled.plugins
         options = build_options(

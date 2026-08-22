@@ -108,6 +108,53 @@ _DELEGATE_MARKER_RE = re.compile(r"\[fake:delegate:([A-Za-z0-9_-]+)\]")
 DELEGATE_TOOL_NAME = f"mcp__{DELEGATE_SERVER_NAME}__call_agent"
 
 
+# The delegate TARGET's side of the prototype demo. The fake model cannot
+# reason, so a delegated question would otherwise come back as the canned
+# "all done" -- a visible non-answer that makes the demo look like the delivery
+# path worked while the answer did not. This is a deterministic responder, not a
+# model: it solves a two-operand integer expression by regex and arithmetic, and
+# says "idk" for anything else. No model call and no network, so the
+# CURIE_FAKE_MODEL offline guarantee (ADR-0055, runner/CLAUDE.md) still holds.
+#
+# `eval` is deliberately NOT used: the input is an inbound message from another
+# agent, and handing that to the interpreter would be arbitrary code execution
+# in the sandbox for a demo fixture's convenience.
+_ARITH_RE = re.compile(r"(-?\d+)\s*([-+*/])\s*(-?\d+)")
+
+
+def solve_arithmetic(text: str) -> str | None:
+    """The answer to the first two-operand integer expression in ``text``.
+
+    None when there is nothing to solve, or when the expression is a division
+    by zero -- the caller turns both into "idk" rather than inventing an answer.
+    """
+
+    match = _ARITH_RE.search(text)
+    if match is None:
+        return None
+    left, operator, right = int(match.group(1)), match.group(2), int(match.group(3))
+    if operator == "+":
+        return str(left + right)
+    if operator == "-":
+        return str(left - right)
+    if operator == "*":
+        return str(left * right)
+    if right == 0:
+        return None
+    quotient, remainder = divmod(left, right)
+    return str(quotient) if remainder == 0 else f"{left / right:g}"
+
+
+def arithmetic_turn(question: str) -> list[Any]:
+    """A turn that answers a delegated arithmetic question, or admits it cannot."""
+
+    answer = solve_arithmetic(question) or "idk"
+    return [
+        _assistant(TextBlock(text=answer), usage={"input_tokens": 12, "output_tokens": 4}),
+        _result(text=answer, usage={"input_tokens": 12, "output_tokens": 4}),
+    ]
+
+
 def delegate_turn(target_agent: str, message: str) -> list[Any]:
     """A turn that calls the (prototype) curie-delegate tool, then ends."""
 
@@ -154,6 +201,7 @@ class FakeModelSession:
         can_use_tool: CanUseTool | None = None,
         approval_gate: ApprovalGate | None = None,
         delegate_client: DelegateApiClient | None = None,
+        answer_arithmetic: bool = False,
     ) -> None:
         self._script_factory = script_factory or self._default_script
         self._truncate_on_interrupt = truncate_on_interrupt
@@ -168,6 +216,11 @@ class FakeModelSession:
         # prototype delegate route), the same "fake decision, real side effect"
         # shape as request_approval above.
         self._delegate_client = delegate_client
+        # PROTOTYPE (Draft ADR-0115): set only for a turn the delegate router
+        # minted (its conversation id is `delegate:<call id>`), so this responder
+        # answers a DELEGATED question and nothing else. Every other fake boot,
+        # and every existing test, keeps `default_turn()` verbatim.
+        self._answer_arithmetic = answer_arithmetic
         self.connected = False
         self.queries: list[str] = []
         self.interrupts = 0
@@ -190,6 +243,8 @@ class FakeModelSession:
         if delegate_match:
             message = last[delegate_match.end() :].strip() or "hello"
             return delegate_turn(delegate_match.group(1), message)
+        if self._answer_arithmetic:
+            return arithmetic_turn(last)
         return default_turn()
 
     async def connect(self) -> None:

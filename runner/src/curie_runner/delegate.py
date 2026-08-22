@@ -42,6 +42,11 @@ HISTORY_REF_ENV = BootEnv.env_key("history_ref")
 
 _TIMEOUT_SECONDS = 15
 
+# The conversation-id prefix the (prototype) delegate router mints for a target's
+# turn (`delegate:<call id>`), mirrored here so the runner can tell a delegated
+# turn from an ordinary one without a new boot-env field.
+DELEGATE_CONVERSATION_PREFIX = "delegate:"
+
 
 class DelegateError(RuntimeError):
     """A delegate call could not be submitted to the API."""
@@ -158,6 +163,19 @@ def build_delegate_server(client: DelegateApiClient) -> McpSdkServerConfig:
     return create_sdk_mcp_server(
         name=DELEGATE_SERVER_NAME, version="1.0.0", tools=[call_agent_tool]
     )
+
+
+def is_delegate_target_boot(env: Mapping[str, str]) -> bool:
+    """Whether this boot is serving a turn the delegate router minted.
+
+    Derived from the conversation id already encoded in ``CURIE_HISTORY_REF``
+    rather than a new boot-env field: the router mints the target's
+    ``conversation_id`` as ``delegate:<call id>``, and the worker composes the
+    history ref from that same thread key, so the fact is already on the wire.
+    """
+
+    conversation_id = _conversation_id_from_history_ref(env.get(HISTORY_REF_ENV))
+    return bool(conversation_id and conversation_id.startswith(DELEGATE_CONVERSATION_PREFIX))
 
 
 def resolve_delegate_client(env: Mapping[str, str]) -> DelegateApiClient | None:
