@@ -26,6 +26,7 @@ pub mod interactive;
 pub mod local;
 pub mod message;
 pub mod migrate_store;
+pub mod modelpin;
 pub mod ndjson;
 pub mod observability;
 pub mod ops;

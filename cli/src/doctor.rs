@@ -20,6 +20,8 @@
 
 use serde::Serialize;
 
+use crate::modelpin::{classify, PinStatus};
+
 /// What one check found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +69,9 @@ pub struct Facts {
     pub model_credential: Option<String>,
     /// Where it came from, for the detail line.
     pub model_credential_source: Option<String>,
+    /// The configured model id, verbatim. A value here is not a claim that the
+    /// id is valid, only that something set it.
+    pub model_pin: Option<String>,
     pub docker_ok: bool,
     /// Plugin name from `.claude-plugin/plugin.json` in the working directory.
     pub bundle_name: Option<String>,
@@ -140,6 +145,34 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             "export CURIE_CREDENTIALS=sk-ant-...   (or `curie secrets set CURIE_CREDENTIALS`; \
              `curie skill up --fake-model` needs none)",
         ),
+    });
+
+    out.push(match classify(f.model_pin.as_deref()) {
+        PinStatus::Unset => skipped(
+            "model-pin",
+            "Model pin",
+            "no CURIE_MODEL set, so the platform default applies",
+        ),
+        PinStatus::Pinned { id, date } => {
+            ok("model-pin", "Model pin", format!("{id} (snapshot {date})"))
+        }
+        // Ok rather than Missing, deliberately: a floating name works, and a
+        // working install must not report as unready. What is at risk is
+        // reproducibility, so this carries a fix without failing the check.
+        PinStatus::Floating { id } => Check {
+            id: "model-pin",
+            title: "Model pin",
+            state: State::Ok,
+            detail: format!(
+                "{id} is a floating name; the provider can repoint it at new \
+                 weights with no change here, and no gate would see it"
+            ),
+            fix: Some(
+                "export CURIE_MODEL=<id>-YYYYMMDD   (pin the dated snapshot, so a \
+                 graded bundle keeps the weights it was graded on)"
+                    .into(),
+            ),
+        },
     });
 
     out.push(if f.docker_ok {
@@ -548,6 +581,54 @@ mod tests {
         }
     }
 
+    /// A floating model name is reported without failing the install: it works
+    /// today, so `Missing` would make a usable setup look broken. The fix is
+    /// what carries the advice.
+    #[test]
+    fn a_floating_model_reports_ok_with_a_fix() {
+        let f = Facts {
+            model_pin: Some("gpt-4o".into()),
+            ..Default::default()
+        };
+        let c = evaluate(&f)
+            .into_iter()
+            .find(|c| c.id == "model-pin")
+            .expect("model-pin check");
+        assert_eq!(c.state, State::Ok);
+        assert!(c.detail.contains("gpt-4o"), "{}", c.detail);
+        assert!(
+            c.fix.as_deref().unwrap_or("").contains("CURIE_MODEL"),
+            "the fix must name the variable to set"
+        );
+    }
+
+    /// A dated snapshot is clean: no advice, nothing to do.
+    #[test]
+    fn a_pinned_snapshot_carries_no_fix() {
+        let f = Facts {
+            model_pin: Some("claude-haiku-4-5-20251001".into()),
+            ..Default::default()
+        };
+        let c = evaluate(&f)
+            .into_iter()
+            .find(|c| c.id == "model-pin")
+            .expect("model-pin check");
+        assert_eq!(c.state, State::Ok);
+        assert!(c.fix.is_none(), "a pinned snapshot needs no fix");
+        assert!(c.detail.contains("20251001"), "{}", c.detail);
+    }
+
+    /// No model configured is not a gap: the platform default is a valid way to
+    /// run, so this must not count against readiness.
+    #[test]
+    fn an_unset_model_is_not_applicable() {
+        let c = evaluate(&Facts::default())
+            .into_iter()
+            .find(|c| c.id == "model-pin")
+            .expect("model-pin check");
+        assert_eq!(c.state, State::NotApplicable);
+    }
+
     /// Every failing check must be actionable. A report that says "missing"
     /// without saying what to run is the checklist problem restated.
     #[test]
@@ -740,6 +821,9 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         bundle_name: bundle_name(),
         ..Default::default()
     };
+
+    // Names, never values: the id is the configuration, not a secret.
+    f.model_pin = std::env::var(curie_aci_protocol::env_keys::CURIE_MODEL).ok();
 
     for name in crate::commands::MODEL_CREDENTIAL_ENV_NAMES {
         if std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false) {
