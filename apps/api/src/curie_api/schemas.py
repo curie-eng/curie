@@ -1524,3 +1524,75 @@ class ConsoleSessionOut(BaseModel):
     """
 
     expires_at: datetime
+
+
+class ActionRecordIn(BaseModel):
+    """What the worker posts when a side-effecting call is observed."""
+
+    agent_id: uuid.UUID | None = None
+    conversation_id: str
+    turn_id: str
+    tool: str
+    arguments: dict[str, Any] | None = None
+    target: dict[str, Any] | None = None
+    snapshot: dict[str, Any] | None = None
+    snapshot_status: str = "absent"
+    post_state: dict[str, Any] | None = None
+    outcome: str = "unknown"
+    outcome_detail: str | None = None
+    irreversible_reason: str | None = None
+    reply_kind: str | None = None
+    reply_channel: str | None = None
+    card_channel: str | None = None
+    dedupe_key: str
+
+
+class ActionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    agent_id: uuid.UUID | None
+    conversation_id: str
+    turn_id: str
+    tool: str
+    arguments: dict[str, Any] | None
+    target: dict[str, Any] | None
+    snapshot: dict[str, Any] | None
+    snapshot_status: str
+    post_state: dict[str, Any] | None
+    outcome: str
+    outcome_detail: str | None
+    irreversible_reason: str | None
+    undo_status: str
+    undone_at: datetime | None
+    undone_by: str | None
+    created_at: datetime
+    # Derived, never stored: a row must not be able to claim reversibility it has
+    # no snapshot for.
+    undoable: bool
+
+
+class ActionUndo(BaseModel):
+    """Who is asking, and what the live world looks like right now.
+
+    ``observed_state`` is supplied by the caller because the API cannot reach a
+    connector to read it. The conflict check compares it to ``post_state``; a
+    caller that omits it gets a refusal rather than an unchecked restore.
+    """
+
+    actor: str
+    actor_channel: str | None = None
+    observed_state: dict[str, Any] | None = None
+
+
+class ActionAuditOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    action_id: uuid.UUID
+    action: str
+    actor: str
+    actor_channel: str | None
+    reason: str | None
+    evidence: dict[str, Any] | None
+    created_at: datetime
