@@ -27,6 +27,7 @@ from .langfuse import LangfuseClient
 from .resumequeue import ResumeQueue
 from .resumereconciler import ResumeReconciler
 from .routers import (
+    actions,
     agents,
     approvals,
     bundles,
@@ -271,6 +272,7 @@ def create_app() -> FastAPI:
     app.include_router(evals.router)
     app.include_router(runs.router)
     app.include_router(state.router)
+    app.include_router(actions.router)
     app.include_router(memory.router)
     app.include_router(approvals.router)
     app.include_router(channels.router)

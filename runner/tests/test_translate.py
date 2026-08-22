@@ -7,7 +7,9 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ThinkingBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 from claude_agent_sdk.types import RateLimitInfo
 from curie_runner import SideEffectClassifier
@@ -25,21 +27,94 @@ def test_text_block_becomes_text_delta() -> None:
     assert events[0].text == "hi there"
 
 
-def test_tool_use_emits_note_and_side_effect_once() -> None:
+def test_every_side_effecting_call_emits_its_own_flag() -> None:
+    """One flag per CALL, not per run.
+
+    This used to assert one flag per run, because the only consumer was the
+    kernel's no-retry rule and a boolean cannot be more than set. A consumer that
+    records what a turn did to the world needs each call, so the dedup is gone
+    while ``side_effect_emitted`` still latches for the rule that reads it.
+    """
+
     state = TurnState()
     msg = AssistantMessage(
         content=[
-            ToolUseBlock(id="1", name="Bash", input={}),
-            ToolUseBlock(id="2", name="Write", input={}),
+            ToolUseBlock(id="1", name="Bash", input={"command": "ls"}),
+            ToolUseBlock(id="2", name="Write", input={"path": "a"}),
         ],
         model="m",
     )
     events = _translate(msg, state)
     types = [e.type for e in events]
-    # Two tool notes, but the side-effect flag fires once per run (dedup).
     assert types.count("tool_note") == 2
-    assert types.count("side_effect_flag") == 1
+    assert types.count("side_effect_flag") == 2
     assert state.side_effect_emitted
+    flags = [e for e in events if e.type == "side_effect_flag"]
+    assert [f.tool for f in flags] == ["Bash", "Write"]
+    assert flags[0].arguments == {"command": "ls"}
+
+
+def test_a_read_only_call_records_nothing_to_attribute_a_result_to() -> None:
+    state = TurnState()
+    _translate(
+        AssistantMessage(
+            content=[ToolUseBlock(id="1", name="Read", input={"path": "a"})], model="m"
+        ),
+        state,
+    )
+    assert state.pending_actions == {}
+
+
+def test_a_side_effecting_result_is_attributed_to_its_call() -> None:
+    """The result arrives on a later UserMessage, which used to be dropped whole."""
+
+    state = TurnState()
+    _translate(
+        AssistantMessage(
+            content=[ToolUseBlock(id="call-1", name="Write", input={"path": "a"})], model="m"
+        ),
+        state,
+    )
+    events = _translate(
+        UserMessage(content=[ToolResultBlock(tool_use_id="call-1", content='{"ok": true}')]),
+        state,
+    )
+    assert [e.type for e in events] == ["side_effect_flag"]
+    assert events[0].tool == "Write"
+    assert events[0].result == {"ok": True}
+    assert state.pending_actions == {}
+
+
+def test_a_prose_result_carries_no_structured_payload() -> None:
+    """Guessing structure out of a sentence is how a restore acts on a guess."""
+
+    state = TurnState()
+    _translate(
+        AssistantMessage(
+            content=[ToolUseBlock(id="call-1", name="Write", input={})], model="m"
+        ),
+        state,
+    )
+    events = _translate(
+        UserMessage(content=[ToolResultBlock(tool_use_id="call-1", content="restart triggered")]),
+        state,
+    )
+    assert events[0].result is None
+
+
+def test_a_read_only_result_is_still_dropped() -> None:
+    """File contents are the model's working material, not wire traffic."""
+
+    state = TurnState()
+    _translate(
+        AssistantMessage(content=[ToolUseBlock(id="r1", name="Read", input={})], model="m"),
+        state,
+    )
+    events = _translate(
+        UserMessage(content=[ToolResultBlock(tool_use_id="r1", content="the file body")]),
+        state,
+    )
+    assert events == []
 
 
 def test_read_only_tool_notes_without_flag() -> None:

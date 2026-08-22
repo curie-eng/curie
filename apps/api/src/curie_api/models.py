@@ -420,3 +420,123 @@ class ConsoleSession(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(default=None)
     revoked_at: Mapped[datetime | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class UndoStatus(enum.StrEnum):
+    """Lifecycle of one recorded action's undo, mirroring ApprovalStatus."""
+
+    recorded = "recorded"
+    undone = "undone"
+    refused = "refused"
+
+
+class AgentAction(Base):
+    """One thing an agent did to the world.
+
+    The platform already knew that a turn mutated something: the runner
+    classifies every tool absent from a harness-declared read-only allowlist as
+    side-effecting, and the kernel reduced that to a boolean whose only job was
+    refusing to retry. This is the record that boolean could not be -- what was
+    called, with what, against what, and whether it can be put back.
+
+    Deliberately shaped like ``Approval``. The requirements are the same: a row
+    tied to a conversation, carrying the reply handle of the surface that has to
+    be told about it, a status a human drives, and an audit trail. The difference
+    is only when it is written: an approval is a question asked BEFORE an action,
+    and this is the account of one AFTER.
+
+    ``undoable`` is derived rather than stored. A row cannot be allowed to claim
+    it is reversible when no prior state was captured, and a stored flag is a
+    second source of truth for the same fact.
+    """
+
+    __tablename__ = "agent_actions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Nullable for the same reason approvals are: a run with no deployment
+    # binding (the dev path) still acts on the world.
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        index=True,
+        default=None,
+    )
+    conversation_id: Mapped[str] = mapped_column(index=True)
+    # The turn this action belongs to, so a receipt can group the actions of one
+    # turn without inferring the grouping from timestamps.
+    turn_id: Mapped[str] = mapped_column(index=True)
+    # The runtime tool name, plugin prefix included, as the ACI frame reports it.
+    tool: Mapped[str]
+    # The call's arguments, redacted. NULL when the harness reported none.
+    arguments: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # The declared identity of the thing changed, from the tool's own reply. Two
+    # actions against one resource are only comparable through this.
+    target: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # The state the tool read immediately before it wrote. This is what a restore
+    # replays, and its absence is what makes an action final.
+    snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # Why there is no snapshot, when there is none: the tool reported prose, the
+    # read failed, or nothing declared how to capture it. A user reads this
+    # sentence, so an empty explanation is worse than a wrong one.
+    snapshot_status: Mapped[str] = mapped_column(default="absent")
+    # What the action left behind. The world-moved check compares the live
+    # resource against this, not against the snapshot, because the snapshot is
+    # where it came FROM.
+    post_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # Whether the call itself succeeded. A failed call still gets a row: "it may
+    # have happened" is the state a human most needs told.
+    outcome: Mapped[str] = mapped_column(default="unknown", index=True)
+    outcome_detail: Mapped[str | None] = mapped_column(default=None)
+    # The declared reason a tool cannot be undone, shown verbatim. NULL when the
+    # action is undoable or when nothing declared a reason, which are different
+    # cases and are distinguished by ``snapshot``.
+    irreversible_reason: Mapped[str | None] = mapped_column(default=None)
+    undo_status: Mapped[str] = mapped_column(server_default=UndoStatus.recorded, index=True)
+    undone_at: Mapped[datetime | None] = mapped_column(default=None)
+    undone_by: Mapped[str | None] = mapped_column(default=None)
+    # The reply handle of the turn that acted, so the receipt lands on the
+    # surface that asked. Copied from Approval's shape rather than reinvented.
+    reply_kind: Mapped[str | None] = mapped_column(default=None)
+    reply_channel: Mapped[str | None] = mapped_column(default=None)
+    card_channel: Mapped[str | None] = mapped_column(default=None)
+    # Idempotency under the worker's at-least-once redelivery: a redelivered turn
+    # that replays the same call adopts the existing row instead of forking one.
+    dedupe_key: Mapped[str] = mapped_column(unique=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    @property
+    def undoable(self) -> bool:
+        """A restore needs a prior state, a target to put it back on, and a
+        successful call to reverse. Anything less is not reversible, and an
+        already-undone action is not reversible twice."""
+
+        return (
+            self.snapshot is not None
+            and self.target is not None
+            and self.outcome == "succeeded"
+            and self.undo_status == UndoStatus.recorded
+        )
+
+
+class ActionAuditEntry(Base):
+    """An undo decision, recorded the way an approval decision is.
+
+    An undo is itself a write against production. If approvals are audited and
+    undos are not, the auditable half is the one that asked permission and the
+    unauditable half is the one that acted.
+    """
+
+    __tablename__ = "action_audit_entries"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    action_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_actions.id", ondelete="CASCADE"), index=True
+    )
+    # requested / undone / refused. Named like ApprovalAuditEntry.action.
+    action: Mapped[str]
+    actor: Mapped[str]
+    actor_channel: Mapped[str | None] = mapped_column(default=None)
+    # Why a refusal refused. The world-moved case puts the expected and observed
+    # states here, which is the whole diagnosis.
+    reason: Mapped[str | None] = mapped_column(default=None)
+    evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())

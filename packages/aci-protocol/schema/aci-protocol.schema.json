@@ -1187,6 +1187,19 @@
     "SideEffectFlag": {
       "description": "Marks that a non-idempotent tool call executed during the run.\n\nIts presence gates the no-retry-after-side-effects rule (section 2b): a\nfailed run carrying this flag escalates to a human instead of retrying.",
       "properties": {
+        "arguments": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Arguments"
+        },
         "detail": {
           "anyOf": [
             {
@@ -1198,6 +1211,19 @@
           ],
           "default": null,
           "title": "Detail"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Result"
         },
         "tool": {
           "anyOf": [
@@ -1306,6 +1332,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.4.1",
-  "title": "ACI Protocol v0.4.1"
+  "protocolVersion": "0.4.2",
+  "title": "ACI Protocol v0.4.2"
 }

@@ -15,8 +15,9 @@ translation serve both the live HTTP turn and the conformance producer.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from aci_protocol import (
     ErrorEvent,
@@ -32,7 +33,9 @@ from claude_agent_sdk import (
     RateLimitEvent,
     ResultMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 
 from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
@@ -80,6 +83,12 @@ class TurnState:
     # reply recorded into the conversation transcript (#20); left None on a
     # failure/budget/auth final so those turns are not persisted as history.
     final_text: str | None = None
+    # Tool-use id -> tool name, for side-effecting calls whose result has not
+    # arrived yet. A tool result lands on a LATER message, so the name has to be
+    # remembered to attribute it. Entries are popped as results arrive; a call
+    # whose result never comes simply leaves its argument-only record standing,
+    # which is the honest outcome for a turn that died mid-call.
+    pending_actions: dict[str, str] = field(default_factory=dict)
 
 
 def translate_message(
@@ -94,6 +103,8 @@ def translate_message(
         return _translate_assistant(message, state, classifier, gen)
     if isinstance(message, ResultMessage):
         return _translate_result(message, state, gen)
+    if isinstance(message, UserMessage):
+        return _translate_user(message, state)
     if isinstance(message, RateLimitEvent):
         # status is one of allowed / allowed_warning / rejected; only a hard
         # rejection is an ACI error. The warning states are advisory (the model
@@ -159,12 +170,78 @@ def _translate_assistant(
                     # approval_granted_tool None so the worker can never mint a
                     # bypass grant from a model-authored request (#430).
                     state.approval_gate_kind = "policy"
-            if classifier.is_side_effecting(block.name) and not state.side_effect_emitted:
+            if classifier.is_side_effecting(block.name):
+                # One flag per CALL, not per turn. The no-retry rule only needs
+                # to know that something mutated, and ``side_effect_emitted``
+                # still latches for it below; a consumer that records what
+                # happened needs each call, and the arguments are in hand here.
+                state.pending_actions[block.id] = block.name
                 events.append(
-                    SideEffectFlag(tool=block.name, detail="non-idempotent tool executed")
+                    SideEffectFlag(
+                        tool=block.name,
+                        detail="non-idempotent tool executed",
+                        arguments=block.input if isinstance(block.input, dict) else None,
+                    )
                 )
                 state.side_effect_emitted = True
     return events
+
+
+def _translate_user(message: UserMessage, state: TurnState) -> list[OutboundEvent]:
+    """Forward the RESULT of a side-effecting call, and nothing else.
+
+    A tool result arrives on a UserMessage, which the v0.1 contract dropped
+    whole. Read-only results stay dropped: they are the model's working material
+    and forwarding them would put file contents on the wire. A side-effecting
+    call is different -- its result is the only place a connector can report what
+    the call did to the world, which is what makes an action recordable.
+    """
+
+    events: list[OutboundEvent] = []
+    for block in message.content:
+        if not isinstance(block, ToolResultBlock):
+            continue
+        tool = state.pending_actions.pop(block.tool_use_id, None)
+        if tool is None:
+            # Not a side-effecting call, or a result for a call this turn never
+            # saw. Either way there is nothing to attribute it to.
+            continue
+        events.append(
+            SideEffectFlag(tool=tool, detail="tool result", result=_result_payload(block))
+        )
+    return events
+
+
+def _result_payload(block: ToolResultBlock) -> dict[str, object] | None:
+    """A structured reply, or None. A connector that answers in prose has none.
+
+    Deliberately not a parse of prose: guessing structure out of a sentence is
+    how a ledger ends up holding something a restore would act on. No JSON
+    object means no structured result, and downstream that means not undoable.
+    """
+
+    content = block.content
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, list):
+        # The SDK may wrap a text payload in content blocks.
+        for part in content:
+            text = part.get("text") if isinstance(part, dict) else None
+            parsed = _loads_object(text)
+            if parsed is not None:
+                return parsed
+        return None
+    return _loads_object(content)
+
+
+def _loads_object(raw: object) -> dict[str, object] | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _translate_result(

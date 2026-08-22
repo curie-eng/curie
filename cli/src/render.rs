@@ -218,6 +218,11 @@ mod tests {
             version: v(),
             tool: Some("Bash".into()),
             detail: None,
+            // Optional on the wire, but a Rust struct-variant literal has to
+            // name every field, so an additive ACI field is free for readers
+            // and not free for constructors.
+            arguments: None,
+            result: None,
         };
         let error = OutboundEvent::ErrorEvent {
             version: v(),

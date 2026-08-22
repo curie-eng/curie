@@ -35,6 +35,7 @@ from typing import Any
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from curie_api.config import get_settings
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql import text
@@ -112,6 +113,17 @@ def _seed_v062_database() -> None:
     )
 
 
+def _head_revision() -> str:
+    """The head resolved from the script directory, not written as a literal.
+
+    The claim these tests make is that a database REACHES head. That is true at
+    every head, and pinning the number turned every later migration into a
+    failure of a test about the 0021 collision.
+    """
+
+    return ScriptDirectory.from_config(_alembic_config()).get_current_head()
+
+
 def _stamped_revision() -> str:
     rows = _sql("SELECT version_num FROM curie.alembic_version")
     assert len(rows) == 1, rows
@@ -127,7 +139,11 @@ def test_v0_6_x_database_reaches_head_with_its_bindings_carried_over(
 
     command.upgrade(_alembic_config(), "head")
 
-    assert _stamped_revision() == "0027"
+    # Resolved from the script directory rather than written as a literal. The
+    # claim under test is that a v0.6.x database REACHES head, which is true at
+    # every head; pinning the number made every later migration fail a test
+    # about the 0021 collision.
+    assert _stamped_revision() == _head_revision()
 
     # The backfill IS the migration: an empty table here is every agent
     # deployed, healthy looking and unroutable.
@@ -151,7 +167,7 @@ def test_v0_6_x_database_reaches_head_with_its_bindings_carried_over(
 
     # Re-running the upgrade against the already-upgraded database is a no-op.
     command.upgrade(_alembic_config(), "head")
-    assert _stamped_revision() == "0027"
+    assert _stamped_revision() == _head_revision()
     assert len(_sql("SELECT 1 FROM curie.agent_channels")) == len(BINDINGS)
 
 

@@ -197,6 +197,14 @@ class SideEffectFlag(_OutboundBase):
     type: Literal["side_effect_flag"] = "side_effect_flag"
     tool: str | None = None
     detail: str | None = None
+    # The call's arguments and the tool's structured reply. Both are optional and
+    # default to None, so a reader that predates them is unaffected (ADR-0036).
+    # They exist because the information is already in hand when this frame is
+    # built and was previously replaced by a constant string: without them a
+    # consumer can know that something mutated but never what, which is the gap
+    # an action ledger has to close.
+    arguments: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
 
 
 OutboundEvent = Annotated[
