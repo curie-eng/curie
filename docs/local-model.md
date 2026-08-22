@@ -65,8 +65,13 @@ download from a wedged one (issue #1183). Once both assets are cached the flag i
 never needed again and `up` is unchanged — measured at **17.9s warm**, against
 **232s** for the same command on a cold machine over a fast link.
 
-`cluster up --local-model` is unaffected: it has no host-side Ollama to
-provision, so there is nothing to preflight and no `--pull-model` flag.
+`cluster up --local-model` has **no** such preflight and no `--pull-model` flag,
+because there is no host-side Ollama to provision. That is not the same as
+nothing being downloaded: the chart's inference Deployment pulls the weights
+*inside the cluster* instead, and does it implicitly. See
+[the cluster tier](#the-cluster-tier-downloads-implicitly) below before running
+this against a real cluster with a large model
+([#1779](https://github.com/curie-eng/curie/issues/1779)).
 
 ## How it runs
 
@@ -81,6 +86,36 @@ reclaimed with `docker volume rm <volume>` — after which the next
 `cluster up` uses the in-chart inference Deployment; the chart renders the Ollama
 Service and Deployment, opens the runner egress carve-out automatically, and
 bakes `ANTHROPIC_BASE_URL` plus the inference model into the runner template.
+
+### The cluster tier downloads implicitly
+
+Unlike the other two tiers, the cluster tier fetches the weights for you, and
+nothing announces it. `inference.pullModel` defaults to `true`, and the chart
+pulls from a `postStart` lifecycle hook on the Ollama container, so:
+
+- **the pod is not-ready for the whole download.** kubelet does not mark a
+  container started until `postStart` returns, so the readiness probe has not
+  begun yet and the wait is unbounded. A large model looks identical to a wedged
+  deploy, which is the failure ADR-0093 removed at the other two tiers;
+- **a failed pull restarts the container.** A non-zero `postStart` makes kubelet
+  kill it, so a network error or an unknown model name surfaces as
+  `CrashLoopBackOff` with the reason in a `FailedPostStartHook` event, and each
+  restart retries the whole download;
+- **the default does not keep the weights.** `inference.persistence.enabled`
+  defaults to `false`, so the data directory is an `emptyDir` and `cluster up`
+  requests no PVC. Any restart, eviction, or node drain re-downloads the model in
+  full.
+
+With the `qwen3:4b` default (~2.5GB) this is mostly invisible. With a documented
+upgrade such as `qwen3-coder:30b` (~17-19GB) it is not. Until
+[#1779](https://github.com/curie-eng/curie/issues/1779) is resolved, deploy a
+large model with persistence turned on so a restart does not re-fetch it:
+
+```bash
+curie cluster up --local-model qwen3-coder:30b --set inference.persistence.enabled=true --set inference.persistence.size=40Gi
+```
+
+and expect that first `up` to sit at not-ready for as long as the pull takes.
 
 ## Choosing a model
 
