@@ -42,11 +42,14 @@ _MINTED = (
     "CURIE_MEMORY_TOKEN",
     "CURIE_HISTORY_TOKEN",
     "CURIE_STATE_TOKEN",
+    # PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+    "CURIE_DELEGATE_TOKEN",
 )
 
 _MEMORY_REF = f"http://localhost:8000/agents/{_AGENT}/state/memory"
 _HISTORY_REF = f"http://localhost:8000/agents/{_AGENT}/state/transcript/{_THREAD}"
 _STATE_URL = f"http://localhost:8000/agents/{_AGENT}/state"
+_DELEGATE_URL = f"http://localhost:8000/agents/{_AGENT}/delegate/calls"
 
 
 def _resolved(**kwargs: object) -> ResolvedDeployment:
@@ -87,6 +90,7 @@ def test_plain_bound_run_renders_the_frozen_boot_env() -> None:
         "CURIE_MEMORY_REF": _MEMORY_REF,
         "CURIE_HISTORY_REF": _HISTORY_REF,
         "CURIE_STATE_URL": _STATE_URL,
+        "CURIE_DELEGATE_URL": _DELEGATE_URL,
     }
 
     assert set(minted) == set(_MINTED)
@@ -181,6 +185,7 @@ def test_fully_loaded_run_renders_the_frozen_boot_env() -> None:
         "CURIE_MEMORY_REF": _MEMORY_REF,
         "CURIE_HISTORY_REF": _HISTORY_REF,
         "CURIE_STATE_URL": _STATE_URL,
+        "CURIE_DELEGATE_URL": _DELEGATE_URL,
         # Connector secret values ride the merged dict by value, and the marker
         # names exactly the keys injected (#429).
         "GITHUB_TOKEN": "ghp-1",
@@ -198,7 +203,10 @@ def test_fully_loaded_run_renders_the_frozen_boot_env() -> None:
 def test_no_api_key_path_mints_no_state_token() -> None:
     # fake/local: nothing to sign with, so no state token is set and the pre-#410
     # no-key path is preserved. The state URL is not a credential, so it is still
-    # emitted (the store is simply unauthenticated on this path).
+    # emitted (the store is simply unauthenticated on this path). PROTOTYPE
+    # (Draft ADR-0115): unlike state_url, delegate_url is omitted here too --
+    # with no token to authenticate a call, the runner should mount no
+    # curie-delegate server at all rather than an unauthenticated one.
     stable, minted = _split_minted(_boot_env(WorkerConfig(api_key=""), _resolved()))
 
     assert stable == {

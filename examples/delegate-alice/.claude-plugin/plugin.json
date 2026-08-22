@@ -1,0 +1,10 @@
+{
+  "name": "delegate-alice",
+  "version": "0.1.0",
+  "description": "PROTOTYPE demo bundle for Draft ADR-0115 (agents call each other with no third party in the path). Alice is the human-facing agent: on the offline fake-model tier she calls the auto-mounted curie-delegate MCP tool when the message contains a [fake:delegate:<agent>] marker, since the fake model cannot reason about tool descriptions the way a live model would. See docs/demo/ADR-0115-PROTOTYPE-NOTES.md.",
+  "author": { "name": "CurieTech" },
+  "keywords": ["prototype", "adr-0115", "delegation", "demo"],
+  "starterPrompts": [
+    "[fake:delegate:bob] what is 2 + 2?"
+  ]
+}

@@ -1238,6 +1238,199 @@
         "title": "CostReport",
         "type": "object"
       },
+      "DelegateCallDetailOut": {
+        "description": "A demo/ops convenience read: one call's full current record. Not part of\nthe ADR's design -- added so the round trip can be inspected without a\ndirect DB connection.",
+        "properties": {
+          "caller_agent_id": {
+            "format": "uuid",
+            "title": "Caller Agent Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "request_text": {
+            "title": "Request Text",
+            "type": "string"
+          },
+          "resolved_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved At"
+          },
+          "result_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Text"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "target_agent_id": {
+            "format": "uuid",
+            "title": "Target Agent Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "caller_agent_id",
+          "target_agent_id",
+          "status",
+          "request_text",
+          "result_text",
+          "created_at",
+          "resolved_at"
+        ],
+        "title": "DelegateCallDetailOut",
+        "type": "object"
+      },
+      "DelegateCallIn": {
+        "description": "A caller sandbox's ``call_agent`` tool invocation, as posted to the API.\n\n``caller_conversation_id`` cannot be derived server-side: the API only ever\nlearns the calling agent's identity (from the scoped token's path), not\nwhich live thread it is currently running as. The runner reads it off its\nown ``CURIE_HISTORY_REF`` boot-env value, which is already a stable per-turn\nidentifier (ADR-0029).",
+        "properties": {
+          "caller_conversation_id": {
+            "minLength": 1,
+            "title": "Caller Conversation Id",
+            "type": "string"
+          },
+          "message": {
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "target_agent": {
+            "minLength": 1,
+            "title": "Target Agent",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_agent",
+          "message",
+          "caller_conversation_id"
+        ],
+        "title": "DelegateCallIn",
+        "type": "object"
+      },
+      "DelegateCallOut": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ],
+        "title": "DelegateCallOut",
+        "type": "object"
+      },
+      "DelegateCompleteIn": {
+        "description": "The target turn's outcome, exactly ``channel_protocol.reply.TurnCompleted``'s\nvocabulary (``delivered`` / ``dropped`` / ``escalated`` / ``awaiting-approval``).\nCarries no text -- ``TurnCompleted`` itself has none; the answer text was\nalready buffered by an earlier ``progress_call`` (``reply.update``).",
+        "properties": {
+          "outcome": {
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "title": "DelegateCompleteIn",
+        "type": "object"
+      },
+      "DelegateGrantIn": {
+        "description": "The operator-arming request: may ``caller_agent`` call ``target_agent``?",
+        "properties": {
+          "armed": {
+            "default": true,
+            "title": "Armed",
+            "type": "boolean"
+          },
+          "caller_agent": {
+            "minLength": 1,
+            "title": "Caller Agent",
+            "type": "string"
+          },
+          "target_agent": {
+            "minLength": 1,
+            "title": "Target Agent",
+            "type": "string"
+          }
+        },
+        "required": [
+          "caller_agent",
+          "target_agent"
+        ],
+        "title": "DelegateGrantIn",
+        "type": "object"
+      },
+      "DelegateGrantOut": {
+        "properties": {
+          "armed": {
+            "title": "Armed",
+            "type": "boolean"
+          },
+          "caller_agent_id": {
+            "format": "uuid",
+            "title": "Caller Agent Id",
+            "type": "string"
+          },
+          "target_agent_id": {
+            "format": "uuid",
+            "title": "Target Agent Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "caller_agent_id",
+          "target_agent_id",
+          "armed"
+        ],
+        "title": "DelegateGrantOut",
+        "type": "object"
+      },
+      "DelegateProgressIn": {
+        "description": "A streamed (non-terminal) update to a call's buffered result text.",
+        "properties": {
+          "result_text": {
+            "title": "Result Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result_text"
+        ],
+        "title": "DelegateProgressIn",
+        "type": "object"
+      },
       "DeploymentCreate": {
         "properties": {
           "agent_id": {
@@ -3623,6 +3816,363 @@
         ]
       }
     },
+    "/agents/{agent_id}/delegate/calls": {
+      "get": {
+        "description": "Demo/ops convenience: every call this agent was caller or target of,\nnewest first. Not part of the ADR's design.",
+        "operationId": "list_calls_agents__agent_id__delegate_calls_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DelegateCallDetailOut"
+                  },
+                  "title": "Response List Calls Agents  Agent Id  Delegate Calls Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Calls",
+        "tags": [
+          "delegate"
+        ]
+      },
+      "post": {
+        "description": "Mint a delegate call: caller ``agent_id`` asks ``body.target_agent`` to do\nsomething. Refuses (1) an unarmed pair -- default closed, ADR-0115 part 5 --\nand (2) a caller whose OWN conversation is already a delegate call, the\nprototype's stand-in for the real ADR's depth/cycle bound (part 6).",
+        "operationId": "create_call_agents__agent_id__delegate_calls_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DelegateCallIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DelegateCallOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Call",
+        "tags": [
+          "delegate"
+        ]
+      }
+    },
+    "/agents/{agent_id}/delegate/calls/{call_id}": {
+      "get": {
+        "description": "Demo/ops convenience: inspect one call's current record, by either its\ncaller or its target agent id. Not part of the ADR's design -- exists so\nthe round trip can be checked without a direct DB connection.",
+        "operationId": "get_call_agents__agent_id__delegate_calls__call_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "call_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Call Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DelegateCallDetailOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Call",
+        "tags": [
+          "delegate"
+        ]
+      },
+      "patch": {
+        "description": "Buffer the target's latest streamed reply text. Last-write-wins, no\nhistory -- this prototype only needs the FINAL text at completion time.",
+        "operationId": "progress_call_agents__agent_id__delegate_calls__call_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "call_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Call Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DelegateProgressIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Progress Call",
+        "tags": [
+          "delegate"
+        ]
+      }
+    },
+    "/agents/{agent_id}/delegate/calls/{call_id}/complete": {
+      "post": {
+        "description": "The target's turn settled. Mints the round-trip ``QueuedTurn`` back onto\nthe caller's ORIGINAL conversation, using the reply route snapshotted at\ncall time -- this is the one and only place a round-trip turn is minted,\nliving in the API next to every other ingress mint site, never in the\nworker (the worker only ever calls back over HTTP with the platform key,\nthe same pattern ``ApprovalClient`` already uses).",
+        "operationId": "complete_call_agents__agent_id__delegate_calls__call_id__complete_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "call_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Call Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DelegateCompleteIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Complete Call Agents  Agent Id  Delegate Calls  Call Id  Complete Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete Call",
+        "tags": [
+          "delegate"
+        ]
+      }
+    },
     "/agents/{agent_id}/kill": {
       "get": {
         "operationId": "get_kill_state_agents__agent_id__kill_get",
@@ -5694,6 +6244,66 @@
         "summary": "Exchange Login Code",
         "tags": [
           "console"
+        ]
+      }
+    },
+    "/delegate/grants": {
+      "post": {
+        "description": "Operator-only: arm (or disarm) ``caller_agent`` to call ``target_agent``.\n\nArming a target for the first time also binds its channel to\n``{kind: \"delegation\", address: <target agent id>}`` via the existing\n``update_agent_binding`` -- no new binding code, since ``AgentChannel``\nalready accepts any unregistered kind (ADR-0096's documented escape\nhatch). This REPLACES whatever channel the target held (an agent holds\nexactly one binding); the prototype's target agent is meant to be\nbackend-only for this reason -- see the prototype notes doc.",
+        "operationId": "arm_grant_delegate_grants_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DelegateGrantIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DelegateGrantOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Arm Grant",
+        "tags": [
+          "delegate"
         ]
       }
     },

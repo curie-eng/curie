@@ -1504,3 +1504,76 @@ class ConsoleSessionOut(BaseModel):
     """
 
     expires_at: datetime
+
+
+# --- delegation (ADR-0115 PROTOTYPE, Draft ADR, see docs/demo/ADR-0115-PROTOTYPE-NOTES.md) --
+
+
+class DelegateCallIn(BaseModel):
+    """A caller sandbox's ``call_agent`` tool invocation, as posted to the API.
+
+    ``caller_conversation_id`` cannot be derived server-side: the API only ever
+    learns the calling agent's identity (from the scoped token's path), not
+    which live thread it is currently running as. The runner reads it off its
+    own ``CURIE_HISTORY_REF`` boot-env value, which is already a stable per-turn
+    identifier (ADR-0029).
+    """
+
+    target_agent: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    caller_conversation_id: str = Field(min_length=1)
+
+
+class DelegateCallOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    status: str
+
+
+class DelegateProgressIn(BaseModel):
+    """A streamed (non-terminal) update to a call's buffered result text."""
+
+    result_text: str
+
+
+class DelegateCompleteIn(BaseModel):
+    """The target turn's outcome, exactly ``channel_protocol.reply.TurnCompleted``'s
+    vocabulary (``delivered`` / ``dropped`` / ``escalated`` / ``awaiting-approval``).
+    Carries no text -- ``TurnCompleted`` itself has none; the answer text was
+    already buffered by an earlier ``progress_call`` (``reply.update``)."""
+
+    outcome: str
+
+
+class DelegateGrantIn(BaseModel):
+    """The operator-arming request: may ``caller_agent`` call ``target_agent``?"""
+
+    caller_agent: str = Field(min_length=1)
+    target_agent: str = Field(min_length=1)
+    armed: bool = True
+
+
+class DelegateGrantOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    caller_agent_id: uuid.UUID
+    target_agent_id: uuid.UUID
+    armed: bool
+
+
+class DelegateCallDetailOut(BaseModel):
+    """A demo/ops convenience read: one call's full current record. Not part of
+    the ADR's design -- added so the round trip can be inspected without a
+    direct DB connection."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    caller_agent_id: uuid.UUID
+    target_agent_id: uuid.UUID
+    status: str
+    request_text: str
+    result_text: str | None
+    created_at: datetime
+    resolved_at: datetime | None

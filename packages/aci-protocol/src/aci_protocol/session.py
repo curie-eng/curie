@@ -325,6 +325,17 @@ class BootEnv(_AciModel):
     state_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_STATE_TOKEN", "worker")
     )
+    # PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+    # Mirrors state_url/state_token exactly: the auto-mounted curie-delegate MCP
+    # server's base URL and its scoped ADR-0033 "delegate" token, never the raw
+    # platform key. Absent when the worker mints no delegate token (no api_key
+    # configured), same as state_token today.
+    delegate_url: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_DELEGATE_URL", "worker")
+    )
+    delegate_token: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_DELEGATE_TOKEN", "worker")
+    )
     # Per-agent permission gates (#245, ADR-0010).
     approval_required_tools: list[str] | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_REQUIRED_TOOLS", "worker")
@@ -522,6 +533,8 @@ class BootEnv(_AciModel):
         memory_token: str | None = None,
         state_url: str | None = None,
         state_token: str | None = None,
+        delegate_url: str | None = None,
+        delegate_token: str | None = None,
         approval_required_tools: Sequence[str] | None = None,
         connector_release: str | None = None,
         connector_agent: str | None = None,
@@ -584,6 +597,10 @@ class BootEnv(_AciModel):
             env[cls.env_key("state_url")] = state_url
         if state_token:
             env[cls.env_key("state_token")] = state_token
+        if delegate_url:
+            env[cls.env_key("delegate_url")] = delegate_url
+        if delegate_token:
+            env[cls.env_key("delegate_token")] = delegate_token
         # Emitted as a SET or not at all: the runner derives a connector URL
         # from all three or derives nothing, so a partial scope would name a
         # Service that cannot exist.
@@ -630,6 +647,10 @@ class BootEnv(_AciModel):
             env[self.env_key("state_url")] = self.state_url
         if self.state_token is not None:
             env[self.env_key("state_token")] = self.state_token
+        if self.delegate_url is not None:
+            env[self.env_key("delegate_url")] = self.delegate_url
+        if self.delegate_token is not None:
+            env[self.env_key("delegate_token")] = self.delegate_token
         if self.approval_required_tools:
             env[self.env_key("approval_required_tools")] = ",".join(self.approval_required_tools)
         if self.approval_grant_tool is not None:
@@ -684,6 +705,8 @@ class BootEnv(_AciModel):
             memory_token=_str_or_none(env.get("CURIE_MEMORY_TOKEN")),
             state_url=_str_or_none(env.get("CURIE_STATE_URL")),
             state_token=_str_or_none(env.get("CURIE_STATE_TOKEN")),
+            delegate_url=_str_or_none(env.get("CURIE_DELEGATE_URL")),
+            delegate_token=_str_or_none(env.get("CURIE_DELEGATE_TOKEN")),
             approval_required_tools=_list_or_none(env.get("CURIE_APPROVAL_REQUIRED_TOOLS")),
             approval_grant_tool=_stripped_or_none(env.get("CURIE_APPROVAL_GRANT_TOOL")),
             approval_resumed_kind=_stripped_or_none(env.get("CURIE_APPROVAL_RESUMED_KIND")),

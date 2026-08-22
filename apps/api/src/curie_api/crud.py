@@ -18,6 +18,8 @@ from .models import (
     ApprovalAuditEntry,
     ApprovalStatus,
     ConsoleSession,
+    DelegateGrant,
+    DelegationCall,
     Deployment,
     Environment,
 )
@@ -25,6 +27,7 @@ from .schemas import (
     AgentCreate,
     ApprovalRequest,
     ChannelBindingWrite,
+    DelegateCallIn,
     DeploymentCreate,
     VersionCreate,
 )
@@ -471,6 +474,111 @@ async def get_approval_by_dedupe_key(session: AsyncSession, dedupe_key: str) -> 
         select(Approval).where(Approval.dedupe_key == dedupe_key)
     )
     return result
+
+
+# -- delegation (ADR-0115 PROTOTYPE, see docs/demo/ADR-0115-PROTOTYPE-NOTES.md) --
+
+
+async def create_delegation_call(
+    session: AsyncSession,
+    *,
+    caller: Agent,
+    target: Agent,
+    data: DelegateCallIn,
+) -> DelegationCall:
+    """Snapshot the caller's reply route and insert a pending call.
+
+    ``caller.channel`` fields are copied verbatim, the same reconstruction
+    ``hooks._mint_turn`` performs for every hook-originated turn -- the
+    durable-twin-of-ReplyHandle pattern ``Approval`` already uses.
+    """
+
+    call = DelegationCall(
+        caller_agent_id=caller.id,
+        caller_conversation_id=data.caller_conversation_id,
+        caller_reply_kind=caller.channel.kind,
+        caller_reply_channel=caller.channel.address,
+        caller_reply_endpoint=caller.channel.endpoint,
+        caller_reply_adapter=caller.channel.adapter,
+        target_agent_id=target.id,
+        request_text=data.message,
+    )
+    session.add(call)
+    await session.commit()
+    await session.refresh(call)
+    return call
+
+
+async def get_delegation_call(session: AsyncSession, call_id: uuid.UUID) -> DelegationCall | None:
+    return await session.get(DelegationCall, call_id)
+
+
+async def list_delegation_calls_for_agent(
+    session: AsyncSession, agent_id: uuid.UUID
+) -> list[DelegationCall]:
+    """Every call agent_id was either the caller or the target of, newest
+    first. Demo/ops convenience -- not part of the ADR's design."""
+
+    result = await session.scalars(
+        select(DelegationCall)
+        .where(
+            (DelegationCall.caller_agent_id == agent_id)
+            | (DelegationCall.target_agent_id == agent_id)
+        )
+        .order_by(DelegationCall.created_at.desc())
+    )
+    return list(result)
+
+
+async def update_delegation_call_text(
+    session: AsyncSession, call: DelegationCall, result_text: str
+) -> DelegationCall:
+    call.result_text = result_text
+    await session.commit()
+    await session.refresh(call)
+    return call
+
+
+async def resolve_delegation_call(
+    session: AsyncSession, call: DelegationCall, *, status: str
+) -> DelegationCall:
+    """Mark a call resolved. Does not touch ``result_text``: any answer text was
+    already buffered by ``update_delegation_call_text`` -- the terminal outcome
+    event carries none of its own."""
+
+    call.status = status
+    call.resolved_at = datetime.now(UTC).replace(tzinfo=None)
+    await session.commit()
+    await session.refresh(call)
+    return call
+
+
+async def get_delegate_grant(
+    session: AsyncSession, *, caller_agent_id: uuid.UUID, target_agent_id: uuid.UUID
+) -> DelegateGrant | None:
+    grant: DelegateGrant | None = await session.scalar(
+        select(DelegateGrant).where(
+            DelegateGrant.caller_agent_id == caller_agent_id,
+            DelegateGrant.target_agent_id == target_agent_id,
+        )
+    )
+    return grant
+
+
+async def upsert_delegate_grant(
+    session: AsyncSession, *, caller: Agent, target: Agent, armed: bool
+) -> DelegateGrant:
+    grant = await get_delegate_grant(
+        session, caller_agent_id=caller.id, target_agent_id=target.id
+    )
+    if grant is None:
+        grant = DelegateGrant(caller_agent_id=caller.id, target_agent_id=target.id, armed=armed)
+        session.add(grant)
+    else:
+        grant.armed = armed
+    await session.commit()
+    await session.refresh(grant)
+    return grant
 
 
 async def list_approvals(

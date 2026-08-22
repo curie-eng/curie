@@ -608,6 +608,12 @@ class BindingResolver:
         # and none is set -- preserving the pre-#410 no-key path.
         state_token: str | None = None
         app_state_token: str | None = None
+        # PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+        # A third scoped-token scope, minted the same way as state/state.app: the
+        # sandbox presents this to the API's new (prototype) delegate router,
+        # never the raw platform key. Absent on the no-key fake/local path, same
+        # as the state tokens above.
+        delegate_token: str | None = None
         if self._config.api_key:
             exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
             state_token = sandbox_token.mint(
@@ -622,6 +628,13 @@ class BindingResolver:
                 scope="state.app",
                 exp=exp,
             )
+            delegate_token = sandbox_token.mint(
+                self._config.api_key,
+                agent=str(resolved.agent_id),
+                scope="delegate",
+                exp=exp,
+            )
+        delegate_url = f"{base}/agents/{resolved.agent_id}/delegate/calls"
         env = BootEnv.render_worker(
             plugin_dir=self._config.bundle_plugin_dir,
             session_id=f"agent-{resolved.agent_id}-thread-{thread_key}",
@@ -671,6 +684,12 @@ class BindingResolver:
             # (and the URL still emitted) on the no-key fake/local path.
             state_url=state_url,
             state_token=app_state_token,
+            # PROTOTYPE (Draft ADR-0115): mirrors state_url/state_token exactly.
+            # Omitted (both None) on the no-key fake/local path since there is
+            # nothing to sign a delegate token with; the runner simply mounts
+            # no curie-delegate server in that case.
+            delegate_url=delegate_url if delegate_token else None,
+            delegate_token=delegate_token,
         )
         # #517/#669 opt-in false-completion check: NOT a BootEnv.render_worker
         # kwarg (it is deliberately kept out of the frozen ACI contract, see

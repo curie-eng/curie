@@ -47,6 +47,12 @@ SHARED = "0020"
 # The stamp a v0.6.x database carries: its own `0021_console_sessions`.
 V062_HEAD = "0021"
 
+# This tree's current head, asserted as a LITERAL on purpose: deriving it from
+# the script directory would make the "reached head" assertions tautological and
+# stop catching a chain that silently concludes early. Bump it when a migration
+# is added.
+CURRENT_HEAD = "0028"
+
 # The DDL v0.6.2's `0021_console_sessions` left behind, transcribed. Renumbered
 # to `0026` on this line with its statements unchanged, which is why the upgrade
 # path finds the table already there.
@@ -127,7 +133,7 @@ def test_v0_6_x_database_reaches_head_with_its_bindings_carried_over(
 
     command.upgrade(_alembic_config(), "head")
 
-    assert _stamped_revision() == "0027"
+    assert _stamped_revision() == CURRENT_HEAD
 
     # The backfill IS the migration: an empty table here is every agent
     # deployed, healthy looking and unroutable.
@@ -151,7 +157,7 @@ def test_v0_6_x_database_reaches_head_with_its_bindings_carried_over(
 
     # Re-running the upgrade against the already-upgraded database is a no-op.
     command.upgrade(_alembic_config(), "head")
-    assert _stamped_revision() == "0027"
+    assert _stamped_revision() == CURRENT_HEAD
     assert len(_sql("SELECT 1 FROM curie.agent_channels")) == len(BINDINGS)
 
 

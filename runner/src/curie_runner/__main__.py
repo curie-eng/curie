@@ -27,6 +27,11 @@ from .approval import (
 )
 from .config import RunnerConfig
 from .connectors import build_mcp_servers, derive_mcp_servers
+from .delegate import (
+    DELEGATE_SERVER_NAME,
+    build_delegate_server,
+    resolve_delegate_client,
+)
 from .fake import FakeModelSession
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
@@ -196,6 +201,9 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
+    # PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+    # Same absent-means-unmounted pattern as the state client above.
+    delegate_client = resolve_delegate_client(os.environ)
 
     def factory() -> ModelSession:
         if fake_model:
@@ -212,6 +220,9 @@ def build_runner(
                 # Share the same gate so a scripted request_approval resolves its
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
+                # PROTOTYPE (Draft ADR-0115): a scripted [fake:delegate:<agent>]
+                # marker makes a REAL delegate call through this client, offline.
+                delegate_client=delegate_client,
             )
         plugins = compiled.plugins
         options = build_options(
@@ -242,6 +253,11 @@ def build_runner(
                     **(
                         {STATE_SERVER_NAME: build_state_server(state_client)}
                         if state_client is not None
+                        else {}
+                    ),
+                    **(
+                        {DELEGATE_SERVER_NAME: build_delegate_server(delegate_client)}
+                        if delegate_client is not None
                         else {}
                     ),
                 },
