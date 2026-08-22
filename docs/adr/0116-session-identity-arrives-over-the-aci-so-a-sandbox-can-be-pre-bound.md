@@ -632,12 +632,20 @@ counts it, which decision 6 is what fixes.
   as hygiene; it does not remove a wall-clock deadline from a proportionally
   starved path.
 
-- **Process checkpoint/restore (`runsc checkpoint`) to preserve a live session
-  and its prompt cache across idleness.** Deferred, not rejected. It is the
-  natural extension of decision 5 and gVisor is already the default sandbox
-  runtime, but restoring a process holding an open ACI socket, and a checkpoint
-  image containing a live runner token, are each their own decision. This ADR
-  deliberately buys most of the benefit without them.
+- **Process checkpoint/restore (`runsc checkpoint`).** Deferred, not rejected,
+  and now split in two by the load test above.
+
+  The half that addresses this ADR's measured ceiling -- refill cost, which is
+  what caps the arrival rate a pool can absorb -- is taken up by
+  [ADR-0118](0118-a-versions-golden-checkpoint-makes-a-refill-a-restore-not-a-boot.md):
+  a version's deploy produces a golden checkpoint of a booted, *unbound* runner,
+  and a pool refills by restoring it. That needs no conversation and no
+  credential in the image, which is what makes it separable from the harder half.
+
+  The harder half is checkpointing a **live** conversation to hibernate an idle
+  thread and keep its prompt cache. That inverts
+  [ADR-0003](0003-stateless-first-rehydrate-on-resume.md), and it puts a
+  transcript and a live credential into an image at rest. It stays deferred.
 
 - **Replacing the adopted harness to shrink the 259.5 MiB per session.**
   Rejected under ADR-0007: `claude-agent-sdk` and the Claude Code plugin format
@@ -730,4 +738,6 @@ counts it, which decision 6 is what fixes.
   bundled MCP server. It affects node scale-out rather than per-pod boot once
   decision 4 lands, and it is a separate concern.
 
-- **Checkpoint/restore**, per the alternatives above.
+- **Checkpoint/restore**, per the alternatives above. The refill half is
+  [ADR-0118](0118-a-versions-golden-checkpoint-makes-a-refill-a-restore-not-a-boot.md);
+  hibernating a live conversation remains unowned.
