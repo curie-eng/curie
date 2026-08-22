@@ -51,13 +51,15 @@ def through_the_runner(tool, args, connector_reply):
     """Push one real tool call and its real reply through the real translate seam."""
     state, clf = TurnState(), SideEffectClassifier(CLAUDE_READONLY_TOOLS)
     am = AssistantMessage(content=[ToolUseBlock(id="c1", name=tool, input=args)], model="probe")
-    translate_message(am, state, clf, None)
+    call_flags = [e for e in translate_message(am, state, clf, None)
+                  if type(e).__name__ == "SideEffectFlag"]
     um = UserMessage(content=[ToolResultBlock(tool_use_id="c1", content=connector_reply)])
-    translate_message(um, state, clf, None)          # today: returns [] and drops it
-    # what the runner WOULD assemble once it stops dropping the result:
-    rec = {"tool": tool, "arguments": args}
-    try: rec["result"] = json.loads(connector_reply)
-    except Exception: rec["result"] = None
+    result_flags = [e for e in translate_message(um, state, clf, None)
+                    if type(e).__name__ == "SideEffectFlag"]
+    # The RUNNER assembles this now. The probe only reads the frames it emitted.
+    rec = {"tool": call_flags[0].tool, "arguments": call_flags[0].arguments,
+           "result": result_flags[0].result if result_flags else None,
+           "_frames": len(call_flags) + len(result_flags)}
     return rec
 
 
@@ -78,6 +80,8 @@ def main():
     rec = through_the_runner(TOOL, args, reply)
     prior = (rec.get("result") or {}).get("prior")
     undoable = bool(rec["result"] and rec["result"].get("ok") and prior)
+    print(f"    {C['g']}frames the RUNNER emitted: {rec['_frames']}{C['x']}"
+          f"  {C['d']}(one for the call, one for its result){C['x']}")
     print(f"    record.tool      = {rec['tool']}")
     print(f"    record.arguments = {rec['arguments']}")
     print(f"    record.prior     = {prior}")

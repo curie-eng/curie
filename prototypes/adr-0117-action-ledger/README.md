@@ -87,7 +87,7 @@ Not real: the Kubernetes API server. No cluster, no network, no model, no
 platform. The receipt at the end is printed by the probe to show the shape the
 design proposes, not rendered by any card code, which does not exist yet.
 
-Also not real yet: the runner still drops the tool result. The probe calls
-`translate_message` on the `UserMessage` to show it returns nothing, then
-assembles the record itself. Making the runner do that assembly is Task 3 of the
-plan.
+Update: the runner does the assembly now. It emits two frames per action, one
+for the call carrying `arguments` and one for the result carrying `result`, and
+the probe only reads them. The line it prints, "frames the RUNNER emitted: 2", is
+the difference between this probe measuring a proposal and measuring the product.
