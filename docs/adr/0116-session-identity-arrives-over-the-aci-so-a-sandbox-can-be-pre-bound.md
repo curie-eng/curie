@@ -906,8 +906,9 @@ counts it, which decision 6 is what fixes.
   Rehydrating as message history with a stable prefix instead would decouple
   caching from residency entirely: slots could be released aggressively and a
   returning thread would still hit the cache, within the TTL. That is a change to
-  ADR-0003's rehydrate delivery and to ADR-0029's design, so it belongs in its own
-  record rather than inside decision 5, and it needs the measurements above first.
+  ADR-0003's rehydrate delivery and to ADR-0029's design, so it is
+  [ADR-0119](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md)
+  rather than part of decision 5, and it needs the measurements above first.
   It is called out here because it is the answer to decision 5's main objection,
   and because the 16 KB bound exists for a reason -- something else has to bound
   the prompt if the truncation goes.
