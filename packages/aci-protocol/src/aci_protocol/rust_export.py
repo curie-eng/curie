@@ -134,6 +134,16 @@ def _rust_bare_type(annotation: Any) -> str:
             # fallback for any future single-valued literal field.
             return "String"
         raise TypeError(f"unexpected literal field {annotation!r}")
+    if origin is dict:
+        key, value = get_args(annotation)
+        if key is not str or value is not Any:
+            # Anything narrower deserves a named type on both sides rather than
+            # a free-form map, so only the fully open shape is mapped here.
+            raise TypeError(f"only dict[str, Any] is supported, got {annotation!r}")
+        # The crate already depends on serde_json, and a Map preserves the
+        # object-ness the schema declares (a bare Value would also accept a
+        # string or a number).
+        return "serde_json::Map<String, serde_json::Value>"
     if isinstance(annotation, type) and issubclass(annotation, BaseModel):
         return annotation.__name__
     if isinstance(annotation, type) and issubclass(annotation, Enum):
