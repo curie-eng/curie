@@ -276,6 +276,15 @@ directory, which is the claim the test actually makes.
   It is the same shape as the read-only allowlist's deny-by-default, and the
   remedy is the same: wrap the tool in a connector that reports.
 
+- **An additive ACI field is free for readers and not for constructors.** The
+  reader policy holds: a consumer that predates `arguments` and `result` parses
+  the frame unchanged. But the generated Rust is an enum with struct variants,
+  and a struct-variant literal has to name every field, so
+  [`cli/src/render.rs`](../../cli/src/render.rs) failed to compile until it
+  named the two new ones. Pattern matches with `..` were unaffected. The lesson
+  is that "additive" describes the wire, not every language binding, and the
+  Rust build is what says so.
+
 - **The kernel now sees more side-effect frames than before.** It reads the same
   signal (`saw_side_effect` still latches on the first), so the no-retry rule is
   unchanged, but `kernel.py` is sacred under ADR-0013 and the widened stream is

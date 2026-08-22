@@ -57,7 +57,9 @@ def test_every_side_effecting_call_emits_its_own_flag() -> None:
 def test_a_read_only_call_records_nothing_to_attribute_a_result_to() -> None:
     state = TurnState()
     _translate(
-        AssistantMessage(content=[ToolUseBlock(id="1", name="Read", input={"path": "a"})], model="m"),
+        AssistantMessage(
+            content=[ToolUseBlock(id="1", name="Read", input={"path": "a"})], model="m"
+        ),
         state,
     )
     assert state.pending_actions == {}

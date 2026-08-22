@@ -15,8 +15,8 @@ translation serve both the live HTTP turn and the conformance producer.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from aci_protocol import (
