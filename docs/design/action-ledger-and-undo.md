@@ -1,6 +1,8 @@
 # Design pass: the action ledger and undo
 
-> Status: **Design pass** for a proposed ADR (0117, unclaimed at time of writing).
+> Status: **Design pass** behind
+> [ADR-0117](../adr/0117-a-tool-that-changes-the-world-reports-what-it-changed.md)
+> (Draft), which settles the open questions this document raised.
 > No implementation is committed in this doc, and no ADR authorizes one yet
 > ([ADR-0085](../adr/0085-acceptance-not-implementation-authorizes-an-adr.md), as
 > amended by [ADR-0102](../adr/0102-accepted-alongside-implementation-with-explicit-approval.md)).
@@ -327,12 +329,21 @@ row is never itself reversible.
 - Any change to what a sandbox may reach. This design records and reverses; it
   does not widen.
 
-## Open questions for the ADR
+## Open questions, and how the ADR settled them
 
-1. Does undoing a gated tool require its own approval?
-2. Does the declaration live in `plugin.json` beside `approvalPolicy`, or in
-   `connectors.yaml` beside the connector that owns the tool? The bundle manifest
-   is proposed above; the connector is where the knowledge actually lives.
-3. Is `target` a declared key list per tool, or derived from the snapshot read?
-4. How long does a ledger row stay undoable? Approvals have `expires_at`; an
-   action probably needs the same, and the value is a policy question.
+1. ~~Does undoing a gated tool require its own approval?~~ **An undo requires the
+   authorization the forward action required, and no more.** The state being
+   restored is one the cluster was already in, reached without anyone approving
+   it, so nobody needs permission to put back what was there; what they need is
+   to be someone who could have permitted the change.
+2. ~~Does the declaration live in `plugin.json` or in `connectors.yaml`?~~
+   **Neither. The tool's reply is the declaration.** A manifest surface would be
+   a second source of truth, and the disagreement resolves the wrong way: the
+   manifest claims reversible, nothing captured the state, and the platform
+   either lies or ignores the manifest.
+3. ~~Is `target` declared per tool or derived from the snapshot read?~~ **It comes
+   from the tool's reply, with the same reasoning as 2**, and its absence is one
+   of the three things that make a row not undoable.
+4. ~~How long does a row stay undoable?~~ **It does not expire.** Time is the
+   wrong bound: a change one minute later makes a restore unsafe and a quiet week
+   does not make it safer. The world-moved check is the real bound.
