@@ -224,6 +224,18 @@ world before   public/api replicas = 3
 Step 5 is decision 4 working: a refused undo changes nothing, so a manual fix
 survives an undo pressed after it.
 
+**The loop runs through the platform.** `demo/action-ledger/run_demo.py`, recorded
+at [`docs/demo/adr-0117-undo.gif`](../demo/adr-0117-undo.gif), with the API
+answering over HTTP against a real Postgres:
+
+```
+[1] connector scales it              reply carries prior {"spec": {"replicas": 3}}
+[2] runner emits 2 frames            POST /actions x2, one undoable, one not
+[3] the receipt                      both lines, the second stating its reason
+[4] undo                             200, recorded state goes back
+[5] a human set it to 7 first        409, both states named, the fix survives
+```
+
 **A latent test defect surfaced.**
 `apps/api/tests/test_migration_0021a_v0_6_x_reconcile.py` pinned head as the
 literal `"0027"` in two places, so every future migration would have failed a
@@ -304,6 +316,34 @@ directory, which is the claim the test actually makes.
 - **Undo is a new write path into a customer's infrastructure**, authorized by
   decision 3 and audited by `action_audit_entries`. It reuses the connector's own
   credential and allowlist, so it can reach nothing the forward action could not.
+
+## The one decision this ADR does not make
+
+**Where the undo executor lives is open, and building the demo is what surfaced
+it.** Nothing in the platform can reach a connector today: neither
+`apps/api` nor `apps/worker` has an MCP client, and every out-of-loop HTTP call
+either makes is to the platform's own API. So the API rules on an undo and
+returns, and something else has to perform the call the ruling authorizes.
+
+Three candidates, none settled here:
+
+- **An MCP client in the worker.** The dependency is already present
+  transitively, so this is the smallest change. It also makes the control plane
+  a direct client of tenant connectors, which is a reachability question ADR-0008
+  has opinions about.
+- **A new ACI verb, executed by the runner in a sandbox.** Architecturally the
+  most conservative, because the sandbox is where a connector's credential,
+  allowlist and network policy already apply, so an undo could reach nothing the
+  forward call could not. It is also the most work: the runner would need to
+  invoke an MCP tool outside the model loop, which is precisely what the spike
+  found it cannot do today.
+- **The connector exposes a plain HTTP replay endpoint.** Avoids MCP entirely and
+  changes the connector contract for every author.
+
+The ruling and the execution are already separate in the code, which is what
+makes deferring this safe: a refusal is recorded and returned before anything
+could act on it, so whichever executor lands cannot bypass the check by holding
+the connector's address.
 
 ## Out of scope
 
