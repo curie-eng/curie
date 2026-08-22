@@ -45,7 +45,6 @@ import json
 import logging
 import os
 import ssl
-import sys
 from typing import Any
 
 import httpx
