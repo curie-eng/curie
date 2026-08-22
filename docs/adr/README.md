@@ -143,4 +143,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
 | 0113 | [Bundles declare connector build inputs and tiers deliver pinned images](0113-bundles-declare-connector-build-inputs-and-tiers-deliver-pinned-images.md) | Accepted |
 | 0116 | [Session identity arrives over the ACI so a sandbox can be pre-bound](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md) | Draft |
+| 0119 | [A resumed thread rebuilds its prefix so the prompt cache still hits](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md) | Draft |
 <!-- END GENERATED: adr-index -->
