@@ -233,6 +233,8 @@ _NAME_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
 _RESERVED_CONNECTOR_DISPLACES: dict[str, str] = {
     "curie": "`request_approval`",
     "curie-state": "the durable-state tools",
+    # PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+    "curie-delegate": "the agent-delegation tools",
 }
 RESERVED_CONNECTOR_NAMES: frozenset[str] = frozenset(_RESERVED_CONNECTOR_DISPLACES)
 

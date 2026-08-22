@@ -143,4 +143,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
 | 0113 | [Bundles declare connector build inputs and tiers deliver pinned images](0113-bundles-declare-connector-build-inputs-and-tiers-deliver-pinned-images.md) | Accepted |
 | 0114 | [Cluster up infers detected install facts](0114-cluster-up-infers-detected-install-facts.md) | Accepted |
+| 0115 | [Agents call each other directly, with no third party in the path](0115-agents-call-each-other-with-no-third-party.md) | Draft |
 <!-- END GENERATED: adr-index -->

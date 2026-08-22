@@ -360,6 +360,71 @@ class ApprovalAuditEntry(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class DelegationCallStatus(enum.StrEnum):
+    """Lifecycle of one agent-to-agent delegate call (ADR-0115 prototype)."""
+
+    pending = "pending"
+    delivered = "delivered"
+    dropped = "dropped"
+
+
+class DelegationCall(Base):
+    """PROTOTYPE (ADR-0115, Draft, not accepted -- see docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+
+    One row per ``curie-delegate__call_agent`` invocation: the durable record of
+    "agent A asked agent B to do something", carrying everything the round trip
+    needs. ``caller_reply_*`` is the durable twin of the CALLER's ``ReplyHandle``
+    at call time (mirrors ``Approval.reply_kind``/etc.), snapshotted rather than
+    re-resolved, so the eventual reply lands on the same route even if the
+    caller's binding changes in between.
+    """
+
+    __tablename__ = "delegation_calls"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    caller_agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    caller_conversation_id: Mapped[str]
+    caller_reply_kind: Mapped[str]
+    caller_reply_channel: Mapped[str]
+    caller_reply_endpoint: Mapped[str | None] = mapped_column(default=None)
+    caller_reply_adapter: Mapped[str | None] = mapped_column(default=None)
+    target_agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    request_text: Mapped[str]
+    result_text: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column(server_default=DelegationCallStatus.pending)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(default=None)
+
+
+class DelegateGrant(Base):
+    """PROTOTYPE (ADR-0115). The operator-armed allowlist: caller may call target.
+
+    Default closed -- a call is refused unless a row here has ``armed=True``
+    (ADR-0115 part 5, "the bundle declares, the operator arms"). The prototype
+    skips the bundle-manifest declaration half and just lets an operator arm a
+    pair by name directly; see the prototype notes doc for why.
+    """
+
+    __tablename__ = "delegate_grants"
+    __table_args__ = (
+        UniqueConstraint("caller_agent_id", "target_agent_id", name="delegate_grants_pair_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    caller_agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    target_agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    armed: Mapped[bool] = mapped_column(server_default="false")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class WorkflowStateEntry(Base):
     """Durable, agent-scoped key/value state (#23, first slice).
 

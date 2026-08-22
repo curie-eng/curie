@@ -1,0 +1,7 @@
+{
+  "name": "delegate-bob",
+  "version": "0.1.0",
+  "description": "PROTOTYPE demo bundle for Draft ADR-0115. Bob is the backend-only specialist agent a delegate call targets: it holds no other channel binding, since arming it as a delegate target replaces its one AgentChannel binding (an agent holds exactly one). See docs/demo/ADR-0115-PROTOTYPE-NOTES.md.",
+  "author": { "name": "CurieTech" },
+  "keywords": ["prototype", "adr-0115", "delegation", "demo"]
+}

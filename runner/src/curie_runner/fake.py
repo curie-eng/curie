@@ -9,10 +9,12 @@ spawns the CLI or touches the network. ``aci-protocol`` is never mocked.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+import aiohttp
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
@@ -22,10 +24,14 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import CanUseTool, ToolPermissionContext
 
 from .approval import APPROVAL_TOOL_NAME, ApprovalGate, process_approval_request
+from .delegate import DELEGATE_SERVER_NAME, DelegateApiClient, DelegateError
 
 
 def _assistant(*blocks: Any, usage: dict[str, Any] | None = None) -> AssistantMessage:
     return AssistantMessage(content=list(blocks), model="fake-model", usage=usage)
+
+
+logger = logging.getLogger(__name__)
 
 
 def _result(
@@ -89,6 +95,83 @@ def approval_turn(summary: str, route: str | None = None) -> list[Any]:
     ]
 
 
+# PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+# The offline fake never runs a real model, so it cannot "decide" to call
+# curie-delegate the way a live model reading its tool description would.
+# Mirrors APPROVAL_MARKER exactly: a marker in the query text stands in for
+# that decision so the demo (`curie local` with no model credential) can
+# exercise the REAL delegate router/MCP-server/reply-sink code path end to
+# end, offline. Everything after the marker on the same line is the message
+# sent to the target agent.
+DELEGATE_MARKER = "[fake:delegate:<target-agent>]"
+_DELEGATE_MARKER_RE = re.compile(r"\[fake:delegate:([A-Za-z0-9_-]+)\]")
+DELEGATE_TOOL_NAME = f"mcp__{DELEGATE_SERVER_NAME}__call_agent"
+
+
+# The delegate TARGET's side of the prototype demo. The fake model cannot
+# reason, so a delegated question would otherwise come back as the canned
+# "all done" -- a visible non-answer that makes the demo look like the delivery
+# path worked while the answer did not. This is a deterministic responder, not a
+# model: it solves a two-operand integer expression by regex and arithmetic, and
+# says "idk" for anything else. No model call and no network, so the
+# CURIE_FAKE_MODEL offline guarantee (ADR-0055, runner/CLAUDE.md) still holds.
+#
+# `eval` is deliberately NOT used: the input is an inbound message from another
+# agent, and handing that to the interpreter would be arbitrary code execution
+# in the sandbox for a demo fixture's convenience.
+_ARITH_RE = re.compile(r"(-?\d+)\s*([-+*/])\s*(-?\d+)")
+
+
+def solve_arithmetic(text: str) -> str | None:
+    """The answer to the first two-operand integer expression in ``text``.
+
+    None when there is nothing to solve, or when the expression is a division
+    by zero -- the caller turns both into "idk" rather than inventing an answer.
+    """
+
+    match = _ARITH_RE.search(text)
+    if match is None:
+        return None
+    left, operator, right = int(match.group(1)), match.group(2), int(match.group(3))
+    if operator == "+":
+        return str(left + right)
+    if operator == "-":
+        return str(left - right)
+    if operator == "*":
+        return str(left * right)
+    if right == 0:
+        return None
+    quotient, remainder = divmod(left, right)
+    return str(quotient) if remainder == 0 else f"{left / right:g}"
+
+
+def arithmetic_turn(question: str) -> list[Any]:
+    """A turn that answers a delegated arithmetic question, or admits it cannot."""
+
+    answer = solve_arithmetic(question) or "idk"
+    return [
+        _assistant(TextBlock(text=answer), usage={"input_tokens": 12, "output_tokens": 4}),
+        _result(text=answer, usage={"input_tokens": 12, "output_tokens": 4}),
+    ]
+
+
+def delegate_turn(target_agent: str, message: str) -> list[Any]:
+    """A turn that calls the (prototype) curie-delegate tool, then ends."""
+
+    text = f"Asking {target_agent} about that."
+    return [
+        _assistant(TextBlock(text=text)),
+        _assistant(
+            ToolUseBlock(
+                id="t1",
+                name=DELEGATE_TOOL_NAME,
+                input={"target_agent": target_agent, "message": message},
+            )
+        ),
+        _result(text=text, usage={"input_tokens": 20, "output_tokens": 8}),
+    ]
+
+
 class FakeModelSession:
     """A ModelSession that replays a fixed script of SDK messages per turn.
 
@@ -117,6 +200,8 @@ class FakeModelSession:
         truncate_on_interrupt: bool = True,
         can_use_tool: CanUseTool | None = None,
         approval_gate: ApprovalGate | None = None,
+        delegate_client: DelegateApiClient | None = None,
+        answer_arithmetic: bool = False,
     ) -> None:
         self._script_factory = script_factory or self._default_script
         self._truncate_on_interrupt = truncate_on_interrupt
@@ -126,6 +211,16 @@ class FakeModelSession:
         # the fake tier omits the sole-route auto-bind / unknown-route refusal and
         # silently widens the card -- the exact real-path regression #544 closed.
         self._approval_gate = approval_gate
+        # PROTOTYPE (Draft ADR-0115): when set, a scripted DELEGATE_TOOL_NAME
+        # block makes a REAL call through it (an actual HTTP POST to the
+        # prototype delegate route), the same "fake decision, real side effect"
+        # shape as request_approval above.
+        self._delegate_client = delegate_client
+        # PROTOTYPE (Draft ADR-0115): set only for a turn the delegate router
+        # minted (its conversation id is `delegate:<call id>`), so this responder
+        # answers a DELEGATED question and nothing else. Every other fake boot,
+        # and every existing test, keeps `default_turn()` verbatim.
+        self._answer_arithmetic = answer_arithmetic
         self.connected = False
         self.queries: list[str] = []
         self.interrupts = 0
@@ -144,6 +239,12 @@ class FakeModelSession:
         if match:
             summary = last[match.end() :].strip() or "unspecified request"
             return approval_turn(summary, route=match.group(1))
+        delegate_match = _DELEGATE_MARKER_RE.search(last)
+        if delegate_match:
+            message = last[delegate_match.end() :].strip() or "hello"
+            return delegate_turn(delegate_match.group(1), message)
+        if self._answer_arithmetic:
+            return arithmetic_turn(last)
         return default_turn()
 
     async def connect(self) -> None:
@@ -188,6 +289,15 @@ class FakeModelSession:
                 # untouched, so this is the only thing that sets the policy fields.
                 payload = block.input if isinstance(block.input, dict) else {}
                 process_approval_request(self._approval_gate, payload)
+            if block.name == DELEGATE_TOOL_NAME and self._delegate_client is not None:
+                payload = block.input if isinstance(block.input, dict) else {}
+                target_agent = payload.get("target_agent")
+                message = payload.get("message")
+                if isinstance(target_agent, str) and isinstance(message, str):
+                    try:
+                        await self._delegate_client.call_agent(target_agent, message)
+                    except (DelegateError, aiohttp.ClientError) as exc:
+                        logger.warning("fake-tier delegate call failed: %s", exc)
             if self._can_use_tool is not None:
                 await self._can_use_tool(block.name, block.input, ToolPermissionContext())
 

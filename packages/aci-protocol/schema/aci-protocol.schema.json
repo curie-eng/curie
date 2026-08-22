@@ -341,6 +341,38 @@
           ],
           "title": "Connector Secret Keys"
         },
+        "delegate_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_DELEGATE_TOKEN",
+          "producer": [
+            "worker"
+          ],
+          "title": "Delegate Token"
+        },
+        "delegate_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_DELEGATE_URL",
+          "producer": [
+            "worker"
+          ],
+          "title": "Delegate Url"
+        },
         "fake_model": {
           "anyOf": [
             {
@@ -1306,6 +1338,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.4.1",
-  "title": "ACI Protocol v0.4.1"
+  "protocolVersion": "0.4.2",
+  "title": "ACI Protocol v0.4.2"
 }
