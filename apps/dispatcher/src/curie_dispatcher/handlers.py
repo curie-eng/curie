@@ -53,6 +53,27 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _strip_self_mention(text: str, bot_user_id: str | None) -> str:
+    """Remove every mention of THIS bot from an event's raw ``text``.
+
+    Slack delivers ``app_mention``/``message`` events with the mention token
+    still embedded verbatim -- ``<@BOT_USER_ID>``, optionally followed by a
+    ``|display name`` label, and (since the composer always inserts one after
+    an inline mention) trailing whitespace. Left unstripped, a mention-only
+    message -- ``@Squawk`` and nothing else -- reaches the worker as a
+    NON-empty string, the mention markup itself, rather than the empty text
+    the sender actually meant. A model-backed agent shrugs this off as prompt
+    noise, which is exactly why it went unnoticed; an agent whose behavior
+    branches on emptiness (a stack's push-vs-pop, #1525) pushes the literal
+    markup instead of popping. ``bot_user_id`` comes from Bolt's own
+    ``context["bot_user_id"]`` (resolved from the ``authorize`` result per
+    request), never re-derived here.
+    """
+    if not bot_user_id:
+        return text
+    return re.sub(rf"<@{re.escape(bot_user_id)}(?:\|[^>]*)?>\s*", "", text).strip()
+
+
 def is_actionable(event: dict[str, Any]) -> bool:
     """False for events the dispatcher must ignore to avoid loops and noise.
 
@@ -73,6 +94,7 @@ def process_event(
     web_client: WebClient,
     redis_client: "Redis",
     config: DispatcherConfig,
+    bot_user_id: str | None = None,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
 ) -> str | None:
@@ -116,7 +138,7 @@ def process_event(
         event_id=slack_event_id,
         conversation_id=thread_ts,
         author=event.get("user", ""),
-        text=event.get("text", ""),
+        text=_strip_self_mention(event.get("text", ""), bot_user_id),
         # A person spoke, so this turn MAY steer a live one. Stated rather than
         # left to the model default for the same reason `kind` is: a producer
         # that does not say what it is produces turns nobody can audit.
@@ -242,19 +264,24 @@ def register_handlers(
     approval_resolver = resolver if resolver is not None else build_resolver(config)
 
     @app.event("app_mention")
-    def _on_app_mention(body: dict[str, Any], event: dict[str, Any]) -> None:
+    def _on_app_mention(
+        body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]
+    ) -> None:
         process_event(
             body=body,
             event=event,
             web_client=web_client,
             redis_client=redis_client,
             config=config,
+            bot_user_id=context.get("bot_user_id"),
             clock=clock,
             logger=logger,
         )
 
     @app.event("message")
-    def _on_message(body: dict[str, Any], event: dict[str, Any]) -> None:
+    def _on_message(
+        body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]
+    ) -> None:
         if event.get("channel_type") != "im":
             return
         process_event(
@@ -263,6 +290,7 @@ def register_handlers(
             web_client=web_client,
             redis_client=redis_client,
             config=config,
+            bot_user_id=context.get("bot_user_id"),
             clock=clock,
             logger=logger,
         )

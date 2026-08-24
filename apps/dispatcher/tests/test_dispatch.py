@@ -132,6 +132,67 @@ def test_envelope_acked_placeholder_posted_and_enqueued(
     assert queued.reply_handle.placeholder == BOT_TS
 
 
+def test_a_leading_self_mention_is_stripped_from_the_enqueued_text(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    # Slack delivers the raw `<@BOT_USER_ID>` token still embedded in `text`
+    # (never pre-stripped), so the dispatcher must remove its OWN mention --
+    # `_authorize`'s bot_user_id is "U0BOT" (conftest.py) -- before the text
+    # becomes the turn a bundle sees.
+    app, web_client = _build(config, redis_client)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(
+        sock, _events_api_request("env-1", "Ev-100", _mention_event("<@U0BOT> hi there"))
+    )
+    _drain(app)
+
+    _, fields = redis_client.xrange(config.stream)[0]
+    queued = from_stream_fields(fields)
+    assert queued.text == "hi there"
+
+
+def test_a_mention_only_message_strips_to_empty_text(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """A message that is JUST the mention -- the composer's forced trailing
+    space and nothing else -- must reach the worker as an EMPTY string, not as
+    the mention markup itself. Left unstripped this is invisible to a
+    model-backed agent (prompt noise) but wrong for anything that branches on
+    emptiness (a stack's push-vs-pop, #1525)."""
+    app, web_client = _build(config, redis_client)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(sock, _events_api_request("env-1", "Ev-100", _mention_event("<@U0BOT> ")))
+    _drain(app)
+
+    _, fields = redis_client.xrange(config.stream)[0]
+    queued = from_stream_fields(fields)
+    assert queued.text == ""
+
+
+def test_a_mention_with_a_display_label_is_also_stripped(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    # Some Slack surfaces render/echo a mention as `<@ID|label>` rather than
+    # the bare `<@ID>` the composer normally sends; both forms name the same
+    # bot and both must strip.
+    app, web_client = _build(config, redis_client)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(
+        sock, _events_api_request("env-1", "Ev-100", _mention_event("<@U0BOT|Squawk> hi"))
+    )
+    _drain(app)
+
+    _, fields = redis_client.xrange(config.stream)[0]
+    queued = from_stream_fields(fields)
+    assert queued.text == "hi"
+
+
 def test_the_dispatcher_makes_no_assistant_status_call(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
