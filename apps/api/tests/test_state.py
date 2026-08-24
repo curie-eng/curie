@@ -450,3 +450,70 @@ def test_list_namespaces_summarizes_the_store_recent_first(
     assert by_ns["alpha"]["key_count"] == 2
     assert by_ns["beta"]["key_count"] == 1
     assert by_ns["alpha"]["last_updated"] and by_ns["beta"]["last_updated"]
+
+
+def test_binding_scoped_state_is_isolated_from_the_shared_and_sibling_scopes(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#1525 follow-up: the `/state/bindings/{kind}/{address}/...` path names an
+    independent partition of the same agent's general state, distinct from the
+    plain (shared) path and from any other binding's own partition. This is
+    what makes a memory=False agent's bindings behave as isolated instances
+    that happen to share one bundle/budget/kill-state, and a memory=True
+    agent's worth of state (the plain path) as one instance reachable from
+    several doors -- the worker decides which URL to hand a runner (never
+    exercised here, an API-level test), but the API must honor both shapes
+    correctly regardless of which one is asked for.
+    """
+    aid = _agent(client, auth_headers)
+    second = client.post(
+        f"/agents/{aid}/channels",
+        json={"kind": "slack", "address": "C000000S02"},
+        headers=auth_headers,
+    )
+    assert second.status_code == 201, second.text
+
+    shared_url = f"/agents/{aid}/state/ns/k"
+    first_url = f"/agents/{aid}/state/bindings/slack/C000000S01/ns/k"
+    second_url = f"/agents/{aid}/state/bindings/slack/C000000S02/ns/k"
+
+    assert client.put(shared_url, json={"value": "shared"}, headers=auth_headers).status_code == 200
+    assert client.put(first_url, json={"value": "first"}, headers=auth_headers).status_code == 200
+    assert client.put(second_url, json={"value": "second"}, headers=auth_headers).status_code == 200
+
+    assert client.get(shared_url, headers=auth_headers).json()["value"] == "shared"
+    assert client.get(first_url, headers=auth_headers).json()["value"] == "first"
+    assert client.get(second_url, headers=auth_headers).json()["value"] == "second"
+
+    # Each scope's namespace listing sees only its own row.
+    listed = client.get(f"/agents/{aid}/state/bindings/slack/C000000S01/ns", headers=auth_headers)
+    assert [e["value"] for e in listed.json()] == ["first"]
+
+
+def test_binding_scoped_route_404s_for_a_pair_that_is_not_this_agents(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid = _agent(client, auth_headers)
+    resp = client.get(
+        f"/agents/{aid}/state/bindings/slack/C0NOTBOUND1/ns/k", headers=auth_headers
+    )
+    assert resp.status_code == 404
+    assert "binding" in resp.text.lower()
+
+
+def test_binding_scoped_route_accepts_the_same_scoped_token_shape_as_the_plain_route(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The binding path adds no new credential shape (#1525 follow-up): the
+    # SAME app-scoped sandbox token that already works on the plain path
+    # authenticates here too, since the token still only ever names an agent,
+    # never a binding -- the rejected #1525 alternative was widening it to.
+    aid = _agent(client, auth_headers)
+    api_key = get_settings().api_key
+    token = mint(api_key, agent=aid, scope="state.app", exp=_FAR_FUTURE)
+    headers = {"X-API-Key": token}
+    url = f"/agents/{aid}/state/bindings/slack/C000000S01/ns/k"
+
+    put = client.put(url, json={"value": {"n": 1}}, headers=headers)
+    assert put.status_code == 200, put.text
+    assert client.get(url, headers=headers).json()["value"] == {"n": 1}

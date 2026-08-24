@@ -52,7 +52,7 @@ fn agent_json(channels: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{bindings}],"created_at":"2026-07-05T00:00:00Z"}}"#
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{bindings}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
     )
 }
 

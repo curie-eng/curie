@@ -26,7 +26,7 @@ from .. import crud, sandbox_token
 from ..auth import verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import WorkflowStateEntry
+from ..models import AgentChannel, WorkflowStateEntry
 from ..schemas import StateAppendIn, StateEntryOut, StateEntryPut, StateNamespaceOut
 
 # Two scoped-token scopes the state router accepts (ADR-0033). The BROAD scope is
@@ -89,6 +89,43 @@ async def require_state_access(
     )
 
 
+async def _binding_scope(
+    session: AsyncSession, agent_id: uuid.UUID, kind: str, address: str
+) -> str:
+    """The `workflow_state_entries.binding_scope` value for one named binding
+    (#1525 follow-up): `"{kind}:{address}"`, once confirmed to actually belong
+    to this agent.
+
+    Not a security boundary -- the caller already reached this far only by
+    presenting a credential authenticating it as THIS agent's own sandbox (or
+    the platform key), and a scope string is just a partition key within that
+    one agent's already-fully-accessible general-state store, the same as any
+    `namespace`/`key` a caller could always freely choose. Checking it against
+    `agent_channels` is a correctness guard -- a typo or a stale binding name
+    fails loudly as 404 instead of silently opening a new, orphaned partition
+    that corresponds to nothing -- not an authorization check. That is also
+    why this reads the database directly rather than trusting a claim on the
+    presented credential: the credential (`sandbox_token`) authenticates WHICH
+    agent, never which of that agent's own bindings, by design (ADR-0033;
+    rejected alternative for #1525 was widening it to carry one, but a
+    same-agent partition key has no privilege for that credential to carry in
+    the first place).
+    """
+
+    exists = await session.scalar(
+        select(AgentChannel.id).where(
+            AgentChannel.agent_id == agent_id,
+            AgentChannel.kind == kind,
+            AgentChannel.address == address,
+        )
+    )
+    if exists is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"this agent has no {kind}:{address} binding"
+        )
+    return f"{kind}:{address}"
+
+
 async def forbid_reserved_namespace(
     namespace: str,
     caller: Annotated[StateCaller, Depends(require_state_access)],
@@ -122,6 +159,7 @@ def _json_size(value: Any) -> int:
 async def _enforce_caps(
     session: AsyncSession,
     agent_id: uuid.UUID,
+    scope: str | None,
     namespace: str,
     key: str,
     value: Any,
@@ -129,7 +167,11 @@ async def _enforce_caps(
     """Reject a write that breaks the per-value or per-namespace size cap (#248).
 
     The namespace total counts the incoming value plus every *other* key already
-    in the namespace (the key being written replaces its own prior size).
+    in the namespace (the key being written replaces its own prior size). Both
+    the byte totals and the namespace-count cap below are scoped by `scope`
+    (#1525 follow-up): a memory=False agent's bindings are meant to be
+    isolated, so one binding filling its own namespace or hitting the
+    namespace-count cap must not block or inflate another's unrelated usage.
     """
     settings = get_settings()
     value_bytes = _json_size(value)
@@ -143,6 +185,7 @@ async def _enforce_caps(
     others = await session.scalars(
         select(WorkflowStateEntry.value).where(
             WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.binding_scope == scope,
             WorkflowStateEntry.namespace == namespace,
             WorkflowStateEntry.key != key,
         )
@@ -163,6 +206,7 @@ async def _enforce_caps(
         select(WorkflowStateEntry.namespace)
         .where(
             WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.binding_scope == scope,
             WorkflowStateEntry.namespace == namespace,
         )
         .limit(1)
@@ -170,7 +214,8 @@ async def _enforce_caps(
     if namespace_exists is None:
         namespace_count = await session.scalar(
             select(func.count(func.distinct(WorkflowStateEntry.namespace))).where(
-                WorkflowStateEntry.agent_id == agent_id
+                WorkflowStateEntry.agent_id == agent_id,
+                WorkflowStateEntry.binding_scope == scope,
             )
         )
         if (namespace_count or 0) >= settings.state_max_namespaces:
@@ -183,11 +228,12 @@ async def _enforce_caps(
 
 
 async def _get_entry(
-    session: AsyncSession, agent_id: uuid.UUID, namespace: str, key: str
+    session: AsyncSession, agent_id: uuid.UUID, scope: str | None, namespace: str, key: str
 ) -> WorkflowStateEntry | None:
     entry: WorkflowStateEntry | None = await session.scalar(
         select(WorkflowStateEntry).where(
             WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.binding_scope == scope,
             WorkflowStateEntry.namespace == namespace,
             WorkflowStateEntry.key == key,
         )
@@ -195,24 +241,20 @@ async def _get_entry(
     return entry
 
 
-@router.put(
-    "/{agent_id}/state/{namespace}/{key}",
-    response_model=StateEntryOut,
-    dependencies=[Depends(forbid_reserved_namespace)],
-)
-async def put_state(
+async def _put_state(
     agent_id: uuid.UUID,
+    scope: str | None,
     namespace: str,
     key: str,
     data: StateEntryPut,
-    session: SessionDep,
+    session: AsyncSession,
 ) -> StateEntryOut:
     # Unknown agent is a 404 (the FK would also reject, but this is the clear
     # signal). expected_version opts into compare-and-set.
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    await _enforce_caps(session, agent_id, namespace, key, data.value)
-    entry = await _get_entry(session, agent_id, namespace, key)
+    await _enforce_caps(session, agent_id, scope, namespace, key, data.value)
+    entry = await _get_entry(session, agent_id, scope, namespace, key)
     if entry is None:
         if data.expected_version is not None:
             # A CAS put that expects a prior version cannot create the entry.
@@ -221,7 +263,7 @@ async def put_state(
                 "version mismatch: entry does not exist yet",
             )
         entry = WorkflowStateEntry(
-            agent_id=agent_id, namespace=namespace, key=key, value=data.value
+            agent_id=agent_id, binding_scope=scope, namespace=namespace, key=key, value=data.value
         )
         session.add(entry)
     else:
@@ -238,17 +280,42 @@ async def put_state(
     return StateEntryOut.model_validate(entry)
 
 
-@router.post(
-    "/{agent_id}/state/{namespace}/{key}/append",
+@router.put(
+    "/{agent_id}/state/{namespace}/{key}",
     response_model=StateEntryOut,
     dependencies=[Depends(forbid_reserved_namespace)],
 )
-async def append_state(
+async def put_state(
+    agent_id: uuid.UUID, namespace: str, key: str, data: StateEntryPut, session: SessionDep
+) -> StateEntryOut:
+    return await _put_state(agent_id, None, namespace, key, data, session)
+
+
+@router.put(
+    "/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
+    response_model=StateEntryOut,
+    dependencies=[Depends(forbid_reserved_namespace)],
+)
+async def put_state_for_binding(
     agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    namespace: str,
+    key: str,
+    data: StateEntryPut,
+    session: SessionDep,
+) -> StateEntryOut:
+    scope = await _binding_scope(session, agent_id, kind, address)
+    return await _put_state(agent_id, scope, namespace, key, data, session)
+
+
+async def _append_state(
+    agent_id: uuid.UUID,
+    scope: str | None,
     namespace: str,
     key: str,
     data: StateAppendIn,
-    session: SessionDep,
+    session: AsyncSession,
 ) -> StateEntryOut:
     """Append an item to a log-shaped (JSON array) entry (#248).
 
@@ -262,6 +329,7 @@ async def append_state(
         select(WorkflowStateEntry)
         .where(
             WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.binding_scope == scope,
             WorkflowStateEntry.namespace == namespace,
             WorkflowStateEntry.key == key,
         )
@@ -269,9 +337,9 @@ async def append_state(
     )
     if entry is None:
         new_value = [data.item]
-        await _enforce_caps(session, agent_id, namespace, key, new_value)
+        await _enforce_caps(session, agent_id, scope, namespace, key, new_value)
         entry = WorkflowStateEntry(
-            agent_id=agent_id, namespace=namespace, key=key, value=new_value
+            agent_id=agent_id, binding_scope=scope, namespace=namespace, key=key, value=new_value
         )
         session.add(entry)
     else:
@@ -281,7 +349,7 @@ async def append_state(
                 "cannot append: stored value is not a JSON array",
             )
         new_value = [*entry.value, data.item]
-        await _enforce_caps(session, agent_id, namespace, key, new_value)
+        await _enforce_caps(session, agent_id, scope, namespace, key, new_value)
         entry.value = new_value
         entry.version += 1
     await session.commit()
@@ -289,14 +357,43 @@ async def append_state(
     return StateEntryOut.model_validate(entry)
 
 
-@router.get("/{agent_id}/state", response_model=list[StateNamespaceOut])
-async def list_namespaces(
+@router.post(
+    "/{agent_id}/state/{namespace}/{key}/append",
+    response_model=StateEntryOut,
+    dependencies=[Depends(forbid_reserved_namespace)],
+)
+async def append_state(
+    agent_id: uuid.UUID, namespace: str, key: str, data: StateAppendIn, session: SessionDep
+) -> StateEntryOut:
+    return await _append_state(agent_id, None, namespace, key, data, session)
+
+
+@router.post(
+    "/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}/append",
+    response_model=StateEntryOut,
+    dependencies=[Depends(forbid_reserved_namespace)],
+)
+async def append_state_for_binding(
     agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    namespace: str,
+    key: str,
+    data: StateAppendIn,
     session: SessionDep,
-    caller: Annotated[StateCaller, Depends(require_state_access)],
+) -> StateEntryOut:
+    scope = await _binding_scope(session, agent_id, kind, address)
+    return await _append_state(agent_id, scope, namespace, key, data, session)
+
+
+async def _list_namespaces(
+    agent_id: uuid.UUID,
+    scope: str | None,
+    session: AsyncSession,
+    caller: StateCaller,
 ) -> list[StateNamespaceOut]:
-    """List the namespaces an agent has stored, each with its key count and the
-    most recent write time (#250). This is the enumeration the operator's
+    """List the namespaces stored under one scope, each with its key count and
+    the most recent write time (#250). This is the enumeration the operator's
     read/inspect surface needs on top of get-by-key + list-by-namespace; it stays
     within the store's non-goals (no query language, just a grouped summary).
     Namespaces are returned most-recently-written first.
@@ -304,20 +401,24 @@ async def list_namespaces(
     This route has no ``namespace`` path param, so ``forbid_reserved_namespace``
     cannot gate it; instead the reserved namespaces are filtered out for the
     narrow app (bundle) token (#856), the enumeration equivalent of that guard.
-    The platform key (the UI inspector) and the broad ``state`` loaders keep full
-    reach. ``require_state_access`` is a router-level dependency, so re-declaring
-    it here only surfaces the already-resolved caller (FastAPI caches it).
+    Which SCOPE this lists is entirely a function of which URL was called
+    (#1525 follow-up) -- the plain path always lists the shared scope, the
+    ``/bindings/{kind}/{address}`` path always lists exactly that binding's,
+    for every caller alike; an operator wanting the full picture of a
+    memory=False agent calls once per binding, the same way its own bundle
+    code only ever sees the one scope the worker handed it.
     """
-    rows = await session.execute(
+    query = (
         select(
             WorkflowStateEntry.namespace,
             func.count().label("key_count"),
             func.max(WorkflowStateEntry.updated_at).label("last_updated"),
         )
-        .where(WorkflowStateEntry.agent_id == agent_id)
+        .where(WorkflowStateEntry.agent_id == agent_id, WorkflowStateEntry.binding_scope == scope)
         .group_by(WorkflowStateEntry.namespace)
         .order_by(func.max(WorkflowStateEntry.updated_at).desc())
     )
+    rows = await session.execute(query)
     return [
         StateNamespaceOut(
             namespace=row.namespace,
@@ -332,6 +433,36 @@ async def list_namespaces(
     ]
 
 
+@router.get("/{agent_id}/state", response_model=list[StateNamespaceOut])
+async def list_namespaces(
+    agent_id: uuid.UUID,
+    session: SessionDep,
+    caller: Annotated[StateCaller, Depends(require_state_access)],
+) -> list[StateNamespaceOut]:
+    return await _list_namespaces(agent_id, None, session, caller)
+
+
+@router.get("/{agent_id}/state/bindings/{kind}/{address}", response_model=list[StateNamespaceOut])
+async def list_namespaces_for_binding(
+    agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    session: SessionDep,
+    caller: Annotated[StateCaller, Depends(require_state_access)],
+) -> list[StateNamespaceOut]:
+    scope = await _binding_scope(session, agent_id, kind, address)
+    return await _list_namespaces(agent_id, scope, session, caller)
+
+
+async def _get_state(
+    agent_id: uuid.UUID, scope: str | None, namespace: str, key: str, session: AsyncSession
+) -> StateEntryOut:
+    entry = await _get_entry(session, agent_id, scope, namespace, key)
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "state entry not found")
+    return StateEntryOut.model_validate(entry)
+
+
 @router.get(
     "/{agent_id}/state/{namespace}/{key}",
     response_model=StateEntryOut,
@@ -340,10 +471,34 @@ async def list_namespaces(
 async def get_state(
     agent_id: uuid.UUID, namespace: str, key: str, session: SessionDep
 ) -> StateEntryOut:
-    entry = await _get_entry(session, agent_id, namespace, key)
-    if entry is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "state entry not found")
-    return StateEntryOut.model_validate(entry)
+    return await _get_state(agent_id, None, namespace, key, session)
+
+
+@router.get(
+    "/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
+    response_model=StateEntryOut,
+    dependencies=[Depends(forbid_reserved_namespace)],
+)
+async def get_state_for_binding(
+    agent_id: uuid.UUID, kind: str, address: str, namespace: str, key: str, session: SessionDep
+) -> StateEntryOut:
+    scope = await _binding_scope(session, agent_id, kind, address)
+    return await _get_state(agent_id, scope, namespace, key, session)
+
+
+async def _list_state(
+    agent_id: uuid.UUID, scope: str | None, namespace: str, session: AsyncSession
+) -> list[StateEntryOut]:
+    # Which scope this lists is a function of which URL was called, same as
+    # _list_namespaces above -- uniform for every caller, no caller-type
+    # branching here either.
+    query = select(WorkflowStateEntry).where(
+        WorkflowStateEntry.agent_id == agent_id,
+        WorkflowStateEntry.binding_scope == scope,
+        WorkflowStateEntry.namespace == namespace,
+    )
+    entries = await session.scalars(query.order_by(WorkflowStateEntry.key))
+    return [StateEntryOut.model_validate(e) for e in entries]
 
 
 @router.get(
@@ -354,15 +509,29 @@ async def get_state(
 async def list_state(
     agent_id: uuid.UUID, namespace: str, session: SessionDep
 ) -> list[StateEntryOut]:
-    entries = await session.scalars(
-        select(WorkflowStateEntry)
-        .where(
-            WorkflowStateEntry.agent_id == agent_id,
-            WorkflowStateEntry.namespace == namespace,
-        )
-        .order_by(WorkflowStateEntry.key)
-    )
-    return [StateEntryOut.model_validate(e) for e in entries]
+    return await _list_state(agent_id, None, namespace, session)
+
+
+@router.get(
+    "/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
+    response_model=list[StateEntryOut],
+    dependencies=[Depends(forbid_reserved_namespace)],
+)
+async def list_state_for_binding(
+    agent_id: uuid.UUID, kind: str, address: str, namespace: str, session: SessionDep
+) -> list[StateEntryOut]:
+    scope = await _binding_scope(session, agent_id, kind, address)
+    return await _list_state(agent_id, scope, namespace, session)
+
+
+async def _delete_state(
+    agent_id: uuid.UUID, scope: str | None, namespace: str, key: str, session: AsyncSession
+) -> Response:
+    entry = await _get_entry(session, agent_id, scope, namespace, key)
+    if entry is not None:
+        await session.delete(entry)
+        await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.delete(
@@ -373,8 +542,16 @@ async def list_state(
 async def delete_state(
     agent_id: uuid.UUID, namespace: str, key: str, session: SessionDep
 ) -> Response:
-    entry = await _get_entry(session, agent_id, namespace, key)
-    if entry is not None:
-        await session.delete(entry)
-        await session.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return await _delete_state(agent_id, None, namespace, key, session)
+
+
+@router.delete(
+    "/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(forbid_reserved_namespace)],
+)
+async def delete_state_for_binding(
+    agent_id: uuid.UUID, kind: str, address: str, namespace: str, key: str, session: SessionDep
+) -> Response:
+    scope = await _binding_scope(session, agent_id, kind, address)
+    return await _delete_state(agent_id, scope, namespace, key, session)

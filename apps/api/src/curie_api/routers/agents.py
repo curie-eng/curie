@@ -169,6 +169,12 @@ async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionD
         agent = await crud.update_agent_model(session, agent, data.model)
     if "thinking" in sent:
         agent = await crud.update_agent_thinking(session, agent, data.thinking)
+    if data.memory is not None:
+        # Omitted leaves it unchanged; unlike `model`/`thinking` there is no
+        # separate "platform default" a null would clear back to, so this
+        # follows the plain-None-check siblings below rather than the
+        # model_fields_set pair above.
+        agent = await crud.update_agent_memory(session, agent, data.memory)
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).
         agent = await crud.update_agent_approval_tools(session, agent, data.approval_required_tools)

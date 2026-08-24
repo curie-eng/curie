@@ -112,6 +112,12 @@ pub struct Agent {
     /// explicit null clears it.
     #[serde(default)]
     pub thinking: Option<String>,
+    /// Whether this agent's bindings share one workflow-state namespace
+    /// (`true`) or each get their own (`false`, the default) (#1525 follow-up,
+    /// ADR-0118). Cardinality alone opts an agent into multiple surfaces; this
+    /// is the separate, explicit toggle for whether those surfaces share
+    /// cross-turn state.
+    pub memory: bool,
 }
 
 /// One route's workspace binding, mirroring the committed `ApprovalRouteBinding`.

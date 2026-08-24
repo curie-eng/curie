@@ -1100,7 +1100,14 @@ class _TokenBinding:
     async def resolve(self, _kind: str, _channel: str) -> _FakeResolved:
         return _FakeResolved(self._agent_id)
 
-    def boot_env(self, _resolved: object, _thread_key: str) -> dict[str, str]:
+    def boot_env(
+        self,
+        _resolved: object,
+        _thread_key: str,
+        *,
+        kind: str | None = None,
+        address: str | None = None,
+    ) -> dict[str, str]:
         return {"CURIE_RUNNER_TOKEN": self._token}
 
     def packs_for(self, _resolved: object) -> BehaviorPacks:

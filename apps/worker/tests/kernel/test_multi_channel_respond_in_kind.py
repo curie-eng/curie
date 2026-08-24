@@ -93,7 +93,14 @@ class OneAgentTwoBindings:
             return self._deployment()
         return None
 
-    def boot_env(self, resolved: ResolvedDeployment, thread_key: str) -> dict[str, str]:
+    def boot_env(
+        self,
+        resolved: ResolvedDeployment,
+        thread_key: str,
+        *,
+        kind: str | None = None,
+        address: str | None = None,
+    ) -> dict[str, str]:
         return {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
             BUNDLE_REF_ENV: resolved.bundle_ref or "",

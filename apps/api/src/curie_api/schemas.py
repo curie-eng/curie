@@ -800,6 +800,10 @@ class AgentCreate(BaseModel):
     # secret. Stored on the agent row for the local tier and forwarded into the
     # sandbox by the worker binding. None means no connector secrets.
     secrets: dict[str, str] | None = None
+    # Whether this agent's bindings share one workflow-state namespace (#1525
+    # follow-up). False (the default) matches a single-binding agent's existing
+    # behavior exactly, since there is nothing yet to share with.
+    memory: bool = False
 
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
@@ -850,6 +854,13 @@ class AgentUpdate(BaseModel):
     # has no other way to be bound. Without this, git-flow cannot find that
     # agent and a target naming it is rejected as unknown.
     repo_full_name: str | None = None
+    # New value for whether this agent's bindings share one workflow-state
+    # namespace (#1525 follow-up). Omitted (None) leaves it unchanged; unlike
+    # `model`/`thinking` there is no separate "platform default" a null would
+    # clear back to, so the router checks `is not None` rather than
+    # `model_fields_set` -- an explicit `"memory": null` is refused by the
+    # type rather than accepted as a third state.
+    memory: bool | None = None
 
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
@@ -886,6 +897,9 @@ class AgentOut(BaseModel):
     # column is a name->value map; expose just the sorted names so an operator can
     # see which secrets an agent has bound without the material leaving the API.
     secrets: list[str] | None
+    # Whether this agent's bindings share one workflow-state namespace (#1525
+    # follow-up).
+    memory: bool
     created_at: datetime
 
     @field_validator("secrets", mode="before")

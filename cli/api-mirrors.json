@@ -275,6 +275,10 @@
         {
           "field": "channels",
           "why": "The verb reads and writes the two nullable model/thinking overrides; an agent's channel bindings (kind + address) are a different concern with their own surface (`<tier> surfaces`), and emitting them here would imply this verb can change them."
+        },
+        {
+          "field": "memory",
+          "why": "Same reason as `channels`: whether an agent's bindings share workflow state (#1525 follow-up, ADR-0118) is a separate concern from the model/thinking pair this verb reads and writes, and it has no CLI surface of its own yet -- emitting it here would imply this verb can change it."
         }
       ]
     }

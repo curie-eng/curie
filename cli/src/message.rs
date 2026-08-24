@@ -3242,11 +3242,11 @@ mod tests {
         );
     }
 
-    fn agent(name: &str, channel: &str) -> Agent {
-        agent_bound_to(name, &[channel])
+    fn test_agent(name: &str, channel: &str) -> Agent {
+        test_agent_bound_to(name, &[channel])
     }
 
-    fn agent_bound_to(name: &str, channels: &[&str]) -> Agent {
+    fn test_agent_bound_to(name: &str, channels: &[&str]) -> Agent {
         Agent {
             id: format!("id-{name}"),
             name: name.to_string(),
@@ -3262,6 +3262,7 @@ mod tests {
             approval_routes: None,
             model: None,
             thinking: None,
+            memory: false,
         }
     }
 
@@ -3424,13 +3425,13 @@ mod tests {
 
     #[test]
     fn select_channel_prefers_explicit() {
-        let agents = [agent("a", "C1"), agent("b", "C2")];
+        let agents = [test_agent("a", "C1"), test_agent("b", "C2")];
         assert_eq!(select_channel(&agents, Some("CX")).unwrap(), "CX");
     }
 
     #[test]
     fn select_channel_uses_the_sole_agent() {
-        let agents = [agent("only", "C-ONLY")];
+        let agents = [test_agent("only", "C-ONLY")];
         assert_eq!(select_channel(&agents, None).unwrap(), "C-ONLY");
     }
 
@@ -3443,7 +3444,7 @@ mod tests {
 
     #[test]
     fn select_channel_errors_on_many_agents_listing_them() {
-        let agents = [agent("alpha", "C1"), agent("beta", "C2")];
+        let agents = [test_agent("alpha", "C1"), test_agent("beta", "C2")];
         let err = select_channel(&agents, None).unwrap_err().to_string();
         assert!(err.contains("--channel"), "{err}");
         assert!(err.contains("alpha -> C1"), "{err}");
@@ -3457,8 +3458,8 @@ mod tests {
         // deployed, so an agent bound to nothing must not make the one real
         // binding ambiguous.
         let agents = [
-            agent_bound_to("only", &["C0EXAMPLE1"]),
-            agent_bound_to("idle", &[]),
+            test_agent_bound_to("only", &["C0EXAMPLE1"]),
+            test_agent_bound_to("idle", &[]),
         ];
         assert_eq!(select_channel(&agents, None).unwrap(), "C0EXAMPLE1");
     }
@@ -3470,7 +3471,7 @@ mod tests {
         // agent bound to two channels silently routes to whichever one the
         // scalar column happened to hold. Two pairs is ambiguous, and the
         // error must name BOTH so the operator can pick.
-        let agents = [agent_bound_to("solo", &["C0EXAMPLE1", "C0EXAMPLE2"])];
+        let agents = [test_agent_bound_to("solo", &["C0EXAMPLE1", "C0EXAMPLE2"])];
         let err = select_channel(&agents, None).unwrap_err().to_string();
         assert!(err.contains("--channel"), "{err}");
         assert!(err.contains("solo -> C0EXAMPLE1"), "{err}");
@@ -3484,8 +3485,8 @@ mod tests {
         // binding: an explicit --channel naming the SECOND one would report
         // "no deployed agent has channel ..." for an agent that plainly does.
         let agents = [
-            agent_bound_to("one", &["C0EXAMPLE1", "C0EXAMPLE2"]),
-            agent_bound_to("two", &["C0EXAMPLE3"]),
+            test_agent_bound_to("one", &["C0EXAMPLE1", "C0EXAMPLE2"]),
+            test_agent_bound_to("two", &["C0EXAMPLE3"]),
         ];
         assert_eq!(
             select_agent_id(&agents, Some("C0EXAMPLE2")).unwrap(),
@@ -4166,6 +4167,7 @@ mod tests {
                 approval_routes: None,
                 model: None,
                 thinking: None,
+                memory: false,
             },
             Agent {
                 id: "a2".into(),
@@ -4179,6 +4181,7 @@ mod tests {
                 approval_routes: None,
                 model: None,
                 thinking: None,
+                memory: false,
             },
         ];
         // Explicit channel picks the matching agent's id.

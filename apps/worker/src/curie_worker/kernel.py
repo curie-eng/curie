@@ -791,7 +791,12 @@ class Kernel:
                 # The scoped key, not the bare conversation id: this mints the
                 # sandbox's history ref and session id, so two channels sharing
                 # a conversation id must not rehydrate one another's transcript.
-                boot_env = self._binding.boot_env(resolved, thread_key)
+                boot_env = self._binding.boot_env(
+                    resolved,
+                    thread_key,
+                    kind=qevent.reply_handle.kind,
+                    address=qevent.reply_handle.channel,
+                )
                 if getattr(resolved, "workspace_enabled", False):
                     workspace_deployment_id = getattr(resolved, "deployment_id", None)
                     if workspace_deployment_id is None:

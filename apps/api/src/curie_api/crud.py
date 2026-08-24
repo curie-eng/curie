@@ -171,6 +171,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
             else None
         ),
         secrets=data.secrets,
+        memory=data.memory,
     )
     session.add(agent)
     return await refresh_with_channels(session, agent)
@@ -350,6 +351,19 @@ async def update_agent_thinking(
     session: AsyncSession, agent: Agent, thinking: str | None
 ) -> Agent:
     agent.thinking = thinking
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_memory(session: AsyncSession, agent: Agent, memory: bool) -> Agent:
+    """Set whether this agent's bindings share one workflow-state namespace
+    (#1525 follow-up). Flipping it changes nothing already stored -- a row
+    written under one scope is simply not the row a later request under the
+    other scope reads; it is a routing decision for FUTURE state calls, not a
+    migration of past ones."""
+
+    agent.memory = memory
     await session.commit()
     await session.refresh(agent)
     return agent

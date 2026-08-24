@@ -39,7 +39,14 @@ class StubBinding:
     async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
         return self._by_route.get((kind, address))
 
-    def boot_env(self, resolved: ResolvedDeployment, thread_key: str) -> dict[str, str]:
+    def boot_env(
+        self,
+        resolved: ResolvedDeployment,
+        thread_key: str,
+        *,
+        kind: str | None = None,
+        address: str | None = None,
+    ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
             PLUGIN_DIR_ENV: "/bundles/current",

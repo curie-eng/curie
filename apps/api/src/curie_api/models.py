@@ -126,6 +126,17 @@ class Agent(Base):
     # sitting in plaintext in the control plane, and rotating it any other way
     # means rotating the platform key for every agent at once.
     hook_generation: Mapped[int] = mapped_column(default=0, server_default="0")
+    # Whether this agent's bindings share one workflow-state namespace or each
+    # get their own (#1525 follow-up). Cardinality alone (ADR-0118 decision 2)
+    # governs routing and agent-scoped controls (budget, kill state, bundle
+    # version) unconditionally -- those are never gated by this column. This
+    # ONLY decides `workflow_state_entries.binding_scope`: False (default) keys
+    # every binding's state store separately, so an agent invited to a second
+    # channel it never explicitly opted into sharing does not silently start
+    # mixing that channel's state into the first's. True shares one namespace
+    # across every binding. Existing single-binding agents are unaffected
+    # either way, since there is nothing else to share with.
+    memory: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list[AgentVersion]] = relationship(
@@ -652,13 +663,23 @@ class WorkflowStateEntry(Base):
 
     __tablename__ = "workflow_state_entries"
     __table_args__ = (
-        UniqueConstraint("agent_id", "namespace", "key", name="uq_state_agent_ns_key"),
+        UniqueConstraint(
+            "agent_id", "binding_scope", "namespace", "key", name="uq_state_agent_scope_ns_key"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
     )
+    # NULL when the owning agent has `memory=True` (one shared namespace); the
+    # binding's own `"{kind}:{address}"` when `memory=False` (#1525 follow-up).
+    # Minted into the worker's `state.app`/`state` token per turn from the
+    # agent's CURRENT `memory` value, never read back off this column -- the
+    # column only picks which row a request lands on. Part of the unique key
+    # (not just an extra filter) so a memory=False agent's two bindings get
+    # two independent rows for the same namespace+key instead of colliding.
+    binding_scope: Mapped[str | None] = mapped_column(default=None)
     namespace: Mapped[str]
     key: Mapped[str]
     # Any JSON value: an object (a pending-approvals map), an array (a log
