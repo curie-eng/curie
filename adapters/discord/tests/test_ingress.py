@@ -26,6 +26,35 @@ def test_parent_mention_becomes_a_stable_curie_turn() -> None:
     }
 
 
+def test_a_mention_with_nothing_else_still_becomes_a_turn_with_empty_text() -> None:
+    # Whether "nothing to say" is meaningful is the agent's call (a
+    # stack-shaped agent treats it as pop), never this adapter's -- refusing
+    # to build a turn here would drop the delivery before Curie ever saw it,
+    # inconsistent with Slack's ingress forwarding the same empty text.
+    binding = DiscordBinding(parent_channel_id="111", address="111", token="chn_test")
+    message = DiscordMessage(
+        id="9001",
+        channel_id="111",
+        thread_id="222",
+        author_id="333",
+        author_name="Ada",
+        content="<@42>",
+        mentioned_user_ids=frozenset({"42"}),
+    )
+
+    turn = build_turn(message, bot_user_id="42", binding=binding, reply_ref="9002")
+
+    assert turn == {
+        "kind": "discord",
+        "address": "111",
+        "delivery_id": "9001",
+        "conversation_id": "222",
+        "author": "Ada (333)",
+        "text": "",
+        "reply_ref": "9002",
+    }
+
+
 def test_message_without_the_bot_mention_is_not_a_new_turn() -> None:
     binding = DiscordBinding(parent_channel_id="111", address="111", token="chn_test")
     message = DiscordMessage(

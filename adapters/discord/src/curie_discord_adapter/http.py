@@ -20,9 +20,17 @@ def create_reply_app(service: ReplyService, adapter_secret: str) -> FastAPI:
     @app.post("/replies", response_model=ReplyAck)
     async def replies(
         request: Request,
-        x_curie_adapter_key: str | None = Header(default=None),
+        # Matches the worker's own name for this header exactly
+        # (`ADAPTER_SECRET_HEADER` in `apps/worker/src/curie_worker/reply_sink.py`)
+        # -- that is the side that actually sends it, so it is the name that
+        # governs. A prior mismatch here (`X-Curie-Adapter-Key`) meant every
+        # reply delivery 401'd unconditionally: each side's own unit tests
+        # passed in isolation because each asserted its OWN (different) name,
+        # and only a genuine cross-service round trip ever exercised both at
+        # once.
+        x_curie_adapter_secret: str | None = Header(default=None),
     ) -> ReplyAck:
-        supplied = x_curie_adapter_key or ""
+        supplied = x_curie_adapter_secret or ""
         if not secrets.compare_digest(supplied, adapter_secret):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing or invalid credential")
         try:

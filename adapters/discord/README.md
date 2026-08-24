@@ -17,7 +17,7 @@ messages. Keep the bot token in this adapter only.
 Set these environment variables:
 
 - `DISCORD_BOT_TOKEN`: Discord bot token.
-- `CURIE_DISCORD_ADAPTER_SECRET`: secret expected in `X-Curie-Adapter-Key` on
+- `CURIE_DISCORD_ADAPTER_SECRET`: secret expected in `X-Curie-Adapter-Secret` on
   Curie reply requests.
 - `CURIE_API_URL`: Curie API origin, for example `http://api:8000`.
 - `CURIE_DISCORD_BINDINGS`: JSON array of parent channel bindings. Each item is

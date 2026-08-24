@@ -34,7 +34,7 @@ def test_reply_endpoint_authenticates_and_parses_the_neutral_wire() -> None:
     accepted = client.post(
         "/replies",
         json=payload(),
-        headers={"X-Curie-Adapter-Key": "reply-secret"},
+        headers={"X-Curie-Adapter-Secret": "reply-secret"},
     )
 
     assert accepted.status_code == 200
