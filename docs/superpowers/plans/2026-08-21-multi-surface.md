@@ -188,46 +188,10 @@ Run: `git add cli apps/ui apps/api/openapi.json && git commit -m "Expose multi s
 
 ### Task 5: Discord Adapter
 
-**Files:**
-- Create: `adapters/discord/pyproject.toml`
-- Create: `adapters/discord/src/curie_discord_adapter/config.py`
-- Create: `adapters/discord/src/curie_discord_adapter/state.py`
-- Create: `adapters/discord/src/curie_discord_adapter/ingress.py`
-- Create: `adapters/discord/src/curie_discord_adapter/egress.py`
-- Create: `adapters/discord/src/curie_discord_adapter/main.py`
-- Create: `adapters/discord/Dockerfile`
-- Create: `adapters/discord/README.md`
-- Create: `adapters/discord/tests/test_ingress.py`
-- Create: `adapters/discord/tests/test_egress.py`
-- Create: `adapters/discord/tests/test_state.py`
-- Modify: `pyproject.toml`
-
-**Interfaces:**
-- Consumes: Discord Gateway message events and `POST /channels/turns` with a per-binding bearer token.
-- Produces: authenticated `POST /replies` accepting neutral `turn.status`, `reply.update`, and `reply.post` events.
-- Persists: SQLite mapping from `(conversation, reply_ref)` to continuation message ids and completed event ids.
-
-- [ ] **Step 1: Write and run fail first adapter tests**
-
-Test the observable transforms: only bot mentions in configured parent channels start turns; adapter-created thread messages continue them; delivery ids equal Discord message ids; reply chunks are at most 2000 Unicode code points; repeated completion events do not post twice; invalid adapter secrets return `401`; allowed mentions are suppressed.
-
-Run: `uv run pytest -q adapters/discord/tests`
-
-Expected: import failure because the adapter package does not exist.
-
-- [ ] **Step 2: Implement the adapter service**
-
-Use the maintained Discord Gateway client for message receipt and Discord REST for create and edit operations. Create a public thread and placeholder for a new mention, then post the normalized turn to Curie. Authenticate neutral reply delivery with a constant-time comparison, edit the placeholder plus durable continuation messages for updates, and make `turn.status` a successful no-op.
-
-- [ ] **Step 3: Re-run adapter tests and static checks**
-
-Run: `uv run pytest -q adapters/discord/tests && uv run ruff check adapters/discord && uv run mypy adapters/discord/src`
-
-Expected: pass.
-
-- [ ] **Step 4: Commit**
-
-Run: `git add adapters/discord pyproject.toml uv.lock && git commit -m "Add the Discord surface adapter"`
+Ships in a companion PR stacked on this one (`adapters/discord/`), not here --
+the core stays adapter neutral regardless of which second adapter proves it,
+and the two are independently reviewable. See that PR's own plan for this
+task's original steps.
 
 ### Task 6: Documentation and End to End Verification
 
@@ -236,7 +200,6 @@ Run: `git add adapters/discord pyproject.toml uv.lock && git commit -m "Add the 
 - Modify: `docs/guides/building-a-channel-adapter.md`
 - Modify: `docs/interfaces/channel-ingress/INTERFACE.md`
 - Modify: `docs/your-first-slack-agent.md`
-- Create: `docs/guides/discord-adapter.md`
 
 **Interfaces:**
 - Produces: a reproducible demo showing one agent id and deployment answering in Slack and Discord with surface-specific thread continuity.

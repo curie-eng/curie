@@ -1,9 +1,5 @@
 # Building a channel adapter
 
-For a complete production-shaped example, see
-[`adapters/discord`](../../adapters/discord/) and
-[`Connect one Curie agent to Discord and Slack`](discord-adapter.md).
-
 How to put Curie on a channel it has never heard of (a mail server, a support
 desk, a webhook bus) without changing the platform. Since ADR-0096 phase 2 the
 channel port is neutral: the platform never learns your channel's shape, and you

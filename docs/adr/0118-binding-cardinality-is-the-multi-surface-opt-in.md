@@ -16,7 +16,10 @@ Realizing code paths are `apps/api/src/curie_api/models.py` and
 `apps/worker/src/curie_worker/binding.py` and
 `apps/worker/src/curie_worker/kernel.py` for resolution and session isolation,
 `cli/src/main.rs` and `apps/ui/src/views/wired/WiredAgentDetail.tsx` for the
-operator surface, and `adapters/discord/` for the public second adapter.
+operator surface. `adapters/discord/`, the public second adapter proving
+decision 6, ships in a companion PR stacked on this one -- the core stays
+adapter neutral regardless of which adapter proves it, so the two are
+independently reviewable.
 
 ## Context
 
@@ -97,10 +100,14 @@ Slack and Discord conversations.
 ### 6. The public proof is a deployed Discord adapter
 
 The core remains adapter neutral and a real Discord adapter proves the second
-surface. Per ADR 0096, the adapter is a deployed service outside the worker. It
-owns the Discord bot token, calls the scoped Curie ingress API, and implements
-the neutral reply HTTP wire. It never receives the Slack token, platform key,
-model credentials, or queue credentials.
+surface, in a companion PR stacked on this one rather than bundled into it --
+the cardinality decision and its realization here do not depend on any
+particular second adapter existing, and reviewing the two independently keeps
+that true rather than merely stated. Per ADR 0096, the adapter is a deployed
+service outside the worker. It owns the Discord bot token, calls the scoped
+Curie ingress API, and implements the neutral reply HTTP wire. It never
+receives the Slack token, platform key, model credentials, or queue
+credentials.
 
 The first Discord capability set is text, mentions, threaded conversations,
 and editable streamed replies. Interactive approvals, files, reactions, direct
