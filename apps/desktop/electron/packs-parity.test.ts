@@ -70,8 +70,22 @@ for blob, seed in req["sample"]:
 json.dump(out, sys.stdout)
 `;
 
+/**
+ * Why this suite may legitimately be skipped, or null to run it.
+ *
+ * The two failure modes must not be conflated. No `uv` on PATH is a property of
+ * the machine and a fair skip. `uv` present but the module failing to import is a
+ * property of the REPO -- the module moved, was renamed, or grew a dependency
+ * beyond pydantic -- and skipping on that would silently retire the only check
+ * that the mirror is still faithful. So that one throws.
+ */
 function probe(): string | null {
   if (!existsSync(WORKER)) return "apps/worker is not in this checkout";
+  try {
+    execFileSync("uv", ["--version"], { stdio: "pipe", timeout: 60_000 });
+  } catch {
+    return "uv is not on PATH";
+  }
   try {
     execFileSync("uv", [...UV, "-c", "import curie_worker.behaviorpacks"], {
       cwd: WORKER,
@@ -79,10 +93,16 @@ function probe(): string | null {
       stdio: "pipe",
       timeout: 180_000,
     });
-    return null;
   } catch (err) {
-    return `cannot run the worker's Python: ${(err as Error).message.split("\n")[0]}`;
+    const detail = (err as { stderr?: Buffer }).stderr?.toString().trim().split("\n").slice(-3).join(" ");
+    throw new Error(
+      `uv is available but curie_worker.behaviorpacks would not import, so the ` +
+        `behavior-pack mirror cannot be checked against it. If the module grew a ` +
+        `dependency, add it to the --with list in UV above. ${detail ?? ""}`,
+      { cause: err },
+    );
   }
+  return null;
 }
 
 const unavailable = probe();
