@@ -138,6 +138,42 @@ React + TypeScript renderer. Full structure and rationale in
   normal state to save in. YAML is left to the CLI because there is no parser
   here and guessing would be worse.
 
+- **The behavior-pack mirror must agree with the worker, and is tested against
+  it.** `src/lib/packs.ts` reimplements `curie_worker.behaviorpacks` -- the
+  greeting/help matcher, the load/tip sampler, the caption composition, setting
+  coercion -- so the Build view can show an author what a pack will actually do.
+  A mirror that is merely plausible is worse than none, because it states a
+  confident preview the platform disagrees with. So
+  `electron/packs-parity.test.ts` runs both implementations over one corpus and
+  fails when they differ; CI installs `uv` for it, and it skips (loudly) without.
+  When the worker's matcher changes, that test is what tells you.
+
+  Three things about packs are load bearing and were each read out of the
+  platform rather than assumed:
+  - **Packs are per-agent config on the agent row, not bundle content.**
+    `plugin.json` has no pack field. They are read and written through
+    `GET|PUT /agents/{id}/behavior-packs`, and **the CLI has no verb for them at
+    all** -- the only surface of this app that is not catching up to the CLI. The
+    Build view therefore drafts packs from the bundle's own facts (description,
+    starter prompts) and writes them to an agent the operator picks, and says so
+    on screen. Do not add a pack field to a bundle file to make the screen
+    tidier; `packages/plugin-format` would reject it.
+  - **A pack can be enabled and inert, and the platform will not say so.**
+    `match_greeting` returns None when the reply is empty *before* it looks at
+    the phrases; `sample_load` returns None on an empty list and the generic
+    caption shows instead. Naming those two states is most of why this surface
+    exists (`packIssues`, `isInert`).
+  - **Only the settings pack has no runtime.** `resolve_settings` and
+    `coerce_setting` have no call site outside their own module, and the doc says
+    the override store is deferred. `PACK_KINDS[].live` carries that, and the UI
+    shows it, because an author who is not told will read inert as broken.
+    Everything else -- load, tips, greeting, help, nav -- is wired in `kernel.py`
+    and `blocks.py`.
+
+  As in `bundle.ts`, an `error` here means "this will not fire", never "the API
+  will reject it". Every pack the checker flags is schema-valid, so refusing to
+  save one would make this app stricter than the platform it is a client of.
+
 - **Table logic lives in `src/lib/workloads.ts`, not in the view.** Filtering,
   sorting, grouping and roll-up are pure functions with tests, because grouping
   that only exists inside a component can only be checked by opening a browser
