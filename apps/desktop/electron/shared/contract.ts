@@ -156,6 +156,10 @@ export interface ShellEnvironment {
   readonly kubectlAvailable: boolean;
   readonly helmAvailable: boolean;
   readonly platform: Platform;
+  /** Where a command runs when no bundle is open. Resolved in the shell
+   *  (`CURIE_WORKSPACE` or the home directory), because the renderer cannot see
+   *  either and must not print a directory it guessed. */
+  readonly defaultCwd: string;
   readonly appVersion: string;
   readonly electronVersion: string;
   readonly chromeVersion: string;

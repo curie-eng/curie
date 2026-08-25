@@ -244,6 +244,7 @@ function registerIpc(): void {
       kubectlAvailable: await which("kubectl"),
       helmAvailable: await which("helm"),
       platform: process.platform,
+      defaultCwd: cli.defaultCwd(),
       appVersion: app.getVersion(),
       electronVersion: process.versions.electron,
       chromeVersion: process.versions.chrome,

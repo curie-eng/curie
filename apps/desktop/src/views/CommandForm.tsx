@@ -17,7 +17,7 @@ import { useCallback, useMemo, useState } from "react";
 
 import { useApp } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
-import { ACCENT, FONT, LINE, R, S, STATUS, T } from "../tokens";
+import { ACCENT, F, FONT, LINE, R, S, STATUS, T } from "../tokens";
 import { Badge, Button, CopyButton, Field, Input, Mono, Notice, Select, Sheet, Textarea, Toggle } from "../primitives";
 import {
   fieldKind,
@@ -34,6 +34,39 @@ type Values = Record<string, string | boolean | undefined>;
 /** Seed a form from the manifest's defaults plus whatever the app already knows
  *  (the open bundle, the last-used API URL). A field the operator has since
  *  edited is never overwritten -- `seed` runs only when the command changes. */
+/**
+ * The directory the command will run in.
+ *
+ * Every invocation this form launches carries `cwd: app.workspace?.path`, so the
+ * bundle chosen in the sidebar decides where `skill up`, `skill check` and
+ * `skill eval` do their work -- from any tab, including the palette. Nothing said
+ * so anywhere, which is what made a global control look like decoration for the
+ * Build tab, and made "the exact command that will run" less than exact: for a
+ * skill-tier command the directory IS the argument.
+ *
+ * The fallback comes from the shell (`CURIE_WORKSPACE` or the home directory)
+ * rather than being guessed here, because a directory this app prints and does
+ * not actually use would be worse than printing none.
+ */
+function RunDirectory() {
+  const app = useApp();
+  const open = app.workspace;
+  const where = open?.path || app.env?.defaultCwd || null;
+
+  return (
+    <div style={{ ...F.footnote, color: T.quaternary, marginBottom: 12, marginTop: -6 }}>
+      {where === null ? (
+        "Working directory not known yet."
+      ) : (
+        <>
+          Runs in <Mono style={{ color: T.tertiary }}>{where}</Mono>
+          {open ? null : " (no bundle open; pick one in the sidebar to run against it)"}
+        </>
+      )}
+    </div>
+  );
+}
+
 function seedValues(
   cmd: Command,
   ctx: { workspacePath: string | null; sticky: Readonly<Record<string, string>> },
@@ -262,6 +295,8 @@ export function CommandForm({
         </Mono>
         <CopyButton text={preview} />
       </div>
+
+      <RunDirectory />
 
       {missing.length ? (
         <div style={{ marginBottom: 10 }}>

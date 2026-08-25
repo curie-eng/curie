@@ -27,6 +27,7 @@ function stubShell(): CurieBridge {
       kubectlAvailable: true,
       helmAvailable: true,
       platform: "darwin",
+      defaultCwd: "/Users/dev",
       appVersion: "0.1.0",
       electronVersion: "34",
       chromeVersion: "132",
@@ -184,5 +185,35 @@ describe("--json", () => {
     await user.click(screen.getByRole("button", { name: "Run" }));
     await waitFor(() => expect(started).toHaveLength(1));
     expect(started[0].json).toBe(true);
+  });
+});
+
+describe("the working directory", () => {
+  // The bundle chosen in the sidebar sets `cwd` on every invocation this form
+  // launches, so for a skill-tier command the directory is effectively an
+  // argument. It used to be invisible, which made a global control look like it
+  // belonged to the Build tab and made "the exact command that will run" less
+  // than exact.
+  it("names the directory the command will run in", async () => {
+    mount("local.status");
+    // No bundle open in this stub, so the shell's fallback is what runs.
+    expect(await screen.findByText("/Users/dev")).toBeInTheDocument();
+  });
+
+  it("says a bundle is needed to run against one", async () => {
+    mount("local.status");
+    expect(await screen.findByText(/no bundle open/)).toBeInTheDocument();
+  });
+
+  it("prints no directory at all when the shell cannot say", async () => {
+    // Never invent a path: one this app prints but does not use is worse than
+    // printing none.
+    const shell = stubShell();
+    window.curie = {
+      ...shell,
+      env: async () => ({ ...(await shell.env()), defaultCwd: "" }),
+    };
+    mount("local.status");
+    expect(await screen.findByText(/not known yet/)).toBeInTheDocument();
   });
 });

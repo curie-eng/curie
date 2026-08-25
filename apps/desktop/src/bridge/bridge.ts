@@ -56,6 +56,9 @@ const detached: CurieBridge = {
     kubectlAvailable: false,
     helmAvailable: false,
     platform: "darwin",
+    // Empty, not a guess: with no shell there is no working directory to report,
+    // and the UI renders "not known yet" rather than inventing a path.
+    defaultCwd: "",
     appVersion: "0.0.0",
     electronVersion: "",
     chromeVersion: "",
