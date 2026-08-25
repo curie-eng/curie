@@ -25,11 +25,13 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use curie_aci_protocol::QueuedTurn;
 use redis::aio::MultiplexedConnection;
+use tokio::io::AsyncWriteExt;
 
 use crate::api::{Agent, ApiClient};
 use crate::chat::{
@@ -918,13 +920,374 @@ async fn bounded_diagnostics(
         })
 }
 
+const COMPOSE_CONFIG_FILES_LABEL: &str = "com.docker.compose.project.config_files";
+const COMPOSE_DISPATCHER_SERVICE: &str = "curie-dispatcher";
+const DISPATCHER_ENQUEUE_MODULE: &str = "curie_dispatcher.enqueue_once";
+const DISPATCHER_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+const OTEL_EXPORTER_ENV_KEYS: [&str; 38] = [
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_INSECURE",
+    "OTEL_EXPORTER_OTLP_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+    "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_INSECURE",
+    "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+    "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_INSECURE",
+    "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+    "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION",
+];
+static DISPATCHER_ENQUEUE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Parse Compose's canonical config-file label. Compose stores multiple `-f`
+/// inputs as a comma-separated list; an ordinary Curie stack carries one.
+fn compose_config_files(label: &str) -> Result<Vec<String>> {
+    let files: Vec<String> = label
+        .trim()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "<no value>" && *value != "<nil>")
+        .map(str::to_string)
+        .collect();
+    if files.is_empty() {
+        bail!(
+            "the running local worker has no `{COMPOSE_CONFIG_FILES_LABEL}` label; restart it with `curie local up`"
+        );
+    }
+    Ok(files)
+}
+
+fn worker_compose_config_command(container: &str) -> OpsCommand {
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("inspect"),
+            plain("--format"),
+            plain(format!(
+                "{{{{ index .Config.Labels \"{COMPOSE_CONFIG_FILES_LABEL}\" }}}}"
+            )),
+            plain(container),
+        ],
+    )
+}
+
+fn worker_otel_exporter_env_command(container: &str) -> OpsCommand {
+    // Filter before captured stdout crosses the worker process boundary. Each
+    // selected entry is encoded as one JSON string so the first `=` and
+    // everything after it survive intact.
+    let mut template = concat!(
+        "{{range .Config.Env}}",
+        "{{$entry := .}}",
+        "{{$name := index (split $entry \"=\") 0}}",
+        "{{if or "
+    )
+    .to_string();
+    for name in OTEL_EXPORTER_ENV_KEYS {
+        template.push_str(&format!("(eq $name \"{name}\") "));
+    }
+    template.push_str("}}{{json $entry}}{{println}}{{end}}{{end}}");
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("inspect"),
+            plain("--format"),
+            plain(template),
+            plain(container),
+        ],
+    )
+}
+
+fn parse_worker_otel_env(stdout: &str) -> Result<Vec<(String, String)>> {
+    let mut selected = Vec::new();
+    for (index, line) in stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        let line = line.trim();
+        let entry = if line.starts_with('"') {
+            serde_json::from_str::<String>(line).with_context(|| {
+                format!(
+                    "parsing the local worker's telemetry environment entry {}",
+                    index + 1
+                )
+            })?
+        } else {
+            // Some already-filtered callers and test doubles return one plain
+            // Docker environment entry per line. Production inspection emits
+            // JSON strings, but retaining this narrow seam is harmless because
+            // the exact allowlist below still gates every accepted name.
+            line.to_string()
+        };
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        // Keep the same allowlist here as defense in depth if the Docker
+        // formatting boundary ever changes independently.
+        if OTEL_EXPORTER_ENV_KEYS.contains(&name) {
+            selected.push((name.to_string(), value.to_string()));
+        }
+    }
+    Ok(selected)
+}
+
+struct LocalDispatcherContext {
+    compose_files: Vec<String>,
+    otel_env: Vec<(String, String)>,
+}
+
+async fn local_dispatcher_context() -> Result<LocalDispatcherContext> {
+    let container = local_worker_container().await?;
+    let cmd = worker_compose_config_command(&container);
+    let (ok, stdout, stderr) = run_capture(&cmd).await?;
+    if !ok {
+        bail!(
+            "reading the local stack's Compose configuration: {}",
+            stderr.trim()
+        );
+    }
+    let compose_files = compose_config_files(&stdout)?;
+
+    let telemetry_cmd = worker_otel_exporter_env_command(&container);
+    let (ok, telemetry_stdout, telemetry_stderr) = run_capture(&telemetry_cmd).await?;
+    if !ok {
+        bail!(
+            "reading the local worker's telemetry configuration: {}",
+            telemetry_stderr.trim()
+        );
+    }
+    let otel_env = parse_worker_otel_env(&telemetry_stdout)?;
+    Ok(LocalDispatcherContext {
+        compose_files,
+        otel_env,
+    })
+}
+
+/// Build the bounded one-shot dispatcher producer. Secrets ride named process
+/// environment entries, never argv; Slack variables are explicitly cleared so
+/// this process cannot acquire or use a workspace credential.
+fn dispatcher_enqueue_command(
+    compose_files: &[String],
+    container_name: &str,
+    stream: &str,
+    valkey_password: &str,
+    otel_env: &[(String, String)],
+) -> OpsCommand {
+    // The dispatcher service lives in the slack profile but depends on core
+    // services (notably the API and Valkey). Compose resolves that dependency
+    // graph before the one-shot Python producer starts.
+    let mut args = vec![
+        plain("compose"),
+        plain("--profile"),
+        plain("core"),
+        plain("--profile"),
+        plain("slack"),
+    ];
+    for file in compose_files {
+        args.extend([plain("-f"), plain(file)]);
+    }
+    args.extend([
+        plain("run"),
+        plain("--rm"),
+        plain("--name"),
+        plain(container_name),
+        plain("--no-deps"),
+        plain("-T"),
+        plain("-e"),
+        plain("VALKEY_PASSWORD"),
+        plain("-e"),
+        plain("CURIE_STREAM"),
+        plain("-e"),
+        plain("SLACK_APP_TOKEN="),
+        plain("-e"),
+        plain("SLACK_BOT_TOKEN="),
+        plain("-e"),
+        plain("SLACK_SIGNING_SECRET="),
+    ]);
+    for (name, _) in otel_env {
+        if OTEL_EXPORTER_ENV_KEYS.contains(&name.as_str()) {
+            args.extend([plain("-e"), plain(name)]);
+        }
+    }
+    args.extend([
+        plain(COMPOSE_DISPATCHER_SERVICE),
+        plain("python"),
+        plain("-m"),
+        plain(DISPATCHER_ENQUEUE_MODULE),
+    ]);
+    let mut secret_env = vec![("VALKEY_PASSWORD".to_string(), valkey_password.to_string())];
+    secret_env.extend(
+        otel_env
+            .iter()
+            .filter(|(name, _)| OTEL_EXPORTER_ENV_KEYS.contains(&name.as_str()))
+            .cloned(),
+    );
+    OpsCommand::new("docker", args)
+        .with_env(vec![
+            (
+                "COMPOSE_PROJECT_NAME".to_string(),
+                crate::local::COMPOSE_PROJECT.to_string(),
+            ),
+            ("CURIE_STREAM".to_string(), stream.to_string()),
+        ])
+        .with_secret_env(secret_env)
+}
+
+fn redact_dispatcher_diagnostic(stderr: &str, sensitive_values: &[&str]) -> String {
+    let clean = sensitive_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .fold(stderr.to_string(), |text, value| {
+            text.replace(value, "[REDACTED]")
+        });
+    let clean = clean.trim();
+    if clean.is_empty() {
+        "one-shot dispatcher exited without a diagnostic".to_string()
+    } else {
+        clean.chars().take(4096).collect()
+    }
+}
+
+fn parse_dispatcher_stream_id(stdout: &str) -> Result<String> {
+    let mut lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let stream_id = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("one-shot dispatcher returned no Stream id"))?;
+    let valid = stream_id.split_once('-').is_some_and(|(ms, sequence)| {
+        !ms.is_empty()
+            && !sequence.is_empty()
+            && ms.bytes().all(|byte| byte.is_ascii_digit())
+            && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if !valid || lines.next().is_some() {
+        bail!("one-shot dispatcher returned malformed stdout instead of one Stream id");
+    }
+    Ok(stream_id.to_string())
+}
+
+/// Enqueue a local synthetic turn through code running in the dispatcher image.
+/// The CLI retains its open Valkey connection only for completion observation;
+/// the producer write itself happens inside this bounded child process.
+async fn dispatcher_enqueue_local(opts: &MessageOpts, turn: &QueuedTurn) -> Result<String> {
+    let context = local_dispatcher_context().await?;
+    let sequence = DISPATCHER_ENQUEUE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let container_name = format!("curie-dispatcher-enqueue-{}-{sequence}", std::process::id());
+    let cmd = dispatcher_enqueue_command(
+        &context.compose_files,
+        &container_name,
+        &opts.stream,
+        &opts.valkey_password,
+        &context.otel_env,
+    );
+    crate::ui::ui().plumbing(&format!("+ {}", cmd.display()));
+    let payload = queue::payload_json(turn)?;
+
+    let mut child = tokio::process::Command::new(&cmd.program)
+        .args(cmd.argv())
+        .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("starting the one-shot local dispatcher producer")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("one-shot dispatcher stdin was unavailable"))?;
+    let child_run = async move {
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .context("sending the queued turn to the one-shot dispatcher")?;
+        drop(stdin);
+        child
+            .wait_with_output()
+            .await
+            .context("waiting for the one-shot dispatcher producer")
+    };
+    let output = match tokio::time::timeout(DISPATCHER_ENQUEUE_TIMEOUT, child_run).await {
+        Ok(result) => result?,
+        Err(_) => {
+            // Dropping child_run kills the Docker CLI. Remove the explicitly
+            // named Compose container too: otherwise a blocked Valkey connect
+            // can outlive the CLI with its secret environment still attached.
+            let _ = crate::docker::remove_container(&container_name).await;
+            bail!(
+                "one-shot dispatcher did not finish within {}s",
+                DISPATCHER_ENQUEUE_TIMEOUT.as_secs()
+            );
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut sensitive_values = vec![opts.valkey_password.as_str()];
+    sensitive_values.extend(context.otel_env.iter().map(|(_, value)| value.as_str()));
+    if !stderr.trim().is_empty() {
+        let sanitized = redact_dispatcher_diagnostic(&stderr, &sensitive_values);
+        for line in sanitized.lines() {
+            crate::ui::ui().plumbing(line);
+        }
+    }
+    if !output.status.success() {
+        let diagnostic = redact_dispatcher_diagnostic(&stderr, &sensitive_values);
+        bail!("one-shot dispatcher failed: {diagnostic}");
+    }
+    parse_dispatcher_stream_id(&stdout)
+}
+
+async fn enqueue_for_turn_verb(
+    opts: &MessageOpts,
+    conn: &mut MultiplexedConnection,
+    verb: TurnVerb,
+    turn: &QueuedTurn,
+) -> Result<String> {
+    match verb {
+        TurnVerb::Local => dispatcher_enqueue_local(opts, turn).await,
+        // Deliberately retain the direct lane as the missing-carrier
+        // compatibility control required by #1817.
+        TurnVerb::Cluster => xadd(conn, &opts.stream, turn).await,
+    }
+}
+
 /// The `curie local message` handler: drive the compose stack directly.
 ///
 /// The cluster path's self-plumbing (kubectl port-forwards) is cluster-specific,
-/// so local mode keeps only the shared engine: bind the Slack stub, enqueue the
-/// `QueuedTurn` carrying this stub as its reply endpoint (issue #19), and wait on
-/// the XACK signal. The compose worker reaches the stub on the fixed loopback
-/// port `http://localhost:{DEFAULT_LOCAL_STUB_PORT}/api/`.
+/// so local mode keeps only the shared engine: bind the Slack stub, send the
+/// `QueuedTurn` through the compose dispatcher's bounded producer, and wait on
+/// the XACK signal. The turn still carries this stub as its reply endpoint
+/// (issue #19). The compose worker reaches the stub on the fixed loopback port
+/// `http://localhost:{DEFAULT_LOCAL_STUB_PORT}/api/`.
 async fn message_local(opts: MessageOpts) -> Result<()> {
     let ui = crate::ui::ui();
     let valkey_url = local_valkey_url(&opts.valkey_password);
@@ -1040,7 +1403,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
         &placeholder_ts,
         Some(reply_endpoint),
     );
-    let stream_id = xadd(&mut conn, &opts.stream, &event).await?;
+    let stream_id = enqueue_for_turn_verb(&opts, &mut conn, TurnVerb::Local, &event).await?;
     ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
         event.event_id, opts.stream
@@ -1603,7 +1966,7 @@ pub async fn enqueue_over_connected_transport(
             })?;
 
     let event = connected_turn(channel, opts, explicit_thread, &placeholder_ts);
-    let stream_id = xadd(conn, &opts.stream, &event).await?;
+    let stream_id = enqueue_for_turn_verb(opts, conn, verb, &event).await?;
     ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
         event.event_id, opts.stream
@@ -3122,6 +3485,265 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EXPECTED_OTEL_EXPORTER_ENV_KEYS: [&str; 38] = [
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_INSECURE",
+        "OTEL_EXPORTER_OTLP_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+        "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_INSECURE",
+        "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_INSECURE",
+        "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
+        "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION",
+    ];
+
+    fn otel_exporter_test_value(name: &str) -> String {
+        if name.ends_with("_PROTOCOL") {
+            "grpc".to_string()
+        } else if name.ends_with("_HEADERS") {
+            "authorization=Bearer example==,tenant=acme".to_string()
+        } else if name.ends_with("_ENDPOINT") {
+            "https://collector.example.com/v1/data?signature=example==".to_string()
+        } else if name.ends_with("_CLIENT_KEY") {
+            "/tls/client=key.pem".to_string()
+        } else if name.ends_with("_CLIENT_CERTIFICATE") {
+            "/tls/client=certificate.pem".to_string()
+        } else if name.ends_with("_CERTIFICATE") {
+            "/tls/ca=certificate.pem".to_string()
+        } else if name.ends_with("_INSECURE") {
+            "false".to_string()
+        } else if name.ends_with("_COMPRESSION") {
+            "gzip".to_string()
+        } else if name.ends_with("_TIMEOUT") {
+            "12.5".to_string()
+        } else if name.ends_with("_TEMPORALITY_PREFERENCE") {
+            "delta".to_string()
+        } else {
+            "base2_exponential_bucket_histogram".to_string()
+        }
+    }
+
+    fn sensitive_otel_exporter_value(name: &str) -> bool {
+        name.ends_with("_ENDPOINT")
+            || name.ends_with("_HEADERS")
+            || name.ends_with("_CERTIFICATE")
+            || name.ends_with("_CLIENT_KEY")
+            || name.ends_with("_CLIENT_CERTIFICATE")
+    }
+
+    #[test]
+    fn local_dispatcher_command_is_slack_free_and_keeps_secrets_off_argv() {
+        let secret = "private-valkey-password";
+        let otel_env: Vec<(String, String)> = EXPECTED_OTEL_EXPORTER_ENV_KEYS
+            .iter()
+            .map(|name| (name.to_string(), otel_exporter_test_value(name)))
+            .collect();
+        let command = dispatcher_enqueue_command(
+            &["/tmp/curie compose.yaml".to_string()],
+            "curie-dispatcher-enqueue-test",
+            "test:curie:runs",
+            secret,
+            &otel_env,
+        );
+        let argv = command.argv();
+
+        // `curie-dispatcher` is declared in the slack profile but depends on
+        // `curie-api` from the core profile. Selecting slack alone makes the
+        // one-shot producer fail before Python runs because Compose cannot
+        // resolve that dependency.
+        assert!(
+            argv.windows(2).any(|pair| pair == ["--profile", "core"]),
+            "one-shot dispatcher must activate core dependencies: {argv:?}"
+        );
+        assert!(argv
+            .windows(2)
+            .any(|pair| { pair[0] == COMPOSE_DISPATCHER_SERVICE && pair[1] == "python" }));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && pair[1] == DISPATCHER_ENQUEUE_MODULE));
+        assert!(argv.contains(&"--no-deps".to_string()));
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["--name", "curie-dispatcher-enqueue-test"]));
+        assert!(argv.contains(&"-T".to_string()));
+        assert!(argv.contains(&"SLACK_APP_TOKEN=".to_string()));
+        assert!(argv.contains(&"SLACK_BOT_TOKEN=".to_string()));
+        assert!(!argv.iter().any(|arg| arg.contains(secret)));
+        assert!(!command.display().contains(secret));
+        for (name, value) in &otel_env {
+            assert!(
+                argv.windows(2)
+                    .any(|pair| pair[0] == "-e" && pair[1] == *name),
+                "one-shot dispatcher did not forward {name}: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|arg| arg.contains(value)),
+                "telemetry value for {name} leaked onto argv"
+            );
+            if sensitive_otel_exporter_value(name) {
+                assert!(
+                    !command.display().contains(value),
+                    "sensitive telemetry value for {name} leaked into command display"
+                );
+            }
+            assert!(
+                command.secret_env.contains(&(name.clone(), value.clone())),
+                "telemetry value for {name} was not preserved exactly"
+            );
+        }
+        assert!(command
+            .secret_env
+            .contains(&("VALKEY_PASSWORD".to_string(), secret.to_string())));
+    }
+
+    #[test]
+    fn compose_config_label_preserves_each_declared_file() {
+        assert_eq!(
+            compose_config_files(" /tmp/base.yaml,/tmp/override.yaml\n").unwrap(),
+            vec!["/tmp/base.yaml", "/tmp/override.yaml"]
+        );
+        assert!(compose_config_files("  \n").is_err());
+        assert!(compose_config_files("<no value>\n").is_err());
+    }
+
+    #[test]
+    fn worker_telemetry_probe_outputs_only_standard_exporter_configuration() {
+        let command = worker_otel_exporter_env_command("curie-worker-example");
+        let template = &command.argv()[2];
+
+        assert_eq!(
+            OTEL_EXPORTER_ENV_KEYS.as_slice(),
+            EXPECTED_OTEL_EXPORTER_ENV_KEYS.as_slice()
+        );
+        for name in EXPECTED_OTEL_EXPORTER_ENV_KEYS {
+            assert!(template.contains(name), "inspect template omitted {name}");
+        }
+        assert!(!template.contains("{{json .Config.Env}}"));
+        assert!(!template.contains("UNRELATED_SECRET"));
+        assert!(!template.contains("println ."));
+        assert!(!template.contains("range .Config.Env}}{{println"));
+    }
+
+    #[test]
+    fn worker_telemetry_probe_preserves_equals_in_exporter_values() {
+        let inspected = concat!(
+            "\"OTEL_EXPORTER_OTLP_PROTOCOL=grpc\"\n",
+            "\"OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer example==,tenant=acme\"\n",
+            "\"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=https://logs.example.com/v1/logs?signature=example==\"\n",
+            "\"OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY=/tls/client=key.pem\"\n",
+            "\"OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE=/tls/client=certificate.pem\"\n",
+            "\"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=\"\n",
+            "\"UNRELATED_SECRET=must-not-forward\"\n",
+        );
+
+        assert_eq!(
+            parse_worker_otel_env(inspected).unwrap(),
+            vec![
+                (
+                    "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
+                    "grpc".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
+                    "authorization=Bearer example==,tenant=acme".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT".to_string(),
+                    "https://logs.example.com/v1/logs?signature=example==".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY".to_string(),
+                    "/tls/client=key.pem".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE".to_string(),
+                    "/tls/client=certificate.pem".to_string(),
+                ),
+                (
+                    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT".to_string(),
+                    "".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_telemetry_probe_accepts_already_filtered_plain_lines() {
+        let inspected = concat!(
+            "OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.com?signature=example==\n",
+            "UNRELATED_SECRET=must-not-forward\n",
+            "/tmp/non-telemetry-inspect-output\n",
+        );
+
+        assert_eq!(
+            parse_worker_otel_env(inspected).unwrap(),
+            vec![(
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                "https://collector.example.com?signature=example==".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn dispatcher_failure_diagnostic_is_present_bounded_and_redacted() {
+        let secret = "private-valkey-password";
+        let endpoint = "https://token@collector.example.com";
+        let stderr = format!(
+            "connection failed for password {secret} at {endpoint} {}",
+            "x".repeat(5000)
+        );
+        let diagnostic = redact_dispatcher_diagnostic(&stderr, &[secret, endpoint]);
+        assert!(diagnostic.contains("connection failed"));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!diagnostic.contains(secret));
+        assert!(!diagnostic.contains(endpoint));
+        assert!(diagnostic.chars().count() <= 4096);
+        assert_eq!(
+            redact_dispatcher_diagnostic("", &[secret]),
+            "one-shot dispatcher exited without a diagnostic"
+        );
+    }
+
+    #[test]
+    fn dispatcher_stdout_must_be_exactly_one_stream_id() {
+        assert_eq!(
+            parse_dispatcher_stream_id("1700000000000-0\n").unwrap(),
+            "1700000000000-0"
+        );
+        assert!(parse_dispatcher_stream_id("").is_err());
+        assert!(parse_dispatcher_stream_id("telemetry\n1700000000000-0\n").is_err());
+        assert!(parse_dispatcher_stream_id("not-an-id\n").is_err());
+    }
 
     /// An empty `--thread` must not survive as a thread: carried through, it
     /// enqueues `conversation_id: ""` and puts a literal `"thread_ts": ""` in an

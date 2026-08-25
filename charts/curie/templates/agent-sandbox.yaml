@@ -135,6 +135,16 @@ roleRef:
 {{- $runner := .Values.agentSandbox.runner }}
 {{- $bf := $runner.bundleFetch }}
 {{- $wf := $runner.workspace }}
+{{- $hasRunnerOtelEndpoint := false }}
+{{- $hasRunnerOtelProtocol := false }}
+{{- range $runner.extraEnv }}
+{{- if eq .name "OTEL_EXPORTER_OTLP_ENDPOINT" }}
+{{- $hasRunnerOtelEndpoint = true }}
+{{- end }}
+{{- if eq .name "OTEL_EXPORTER_OTLP_PROTOCOL" }}
+{{- $hasRunnerOtelProtocol = true }}
+{{- end }}
+{{- end }}
 {{- $templateName := printf "%s-runner" (include "curie.fullname" .) }}
 {{- $poolName := printf "%s-runner-pool" (include "curie.fullname" .) }}
 {{- if $agent }}
@@ -624,9 +634,11 @@ spec:
             - name: GIT_CONFIG_VALUE_0
               value: {{ $wf.mountPath | quote }}
             {{- end }}
-            {{- if .Values.otelCollector.deploy }}
+            {{- if and .Values.otelCollector.deploy (not $hasRunnerOtelEndpoint) }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
+            {{- end }}
+            {{- if and .Values.otelCollector.deploy (not $hasRunnerOtelProtocol) }}
             - name: OTEL_EXPORTER_OTLP_PROTOCOL
               value: http/protobuf
             {{- end }}

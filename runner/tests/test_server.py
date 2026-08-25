@@ -6,6 +6,9 @@ from aiohttp.test_utils import TestClient, TestServer
 from curie_runner import RunTracer, SideEffectClassifier, create_app
 from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 
 def _runner() -> tuple[SessionRunner, FakeModelSession]:
@@ -44,6 +47,61 @@ def test_healthz_status_and_event_round_trip() -> None:
             assert events[-1].status == SessionStatus.DONE
 
     anyio.run(go)
+
+
+def test_event_header_uses_explicit_parent_and_missing_or_malformed_is_safe_root() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    runner = SessionRunner(
+        session_factory=FakeModelSession,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+    )
+    trace_id = "1234567890abcdef1234567890abcdef"
+    parent_span_id = "1234567890abcdef"
+    traceparent = f"00-{trace_id}-{parent_span_id}-01"
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner))) as client:
+            inherited = await client.post(
+                "/v1/event",
+                json=_EVENT_FRAME,
+                headers={"traceparent": traceparent},
+            )
+            assert inherited.status == 200
+            missing = await client.post("/v1/event", json=_EVENT_FRAME)
+            assert missing.status == 200
+            malformed = await client.post(
+                "/v1/event",
+                json=_EVENT_FRAME,
+                headers={"traceparent": "not-a-traceparent"},
+            )
+            assert malformed.status == 200
+
+    anyio.run(go)
+
+    roots = [span for span in exporter.get_finished_spans() if span.name == "agent.run"]
+    assert len(roots) == 3
+    inherited, missing, malformed = roots
+    assert inherited.context is not None
+    assert missing.context is not None
+    assert malformed.context is not None
+    assert inherited.context.trace_id == int(trace_id, 16)
+    assert inherited.parent is not None
+    assert inherited.parent.span_id == int(parent_span_id, 16)
+    assert missing.parent is None
+    assert malformed.parent is None
+    assert len(
+        {
+            inherited.context.trace_id,
+            missing.context.trace_id,
+            malformed.context.trace_id,
+        }
+    ) == 3
 
 
 def test_event_rejects_non_event_frame() -> None:

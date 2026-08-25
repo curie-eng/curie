@@ -43,6 +43,16 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- $hasApiOtelEndpoint := false }}
+      {{- $hasApiOtelProtocol := false }}
+      {{- range .Values.api.extraEnv }}
+      {{- if eq .name "OTEL_EXPORTER_OTLP_ENDPOINT" }}
+      {{- $hasApiOtelEndpoint = true }}
+      {{- end }}
+      {{- if eq .name "OTEL_EXPORTER_OTLP_PROTOCOL" }}
+      {{- $hasApiOtelProtocol = true }}
+      {{- end }}
+      {{- end }}
       {{- if .Values.api.migrate.enabled }}
       # Bring the schema to head before the server boots. The init container
       # re-runs until it succeeds, so it also serves as a wait-for-Postgres gate
@@ -99,6 +109,16 @@ spec:
                   key: githubToken
             - name: GITHUB_REPO_ALLOWLIST
               value: {{ .Values.api.githubRepoAllowlist | toJson | quote }}
+            {{- if and .Values.otelCollector.deploy (not $hasApiOtelEndpoint) }}
+            # Standard OTLP/HTTP reception is chart-owned only while the chart
+            # also owns the endpoint. External-Collector installs stay inert.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
+            {{- end }}
+            {{- if and .Values.otelCollector.deploy (not $hasApiOtelProtocol) }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            {{- end }}
             # GitHub App identity (ADR-0092). When both are set the platform
             # mints a one-hour token scoped to the single repository it is
             # cloning, instead of using GITHUB_TOKEN above. Both empty is fine:
@@ -194,6 +214,9 @@ spec:
             # the setting an operator is trying to make.
             - name: SLACK_USERGROUP_CACHE_TTL_S
               value: {{ .Values.api.slackUsergroupCacheTtlSeconds | quote }}
+            {{- with .Values.api.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8000

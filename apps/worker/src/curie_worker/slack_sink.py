@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, TypeVar, cast
 from urllib.parse import urlsplit
 
@@ -43,6 +43,7 @@ from channel_protocol.reply import (
     TurnCompleted,
     TurnStatus,
 )
+from curie_telemetry import record_metric
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
@@ -56,6 +57,39 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle: reply_sink builds this ada
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+
+def _record_reply_retry(operation: str, retry_class: str) -> None:
+    record_metric(
+        "curie.reply.retry",
+        attributes={
+            "service.name": "curie-worker",
+            "operation": operation,
+            "role": "client",
+            "retry_class": retry_class,
+        },
+    )
+
+
+def _slack_retry_class(exc: SlackApiError) -> str:
+    """Classify the one retry this adapter actually performs after rejection."""
+
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    error: object | None = None
+    if isinstance(response, Mapping):
+        status_code = response.get("status_code", status_code)
+        error = response.get("error")
+    elif response is not None:
+        try:
+            error = response.get("error")
+        except (AttributeError, TypeError):
+            pass
+    return (
+        "rate-limit"
+        if status_code == 429 or error in {"ratelimited", "rate_limited"}
+        else "block-fallback"
+    )
 
 # The SDK's own default base URL, which is the trusted origin when the worker
 # configures none. Kept as a literal so the trust check has a concrete origin to
@@ -340,6 +374,7 @@ class SlackReplyAdapter:
         op: Callable[[AsyncWebClient], Awaitable[_T]],
         *,
         describe: str,
+        operation: str,
         best_effort_unreachable: bool = False,
     ) -> _T:
         """Run ``op`` against this turn's endpoint, falling back to the worker
@@ -382,6 +417,7 @@ class SlackReplyAdapter:
             return await op(primary)
         except _UNREACHABLE_ERRORS as exc:
             if has_distinct_default:
+                _record_reply_retry(operation, "transport-fallback")
                 logger.warning(
                     "%s: reply endpoint %s is unreachable (%s); falling back to the "
                     "default Slack transport",
@@ -446,7 +482,8 @@ class SlackReplyAdapter:
                     await client.chat_update(
                         channel=channel, ts=ts, text=rendered_text, blocks=blocks
                     )
-                except SlackApiError:
+                except SlackApiError as exc:
+                    _record_reply_retry("update", _slack_retry_class(exc))
                     logger.warning(
                         "chat_update with blocks rejected for %s; retrying text-only", ts
                     )
@@ -458,6 +495,7 @@ class SlackReplyAdapter:
             endpoint,
             op,
             describe="chat_update",
+            operation="update",
             best_effort_unreachable=best_effort_unreachable,
         )
 
@@ -509,9 +547,10 @@ class SlackReplyAdapter:
                 return await client.chat_postMessage(
                     channel=channel, text=rendered_text, thread_ts=thread_ts
                 )
-            except SlackApiError:
+            except SlackApiError as exc:
                 if blocks is None:
                     raise
+                _record_reply_retry("post", _slack_retry_class(exc))
                 logger.warning("chat_postMessage with blocks rejected; retrying text-only")
                 return await client.chat_postMessage(
                     channel=channel, text=rendered_text, thread_ts=thread_ts
@@ -521,6 +560,7 @@ class SlackReplyAdapter:
             endpoint,
             op,
             describe="chat_postMessage",
+            operation="post",
             best_effort_unreachable=best_effort_unreachable,
         )
         # The best-effort swallow returns None instead of a response when the
@@ -584,9 +624,10 @@ class SlackReplyAdapter:
                     thread_ts=thread_ts,
                     client_msg_id=client_msg_id,
                 )
-            except SlackApiError:
+            except SlackApiError as exc:
                 if blocks is None:
                     raise
+                _record_reply_retry("post", _slack_retry_class(exc))
                 logger.warning(
                     "chat_postMessage with blocks rejected; retrying text-only"
                 )
@@ -598,7 +639,7 @@ class SlackReplyAdapter:
                 )
 
         response = await self._with_transport_fallback(
-            endpoint, op, describe="chat_postMessage"
+            endpoint, op, describe="chat_postMessage", operation="post"
         )
         ts = response.get("ts")
         return str(ts) if ts else None
@@ -637,7 +678,8 @@ class SlackReplyAdapter:
                 await client.chat_update(
                     channel=channel, ts=ts, text=text, blocks=blocks
                 )
-            except SlackApiError:
+            except SlackApiError as exc:
+                _record_reply_retry("update", _slack_retry_class(exc))
                 logger.warning(
                     "card chat_update with blocks rejected for %s; retrying text-only",
                     ts,
@@ -645,7 +687,7 @@ class SlackReplyAdapter:
                 await client.chat_update(channel=channel, ts=ts, text=text)
 
         await self._with_transport_fallback(
-            endpoint, op, describe="chat_update(card)"
+            endpoint, op, describe="chat_update(card)", operation="update"
         )
 
     async def _set_status(

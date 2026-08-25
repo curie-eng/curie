@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 from redis.exceptions import (
     ConnectionError as RedisConnectionError,
 )
@@ -73,6 +75,7 @@ class DeliverySpec:
     reclaim_min_idle_ms: int
     read_count: int
     cap_scan_page: int
+    telemetry_source: str
     handler: EntryHandler
     logger: logging.Logger
     dead_letter_log: str
@@ -256,20 +259,56 @@ class StreamConsumer:
                 "dl_dead_lettered_at": datetime.now(UTC).isoformat(),
             }
         )
-        await self._redis.xadd(
-            target,
-            payload,
-            maxlen=self._spec.dead_letter_maxlen,
-            approximate=True,
+        attributes = {
+            "service.name": "curie-worker",
+            "source": self._spec.telemetry_source,
+        }
+        error: Exception | None = None
+        with operation_span(
+            "curie.queue.dead-letter",
+            kind=SpanKind.INTERNAL,
+            attributes=attributes,
+        ) as span:
+            try:
+                await self._redis.xadd(
+                    target,
+                    payload,
+                    maxlen=self._spec.dead_letter_maxlen,
+                    approximate=True,
+                )
+                self._spec.logger.error(
+                    self._spec.dead_letter_log,
+                    entry_id,
+                    delivery_count,
+                    reason,
+                    target,
+                )
+                await self._ack(entry_id)
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "queue.dead-letter.failed",
+                    {"outcome": "failure", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event("queue.dead-lettered", {"outcome": "dead-letter"})
+
+        outcome = "failure" if error is not None else "success"
+        record_metric(
+            "curie.queue.dead_letter",
+            attributes={**attributes, "outcome": outcome},
         )
-        self._spec.logger.error(
-            self._spec.dead_letter_log,
-            entry_id,
-            delivery_count,
-            reason,
-            target,
+        record_metric(
+            "curie.queue.settle",
+            attributes={
+                **attributes,
+                "outcome": "pending" if error is not None else "dead-letter",
+            },
         )
-        await self._ack(entry_id)
+        if error is not None:
+            raise error
 
     async def _dead_letter_over_cap(self) -> set[str]:
         """Dead-letter pending entries that have exhausted their delivery budget.
@@ -373,6 +412,14 @@ class StreamConsumer:
                 if entry_id in over_cap:
                     continue  # budget spent; never dispatch it again
                 reclaimed += 1
+                record_metric(
+                    "curie.queue.retry",
+                    attributes={
+                        "service.name": "curie-worker",
+                        "source": self._spec.telemetry_source,
+                        "retry_class": "redelivery",
+                    },
+                )
                 await self._spec.handler(entry_id, fields)
             if cursor in ("0-0", "0"):
                 break

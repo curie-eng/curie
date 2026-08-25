@@ -10,8 +10,10 @@ dependencies = [
     "curie-api",
     "curie-dispatcher",
     "curie-discord-adapter",
+    "curie-mail-adapter",
     "curie-worker",
     "curie-runner",
+    "curie-telemetry",
 ]
 
 [tool.uv]
@@ -23,9 +25,11 @@ members = [
     "packages/channel-protocol",
     "packages/plugin-format",
     "packages/test-support",
+    "packages/telemetry",
     "apps/api",
     "apps/dispatcher",
     "adapters/discord",
+    "apps/mail-adapter",
     "apps/worker",
     "runner",
     "tools/doclint",
@@ -40,8 +44,10 @@ curie-test-support = { workspace = true }
 curie-api = { workspace = true }
 curie-dispatcher = { workspace = true }
 curie-discord-adapter = { workspace = true }
+curie-mail-adapter = { workspace = true }
 curie-worker = { workspace = true }
 curie-runner = { workspace = true }
+curie-telemetry = { workspace = true }
 curie-doclint = { workspace = true }
 curie-wire-tolerance-gate = { workspace = true }
 
@@ -73,7 +79,9 @@ root_packages = [
     "curie_worker",
     "curie_dispatcher",
     "curie_discord_adapter",
+    "curie_mail_adapter",
     "curie_runner",
+    "curie_telemetry",
     # The frozen contract packages (#961). Outside the graph, no contract could
     # ever fire on them, which left the worst possible place for an SDK import
     # ungated. Clean today; the contract below keeps them that way.
@@ -91,7 +99,7 @@ include_external_packages = true
 # direction that is hardest to see in review.
 name = "The platform never imports a harness SDK"
 type = "forbidden"
-source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_discord_adapter"]
+source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_discord_adapter", "curie_mail_adapter"]
 forbidden_modules = ["claude_agent_sdk"]
 
 [[tool.importlinter.contracts]]
@@ -131,8 +139,10 @@ testpaths = [
     "packages/aci-protocol/tests",
     "packages/channel-protocol/tests",
     "packages/plugin-format/tests",
+    "packages/telemetry/tests",
     "apps/api/tests",
     "apps/dispatcher/tests",
+    "apps/mail-adapter/tests",
     "apps/worker/tests",
     "runner/tests",
     "compose/tests",
@@ -174,9 +184,11 @@ mypy_path = [
     "packages/channel-protocol/src",
     "packages/plugin-format/src",
     "packages/test-support/src",
+    "packages/telemetry/src",
     "apps/api/src",
     "apps/dispatcher/src",
     "adapters/discord/src",
+    "apps/mail-adapter/src",
     "apps/worker/src",
     "runner/src",
     "tools/doclint/src",
@@ -187,9 +199,11 @@ files = [
     "packages/channel-protocol/src",
     "packages/plugin-format/src",
     "packages/test-support/src",
+    "packages/telemetry/src",
     "apps/api/src",
     "apps/dispatcher/src",
     "adapters/discord/src",
+    "apps/mail-adapter/src",
     "apps/worker/src",
     "runner/src",
     "tools/doclint/src",

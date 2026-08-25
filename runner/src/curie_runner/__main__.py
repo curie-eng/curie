@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from pathlib import Path
 
 import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
+from curie_telemetry import bootstrap_service_telemetry
 
+from . import __version__
 from .adapter import ClaudeAgentSession, ModelSession, build_options
 from .approval import (
     APPROVAL_SERVER_NAME,
@@ -54,7 +55,7 @@ from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("curie_runner")
 
 
 def _resolve_harness(name: str = DEFAULT_HARNESS) -> HarnessContribution:
@@ -374,9 +375,7 @@ def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, str | None]:
     return store, format_conversation_preamble(turns, max_turns=max_turns, max_bytes=max_bytes)
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    install_stdout_redaction()
+def _serve() -> None:
     # The NAME comes from the one declaration (#488); the parse deliberately does
     # not. BootEnv reads any non-"0" value as true, while this boot has always
     # required an explicit 1/true/yes -- routing through it would turn
@@ -460,6 +459,20 @@ def main() -> None:
 
     app.on_startup.append(_startup)
     web.run_app(app, host="0.0.0.0", port=config.port)
+
+
+def main() -> None:
+    install_stdout_redaction()
+    telemetry = bootstrap_service_telemetry(
+        "curie-runner",
+        service_version=__version__,
+        logger=logger,
+        environ=os.environ,
+    )
+    try:
+        _serve()
+    finally:
+        telemetry.shutdown()
 
 
 if __name__ == "__main__":

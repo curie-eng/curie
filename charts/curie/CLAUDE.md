@@ -11,6 +11,36 @@ component and rail detail in `charts/curie/README.md`.
   counts, and probe settings belong in `values.yaml` / a values overlay, not
   hardcoded in `templates/`. A value safe on a 4 GB scratch cluster can OOMKill
   on a smaller install.
+  - **One recorded exception: `templates/mail-adapter.yaml`**, which hardcodes
+    `replicas: 1` and `strategy: type: Recreate`. The reason is correctness, not
+    sizing: the adapter is one serialized SQLite writer on a single-writer
+    `ReadWriteOnce` or `ReadWriteOncePod` PVC.
+    A second replica or a rolling update creates two writers and defeats the
+    ownership/lease invariant even on storage that happens to multi-attach. Any
+    count other than 1 is wrong at every cluster size, which is exactly what
+    makes it unlike the resource limits and probe settings the invariant is
+    about, and `Recreate` is required for the same reason (a rolling update runs
+    two pods for the duration of every upgrade).
+    There is deliberately **no `mailAdapter.replicas` key**: a values key that
+    must never be changed advertises a knob that silently breaks reply routing,
+    which is worse than no knob. Pinned behaviorally by
+    `ci/mail-adapter-wiring-assertions.sh` assertion 10, which asserts
+    `spec.replicas` is 1 even under `--set mailAdapter.replicas=3`. Horizontal
+    scale for this adapter needs an Accepted shared-store/multi-writer design;
+    when it lands, this exception is removed rather than extended. Do not
+    generalize it into a rule about stateful services -- one named file, one
+    named reason.
+- **Mail-adapter egress is a separate fail-closed rail.** Enabling
+  `mailAdapter.deploy` requires at least one
+  `mailAdapter.agentmail.httpsCidrs` entry. Its single egress-only policy allows
+  DNS, this release's API pods, and those CIDRs on TCP 443; with `api.deploy`
+  false, `mailAdapter.apiEgress.httpsCidrs` and `.port` replace the pod selector
+  with an explicit narrow BYO-API peer. It never selects a runner sandbox and
+  never allows the Kubernetes API. The runtime pod mounts no ServiceAccount
+  token and has no RBAC. Prefix-0 and prefix-1 routes fail render, including
+  split default routes. Do not turn provider DNS into a broad CIDR or add a
+  private-network allow: use current provider ranges or a controlled egress
+  proxy with a stable range.
 - **Every backing store follows the same toggle + BYO idiom.** `<store>.deploy`
   (default `true`) gates whether the in-chart resource renders; flipping it
   to `false` repoints consumers (Langfuse env, the collector config) at the

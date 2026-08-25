@@ -11,6 +11,7 @@ import asyncio
 from typing import Any
 
 import pytest
+from curie_worker import connector_loop as connector_loop_module
 from curie_worker.connector_agent import AgentOutcome, RenderedConnectors
 from curie_worker.connector_apply import ApplyReport
 from curie_worker.connector_loop import AgentTarget, ConnectorReconcileLoop, PassSummary
@@ -152,6 +153,56 @@ async def test_a_pass_that_did_work_says_so(caplog) -> None:
     with caplog.at_level("INFO", logger="curie_worker.connector_loop"):
         await Loop([target("a")], {"a": ok("a", applied=2, deleted=1)}).one_pass()
     assert any("2 applied, 1 deleted" in r.getMessage() for r in caplog.records)
+
+
+async def test_each_connector_pass_reports_bounded_success_and_failure_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    points: list[tuple[str, float, dict[str, str]]] = []
+
+    def capture(
+        name: str,
+        value: float = 1,
+        *,
+        attributes: dict[str, str],
+    ) -> None:
+        points.append((name, value, attributes))
+
+    monkeypatch.setattr(connector_loop_module, "record_metric", capture)
+    times = iter([1.0, 10.0, 17.0])
+    monkeypatch.setattr(connector_loop_module, "_monotonic", lambda: next(times))
+    loop = Loop([target("bad")], {"bad": RuntimeError()})
+
+    await loop.one_pass()
+
+    assert points[0] == (
+        "curie.background.loop",
+        1,
+        {
+            "service.name": "curie-worker",
+            "operation": "connector-reconciler",
+            "role": "background",
+            "outcome": "failure",
+        },
+    )
+    assert len(points) == 1, "a first failure has no successful instant to age from"
+
+    loop._outcomes["bad"] = ok("bad")
+    await loop.one_pass()
+    loop._outcomes["bad"] = RuntimeError()
+    await loop.one_pass()
+
+    ages = [point for point in points if point[0] == "curie.background.last_success.age"]
+    assert [point[1] for point in ages] == [0.0, 7.0]
+    assert all(
+        point[2]
+        == {
+            "service.name": "curie-worker",
+            "operation": "connector-reconciler",
+            "role": "background",
+        }
+        for point in ages
+    )
 
 
 # --------------------------------------------------------------------------- #

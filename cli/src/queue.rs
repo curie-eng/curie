@@ -1,7 +1,10 @@
 //! Shared machinery for the Slack-facing drivers (`chat` and `message`).
 //!
-//! Both mint the exact `QueuedTurn` the dispatcher would produce, `XADD` it onto
-//! the real Valkey stream, and (on timeout) print the same stream diagnostics.
+//! Both mint the exact `QueuedTurn` the dispatcher would produce. `local
+//! message` hands those bytes to a bounded one-shot dispatcher producer so the
+//! real producer span injects trace context; cluster and the shared low-level
+//! helper retain the direct `XADD` path as the carrierless compatibility lane.
+//! Both paths use the real Valkey stream and print the same timeout diagnostics.
 //! The queue seam is the frozen `QueuedTurn` contract promoted into
 //! `packages/aci-protocol` (issue #7): the CLI uses the generated
 //! `curie_aci_protocol` types directly rather than hand-mirroring them. The

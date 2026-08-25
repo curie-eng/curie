@@ -1621,11 +1621,12 @@ mod tests {
         "curie-worker",
     ];
 
-    /// The 5 services that must carry `profiles: *full_profiles`.
+    /// The 6 services that must carry `profiles: *full_profiles`.
     const FULL_SERVICES: &[&str] = &[
         "clickhouse",
         "langfuse-worker",
         "langfuse-web",
+        "otel-collector-perms",
         "otel-collector",
         "curie-ui",
     ];
@@ -1651,7 +1652,7 @@ mod tests {
         &rest[..end]
     }
 
-    /// Assert the shared core(8)/full(5) profile binding in a compose file:
+    /// Assert the shared core(8)/full(6) profile binding in a compose file:
     /// the anchors are declared, the counts hold, AND each service block carries
     /// the anchor it should (so swapping a service's profile fails the test).
     fn assert_core_full_bindings(compose: &str, file: &str) {
@@ -1670,7 +1671,7 @@ mod tests {
         );
         assert_eq!(
             compose.matches("profiles: *full_profiles").count(),
-            5,
+            6,
             "{file} full-profile count"
         );
         for service in CORE_SERVICES {

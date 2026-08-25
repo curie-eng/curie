@@ -1,0 +1,176 @@
+{{- if and .Values.mailAdapter.deploy (not .Values.mailAdapter.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "curie.fullname" . }}-mail-state
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail-adapter-state
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- $storageClass := .Values.mailAdapter.persistence.storageClass | default .Values.global.storageClass }}
+  {{- if $storageClass }}
+  storageClassName: {{ $storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.mailAdapter.persistence.size }}
+{{- end }}
+
+{{- if and .Values.mailAdapter.deploy .Values.mailAdapter.persistence.existingClaim }}
+---
+{{/*
+The runtime pod has no Kubernetes credential or RBAC. This short-lived hook is
+the separate operator-time exception: it can GET exactly the named PVC so an
+upgrade cannot replace the only writer with a claim that is absent, RWX, or a
+raw block device. Hook deletion removes the ServiceAccount and grant after the
+check on success or failure.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "curie.fullname" . }}-mail-persistence-preflight
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail-persistence-preflight
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade,test
+    "helm.sh/hook-weight": "-9"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "curie.fullname" . }}-mail-persistence-preflight
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail-persistence-preflight
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade,test
+    "helm.sh/hook-weight": "-9"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    resourceNames: [{{ .Values.mailAdapter.persistence.existingClaim | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "curie.fullname" . }}-mail-persistence-preflight
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail-persistence-preflight
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade,test
+    "helm.sh/hook-weight": "-8"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "curie.fullname" . }}-mail-persistence-preflight
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "curie.fullname" . }}-mail-persistence-preflight
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "curie.fullname" . }}-mail-persistence-preflight
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail-persistence-preflight
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade,test
+    "helm.sh/hook-weight": "-7"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 60
+  template:
+    metadata:
+      labels:
+        {{- include "curie.selectorLabels" (dict "root" . "component" "mail-persistence-preflight") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "curie.fullname" . }}-mail-persistence-preflight
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: claim-check
+          image: {{ .Values.security.probe.kubectlImage }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: CLAIM
+              value: {{ .Values.mailAdapter.persistence.existingClaim | quote }}
+            - name: NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: HOME
+              value: /tmp
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              modes=$(kubectl get persistentvolumeclaim "$CLAIM" -n "$NAMESPACE" -o jsonpath='{.spec.accessModes[*]}')
+              volume_mode=$(kubectl get persistentvolumeclaim "$CLAIM" -n "$NAMESPACE" -o jsonpath='{.spec.volumeMode}')
+              case "$modes" in
+                ReadWriteOnce|ReadWriteOncePod) ;;
+                *)
+                  echo "mailAdapter.persistence.existingClaim must name a same-namespace PVC with exactly one access mode, ReadWriteOnce or ReadWriteOncePod; got: $modes" >&2
+                  exit 1
+                  ;;
+              esac
+              case "$volume_mode" in
+                ""|Filesystem) ;;
+                *)
+                  echo "mailAdapter.persistence.existingClaim must be a Filesystem PVC; got: $volume_mode" >&2
+                  exit 1
+                  ;;
+              esac
+              echo "mail persistence claim is same-namespace, single-writer, and Filesystem"
+          resources:
+            {{- toYaml .Values.mailAdapter.persistence.preflight.resources | nindent 12 }}
+          volumeMounts:
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: kube-api-access
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        - name: tmp
+          emptyDir: {}
+{{- end }}

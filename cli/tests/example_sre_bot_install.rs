@@ -171,7 +171,7 @@ case " $* " in
     *" get secret sre-bot-reader-token "*)
         case "$CURIE_TEST_READER_TOKEN_MODE" in
             success)
-                printf '%s\n' '{"apiVersion":"v1","kind":"Secret","data":{"ca.crt":"Zml4dHVyZS1jYQ==","token":"YWJj"}}'
+                printf '%s\n' '{"apiVersion":"v1","kind":"Secret","data":{"ca.crt":"Zml4dHVyZS1jYQ==","token":"enp6enp6enp6enp6"}}'
                 exit 0
                 ;;
             read-failure)
@@ -1438,7 +1438,7 @@ fn reader_kubeconfig_is_owned_secret_stdin_and_connectors_reconcile_after_deploy
         config["clusters"][0]["cluster"]["server"],
         "https://kubernetes.default.svc"
     );
-    assert_eq!(config["users"][0]["user"]["token"], "abc");
+    assert_eq!(config["users"][0]["user"]["token"], "zzzzzzzzzzzz");
     assert_eq!(
         config["clusters"][0]["cluster"]["certificate-authority-data"],
         "Zml4dHVyZS1jYQ=="
@@ -1455,9 +1455,25 @@ fn reader_kubeconfig_is_owned_secret_stdin_and_connectors_reconcile_after_deploy
         }),
         "stale connector objects must be reconciled after apply: {kubectl:?}"
     );
+    // The needle must be a string that CANNOT occur by chance. It was "abc",
+    // and `observable` carries temp paths built from random UUIDs -- which are
+    // hex, so a, b and c are all in the alphabet. A run whose helm values file
+    // landed on `/tmp/curie-helm-values-0e7b51b5-ab30-4abc-a064-...` failed this
+    // assertion with no credential anywhere near the output.
+    //
+    // That is worse than a flake. A leak check that fires on a filename gets
+    // re-run until green, and then it is not checking anything.
+    //
+    // So the fixture token is `z` repeated: `z` is outside hex, so no UUID or
+    // digest can produce it, and the base64 form is one block repeated, so its
+    // entropy stays where "abc" had it. A distinctive high-entropy string fixes
+    // the collision and becomes a gitleaks `generic-api-key` finding sitting
+    // next to the word "token" -- which is the secret-scanner's job working
+    // correctly, and the reason this is a placeholder rather than a plausible
+    // credential.
     let observable = format!("{text}\n{kubectl:?}\n{:?}", fixture.helm_calls());
     assert!(
-        !observable.contains("abc") && !observable.contains("YWJj"),
+        !observable.contains("zzzzzzzzzzzz") && !observable.contains("enp6enp6enp6enp6"),
         "the generated kubeconfig credential must not reach output or argv: {observable}"
     );
 }

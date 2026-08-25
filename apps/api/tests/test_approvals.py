@@ -12,9 +12,10 @@ import json
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,20 +28,35 @@ from aci_protocol import QueuedTurn
 from alembic import command
 from alembic.config import Config
 from curie_api import crud
+from curie_api import sweeper as sweeper_module
 from curie_api.config import get_settings
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
 from curie_api.models import Approval
 from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
+from curie_api.routers import approvals as approvals_module
 from curie_api.sandbox_token import mint
 from curie_api.slack_approvers import SlackApproverSetSelector
 from curie_api.slack_usergroups import SlackUserGroupClient
-from curie_api.sweeper import run_expiry_sweeper, sweep_expired_approvals
+from curie_api.sweeper import (
+    observe_pending_approvals,
+    run_expiry_sweeper,
+    sweep_expired_approvals,
+)
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    extract_trace_context,
+    operation_span,
+    record_metric,
+)
 from curie_test_support.valkey import (
     connect_or_skip,
 )
 from fastapi.testclient import TestClient
+from opentelemetry import context as otel_context
+from opentelemetry import trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -48,6 +64,24 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 # The migration test (18) drives alembic directly against the disposable DB the
 # conftest provisions, so it needs the same script location conftest uses.
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
+_TRACE_ID = int("2123456789abcdef0123456789abcdef", 16)
+_SPAN_ID = int("2123456789abcdef", 16)
+
+
+@asynccontextmanager
+async def _remote_parent() -> AsyncIterator[None]:
+    parent = SpanContext(
+        trace_id=_TRACE_ID,
+        span_id=_SPAN_ID,
+        is_remote=True,
+        trace_flags=TraceFlags.SAMPLED,
+        trace_state=TraceState(),
+    )
+    token = otel_context.attach(trace.set_span_in_context(NonRecordingSpan(parent)))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
 
 
 @pytest.fixture
@@ -363,6 +397,48 @@ def test_happy_path_resolve_marks_resumed(
 
     # ... and the record is now marked resumed (the new #411 contract).
     assert _read_resumed_at(created["id"]) is not None
+
+
+def test_resume_queue_injects_traceparent_adjacent_to_unchanged_payload(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """Approval resume uses the same transport carrier without widening the DTO."""
+
+    created = approvals_client.post(
+        "/approvals", json=_payload(), headers=auth_headers
+    ).json()
+
+    async def _resolve_with_parent() -> Any:
+        async with _remote_parent():
+            return await asyncio.to_thread(
+                approvals_client.post,
+                f"/approvals/{created['id']}/resolve",
+                json={
+                    "decision": "approved",
+                    "resolved_by": "U9",
+                    "actor_channel": "C1",
+                },
+                headers=auth_headers,
+            )
+
+    resolved = asyncio.run(_resolve_with_parent())
+    assert resolved.status_code == 200, resolved.text
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    _entry_id, fields = entries[0]
+    assert set(fields) == {"payload", TRACEPARENT_STREAM_FIELD}
+    raw_payload = fields["payload"]
+    assert QueuedTurn.model_validate_json(raw_payload).model_dump_json() == raw_payload
+
+    parent = trace.get_current_span(extract_trace_context(fields)).get_span_context()
+    assert parent.is_valid is True
+    assert parent.is_remote is True
+    assert parent.trace_id == _TRACE_ID
 
 
 def test_create_get_list_round_trip(
@@ -2294,3 +2370,202 @@ def test_unbound_route_name_keeps_channel_membership(
     inside = _resolve(approvals_client, auth_headers, created["id"], _OTHER)
     assert inside.status_code == 200, inside.text
     assert len(valkey.xrange(runs_stream)) == 1
+
+
+@dataclass(frozen=True)
+class _ApprovalMetric:
+    name: str
+    value: float
+    attributes: dict[str, str]
+
+
+class _ApprovalSpan:
+    def add_event(
+        self, _name: str, _attributes: Mapping[str, str] | None = None
+    ) -> None:
+        pass
+
+
+class _ApprovalTelemetryProbe:
+    def __init__(self) -> None:
+        self.spans: list[str] = []
+        self.metrics: list[_ApprovalMetric] = []
+
+    @contextmanager
+    def operation_span(
+        self,
+        name: str,
+        *,
+        kind: Any,
+        parent: Any = None,
+        attributes: Mapping[str, str] | None = None,
+    ) -> Iterator[_ApprovalSpan]:
+        del kind, parent, attributes
+        self.spans.append(name)
+        yield _ApprovalSpan()
+
+    def record_metric(
+        self,
+        name: str,
+        value: float = 1,
+        *,
+        attributes: Mapping[str, str] | None = None,
+    ) -> None:
+        self.metrics.append(
+            _ApprovalMetric(name, float(value), dict(attributes or {}))
+        )
+
+
+def _install_approval_telemetry(monkeypatch: pytest.MonkeyPatch) -> _ApprovalTelemetryProbe:
+    import curie_telemetry
+
+    probe = _ApprovalTelemetryProbe()
+    monkeypatch.setattr(curie_telemetry, "operation_span", probe.operation_span)
+    monkeypatch.setattr(curie_telemetry, "record_metric", probe.record_metric)
+    for module in (approvals_module, sweeper_module):
+        if hasattr(module, "operation_span"):
+            monkeypatch.setattr(module, "operation_span", probe.operation_span)
+        if hasattr(module, "record_metric"):
+            monkeypatch.setattr(module, "record_metric", probe.record_metric)
+    return probe
+
+
+def test_pending_age_resolved_and_expired_approval_metrics_are_bounded(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One real record traverses each approval state required by the catalog."""
+
+    assert callable(operation_span)
+    assert callable(record_metric)
+    probe = _install_approval_telemetry(monkeypatch)
+
+    resolved_record = approvals_client.post(
+        "/approvals", json=_payload(), headers=auth_headers
+    ).json()
+    pending = approvals_client.get(
+        "/approvals", params={"status_filter": "pending"}, headers=auth_headers
+    )
+    assert pending.status_code == 200
+    resolved = approvals_client.post(
+        f"/approvals/{resolved_record['id']}/resolve",
+        json={"decision": "approved", "resolved_by": "U9", "actor_channel": "C1"},
+        headers=auth_headers,
+    )
+    assert resolved.status_code == 200, resolved.text
+
+    approvals_client.post(
+        "/approvals",
+        json=_payload(expires_in_seconds=1),
+        headers=auth_headers,
+    )
+
+    async def _expire() -> int:
+        async with _sweeper_stack(runs_stream) as (sessionmaker, queue, _client):
+            async with sessionmaker() as session:
+                return await sweep_expired_approvals(
+                    session,
+                    queue,
+                    now=_naive_utc(2),
+                )
+
+    assert asyncio.run(_expire()) == 1
+
+    pending_counts = [
+        point for point in probe.metrics if point.name == "curie.approval.pending"
+    ]
+    pending_ages = [
+        point
+        for point in probe.metrics
+        if point.name == "curie.approval.pending.age"
+    ]
+    lifecycle = [
+        point for point in probe.metrics if point.name == "curie.approval.lifecycle"
+    ]
+    assert pending_counts and pending_counts[-1].value == 0
+    assert pending_ages and all(point.value >= 0 for point in pending_ages)
+    assert {point.attributes["outcome"] for point in lifecycle} >= {
+        "resolved",
+        "expired",
+    }
+    assert {"curie.approval.resolve", "curie.approval.expire"} <= set(probe.spans)
+    assert all(
+        set(point.attributes)
+        <= {"service.name", "operation", "role", "source", "outcome"}
+        for point in probe.metrics
+    )
+    assert all(
+        resolved_record["id"] not in point.attributes.values()
+        for point in probe.metrics
+    )
+
+
+def test_pending_inventory_ignores_filtered_page_and_counts_more_than_200(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _install_approval_telemetry(monkeypatch)
+    observed_at = datetime.now(UTC).replace(tzinfo=None)
+    created_at = observed_at - timedelta(minutes=5)
+
+    async def seed() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                session.add_all(
+                    [
+                        Approval(
+                            conversation_id=f"bulk-{index}",
+                            author="U0EXAMPLE1",
+                            summary="example approval",
+                            reply_kind="slack",
+                            reply_channel="C0EXAMPLE1",
+                            dedupe_key=f"bulk-pending-{index}",
+                            created_at=created_at,
+                        )
+                        for index in range(205)
+                    ]
+                )
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+    page = approvals_client.get(
+        "/approvals",
+        params={
+            "status_filter": "pending",
+            "conversation_id": "bulk-0",
+            "limit": 1,
+        },
+        headers=auth_headers,
+    )
+    assert page.status_code == 200
+    assert len(page.json()) == 1
+    assert not [point for point in probe.metrics if point.name == "curie.approval.pending"]
+
+    async def observe() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                await observe_pending_approvals(session, now=observed_at)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(observe())
+    counts = [point for point in probe.metrics if point.name == "curie.approval.pending"]
+    ages = [point for point in probe.metrics if point.name == "curie.approval.pending.age"]
+    assert [point.value for point in counts] == [205]
+    assert [point.value for point in ages] == [300]
+    assert counts[0].attributes == ages[0].attributes == {
+        "service.name": "curie-api",
+        "operation": "observe",
+        "outcome": "pending",
+    }

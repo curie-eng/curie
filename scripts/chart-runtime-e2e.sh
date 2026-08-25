@@ -22,6 +22,9 @@
 #    real bundle-fetch/bundle-extract init containers actually run.
 # 4. Wait for the init pair to complete and the runner container to be Running.
 # 5. `kubectl exec` into the runner and ASSERT on what it can see.
+# 6. Drive traces, logs, and metrics through the chart Collector into a private
+#    task-owned sink; then prove outage queueing, PVC-backed restart recovery,
+#    and explicit bounded-queue overflow/loss using Collector 0.119 self-metrics.
 #
 # HOW TO ADD ANOTHER RUNTIME ASSERTION
 # ------------------------------------
@@ -44,15 +47,28 @@ RUNNER_IMAGE=""
 EXPECT_VULNERABLE=0
 POD_NAME="e2e-bound-sandbox"
 BUNDLE_REF="e2e/probe.tgz"
+OTEL_SINK="e2e-otlp-sink"
+OTEL_OBSERVER="e2e-otel-observer"
+OTEL_UNSELECTED_OBSERVER="e2e-otel-unselected-observer"
+OTEL_METRICS_TEST_ALLOW="e2e-otel-metrics-test-allow"
+OTEL_STORAGE_OBSERVER="e2e-otel-storage-observer"
+OTEL_FIXTURES="e2e-otlp-fixtures"
+OTEL_EXPORTER="otlphttp/e2e-sink"
+OTEL_QUEUE_SIZE=2
+# Queue gauges have one series per traces/logs/metrics pipeline. metric_value
+# intentionally sums series, so the signal-wide capacity is three queue bounds.
+OTEL_QUEUE_CAPACITY_TOTAL=$((OTEL_QUEUE_SIZE * 3))
+OTEL_PVC_SIZE="128Mi"
+OTEL_MEMORY_LIMIT="96Mi"
 
 usage() {
   cat <<'EOF'
 Usage: scripts/chart-runtime-e2e.sh [options]
 
 Stands up a trimmed Curie chart slice on the k8scratch cluster, seeds a real
-bundle into RustFS, renders a bound agent-sandbox Pod, runs its bundle-fetch/
-extract init containers, and execs the runner to assert the #56 credential is
-NOT readable off the shared bundle volume (and the bundle really was provisioned).
+bundle into RustFS, and retains the #56 credential-isolation proof. It also
+drives all three OTLP signals through the chart Collector into a private sink,
+then proves outage queueing, PVC-backed restart recovery, and bounded overflow.
 
 Options:
   --namespace <ns>       Namespace to use (default: curie-e2eharness)
@@ -105,8 +121,11 @@ fi
 SANDBOX_TEMPLATE="$FULLNAME-runner"
 RUSTFS_SVC="$FULLNAME-rustfs"
 SECRET_NAME="$FULLNAME-secrets"
+OTEL_COLLECTOR_DEPLOYMENT="$FULLNAME-otel-collector"
+OTEL_COLLECTOR_SERVICE="$FULLNAME-otel-collector"
 RUSTFS_BUCKET="curie-bundles"
 RUSTFS_ACCESS_KEY="rustfs"
+E2E_TMP="$(mktemp -d /tmp/curie-chart-runtime-e2e.XXXXXX)"
 # Ownership label stamped on any namespace THIS script creates. The script only
 # ever deletes a namespace carrying this label, so pointing --namespace at a
 # pre-existing namespace (e.g. `default`) can never destroy it.
@@ -142,6 +161,7 @@ fi
 # --------------------------------------------------------------------------
 teardown() {
   local rc=$?
+  rm -rf "$E2E_TMP"
   if [[ "$KEEP" -eq 1 ]]; then
     banner "TEARDOWN skipped (--keep); namespace $NAMESPACE left in place"
     return $rc
@@ -190,6 +210,566 @@ exec_echo() {
   fi
 }
 
+# Collector 0.119.0 self-metric names consumed below. These are intentionally
+# literal: an image bump must update the harness together with the expected
+# Prometheus contract instead of silently turning every resilience check into a
+# grep for a metric the selected Collector no longer emits.
+OTELCOL_RECEIVER_METRICS=(
+  otelcol_receiver_accepted_spans
+  otelcol_receiver_accepted_log_records
+  otelcol_receiver_accepted_metric_points
+)
+OTELCOL_REFUSED_METRICS=(
+  otelcol_receiver_refused_spans
+  otelcol_receiver_refused_log_records
+  otelcol_receiver_refused_metric_points
+)
+OTELCOL_SENT_METRICS=(
+  otelcol_exporter_sent_spans
+  otelcol_exporter_sent_log_records
+  otelcol_exporter_sent_metric_points
+)
+OTELCOL_FAILED_METRICS=(
+  otelcol_exporter_send_failed_spans
+  otelcol_exporter_send_failed_log_records
+  otelcol_exporter_send_failed_metric_points
+)
+OTELCOL_ENQUEUE_FAILED_METRICS=(
+  otelcol_exporter_enqueue_failed_spans
+  otelcol_exporter_enqueue_failed_log_records
+  otelcol_exporter_enqueue_failed_metric_points
+)
+OTELCOL_QUEUE_SIZE_METRIC=otelcol_exporter_queue_size
+OTELCOL_QUEUE_CAPACITY_METRIC=otelcol_exporter_queue_capacity
+
+# metrics_snapshot <service> : fetch a Collector Prometheus endpoint through
+# the task-owned observer Pod and save the complete payload in METRICS_OUT.
+metrics_snapshot() {
+  local service="$1"
+  if ! METRICS_OUT="$(kubectl exec "$OTEL_OBSERVER" -n "$NAMESPACE" -- \
+      curl -fsS "http://$service:8888/metrics")"; then
+    fail "could not read Collector self-metrics from $service:8888"
+  fi
+}
+
+# metrics_scrape_from <observer-pod> : require the named observer to reach the
+# Collector metrics endpoint and see a Collector-owned metric. Retry across
+# NetworkPolicy propagation so a transient policy update cannot false-red.
+metrics_scrape_from() {
+  local observer="$1" deadline=$((SECONDS + 45)) output=""
+  while (( SECONDS < deadline )); do
+    if output="$(kubectl exec "$observer" -n "$NAMESPACE" -- \
+        curl -fsS --connect-timeout 2 --max-time 5 \
+        "http://$OTEL_COLLECTOR_SERVICE:8888/metrics" 2>/dev/null)" && \
+        grep -q '^otelcol_process_uptime' <<<"$output"; then
+      return 0
+    fi
+    sleep 2
+  done
+  fail "$observer could not scrape Collector self-metrics"
+}
+
+# assert_metrics_scrape_denied <observer-pod> : three denied attempts after a
+# selected peer has already proved endpoint health distinguish enforcement from
+# a transient service failure.
+assert_metrics_scrape_denied() {
+  local observer="$1" attempt
+  for attempt in 1 2 3; do
+    if kubectl exec "$observer" -n "$NAMESPACE" -- \
+        curl -fsS --connect-timeout 2 --max-time 5 \
+        "http://$OTEL_COLLECTOR_SERVICE:8888/metrics" >/dev/null 2>&1; then
+      fail "$observer reached Collector self-metrics without an allowed peer"
+    fi
+  done
+}
+
+# Prove the chart policy and the cluster CNI both enforce the intended peer:
+# selected observer succeeds, an otherwise equivalent same-namespace pod is
+# denied, then succeeds only while a narrowly targeted additive policy exists.
+assert_collector_metrics_network_policy() {
+  metrics_scrape_from "$OTEL_OBSERVER"
+  assert_metrics_scrape_denied "$OTEL_UNSELECTED_OBSERVER"
+
+  cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: $OTEL_METRICS_TEST_ALLOW
+  labels:
+    app.kubernetes.io/name: curie
+    app.kubernetes.io/instance: $RELEASE
+    app.kubernetes.io/component: e2e-otel-metrics-test-allow
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: curie
+      app.kubernetes.io/instance: $RELEASE
+      app.kubernetes.io/component: otel-collector
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: curie
+              app.kubernetes.io/instance: $RELEASE
+              app.kubernetes.io/component: e2e-otel-unselected-observer
+      ports:
+        - protocol: TCP
+          port: 8888
+EOF
+  metrics_scrape_from "$OTEL_UNSELECTED_OBSERVER"
+  kubectl delete networkpolicy "$OTEL_METRICS_TEST_ALLOW" \
+    -n "$NAMESPACE" --wait=true --timeout=60s
+  echo "Collector metrics policy: selected peer allowed; unselected peer denied; targeted control allow proved CNI enforcement"
+}
+
+# metric_value <name> [exporter] : sum every series with this exact 0.119 name,
+# optionally selecting the named exporter label.
+metric_value() {
+  local name="$1" exporter="${2:-}"
+  printf '%s\n' "$METRICS_OUT" | python3 -c '
+import re, sys
+name, exporter = sys.argv[1:]
+total = 0.0
+seen = False
+for line in sys.stdin:
+    if not re.match(r"^" + re.escape(name) + r"(?:\{|\s)", line):
+        continue
+    if exporter and f"exporter=\"{exporter}\"" not in line:
+        continue
+    try:
+        total += float(line.rsplit(None, 1)[1])
+    except (IndexError, ValueError):
+        continue
+    seen = True
+if not seen:
+    raise SystemExit(4)
+print(total)
+' "$name" "$exporter"
+}
+
+# wait_metrics_positive <service> <exporter-or-empty> <metric...>
+wait_metrics_positive() {
+  local service="$1" exporter="$2"
+  shift 2
+  local deadline=$((SECONDS + 90)) value all_positive
+  while (( SECONDS < deadline )); do
+    metrics_snapshot "$service"
+    all_positive=1
+    for metric in "$@"; do
+      value="$(metric_value "$metric" "$exporter" 2>/dev/null || echo 0)"
+      if ! python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) > 0 else 1)' "$value"; then
+        all_positive=0
+      fi
+    done
+    [[ "$all_positive" -eq 1 ]] && return 0
+    sleep 3
+  done
+  for metric in "$@"; do
+    value="$(metric_value "$metric" "$exporter" 2>/dev/null || echo missing)"
+    echo "$service $metric exporter=${exporter:-any}: $value"
+  done
+  fail "$service did not expose positive values for all required Collector 0.119 metrics"
+}
+
+# wait_metrics_present <service> <exporter-or-empty> <metric...>
+# A recoverable exporter retry must not be mistaken for terminal signal loss.
+# This helper pins the self-observability contract without requiring a failure
+# counter to move before the configured retry window is exhausted.
+wait_metrics_present() {
+  local service="$1" exporter="$2"
+  shift 2
+  local deadline=$((SECONDS + 90)) value all_present
+  while (( SECONDS < deadline )); do
+    metrics_snapshot "$service"
+    all_present=1
+    for metric in "$@"; do
+      value="$(metric_value "$metric" "$exporter" 2>/dev/null || echo missing)"
+      [[ "$value" != missing ]] || all_present=0
+    done
+    [[ "$all_present" -eq 1 ]] && return 0
+    sleep 3
+  done
+  for metric in "$@"; do
+    value="$(metric_value "$metric" "$exporter" 2>/dev/null || echo missing)"
+    echo "$service $metric exporter=${exporter:-any}: $value"
+  done
+  fail "$service omitted required Collector 0.119 self-metrics"
+}
+
+wait_collector_retry_log() {
+  local pod="$1" deadline=$((SECONDS + 90)) logs=""
+  while (( SECONDS < deadline )); do
+    logs="$(kubectl logs "$pod" -n "$NAMESPACE" 2>&1 || true)"
+    if grep -Eiq 'exporting failed.*retry|failed to export.*retry|will retry' <<<"$logs"; then
+      return 0
+    fi
+    sleep 3
+  done
+  printf '%s\n' "$logs" | tail -80
+  fail "Collector did not preserve its stderr exporter-retry diagnostic"
+}
+
+wait_metric_equals() {
+  local service="$1" metric="$2" exporter="$3" expected="$4"
+  local deadline=$((SECONDS + 90)) value="missing"
+  while (( SECONDS < deadline )); do
+    metrics_snapshot "$service"
+    value="$(metric_value "$metric" "$exporter" 2>/dev/null || echo missing)"
+    if [[ "$value" != missing ]] && python3 -c '
+import math, sys
+raise SystemExit(0 if math.isclose(float(sys.argv[1]), float(sys.argv[2])) else 1)
+' "$value" "$expected"; then
+      return 0
+    fi
+    sleep 3
+  done
+  fail "$service $metric exporter=$exporter was $value, expected $expected"
+}
+
+assert_metric_between() {
+  local service="$1" metric="$2" exporter="$3" lower="$4" upper="$5"
+  local value
+  metrics_snapshot "$service"
+  value="$(metric_value "$metric" "$exporter" 2>/dev/null || echo missing)"
+  [[ "$value" != missing ]] || fail "$service omitted required self-metric $metric"
+  python3 -c '
+import sys
+value, lower, upper = map(float, sys.argv[1:])
+raise SystemExit(0 if lower <= value <= upper else 1)
+' "$value" "$lower" "$upper" || \
+    fail "$service $metric exporter=$exporter was $value, expected range [$lower, $upper]"
+}
+
+assert_metrics_zero() {
+  local service="$1" exporter="$2"
+  shift 2
+  local metric value
+  wait_metrics_present "$service" "$exporter" "$@"
+  metrics_snapshot "$service"
+  for metric in "$@"; do
+    value="$(metric_value "$metric" "$exporter" 2>/dev/null || echo missing)"
+    [[ "$value" != missing ]] || fail "$service omitted required self-metric $metric"
+    python3 -c '
+import sys
+raise SystemExit(0 if float(sys.argv[1]) == 0 else 1)
+' "$value" || fail "$service $metric exporter=${exporter:-any} was $value, expected zero"
+  done
+}
+
+assert_sustained_outage_bounded() {
+  # Observe a full minute of continuous exporter failure. This is long enough
+  # to cross multiple batch/retry cycles instead of sampling one transient.
+  local pod="$1" samples=20 interval=3 sample ready queue capacity used_kib
+  local pod_uid restart_count current_uid current_restart_count last_reason
+  local first_used_kib=0 max_used_kib=0 bound_kib growth_allowance_kib=4096
+  pod_uid="$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
+  restart_count="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+    -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+  [[ -n "$pod_uid" && "$restart_count" =~ ^[0-9]+$ ]] || \
+    fail "could not capture Collector pod identity/restart baseline"
+  bound_kib="$(python3 -c '
+import re, sys
+value = sys.argv[1]
+match = re.fullmatch(r"([0-9]+)(Ki|Mi|Gi)", value)
+if not match:
+    raise SystemExit(f"unsupported PVC quantity {value!r}")
+amount = int(match.group(1))
+scale = {"Ki": 1, "Mi": 1024, "Gi": 1024 * 1024}[match.group(2)]
+print(amount * scale)
+' "$PVC_REQUEST")"
+  metrics_snapshot "$OTEL_COLLECTOR_SERVICE"
+  capacity="$(metric_value "$OTELCOL_QUEUE_CAPACITY_METRIC" "$OTEL_EXPORTER" 2>/dev/null || echo missing)"
+  [[ "$capacity" != missing ]] || fail "Collector omitted queue capacity during sustained outage"
+  python3 -c '
+import sys
+raise SystemExit(0 if float(sys.argv[1]) == float(sys.argv[2]) else 1)
+' "$capacity" "$OTEL_QUEUE_CAPACITY_TOTAL" || \
+    fail "persistent queue capacity was $capacity, expected $OTEL_QUEUE_CAPACITY_TOTAL"
+
+  for sample in $(seq 1 "$samples"); do
+    ready="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')"
+    [[ "$ready" == True ]] || \
+      fail "Collector stopped being Ready during sustained exporter outage (sample $sample: $ready)"
+    current_uid="$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
+    current_restart_count="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+      -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+    last_reason="$(kubectl get pod "$pod" -n "$NAMESPACE" \
+      -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}')"
+    [[ "$current_uid" == "$pod_uid" && "$current_restart_count" == "$restart_count" ]] || \
+      fail "Collector restarted during sustained exporter outage (uid=$current_uid restarts=$current_restart_count)"
+    [[ "$last_reason" != OOMKilled ]] || \
+      fail "Collector was OOMKilled during sustained exporter outage"
+    metrics_snapshot "$OTEL_COLLECTOR_SERVICE"
+    queue="$(metric_value "$OTELCOL_QUEUE_SIZE_METRIC" "$OTEL_EXPORTER" 2>/dev/null || echo missing)"
+    [[ "$queue" != missing ]] || fail "Collector omitted queue size during sustained outage"
+    python3 -c '
+import sys
+value, capacity = map(float, sys.argv[1:])
+raise SystemExit(0 if 0 < value <= capacity else 1)
+' "$queue" "$capacity" || \
+      fail "persistent queue was $queue outside (0, $capacity] during outage"
+    used_kib="$(kubectl exec "$OTEL_STORAGE_OBSERVER" -n "$NAMESPACE" -- sh -c \
+      'du -sk /var/lib/otelcol 2>/dev/null | cut -f1')"
+    [[ "$used_kib" =~ ^[0-9]+$ ]] || fail "could not measure Collector PVC usage: $used_kib"
+    if (( sample == 1 )); then
+      first_used_kib="$used_kib"
+    fi
+    (( used_kib <= bound_kib )) || \
+      fail "Collector PVC used ${used_kib}Ki beyond declared ${bound_kib}Ki bound"
+    (( used_kib > max_used_kib )) && max_used_kib="$used_kib"
+    sleep "$interval"
+  done
+  (( used_kib <= first_used_kib + growth_allowance_kib )) || \
+    fail "Collector PVC grew from ${first_used_kib}Ki to ${used_kib}Ki while retrying a fixed bounded queue"
+  echo "sustained outage: Collector remained Ready without restart/OOM for $((samples * interval))s; queue<=${capacity}, pvc-used=${first_used_kib}..${max_used_kib}Ki/${bound_kib}Ki"
+}
+
+create_otlp_probe_resources() {
+  cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: $OTEL_SINK
+  labels:
+    app.kubernetes.io/name: curie-e2e-otel
+    app.kubernetes.io/instance: $RELEASE
+data:
+  collector-config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:4318
+    exporters:
+      nop: {}
+      # The private test sink uses detailed stderr output as an independent
+      # receipt ledger. This does not enable the production chart's debug
+      # exporter; it lets the harness count the uniquely named queued sample.
+      debug:
+        verbosity: detailed
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+    service:
+      extensions: [health_check]
+      telemetry:
+        metrics:
+          address: 0.0.0.0:8888
+      pipelines:
+        traces: {receivers: [otlp], exporters: [nop, debug]}
+        logs: {receivers: [otlp], exporters: [nop, debug]}
+        metrics: {receivers: [otlp], exporters: [nop, debug]}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: $OTEL_FIXTURES
+  labels:
+    app.kubernetes.io/name: curie-e2e-otel
+    app.kubernetes.io/instance: $RELEASE
+data:
+  traces.json: |
+    {"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"acme-e2e"}}]},"scopeSpans":[{"scope":{"name":"acme.e2e"},"spans":[{"traceId":"0123456789abcdef0123456789abcdef","spanId":"0123456789abcdef","name":"trace-__LABEL__-probe","kind":1,"startTimeUnixNano":"1000000000","endTimeUnixNano":"1000000001","status":{"code":1}}]}]}]}
+  logs.json: |
+    {"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"acme-e2e"}}]},"scopeLogs":[{"scope":{"name":"acme.e2e"},"logRecords":[{"timeUnixNano":"1000000000","severityNumber":9,"severityText":"INFO","body":{"stringValue":"log-__LABEL__-probe"}}]}]}]}
+  metrics.json: |
+    {"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"acme-e2e"}}]},"scopeMetrics":[{"scope":{"name":"acme.e2e"},"metrics":[{"name":"metric.__LABEL__.probe","gauge":{"dataPoints":[{"timeUnixNano":"1000000000","asInt":"1"}]}}]}]}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $OTEL_SINK
+  labels:
+    app.kubernetes.io/name: curie-e2e-otel
+    app.kubernetes.io/instance: $RELEASE
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: $OTEL_SINK}
+  template:
+    metadata:
+      labels: {app: $OTEL_SINK}
+    spec:
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector-contrib:0.119.0
+          args: ["--config=/etc/otelcol/collector-config.yaml"]
+          ports:
+            - {name: otlp-http, containerPort: 4318}
+            - {name: metrics, containerPort: 8888}
+            - {name: health, containerPort: 13133}
+          readinessProbe:
+            httpGet: {path: /, port: health}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/otelcol, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: $OTEL_SINK}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: $OTEL_SINK
+  labels:
+    app.kubernetes.io/name: curie-e2e-otel
+    app.kubernetes.io/instance: $RELEASE
+spec:
+  selector: {app: $OTEL_SINK}
+  ports:
+    - {name: otlp-http, port: 4318, targetPort: otlp-http}
+    - {name: metrics, port: 8888, targetPort: metrics}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $OTEL_OBSERVER
+  labels:
+    app.kubernetes.io/name: curie
+    app.kubernetes.io/instance: $RELEASE
+    app.kubernetes.io/component: e2e-otel-observer
+spec:
+  restartPolicy: Never
+  containers:
+    - name: observer
+      image: curlimages/curl:8.12.1
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        requests: {cpu: 5m, memory: 8Mi}
+        limits: {cpu: 50m, memory: 32Mi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $OTEL_UNSELECTED_OBSERVER
+  labels:
+    app.kubernetes.io/name: curie
+    app.kubernetes.io/instance: $RELEASE
+    app.kubernetes.io/component: e2e-otel-unselected-observer
+spec:
+  restartPolicy: Never
+  containers:
+    - name: observer
+      image: curlimages/curl:8.12.1
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        requests: {cpu: 5m, memory: 8Mi}
+        limits: {cpu: 50m, memory: 32Mi}
+EOF
+  kubectl rollout status deployment/$OTEL_SINK -n "$NAMESPACE" --timeout=120s
+  kubectl wait --for=condition=Ready pod/$OTEL_OBSERVER -n "$NAMESPACE" --timeout=120s
+  kubectl wait --for=condition=Ready pod/$OTEL_UNSELECTED_OBSERVER \
+    -n "$NAMESPACE" --timeout=120s
+}
+
+create_otlp_storage_observer() {
+  cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $OTEL_STORAGE_OBSERVER
+  labels:
+    app.kubernetes.io/name: curie
+    app.kubernetes.io/instance: $RELEASE
+    app.kubernetes.io/component: e2e-otel-storage-observer
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+    - name: storage-observer
+      image: busybox:1.36.1
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: [ALL]}
+      resources:
+        requests: {cpu: 5m, memory: 8Mi}
+        limits: {cpu: 25m, memory: 16Mi}
+      volumeMounts:
+        - name: collector-storage
+          mountPath: /var/lib/otelcol
+          readOnly: true
+  volumes:
+    - name: collector-storage
+      persistentVolumeClaim:
+        claimName: $COLLECTOR_PVC
+        readOnly: true
+EOF
+  kubectl wait --for=condition=Ready pod/$OTEL_STORAGE_OBSERVER \
+    -n "$NAMESPACE" --timeout=120s
+}
+
+# send_otlp_triplet <label> <count> <delay-seconds> <strict|best-effort>
+send_otlp_triplet() {
+  local label="$1" count="$2" delay="$3" mode="$4"
+  local job="e2e-otlp-${label}"
+  kubectl delete job "$job" -n "$NAMESPACE" --ignore-not-found >/dev/null
+  cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $job
+  labels:
+    app.kubernetes.io/name: curie-e2e-otel
+    app.kubernetes.io/instance: $RELEASE
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: curie
+        app.kubernetes.io/instance: $RELEASE
+        app.kubernetes.io/component: e2e-otel-probe
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: send
+          image: curlimages/curl:8.12.1
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              i=1
+              while [ "\$i" -le "$count" ]; do
+                for signal in traces logs metrics; do
+                  sed 's/__LABEL__/$label/g' "/fixtures/\${signal}.json" > /tmp/payload.json
+                  if [ "$mode" = strict ]; then
+                    curl -fsS -H 'Content-Type: application/json' \
+                      --data-binary @/tmp/payload.json \
+                      "http://$OTEL_COLLECTOR_SERVICE:4318/v1/\${signal}" >/dev/null
+                  else
+                    curl -sS -H 'Content-Type: application/json' \
+                      --data-binary @/tmp/payload.json \
+                      "http://$OTEL_COLLECTOR_SERVICE:4318/v1/\${signal}" >/dev/null || true
+                  fi
+                done
+                i=\$((i + 1))
+                [ "$delay" = 0 ] || sleep "$delay"
+              done
+          volumeMounts:
+            - {name: fixtures, mountPath: /fixtures, readOnly: true}
+      volumes:
+        - name: fixtures
+          configMap: {name: $OTEL_FIXTURES}
+EOF
+  if ! kubectl wait --for=condition=complete job/$job -n "$NAMESPACE" --timeout=180s; then
+    kubectl logs job/$job -n "$NAMESPACE" || true
+    fail "OTLP fixture Job $job did not complete"
+  fi
+}
+
 # build_bound_pod : read the installed SandboxTemplate, extract its podTemplate,
 # and emit a bound `kind: Pod` manifest on stdout. This is the generic
 # "render template -> bind bundle" step; any runtime assertion reuses the Pod.
@@ -220,10 +800,24 @@ def bind_ref(container):
             e["name"] = "CURIE_BUNDLE_REF"
             e["value"] = bundle_ref
 
+def bind_runner_bundle(container):
+    if container.get("name") != "runner":
+        return
+    for e in container.get("env", []):
+        if e.get("name") == "CURIE_PLUGIN_DIR":
+            e.clear()
+            e["name"] = "CURIE_PLUGIN_DIR"
+            e["value"] = "/bundles/current"
+
 for c in spec.get("initContainers", []):
     bind_ref(c)
 for c in spec.get("containers", []):
     bind_ref(c)
+    # The installed SandboxTemplate is intentionally warm/unbound and points
+    # at /unused. This harness has just bound a real bundle, so bind the runner
+    # to the extracted directory as well; otherwise the default exact command
+    # exits before the runtime assertions and only --runner-image can pass.
+    bind_runner_bundle(c)
 
 # Use the default ServiceAccount (avoids a missing-SA scheduling failure).
 spec.pop("serviceAccountName", None)
@@ -358,6 +952,24 @@ run_assertions() {
 # --------------------------------------------------------------------------
 banner "PRECHECK context=$CURRENT_CTX namespace=$NAMESPACE release=$RELEASE"
 
+DEFAULT_STORAGE_CLASS="$(kubectl get storageclass -o json | python3 -c '
+import json, sys
+items = json.load(sys.stdin).get("items", [])
+defaults = []
+for item in items:
+    annotations = item.get("metadata", {}).get("annotations", {})
+    if annotations.get("storageclass.kubernetes.io/is-default-class") == "true" or annotations.get("storageclass.beta.kubernetes.io/is-default-class") == "true":
+        defaults.append(item.get("metadata", {}).get("name", ""))
+print("\n".join(name for name in defaults if name))
+')"
+if [[ -z "$DEFAULT_STORAGE_CLASS" ]]; then
+  fail "no default StorageClass is installed; durable Collector PVC runtime proof cannot run"
+fi
+if [[ "$DEFAULT_STORAGE_CLASS" == *$'\n'* ]]; then
+  fail "multiple default StorageClasses detected (${DEFAULT_STORAGE_CLASS//$'\n'/, }); choose exactly one before running durable Collector proof"
+fi
+echo "default StorageClass: $DEFAULT_STORAGE_CLASS"
+
 if kubectl get ns "$NAMESPACE" >/dev/null 2>&1; then
   # Only reclaim a namespace WE created. An unlabeled pre-existing namespace
   # (e.g. `default`, or someone else's) must never be deleted by this harness.
@@ -374,12 +986,65 @@ fi
 # can only ever delete a namespace this script created.
 create_owned_ns "$NAMESPACE"
 
+banner "CREATE private OTLP sink and observer"
+create_otlp_probe_resources
+
+OTEL_OVERLAY="$E2E_TMP/otel-durability-values.yaml"
+cat > "$OTEL_OVERLAY" <<EOF
+# PriorityClasses are cluster-scoped. Give this task-owned release private
+# names so a concurrent or long-lived Curie install cannot be adopted or
+# disturbed by the throwaway runtime proof.
+priorityClasses:
+  platform:
+    name: $RELEASE-curie-platform
+  sandbox:
+    name: $RELEASE-curie-sandbox
+otelCollector:
+  deploy: true
+  debugExporter:
+    enabled: false
+  persistence:
+    enabled: true
+    size: $OTEL_PVC_SIZE
+  resources:
+    requests: {cpu: 25m, memory: 48Mi}
+    limits: {cpu: 200m, memory: $OTEL_MEMORY_LIMIT}
+  extraExporters:
+    $OTEL_EXPORTER:
+      endpoint: http://$OTEL_SINK:4318
+      retry_on_failure:
+        enabled: true
+        initial_interval: 1s
+        max_interval: 2s
+        # Leave enough retry horizon for a deliberately sustained outage plus
+        # a slow shared-cluster PVC detach/reattach. Queue overflow, not retry
+        # expiry, is the independent bounded-loss control below.
+        max_elapsed_time: 600s
+      sending_queue:
+        enabled: true
+        storage: file_storage
+        queue_size: $OTEL_QUEUE_SIZE
+        num_consumers: 1
+  extraPipelineExporters: [$OTEL_EXPORTER]
+  extraLogPipelineExporters: [$OTEL_EXPORTER]
+  extraMetricPipelineExporters: [$OTEL_EXPORTER]
+security:
+  otelCollectorNetworkPolicy:
+    metricsIngress:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/name: curie
+            app.kubernetes.io/instance: $RELEASE
+            app.kubernetes.io/component: e2e-otel-observer
+EOF
+
 banner "INSTALL trimmed chart"
 install_chart() {
   helm install "$RELEASE" "$CHART_PATH" \
     -n "$NAMESPACE" --no-hooks \
     -f "$CHART_PATH/values-e2e-nogvisor.yaml" \
-    -f "$CHART_PATH/values-e2e-harness.yaml"
+    -f "$CHART_PATH/values-e2e-harness.yaml" \
+    -f "$OTEL_OVERLAY"
 }
 # k8scratch is shared and slightly flaky: a spurious "namespaces not found" at
 # install is usually API churn, so retry ONCE before failing.
@@ -391,8 +1056,47 @@ if ! install_chart; then
     kubectl delete ns "$NAMESPACE" --wait=true --timeout=60s >/dev/null 2>&1 || true
   fi
   create_owned_ns "$NAMESPACE"
+  create_otlp_probe_resources
   install_chart || fail "helm install failed twice"
 fi
+
+banner "WAIT durable OTel Collector Running"
+if ! kubectl rollout status deployment/$OTEL_COLLECTOR_DEPLOYMENT \
+    -n "$NAMESPACE" --timeout=180s; then
+  kubectl describe deployment/$OTEL_COLLECTOR_DEPLOYMENT -n "$NAMESPACE" || true
+  kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=otel-collector || true
+  fail "chart OTel Collector did not become Ready"
+fi
+
+banner "ASSERT Collector self-metrics ingress policy"
+assert_collector_metrics_network_policy
+
+COLLECTOR_PVC="$(kubectl get deployment "$OTEL_COLLECTOR_DEPLOYMENT" -n "$NAMESPACE" -o json | python3 -c '
+import json, sys
+pod = json.load(sys.stdin)["spec"]["template"]["spec"]
+claims = [
+    volume.get("persistentVolumeClaim", {}).get("claimName")
+    for volume in pod.get("volumes", [])
+    if volume.get("persistentVolumeClaim", {}).get("claimName")
+]
+if len(claims) != 1:
+    raise SystemExit(f"expected one Collector PVC volume, found {claims!r}")
+print(claims[0])
+')"
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/$COLLECTOR_PVC \
+  -n "$NAMESPACE" --timeout=120s
+create_otlp_storage_observer
+PVC_REQUEST="$(kubectl get pvc "$COLLECTOR_PVC" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')"
+PVC_CAPACITY="$(kubectl get pvc "$COLLECTOR_PVC" -n "$NAMESPACE" -o jsonpath='{.status.capacity.storage}')"
+[[ "$PVC_REQUEST" == "$OTEL_PVC_SIZE" ]] || \
+  fail "Collector disk bound is $PVC_REQUEST, expected task limit $OTEL_PVC_SIZE"
+[[ -n "$PVC_CAPACITY" ]] || fail "Collector PVC $COLLECTOR_PVC has no finite bound capacity"
+
+COLLECTOR_MEMORY_LIMIT="$(kubectl get deployment "$OTEL_COLLECTOR_DEPLOYMENT" -n "$NAMESPACE" \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="otel-collector")].resources.limits.memory}')"
+[[ "$COLLECTOR_MEMORY_LIMIT" == "$OTEL_MEMORY_LIMIT" ]] || \
+  fail "Collector memory bound is $COLLECTOR_MEMORY_LIMIT, expected $OTEL_MEMORY_LIMIT"
+echo "bounded Collector resources: memory=$COLLECTOR_MEMORY_LIMIT disk-request=$PVC_REQUEST disk-capacity=$PVC_CAPACITY"
 
 # --------------------------------------------------------------------------
 # 2. Wait for RustFS Running. Gate on the pod, not Helm release status.
@@ -511,6 +1215,120 @@ echo "bound sandbox ready: init containers Completed, runner Running"
 # --------------------------------------------------------------------------
 banner "ASSERT runtime security (#56)"
 run_assertions
+
+# --------------------------------------------------------------------------
+# 6. Collector reception, durable outage/restart recovery, and overflow loss
+# --------------------------------------------------------------------------
+banner "ASSERT OTel healthy reception and delivery"
+send_otlp_triplet healthy 1 0 strict
+wait_metrics_positive "$OTEL_COLLECTOR_SERVICE" "" "${OTELCOL_RECEIVER_METRICS[@]}"
+wait_metrics_positive "$OTEL_COLLECTOR_SERVICE" "$OTEL_EXPORTER" "${OTELCOL_SENT_METRICS[@]}"
+wait_metrics_positive "$OTEL_SINK" "" "${OTELCOL_RECEIVER_METRICS[@]}"
+assert_metrics_zero "$OTEL_COLLECTOR_SERVICE" "" "${OTELCOL_REFUSED_METRICS[@]}"
+assert_metrics_zero "$OTEL_COLLECTOR_SERVICE" "$OTEL_EXPORTER" \
+  "${OTELCOL_FAILED_METRICS[@]}"
+echo "healthy path: all three signals accepted and sent; refused and send-failed stayed observable at zero"
+
+banner "ASSERT backend outage queues and reports failure"
+SINK_POD="$(kubectl get pod -n "$NAMESPACE" -l app="$OTEL_SINK" -o jsonpath='{.items[0].metadata.name}')"
+[[ -n "$SINK_POD" ]] || fail "private OTLP sink has no pod before outage control"
+kubectl scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=0
+kubectl wait --for=delete pod/$SINK_POD -n "$NAMESPACE" --timeout=120s
+# Occupy the sole consumer with a distinct in-flight retry, then enqueue the
+# uniquely named outage sample behind it. Queue size excludes the in-flight
+# request, so this makes durable persistence observable before restart.
+send_otlp_triplet priming 1 0 strict
+OUTAGE_COLLECTOR_POD="$(kubectl get pod -n "$NAMESPACE" \
+  -l app.kubernetes.io/component=otel-collector -o jsonpath='{.items[0].metadata.name}')"
+wait_collector_retry_log "$OUTAGE_COLLECTOR_POD"
+send_otlp_triplet outage 1 0 strict
+wait_metrics_present "$OTEL_COLLECTOR_SERVICE" "$OTEL_EXPORTER" "${OTELCOL_FAILED_METRICS[@]}"
+wait_metrics_present "$OTEL_COLLECTOR_SERVICE" "" "${OTELCOL_REFUSED_METRICS[@]}"
+wait_metrics_positive "$OTEL_COLLECTOR_SERVICE" "$OTEL_EXPORTER" "$OTELCOL_QUEUE_SIZE_METRIC"
+assert_sustained_outage_bounded "$OUTAGE_COLLECTOR_POD"
+echo "outage path: per-signal refused/failure counters remain visible, stderr reports retry, and the bounded persistent queue is non-empty"
+
+banner "ASSERT Collector restart retains the queued signals on its PVC"
+OLD_COLLECTOR_POD="$(kubectl get pod -n "$NAMESPACE" \
+  -l app.kubernetes.io/component=otel-collector -o jsonpath='{.items[0].metadata.name}')"
+OLD_COLLECTOR_UID="$(kubectl get pod "$OLD_COLLECTOR_POD" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
+# The storage observer mounts the same ReadWriteOnce claim read-only. Remove it
+# before replacement so single-node and multi-node provisioners alike can
+# detach/reattach the Collector claim without a second live pod holding it.
+kubectl delete pod "$OTEL_STORAGE_OBSERVER" -n "$NAMESPACE" \
+  --wait=true --timeout=120s
+kubectl delete pod "$OLD_COLLECTOR_POD" -n "$NAMESPACE" --wait=true --timeout=180s
+kubectl rollout status deployment/$OTEL_COLLECTOR_DEPLOYMENT -n "$NAMESPACE" --timeout=180s
+NEW_COLLECTOR_POD="$(kubectl get pod -n "$NAMESPACE" \
+  -l app.kubernetes.io/component=otel-collector -o jsonpath='{.items[0].metadata.name}')"
+NEW_COLLECTOR_UID="$(kubectl get pod "$NEW_COLLECTOR_POD" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
+[[ "$NEW_COLLECTOR_UID" != "$OLD_COLLECTOR_UID" ]] || \
+  fail "Collector restart control reused pod UID $OLD_COLLECTOR_UID"
+NEW_COLLECTOR_PVC="$(kubectl get pod "$NEW_COLLECTOR_POD" -n "$NAMESPACE" -o json | python3 -c '
+import json, sys
+pod = json.load(sys.stdin)["spec"]
+claims = [
+    volume.get("persistentVolumeClaim", {}).get("claimName")
+    for volume in pod.get("volumes", [])
+    if volume.get("persistentVolumeClaim", {}).get("claimName")
+]
+if len(claims) != 1:
+    raise SystemExit(f"expected one Collector PVC after restart, found {claims!r}")
+print(claims[0])
+')"
+[[ "$NEW_COLLECTOR_PVC" == "$COLLECTOR_PVC" ]] || \
+  fail "Collector restart changed durable claim from $COLLECTOR_PVC to $NEW_COLLECTOR_PVC"
+wait_metrics_positive "$OTEL_COLLECTOR_SERVICE" "$OTEL_EXPORTER" "$OTELCOL_QUEUE_SIZE_METRIC"
+echo "restart path: new pod UID retained claim $COLLECTOR_PVC and its non-empty queue"
+
+banner "ASSERT queued outage sample recovers exactly once"
+kubectl scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=1
+kubectl rollout status deployment/$OTEL_SINK -n "$NAMESPACE" --timeout=120s
+wait_metrics_positive "$OTEL_SINK" "" "${OTELCOL_RECEIVER_METRICS[@]}"
+# Sink self-metrics reset when its outage pod was removed. Count the unique
+# outage sample in its detailed stderr receipt ledger so an independently
+# recovered priming request cannot disguise a duplicate queued delivery.
+sleep 5
+RECOVERY_SINK_POD="$(kubectl get pod -n "$NAMESPACE" -l app="$OTEL_SINK" \
+  -o jsonpath='{.items[0].metadata.name}')"
+RECOVERY_LOGS="$(kubectl logs "$RECOVERY_SINK_POD" -n "$NAMESPACE")"
+for marker in trace-outage-probe log-outage-probe metric.outage.probe; do
+  recovered="$(awk -v marker="$marker" 'index($0, marker) { count++ } END { print count + 0 }' \
+    <<<"$RECOVERY_LOGS")"
+  [[ "$recovered" -eq 1 ]] || \
+    fail "$marker appeared $recovered times at the recovered sink, expected exactly once"
+done
+wait_metric_equals "$OTEL_COLLECTOR_SERVICE" "$OTELCOL_QUEUE_SIZE_METRIC" "$OTEL_EXPORTER" 0
+echo "recovery path: uniquely named queued trace, log record, and metric point delivered once; queue drained"
+
+banner "ASSERT tiny persistent queue overflows loudly and loses bounded excess"
+SINK_POD="$(kubectl get pod -n "$NAMESPACE" -l app="$OTEL_SINK" -o jsonpath='{.items[0].metadata.name}')"
+kubectl scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=0
+kubectl wait --for=delete pod/$SINK_POD -n "$NAMESPACE" --timeout=120s
+# One-second spacing forces separate batch exports. With one request retrying
+# and queue_size=2, twelve samples cannot all fit and enqueue_failed_* must move.
+OVERFLOW_SAMPLES=12
+send_otlp_triplet overflow "$OVERFLOW_SAMPLES" 1 best-effort
+wait_metrics_positive "$OTEL_COLLECTOR_SERVICE" "$OTEL_EXPORTER" "${OTELCOL_ENQUEUE_FAILED_METRICS[@]}"
+wait_metric_equals "$OTEL_COLLECTOR_SERVICE" "$OTELCOL_QUEUE_CAPACITY_METRIC" "$OTEL_EXPORTER" "$OTEL_QUEUE_CAPACITY_TOTAL"
+assert_metric_between "$OTEL_COLLECTOR_SERVICE" "$OTELCOL_QUEUE_SIZE_METRIC" "$OTEL_EXPORTER" 0 "$OTEL_QUEUE_CAPACITY_TOTAL"
+
+kubectl scale deployment/$OTEL_SINK -n "$NAMESPACE" --replicas=1
+kubectl rollout status deployment/$OTEL_SINK -n "$NAMESPACE" --timeout=120s
+wait_metrics_positive "$OTEL_SINK" "" "${OTELCOL_RECEIVER_METRICS[@]}"
+sleep 8
+metrics_snapshot "$OTEL_SINK"
+for metric in "${OTELCOL_RECEIVER_METRICS[@]}"; do
+  delivered="$(metric_value "$metric" 2>/dev/null || echo missing)"
+  [[ "$delivered" != missing ]] || fail "overflow recovery sink omitted $metric"
+  python3 -c '
+import sys
+value, emitted = float(sys.argv[1]), float(sys.argv[2])
+raise SystemExit(0 if 0 < value < emitted else 1)
+' "$delivered" "$OVERFLOW_SAMPLES" || \
+    fail "$metric delivered $delivered of $OVERFLOW_SAMPLES overflow samples; expected explicit bounded loss"
+done
+echo "overflow path: enqueue_failed metrics moved, per-signal capacity stayed $OTEL_QUEUE_SIZE, and excess was observably lost"
 
 # --------------------------------------------------------------------------
 # Verdict

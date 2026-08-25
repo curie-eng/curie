@@ -476,9 +476,10 @@ inference:
     port: 11434
 
 # ---------------------------------------------------------------------------
-# OTel Collector. Receives OTLP (gRPC 4317 / HTTP 4318) from app services and
-# forwards to Langfuse over HTTP (Langfuse's OTLP ingest is HTTP-only). Deploy
-# false to send app traces to an external collector.
+# OTel Collector. Receives traces, logs, and metrics over OTLP (gRPC 4317 / HTTP
+# 4318). Traces go to Langfuse over HTTP; logs and metrics retain explicit nop
+# defaults until #1765 supplies their backends. Deploy false to send application
+# telemetry to an external collector.
 # ---------------------------------------------------------------------------
 otelCollector:
   deploy: true
@@ -493,24 +494,65 @@ otelCollector:
   # CreateContainerConfigError. Setting it to the published dev header trips
   # security.checkDefaultCredentials.
   otlpAuthHeader: ""
-  # Additional collector exporter definitions rendered verbatim under exporters.
+  # Extra env for the Collector container. Full Kubernetes EnvVar entries are
+  # accepted, including valueFrom.secretKeyRef. Use env expansion from exporter
+  # config (for example ${env:BACKEND_AUTH}) so backend credentials remain in a
+  # Secret reference on the Pod and never enter the Collector ConfigMap.
+  extraEnv: []
+  # Additional collector exporter definitions rendered under exporters. Built-in
+  # exporter names are reserved. Sensitive header names (Authorization, token,
+  # API-key, secret, password, credential) must use ${env:NAME}; bind that name
+  # through extraEnv.valueFrom so literal credentials never enter the ConfigMap.
+  # Network exporters must opt into bounded retry and a persistent file_storage
+  # sending queue. The chart rejects an exporter that omits either protection.
   extraExporters: {}
   # Exporter names appended in order to the traces pipeline. Each name must
   # identify an exporter configured above or in extraExporters.
   extraPipelineExporters: []
+  # Signal-specific exporter lists for the logs and metrics pipelines. Until
+  # #1765 supplies their production backends, these pipelines retain nop
+  # exporters so OTLP reception remains explicit without a second backend.
+  extraLogPipelineExporters: []
+  extraMetricPipelineExporters: []
+  debugExporter:
+    enabled: false
+  # The built-in Langfuse hop retains at most 1000 queued export requests and
+  # retries each request for at most 5 minutes. Queue overflow or retry expiry is
+  # explicit loss; the finite PVC/emptyDir size below is the outer disk bound.
+  memoryLimiter:
+    checkInterval: 1s
+    # Percentages resolve against the container cgroup limit. With the default
+    # 256Mi limit the hard heap limit is 192Mi and the soft limit is about 141Mi.
+    limitPercentage: 75
+    spikeLimitPercentage: 20
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+    mountPath: /var/lib/otelcol/storage
+    accessModes: [ReadWriteOnce]
+  # Kubernetes sends SIGTERM and allows this finite shutdown window. Data still
+  # queued when it expires remains an explicit loss condition, not a drain claim.
+  terminationGracePeriodSeconds: 60
   service:
     grpcPort: 4317
     httpPort: 4318
+    metricsPort: 8888
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 250m, memory: 256Mi }
+  podSecurityContext:
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
   # Container securityContext (issue #67). Full restricted-PSS: the collector
   # image runs as a non-root uid, needs no capabilities, and only reads a mounted
-  # (read-only) config while writing nothing to its rootfs -- so the root
-  # filesystem is read-only too. Override fields or set the whole block to null
-  # to opt out.
+  # config. Its persistent queue is the sole writable mount, while the root
+  # filesystem remains read-only. Override fields or set the whole block to
+  # null to opt out.
   containerSecurityContext:
     runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true
     capabilities:
@@ -708,6 +750,11 @@ api:
   # records -- connector drift corrected, polled deploys, webhook outcomes --
   # which were silently dropped before. WARNING to quieten it.
   logLevel: INFO
+  # Extra env for the API container. Full Kubernetes EnvVar entries are
+  # accepted, including valueFrom. When supplying an external Collector with
+  # otelCollector.deploy=false, set the standard OTEL_EXPORTER_OTLP_* variables
+  # here; the chart will not invent an in-cluster endpoint in that mode.
+  extraEnv: []
   service:
     type: ClusterIP
     port: 8000
@@ -814,6 +861,10 @@ dispatcher:
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 256Mi }
+  # Extra env for the dispatcher container. Full Kubernetes EnvVar entries are
+  # accepted, including valueFrom. This is also the external-Collector override
+  # surface when otelCollector.deploy=false.
+  extraEnv: []
   # Container securityContext (issue #67). Image runs as non-root uid 1000 (see
   # apps/dispatcher/Dockerfile). readOnlyRootFilesystem stays false -- the
   # dispatcher writes a heartbeat file under /tmp. See api.containerSecurityContext.
@@ -821,6 +872,134 @@ dispatcher:
     runAsNonRoot: true
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: false
+    capabilities:
+      drop: [ALL]
+    seccompProfile:
+      type: RuntimeDefault
+
+# The first-party email channel (#1515): an AgentMail inbox in, agent replies
+# back out on the same thread. OFF by default -- it needs an AgentMail account,
+# an inbox, and a minted channel token, none of which a bare install has.
+mailAdapter:
+  deploy: false
+  # Platform API the adapter posts inbound mail to. Empty (the default) derives
+  # the in-chart API Service, http://<fullname>-api:<api.service.port>. A set
+  # value renders verbatim and is the BYO answer, required when api.deploy is
+  # false. Unlike the dispatcher, the adapter receives NO platform API key: it
+  # authenticates with its own channel token (below), which is scoped to the one
+  # channel binding it serves.
+  apiBaseUrl: ""
+  # NetworkPolicy peer for a bring-your-own API. This block is ignored while
+  # api.deploy is true because the policy selects this release's API pods by
+  # label. With api.deploy=false, at least one narrow CIDR is required and the
+  # chart renders only those peers on this TCP port. The default port matches
+  # the Curie API image; override it when apiBaseUrl names a different port.
+  apiEgress:
+    httpsCidrs: []
+    port: 8000
+  image:
+    repository: ghcr.io/curie-eng/curie-mail-adapter
+    # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
+    tag: ""
+    # Optional "sha256:..." content digest; when set it wins over `tag`.
+    digest: ""
+    pullPolicy: Always
+  imagePullSecrets: []
+  # The adapter serves inbound egress events (reply.update, turn.completed) from
+  # the worker, so unlike the dispatcher it has a Service. The container always
+  # listens on 8080; this is the Service port the worker's endpoint URL names.
+  service:
+    port: 8080
+  # The AgentMail inbox address the adapter polls and replies from.
+  inbox: ""
+  # Seconds between polls of that inbox.
+  pollIntervalSeconds: 5
+  # A transport or retryable ingress response leaves the delivery durable and
+  # schedules another attempt. These two values bound the short in-process
+  # attempt loop; the SQLite row remains the authority across restarts.
+  ingressAttempts: 3
+  ingressRetryDelaySeconds: 2
+  # Durable admission and allocation bounds. maxStateBytes is intentionally
+  # smaller than the default PVC so SQLite has room for its WAL, indexes, and
+  # filesystem overhead instead of discovering a full volume mid-transaction.
+  maxPendingDeliveries: 1000
+  maxBodyBytes: 1048576
+  maxReplyBytes: 1048576
+  maxStateBytes: 268435456
+  # Whether the adapter posts inbound mail to the platform. false serves egress
+  # while sending nothing inbound, which is the staged-cutover position while the
+  # platform side of a new binding is being wired.
+  ingressEnabled: true
+  # Who may start a turn by emailing the inbox. Empty denies everything, and with
+  # ingressEnabled true the adapter refuses to boot rather than run an inbox that
+  # answers nobody. "*" is the explicit allow-all.
+  #
+  # THIS IS NOT SENDER AUTHENTICATION. It filters on the `From` header, which the
+  # sender controls. It is meaningful only for domains that publish an enforcing
+  # DMARC policy (p=quarantine or p=reject); a domain with no DMARC record, or
+  # p=none, remains spoofable and adding it here buys nothing.
+  #
+  # The real filtering happens upstream: AgentMail drops hard authentication
+  # failures and excludes spam, blocked and unauthenticated mail from list
+  # results by default, and the adapter asks for that exclusion explicitly on
+  # every poll rather than relying on the default. The `labels` check behind it
+  # is defense in depth and should never fire on a correct install. See
+  # apps/mail-adapter/README.md for the AgentMail key permissions the operator
+  # should also turn off.
+  allowedSenders: []
+  agentmail:
+    # AgentMail API key. Never generated by the chart: a random value would be
+    # sent to a third party as a bearer token and fail auth in a way that looks
+    # like a permissions problem rather than a missing credential.
+    apiKey: ""
+    baseUrl: "https://api.agentmail.to/v0"
+    # NetworkPolicy cannot authorize a DNS name. Supply the current provider
+    # (or a controlled egress proxy) HTTPS CIDRs explicitly. Enabling the
+    # adapter with an empty list fails the chart render closed.
+    httpsCidrs: []
+  # The `chn` channel token minted by the API's POST /channels/token, scoped to
+  # this adapter's channel binding. The adapter presents it on every inbound post.
+  channelToken: ""
+  # The shared secret the worker presents as X-Curie-Adapter-Secret when it
+  # delivers reply events here, and that the adapter verifies before any side
+  # effect. THIS IS THE SINGLE SOURCE OF TRUTH FOR BOTH HALVES of the pair: the
+  # chart derives the worker's half, worker.adapterCredentials[adapterSlug],
+  # from it, so setting this one value wires both sides. Do not also write that
+  # entry by hand. Coalesced by curie.adapterCredentials; see _helpers.tpl for
+  # why an equal value is accepted and a conflicting one fails the render.
+  egressSecret: ""
+  # Must equal the `adapter` slug on the agent's channel binding row, and it is
+  # also the key the derived worker.adapterCredentials entry lands under.
+  adapterSlug: "mail-adapter"
+  # The SQLite state is a single-writer RWO volume. Empty existingClaim renders
+  # a chart-owned PVC; otherwise name a RWO Filesystem PVC that already exists
+  # in the release namespace. The install/upgrade hook verifies that claim
+  # before the Deployment is replaced.
+  persistence:
+    existingClaim: ""
+    size: 1Gi
+    # Empty inherits global.storageClass; if both are empty the cluster default
+    # StorageClass is used.
+    storageClass: ""
+    preflight:
+      resources:
+        requests: { cpu: 10m, memory: 24Mi }
+        limits: { cpu: 100m, memory: 64Mi }
+  resources:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 256Mi }
+  podSecurityContext:
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
+  # Container securityContext (issue #67). Image runs as non-root uid 1000 (see
+  # apps/mail-adapter/Dockerfile). readOnlyRootFilesystem is true here, unlike the
+  # dispatcher: SQLite and temporary files use explicit PVC/emptyDir mounts, so
+  # the image root itself stays immutable.
+  containerSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
     capabilities:
       drop: [ALL]
     seccompProfile:
@@ -1059,6 +1238,8 @@ worker:
   # send anonymously: an unauthenticated platform request lets any reachable pod
   # be impersonated. Stored in the chart Secret (key adapterCredentials), never
   # inlined into a manifest.
+  #
+  # Coalesced by curie.adapterCredentials; see _helpers.tpl for why.
   adapterCredentials: {}
   # Extra env for the worker container, list of {name, value}. For SLACK_API_BASE_URL
   # prefer the first-class slackApiBaseUrl above; use extraEnv for any other
@@ -1508,6 +1689,23 @@ security:
   # single-tenant single-node dev cluster; matters for the shared/production path.
   dataTierNetworkPolicy:
     enabled: true
+  # Default-on ingress isolation for Collector self-metrics. OTLP receivers
+  # remain open to platform workloads and external senders on 4317/4318, and
+  # the kubelet health probe remains admitted on 13133. The Prometheus endpoint
+  # is reachable only from explicit standard Kubernetes NetworkPolicyPeer
+  # entries. Empty means no metrics ingress.
+  otelCollectorNetworkPolicy:
+    enabled: true
+    metricsIngress: []
+    # Example (selectors must carry a real constraint; empty selectors and
+    # catch-all IP blocks are rejected at render time):
+    # metricsIngress:
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: observability
+    #     podSelector:
+    #       matchLabels:
+    #         app.kubernetes.io/name: prometheus
   # Rail 4: gVisor (runsc) kernel isolation for runner sandbox pods.
   gvisor:
     # Tri-state, default `auto`:

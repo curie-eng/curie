@@ -32,9 +32,12 @@ from aci_protocol import (
     Interrupt,
     SessionStatus,
     ToolNote,
+    parse_ndjson_line,
     to_ndjson_line,
 )
 from claude_agent_sdk import AssistantMessage, ResultMessage
+from curie_telemetry import record_metric
+from opentelemetry.context import Context
 
 from .adapter import ModelSession
 from .approval import ApprovalGate
@@ -363,7 +366,9 @@ class SessionRunner:
         async for line in self.run_turn(message):
             yield line
 
-    async def run_turn(self, event: Event) -> AsyncGenerator[str]:
+    async def run_turn(
+        self, event: Event, *, parent: Context | None = None
+    ) -> AsyncGenerator[str]:
         """Run one turn, streaming ACI NDJSON lines and enforcing the budget.
 
         Returns an async *generator* (not just an iterator): the server wraps it
@@ -385,58 +390,104 @@ class SessionRunner:
             if self._approval_gate is not None:
                 self._approval_gate.reset()
             tracker = BudgetTracker(ceiling=self._ceiling)
+            metric_outcome = "interrupted"
+            metric_attributes = {
+                "service.name": "curie-runner",
+                "source": "runner",
+                "outcome": "accepted",
+            }
+            record_metric("curie.turn.accepted", attributes=metric_attributes)
 
-            with self._tracer.run_span(
-                self._trace_name,
-                self._model,
-                self._session_id,
-                event.user,
-                approval_decision=self._approval_decision,
-            ) as gen:
-                try:
-                    async for line in self._drive_turn(event, state, tracker, gen):
-                        yield line
-                    logger.info(
-                        "turn end session=%s status=%s duration_ms=%d",
-                        self._session_id,
-                        self._status.value,
-                        int((time.monotonic() - start) * 1000),
-                    )
-                    # Persist the completed turn to the durable transcript so a
-                    # restarted sandbox can rehydrate this thread (#20).
-                    await self._record_turn(event, state)
-                except Exception as exc:  # noqa: BLE001 - the ACI stream must
-                    # always terminate in a final; a raised SDK/transport error
-                    # (CLI disconnect, auth expiry, model error) becomes a
-                    # classified failure rather than a truncated, final-less
-                    # stream. GeneratorExit (consumer disconnect) is a
-                    # BaseException and is intentionally not caught here -- the
-                    # finally handles that abandonment case.
-                    logger.error(
-                        "turn failed session=%s error_class=%s: %s duration_ms=%d",
-                        self._session_id,
-                        type(exc).__name__,
-                        exc,
-                        int((time.monotonic() - start) * 1000),
-                    )
-                    self._turn_open = False
-                    self._status = SessionStatus.CLASSIFIED_FAILURE
-                    yield to_ndjson_line(
-                        ErrorEvent(message=f"runner error: {exc}", classification="runner-error")
-                    )
-                    yield to_ndjson_line(
-                        Final(text="run failed", status=SessionStatus.CLASSIFIED_FAILURE)
-                    )
-                finally:
-                    # If the turn never reached a terminal final (_turn_open still
-                    # set), the consumer abandoned the stream mid-run (client
-                    # disconnect -> GeneratorExit, or cancellation). Stop the SDK
-                    # so it does not keep executing tools past the released turn
-                    # lock and bleed into the next turn. Best-effort.
-                    if self._turn_open and self._session is not None:
-                        with contextlib.suppress(Exception):
-                            await self._session.interrupt()
-                    self._turn_open = False
+            try:
+                with self._tracer.run_span(
+                    self._trace_name,
+                    self._model,
+                    self._session_id,
+                    event.user,
+                    approval_decision=self._approval_decision,
+                    parent=parent,
+                ) as gen:
+                    try:
+                        async for line in self._drive_turn(event, state, tracker, gen):
+                            if isinstance(parse_ndjson_line(line), Final):
+                                # The terminal decision is authoritative once the
+                                # Final reaches the consumer, even if it closes
+                                # without requesting the generator's next item.
+                                metric_outcome = self._metric_outcome(tracker)
+                            yield line
+                        if self._status is SessionStatus.CLASSIFIED_FAILURE:
+                            gen.set_failed()
+                        else:
+                            gen.set_succeeded()
+                        logger.info(
+                            "turn end session=%s status=%s duration_ms=%d",
+                            self._session_id,
+                            self._status.value,
+                            int((time.monotonic() - start) * 1000),
+                        )
+                        # Persist the completed turn to the durable transcript so a
+                        # restarted sandbox can rehydrate this thread (#20).
+                        await self._record_turn(event, state)
+                        metric_outcome = self._metric_outcome(tracker)
+                    except Exception as exc:  # noqa: BLE001 - the ACI stream must
+                        # always terminate in a final; a raised SDK/transport error
+                        # (CLI disconnect, auth expiry, model error) becomes a
+                        # classified failure rather than a truncated, final-less
+                        # stream. GeneratorExit (consumer disconnect) is a
+                        # BaseException and is intentionally not caught here -- the
+                        # finally handles that abandonment case.
+                        logger.error(
+                            "turn failed session=%s error_class=%s: %s duration_ms=%d",
+                            self._session_id,
+                            type(exc).__name__,
+                            exc,
+                            int((time.monotonic() - start) * 1000),
+                        )
+                        self._turn_open = False
+                        self._status = SessionStatus.CLASSIFIED_FAILURE
+                        metric_outcome = self._metric_outcome(tracker)
+                        gen.set_failed()
+                        yield to_ndjson_line(
+                            ErrorEvent(
+                                message=f"runner error: {exc}",
+                                classification="runner-error",
+                            )
+                        )
+                        yield to_ndjson_line(
+                            Final(text="run failed", status=SessionStatus.CLASSIFIED_FAILURE)
+                        )
+                    finally:
+                        # If the turn never reached a terminal final (_turn_open still
+                        # set), the consumer abandoned the stream mid-run (client
+                        # disconnect -> GeneratorExit, or cancellation). Stop the SDK
+                        # so it does not keep executing tools past the released turn
+                        # lock and bleed into the next turn. Best-effort.
+                        if self._turn_open and self._session is not None:
+                            with contextlib.suppress(Exception):
+                                await self._session.interrupt()
+                        self._turn_open = False
+            finally:
+                completed_attributes = {
+                    "service.name": "curie-runner",
+                    "source": "runner",
+                    "outcome": metric_outcome,
+                }
+                elapsed = time.monotonic() - start
+                record_metric("curie.turn.completed", attributes=completed_attributes)
+                record_metric(
+                    "curie.turn.duration", elapsed, attributes=completed_attributes
+                )
+
+    def _metric_outcome(self, tracker: BudgetTracker) -> str:
+        if self._status is SessionStatus.DONE:
+            return "done"
+        if self._status is SessionStatus.AWAITING_APPROVAL:
+            return "awaiting_approval"
+        if self._status is SessionStatus.CLASSIFIED_FAILURE:
+            return "budget_halted" if tracker.exceeded else "classified_failure"
+        if self._interrupt_requested:
+            return "interrupted"
+        return "idle"
 
     async def _drive_turn(
         self,
@@ -478,7 +529,7 @@ class SessionRunner:
                 if isinstance(outbound, ToolNote):
                     logger.info("tool call session=%s tool=%s", self._session_id, outbound.tool)
                 if isinstance(outbound, ErrorEvent):
-                    logger.warning(
+                    logger.error(
                         "model error session=%s classification=%s",
                         self._session_id,
                         outbound.classification,

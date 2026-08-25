@@ -131,6 +131,76 @@ def test_dispatch_applies_backpressure_at_capacity(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_message_settlement_does_not_sample_queue_inventory(make_harness) -> None:
+    """Queue gauge reads cannot retain the per-message semaphore slot."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+
+            observations = 0
+
+            async def observe() -> None:
+                nonlocal observations
+                observations += 1
+
+            consumer._observe_queue_state = observe  # type: ignore[method-assign]
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(_qevent("hot path", thread="t-hot", event_id="hot-1")),
+            )
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                h.config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+            entry_id, fields = rows[0][1][0]
+            await consumer._dispatch(entry_id, fields)
+            await asyncio.gather(*list(consumer._inflight))
+
+            assert observations == 0
+            # Every configured slot is immediately acquirable again. If the
+            # handler were still awaiting queue observation in its finally, the
+            # last acquire would time out.
+            for _ in range(16):
+                await asyncio.wait_for(consumer._sem.acquire(), timeout=0.1)
+            for _ in range(16):
+                consumer._sem.release()
+
+    asyncio.run(go())
+
+
+def test_maintenance_tick_samples_queue_inventory_once(make_harness) -> None:
+    """The maintenance cadence owns queue inventory observation."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            calls: list[str] = []
+
+            async def step(name: str) -> None:
+                calls.append(name)
+
+            async def observe() -> None:
+                calls.append("observe")
+                consumer.request_stop()
+
+            consumer._reclaim_once = lambda: step("reclaim")  # type: ignore[method-assign]
+            h.kernel.reap_orphans = lambda: step("reap")  # type: ignore[method-assign]
+            h.kernel.sweep_pending_completions = lambda: step("sweep")  # type: ignore[method-assign]
+            consumer._drain_thread_reset_requests = lambda: step("reset")  # type: ignore[method-assign]
+            consumer._observe_queue_state = observe  # type: ignore[method-assign]
+
+            await consumer._maintenance_loop()
+
+            assert calls == ["reclaim", "reap", "sweep", "reset", "observe"]
+
+    asyncio.run(go())
+
+
 def test_ensure_group_does_not_replay_preexisting_backlog(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:

@@ -202,6 +202,16 @@ true
 {{- printf "%s-langfuse-web" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* Base URL of the platform API for a first-party service that calls it. Call
+     with a dict: root (the top context) and baseUrl (the caller's own BYO
+     override). An empty override derives the in-chart API Service; a set value
+     renders verbatim and is the BYO answer, including when api.deploy is false.
+     Keep this separate from curie.env.api so callers such as the mail adapter
+     can receive the API URL without also receiving the platform API key. */}}
+{{- define "curie.api.url" -}}
+{{- .baseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .root) .root.Values.api.service.port) -}}
+{{- end -}}
+
 {{/* base64("<publicKey>:<secretKey>") for the OTel Collector config checksum,
      and the operand the default-credential gate judges. The header this chart
      actually emits is resolved in secrets.yaml, from the managed-secret value
@@ -244,17 +254,84 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/* Reject absent, malformed, negative, and zero-equivalent retry durations.
+     Keep max_interval and max_elapsed_time on this one validation path so the
+     finite retry bound cannot harden one field while leaving its sibling open. */}}
+{{- define "curie.otelCollector.requirePositiveDuration" -}}
+{{- $value := trim (toString .value) -}}
+{{- $durationPattern := "^\\+?(?:(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:ns|us|µs|μs|ms|s|m|h))+$" -}}
+{{- $zeroPattern := "^\\+?(?:(?:0+(?:\\.0*)?|\\.0+)(?:ns|us|µs|μs|ms|s|m|h))+$" -}}
+{{- if or (empty $value) (not (regexMatch $durationPattern $value)) (regexMatch $zeroPattern $value) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] retry_on_failure.%s must use a supported finite, non-zero positive duration." .exporter .field) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.otelCollector.config" -}}
-{{- $builtInExporters := dict "otlphttp/langfuse" true "debug" true -}}
-{{- range $exporter := .Values.otelCollector.extraPipelineExporters }}
-{{- if not (or (hasKey $builtInExporters $exporter) (hasKey $.Values.otelCollector.extraExporters $exporter)) }}
-{{- fail (printf "otelCollector.extraPipelineExporters references undefined exporter %q. Add it under otelCollector.extraExporters." $exporter) }}
-{{- end }}
-{{- end }}
-# Receives OTLP over gRPC (4317) and HTTP (4318) from app services and
-# forwards to Langfuse over HTTP. Langfuse OTLP ingest is HTTP-only (gRPC is
-# silently unsupported), so the collector is the adapter. Langfuse appends
-# /v1/traces to the otlphttp base path itself.
+{{- $debugEnabled := .Values.otelCollector.debugExporter.enabled -}}
+{{- $builtInExporters := dict "otlphttp/langfuse" true "nop/logs" true "nop/metrics" true -}}
+{{- /* Reserve built-in names even when the development-only debug exporter is disabled.
+      An extra exporter with one of these keys would otherwise replace chart-owned
+      configuration in the rendered ConfigMap. */ -}}
+{{- $reservedExporterNames := dict "otlphttp/langfuse" true "nop/logs" true "nop/metrics" true "debug" true -}}
+{{- if $debugEnabled -}}
+{{- $_ := set $builtInExporters "debug" true -}}
+{{- end -}}
+{{- $pipelineExporters := dict
+      "extraPipelineExporters" .Values.otelCollector.extraPipelineExporters
+      "extraLogPipelineExporters" .Values.otelCollector.extraLogPipelineExporters
+      "extraMetricPipelineExporters" .Values.otelCollector.extraMetricPipelineExporters -}}
+{{- range $valueName, $exporters := $pipelineExporters -}}
+{{- range $exporter := $exporters -}}
+{{- if not (or (hasKey $builtInExporters $exporter) (hasKey $.Values.otelCollector.extraExporters $exporter)) -}}
+{{- fail (printf "otelCollector.%s references undefined exporter %q. Add it under otelCollector.extraExporters." $valueName $exporter) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $name, $config := .Values.otelCollector.extraExporters -}}
+{{- if hasKey $reservedExporterNames $name -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must not replace built-in exporter %q." $name $name) -}}
+{{- end -}}
+{{- $exporterType := first (splitList "/" $name) -}}
+{{- if not (or (eq $exporterType "nop") (eq $exporterType "debug")) -}}
+{{- if not (kindIs "map" $config) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] is a network exporter and must be a map with retry_on_failure and sending_queue settings." $name) -}}
+{{- end -}}
+{{- $headers := get $config "headers" -}}
+{{- if and $headers (not (kindIs "map" $headers)) -}}
+{{- fail (printf "otelCollector.extraExporters[%q].headers must be a map." $name) -}}
+{{- end -}}
+{{- if kindIs "map" $headers -}}
+{{- $sensitiveHeaderPattern := "(?i)(^|[-_])(authorization|token|api[-_]?key|secret|password|credential)([-_]|$)" -}}
+{{- $collectorEnvPattern := "^\\$\\{env:[A-Za-z_][A-Za-z0-9_]*\\}$" -}}
+{{- range $headerName, $headerValue := $headers -}}
+{{- if and (regexMatch $sensitiveHeaderPattern (lower (toString $headerName))) (not (regexMatch $collectorEnvPattern (trim (toString $headerValue)))) -}}
+{{- fail (printf "otelCollector.extraExporters[%q].headers[%q] is sensitive and must use Collector environment expansion ${env:NAME}; put its value in otelCollector.extraEnv via valueFrom.secretKeyRef." $name $headerName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $retry := get $config "retry_on_failure" -}}
+{{- if not (kindIs "map" $retry) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must configure retry_on_failure with enabled: true and finite max_interval/max_elapsed_time." $name) -}}
+{{- end -}}
+{{- if ne (lower (toString (get $retry "enabled"))) "true" -}}
+{{- fail (printf "otelCollector.extraExporters[%q] retry_on_failure must be enabled and use finite, non-zero max_interval and max_elapsed_time values." $name) -}}
+{{- end -}}
+{{- include "curie.otelCollector.requirePositiveDuration" (dict "exporter" $name "field" "max_interval" "value" (get $retry "max_interval")) -}}
+{{- include "curie.otelCollector.requirePositiveDuration" (dict "exporter" $name "field" "max_elapsed_time" "value" (get $retry "max_elapsed_time")) -}}
+{{- $queue := get $config "sending_queue" -}}
+{{- if not (kindIs "map" $queue) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must configure sending_queue with enabled: true, storage: file_storage, and a finite queue_size." $name) -}}
+{{- end -}}
+{{- $queueSize := int (get $queue "queue_size") -}}
+{{- if or (ne (lower (toString (get $queue "enabled"))) "true") (ne (toString (get $queue "storage")) "file_storage") (le $queueSize 0) (gt $queueSize 100000) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] sending_queue must be enabled, use storage: file_storage, and set queue_size between 1 and 100000." $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+# Receives OTLP traces, logs, and metrics over gRPC (4317) and HTTP (4318).
+# Traces go to Langfuse over HTTP; logs and metrics retain explicit nop defaults
+# until #1765 supplies their backends. Langfuse OTLP ingest is HTTP-only (gRPC
+# is silently unsupported), so the collector adapts trace traffic to otlphttp.
 receivers:
   otlp:
     protocols:
@@ -263,30 +340,67 @@ receivers:
       http:
         endpoint: 0.0.0.0:4318
 processors:
+  memory_limiter:
+    check_interval: {{ .Values.otelCollector.memoryLimiter.checkInterval }}
+    limit_percentage: {{ .Values.otelCollector.memoryLimiter.limitPercentage }}
+    spike_limit_percentage: {{ .Values.otelCollector.memoryLimiter.spikeLimitPercentage }}
   batch: {}
 exporters:
   otlphttp/langfuse:
     endpoint: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}/api/public/otel
     headers:
       Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 5m
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 1000
+      num_consumers: 2
+  nop/logs: {}
+  nop/metrics: {}
+{{- if $debugEnabled }}
   debug:
     verbosity: normal
+{{- end }}
 {{- with .Values.otelCollector.extraExporters }}
 {{ toYaml . | nindent 2 }}
 {{- end }}
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
+  file_storage:
+    directory: {{ .Values.otelCollector.persistence.mountPath }}
+    timeout: 1s
+    create_directory: true
+    fsync: true
+    compaction:
+      on_start: true
+      on_rebound: true
+      directory: {{ .Values.otelCollector.persistence.mountPath }}
+      cleanup_on_start: true
 service:
-  extensions: [health_check]
+  extensions: [health_check, file_storage]
   telemetry:
     metrics:
-      level: none
+      level: normal
+      address: 0.0.0.0:{{ .Values.otelCollector.service.metricsPort }}
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [otlphttp/langfuse, debug{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [nop/logs{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraLogPipelineExporters }}, {{ . }}{{- end }}]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [nop/metrics{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraMetricPipelineExporters }}, {{ . }}{{- end }}]
 {{- end }}
 
 {{/* ---- Default-credential gate (issue #198) ----
@@ -509,7 +623,7 @@ service:
 # the only correct one when api.deploy is false. The port comes from
 # api.service.port so the two sides cannot drift.
 - name: CURIE_API_URL
-  value: {{ .Values.dispatcher.apiBaseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .) .Values.api.service.port) | quote }}
+  value: {{ include "curie.api.url" (dict "root" . "baseUrl" .Values.dispatcher.apiBaseUrl) | quote }}
 {{- end -}}
 
 {{- define "curie.env.apiKey" -}}
@@ -527,6 +641,30 @@ service:
 {{- define "curie.env.api" -}}
 {{- include "curie.env.apiUrl" . }}
 {{ include "curie.env.apiKey" . }}
+{{- end -}}
+
+{{/* Coalesce the worker's egress credentials and the first-party mail
+     adapter's paired credential. The chart Secret and the worker rollout
+     checksum must use this same rendered JSON so a rotation reaches both
+     sides. mailAdapter.egressSecret is the source of truth; accepting an equal
+     hand-written worker entry keeps migrations from hand-rolled manifests
+     possible, while a disagreement fails rather than deploying a reply path
+     that can only return 401. */}}
+{{- define "curie.adapterCredentials" -}}
+{{- $creds := deepCopy (.Values.worker.adapterCredentials | default dict) -}}
+{{- if .Values.mailAdapter.deploy -}}
+{{- $slug := .Values.mailAdapter.adapterSlug -}}
+{{- $derived := .Values.mailAdapter.egressSecret -}}
+{{- if hasKey $creds $slug -}}
+{{- $existing := get $creds $slug -}}
+{{- if ne $existing $derived -}}
+{{- fail (printf "worker.adapterCredentials.%s and mailAdapter.egressSecret are set to DIFFERENT values. mailAdapter.egressSecret is the source of truth for both halves of the mail adapter's egress pair: the chart derives worker.adapterCredentials.%s from it. Fix the two configuration keys to the same value. Neither value is printed here because both are live egress credentials." $slug $slug) -}}
+{{- end -}}
+{{- else -}}
+{{- $_ := set $creds $slug $derived -}}
+{{- end -}}
+{{- end -}}
+{{- $creds | toJson -}}
 {{- end -}}
 
 {{/* Heartbeat exec probes for the worker and dispatcher. Neither has an HTTP

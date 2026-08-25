@@ -32,6 +32,10 @@ from curie_runner.redact import (
     redact_text,
 )
 from curie_runner.session import SessionRunner
+from curie_telemetry.redact import (
+    REDACTION_RULES as SHARED_REDACTION_RULES,
+)
+from curie_telemetry.redact import redact_text as shared_redact_text
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -52,6 +56,8 @@ FAKE_PEM_PRIVATE_KEY = (
     "-----END " + "RSA PRIVATE KEY-----"
 )
 FAKE_BEARER_HEADER = "Bearer " + "abc0000FAKEFAKEFAKEFAKEFAKEFAKE"
+FAKE_BASIC_HEADER = "Basic " + "QUNNRUZBS0VGQUtFUEFTUw=="
+FAKE_DSN_USERINFO = "postgresql://acme-user:fake-password@db.example.invalid/acme"
 FAKE_JWT = "eyJ" + "hbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.FAKEFAKEFAKEFAKEFAKEFAKE00"
 FAKE_URL_WITH_TOKEN = "https://example.invalid/hook?token=" + "0000FAKEFAKEFAKEFAKE"
 FAKE_SECRET_ASSIGNMENT = "secret=" + "0000FAKEFAKEFAKEVALUE"
@@ -68,6 +74,8 @@ SECRET_LITERALS: dict[str, str] = {
     "google_api_key": FAKE_GOOGLE_API_KEY,
     "pem_private_key": FAKE_PEM_PRIVATE_KEY,
     "bearer_token": FAKE_BEARER_HEADER,
+    "basic_auth": FAKE_BASIC_HEADER,
+    "dsn_userinfo": FAKE_DSN_USERINFO,
     "jwt": FAKE_JWT,
     "url_secret_param": FAKE_URL_WITH_TOKEN,
     "secret_assignment": FAKE_SECRET_ASSIGNMENT,
@@ -89,7 +97,7 @@ CASES: tuple[tuple[str, str, str], ...] = tuple(
 
 
 def _placeholder(name: str) -> str:
-    return {rule.name: rule.placeholder for rule in REDACTION_RULES}[name]
+    return f"[REDACTED:{name}]"
 
 
 def _log_through_stdout(*args: object) -> str:
@@ -216,6 +224,20 @@ def test_every_rule_has_a_frozen_vector() -> None:
     # Without this gate a new rule can ship applied at one boundary and absent at
     # the other, which is a leak that no other test would catch.
     assert {rule.name for rule in REDACTION_RULES} == {name for name, _ in VECTORS}
+
+
+def test_runner_reuses_the_shared_redaction_policy_without_drift() -> None:
+    runner_rules = [
+        (rule.name, rule.pattern.pattern, rule.pattern.flags, rule.placeholder)
+        for rule in REDACTION_RULES
+    ]
+    shared_rules = [
+        (rule.name, rule.pattern.pattern, rule.pattern.flags, rule.placeholder)
+        for rule in SHARED_REDACTION_RULES
+    ]
+    assert runner_rules == shared_rules
+    for _, vector in VECTORS:
+        assert redact_text(vector) == shared_redact_text(vector)
 
 
 def test_every_boundary_is_exercised() -> None:

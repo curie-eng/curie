@@ -58,10 +58,13 @@ Three qualifications shape the design:
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
 from aci_protocol import parse_queued_turn
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -127,8 +130,52 @@ class ResumeReconciler:
         self._grace_seconds = grace_seconds
         self._batch_limit = batch_limit
         self._dead_letter_scan_limit = dead_letter_scan_limit
+        self._last_success_monotonic: float | None = None
 
     async def reconcile_once(self) -> int:
+        """Run one measured pass without changing the reconciler's result shape."""
+
+        result = 0
+        error: Exception | None = None
+        attributes = {
+            "service.name": "curie-api",
+            "operation": "resume-reconciler",
+            "role": "background",
+        }
+        with operation_span(
+            "curie.background.resume-reconciler",
+            kind=SpanKind.INTERNAL,
+            attributes=attributes,
+        ) as span:
+            try:
+                result = await self._reconcile_once()
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event("background.pass.failed", {"outcome": "failure"})
+            else:
+                span.add_event("background.pass.completed", {"outcome": "success"})
+
+        outcome = "failure" if error is not None else "success"
+        record_metric(
+            "curie.background.loop",
+            attributes={**attributes, "outcome": outcome},
+        )
+        now = time.monotonic()
+        if error is None:
+            self._last_success_monotonic = now
+        if self._last_success_monotonic is not None:
+            record_metric(
+                "curie.background.last_success.age",
+                max(0.0, now - self._last_success_monotonic),
+                attributes=attributes,
+            )
+        if error is not None:
+            raise error
+        return result
+
+    async def _reconcile_once(self) -> int:
         """Re-enqueue every owed wake past the grace horizon; return the count.
 
         Candidates are read once (unlocked) past the grace horizon; then each is

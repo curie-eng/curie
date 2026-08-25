@@ -492,7 +492,11 @@ async fn enqueue_connected(
     enqueue_over_connected_transport(
         &opts,
         conn,
-        TurnVerb::Local,
+        // Keep this composition test on the deliberate carrierless/direct
+        // compatibility lane. The real local verb now delegates its producer
+        // write to the one-shot dispatcher container and is exercised by the
+        // local ladder; Cluster retains the frozen-payload direct helper.
+        TurnVerb::Cluster,
         "C-REAL-CONNECTED",
         "xoxb-test",
     )

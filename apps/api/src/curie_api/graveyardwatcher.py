@@ -26,11 +26,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
+_monotonic = time.monotonic
 
 
 def _text(value: Any) -> str:
@@ -51,6 +55,7 @@ class GraveyardWatcher:
         # ``seed_cursor`` so a boot does not re-alert history; "0-0" (alert on
         # everything) is the safe fallback for an empty/absent stream.
         self._cursor = "0-0"
+        self._last_success_monotonic: float | None = None
         # Monotonic count of alerts emitted, exposed for tests and any future
         # health surface.
         self.alerts_emitted = 0
@@ -93,9 +98,44 @@ class GraveyardWatcher:
             logger.exception("dead-letter watcher failed to seed its cursor; starting from 0")
         while True:
             await asyncio.sleep(self._interval)
-            try:
-                await self.scan_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("dead-letter watcher pass failed")
+            attributes = {
+                "service.name": "curie-api",
+                "operation": "graveyard-watcher",
+                "role": "background",
+            }
+            error: Exception | None = None
+            with operation_span(
+                "curie.background.graveyard-watcher",
+                kind=SpanKind.INTERNAL,
+                attributes=attributes,
+            ) as span:
+                try:
+                    await self.scan_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    error = exc
+                    if hasattr(span, "set_status"):
+                        span.set_status(StatusCode.ERROR)
+                    span.add_event(
+                        "background.pass.failed",
+                        {"outcome": "failure", "error.class": type(exc).__name__},
+                    )
+                else:
+                    span.add_event("background.pass.completed", {"outcome": "success"})
+            outcome = "failure" if error is not None else "success"
+            record_metric(
+                "curie.background.loop",
+                attributes={**attributes, "outcome": outcome},
+            )
+            now = _monotonic()
+            if error is None:
+                self._last_success_monotonic = now
+            if self._last_success_monotonic is not None:
+                record_metric(
+                    "curie.background.last_success.age",
+                    max(0.0, now - self._last_success_monotonic),
+                    attributes=attributes,
+                )
+            if error is not None:
+                logger.error("dead-letter watcher pass failed (%s)", type(error).__name__)

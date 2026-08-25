@@ -78,6 +78,19 @@ def test_live_claim_names_skips_expired_routes(affinity: AffinityStore) -> None:
     assert affinity.live_claim_names() == {"claim-a"}
 
 
+def test_route_inventory_uses_persisted_state_not_process_memory(
+    affinity: AffinityStore,
+) -> None:
+    affinity.put_if_absent("T1", RouteRecord(handle=_handle("T1", "claim-a")), 60)
+    affinity.put_if_absent("T2", RouteRecord(handle=_handle("T2", "claim-b")), 60)
+    affinity.mark_suspended("T2", "history-example", 120)
+
+    assert affinity.route_inventory() == {
+        RouteState.LIVE: {"claim-a"},
+        RouteState.SUSPENDED: {"claim-b"},
+    }
+
+
 # --- #1388: why a non-positive TTL is refused at boot rather than at the store ---
 #
 # Observed against the real Valkey 8.1.8 on the compose dev stack

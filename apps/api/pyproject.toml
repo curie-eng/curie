@@ -22,6 +22,7 @@ dependencies = [
     "redis>=5.0",
     "plugin-format",
     "aci-protocol",
+    "curie-telemetry",
 ]
 
 [build-system]

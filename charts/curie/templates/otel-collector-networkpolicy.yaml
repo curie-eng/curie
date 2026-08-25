@@ -1,0 +1,113 @@
+{{- $policy := .Values.security.otelCollectorNetworkPolicy -}}
+{{- if and .Values.otelCollector.deploy $policy.enabled -}}
+{{- $metricsPort := int .Values.otelCollector.service.metricsPort -}}
+{{- if and (gt (len $policy.metricsIngress) 0) (or (eq $metricsPort 4317) (eq $metricsPort 4318) (eq $metricsPort 13133)) -}}
+  {{- fail "otelCollector.service.metricsPort must not match an unrestricted Collector ingress port (4317, 4318, or 13133) when security.otelCollectorNetworkPolicy.metricsIngress is configured" -}}
+{{- end -}}
+{{- range $index, $peer := $policy.metricsIngress -}}
+  {{- if not (kindIs "map" $peer) -}}
+    {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d] must be a standard NetworkPolicyPeer map" $index) -}}
+  {{- end -}}
+  {{- range $key, $_ := $peer -}}
+    {{- if not (has $key (list "podSelector" "namespaceSelector" "ipBlock")) -}}
+      {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d] contains unsupported NetworkPolicyPeer field %q" $index $key) -}}
+    {{- end -}}
+  {{- end -}}
+  {{- $hasPod := hasKey $peer "podSelector" -}}
+  {{- $hasNamespace := hasKey $peer "namespaceSelector" -}}
+  {{- $hasIP := hasKey $peer "ipBlock" -}}
+  {{- if not (or $hasPod $hasNamespace $hasIP) -}}
+    {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d] must not be an empty wildcard peer" $index) -}}
+  {{- end -}}
+  {{- if and $hasIP (or $hasPod $hasNamespace) -}}
+    {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d] ipBlock cannot be combined with podSelector or namespaceSelector" $index) -}}
+  {{- end -}}
+  {{- if $hasIP -}}
+    {{- $ipBlock := get $peer "ipBlock" -}}
+    {{- if not (kindIs "map" $ipBlock) -}}
+      {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d].ipBlock must be a map" $index) -}}
+    {{- end -}}
+    {{- range $key, $_ := $ipBlock -}}
+      {{- if not (has $key (list "cidr" "except")) -}}
+        {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d].ipBlock contains unsupported field %q" $index $key) -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if not (kindIs "string" (get $ipBlock "cidr")) -}}
+      {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d].ipBlock.cidr must be a string" $index) -}}
+    {{- end -}}
+    {{- if and (hasKey $ipBlock "except") (not (kindIs "slice" (get $ipBlock "except"))) -}}
+      {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d].ipBlock.except must be a list" $index) -}}
+    {{- end -}}
+    {{- $cidr := trim (get $ipBlock "cidr") -}}
+    {{- if or (eq $cidr "") (eq $cidr "0.0.0.0/0") (eq $cidr "::/0") -}}
+      {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d].ipBlock.cidr must be non-wildcard" $index) -}}
+    {{- end -}}
+  {{- end -}}
+  {{- range $selectorName := list "podSelector" "namespaceSelector" -}}
+    {{- if hasKey $peer $selectorName -}}
+      {{- $selector := get $peer $selectorName -}}
+      {{- if not (kindIs "map" $selector) -}}
+        {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d].%s must be a LabelSelector map" $index $selectorName) -}}
+      {{- end -}}
+      {{- range $key, $_ := $selector -}}
+        {{- if not (has $key (list "matchLabels" "matchExpressions")) -}}
+          {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d].%s contains unsupported LabelSelector field %q" $index $selectorName $key) -}}
+        {{- end -}}
+      {{- end -}}
+      {{- $hasLabels := false -}}
+      {{- if hasKey $selector "matchLabels" -}}
+        {{- if not (kindIs "map" (get $selector "matchLabels")) -}}
+          {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d].%s.matchLabels must be a map" $index $selectorName) -}}
+        {{- end -}}
+        {{- if gt (len (get $selector "matchLabels")) 0 -}}
+          {{- $hasLabels = true -}}
+        {{- end -}}
+      {{- end -}}
+      {{- $hasExpressions := false -}}
+      {{- if hasKey $selector "matchExpressions" -}}
+        {{- if not (kindIs "slice" (get $selector "matchExpressions")) -}}
+          {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d].%s.matchExpressions must be a list" $index $selectorName) -}}
+        {{- end -}}
+        {{- if gt (len (get $selector "matchExpressions")) 0 -}}
+          {{- $hasExpressions = true -}}
+        {{- end -}}
+      {{- end -}}
+      {{- if not (or $hasLabels $hasExpressions) -}}
+        {{- fail (printf "security.otelCollectorNetworkPolicy.metricsIngress[%d].%s must contain a non-wildcard matchLabels or matchExpressions constraint" $index $selectorName) -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-otel-collector
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "otel-collector") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # OTLP is the Collector's platform-wide intake and intentionally remains
+    # reachable without a source selector. The kubelet also needs the
+    # Collector health_check endpoint for readiness/liveness probes. This
+    # policy isolates self-metrics, not intake or health probes.
+    - ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+        - protocol: TCP
+          port: 13133
+    {{- with $policy.metricsIngress }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.otelCollector.service.metricsPort }}
+    {{- end }}
+{{- end }}

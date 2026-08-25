@@ -418,10 +418,10 @@ jobs:
         run: |
           count=$(docker compose -f compose.release.yaml --profile core config --services | wc -l)
           [ "$count" -eq 8 ] || { echo "core profile must render 8 services, got $count" >&2; exit 1; }
-      - name: Full profile renders 13 services
+      - name: Full profile renders 14 services
         run: |
           count=$(docker compose -f compose.release.yaml --profile full config --services | wc -l)
-          [ "$count" -eq 13 ] || { echo "full profile must render 13 services, got $count" >&2; exit 1; }
+          [ "$count" -eq 14 ] || { echo "full profile must render 14 services, got $count" >&2; exit 1; }
 
   # Build the first-party images on every PR/push -- build only, never push --
   # so a Dockerfile break is caught here instead of only at release time. This
@@ -445,6 +445,8 @@ jobs:
           - name: dispatcher
             context: .
             dockerfile: apps/dispatcher/Dockerfile
+          - name: mail-adapter
+            dockerfile: apps/mail-adapter/Dockerfile
           - name: worker
             context: .
             dockerfile: apps/worker/Dockerfile
@@ -508,6 +510,24 @@ jobs:
         run: docker build -t curie-dispatcher:ci-smoke -f apps/dispatcher/Dockerfile .
       - name: Entrypoint imports resolve in the built image
         run: docker run --rm --entrypoint python curie-dispatcher:ci-smoke -c "import curie_dispatcher; import aci_protocol"
+
+  # Same gap, same shape (issue #428). The mail adapter image also builds with
+  # `uv sync --no-editable`, so it installs only the package's DECLARED
+  # dependencies: aci-protocol (a uv workspace member) and pydantic-settings
+  # stay importable from a source checkout while being absent from the isolated
+  # image venv, and the process crash-loops on startup. The build-only `images`
+  # job above never runs the image, so this is the one place that is observable.
+  mail-adapter-image-smoke:
+    name: Mail adapter image imports resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build the mail adapter image locally
+        run: docker build -t curie-mail-adapter:ci-smoke -f apps/mail-adapter/Dockerfile .
+      - name: Entrypoint imports resolve in the built image
+        run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_mail_adapter; import aci_protocol; import pydantic_settings"
 
   # FALSIFIABILITY gate for the committed eval suites (issue #619). This is NOT
   # an E2E test: it never runs a real agent or makes a model call. It boots the
@@ -757,6 +777,17 @@ jobs:
           load: true
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
+      - name: Build the dispatcher image locally (one-shot local message producer, no registry auth)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.laddercache.outputs.name }}
+          tags: ghcr.io/curie-eng/curie-dispatcher:latest
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-dispatcher
+          cache-to: type=gha,mode=max,scope=ladder-dispatcher
       - name: Parity ladder (skill + local rungs, fake model, credential-free)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -832,6 +863,17 @@ jobs:
           load: true
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
+      - name: Build the dispatcher image locally (one-shot local message producer, no registry auth)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.releasecache.outputs.name }}
+          tags: ghcr.io/curie-eng/curie-dispatcher:latest
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-dispatcher
+          cache-to: type=gha,mode=max,scope=ladder-dispatcher
       - name: Build the ui image locally (satisfies the generated release compose, no registry auth)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:

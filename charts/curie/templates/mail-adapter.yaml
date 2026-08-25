@@ -1,0 +1,344 @@
+{{/*
+Validate and normalize one CIDR before it is allowed into the credential-bearing
+mail pod's NetworkPolicy. Kubernetes validates CIDR syntax only after Helm has
+already accepted the release, so this render gate keeps malformed and broad
+routes from becoming an install-time surprise or an egress escape hatch.
+
+The chart has no general IP-network parser. This deliberately accepts the two
+NetworkPolicy families Kubernetes accepts: strict dotted-quad IPv4 and IPv6
+hextets with at most one `::` compression. Prefix 0 and 1 are rejected outright;
+that also rejects the two-/1 spellings of a default route without depending on
+list order or an exact string comparison.
+*/}}
+{{- define "curie.mailAdapter.narrowCidr" -}}
+{{- $key := .key -}}
+{{- $cidr := trim (printf "%v" .cidr) -}}
+{{- if eq $cidr "" -}}
+{{- fail (printf "%s entries must be non-empty narrow CIDRs" $key) -}}
+{{- end -}}
+{{- $parts := splitList "/" $cidr -}}
+{{- if ne (len $parts) 2 -}}
+{{- fail (printf "%s entry %q is not a valid IPv4 or IPv6 CIDR" $key $cidr) -}}
+{{- end -}}
+{{- $ip := index $parts 0 -}}
+{{- $prefixText := index $parts 1 -}}
+{{- if not (regexMatch "^(0|[1-9][0-9]{0,2})$" $prefixText) -}}
+{{- fail (printf "%s entry %q has an invalid prefix length" $key $cidr) -}}
+{{- end -}}
+{{- $prefix := int $prefixText -}}
+{{- if contains ":" $ip -}}
+  {{- if or (gt $prefix 128) (not (regexMatch "^[0-9A-Fa-f:]+$" $ip)) -}}
+  {{- fail (printf "%s entry %q is not a valid IPv6 CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- $compressed := splitList "::" $ip -}}
+  {{- if gt (len $compressed) 2 -}}
+  {{- fail (printf "%s entry %q is not a valid IPv6 CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- $hextets := 0 -}}
+  {{- range $side := $compressed -}}
+    {{- if ne $side "" -}}
+      {{- range $hextet := splitList ":" $side -}}
+        {{- if not (regexMatch "^[0-9A-Fa-f]{1,4}$" $hextet) -}}
+        {{- fail (printf "%s entry %q is not a valid IPv6 CIDR" $key $cidr) -}}
+        {{- end -}}
+        {{- $hextets = add1 $hextets -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if and (eq (len $compressed) 1) (ne $hextets 8) -}}
+  {{- fail (printf "%s entry %q is not a valid IPv6 CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- if and (eq (len $compressed) 2) (gt $hextets 7) -}}
+  {{- fail (printf "%s entry %q is not a valid IPv6 CIDR" $key $cidr) -}}
+  {{- end -}}
+{{- else -}}
+  {{- if or (gt $prefix 32) (not (regexMatch "^(0|[1-9][0-9]{0,2})([.](0|[1-9][0-9]{0,2})){3}$" $ip)) -}}
+  {{- fail (printf "%s entry %q is not a valid IPv4 CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- range $octet := splitList "." $ip -}}
+    {{- if gt (int $octet) 255 -}}
+    {{- fail (printf "%s entry %q is not a valid IPv4 CIDR" $key $cidr) -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- if le $prefix 1 -}}
+{{- fail (printf "%s entry %q is a default or equivalently broad route; use narrow provider/API ranges" $key $cidr) -}}
+{{- end -}}
+{{- $cidr -}}
+{{- end -}}
+
+{{- if .Values.mailAdapter.deploy }}
+{{- if not .Values.mailAdapter.agentmail.httpsCidrs }}
+{{- fail "mailAdapter.deploy is true: set at least one mailAdapter.agentmail.httpsCidrs entry for AgentMail (or a controlled HTTPS egress proxy); provider egress fails closed" }}
+{{- end }}
+{{- if not (hasPrefix "https://" .Values.mailAdapter.agentmail.baseUrl) }}
+{{- fail "mailAdapter.deploy is true: mailAdapter.agentmail.baseUrl must use https:// because the mail egress policy permits provider traffic only on TCP 443" }}
+{{- end }}
+{{- $agentmailCidrs := list }}
+{{- range .Values.mailAdapter.agentmail.httpsCidrs }}
+{{- $agentmailCidrs = append $agentmailCidrs (include "curie.mailAdapter.narrowCidr" (dict "key" "mailAdapter.agentmail.httpsCidrs" "cidr" .) | trim) }}
+{{- end }}
+{{- $apiCidrs := list }}
+{{- if not .Values.api.deploy }}
+  {{- if not .Values.mailAdapter.apiBaseUrl }}
+  {{- fail "api.deploy is false: set mailAdapter.apiBaseUrl to the bring-your-own API URL" }}
+  {{- end }}
+  {{- if not .Values.mailAdapter.apiEgress.httpsCidrs }}
+  {{- fail "api.deploy is false: set at least one narrow mailAdapter.apiEgress.httpsCidrs entry for the bring-your-own API; API egress fails closed" }}
+  {{- end }}
+  {{- range .Values.mailAdapter.apiEgress.httpsCidrs }}
+  {{- $apiCidrs = append $apiCidrs (include "curie.mailAdapter.narrowCidr" (dict "key" "mailAdapter.apiEgress.httpsCidrs" "cidr" .) | trim) }}
+  {{- end }}
+  {{- $apiPortText := printf "%v" .Values.mailAdapter.apiEgress.port }}
+  {{- $apiPort := int $apiPortText }}
+  {{- if or (not (regexMatch "^[0-9]+$" $apiPortText)) (lt $apiPort 1) (gt $apiPort 65535) }}
+  {{- fail "mailAdapter.apiEgress.port must be an integer from 1 through 65535" }}
+  {{- end }}
+{{- end }}
+{{/*
+The first-party email channel (#1515): the adapter polls an AgentMail inbox,
+posts each allowed message to the platform as a turn, and replies on the same
+mail thread when the worker delivers the turn's events back.
+
+Modeled on templates/dispatcher.yaml, with six deliberate divergences:
+
+ 1. A Service exists. The dispatcher dials Slack outbound over a websocket and
+    has no inbound port; this adapter receives reply.update / turn.completed
+    from the worker over HTTP, so the worker needs an address to deliver to.
+ 2. curie.env.api is deliberately NOT included. That helper renders a
+    CURIE_API_KEY secretKeyRef alongside the URL, and the adapter must hold no
+    platform API key: it authenticates with CURIE_CHANNEL_TOKEN, scoped to the
+    one channel binding it serves. CURIE_API_URL is therefore rendered here from
+    curie.api.url, the derivation curie.env.api itself uses, off
+    mailAdapter.apiBaseUrl. Include that helper, never a copy of its expression.
+ 3. HTTP probes replace curie.heartbeatProbes, which exists only for the
+    portless services (worker, dispatcher). GET /healthz is a static liveness
+    signal; GET /readyz is withheld until SQLite opens and startup recovery
+    completes. Every POST still requires the egress secret.
+ 4. replicas is hardcoded 1 and the strategy is Recreate, neither of them a
+    value. SQLite makes replacement durable, but the PVC is ReadWriteOnce and
+    the database has one serialized writer. A rolling update would briefly run
+    two writers, so any count other than 1 remains wrong. This is the one
+    recorded exception to the values-not-templates invariant in
+    charts/curie/CLAUDE.md; horizontal scale needs a separately accepted shared
+    store design, at which point the exception is removed, not extended.
+ 5. A checksum/mail-adapter-credentials pod-template annotation, the same idiom
+    as worker.yaml:96-110 (see its comment for the canonical rationale) and
+    otel-collector.yaml / clickhouse.yaml. Env is read once at boot, so without
+    it a `helm upgrade` that rotates an expired token leaves the pod 401ing at
+    AgentMail behind a green /healthz. Scoped to this adapter's own three
+    credentials so an unrelated key rotating in the shared Secret does not
+    restart it.
+ 6. The deploy gate is a bare `.Values.mailAdapter.deploy`, deliberately NOT the
+    dispatcher's three-way curie.dispatcher.enabled gate on deploy plus both
+    tokens. mailAdapter.deploy defaults to false, so an operator who sets it true
+    has made a deliberate choice and deserves a loud crash-loop naming the
+    missing variable (the adapter's own boot gates do exactly that), not a
+    Deployment that silently fails to render and leaves them hunting for a typo
+    in their values file. The same bare check appears in curie.adapterCredentials,
+    which derives this adapter's egress entry only when it is deployed.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "curie.fullname" . }}-mail-adapter
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail-adapter
+spec:
+  selector:
+    {{- include "curie.selectorLabels" (dict "root" . "component" "mail-adapter") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.mailAdapter.service.port }}
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "curie.fullname" . }}-mail-adapter
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail-adapter
+spec:
+  # Divergence 4 above: pinned, not configurable.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "mail-adapter") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/mail-adapter-credentials: {{ dict "channelToken" .Values.mailAdapter.channelToken "egressSecret" .Values.mailAdapter.egressSecret "agentmailApiKey" .Values.mailAdapter.agentmail.apiKey | toJson | sha256sum }}
+      labels:
+        {{- include "curie.labels" . | nindent 8 }}
+        {{- include "curie.selectorLabels" (dict "root" . "component" "mail-adapter") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.mailAdapter.podSecurityContext | nindent 8 }}
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.mailAdapter.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: mail-adapter
+          image: {{ include "curie.image" (dict "repository" .Values.mailAdapter.image.repository "tag" .Values.mailAdapter.image.tag "digest" .Values.mailAdapter.image.digest "defaultTag" .Chart.AppVersion) | quote }}
+          imagePullPolicy: {{ .Values.mailAdapter.image.pullPolicy }}
+          {{- with .Values.mailAdapter.containerSecurityContext }}
+          {{- include "curie.containerSecurityContext" . | nindent 10 }}
+          {{- end }}
+          env:
+            # Where the platform API lives. Empty mailAdapter.apiBaseUrl (the
+            # default) derives the in-chart API Service; a set value renders
+            # verbatim and is the only correct answer when api.deploy is false.
+            # The port comes from api.service.port so the two cannot drift.
+            # Deliberately not curie.env.api -- see divergence 2 above.
+            - name: CURIE_API_URL
+              value: {{ include "curie.api.url" (dict "root" . "baseUrl" .Values.mailAdapter.apiBaseUrl) | quote }}
+            # The three credentials, by reference only: an inline value would put
+            # them into `helm get manifest` output and into every rendered
+            # artifact CI uploads.
+            - name: CURIE_CHANNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: mailChannelToken
+            - name: CURIE_EGRESS_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: mailEgressSecret
+            - name: AGENTMAIL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: mailAgentmailApiKey
+            - name: AGENTMAIL_INBOX
+              value: {{ .Values.mailAdapter.inbox | quote }}
+            - name: AGENTMAIL_BASE_URL
+              value: {{ .Values.mailAdapter.agentmail.baseUrl | quote }}
+            - name: CURIE_MAIL_POLL_INTERVAL_SECONDS
+              value: {{ .Values.mailAdapter.pollIntervalSeconds | quote }}
+            - name: CURIE_MAIL_INGRESS_ATTEMPTS
+              value: {{ .Values.mailAdapter.ingressAttempts | quote }}
+            - name: CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS
+              value: {{ .Values.mailAdapter.ingressRetryDelaySeconds | quote }}
+            - name: CURIE_MAIL_STATE_PATH
+              value: /var/lib/curie-mail/state.sqlite3
+            - name: CURIE_MAIL_MAX_PENDING_DELIVERIES
+              value: {{ .Values.mailAdapter.maxPendingDeliveries | quote }}
+            - name: CURIE_MAIL_MAX_BODY_BYTES
+              value: {{ .Values.mailAdapter.maxBodyBytes | int64 | quote }}
+            - name: CURIE_MAIL_MAX_REPLY_BYTES
+              value: {{ .Values.mailAdapter.maxReplyBytes | int64 | quote }}
+            - name: CURIE_MAIL_MAX_STATE_BYTES
+              value: {{ .Values.mailAdapter.maxStateBytes | int64 | quote }}
+            - name: HOME
+              value: /tmp
+            - name: TMPDIR
+              value: /tmp
+            - name: ADAPTER_INGRESS_ENABLED
+              value: {{ .Values.mailAdapter.ingressEnabled | quote }}
+            # Rendered even when the list is empty, and empty on purpose: the
+            # adapter's boot gate refuses an inbox that answers nobody, which is
+            # the honest signal. Omitting the variable instead would let the
+            # process fall back to its own default and start.
+            - name: CURIE_MAIL_ALLOWED_SENDERS
+              value: {{ join "," .Values.mailAdapter.allowedSenders | quote }}
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          resources:
+            {{- toYaml .Values.mailAdapter.resources | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/curie-mail
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ .Values.mailAdapter.persistence.existingClaim | default (printf "%s-mail-state" (include "curie.fullname" .)) }}
+        - name: tmp
+          emptyDir: {}
+---
+# One egress-only policy selects exactly the mail adapter. It deliberately has
+# no ingress policy: kubelet-originated HTTP probes are not reliably labelable
+# as worker traffic, while authenticated POST remains the write gate.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-mail-adapter-egress
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mail-adapter
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "mail-adapter") | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    # DNS only. No API-server peer or broad private-network allow is present.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.security.networkPolicy.dnsNamespace }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The channel ingress on this release's API pods only. Service routing is
+    # ultimately enforced against the selected pod endpoints.
+    {{- if .Values.api.deploy }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.api.service.port }} }
+    {{- else }}
+    # A bring-your-own API has no in-chart pod labels to select. The operator
+    # must declare its narrow IP peer and port explicitly at render time.
+    - to:
+        {{- range $apiCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.mailAdapter.apiEgress.port }} }
+    {{- end }}
+    # AgentMail, or an operator-controlled HTTPS egress proxy. NetworkPolicy is
+    # IP based, so operators must keep these CIDRs aligned with the configured
+    # AGENTMAIL_BASE_URL destination.
+    - to:
+        {{- range $agentmailCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: 443 }
+{{- end }}

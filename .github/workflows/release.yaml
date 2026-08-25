@@ -106,7 +106,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, worker, ui, sre-bot-tempo]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo]
         platform: [linux/amd64, linux/arm64]
         include:
           - name: runner
@@ -118,6 +118,9 @@ jobs:
           - name: dispatcher
             context: .
             dockerfile: apps/dispatcher/Dockerfile
+          - name: mail-adapter
+            context: .
+            dockerfile: apps/mail-adapter/Dockerfile
           - name: worker
             context: .
             dockerfile: apps/worker/Dockerfile
@@ -223,7 +226,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, worker, ui, sre-bot-tempo]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo]
     steps:
       - name: Download digests
         id: download_digests

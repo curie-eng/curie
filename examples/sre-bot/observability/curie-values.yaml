@@ -2,6 +2,16 @@ otelCollector:
   extraExporters:
     otlphttp/tempo:
       endpoint: http://tempo.observability.svc.cluster.local:4318
+      retry_on_failure:
+        enabled: true
+        initial_interval: 5s
+        max_interval: 30s
+        max_elapsed_time: 5m
+      sending_queue:
+        enabled: true
+        storage: file_storage
+        queue_size: 1000
+        num_consumers: 2
   extraPipelineExporters:
     - otlphttp/tempo
 grafanaConnector:

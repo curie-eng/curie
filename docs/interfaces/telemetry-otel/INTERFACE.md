@@ -6,6 +6,9 @@ grade: B+
 vision_row: Observability
 epics:
   - "#47"
+  - "#1817"
+  - "#1818"
+  - "#1819"
 order: 7
 ---
 # INTERFACE: Telemetry / OTEL
@@ -19,19 +22,76 @@ order: 7
 
 ## The black line
 
-On the write side, observability is swapped at the OTLP wire, not in code: the runner
-exports `gen_ai.*` spans over OTLP-HTTP to a collector, and the collector is the only
-component that authenticates and forwards to a backend. Services never speak the
-backend directly. Swapping the trace store means repointing one collector exporter
-block, not touching the runner. The opinionated core is the span tree shape
-(`agent.run` → `llm.generation` → `execute_tool`) and the attributes on it, which since
-ADR-0076 are a closed, versioned key set rather than an open bag of `gen_ai.*` names.
+On the write side, observability is swapped at the OTLP wire, not in code. The API,
+dispatcher, worker, eval worker, and runner emit OTLP traces, logs, and metrics to an
+OpenTelemetry Collector; services never authenticate to or speak a storage backend
+directly. Standard `OTEL_EXPORTER_OTLP_*` endpoint, protocol, and header variables select
+the wire transport independently per signal. With no endpoint a process keeps its JSON
+stderr diagnostics and uses no-op trace/log exporters rather than inventing a localhost
+destination.
+
+The Collector is the ownership boundary for backend authentication, retry, queueing, and
+signal routing. Swapping a backend means changing a collector exporter and pipeline, not
+application code. The runner's opinionated `agent.run` → `llm.generation` →
+`execute_tool` tree remains a narrower contract inside that platform-wide path: since
+ADR-0076 its attributes are a closed, versioned key set rather than an open bag of
+`gen_ai.*` names.
 
 ## Current contract
 
-A second backend must ingest the OTLP-HTTP export produced in
-`runner/src/curie_runner/otel.py`. Per ADR-0076 that export is a closed, versioned
-attribute schema, not an open bag of `gen_ai.*` keys:
+### Shared service signals
+
+- `bootstrap_service_telemetry`
+  (`packages/telemetry/src/curie_telemetry/bootstrap.py::bootstrap_service_telemetry`)
+  installs bounded batch processors for traces and logs and a periodic metric reader.
+  The exporters honor the standard per-signal-over-general precedence for OTLP
+  endpoints, protocols (`grpc` or `http/protobuf`), and headers. Each signal is disabled
+  when its effective endpoint is absent; shutdown flushes and closes every configured
+  provider within a finite bound.
+- Every service resource comes from `build_resource`
+  (`packages/telemetry/src/curie_telemetry/resource.py::build_resource`) and contains
+  `service.namespace`, `service.name`, `service.version`, and one anonymous stable
+  `service.instance.id` for the process, plus `deployment.environment.name` when
+  configured. Event, run, session, sandbox, user, agent, and deployment identifiers are
+  correlation attributes, never resource attributes.
+- `operation_span`
+  (`packages/telemetry/src/curie_telemetry/tracing.py::operation_span`) provides explicit
+  parentage and honest status for platform operations. Its caller vocabulary is closed
+  to `service.name`, `operation`, `role`, `source`, `outcome`, and `retry_class`; custom
+  keys export only as `curie.operation`, `curie.role`, `curie.source`, `curie.outcome`,
+  and `curie.retry_class`. Event mutations are separately closed to `curie.outcome` and
+  the standard `error.type`; adding an arbitrary identifier at construction or later
+  fails before export. Producers inject
+  and consumers extract only W3C `traceparent` through the separate Stream field or
+  runner HTTP header using `inject_trace_context` and `extract_trace_context`
+  (`packages/telemetry/src/curie_telemetry/context.py::inject_trace_context`). A missing
+  or malformed carrier starts a safe new root rather than inheriting ambient context.
+- `configure_service_logging`
+  (`packages/telemetry/src/curie_telemetry/logging.py::configure_service_logging`) keeps
+  redacted structured JSON on stderr and, when configured, adds correlated OTLP
+  LogRecords carrying the active trace and span identifiers. Stderr retains a redacted
+  traceback for diagnosis; the OTLP copy exports only the exception type, not an
+  exception message or stack.
+- The metric catalog in `packages/telemetry/schema/metrics.json` is the committed
+  contract for operational counters, histograms, and gauges across turn, queue,
+  thread-lock, sandbox, runner RPC, approval, reply, HTTP, background-loop, and eval
+  work. `record_metric`
+  (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
+  instruments, attribute keys, and enum values. Its allowlisted dimensions describe
+  operation classes and outcomes, not event, run, session, sandbox, user, agent, or
+  deployment identifiers, so the application-defined series space remains bounded.
+  Standard resource identity still contributes one anonymous `service.instance.id` per
+  running process. It is independent of turn input and adds at most one resource series
+  per live or restarted process, never one per event, session, user, or sandbox. The
+  1,000-identifier regression exercises this production resource shape as well as the
+  point attributes.
+
+### Runner generation spans
+
+The runner uses the shared service bootstrap for OTLP logs and metrics while preserving
+its specialized trace provider in `runner/src/curie_runner/otel.py`. Per ADR-0076 those
+generation spans use a closed, versioned attribute schema, not an open bag of `gen_ai.*`
+keys:
 
 - **The vocabulary is closed and committed.** `SpanAttributeKey`
   (`runner/src/curie_runner/otel.py::SpanAttributeKey`) is the only key set the runner
@@ -39,8 +99,8 @@ attribute schema, not an open bag of `gen_ai.*` keys:
   `gen_ai.approval.decision`, `gen_ai.request.model`, a bare `model`,
   `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read_input_tokens` /
   `cache_creation_input_tokens`, `gen_ai.tool.name`, `gen_ai.operation.name`, plus the
-  resource keys `service.name`, `curie.session_id`, `curie.sandbox_id` and
-  `schema.version`. `SPAN_ATTRIBUTE_VALUE_TYPES`
+  resource keys `service.name` and `schema.version`, plus the root-span correlation keys
+  `curie.session_id` and `curie.sandbox_id`. `SPAN_ATTRIBUTE_VALUE_TYPES`
   (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
   value type (the four usage counts are `int`, every other key is `str`).
 - **The schema is versioned.** `SCHEMA_VERSION`
@@ -50,21 +110,23 @@ attribute schema, not an open bag of `gen_ai.*` keys:
   mirror, and `runner/tests/test_otel_schema_drift.py` fails CI when the mirror, the enum,
   the declared types, or a real run's emitted attributes disagree.
 - `build_tracer_provider` (`runner/src/curie_runner/otel.py::build_tracer_provider`) takes
-  `(otel, session_id, sandbox_id=None)` and returns `None` when `otel.endpoint` is unset
-  (so offline runs neither export nor fail). Otherwise the `TracerProvider`'s `Resource`
-  carries `service.name` (`curie-runner`), `curie.session_id`, `schema.version`, and
-  `curie.sandbox_id` when that value is non-empty.
+  `(otel, session_id, sandbox_id=None)` and resolves standard trace-specific/general OTLP
+  environment first, with the typed `otel` values as fallback. It returns `None` when
+  disabled or no endpoint is configured, so offline runs neither export nor fail.
+  Otherwise its `Resource` uses the shared stable `curie-runner` service identity and
+  `schema.version`; session and sandbox correlation are attached to the `agent.run` root
+  span rather than multiplying resource identities.
 - **A fail-closed validator runs ahead of the exporter.** The provider registers
   `_SchemaValidatingSpanProcessor`
-  (`runner/src/curie_runner/otel.py::_SchemaValidatingSpanProcessor`) first, then
-  `SimpleSpanProcessor(OTLPSpanExporter())`. On each span ending the validator strips any
-  attribute whose key falls outside the closed set, or whose value (or any element of a
-  sequence value) still matches a redaction pattern after the `redact.py` scrub. It drops
-  the offending attribute, never the span, so the exporter only ever sees schema-legal
+  (`runner/src/curie_runner/otel.py::_SchemaValidatingSpanProcessor`) first, then a
+  bounded `BatchSpanProcessor`. On each span ending the validator strips any attribute
+  whose key falls outside the closed set, or whose value (or any element of a sequence
+  value) still matches a redaction pattern after the `redact.py` scrub. It drops the
+  offending attribute, never the span, so the exporter only ever sees schema-legal
   attributes.
-- Endpoint/headers come from the standard `OTEL_EXPORTER_OTLP_*` env vars, read by the
-  opentelemetry SDK itself because the exporter is constructed argument-free;
-  `SessionConfig.otel` is the typed view of the same vars.
+- Endpoint, protocol, and headers use the same standard `OTEL_EXPORTER_OTLP_*`
+  precedence as the shared bootstrap; `SessionConfig.otel` is the typed runner view of
+  those variables.
 - `RunTracer.run_span` (`runner/src/curie_runner/otel.py::RunTracer.run_span`) takes
   `(trace_name, model, session_id=None, user_id=None, approval_decision=None)`, opens the
   root `agent.run` (`SpanKind.SERVER`) and a child `llm.generation` span. It always stamps
@@ -80,24 +142,50 @@ attribute schema, not an open bag of `gen_ai.*` keys:
   `tool_span` (`runner/src/curie_runner/otel.py::_GenerationSpan.tool_span`) emits an
   `execute_tool` child carrying `gen_ai.tool.name` and `gen_ai.operation.name`.
 
+### Collector delivery
+
+The Helm Collector receives all three OTLP signals over gRPC and HTTP. Every pipeline
+orders `memory_limiter` before `batch`. The built-in Langfuse trace exporter has finite
+retry and a bounded `sending_queue` backed by the `file_storage` extension; Helm mounts
+that directory on a PVC by default, so queued trace batches survive a Collector pod
+restart. Any operator-supplied network exporter is rejected at render time unless it
+also enables finite retry and a finite file-backed queue. Logs and metrics deliberately
+use explicit no-op exporters until an operator configures their backends, avoiding scope
+overlap with #1765.
+
+Collector self-metrics remain enabled on the chart's internal metrics port, including
+queue size/capacity and exporter accepted, sent, failed, and enqueue-failed counters used
+to distinguish backlog from loss. The debug exporter is disabled by default and is an
+explicit development opt-in. Queue storage uses synchronous file writes, startup and
+rebound compaction, a finite queue capacity, and either the configured persistent volume
+or an explicit ephemeral-storage choice.
+
+Collector diagnostics remain JSON/stderr so exporter failure is observable through
+cluster container logs even when every OTLP backend is unavailable. The production log
+collection path consumes that container stream externally; the Collector deliberately
+does not export its own failure logs back through its failing OTLP pipeline, which would
+create a recursive failure loop.
+
 ## Implementations today
 
-One: Langfuse, reached through the OTel Collector (which authenticates and forwards,
-since Langfuse OTLP ingest is HTTP-only). The runner does not know it is Langfuse — it
-only knows OTLP. The runner is also the only span producer: neither the API nor the
-worker builds a tracer, and the chart hands `OTEL_EXPORTER_OTLP_ENDPOINT` only to the
-sandbox pod (`charts/curie/templates/agent-sandbox.yaml`). The read side (trace list, tree
-reconstruction) is a separate concern in the API — Langfuse's query model spans several
-API modules plus routers, not one isolated module — and is out of scope for this
-write-side seam, though it is not attribute-blind (see leakage below).
+One trace backend: Langfuse, reached through the OTel Collector (which authenticates and
+forwards over HTTP because Langfuse OTLP ingest is HTTP-only). Every producer knows only
+OTLP. The chart injects the Collector endpoint into the API, dispatcher, worker, eval
+worker, and sandbox runner; the local Compose profiles do the same for the services they
+start. The read side (trace list and tree reconstruction) remains a separate API concern.
+
+The default chart intentionally has no log or metric storage implementation: those
+pipelines terminate in named no-op exporters unless the operator adds durable backends.
+This keeps signal production and Collector reliability available without claiming the
+installable observability stack tracked by #1765.
 
 ## Known leakage
 
 Three vendor-named attributes are set at the source on the root span rather than mapped in
 the collector. `RunTracer.run_span` stamps `langfuse.trace.name`, `langfuse.session.id`,
 and `langfuse.user.id` (`runner/src/curie_runner/otel.py::RunTracer.run_span`) so Langfuse
-maps them to its name/Sessions/Users features. The collector pipeline is
-receivers/`batch`/`otlphttp` with no attributes processor
+maps them to its name/Sessions/Users features. The collector trace pipeline is
+receivers/`memory_limiter`/`batch`/`otlphttp` with no attributes processor
 (`charts/curie/templates/_helpers.tpl`), so nothing downstream renames them. A clean seam
 would emit neutral attributes the collector maps to the vendor names; today all three
 vendor names are set at the source, and they are members of the closed schema, so a second
@@ -124,7 +212,10 @@ reader.
 
 ## Cross-links
 
-- **Epic(s):** #47 — extends the observability / telemetry write path.
+- **Epic(s):** #47 — harness-neutral generation telemetry. #1817, #1818, and
+  #1819 extend the write path across platform traces/logs, bounded operational metrics,
+  and durable/self-observable Collector delivery without adding the backends tracked by
+  #1765.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 2 (Observability / OTel store), grade B+.
 - **ADR(s):** [ADR-0004](../../adr/0004-langfuse-observability-and-eval-backbone.md) — Langfuse as the single observability + eval backbone (OTLP over HTTP/protobuf to the collector).
   [ADR-0076](../../adr/0076-closed-typed-telemetry-attribute-schema.md) (Accepted, epic #512) — the closed, versioned attribute schema, the export-time validator, and the `gen_ai.approval.decision` key that closed the approval-gate observability gap ADR-0038 left open.

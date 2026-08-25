@@ -59,14 +59,20 @@ logger = logging.getLogger(__name__)
 # and answer the correspondent twice -- silently, and only for the deliveries a
 # caller happens to retry after the window.
 _ENQUEUE_SCRIPT = """
+local function append()
+  if ARGV[5] ~= '' then
+    return redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2], ARGV[5], ARGV[6])
+  end
+  return redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
+end
 local cur = redis.call('GET', KEYS[1])
 if cur == ARGV[1] then
-  local id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
+  local id = append()
   redis.call('SET', KEYS[1], id)
   return {1, id}
 elseif not cur then
   redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[4])
-  local id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
+  local id = append()
   redis.call('SET', KEYS[1], id)
   return {1, id}
 else
@@ -145,6 +151,8 @@ async def enqueue_owned(
     payload: str,
     payload_field: str,
     lease_s: int,
+    transport_field: str | None = None,
+    transport_value: str | None = None,
 ) -> tuple[bool, str]:
     """Enqueue the payload if this request still owns the claim.
 
@@ -156,6 +164,8 @@ async def enqueue_owned(
         payload: The serialized ``QueuedTurn``.
         payload_field: The stream field the payload rides in.
         lease_s: The lease used by the re-claim arm.
+        transport_field: Optional transport-owned metadata field beside payload.
+        transport_value: Value paired with ``transport_field``.
 
     Returns:
         ``(True, stream_id)`` when THIS request enqueued; ``(False, owner_value)``
@@ -163,7 +173,16 @@ async def enqueue_owned(
     """
 
     result: Any = await client.eval(
-        _ENQUEUE_SCRIPT, 2, key, stream, owner, payload, payload_field, str(lease_s)
+        _ENQUEUE_SCRIPT,
+        2,
+        key,
+        stream,
+        owner,
+        payload,
+        payload_field,
+        str(lease_s),
+        transport_field or "",
+        transport_value or "",
     )
     enqueued, current = result
     return bool(enqueued), _text(current)

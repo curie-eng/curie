@@ -2,7 +2,7 @@
 
 Curie (codename **Relay**) turns a Slack thread into a conversation with a
 versioned, sandboxed AI agent, and turns a git push into a deployment of that
-agent. Slack is the only wired channel today; the dispatcher sits behind a
+agent. Slack, Discord, and email are the three wired channels today; all sit behind a
 channel-agnostic message port ([ADR 0020](docs/adr/0020-message-port-rendering-free-channel-interface.md)),
 so additional channels are additive, not a rewrite. This document is the as-built map. It covers:
 
@@ -137,11 +137,13 @@ focused diagram docs, each a single clean picture:
 ```mermaid
 flowchart TB
     Slack["Slack"]
+    Email["Email<br/>(AgentMail inbox)"]
     CLI["CLI / laptop"]
     GH["GitHub push"]
 
     subgraph core["Agent runner core (apps/)"]
         Dispatcher["dispatcher<br/>ingress + dedupe"]
+        MailAdapter["mail-adapter<br/>email ingress + threaded reply"]
         Queue["Valkey<br/>queue + routing"]
         Worker["worker kernel<br/>one session per thread"]
         API["api<br/>git-driven deploy · bundles · read proxy"]
@@ -161,10 +163,14 @@ flowchart TB
     end
 
     Slack --> Dispatcher
+    Email --> MailAdapter
     CLI -- XADD --> Queue
     CLI --> API
     GH --> API
     Dispatcher --> Queue --> Worker --> Sandbox --> Anthropic
+    MailAdapter -- channel ingress --> API
+    API -- channel turns --> Queue
+    Worker -- reply events --> MailAdapter
     API -- evals --> Queue
     Sandbox -. bundle-fetch .-> Store
     Worker -. bundle-fetch .-> Store
@@ -173,7 +179,10 @@ flowchart TB
     API --> Store
     API --> PG
     UI --> API
+    Dispatcher --> OTel
+    Worker --> OTel
     Sandbox --> OTel
+    API --> OTel
     Worker -- eval scores --> LF
     API -- read --> LF
 ```
@@ -198,11 +207,13 @@ with four outbound dependencies of its own:
 - It writes eval scores straight to Langfuse
   ([`apps/worker/src/curie_worker/eval/recorder.py::LangfuseEvalRecorder`](apps/worker/src/curie_worker/eval/recorder.py)).
 
-The worker has **no** OTel dependency — the runner is the only emitter. Its one
-connection to observability is the eval-score write to Langfuse above. The CLI
-likewise never calls the dispatcher directly — see
-[the Slack seam](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub) for
-how it enqueues a turn instead.
+The API, dispatcher, worker, and runner share the platform telemetry bootstrap:
+they emit OTLP traces, correlated OTLP logs, and bounded operational metrics to
+the collector. For local verification, the CLI runs the dispatcher's bounded,
+Slack-free one-shot producer in the existing Compose network so the synthetic
+turn crosses the real producer span and W3C carrier seam. The cluster driver
+retains a direct carrierless enqueue as the legacy/missing-context control. See
+[the Slack seam](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub).
 
 ### Adopted, not built
 
@@ -212,14 +223,15 @@ Curie leans on these systems rather than building its own (ADR-0007,
 - Langfuse (traces + evals)
 - Kubernetes Agent Sandbox (interactive runtime)
 - Slack Bolt (Socket Mode)
+- AgentMail (the email inbox, and the SPF/DKIM/DMARC filtering in front of it; see [`docs/operations.md`](docs/operations.md))
 - Valkey Streams (queue)
 - Postgres (app state)
 - the OTel Collector
 - **claude-agent-sdk** as the harness (ADR-0005) — one of the two most load-bearing adopt calls of all
 - **the Claude Code plugin format verbatim** — the other, which ADR-0007 calls "the distribution wedge — do not invent a format"
 
-Curie builds **six** things around that spine: the API, the dispatcher, the
-worker+runner glue, the UI, the CLI, and the umbrella Helm chart ([Deployment, CI, and release](#deployment-ci-and-release)). The
+Curie builds **seven** things around that spine: the API, the dispatcher, the mail
+adapter, the worker+runner glue, the UI, the CLI, and the umbrella Helm chart ([Deployment, CI, and release](#deployment-ci-and-release)). The
 chart is a built thing, not a packaging afterthought. The security rails are
 chart defaults, so the chart is where a rail either ships or does not.
 
@@ -465,8 +477,15 @@ The CLI's `curie local message` path does four things:
 
 - starts a local Slack Web API stub ([`cli/src/chat.rs`](cli/src/chat.rs))
 - mints the exact `QueuedTurn` the dispatcher would produce, with `endpoint` pointed at the stub
-- `XADD`s it onto the very same `curie:runs` stream the dispatcher uses ([`cli/src/queue.rs`](cli/src/queue.rs))
+- passes the frozen payload over stdin to a bounded, Slack-free dispatcher
+  one-shot, which adds the transport-owned trace carrier and `XADD`s it onto the
+  same `curie:runs` stream
 - waits for the worker to finalize the turn by calling the stub's Slack API back
+
+`curie cluster message` deliberately keeps the older direct `XADD` path
+([`cli/src/queue.rs`](cli/src/queue.rs)). Its carrierless entry proves the worker
+still starts a safe root for legacy producers; it is not the positive local
+causality path.
 
 The worker cannot distinguish the stub from Slack: same queue payload, same
 `chat.update` call. This is what lets most of the verification suite run with
@@ -477,11 +496,16 @@ channel-neutral now (#1459, ADR-0096) — a deployment binds an agent by
 exact-match on a `{kind, address}` channel row, not a Slack-typed column, and
 an agent may hold several such rows (ADR-0118): a reply routes on the pair the
 inbound turn arrived on, never on any other channel the agent also serves. The
-catalog still grades the channel/ingress seam `C` with one implementation:
-Slack is the only registered `kind`, and there is no multi-channel adapter
-framework yet (#27). "The system does not care which channel" is true of a
-turn in flight and of how an agent gets bound to one; it is not yet true of
-how many channel kinds are wired up.
+catalog now carries three implementations of the channel/ingress seam: Slack,
+Discord, and email (#1515, [`apps/mail-adapter`](apps/mail-adapter)). It still
+grades the seam `C`: another implementation is not a regrade, and there is no
+multi-channel adapter framework yet (#27). `slack` also remains the only kind
+with a registered address shape
+([`apps/api/src/curie_api/schemas.py::_validate_channel_binding`](apps/api/src/curie_api/schemas.py));
+Discord and email bind on the generic non-empty rule, which is ADR-0096 working
+as designed rather than a gap. "The system does not care which channel" is true
+of a turn in flight and of how an agent gets bound to one; three wired channels
+is still not the same as any channel.
 
 Net effect: a developer can run the entire product loop — real model call
 included — on a laptop with Docker, no cluster, and no Slack. The code
@@ -540,27 +564,50 @@ silently degrading to fake ([`apps/worker/src/curie_worker/binding.py::apply_mod
 
 ## The observability pipeline
 
-The write path runs down; the read path (arrows reversed) runs back up from
-Langfuse to whoever's asking:
+The write path runs down; configured observability backends provide any retained
+read path back to the operator:
 
 ```
-runner (OTLP spans, resource attr curie.session_id)
-  --> OTel Collector (OTLP gRPC 4317 / HTTP 4318 in)
-        --> Langfuse v3 over HTTP (ClickHouse-backed)
-              <-- apps/api Langfuse proxy (trace tree, metrics, cost)
-                    <-- apps/ui Runs / Metrics / Cost / Logs views
+API / dispatcher / worker / runner
+  -- OTLP traces + logs + metrics (standard OTEL_EXPORTER_OTLP_* config) -->
+OTel Collector (OTLP gRPC 4317 / HTTP 4318)
+  -- traces --> Langfuse v3 over HTTP (ClickHouse-backed)
+  -- logs and metrics --> configured collector exporters
 ```
 
-- The runner emits `gen_ai`-style spans (`agent.run -> generation -> tool`) with a resource including `service.name`, `curie.session_id`, and `curie.sandbox_id` ([`runner/src/curie_runner/otel.py`](runner/src/curie_runner/otel.py)). The `sandbox_id` is what lets a trace be tied back to the sandbox that served it.
-- **Langfuse OTLP (OpenTelemetry Protocol) ingest is HTTP-only.** Services send to the OTel Collector (which may take gRPC or HTTP), and the collector always exports to Langfuse over HTTP. Collector config is at [`otel/collector-config.yaml`](otel/collector-config.yaml). The load-bearing constraint is documented in [`CLAUDE.md`](CLAUDE.md).
-- The API reconstructs the tool-call tree from Langfuse's public API via `parentObservationId` ([`apps/api/src/curie_api/langfuse.py::build_tree`](apps/api/src/curie_api/langfuse.py)) and proxies metrics/cost ([`apps/api/src/curie_api/langfuse.py::LangfuseClient`](apps/api/src/curie_api/langfuse.py), surfaced at [`apps/api/src/curie_api/routers/observability.py`](apps/api/src/curie_api/routers/observability.py)).
-- The UI's Runs (`RealTraces.tsx`), Metrics (`RealMetrics.tsx`), Cost (`RealCost.tsx`), and Logs (`RealLogs.tsx`) views render these live in wired mode ([`apps/ui/src/views/obs/`](apps/ui/src/views/obs/)).
+- Services have stable resources (`service.namespace=curie`, service name,
+  version, instance ID, and configured deployment environment). Per-turn IDs
+  are never resource attributes. An unset OTLP endpoint is a no-export mode:
+  it does not delay startup or turn handling, and stderr diagnostics remain.
+- The dispatcher injects W3C context into a separate Valkey Stream transport
+  field. The worker creates a messaging process span from it (or a fresh valid
+  root when the field is missing or malformed), then injects context on the
+  worker-to-runner HTTP call. `agent.run` is therefore a descendant of the
+  worker process span without changing the queued turn or ACI request bodies.
+- Trace spans cover queue and routing decisions, sandbox lifecycle, runner RPC,
+  approval and reply outcomes, retry, and dead-lettering. Terminal failures are
+  recorded as failures even when the kernel converts them into a classified
+  product result. Logs retain stderr output and are also OTLP LogRecords with
+  automatic trace/span correlation. Shared redaction excludes secrets,
+  credentials, user/model content, and tool arguments/results by default.
+- The metric schema fixes every instrument's name, type, unit, attributes, and
+  finite value domains. Operational counters, histograms, and gauges cover turn
+  outcomes, queue state, locks, sandbox lifecycle, runner RPC, approvals,
+  replies, and API/background work. Trace IDs, users, sessions, sandbox names,
+  arbitrary paths, and error text are prohibited metric attributes.
+- **Langfuse OTLP ingest is HTTP-only.** The collector adapts trace traffic to
+  Langfuse over HTTP; no application speaks to it directly. Logs and metrics
+  remain explicit collector pipelines, whose production destinations are
+  supplied through supported collector values rather than application code.
+  Collector config is at [`otel/collector-config.yaml`](otel/collector-config.yaml).
+- The API still reconstructs the Langfuse tool-call tree via `parentObservationId`
+  ([`apps/api/src/curie_api/langfuse.py::build_tree`](apps/api/src/curie_api/langfuse.py))
+  and proxies its existing trace/cost surfaces. Installing a retained query
+  backend and extending query views is separate work; emitted OTLP logs and
+  metrics do not imply that the current UI is a cross-service log backend.
 
-The `sandbox_id` is also known worker-side (the affinity store and
-`SandboxHandle`), so a trace, its session, and its serving sandbox all line up.
-The API hoists it out of the trace's observations onto the trace itself
-([`apps/api/src/curie_api/langfuse.py::hoist_sandbox_id`](apps/api/src/curie_api/langfuse.py)),
-so sandbox identity is surfaced, not pending.
+The sandbox ID is known worker-side (the affinity store and `SandboxHandle`) and
+can be a redacted per-run trace/log attribute, not a resource or metric label.
 
 **The observability CLI.** `curie local observability` prints the local
 observability surfaces — the console, Langfuse traces/cost, and the API base.
@@ -569,9 +616,10 @@ subcommands, not a top-level one ([`cli/src/main.rs`](cli/src/main.rs)). It is
 deliberately a **thin client over the same `apps/api` proxy the UI uses, not a
 second backend** (ADR-0038,
 [`docs/adr/0038-observability-cli-helper-for-the-agent-dev-loop.md`](docs/adr/0038-observability-cli-helper-for-the-agent-dev-loop.md)).
-There is no Prometheus and no separate metrics store behind it. It prints URLs and
-opens nothing unless `--open` is passed, and `--json` never opens a browser — the
-agent-facing default is inert output.
+It prints URLs and opens nothing unless `--open` is passed, and `--json` never
+opens a browser — the agent-facing default is inert output. A retained metrics
+or log backend, its installation, and its query surface remain outside this
+write-path work.
 
 ## The UI: always the real API, no demo mode
 
@@ -610,7 +658,8 @@ working around it — see [`CLAUDE.md`](CLAUDE.md).
 **The chart** ([`charts/curie`](charts/curie)) is an umbrella that brings up:
 
 - Postgres, Valkey, Langfuse, ClickHouse, RustFS, and the OTel Collector
-- Deployments/Services for api/dispatcher/worker/ui (the dispatcher has no inbound port and so no Service)
+- Deployments/Services for api/dispatcher/mail-adapter/worker/ui (the dispatcher has no inbound port and so no Service)
+- the mail adapter is **off by default** (`mailAdapter.deploy: false`) and, unlike the dispatcher, does get a Service: the worker POSTs reply events to it ([`charts/curie/templates/mail-adapter.yaml`](charts/curie/templates/mail-adapter.yaml))
 
 Templates live under [`charts/curie/templates/`](charts/curie/templates).
 Security rails are all chart defaults (ADR-0006,
@@ -656,14 +705,14 @@ ladder; see the workflow file for the complete, current list. Notable ones:
 
 - `python` (ruff + mypy + pytest) — the one that boots the full compose stack, runs real Alembic migrations on a virgin Postgres (`version_table_schema=curie`, [`apps/api/alembic/env.py::do_run_migrations`](apps/api/alembic/env.py)), and runs the whole workspace pytest suite against those live services
 - `rust`, `rust-build` (the release binary), `contracts-ts`, `ui` (lint + vitest + build + headless Playwright)
-- `images`, `worker-local-image`, `dispatcher-image-smoke` — the **image build gates**. An operator reading this list to know what protects a release needs them named, since a green `python` says nothing about whether the images build.
+- `images`, `worker-local-image`, `dispatcher-image-smoke`, `mail-adapter-image-smoke` — the **image build gates**. An operator reading this list to know what protects a release needs them named, since a green `python` says nothing about whether the images build.
 - `eval-falsifiability`, `commit-messages` (no AI attribution)
 - `e2e-ladder`, `e2e-ladder-release`, `e2e-ladder-cluster` — the parity ladder's three rungs, each its own job, gated by an internal `changes` path filter
 
 **Release** ([`.github/workflows/release.yaml`](.github/workflows/release.yaml))
-publishes `ghcr.io/curie-eng/curie-{runner,api,dispatcher,worker,ui}` as
+publishes `ghcr.io/curie-eng/curie-{runner,api,dispatcher,mail-adapter,worker,ui}` as
 multi-arch (`linux/amd64` + `linux/arm64`) manifests (both `latest` and long-SHA
-tags) on every push to `main`. It also publishes a sixth image,
+tags) on every push to `main`. It also publishes a seventh image,
 **`ghcr.io/curie-eng/curie-worker-local`** (the worker-local overlay, built and
 merged by its own `worker-local-build` / `worker-local-merge` jobs). A `v*` tag
 additionally cuts a GitHub Release with CLI binaries for
@@ -695,6 +744,7 @@ The following are built and verified:
 - ripping out the UI fixture/showroom surface (the code is still in the tree; wired-and-live is the target, [the UI section](#the-ui-always-the-real-api-no-demo-mode))
 - binding the UI's eval matrix view to the live `GET /evals/matrix` endpoint ([Pushing agent versions with git](#pushing-agent-versions-with-git-deploy-flow))
 - **running** the soak/chaos suite at N1 scale (the suite itself is 762 lines of real Python, env-gated on `CURIE_SOAK` — what is deferred is the run, not the code)
+- the **live cluster run** of the email channel (the adapter itself ships: [`apps/mail-adapter`](apps/mail-adapter) with its test suite, its `mail-adapter-image-smoke` gate and its chart wiring behind `mailAdapter.deploy`; what is deferred is the on-cluster send-and-reply rehearsal, so email is not yet in the live-verified list above)
 - the Interview-Me onboarding compiler
 - automatic memory generation
 - the **native OpenAI wire format**

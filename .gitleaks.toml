@@ -124,6 +124,9 @@ regexes = [
   # them (curie seal / credcheck), so they cannot be shortened past it -- the
   # EXAMPLE marker is what makes them obviously not a live token.
   '''\b(xapp|xoxb|xoxp)-EXAMPLE[A-Za-z0-9-]*''',
+  # Historical redaction regression input. Every token component is a repeated
+  # zero or the literal FAKE marker, so it cannot identify a real Slack app.
+  '''\bxapp-0-0000000000-0000000000-FAKEFAKEFAKEFAKE\b''',
 ]
 
 paths = [

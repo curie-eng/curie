@@ -10,7 +10,8 @@
 # otel-collector is full-profile only; a core-only stack must blank the endpoint
 # or every span pays a synchronous DNS retry against an absent collector.
 # core = postgres, valkey, rustfs-perms, rustfs, rustfs-init, curie-migrate, curie-api, curie-worker
-# full = core + clickhouse, langfuse-web, langfuse-worker, otel-collector, curie-ui
+# full = core + clickhouse, langfuse-web, langfuse-worker,
+#        otel-collector-perms, otel-collector, curie-ui
 # The CLI `curie local up` wraps these compose profile invocations.
 # Tear down:  docker compose -f compose.dev.yaml down        (keeps volumes; fast restart)
 # Wipe:       docker compose -f compose.dev.yaml down -v     (drops volumes; throwaway)
@@ -25,6 +26,7 @@
 #   ClickHouse HTTP ... localhost:28123   (native TCP localhost:29009)
 #   RustFS S3 API ..... localhost:29000   (console localhost:29001)
 #   OTel Collector .... localhost:24317 (gRPC) / localhost:24318 (HTTP)
+#   Collector metrics . http://localhost:28888/metrics
 #
 # ClickHouse is pinned to :24.8 on purpose. Newer ClickHouse requires AVX and
 # SIGILLs with exit 132 on CPUs without it; :24.8 still ships an SSE4.2 build.
@@ -274,9 +276,23 @@ services:
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-curie-dev-password}
     restart: unless-stopped
 
+  # The Collector image runs as UID 10001. Prepare its task-owned named volume
+  # before boot so the persistent queue stays writable without running the
+  # Collector itself as root.
+  otel-collector-perms:
+    image: rustfs/rustfs:1.0.0-beta.12
+    profiles: *full_profiles
+    user: "0"
+    volumes:
+      - otel_collector_storage:/var/lib/otelcol/storage
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown -R 10001:10001 /var/lib/otelcol/storage"]
+    restart: "no"
+
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.119.0
     profiles: *full_profiles
+    user: "10001:10001"
     # Multi-homed onto curie_runner (#631): a hardened runner exports OTLP to
     # `otel-collector:4318` from the isolated runner network, while the collector
     # still reaches langfuse-web on the default network.
@@ -285,14 +301,21 @@ services:
     depends_on:
       langfuse-web:
         condition: service_started
+      otel-collector-perms:
+        condition: service_completed_successfully
     environment:
       # base64("pk-lf-curie-dev:sk-lf-curie-dev"); matches the LANGFUSE_INIT keys above.
       LANGFUSE_OTLP_AUTH_HEADER: ${LANGFUSE_OTLP_AUTH_HEADER:-Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==}
     volumes:
       - ./otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
+      - otel_collector_storage:/var/lib/otelcol/storage
     ports:
       - "24317:4317"
       - "24318:4318"
+      - "127.0.0.1:28888:8888"
+    mem_limit: 256m
+    stop_signal: SIGTERM
+    stop_grace_period: 60s
     restart: unless-stopped
 
   # ---- Curie product services (the local product loop) --------------------
@@ -391,6 +414,11 @@ services:
       # float-typed: an empty value fails validation and the API would not boot.
       # Set SLACK_USERGROUP_CACHE_TTL_S=0 to fetch on every resolve.
       SLACK_USERGROUP_CACHE_TTL_S: ${SLACK_USERGROUP_CACHE_TTL_S:-60}
+      # Single-dash defaults preserve an explicitly empty endpoint/protocol.
+      # `curie local up --minimal` uses that empty value to keep the core-only
+      # stack inert when the full-profile Collector is absent.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL-http/protobuf}
     ports:
       - "28000:8000"
     healthcheck:
@@ -585,6 +613,7 @@ services:
       - CURIE_FALSE_COMPLETION_CHECK=${CURIE_FALSE_COMPLETION_CHECK:-}
       - CURIE_DOCKER_NETWORK=${CURIE_DOCKER_NETWORK:-curie_runner}
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
+      - OTEL_EXPORTER_OTLP_PROTOCOL=${OTEL_EXPORTER_OTLP_PROTOCOL-http/protobuf}
       # config.py's connector_release/connector_namespace (CURIE_RELEASE /
       # CURIE_NAMESPACE) both default empty, which was built for the cluster
       # tier (#1118) where Helm supplies the real release name and namespace.
@@ -639,6 +668,9 @@ services:
       # Mirrors curie-api's API_KEY so resolve calls authenticate. Wired
       # explicitly rather than relying on the two defaults happening to match.
       CURIE_API_KEY: curie-dev-key
+      # Like API/worker, explicit empty disables export for a core-only stack.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL-http/protobuf}
     restart: unless-stopped
 
 networks:
@@ -662,3 +694,4 @@ volumes:
   rustfs_data:
   rustfs_logs:
   ollama_data:
+  otel_collector_storage:

@@ -45,6 +45,8 @@ from aci_protocol import (
     EvalReport,
     parse_eval_job,
 )
+from curie_telemetry import extract_trace_context, operation_span, record_metric
+from opentelemetry.trace import SpanKind
 from plugin_format import (
     DEFAULT_MAX_COMPRESSION_RATIO,
     DEFAULT_MAX_MEMBERS,
@@ -286,6 +288,7 @@ class EvalStreamConsumer(StreamConsumer):
             reclaim_min_idle_ms=config.reclaim_min_idle_ms,
             read_count=config.read_count,
             cap_scan_page=_EVAL_CAP_SCAN_PAGE,
+            telemetry_source="eval",
             handler=self._handle,
             logger=logger,
             dead_letter_log="dead-lettered eval entry %s after %d deliveries (reason=%s) -> %s",
@@ -354,6 +357,18 @@ class EvalStreamConsumer(StreamConsumer):
             await self._sleep_or_stop(self._config.reclaim_interval_s)
 
     async def _handle(self, entry_id: str, fields: dict[str, str]) -> None:
+        # Eval jobs are their own lifecycle. Ignore any adjacent turn carrier so
+        # a reused transport field cannot fabricate causality across the sibling
+        # stream; missing and malformed values therefore share this safe root.
+        with operation_span(
+            "curie.eval.process",
+            kind=SpanKind.CONSUMER,
+            parent=extract_trace_context({}),
+            attributes={"service.name": "curie-worker", "source": "eval"},
+        ):
+            await self._handle_entry(entry_id, fields)
+
+    async def _handle_entry(self, entry_id: str, fields: dict[str, str]) -> None:
         self._inflight_ids.add(entry_id)
         try:
             try:
@@ -366,6 +381,14 @@ class EvalStreamConsumer(StreamConsumer):
                 # (not a bare ack) so the malformed entry is observable in the
                 # eval graveyard, matching the runs lane's unparseable path (#535).
                 logger.exception("malformed eval work item %s; dead-lettering as poison", entry_id)
+                record_metric(
+                    "curie.eval.process",
+                    attributes={
+                        "service.name": "curie-worker",
+                        "source": "eval",
+                        "outcome": "failure",
+                    },
+                )
                 await self._dead_letter(entry_id, fields, reason="unparseable", delivery_count=1)
                 return
             try:
@@ -375,7 +398,33 @@ class EvalStreamConsumer(StreamConsumer):
                 # An unexpected error before the report attempt: leave pending so
                 # the reclaim loop re-runs it (an eval must not be lost to a crash).
                 logger.exception("eval processing failed for %s; left pending", entry_id)
+                record_metric(
+                    "curie.eval.process",
+                    attributes={
+                        "service.name": "curie-worker",
+                        "source": "eval",
+                        "outcome": "failure",
+                    },
+                )
                 return
+            metric_outcome = (
+                "plumbing"
+                if result.results
+                and all(row.outcome is EvalOutcome.PLUMBING_OK for row in result.results)
+                else (
+                    "failure"
+                    if any(row.outcome is EvalOutcome.FAIL for row in result.results)
+                    else "success"
+                )
+            )
+            record_metric(
+                "curie.eval.process",
+                attributes={
+                    "service.name": "curie-worker",
+                    "source": "eval",
+                    "outcome": metric_outcome,
+                },
+            )
             await self._ack(entry_id)
         finally:
             self._inflight_ids.discard(entry_id)

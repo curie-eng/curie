@@ -78,7 +78,15 @@ class AffinityStore:
         has no live route and is an orphan.
         """
 
-        names: set[str] = set()
+        inventory = self.route_inventory(thread_keys_scan_count)
+        return set().union(*inventory.values())
+
+    def route_inventory(
+        self, thread_keys_scan_count: int = 500
+    ) -> dict[RouteState, set[str]]:
+        """Authoritative unexpired route claims grouped by persisted state."""
+
+        inventory: dict[RouteState, set[str]] = {state: set() for state in RouteState}
         for key in self._redis.scan_iter(
             match=f"{self._prefix}:route:*", count=thread_keys_scan_count
         ):
@@ -90,8 +98,8 @@ class AffinityStore:
                 record = RouteRecord.from_json(text)
             except (ValueError, TypeError, KeyError):
                 continue
-            names.add(record.handle.claim_name)
-        return names
+            inventory[record.state].add(record.handle.claim_name)
+        return inventory
 
     def mark_suspended(
         self, thread_key: str, history_ref: str | None, ttl_seconds: int

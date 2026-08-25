@@ -8,6 +8,7 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "kubernetes>=36.0.3",
     "aci-protocol",
+    "curie-telemetry",
     "curie-channel-protocol",
     "plugin-format",
     "curie-dispatcher",

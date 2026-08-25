@@ -24,11 +24,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from typing import Protocol
 
 import aiohttp
-from channel_protocol.reply import ReplyAck, ReplyEvent
+import curie_telemetry
+from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyPost
+from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ConfigDict
 
 from .config import WorkerConfig
@@ -58,6 +62,8 @@ _UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
     aiohttp.ClientConnectionError,
     asyncio.TimeoutError,
 )
+
+_REPLY_OBSERVATION_DEPTH: ContextVar[int] = ContextVar("curie_reply_observation_depth", default=0)
 
 
 class MissingAdapterCredentialError(RuntimeError):
@@ -96,6 +102,10 @@ class RedirectedAdapterEndpointError(RuntimeError):
     """
 
 
+class _BestEffortUnreachableAck(ReplyAck):
+    """Internal marker for an unreachable delivery deliberately acknowledged."""
+
+
 class TargetRoute(BaseModel):
     """Where this turn's replies are delivered, and under whose credential.
 
@@ -121,6 +131,94 @@ class ReplySink(Protocol):
         route: TargetRoute,
         best_effort_unreachable: bool = False,
     ) -> ReplyAck: ...
+
+
+async def _observe_reply(
+    event: ReplyEvent,
+    *,
+    best_effort_unreachable: bool,
+    call: Callable[[], Awaitable[ReplyAck]],
+) -> ReplyAck:
+    """Observe one logical delivery, suppressing nested adapter double-counting."""
+
+    operation = "post" if isinstance(event, ReplyPost) else "update"
+    attributes = {
+        "service.name": "curie-worker",
+        "operation": operation,
+        "role": "client",
+    }
+    started = time.monotonic()
+    outcome = "failure"
+    error: Exception | None = None
+    ack: ReplyAck | None = None
+    token = _REPLY_OBSERVATION_DEPTH.set(_REPLY_OBSERVATION_DEPTH.get() + 1)
+    try:
+        with curie_telemetry.operation_span(
+            f"curie.reply.{operation}",
+            kind=SpanKind.CLIENT,
+            attributes=attributes,
+        ) as span:
+            try:
+                ack = await call()
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "reply.delivery.failed",
+                    {"outcome": "failure", "error.class": type(exc).__name__},
+                )
+            else:
+                outcome = (
+                    "best-effort"
+                    if isinstance(ack, _BestEffortUnreachableAck)
+                    else "success"
+                )
+                span.add_event("reply.delivered", {"outcome": outcome})
+    finally:
+        _REPLY_OBSERVATION_DEPTH.reset(token)
+
+    metric_attributes = {**attributes, "outcome": outcome}
+    curie_telemetry.record_metric("curie.reply.delivery", attributes=metric_attributes)
+    curie_telemetry.record_metric(
+        f"curie.reply.{operation}.duration",
+        max(0.0, time.monotonic() - started),
+        attributes=metric_attributes,
+    )
+    if error is not None:
+        raise error
+    assert ack is not None
+    return ack
+
+
+class ObservedReplySink:
+    """Telemetry decorator used once around the kernel's injected reply seam."""
+
+    def __init__(self, sink: ReplySink) -> None:
+        self._sink = sink
+
+    async def emit(
+        self,
+        event: ReplyEvent,
+        *,
+        route: TargetRoute,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        if _REPLY_OBSERVATION_DEPTH.get():
+            return await self._sink.emit(
+                event,
+                route=route,
+                best_effort_unreachable=best_effort_unreachable,
+            )
+        return await _observe_reply(
+            event,
+            best_effort_unreachable=best_effort_unreachable,
+            call=lambda: self._sink.emit(
+                event,
+                route=route,
+                best_effort_unreachable=best_effort_unreachable,
+            ),
+        )
 
 
 class HttpReplyAdapter:
@@ -191,6 +289,29 @@ class HttpReplyAdapter:
         route: TargetRoute,
         best_effort_unreachable: bool = False,
     ) -> ReplyAck:
+        if not _REPLY_OBSERVATION_DEPTH.get():
+            return await _observe_reply(
+                event,
+                best_effort_unreachable=best_effort_unreachable,
+                call=lambda: self._emit(
+                    event,
+                    route=route,
+                    best_effort_unreachable=best_effort_unreachable,
+                ),
+            )
+        return await self._emit(
+            event,
+            route=route,
+            best_effort_unreachable=best_effort_unreachable,
+        )
+
+    async def _emit(
+        self,
+        event: ReplyEvent,
+        *,
+        route: TargetRoute,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
         endpoint, secret = self._secret_for(route)
         body = event.model_dump_json()
         headers = {"Content-Type": "application/json", ADAPTER_SECRET_HEADER: secret}
@@ -227,7 +348,7 @@ class HttpReplyAdapter:
                     _redacted(endpoint),
                     exc,
                 )
-                return ReplyAck(ref=None)
+                return _BestEffortUnreachableAck(ref=None)
             raise
         return ReplyAck(ref=_ref_from(payload))
 
@@ -286,9 +407,7 @@ class ReplySinkRouter:
         best_effort_unreachable: bool = False,
     ) -> ReplyAck:
         sink = self._adapters.get(event.target.kind, self._default)
-        return await sink.emit(
-            event, route=route, best_effort_unreachable=best_effort_unreachable
-        )
+        return await sink.emit(event, route=route, best_effort_unreachable=best_effort_unreachable)
 
     async def aclose(self) -> None:
         """Release every adapter that holds a connection of its own.

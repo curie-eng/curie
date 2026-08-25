@@ -197,7 +197,7 @@ def test_invariants_preserved_from_dev():
     assert "x-core-profiles: &core_profiles [core, full]" in out
     assert "x-full-profiles: &full_profiles [full]" in out
     assert out.count("profiles: *core_profiles") == 8
-    assert out.count("profiles: *full_profiles") == 5
+    assert out.count("profiles: *full_profiles") == 6
 
     # No service is added or dropped by the transforms.
     assert service_names(out) == service_names(DEV_TEXT)
@@ -270,6 +270,9 @@ def env_map(spec):
 
 
 SHELL_DEFAULT_RE = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*:?-(.*)\}$")
+SHELL_INTERPOLATION_RE = re.compile(
+    r"^\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<colon>:?)-(?P<default>.*)\}$"
+)
 
 
 def resolve_shell_default(value):
@@ -295,6 +298,20 @@ def resolve_shell_default(value):
         return None
     match = SHELL_DEFAULT_RE.match(value)
     return match.group(1) if match else value
+
+
+def resolve_shell_interpolation(value, environ):
+    """Resolve the two Compose default operators used by this contract."""
+    match = SHELL_INTERPOLATION_RE.match(value or "")
+    if not match:
+        return value
+    name = match.group("name")
+    if name not in environ:
+        return match.group("default")
+    resolved = environ[name]
+    if match.group("colon") and resolved == "":
+        return match.group("default")
+    return resolved
 
 
 def compose_docs():
@@ -477,6 +494,217 @@ def test_worker_traces_to_shipped_collector_by_default():
             "curie-api are multi-homed so a hardened runner resolves its "
             "documented dependencies by name without reaching the stores"
         )
+
+
+@pytest.mark.parametrize("service_name", ["curie-api", "curie-dispatcher", "curie-worker"])
+def test_platform_services_export_to_shipped_collector_by_default(service_name):
+    """Every long-lived Python service gets the standard OTLP endpoint.
+
+    A worker-only default leaves API request/commit-poll spans and dispatcher
+    ingress spans as disconnected stderr diagnostics.  Assert the raw Compose
+    interpolation as well as its unset-shell result: the single-dash form is
+    load-bearing because an explicitly empty value is the supported no-endpoint
+    control for the core/minimal profile.
+
+    The same assertions run against the generated release document so the
+    shipped compose cannot silently lose telemetry wiring during generation.
+    """
+    expected = f"http://otel-collector:{collector_http_port()}"
+    for label, doc in compose_docs():
+        env = env_map(doc["services"][service_name])
+        raw = env.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        assert raw is not None, f"{label}: {service_name} endpoint is absent"
+        assert resolve_shell_interpolation(raw, {}) == expected, (
+            f"{label}: {service_name} OTEL_EXPORTER_OTLP_ENDPOINT resolves to "
+            f"{resolve_shell_interpolation(raw, {})!r} with the variable unset, "
+            f"expected {expected!r}"
+        )
+
+
+@pytest.mark.parametrize("service_name", ["curie-api", "curie-dispatcher", "curie-worker"])
+def test_platform_service_endpoint_explicit_empty_disables_export(service_name):
+    """The minimal/core path can explicitly suppress the full-stack default.
+
+    Compose `${VAR-default}` keeps an exported empty string, whereas
+    `${VAR:-default}` replaces it with the collector endpoint.  Exercise that
+    semantic independently of Docker availability so this remains a fast,
+    durable regression for both development and generated release compose.
+    """
+
+    for label, doc in compose_docs():
+        raw = env_map(doc["services"][service_name]).get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        assert raw is not None, f"{label}: {service_name} endpoint is absent"
+        resolved = resolve_shell_interpolation(raw, {"OTEL_EXPORTER_OTLP_ENDPOINT": ""})
+        assert resolved == "", (
+            f"{label}: {service_name} resolves an explicitly empty endpoint to "
+            f"{resolved!r}; `${{VAR:-default}}` would silently re-enable export "
+            "during core/minimal no-endpoint mode"
+        )
+
+
+# --- Durable Collector reception (#1818, #1819) ---------------------------
+
+COLLECTOR_SELF_METRICS_0_119 = {
+    "otelcol_receiver_accepted_spans",
+    "otelcol_receiver_accepted_log_records",
+    "otelcol_receiver_accepted_metric_points",
+    "otelcol_exporter_sent_spans",
+    "otelcol_exporter_sent_log_records",
+    "otelcol_exporter_sent_metric_points",
+    "otelcol_exporter_send_failed_spans",
+    "otelcol_exporter_send_failed_log_records",
+    "otelcol_exporter_send_failed_metric_points",
+    "otelcol_exporter_enqueue_failed_spans",
+    "otelcol_exporter_enqueue_failed_log_records",
+    "otelcol_exporter_enqueue_failed_metric_points",
+    "otelcol_exporter_queue_size",
+    "otelcol_exporter_queue_capacity",
+}
+
+
+def _assert_component_references_resolve(config, label):
+    """Pin the Collector's runtime graph, not merely YAML key presence."""
+    components = {
+        "receivers": set(config.get("receivers", {})),
+        "processors": set(config.get("processors", {})),
+        "exporters": set(config.get("exporters", {})),
+    }
+    pipelines = config.get("service", {}).get("pipelines", {})
+    assert set(pipelines) == {"traces", "logs", "metrics"}, (
+        f"{label}: Collector must receive all three OTLP signals; got {sorted(pipelines)}"
+    )
+    for signal, pipeline in pipelines.items():
+        for component_type in ("receivers", "processors", "exporters"):
+            for reference in pipeline.get(component_type, []):
+                assert reference in components[component_type], (
+                    f"{label}: {signal} pipeline references undefined "
+                    f"{component_type[:-1]} {reference!r}"
+                )
+
+        processors = pipeline.get("processors", [])
+        assert "memory_limiter" in processors and "batch" in processors, (
+            f"{label}: {signal} pipeline must contain memory_limiter and batch; "
+            f"got {processors!r}"
+        )
+        assert processors.index("memory_limiter") < processors.index("batch"), (
+            f"{label}: {signal} pipeline must limit memory before batching; "
+            f"got {processors!r}"
+        )
+
+    extensions = config.get("extensions", {})
+    for reference in config.get("service", {}).get("extensions", []):
+        assert reference in extensions, (
+            f"{label}: service.extensions references undefined extension {reference!r}"
+        )
+    assert "file_storage" in extensions, f"{label}: file_storage extension is not declared"
+    enabled_extensions = config.get("service", {}).get("extensions", [])
+    assert "file_storage" in enabled_extensions, (
+        f"{label}: file_storage is declared but absent from service.extensions"
+    )
+    directory = extensions["file_storage"].get("directory")
+    assert isinstance(directory, str) and directory.startswith("/"), (
+        f"{label}: file_storage.directory must be an absolute durable path, got {directory!r}"
+    )
+    return directory
+
+
+def _assert_network_exporters_are_bounded(config, label):
+    """Every exporter which crosses a network gets retry plus a disk queue."""
+    for name, exporter in config.get("exporters", {}).items():
+        exporter_type = name.split("/", 1)[0]
+        if exporter_type not in {"otlp", "otlphttp"}:
+            continue
+
+        retry = exporter.get("retry_on_failure", {})
+        assert retry.get("enabled") is True, f"{label}: {name} retry_on_failure is not enabled"
+        assert retry.get("max_interval"), f"{label}: {name} retry max_interval is not bounded"
+        assert retry.get("max_elapsed_time") not in (None, "0", "0s"), (
+            f"{label}: {name} retry max_elapsed_time must be finite and non-zero"
+        )
+
+        queue = exporter.get("sending_queue", {})
+        assert queue.get("enabled") is True, f"{label}: {name} sending_queue is not enabled"
+        assert queue.get("storage") == "file_storage", (
+            f"{label}: {name} queue must persist through file_storage"
+        )
+        size = queue.get("queue_size")
+        assert isinstance(size, int) and 0 < size <= 100_000, (
+            f"{label}: {name} queue_size must be a finite positive bound, got {size!r}"
+        )
+
+
+def _collector_storage_mount(service, directory, label):
+    mounts = service.get("volumes", [])
+    for mount in mounts:
+        if isinstance(mount, str):
+            parts = mount.split(":")
+            if len(parts) >= 2 and directory == parts[1]:
+                return parts[0]
+        elif mount.get("target") == directory:
+            return mount.get("source")
+    raise AssertionError(
+        f"{label}: Collector file_storage path {directory!r} is not backed by a volume"
+    )
+
+
+def test_dev_collector_receives_every_signal_with_durable_bounded_delivery():
+    config = yaml.safe_load(OTEL_TEXT)
+    storage_directory = _assert_component_references_resolve(config, "otel/collector-config.yaml")
+    _assert_network_exporters_are_bounded(config, "otel/collector-config.yaml")
+
+    # Compose is the explicit development opt-in. Production Helm omits debug;
+    # keeping this assertion here makes an accidental production-style no-op in
+    # the local feedback loop visible.
+    assert "debug" in config["exporters"]
+    for signal, pipeline in config["service"]["pipelines"].items():
+        assert "debug" in pipeline["exporters"], (
+            f"otel/collector-config.yaml: dev {signal} pipeline omitted debug exporter"
+        )
+
+    doc = yaml.safe_load(DEV_TEXT)
+    collector = doc["services"]["otel-collector"]
+    volume_name = _collector_storage_mount(
+        collector, storage_directory, "compose.dev.yaml"
+    )
+    assert volume_name in (doc.get("volumes") or {}), (
+        f"compose.dev.yaml: Collector storage volume {volume_name!r} is not declared"
+    )
+    assert "127.0.0.1:28888:8888" in collector.get("ports", []), (
+        "compose.dev.yaml: Collector self-metrics must be reachable from the "
+        "developer host without exposing unauthenticated queue/loss state to the LAN"
+    )
+
+
+def test_release_generator_keeps_collector_config_and_storage_in_lockstep():
+    generate = load_generate()
+    out = generate(DEV_TEXT, OTEL_TEXT, version="9.9.9")
+    release = yaml.safe_load(out)
+    inlined = release["configs"]["otel_collector_config"]["content"]
+    expected = OTEL_TEXT.replace("${env:", "$${env:")
+    assert inlined == expected, "release compose did not inline the complete Collector config"
+
+    config = yaml.safe_load(inlined.replace("$${env:", "${env:"))
+    storage_directory = _assert_component_references_resolve(
+        config, "generated compose.release.yaml"
+    )
+    _assert_network_exporters_are_bounded(config, "generated compose.release.yaml")
+    collector = release["services"]["otel-collector"]
+    volume_name = _collector_storage_mount(
+        collector, storage_directory, "generated compose.release.yaml"
+    )
+    assert volume_name in (release.get("volumes") or {}), (
+        f"generated compose.release.yaml: storage volume {volume_name!r} is not declared"
+    )
+
+
+def test_collector_0_119_self_metric_names_remain_pinned():
+    """Names consumed by chart-runtime-e2e for the pinned 0.119.0 image."""
+    harness = (REPO_ROOT / "scripts" / "chart-runtime-e2e.sh").read_text()
+    missing = sorted(name for name in COLLECTOR_SELF_METRICS_0_119 if name not in harness)
+    assert not missing, (
+        "chart runtime harness no longer checks the Collector 0.119 self-metric "
+        f"contract: missing {missing}"
+    )
 
 
 # --- Local-tier connector scope (#1690, ADR 0113 Stream B2) -----------------

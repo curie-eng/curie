@@ -70,12 +70,15 @@ the same `curie:runs` stream, and a truthful inventory names them:
   `apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`, so a suspended session
   wakes down the identical consumer/kernel/claim path a Slack mention takes (see the
   [approval seam](../approval/INTERFACE.md)).
-- **CLI enqueue** — `curie local message` and `curie cluster message` (and the `local`/`cluster`
-  eval drivers that reuse them) do not call any ingress at all: `cli/src/message.rs` builds a
-  `QueuedTurn` with `synthetic_turn` and appends it to the runs stream with `xadd`, both from
-  `cli/src/queue.rs`. This is an operator-driven wake that skips the Slack listener, the GitHub
-  webhook and the commit poller alike, and it hand-mints its own dedupe id (`new_event_id` in the
-  same file), which is the leak recorded below.
+- **CLI enqueue** — `curie local message` builds a `QueuedTurn` with
+  `synthetic_turn`, then runs the dispatcher's Slack-free one-shot producer in
+  Compose. That producer owns dedupe, the producer span, W3C carrier injection,
+  and the Stream append without constructing a Slack client. `curie cluster
+  message` retains the direct `xadd` path in `cli/src/queue.rs` as the legacy
+  carrierless compatibility control. Both are operator-driven wakes that skip
+  the live Slack listener, GitHub webhook, and commit poller, and both hand-mint
+  their dedupe id (`new_event_id` in `cli/src/message.rs`), which is the leak
+  recorded below.
 
 **Declaration vs. consumption (#273/#270).** The bundle manifest now carries deploy-time-validated
 `triggers` declarations (`cron` with a `schedule`, `webhook` with a `path`; `TriggerDeclaration` in

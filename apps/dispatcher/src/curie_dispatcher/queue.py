@@ -22,11 +22,16 @@ dedupe because it is O(1), TTL-bounded (no unbounded dedupe set to prune), and
 does not require scanning the Stream.
 """
 
+import logging
 from typing import Any, Protocol, cast, runtime_checkable
 
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, parse_queued_turn
+from curie_telemetry import inject_trace_context, operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 
 from .config import DispatcherConfig
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -52,8 +57,10 @@ class StreamPublisher(Protocol):
 
 
 def to_stream_fields(turn: QueuedTurn) -> dict[str, str]:
-    """Render a turn to the flat field map an ``XADD`` takes (one ``payload``)."""
-    return {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+    """Render the byte-identical payload plus optional transport trace context."""
+    fields = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+    inject_trace_context(fields)
+    return fields
 
 
 def from_stream_fields(fields: dict[str, str]) -> QueuedTurn:
@@ -68,21 +75,68 @@ def claim_event(redis_client: "StreamPublisher", config: "DispatcherConfig", eve
     see the key already set and get False, which the caller treats as a duplicate
     to drop.
     """
-    claimed = redis_client.set(
-        config.dedupe_key(event_id),
-        "1",
-        nx=True,
-        ex=config.dedupe_ttl_seconds,
-    )
+    attributes = {"service.name": "curie-dispatcher", "source": "dispatcher"}
+    with operation_span(
+        "curie.queue.dedupe",
+        kind=SpanKind.INTERNAL,
+        attributes=attributes,
+    ) as span:
+        try:
+            claimed = redis_client.set(
+                config.dedupe_key(event_id),
+                "1",
+                nx=True,
+                ex=config.dedupe_ttl_seconds,
+            )
+        except Exception:
+            span.set_status(StatusCode.ERROR)
+            span.add_event("queue.dedupe.failed", {"outcome": "failure"})
+            logger.error("queue dedupe decision failed")
+            raise
+        outcome = "claimed" if claimed else "duplicate"
+        span.add_event("queue.dedupe.decided", {"outcome": outcome})
+        logger.info("queue dedupe decision: %s", outcome)
     return bool(claimed)
 
 
 def enqueue(redis_client: "StreamPublisher", config: "DispatcherConfig", turn: QueuedTurn) -> str:
     """Append the normalized turn to the Valkey Stream, returning its Stream id."""
-    # redis-py types the fields param as an invariant dict of a broad key/value
-    # union, so a plain dict[str, str] does not match; cast to satisfy the stub.
-    fields = cast("dict[Any, Any]", to_stream_fields(turn))
-    stream_id = redis_client.xadd(config.stream, fields)
+    attributes = {"service.name": "curie-dispatcher", "source": "dispatcher"}
+    error: Exception | None = None
+    stream_id: object | None = None
+    outcome = "failure"
+    with operation_span(
+        "curie.queue.enqueue",
+        kind=SpanKind.PRODUCER,
+        attributes=attributes,
+    ) as span:
+        try:
+            # Build inside the producer span so the carrier names this exact
+            # async handoff while leaving QueuedTurn's JSON bytes untouched.
+            fields = cast("dict[Any, Any]", to_stream_fields(turn))
+            stream_id = redis_client.xadd(config.stream, fields)
+        except Exception as exc:  # preserve the queue's original exception shape
+            error = exc
+            span.set_status(StatusCode.ERROR)
+            span.add_event("queue.enqueue.failed", {"outcome": "failure"})
+        else:
+            outcome = "success"
+            span.add_event("queue.enqueued", {"outcome": "success"})
+            logger.info("turn enqueued")
+
+    metric_attributes = {**attributes, "outcome": outcome}
+    record_metric("curie.queue.enqueue", attributes=metric_attributes)
+    if error is not None:
+        raise error
+    assert stream_id is not None
+    record_metric(
+        "curie.turn.accepted",
+        attributes={
+            "service.name": "curie-dispatcher",
+            "source": "dispatcher",
+            "outcome": "accepted",
+        },
+    )
     return _as_str(stream_id)
 
 

@@ -322,6 +322,151 @@ agent's bound Slack channel; disconnected releases use the terminal stub.
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).
 
+### Connecting email
+
+There is no `curie cluster comms --email` yet, so email is wired with a private
+Helm values file. The mail adapter ships off by default
+([`apps/mail-adapter`](../apps/mail-adapter)).
+
+Two platform-side steps come first, in this order:
+
+1. **Bind the agent** to `{"kind": "email", "address": "<the inbox address>"}` with a
+   reply route: `endpoint` is the in-cluster Service the chart renders,
+   `http://<fullname>-mail-adapter:<mailAdapter.service.port>/`, and `adapter` is
+   `mail-adapter`. Neither half of that is a literal. `<fullname>` is the chart's
+   `curie.fullname` ([`charts/curie/templates/_helpers.tpl`](../charts/curie/templates/_helpers.tpl)):
+   it is the release name alone when the release name already contains `curie`, and
+   `<release>-curie` otherwise, so release `curie` renders `curie-mail-adapter` while
+   release `acme-bot` renders `acme-bot-curie-mail-adapter`. The port is
+   `mailAdapter.service.port` (default `8080`), not a fixed `8080`. Getting either
+   wrong points the reply route at nothing, and every completion retries and then
+   dead-letters. Read both off your own release instead of deriving them:
+
+   ```bash
+   kubectl get svc -n <ns> \
+     -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component=mail-adapter \
+     -o jsonpath='http://{.items[0].metadata.name}:{.items[0].spec.ports[0].port}/'
+   ```
+
+   The `adapter` value must equal `mailAdapter.adapterSlug`, because the worker looks
+   its egress credential up under that key.
+2. **Mint the channel token.** `POST /channels/token` with the platform key returns a
+   scoped `chn` token for that one binding. It refuses with 409 for a non-`slack`
+   binding that has no reply route, which is why the binding comes first.
+
+Then turn the adapter on. Do not put any of its three credentials in `--set`:
+command arguments reach shell history and the process table. Keep the ordinary
+configuration in the installation's checked-in values and render the secret
+values from a secret manager into a gitignored mode-0600 file:
+
+```bash
+# One-time local guard for the private file. .git/info/exclude is local to this
+# checkout; it cannot accidentally publish the filename as a repo rule.
+printf '%s\n' '.curie-mail-secrets.yaml' >> .git/info/exclude
+install -m 0600 /dev/null .curie-mail-secrets.yaml
+
+# Have the secret manager/template step write this shape without echoing values:
+# mailAdapter:
+#   agentmail:
+#     apiKey: <secret>
+#   channelToken: <secret>
+#   egressSecret: <secret>
+${EDITOR:?set EDITOR} .curie-mail-secrets.yaml
+chmod 0600 .curie-mail-secrets.yaml
+
+helm upgrade <release> <chart> -n <ns> \
+  -f values.yaml -f .curie-mail-secrets.yaml
+```
+
+The non-secret `values.yaml` contains the switch, inbox, allowed senders, and
+network destination. Kubernetes NetworkPolicy cannot authorize an FQDN, so use
+the provider's current HTTPS CIDRs or point `agentmail.baseUrl` at a controlled
+egress proxy with a stable CIDR:
+
+```yaml
+mailAdapter:
+  deploy: true
+  inbox: agent@yourdomain.example
+  allowedSenders: [alice@example.com, example.com]
+  agentmail:
+    baseUrl: https://api.agentmail.to/v0
+    httpsCidrs: [203.0.113.0/24] # placeholder; replace from your provider/proxy
+```
+
+An empty `mailAdapter.agentmail.httpsCidrs` refuses to render when the adapter is
+enabled. Prefix-0 and prefix-1 routes refuse to render, including IPv4 or IPv6
+split default routes; surrounding whitespace and expanded IPv6 spelling do not
+bypass that gate. Use narrow current provider or controlled-proxy ranges.
+
+For a bring-your-own platform API, declare the URL and its NetworkPolicy peer
+independently; the chart cannot safely infer IP ranges from a hostname:
+
+```yaml
+api:
+  deploy: false
+mailAdapter:
+  apiBaseUrl: https://api.example.com:8443
+  apiEgress:
+    httpsCidrs: [198.51.100.0/24] # placeholder; use the real narrow API range
+    port: 8443
+```
+
+| Value | What it does |
+|---|---|
+| `mailAdapter.deploy` | Renders the Deployment and Service. Default `false`; nothing about email exists in a default install. |
+| `mailAdapter.inbox` | The AgentMail inbox this adapter polls and replies from. |
+| `mailAdapter.pollIntervalSeconds` | Seconds between polls of that inbox (default `5`). Zero or negative fails the boot gate rather than tight-looping a third-party API. |
+| `mailAdapter.maxPendingDeliveries` | Maximum unresolved inbound rows (default `1000`). At capacity new mail stays unclaimed at AgentMail rather than evicting accepted work. |
+| `mailAdapter.maxBodyBytes` / `maxReplyBytes` / `maxStateBytes` | Allocation and SQLite page bounds. Size the PVC above `maxStateBytes` for the WAL and filesystem overhead. |
+| `mailAdapter.allowedSenders` | Who may start a turn. Empty denies everyone, and with ingress on the pod refuses to boot rather than run an inbox that answers nobody; `*` is the explicit allow-all. |
+| `mailAdapter.ingressEnabled` | `false` serves egress while sending nothing inbound. That is the staged-cutover position while the platform side of a new binding is being wired. |
+| `mailAdapter.egressSecret` | The shared secret the worker presents on `X-Curie-Adapter-Secret` and the adapter checks before any side effect. |
+| `mailAdapter.agentmail.httpsCidrs` | Required provider/proxy destination CIDRs on TCP 443. The mail pod's egress policy otherwise allows only DNS and this release's API pods. |
+| `mailAdapter.apiEgress.httpsCidrs` / `port` | Required narrow destination peers when `api.deploy=false`; default port `8000`. Ignored for the in-chart API, whose pod selector and service port are used instead. |
+| `mailAdapter.persistence.size` / `storageClass` | Chart-managed RWO SQLite PVC. The default size is `1Gi`; empty storage class inherits `global.storageClass` and then the cluster default. |
+| `mailAdapter.persistence.existingClaim` | Mount an existing same-namespace RWO Filesystem PVC instead of rendering one. An install/upgrade hook checks the exact claim before replacing the pod. |
+
+**Do not write `worker.adapterCredentials.mail-adapter` by hand.** The chart derives it
+from `mailAdapter.egressSecret`, so the pair cannot drift. An equal value is accepted; a
+conflicting one fails the render by design. Rotating `mailAdapter.channelToken`,
+`mailAdapter.egressSecret` or `mailAdapter.agentmail.apiKey` and running `helm upgrade`
+restarts the adapter pod on its own, with no `kubectl rollout restart`. The one
+`Recreate` replica reopens the same SQLite file and resumes pending work. The
+adapter cannot mint a replacement `chn` token because it deliberately holds no
+platform key.
+
+The chart Secret still contains the three values because the pods need them.
+Using secret references keeps them out of rendered Deployment manifests; it does
+not hide them from a release administrator who can read Helm's release Secret or
+the chart Secret. Restrict those permissions with cluster RBAC, and rotate at the
+provider/platform when an administrator loses that trust.
+
+Only a new SQLite file primes the current inbox as history. A restart performs
+one provider confirmation without marking messages seen, then resumes durable
+pending and downtime mail before `/readyz` becomes healthy. Steady readiness is
+local-only; an AgentMail outage leaves the pod ready while retries remain visible
+in logs and state.
+
+The PVC is PII-bearing application data: it can hold email addresses, message and
+thread identifiers, recovery text, and delivery receipts, though never the three
+credentials or a platform database credential. Back up with a storage snapshot
+that is consistent for SQLite, or stop the Deployment before copying the file.
+Restore the claim before starting the writer. An older image refuses a newer
+schema; restore the pre-upgrade snapshot or roll forward rather than
+deleting state to force a rollback. A chart-managed PVC is deleted by Helm
+uninstall, subject to the StorageClass reclaim policy; an `existingClaim` is not
+owned or deleted by the chart. Erasure means stopping the adapter and deleting
+the PVC plus every retained PV, snapshot, and backup. Starting on a fresh claim
+performs first-boot priming and intentionally does not backfill the inbox.
+
+The remaining operator-relevant sender boundary is documented once in the
+adapter's README rather than here: Curie authenticates no sender, so
+`mailAdapter.allowedSenders` filters an attacker-controlled `From` header and
+buys nothing unless every domain on it enforces DMARC. That section, the
+AgentMail-specific parameter names, the full config surface and the boot gates all live in
+[`apps/mail-adapter/README.md`](../apps/mail-adapter/README.md); to build an adapter for a
+different channel, see [Building a channel adapter](guides/building-a-channel-adapter.md).
+
 ## Upgrading the chart
 
 A chart upgrade is a **full** upgrade: anything the new chart does not render is

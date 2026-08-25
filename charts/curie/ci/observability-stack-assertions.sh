@@ -393,9 +393,20 @@ for label, docs in (("install", curie_install_docs), ("upgrade", curie_upgrade_d
         ]
     tempo_exporter = at(config, "exporters", "otlphttp/tempo")
     assert tempo_exporter.get("endpoint") == "http://tempo.observability.svc.cluster.local:4318"
+    retry = at(tempo_exporter, "retry_on_failure")
+    assert retry.get("enabled") is True
+    assert retry.get("max_interval")
+    assert retry.get("max_elapsed_time") not in (None, "0", "0s")
+    queue = at(tempo_exporter, "sending_queue")
+    assert queue.get("enabled") is True
+    assert queue.get("storage") == "file_storage"
+    assert isinstance(queue.get("queue_size"), int) and 0 < queue["queue_size"] <= 100000
     trace_exporters = at(config, "service", "pipelines", "traces", "exporters")
-    assert trace_exporters == ["otlphttp/langfuse", "debug", "otlphttp/tempo"], (
-        f"{label} render must export traces to Langfuse and Tempo"
+    assert "debug" not in config.get("exporters", {}), (
+        f"{label} production render must omit the debug exporter"
+    )
+    assert trace_exporters == ["otlphttp/langfuse", "otlphttp/tempo"], (
+        f"{label} production render must export traces to Langfuse and Tempo without debug"
     )
 
 default_render = Path(curie_default_path).read_text()

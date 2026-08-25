@@ -242,6 +242,13 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_RUNNER_NO_NEW_PRIVILEGES",
         "CURIE_RUNNER_MEMORY_LIMIT",
         "CURIE_RUNNER_CPU_LIMIT",
+        # Standard signal-specific OTel variables are operator-owned process
+        # configuration read directly by the SDK exporter. They are not boot
+        # keys injected by the worker; the three general fallback keys above
+        # remain derived from BootEnv.
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",

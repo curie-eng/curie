@@ -17,13 +17,16 @@ Env:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 
 import httpx
+from curie_telemetry import bootstrap_service_telemetry
 
+from .. import __version__
 from ..runner_client import RunnerClient
 from .models import EvalRunResult, EvalScorer, EvalSuite
 from .recorder import LangfuseEvalRecorder
@@ -137,7 +140,18 @@ async def _main_async(env: Mapping[str, str]) -> int:
 
 
 def main(env: Mapping[str, str] | None = None) -> None:
-    sys.exit(asyncio.run(_main_async(env if env is not None else os.environ)))
+    resolved = env if env is not None else os.environ
+    telemetry = bootstrap_service_telemetry(
+        "curie-worker",
+        service_version=__version__,
+        logger=logging.getLogger("curie_worker"),
+        environ=resolved,
+    )
+    try:
+        exit_code = asyncio.run(_main_async(resolved))
+    finally:
+        telemetry.shutdown()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

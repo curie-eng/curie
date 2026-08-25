@@ -28,7 +28,9 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import quote
@@ -64,6 +66,8 @@ from channel_protocol.reply import (
     TurnCompleted,
     TurnStatus,
 )
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import ValidationError
 
 from .actions import ActionBackendError, ActionRecorder
@@ -91,7 +95,7 @@ from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
 from .receipt import render_receipt
-from .reply_sink import ReplySink, TargetRoute
+from .reply_sink import ObservedReplySink, ReplySink, TargetRoute
 from .runner_client import (
     RunnerClient,
     RunnerError,
@@ -148,6 +152,39 @@ def _publication_approval_summary(snapshot: RunnerWorkspaceSnapshot) -> str:
         f"{len(snapshot.changed_paths)} changed path(s): {path_list}."
         f"{workflow_note} Requester-provided title: {requester_title}. "
         f"Requester-provided description: {requester_body}"
+    )
+
+_LIFECYCLE_SPAN: ContextVar[Any | None] = ContextVar(
+    "curie_worker_lifecycle_span", default=None
+)
+_LIFECYCLE_OUTCOME: ContextVar[str | None] = ContextVar(
+    "curie_worker_lifecycle_outcome", default=None
+)
+_ERROR_LIFECYCLE_OUTCOMES = frozenset(
+    {
+        "awaiting_approval",
+        "budget_halted",
+        "classified_failure",
+        "side_effect_halted",
+        "interrupted",
+    }
+)
+
+
+def _lifecycle_event(name: str, outcome: str) -> None:
+    span = _LIFECYCLE_SPAN.get()
+    if span is not None:
+        span.add_event(name, {"outcome": outcome})
+
+
+def _record_route(outcome: str) -> None:
+    record_metric(
+        "curie.thread.route",
+        attributes={
+            "service.name": "curie-worker",
+            "source": "worker",
+            "outcome": outcome,
+        },
     )
 
 
@@ -439,7 +476,7 @@ class _ThrottledReply:
         best_effort: bool = False,
         on_ref: Callable[[str], None] | None = None,
     ) -> None:
-        self._sink = sink
+        self._sink = ObservedReplySink(sink)
         self._target = target
         # Told when this turn mints a reply ref (ADR-0079), so the kernel's other
         # delivery paths edit the same message this streamer created. Only fires
@@ -564,7 +601,11 @@ class Kernel:
     ) -> None:
         self._substrate = substrate
         self._runner = runner
-        self._sink = sink
+        # Every outbound reply, including platform-authored drops, completion
+        # events, escalations, and approval cards, crosses this one observed
+        # seam. ``_ThrottledReply`` retains its decorator for direct callers;
+        # the reply-sink ContextVar suppresses that nested observation.
+        self._sink = ObservedReplySink(sink)
         self._lock = lock
         self._markers = markers
         self._config = config
@@ -683,6 +724,53 @@ class Kernel:
         return ack
 
     async def process_event(self, qevent: QueuedTurn) -> None:
+        """Observe one kernel lifecycle while preserving its ``None`` result."""
+
+        error: BaseException | None = None
+        with operation_span(
+            "curie.turn.process",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "source": "worker"},
+        ) as span:
+            token = _LIFECYCLE_SPAN.set(span)
+            outcome_token = _LIFECYCLE_OUTCOME.set(None)
+            try:
+                await self._process_event(qevent)
+            except asyncio.CancelledError as exc:
+                error = exc
+                _LIFECYCLE_OUTCOME.set("interrupted")
+                span.add_event(
+                    "turn.processing.interrupted",
+                    {"outcome": "interrupted"},
+                )
+            except Exception as exc:
+                error = exc
+                span.add_event(
+                    "turn.processing.failed",
+                    {"outcome": "classified_failure", "error.class": type(exc).__name__},
+                )
+            finally:
+                outcome = _LIFECYCLE_OUTCOME.get()
+                if outcome is None:
+                    # A normal early return is the already-terminal skip. An
+                    # exception is classified here rather than exported as the
+                    # operation_span default OK.
+                    outcome = "classified_failure" if error is not None else "done"
+                if hasattr(span, "set_attribute"):
+                    span.set_attribute("outcome", outcome)
+                if hasattr(span, "set_status"):
+                    span.set_status(
+                        StatusCode.ERROR
+                        if outcome in _ERROR_LIFECYCLE_OUTCOMES
+                        else StatusCode.OK
+                    )
+                span.add_event("turn.processing.completed", {"outcome": outcome})
+                _LIFECYCLE_OUTCOME.reset(outcome_token)
+                _LIFECYCLE_SPAN.reset(token)
+        if error is not None:
+            raise error
+
+    async def _process_event(self, qevent: QueuedTurn) -> None:
         """Handle one queued turn to a terminal state (success or escalate).
 
         Returns normally once the event is terminally handled; the consumer then
@@ -741,7 +829,27 @@ class Kernel:
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
             # and gated on the resume event id so an ordinary turn pays nothing.
-            await self._finalize_settled_card(qevent, route)
+            if self._is_approval_resume(qevent.event_id):
+                with operation_span(
+                    "curie.approval.resume",
+                    kind=SpanKind.INTERNAL,
+                    attributes={
+                        "service.name": "curie-worker",
+                        "operation": "resume",
+                    },
+                ) as approval_span:
+                    await self._finalize_settled_card(qevent, route)
+                    approval_span.add_event("approval.resumed", {"outcome": "resumed"})
+                record_metric(
+                    "curie.approval.lifecycle",
+                    attributes={
+                        "service.name": "curie-worker",
+                        "operation": "resume",
+                        "outcome": "resumed",
+                    },
+                )
+            else:
+                await self._finalize_settled_card(qevent, route)
 
             # Crash-safety: a prior attempt executed a side effect but never
             # reached done (worker died mid-run). Do not auto-retry the action.
@@ -769,7 +877,12 @@ class Kernel:
                     "A prior attempt started an action before the worker restarted; "
                     "not retrying automatically. Flagging for a human.",
                 )
-                await self._complete(qevent, route, "escalated")
+                await self._complete(
+                    qevent,
+                    route,
+                    "escalated",
+                    telemetry_outcome="classified_failure",
+                )
                 return
 
             # Deployment-to-runtime binding: resolve which agent/version this
@@ -930,11 +1043,25 @@ class Kernel:
                         approval_routes,
                         deployment_id=workspace_deployment_id,
                     )
-                    await self._complete(qevent, route, "awaiting-approval")
+                    await self._complete(
+                        qevent,
+                        route,
+                        "awaiting-approval",
+                        telemetry_outcome="awaiting_approval",
+                    )
                     return
 
                 if outcome.terminal_ok:
-                    await self._complete(qevent, route, "delivered")
+                    await self._complete(
+                        qevent,
+                        route,
+                        "delivered",
+                        telemetry_outcome=(
+                            "idle"
+                            if outcome.status is SessionStatus.IDLE_AWAITING_INPUT
+                            else "done"
+                        ),
+                    )
                     return
 
                 if outcome.saw_side_effect:
@@ -944,7 +1071,12 @@ class Kernel:
                         f"The run hit an error ({outcome.classification or 'unknown'}) after "
                         "starting an action; not retrying automatically. Flagging for a human.",
                     )
-                    await self._complete(qevent, route, "escalated")
+                    await self._complete(
+                        qevent,
+                        route,
+                        "escalated",
+                        telemetry_outcome="side_effect_halted",
+                    )
                     return
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
@@ -955,9 +1087,26 @@ class Kernel:
                         f"The run failed ({outcome.classification or 'unknown'}) after "
                         f"{attempt} attempt(s). Flagging for a human.",
                     )
-                    await self._complete(qevent, route, "escalated")
+                    await self._complete(
+                        qevent,
+                        route,
+                        "escalated",
+                        telemetry_outcome=(
+                            "budget_halted"
+                            if outcome.classification == "budget-exceeded"
+                            else "classified_failure"
+                        ),
+                    )
                     return
 
+                record_metric(
+                    "curie.queue.retry",
+                    attributes={
+                        "service.name": "curie-worker",
+                        "source": "worker",
+                        "retry_class": cast("str", outcome.classification),
+                    },
+                )
                 await asyncio.sleep(self._backoff(attempt))
         finally:
             release_order()
@@ -1219,7 +1368,7 @@ class Kernel:
         """Edit the placeholder with a reason and complete the turn (a polite
         drop for an unmapped channel or a paused agent, never a crash)."""
         await self._reply_for(qevent, route, message)
-        await self._complete(qevent, route, "dropped")
+        await self._complete(qevent, route, "dropped", telemetry_outcome="interrupted")
 
     async def _reply(
         self,
@@ -1246,6 +1395,8 @@ class Kernel:
         qevent: QueuedTurn,
         route: TargetRoute,
         outcome: str,
+        *,
+        telemetry_outcome: str,
     ) -> None:
         """The terminal ordering, at every durable ``mark_done`` call site.
 
@@ -1267,6 +1418,7 @@ class Kernel:
         would be a completion nothing could ever recover.
         """
         event_id = qevent.event_id
+        _LIFECYCLE_OUTCOME.set(telemetry_outcome)
         record = CompletionRecord(
             event_id=event_id,
             event=TurnCompleted(
@@ -1283,6 +1435,23 @@ class Kernel:
         generation = await self._markers.mark_completion_pending(event_id, record)
         await self._markers.mark_done(event_id)
         await self._deliver_completion(record, generation=generation)
+        attributes = {
+            "service.name": "curie-worker",
+            "source": "worker",
+            "outcome": telemetry_outcome,
+        }
+        record_metric("curie.turn.completed", attributes=attributes)
+        try:
+            received = datetime.fromisoformat(qevent.received_at)
+            if received.tzinfo is None:
+                received = received.replace(tzinfo=UTC)
+            duration = max(
+                0.0,
+                (datetime.now(UTC) - received.astimezone(UTC)).total_seconds(),
+            )
+        except ValueError:
+            duration = 0.0
+        record_metric("curie.turn.duration", duration, attributes=attributes)
 
     async def _deliver_completion(self, record: CompletionRecord, *, generation: str) -> bool:
         """Emit a stored completion and clear it, or leave it owed. True on send.
@@ -1712,12 +1881,17 @@ class Kernel:
         # both run under this same lock), so answer canned without claiming a
         # sandbox or starting a model turn. Any existing route falls through to the
         # normal claim -> steer/start_turn path below.
+        # Snapshot the route under the same distributed lock that guards the
+        # claim and turn-open decision. ``claim`` can evict a stale route or
+        # ``_claim_or_resume`` can replace a suspended one, so the handle after
+        # claiming is compared with this full snapshot rather than treating the
+        # mere presence of an affinity record as proof that a live route was
+        # retained.
+        existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
         if packs is not None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
-            if reply is not None:
-                existing = await asyncio.to_thread(self._substrate.lookup, thread_key)
-                if existing is None:
-                    return _RouteResult(steered=False, canned_reply=reply)
+            if reply is not None and existing_handle is None:
+                return _RouteResult(steered=False, canned_reply=reply)
         # claim() adopts the thread's live sandbox and refreshes its route TTL
         # (so a busy thread past route_ttl is not reaped), or claims a warm one /
         # resumes a suspended one. On a fresh claim the boot env binds the agent's
@@ -1738,6 +1912,7 @@ class Kernel:
             boot_env,
             workspace_deployment_id=workspace_deployment_id,
         )
+        retained_live_route = existing_handle is not None and handle == existing_handle
         claim_ms = round((time.monotonic() - claim_started) * 1000)
         logger.info("claim latency for %s: %d ms", thread_key, claim_ms)
         if source.is_job:
@@ -1761,9 +1936,42 @@ class Kernel:
                 raise ThreadBusyError(
                     f"thread {thread_key} has a live session; deferring the {source} turn"
                 )
-        elif await self._runner.steer(handle.base_url, event, token=handle.token or None):
-            return _RouteResult(steered=True)
+        else:
+            active_before_steer = False
+            if retained_live_route:
+                try:
+                    status = await self._runner.status(handle.base_url)
+                except Exception as exc:  # noqa: BLE001 -- steering still decides the route
+                    logger.warning(
+                        "could not read pre-steer turn liveness at %s: %r",
+                        handle.base_url,
+                        exc,
+                    )
+                else:
+                    active = status.get("turn_active")
+                    if isinstance(active, bool):
+                        active_before_steer = active
+                    else:
+                        logger.warning(
+                            "runner pre-steer status carried no usable turn_active: %r",
+                            status,
+                        )
+            steered = await self._runner.steer(handle.base_url, event, token=handle.token or None)
+            if steered:
+                _record_route("steer")
+                _lifecycle_event("runner.turn.steered", "steer")
+                return _RouteResult(steered=True)
+            # A 409 is a finish race only when the route-lock snapshot and the
+            # claim resolve to the same retained live sandbox. A fresh or
+            # replacement runner is expected to refuse its first steer probe;
+            # counting that bootstrap condition as a race would make every new
+            # turn inflate the operator signal.
+            if retained_live_route and active_before_steer:
+                _record_route("finish-race")
+                _lifecycle_event("runner.finish_race", "finish-race")
         turn = await self._runner.start_turn(handle.base_url, event, token=handle.token or None)
+        _record_route("start")
+        _lifecycle_event("runner.turn.started", "start")
         return _RouteResult(steered=False, handle=handle, turn=turn)
 
     async def _turn_active(self, handle: SandboxHandle) -> bool:
@@ -2293,13 +2501,55 @@ class Kernel:
                         thread,
                         ttl_seconds=self._suspended_route_ttl_seconds,
                     )
-        try:
-            await asyncio.to_thread(self._substrate.suspend, thread_key, history_ref=None)
-        except SandboxError as exc:
+        record_metric(
+            "curie.approval.lifecycle",
+            attributes={
+                "service.name": "curie-worker",
+                "operation": "request",
+                "outcome": "requested",
+            },
+        )
+
+        suspend_error: SandboxError | None = None
+        with operation_span(
+            "curie.approval.suspend",
+            kind=SpanKind.INTERNAL,
+            attributes={
+                "service.name": "curie-worker",
+                "operation": "suspend",
+            },
+        ) as approval_span:
+            try:
+                await asyncio.to_thread(
+                    self._substrate.suspend, thread_key, history_ref=None
+                )
+            except SandboxError as exc:
+                suspend_error = exc
+                if hasattr(approval_span, "set_status"):
+                    approval_span.set_status(StatusCode.ERROR)
+                approval_span.add_event(
+                    "approval.suspend.failed",
+                    {"outcome": "failure", "error.class": type(exc).__name__},
+                )
+            else:
+                approval_span.add_event("approval.suspended", {"outcome": "suspended"})
+        record_metric(
+            "curie.approval.lifecycle",
+            attributes={
+                "service.name": "curie-worker",
+                "operation": "suspend",
+                "outcome": "failure" if suspend_error is not None else "suspended",
+            },
+        )
+        if suspend_error is not None:
             # Non-fatal: the record is durable and the resume path cold-claims a
             # fresh sandbox either way; a still-live sandbox is just reaped when
             # its route expires.
-            logger.warning("suspend failed for thread %s: %s", thread_key, exc)
+            logger.warning(
+                "suspend failed for thread %s (%s)",
+                thread_key,
+                type(suspend_error).__name__,
+            )
 
         # The notice is a control string the CLI parses by splitting on blank
         # lines and requiring the marker-leading block (cli/src/chat.rs
@@ -2322,7 +2572,9 @@ class Kernel:
                 "The session is paused and will resume once an authorized member "
                 "resolves this request."
             )
-        await self._reply_for(qevent, route, f"{base}\n\n{notice}" if base else notice)
+        await self._reply_for(
+            qevent, route, f"{base}\n\n{notice}" if base else notice
+        )
 
         if is_publication:
             # The atomic Approval+Publication insert is also the durable initial
@@ -2511,6 +2763,12 @@ class Kernel:
             async with turn:
                 async for frame in turn:
                     await self._apply_frame(frame, acc, reply, qevent, agent_id)
+                    # ``Final`` is the protocol's terminal response event. Stop
+                    # at that boundary so a late frame from a finishing runner
+                    # cannot overwrite the outcome and suppress the kernel's
+                    # bounded retry/escalation decision.
+                    if isinstance(frame, Final):
+                        break
         except (aiohttp.ClientError, TimeoutError) as exc:
             # Stream dropped mid-run (sandbox killed, network fault). No final.
             logger.warning("turn stream dropped for %s: %s", qevent.event_id, exc)

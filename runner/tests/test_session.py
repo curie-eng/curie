@@ -313,7 +313,7 @@ def test_budget_halt_logged(caplog) -> None:
 
 def test_error_result_body_not_logged(caplog) -> None:
     # An error *result* turn builds ErrorEvent(message=result); the "model error"
-    # WARNING must log only the structural classification, never the result body
+    # ERROR record must log only the structural classification, never the result body
     # (which is the model output / Final.text). No prior interrupt, so the turn is
     # a plain classified failure and translate takes the ErrorEvent(message=text)
     # branch.
@@ -331,6 +331,10 @@ def test_error_result_body_not_logged(caplog) -> None:
         events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert any(
+        record.levelno == logging.ERROR and "model error" in record.getMessage()
+        for record in caplog.records
+    )
     assert all(sentinel not in record.getMessage() for record in caplog.records)
 
 

@@ -17,7 +17,9 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
+from curie_telemetry import operation_span, record_metric
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from opentelemetry.trace import SpanKind
 from sqlalchemy.exc import IntegrityError
 
 from .. import crud
@@ -177,7 +179,15 @@ async def resolve_approval(
         raise HTTPException(status.HTTP_403_FORBIDDEN, decision.reason)
 
     if approval.status == ApprovalStatus.pending and _expired(approval):
-        expired = await crud.expire_approval(session, approval_id)
+        with operation_span(
+            "curie.approval.expire",
+            kind=SpanKind.INTERNAL,
+            attributes={
+                "service.name": "curie-api",
+                "operation": "expire",
+            },
+        ):
+            expired = await crud.expire_approval(session, approval_id)
         # None means a concurrent resolution won the CAS before the expiry did;
         # fall through to the claim below, which will lose and report the winner.
         if expired is not None:
@@ -187,6 +197,14 @@ async def resolve_approval(
             # trigger an implicit reload (MissingGreenlet under the async
             # session) and turn the owed 410 back into a 500.
             expires_at = expired.expires_at
+            record_metric(
+                "curie.approval.lifecycle",
+                attributes={
+                    "service.name": "curie-api",
+                    "operation": "expire",
+                    "outcome": "expired",
+                },
+            )
             await _audit(
                 "expired",
                 authorized=True,
@@ -253,13 +271,21 @@ async def resolve_approval(
                 f"approval expired at {expires_at} and can no longer be resolved",
             )
 
-    claimed = await crud.claim_approval_resolution(
-        session,
-        approval_id,
-        decision=data.decision,
-        resolved_by=data.resolved_by,
-        note=data.note,
-    )
+    with operation_span(
+        "curie.approval.resolve",
+        kind=SpanKind.INTERNAL,
+        attributes={
+            "service.name": "curie-api",
+            "operation": "resolve",
+        },
+    ):
+        claimed = await crud.claim_approval_resolution(
+            session,
+            approval_id,
+            decision=data.decision,
+            resolved_by=data.resolved_by,
+            note=data.note,
+        )
     if claimed is None:
         current = await crud.get_approval(session, approval_id)
         if current is None:
@@ -279,6 +305,14 @@ async def resolve_approval(
             f"already resolved by {current.resolved_by} ({current.status})",
         )
 
+    record_metric(
+        "curie.approval.lifecycle",
+        attributes={
+            "service.name": "curie-api",
+            "operation": "resolve",
+            "outcome": "resolved",
+        },
+    )
     await _audit("resolved", authorized=True, reason=decision.reason or None)
 
     if claimed.purpose == "publication":

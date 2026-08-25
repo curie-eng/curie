@@ -59,8 +59,207 @@ fn ladder() -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+fn chart_runtime_e2e() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/chart-runtime-e2e.sh");
+    fs::read_to_string(path).unwrap_or_default()
+}
+
 fn count_lines_containing(text: &str, needle: &str) -> usize {
     text.lines().filter(|line| line.contains(needle)).count()
+}
+
+#[test]
+fn chart_runtime_observes_each_refusal_series_and_keeps_healthy_failures_zero() {
+    let text = chart_runtime_e2e();
+    let healthy = text
+        .split_once("banner \"ASSERT OTel healthy reception and delivery\"")
+        .and_then(|(_, tail)| {
+            tail.split_once("banner \"ASSERT backend outage queues and reports failure\"")
+        })
+        .map(|(case, _)| case)
+        .expect("chart runtime must retain bounded healthy and outage controls");
+    let overflow = text
+        .split_once(
+            "banner \"ASSERT tiny persistent queue overflows loudly and loses bounded excess\"",
+        )
+        .map(|(_, case)| case)
+        .expect("chart runtime must retain the bounded overflow control");
+
+    for metric in [
+        "otelcol_receiver_refused_spans",
+        "otelcol_receiver_refused_log_records",
+        "otelcol_receiver_refused_metric_points",
+    ] {
+        assert!(text.contains(metric), "chart runtime omitted {metric}");
+    }
+    assert!(healthy.contains(
+        "assert_metrics_zero \"$OTEL_COLLECTOR_SERVICE\" \"\" \"${OTELCOL_REFUSED_METRICS[@]}\""
+    ));
+    assert!(
+        healthy.contains(
+            "assert_metrics_zero \"$OTEL_COLLECTOR_SERVICE\" \"$OTEL_EXPORTER\" \\\n  \"${OTELCOL_FAILED_METRICS[@]}\""
+        ),
+        "the healthy path must require every Collector send_failed series to be present and zero"
+    );
+    assert!(
+        !healthy.contains("OTELCOL_ENQUEUE_FAILED_METRICS"),
+        "Collector 0.119 does not expose enqueue_failed series before an enqueue failure occurs"
+    );
+    assert!(
+        overflow.contains(
+            "wait_metrics_positive \"$OTEL_COLLECTOR_SERVICE\" \"$OTEL_EXPORTER\" \"${OTELCOL_ENQUEUE_FAILED_METRICS[@]}\""
+        ),
+        "the bounded overflow path must still require every enqueue_failed signal series to move"
+    );
+}
+
+#[test]
+fn chart_runtime_sustains_a_ready_bounded_outage_before_restart_and_overflow() {
+    let text = chart_runtime_e2e();
+    let bounded_function = text
+        .split_once("assert_sustained_outage_bounded()")
+        .and_then(|(_, tail)| tail.split_once("\n}\n\n"))
+        .map(|(function, _)| function)
+        .expect("chart runtime must retain the sustained-outage assertion function");
+    let storage_observer = text
+        .split_once("create_otlp_storage_observer()")
+        .and_then(|(_, tail)| tail.split_once("\n}\n\n"))
+        .map(|(function, _)| function)
+        .expect("chart runtime must create a task-owned Collector PVC storage observer");
+    let bounded = text
+        .find("assert_sustained_outage_bounded \"$OUTAGE_COLLECTOR_POD\"")
+        .expect("outage path must execute the bounded readiness control");
+    let restart = text
+        .find("ASSERT Collector restart retains the queued signals")
+        .expect("chart runtime must retain the restart proof");
+    let overflow = text
+        .find("ASSERT tiny persistent queue overflows loudly")
+        .expect("chart runtime must retain the overflow proof");
+    assert!(bounded < restart && restart < overflow);
+    assert!(text.contains("stopped being Ready during sustained exporter outage"));
+    assert!(text.contains("Collector restarted during sustained exporter outage"));
+    assert!(text.contains("Collector was OOMKilled during sustained exporter outage"));
+    assert!(text.contains(".status.containerStatuses[0].restartCount"));
+    assert!(text.contains("0 < value <= capacity"));
+    assert!(text.contains("OTEL_STORAGE_OBSERVER=\"e2e-otel-storage-observer\""));
+    assert!(text.contains("\ncreate_otlp_storage_observer\n"));
+    assert!(storage_observer.contains("name: $OTEL_STORAGE_OBSERVER"));
+    assert!(storage_observer.contains("app.kubernetes.io/component: e2e-otel-storage-observer"));
+    assert!(storage_observer.contains("app.kubernetes.io/instance: $RELEASE"));
+    assert!(storage_observer.contains("claimName: $COLLECTOR_PVC"));
+    assert!(storage_observer.contains("mountPath: /var/lib/otelcol"));
+    assert!(storage_observer.contains("readOnly: true"));
+    let observer_exec = bounded_function
+        .find("kubectl exec \"$OTEL_STORAGE_OBSERVER\"")
+        .expect("the sustained-outage path must measure storage through its PVC observer");
+    let usage = bounded_function
+        .find("du -sk /var/lib/otelcol")
+        .expect("the sustained-outage path must keep its durable PVC usage measurement");
+    assert!(
+        observer_exec < usage,
+        "the durable PVC usage measurement must run through the task-owned storage observer"
+    );
+    assert!(
+        !bounded_function.contains("kubectl exec \"$pod\" -n \"$NAMESPACE\" -- sh"),
+        "the distroless Collector pod must not be used to run sh for PVC measurement"
+    );
+    assert!(
+        !bounded_function.contains("kubectl exec \"$pod\" -n \"$NAMESPACE\" -- du"),
+        "the distroless Collector pod must not be used to run du for PVC measurement"
+    );
+    let observer_delete = text
+        .find("kubectl delete pod \"$OTEL_STORAGE_OBSERVER\"")
+        .expect("the PVC observer must release its read-only mount before Collector restart");
+    let collector_delete = text
+        .find("kubectl delete pod \"$OLD_COLLECTOR_POD\"")
+        .expect("chart runtime must retain the explicit Collector pod restart");
+    assert!(
+        bounded < observer_delete && observer_delete < collector_delete,
+        "the storage observer must be deleted after bounded outage measurement and before the Collector pod restart"
+    );
+    assert!(text.contains("beyond declared ${bound_kib}Ki bound"));
+    assert!(text.contains("while retrying a fixed bounded queue"));
+}
+
+#[test]
+fn chart_runtime_otel_probe_and_metrics_observer_use_release_identity() {
+    let text = chart_runtime_e2e();
+    let sender = text
+        .split("send_otlp_triplet()")
+        .nth(1)
+        .expect("OTLP triplet sender must remain in the chart runtime harness");
+    assert!(sender.contains(
+        "template:\n    metadata:\n      labels:\n        app.kubernetes.io/name: curie\n        app.kubernetes.io/instance: $RELEASE"
+    ));
+    assert!(sender.contains("app.kubernetes.io/component: e2e-otel-probe"));
+
+    assert!(text.contains("ASSERT OTel healthy reception and delivery"));
+
+    assert!(text.contains(
+        "name: $OTEL_OBSERVER\n  labels:\n    app.kubernetes.io/name: curie\n    app.kubernetes.io/instance: $RELEASE"
+    ));
+    assert!(text.contains("metrics_snapshot \"$OTEL_COLLECTOR_SERVICE\""));
+}
+
+#[test]
+fn chart_runtime_falsifies_collector_metrics_ingress_policy() {
+    let text = chart_runtime_e2e();
+    assert!(
+        text.contains("OTEL_UNSELECTED_OBSERVER=\"e2e-otel-unselected-observer\""),
+        "chart runtime must create a distinct same-namespace observer that the configured peer does not select"
+    );
+    assert!(
+        text.contains("OTEL_METRICS_TEST_ALLOW=\"e2e-otel-metrics-test-allow\""),
+        "chart runtime must own a temporary allow policy for the falsifiability control"
+    );
+    assert!(
+        text.contains("security:\n  otelCollectorNetworkPolicy:\n    metricsIngress:"),
+        "the runtime overlay must configure the selected observer through the chart's standard NetworkPolicyPeer surface"
+    );
+
+    let resources = text
+        .split_once("create_otlp_probe_resources()")
+        .and_then(|(_, tail)| tail.split_once("\n}\n\n"))
+        .map(|(function, _)| function)
+        .expect("chart runtime must retain its task-owned OTLP probe resources");
+    assert!(resources.contains("name: $OTEL_UNSELECTED_OBSERVER"));
+    assert!(resources.contains("app.kubernetes.io/instance: $RELEASE"));
+    assert!(resources.contains("app.kubernetes.io/component: e2e-otel-unselected-observer"));
+
+    let proof = text
+        .split_once("assert_collector_metrics_network_policy()")
+        .and_then(|(_, tail)| tail.split_once("\n}\n\n"))
+        .map(|(function, _)| function)
+        .expect("chart runtime must retain a bounded Collector metrics policy proof");
+    let selected_positive = proof
+        .find("metrics_scrape_from \"$OTEL_OBSERVER\"")
+        .expect("selected observer must positively scrape Collector self-metrics");
+    let unselected_negative = proof
+        .find("assert_metrics_scrape_denied \"$OTEL_UNSELECTED_OBSERVER\"")
+        .expect("unselected same-namespace observer must be denied before the control allow");
+    let temporary_allow = proof
+        .find("name: $OTEL_METRICS_TEST_ALLOW")
+        .expect("proof must apply a temporary targeted NetworkPolicy allow");
+    let unselected_positive = proof[temporary_allow..]
+        .find("metrics_scrape_from \"$OTEL_UNSELECTED_OBSERVER\"")
+        .map(|offset| temporary_allow + offset)
+        .expect("the denied observer must scrape after only its targeted allow is applied");
+    let remove_allow = proof
+        .find("kubectl delete networkpolicy \"$OTEL_METRICS_TEST_ALLOW\"")
+        .expect("proof must remove its temporary targeted allow");
+    assert!(
+        selected_positive < unselected_negative
+            && unselected_negative < temporary_allow
+            && temporary_allow < unselected_positive
+            && unselected_positive < remove_allow,
+        "metrics policy proof must observe allow, deny, targeted re-allow, then cleanup in causal order"
+    );
+    assert!(proof.contains("podSelector:"));
+    assert!(proof.contains("app.kubernetes.io/component: otel-collector"));
+    assert!(proof.contains("from:"));
+    assert!(proof.contains("app.kubernetes.io/component: e2e-otel-unselected-observer"));
+    assert!(proof.contains("port: 8888"));
+    assert!(text.contains("\nassert_collector_metrics_network_policy\n"));
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -286,10 +485,14 @@ fn nightly_never_echoes_the_openrouter_secret_on_a_run_line() {
 #[test]
 fn live_local_rung_grades_the_deployed_weather_cases() {
     let text = ladder();
-    let contract = r#"assert_finalized_reply "local" "$out"
-
-    echo
-    echo "=== curie local eval --dry-run (suite parity) ==="
+    let finalized = text
+        .find(r#"assert_finalized_reply "local" "$out""#)
+        .expect("the local rung must assert its finalized reply");
+    let telemetry = text[finalized..]
+        .find(r#"assert_local_otel_healthy_turn "$healthy_before""#)
+        .map(|offset| finalized + offset)
+        .expect("the local rung must prove healthy turn telemetry after the reply");
+    let contract = r#"echo "=== curie local eval --dry-run (suite parity) ==="
     local eval_args=(local eval)
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
         eval_args+=(--cases "$WORKDIR/bundle/evals/cases.json")
@@ -301,11 +504,15 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         echo "=== curie local eval ==="
         (cd "$WORKDIR/bundle" && "$BIN" "${eval_args[@]}")
     fi"#;
+    let eval = text[telemetry..]
+        .find(contract)
+        .map(|offset| telemetry + offset)
+        .expect("the local rung must run its suite check and live eval");
     assert!(
-        text.contains(contract),
-        "the live local rung must run local eval after its plumbing assertion \
-         against the deployed weather bundle cases, with the suite-parity \
-         dry-run check in front of it; ladder contents:\n{text}"
+        finalized < telemetry && telemetry < eval,
+        "the live local rung must prove telemetry after its plumbing assertion, \
+         then run local eval against the deployed weather bundle cases with the \
+         suite-parity dry-run check in front of it"
     );
 }
 

@@ -19,6 +19,9 @@ from typing import Any
 
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
+from curie_telemetry import inject_trace_context, operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
+from redis.typing import EncodableT
 
 from .config import get_settings
 from .models import Approval, ApprovalStatus
@@ -236,8 +239,44 @@ class ResumeQueue:
         self._dead_letter_stream = dead_letter_stream or f"{self._stream}:dead"
 
     async def enqueue(self, turn: QueuedTurn) -> str:
-        fields: dict[Any, Any] = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
-        stream_id = await self._client.xadd(self._stream, fields)
+        carrier: dict[str, str] = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+        stream_id: Any = None
+        error: Exception | None = None
+        with operation_span(
+            "curie.queue.enqueue",
+            kind=SpanKind.PRODUCER,
+            attributes={"service.name": "curie-api", "source": "api"},
+        ) as span:
+            inject_trace_context(carrier)
+            fields: dict[EncodableT, EncodableT] = {}
+            fields.update(carrier)
+            try:
+                stream_id = await self._client.xadd(self._stream, fields)
+            except Exception as exc:
+                error = exc
+                span.set_status(StatusCode.ERROR)
+                span.add_event("queue.enqueue.failed", {"outcome": "failure"})
+            else:
+                span.add_event("queue.enqueued", {"outcome": "success"})
+        outcome = "failure" if error is not None else "success"
+        record_metric(
+            "curie.queue.enqueue",
+            attributes={
+                "service.name": "curie-api",
+                "source": "api",
+                "outcome": outcome,
+            },
+        )
+        if error is not None:
+            raise error
+        record_metric(
+            "curie.turn.accepted",
+            attributes={
+                "service.name": "curie-api",
+                "source": "api",
+                "outcome": "accepted",
+            },
+        )
         return stream_id.decode() if isinstance(stream_id, bytes) else str(stream_id)
 
     async def read_dead_letter(

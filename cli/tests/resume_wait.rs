@@ -377,6 +377,37 @@ async fn run_local_message_terminal(debug: bool) -> Option<String> {
     let mut conn = valkey_or_skip("local_message_transport_narration_is_debug_only").await?;
     let stream = unique_stream("curie:test:resume:");
     let workspace = tempfile::tempdir().expect("create isolated command directory");
+    // `local message` now performs the producer write through a bounded
+    // `docker compose run curie-dispatcher` process. Keep this terminal-focused
+    // test hermetic by replacing only the Docker executable: ps/inspect expose
+    // the same labels as a running local worker, while compose-run executes the
+    // real one-shot dispatcher module against the real test Valkey. The module,
+    // frozen payload parser, telemetry bootstrap, and dispatcher enqueue path
+    // are therefore all real; no Valkey behavior is mocked.
+    let fake_bin = workspace.path().join("bin");
+    std::fs::create_dir(&fake_bin).expect("create fake docker bin directory");
+    let fake_docker = fake_bin.join("docker");
+    let python = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.venv/bin/python");
+    assert!(
+        python.is_file(),
+        "workspace Python is available for dispatcher one-shot test"
+    );
+    std::fs::write(
+        &fake_docker,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  ps) echo curie-test-worker ;;\n  inspect) echo /tmp/curie-test-compose.yaml ;;\n  compose) exec '{}' -m curie_dispatcher.enqueue_once ;;\n  *) echo unsupported fake docker command >&2; exit 64 ;;\nesac\n",
+            python.display()
+        ),
+    )
+    .expect("write fake docker executable");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&fake_docker)
+            .expect("stat fake docker executable")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_docker, permissions).expect("make fake docker executable");
+    }
     let capture_path = workspace.path().join("terminal.log");
     let debug_flag = if debug { "--debug " } else { "" };
     let shell_command = format!(
@@ -390,7 +421,17 @@ async fn run_local_message_terminal(debug: bool) -> Option<String> {
         .current_dir(workspace.path())
         .env("TERM", "xterm-256color")
         .env("NO_COLOR", "1")
-        .env("DOCKER_HOST", "unix:///tmp/curie-test-no-docker.sock")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("VALKEY_HOST", "localhost")
+        .env("VALKEY_PORT", "26379")
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "")
         .env_remove("CI")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

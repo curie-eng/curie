@@ -19,11 +19,15 @@ One service you deploy and own, doing two things:
   authenticated with a shared per-adapter secret.
 
 Nothing else. The adapter holds no platform key, no queue credential, and no
-database access. Binding is an operator action at deploy time.
+platform database access. It may own a local durable delivery store, as the mail
+adapter does, but that store must not become a route to platform credentials or
+state. Binding is an operator action at deploy time.
 
-The worked example referenced throughout is the AgentMail reference adapter, a
-single-file email adapter built during ADR-0096 phase 2. It is a spike, not a
-shipped component, but its shape is the shape being described here.
+The worked example referenced throughout is [`apps/mail-adapter`](../../apps/mail-adapter),
+the first-party email adapter that ships in this repo: a real component with its own
+image, chart wiring and test suite, built to exactly the shape described here. It is a
+worked example, not a framework you extend; yours is a separate service you own, and
+nothing below needs a patch merged into this repo.
 
 ## 2. Bind an agent
 
@@ -144,9 +148,18 @@ Responses:
 | 413 | Body over 256 KiB. The bound is enforced before parsing or authenticating. |
 | 429 + `Retry-After` | This binding's new-delivery quota for the window is spent (64 per 60s by default). Retries of an already-claimed delivery do not count against it. |
 
-**Retry transport failures only.** A response that arrived is final, duplicate
-or not. The reference adapter retries three times on a connection error and
-logs a drop after that; it never re-posts after a status came back.
+**Settle only on documented terminal success.** A 200 receipt, including
+`duplicate: true`, is terminal. Transport ambiguity, 202, 429 (honor
+`Retry-After`), 401, and 5xx are retryable and must retain the same stable
+`delivery_id`; 401 additionally needs an operator to re-mint the scoped token.
+Do not treat “a response arrived” as final: 202 explicitly says another claim is
+not yet enqueued, and dropping that response loses the upstream message.
+
+The remaining 4xx statuses are terminal for the current configuration, but they
+are not success: log the recovery instruction and retain enough durable evidence
+to diagnose or deliberately replay after the binding/configuration is corrected.
+Never mint a new `delivery_id` to escape an error, because that bypasses the
+platform's idempotency receipt.
 
 ## 5. Outbound: serving the reply wire
 
@@ -203,38 +216,59 @@ Rules the transport enforces, so build to them:
 
 ## 6. Operational patterns worth copying
 
-From the AgentMail reference adapter:
+From [`apps/mail-adapter`](../../apps/mail-adapter):
 
-- **Prime on first start.** On startup it lists the inbox and marks every
-  pre-existing message as seen before entering the poll loop, so bringing the
-  adapter up does not replay a month of history as new turns.
+- **Prime only on first start.** A new durable store records the current inbox
+  floor before becoming ready, so bringing the adapter up does not replay a
+  month of history. A restart opens the existing store, confirms the provider
+  once without marking messages seen, and resumes pending/downtime work.
 - **Stage the cutover behind an ingress flag.** `ADAPTER_INGRESS_ENABLED=false`
   serves egress while sending nothing inbound. The platform side can then be
   bound, minted, and exercised end to end before any real correspondent traffic
   reaches it, and ingress is turned on as a separate step.
-- **Dedupe in two layers.** A bounded in-memory set of replied `event_id`s is
-  the fast path; the durable half is a marker line written into the outgoing
-  message itself, which survives a restart. In-memory only is the conformance
-  floor and will double-send after a restart.
-- **Keep per-conversation state keyed by `conversation_id`**, holding the
-  upstream message to reply to and the latest reply text, so `reply.update`
-  overwrites and `reply.post` appends.
+- **Dedupe in two durable layers.** A local terminal receipt is the fast path;
+  the independent witness is a marker written into the provider-visible thread.
+  After an ambiguous accepted send, read that witness before resending. In-memory
+  only will double-send after a restart.
+- **Key reply text on `(conversation_id, reply_ref)`, and take the reply target
+  from the event.** Every reply event carries
+  `target.reply_ref`, the opaque handle you sent on ingress, and the platform hands
+  it back untouched. Keeping "the latest upstream message in this conversation" and
+  replying to that looks equivalent and is not: a second message can arrive in the
+  same thread before the first turn completes, and the first answer then lands on the
+  wrong message or clear the second turn's text. Persist ownership at the same
+  granularity as the target.
+- **Filtering inbound senders is not authenticating them.** Find out what your
+  provider already drops or withholds by default, ask for that filtering explicitly in
+  every request rather than inheriting it, so a changed provider default cannot widen
+  your install silently, and keep a cheap check on the provider's own verdict behind
+  that as defense in depth. An allow-list on a sender identifier the sender controls
+  (an email `From` header, a display name, a caller ID) sits on top of all three and
+  authenticates nobody: it is meaningful only where that identifier is independently
+  enforced, which for email means the sending domain publishing an enforcing DMARC
+  policy. [`apps/mail-adapter/README.md`](../../apps/mail-adapter/README.md) is the
+  worked version, with AgentMail's parameter names and the key permissions it needs.
 
 ## 7. Conformance floor
 
 An adapter must:
 
 1. Send a `delivery_id` that is stable across retries of the same upstream
-   message, and retry only transport failures.
-2. Treat any response from ingress as final, including 202.
+   message, and retain it across process restarts.
+2. Settle it only on documented terminal success. Retry transport ambiguity,
+   202, 429 (honoring `Retry-After`), 401 after operator re-mint, and 5xx without
+   changing the `delivery_id`.
 3. Verify `X-Curie-Adapter-Secret` on every egress request, in constant time,
    before any side effect, and refuse when unset.
 4. Answer 2xx with a JSON body under 64 KiB, and never redirect.
 5. Handle all four events, and tolerate ones it does not use.
-6. Dedupe on `TurnCompleted.event_id`, at minimum in memory, and tolerate a
-   completion arriving for a conversation it already considers finished.
-7. Re-mint its `chn` token rather than treating a 401 as fatal, since any
-   rebind invalidates it.
+6. Dedupe `TurnCompleted.event_id` durably and use an independent
+   provider-visible witness before repeating an ambiguous side effect. Tolerate
+   completion arriving for a conversation already considered finished.
+7. Treat 401 as an operator credential-rotation condition: retain the same
+   delivery, surface the recovery action, and resume it after the `chn` token is
+   re-minted. A channel adapter must not acquire a platform key merely to mint
+   its own token.
 
 ## Related
 

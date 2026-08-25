@@ -37,6 +37,25 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 _SCHEMA_PATH = Path(__file__).parent.parent / "schema" / "otel-attributes.schema.json"
 
+_ADR_0076_V1_KEYS = {
+    "curie.sandbox_id": "str",
+    "curie.session_id": "str",
+    "gen_ai.approval.decision": "str",
+    "gen_ai.operation.name": "str",
+    "gen_ai.request.model": "str",
+    "gen_ai.tool.name": "str",
+    "gen_ai.usage.cache_creation_input_tokens": "int",
+    "gen_ai.usage.cache_read_input_tokens": "int",
+    "gen_ai.usage.input_tokens": "int",
+    "gen_ai.usage.output_tokens": "int",
+    "langfuse.session.id": "str",
+    "langfuse.trace.name": "str",
+    "langfuse.user.id": "str",
+    "model": "str",
+    "schema.version": "str",
+    "service.name": "str",
+}
+
 
 def _committed_schema() -> dict:
     return json.loads(_SCHEMA_PATH.read_text())
@@ -70,6 +89,12 @@ def test_committed_schema_matches_the_enum() -> None:
         "Regenerate the committed file (see this module's docstring) and "
         "commit it alongside the code change."
     )
+
+
+def test_production_telemetry_keeps_the_existing_adr_0076_v1_schema() -> None:
+    committed = _committed_schema()
+    assert committed["schema_version"] == "v1"
+    assert committed["keys"] == _ADR_0076_V1_KEYS
 
 
 def test_declared_value_types_cover_exactly_the_enum() -> None:
@@ -145,8 +170,8 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
     # an approval decision, or the prompt-cache usage fields through). This test
     # closes that gap by driving every declared key through its real setter --
     # the 12 span-level keys via RunTracer.run_span/record_usage/tool_span, and
-    # the 4 resource-level keys via build_tracer_provider -- so a call-site
-    # retype of any of the seven previously-unexercised keys (that also forgot
+    # the stable resource keys via build_tracer_provider -- so a call-site
+    # retype of any previously-unexercised key (that also forgot
     # to update SPAN_ATTRIBUTE_VALUE_TYPES) fails here instead of slipping past.
     committed = _committed_schema()["keys"]
     emitted: dict[str, object] = {}
@@ -154,6 +179,7 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
+    provider._curie_sandbox_id = "sandbox-abc"  # type: ignore[attr-defined]
     tracer = RunTracer(provider)
 
     with tracer.run_span(
@@ -180,9 +206,8 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
     otel = OtelConfig(endpoint="http://localhost:24318")
     resource_provider = build_tracer_provider(otel, "s1", "sandbox-abc")
     assert resource_provider is not None
-    # The OTel SDK's own Resource.create() merges in ambient default attributes
-    # (telemetry.sdk.language/name/version) alongside the ones this module
-    # stamps; only the declared keys are this schema's concern.
+    # The shared stable resource carries only service identity and the schema;
+    # session/sandbox correlation was exercised on the root span above.
     resource_attrs = resource_provider.resource.attributes
     emitted.update({key: value for key, value in resource_attrs.items() if key in committed})
     resource_provider.shutdown()

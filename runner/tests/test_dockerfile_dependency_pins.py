@@ -637,6 +637,18 @@ def test_dockerfile_generates_python_requirements_from_the_lock_exporter() -> No
     assert _dockerfile_python_pins(instructions) == {}
 
 
+def test_runner_image_installs_the_shared_telemetry_workspace_dependency() -> None:
+    instructions = _logical_instructions(_DOCKERFILE.read_text(encoding="utf-8"))
+
+    assert "COPY packages/telemetry ./packages/telemetry" in instructions
+    assert any(
+        instruction.startswith("RUN python3 -m venv ")
+        and "pip install --no-cache-dir --no-deps" in instruction
+        and "./packages/telemetry" in instruction
+        for instruction in instructions
+    )
+
+
 def test_actual_runner_dockerfile_matches_locked_dependencies() -> None:
     assert _find_violations(
         _UV_LOCK.read_text(encoding="utf-8"),
@@ -657,7 +669,7 @@ def test_actual_runner_dockerfile_rejects_unpinned_pip_requirements() -> None:
     ) in _find_violations(_UV_LOCK.read_text(encoding="utf-8"), mutated)
 
 
-def test_prechange_drift_reports_all_four_violations() -> None:
+def test_prechange_drift_reports_all_five_violations() -> None:
     dockerfile = """\
 RUN npm install -g @anthropic-ai/claude-code
 RUN npm install -g @modelcontextprotocol/server-github
@@ -689,6 +701,10 @@ RUN /app/.venv/bin/pip install \\
             "claude-agent-sdk",
             "expected lock version "
             f"{expected['claude-agent-sdk']}, found Dockerfile version 0.2.115",
+        ),
+        Violation(
+            "opentelemetry-exporter-otlp-proto-http",
+            "exact Dockerfile pin 1.44.0 is not a direct registry dependency",
         ),
     ]
 

@@ -13,7 +13,8 @@ via three ordered text transforms:
   T2  Inline otel/collector-config.yaml as a top-level `configs:` block (a literal
       scalar, re-indented 6 spaces, with `${env:` escaped to `$${env:` so compose
       does not try to interpolate the collector's own env references), and repoint
-      the otel-collector service from the host bind-mount to that config.
+      the otel-collector service from the host bind-mount to that config while
+      retaining its task-owned persistent-queue volume.
 
   T3  Pin every `ghcr.io/curie-eng/curie-*:latest` image tag to the release
       version (this also pins the worker-local image introduced by T1). Also
@@ -50,10 +51,13 @@ CONFIGS_ANCHOR = "x-core-profiles: &core_profiles [core, full]"
 
 OTEL_VOLUME_BLOCK = """    volumes:
       - ./otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
+      - otel_collector_storage:/var/lib/otelcol/storage
 """
 OTEL_CONFIGS_REF = """    configs:
       - source: otel_collector_config
         target: /etc/otel/collector-config.yaml
+    volumes:
+      - otel_collector_storage:/var/lib/otelcol/storage
 """
 
 # Matches the plain `:latest` pin AND compose.dev.yaml's

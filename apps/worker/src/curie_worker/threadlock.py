@@ -19,6 +19,8 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 from redis.asyncio import Redis
 
 # Release only if we still own the lock (token match); avoids deleting a lock a
@@ -106,12 +108,45 @@ class ThreadLock:
         """Block until the lock is held (returns the owner token) or time out."""
         token = uuid.uuid4().hex
         deadline = time.monotonic() + self._acquire_timeout_s
-        while True:
-            if await self._redis.set(key, token, nx=True, px=self._ttl_ms):
-                return token
-            if time.monotonic() >= deadline:
-                raise LockAcquireTimeout(key)
-            await asyncio.sleep(self._poll_interval_s)
+        started = time.monotonic()
+        contended = False
+        error: LockAcquireTimeout | None = None
+        acquired = False
+        outcome = "acquired"
+        with operation_span(
+            "curie.thread.lock",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "source": "worker"},
+        ) as span:
+            while True:
+                if await self._redis.set(key, token, nx=True, px=self._ttl_ms):
+                    acquired = True
+                    outcome = "contended" if contended else "acquired"
+                    span.add_event("thread.lock.acquired", {"outcome": outcome})
+                    break
+                contended = True
+                if time.monotonic() >= deadline:
+                    outcome = "timeout"
+                    error = LockAcquireTimeout(key)
+                    if hasattr(span, "set_status"):
+                        span.set_status(StatusCode.ERROR)
+                    span.add_event("thread.lock.timeout", {"outcome": "timeout"})
+                    break
+                await asyncio.sleep(self._poll_interval_s)
+
+        record_metric(
+            "curie.thread.lock.wait.duration",
+            max(0.0, time.monotonic() - started),
+            attributes={
+                "service.name": "curie-worker",
+                "source": "worker",
+                "outcome": outcome,
+            },
+        )
+        if error is not None:
+            raise error
+        assert acquired
+        return token
 
     async def release(self, key: str, token: str) -> None:
         await self._redis.eval(_RELEASE_LUA, 1, key, token)

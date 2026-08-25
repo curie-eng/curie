@@ -21,9 +21,11 @@ from typing import Any
 import httpx
 import redis
 from aci_protocol.s3 import build_s3_client
+from curie_telemetry import bootstrap_service_telemetry
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from . import __version__
 from .actions import ActionClient
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
@@ -49,7 +51,7 @@ from .publication_loop import (
     PublicationReconciler,
 )
 from .publication_store import PostgresPublicationStore
-from .reply_sink import ReplySinkRouter, build_reply_sink
+from .reply_sink import ObservedReplySink, ReplySinkRouter, build_reply_sink
 from .runner_client import RunnerClient
 from .sandbox import (
     AffinityStore,
@@ -540,7 +542,11 @@ def _build_publication_loop(
         ),
         cluster=cluster,
         github=GitHubPublicationLookup(http),
-        replies=sink,
+        # Publication delivery runs outside the kernel, so it must decorate the
+        # shared router independently. The reply observation depth suppresses
+        # the HTTP adapter's nested instrumentation and keeps one logical
+        # delivery at exactly one span/metric pair.
+        replies=ObservedReplySink(sink),
         card_store=card_store,
         transcript=(
             PublicationTranscriptClient(
@@ -648,11 +654,19 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
 
 
 def main(env: Mapping[str, str] | None = None) -> None:
-    logging.basicConfig(level=logging.INFO)
-    install_dead_letter_alerting()
     resolved = env if env is not None else os.environ
-    config = WorkerConfig()
-    asyncio.run(_run(config, resolved))
+    telemetry = bootstrap_service_telemetry(
+        "curie-worker",
+        service_version=__version__,
+        logger=logging.getLogger("curie_worker"),
+        environ=resolved,
+    )
+    try:
+        install_dead_letter_alerting()
+        config = WorkerConfig()
+        asyncio.run(_run(config, resolved))
+    finally:
+        telemetry.shutdown()
 
 
 if __name__ == "__main__":

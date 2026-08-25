@@ -45,6 +45,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 
 from .config import Settings
 from .models import GIT_FLOW_CREATED_BY
@@ -328,6 +330,7 @@ class CommitPoller:
         # Archive failure gets one retry on the next pass, then settles. This
         # bounds network failure clones without making a single blip terminal.
         self._archive_retry: dict[tuple[str, str], str] = {}
+        self._last_success_monotonic: float | None = None
 
     async def run_forever(self) -> None:
         logger.info("commit poller started interval=%ss", self._interval)
@@ -349,6 +352,51 @@ class CommitPoller:
             await asyncio.sleep(self._interval)
 
     async def poll_once(self) -> list[Move]:
+        """Run one measured poll pass without changing its returned moves."""
+
+        moves: list[Move] = []
+        error: Exception | None = None
+        attributes = {
+            "service.name": "curie-api",
+            "operation": "commit-poller",
+            "role": "background",
+        }
+        with operation_span(
+            "curie.background.commit-poller",
+            kind=SpanKind.INTERNAL,
+            attributes=attributes,
+        ) as span:
+            try:
+                moves = await self._poll_once()
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "background.pass.failed",
+                    {"outcome": "failure", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event("background.pass.completed", {"outcome": "success"})
+        outcome = "failure" if error is not None else "success"
+        record_metric(
+            "curie.background.loop",
+            attributes={**attributes, "outcome": outcome},
+        )
+        now = time.monotonic()
+        if error is None:
+            self._last_success_monotonic = now
+        if self._last_success_monotonic is not None:
+            record_metric(
+                "curie.background.last_success.age",
+                max(0.0, now - self._last_success_monotonic),
+                attributes=attributes,
+            )
+        if error is not None:
+            raise error
+        return moves
+
+    async def _poll_once(self) -> list[Move]:
         from sqlalchemy import text
 
         from . import gitflow
@@ -424,9 +472,7 @@ class CommitPoller:
             elif result.status == "rejected":
                 codes = {(error.get("code") or "") for error in (result.errors or [])}
                 if codes & _TOPOLOGY_REJECTIONS:
-                    self._settled[key] = Settled(
-                        move.sha, binding_snapshots[move.repo_full_name]
-                    )
+                    self._settled[key] = Settled(move.sha, binding_snapshots[move.repo_full_name])
                     self._archive_retry.pop(key, None)
                 elif _ARCHIVE_FAILURE in codes and self._archive_retry.get(key) != move.sha:
                     self._archive_retry[key] = move.sha

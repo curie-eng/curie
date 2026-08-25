@@ -19,7 +19,8 @@ import logging
 import tarfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +30,11 @@ import httpx
 import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    operation_span,
+    record_metric,
+)
 from curie_test_support.valkey import (
     VALKEY_HOST as _VH,
 )
@@ -38,6 +44,7 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VPW,
 )
+from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, MODEL_ENV, THINKING_ENV
 from curie_worker.bundle_store import BundleStore
 from curie_worker.config import WorkerConfig
@@ -52,9 +59,11 @@ from curie_worker.eval import (
     LangfuseEvalRecorder,
     load_suite_from_bundle,
 )
+from curie_worker.eval import stream as eval_stream_module
 from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
 from curie_worker.sandbox.types import ClaimView, SandboxView
+from opentelemetry import trace
 from redis.asyncio import Redis as AsyncRedis
 
 CONTAINS = GraderKind.CONTAINS
@@ -1154,6 +1163,106 @@ def _fake_job_consumer(reporter: Any) -> EvalStreamConsumer:
         substrate=_TokenSubstrate("tok"),
         reporter=reporter,
         repo_lookup=_StubRepo(),
+    )
+
+
+@dataclass(frozen=True)
+class _EvalMetric:
+    name: str
+    value: float
+    attributes: dict[str, str]
+
+
+class _EvalSpan:
+    def add_event(
+        self, _name: str, _attributes: Mapping[str, str] | None = None
+    ) -> None:
+        pass
+
+
+class _EvalTelemetryProbe:
+    def __init__(self) -> None:
+        self.spans: list[tuple[str, bool]] = []
+        self.metrics: list[_EvalMetric] = []
+
+    @contextmanager
+    def operation_span(
+        self,
+        name: str,
+        *,
+        kind: Any,
+        parent: Any = None,
+        attributes: Mapping[str, str] | None = None,
+    ) -> Iterator[_EvalSpan]:
+        del kind, attributes
+        span = trace.get_current_span(parent) if parent is not None else trace.get_current_span()
+        self.spans.append((name, span.get_span_context().is_valid))
+        yield _EvalSpan()
+
+    def record_metric(
+        self,
+        name: str,
+        value: float = 1,
+        *,
+        attributes: Mapping[str, str] | None = None,
+    ) -> None:
+        self.metrics.append(_EvalMetric(name, float(value), dict(attributes or {})))
+
+
+@pytest.mark.parametrize(
+    "carrier",
+    [None, "not-a-valid-traceparent"],
+    ids=["missing", "malformed"],
+)
+def test_eval_consumer_uses_a_safe_root_and_records_bounded_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    carrier: str | None,
+) -> None:
+    """The eval sibling must tolerate the same carrier failures as runs."""
+
+    assert callable(operation_span)
+    assert callable(record_metric)
+    probe = _EvalTelemetryProbe()
+    import curie_telemetry
+
+    monkeypatch.setattr(curie_telemetry, "operation_span", probe.operation_span)
+    monkeypatch.setattr(curie_telemetry, "record_metric", probe.record_metric)
+    for module in (eval_stream_module, stream_consumer_module):
+        if hasattr(module, "operation_span"):
+            monkeypatch.setattr(module, "operation_span", probe.operation_span)
+        if hasattr(module, "record_metric"):
+            monkeypatch.setattr(module, "record_metric", probe.record_metric)
+
+    _canned_run(monkeypatch, [EvalOutcome.PASS])
+    reporter = _FakeReporter()
+    consumer = _fake_job_consumer(reporter)
+    acked: list[str] = []
+
+    async def _record_ack(entry_id: str) -> None:
+        acked.append(entry_id)
+
+    monkeypatch.setattr(consumer, "_ack", _record_ack)
+    item = _item(
+        suite="s",
+        sha="deadbeef",
+        bundle_ref="bundles/x.tgz",
+        target_url=None,
+    )
+    fields = {STREAM_PAYLOAD_FIELD: item.model_dump_json()}
+    if carrier is not None:
+        fields[TRACEPARENT_STREAM_FIELD] = carrier
+
+    asyncio.run(consumer._handle("1-0", fields))
+
+    assert acked == ["1-0"]
+    assert ("curie.eval.process", False) in probe.spans
+    completed = [point for point in probe.metrics if point.name == "curie.eval.process"]
+    assert completed
+    assert {point.attributes["outcome"] for point in completed} == {"success"}
+    assert all(
+        set(point.attributes)
+        <= {"service.name", "operation", "role", "source", "outcome"}
+        for point in completed
     )
 
 

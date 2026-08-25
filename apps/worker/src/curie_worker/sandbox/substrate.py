@@ -29,6 +29,8 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from aci_protocol import BootEnv
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 
 from ..binding import RUNNER_TOKEN_ENV
 from .affinity import AffinityStore
@@ -90,6 +92,24 @@ logger = logging.getLogger(__name__)
 REAP_GRACE_MARGIN_SECONDS = 30.0
 
 
+def _sandbox_attributes(operation: str, outcome: str) -> dict[str, str]:
+    return {
+        "service.name": "curie-worker",
+        "operation": operation,
+        "outcome": outcome,
+    }
+
+
+def _record_inventory(*, active: float, suspended: float) -> None:
+    # Both inventories intentionally use one fixed series each. Lifecycle
+    # operation labels belong on curie.sandbox.lifecycle; putting claim/release
+    # on a state gauge creates several stale last-value series whose sum cannot
+    # represent the current inventory.
+    attributes = _sandbox_attributes("observe", "observed")
+    record_metric("curie.sandbox.active", active, attributes=attributes)
+    record_metric("curie.sandbox.suspended", suspended, attributes=attributes)
+
+
 class SandboxSubstrate:
     """Provision, route, and reap runner sandboxes for conversation threads."""
 
@@ -102,7 +122,6 @@ class SandboxSubstrate:
         self._k8s = k8s
         self._affinity = affinity
         self._config = config
-
     # -- claim / lookup -------------------------------------------------------
 
     def claim(self, thread_key: str, *, env: dict[str, str] | None = None) -> SandboxHandle:
@@ -113,20 +132,53 @@ class SandboxSubstrate:
         generic sandbox.
         """
 
-        record = self._affinity.get(thread_key)
-        if record is not None:
-            if record.state is RouteState.SUSPENDED:
-                raise SuspendedThreadError(thread_key)
-            sandbox = self._k8s.get_sandbox(record.handle.sandbox_name)
-            if sandbox is not None and sandbox.operating_mode == "Running":
-                self._affinity.touch(thread_key, self._config.route_ttl_seconds)
-                return record.handle
-            # The sandbox died (or was suspended) out from under a live route:
-            # a stale route must never be handed back, and must not win the
-            # re-claim race below. Evict it and bind fresh.
-            self._evict_stale(thread_key, record)
+        started = time.monotonic()
+        handle: SandboxHandle | None = None
+        error: Exception | None = None
+        outcome = "failed"
+        with operation_span(
+            "curie.sandbox.claim",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "operation": "claim"},
+        ) as span:
+            try:
+                record = self._affinity.get(thread_key)
+                if record is not None:
+                    if record.state is RouteState.SUSPENDED:
+                        raise SuspendedThreadError(thread_key)
+                    sandbox = self._k8s.get_sandbox(record.handle.sandbox_name)
+                    if sandbox is not None and sandbox.operating_mode == "Running":
+                        self._affinity.touch(thread_key, self._config.route_ttl_seconds)
+                        handle = record.handle
+                        outcome = "reused"
+                    else:
+                        # Never hand back a stale route or let it win the fresh claim.
+                        self._evict_stale(thread_key, record)
+                if handle is None:
+                    handle = self._claim_fresh(thread_key, env=env, state=RouteState.LIVE)
+                    outcome = "claimed"
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "sandbox.claim.failed",
+                    {"outcome": "failed", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event("sandbox.claim.completed", {"outcome": outcome})
 
-        return self._claim_fresh(thread_key, env=env, state=RouteState.LIVE)
+        attributes = _sandbox_attributes("claim", outcome)
+        record_metric("curie.sandbox.lifecycle", attributes=attributes)
+        record_metric(
+            "curie.sandbox.claim.duration",
+            max(0.0, time.monotonic() - started),
+            attributes=attributes,
+        )
+        if error is not None:
+            raise error
+        assert handle is not None
+        return handle
 
     def lookup(self, thread_key: str) -> SandboxHandle | None:
         """The thread's live handle, or None (no route, suspended, or the
@@ -187,17 +239,41 @@ class SandboxSubstrate:
         rebuild session state later.
         """
 
-        record = self._affinity.get(thread_key)
-        if record is None:
-            raise NoRouteError(thread_key)
-        self._k8s.set_sandbox_mode(record.handle.sandbox_name, "Suspended")
-        self._affinity.mark_suspended(
-            thread_key, history_ref, self._config.suspended_route_ttl_seconds
+        error: Exception | None = None
+        record: RouteRecord | None = None
+        with operation_span(
+            "curie.sandbox.suspend",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "operation": "suspend"},
+        ) as span:
+            try:
+                record = self._affinity.get(thread_key)
+                if record is None:
+                    raise NoRouteError(thread_key)
+                self._k8s.set_sandbox_mode(record.handle.sandbox_name, "Suspended")
+                self._affinity.mark_suspended(
+                    thread_key, history_ref, self._config.suspended_route_ttl_seconds
+                )
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "sandbox.suspend.failed",
+                    {"outcome": "failed", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event("sandbox.suspended", {"outcome": "suspended"})
+        outcome = "failed" if error is not None else "suspended"
+        record_metric(
+            "curie.sandbox.lifecycle",
+            attributes=_sandbox_attributes("suspend", outcome),
         )
+        if error is not None:
+            raise error
+        assert record is not None
 
-    def resume(
-        self, thread_key: str, *, env: dict[str, str] | None = None
-    ) -> SandboxHandle:
+    def resume(self, thread_key: str, *, env: dict[str, str] | None = None) -> SandboxHandle:
         """Rehydrate a suspended thread into a fresh claim.
 
         The suspended claim is retired (its process and cache are gone either
@@ -213,26 +289,58 @@ class SandboxSubstrate:
         mint one (issue #63: the old token died with the old claim).
         """
 
-        record = self._affinity.get(thread_key)
-        if record is None:
-            raise NoRouteError(thread_key)
-        old = record.handle
-        boot = dict(env) if env else {}
-        boot.setdefault(SESSION_ENV, old.session_id)
-        if not boot.get(RUNNER_TOKEN_ENV):
-            boot[RUNNER_TOKEN_ENV] = secrets.token_urlsafe(32)
-        if old.history_ref is not None:
-            boot.setdefault(HISTORY_ENV, old.history_ref)
+        started = time.monotonic()
+        handle: SandboxHandle | None = None
+        old: SandboxHandle | None = None
+        error: Exception | None = None
+        with operation_span(
+            "curie.sandbox.resume",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "operation": "resume"},
+        ) as span:
+            try:
+                record = self._affinity.get(thread_key)
+                if record is None:
+                    raise NoRouteError(thread_key)
+                old = record.handle
+                boot = dict(env) if env else {}
+                boot.setdefault(SESSION_ENV, old.session_id)
+                if not boot.get(RUNNER_TOKEN_ENV):
+                    boot[RUNNER_TOKEN_ENV] = secrets.token_urlsafe(32)
+                if old.history_ref is not None:
+                    boot.setdefault(HISTORY_ENV, old.history_ref)
 
-        self._k8s.delete_claim(old.claim_name)
-        self._affinity.delete_if_claim(thread_key, old.claim_name)
-        return self._claim_fresh(
-            thread_key,
-            env=boot,
-            state=RouteState.LIVE,
-            session_id=old.session_id,
-            history_ref=old.history_ref,
+                self._k8s.delete_claim(old.claim_name)
+                self._affinity.delete_if_claim(thread_key, old.claim_name)
+                handle = self._claim_fresh(
+                    thread_key,
+                    env=boot,
+                    state=RouteState.LIVE,
+                    session_id=old.session_id,
+                    history_ref=old.history_ref,
+                )
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "sandbox.resume.failed",
+                    {"outcome": "failed", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event("sandbox.resumed", {"outcome": "resumed"})
+        outcome = "failed" if error is not None else "resumed"
+        attributes = _sandbox_attributes("resume", outcome)
+        record_metric("curie.sandbox.lifecycle", attributes=attributes)
+        record_metric(
+            "curie.sandbox.resume.duration",
+            max(0.0, time.monotonic() - started),
+            attributes=attributes,
         )
+        if error is not None:
+            raise error
+        assert handle is not None and old is not None
+        return handle
 
     # -- release / reap -------------------------------------------------------
 
@@ -241,20 +349,108 @@ class SandboxSubstrate:
         deletes its sandbox and pod) and drop the route. True if a route
         existed."""
 
-        record = self._affinity.get(thread_key)
-        if record is None:
-            return False
-        self._k8s.delete_claim(record.handle.claim_name)
-        self._affinity.delete_if_claim(thread_key, record.handle.claim_name)
-        return True
+        started = time.monotonic()
+        released = False
+        record: RouteRecord | None = None
+        error: Exception | None = None
+        with operation_span(
+            "curie.sandbox.release",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "operation": "release"},
+        ) as span:
+            try:
+                record = self._affinity.get(thread_key)
+                if record is not None:
+                    self._k8s.delete_claim(record.handle.claim_name)
+                    self._affinity.delete_if_claim(thread_key, record.handle.claim_name)
+                    released = True
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "sandbox.release.failed",
+                    {"outcome": "failed", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event(
+                    "sandbox.released",
+                    {"outcome": "released" if released else "observed"},
+                )
+        outcome = "failed" if error is not None else ("released" if released else "observed")
+        attributes = _sandbox_attributes("release", outcome)
+        record_metric("curie.sandbox.lifecycle", attributes=attributes)
+        record_metric(
+            "curie.sandbox.release.duration",
+            max(0.0, time.monotonic() - started),
+            attributes=attributes,
+        )
+        if error is not None:
+            raise error
+        return released
 
     def reap_orphans(self) -> list[str]:
+        """Measure orphan cleanup at the substrate seam for every backend."""
+
+        deleted: list[str] = []
+        observed_claims: set[str] = set()
+        inventory: dict[RouteState, set[str]] = {state: set() for state in RouteState}
+        error: Exception | None = None
+        with operation_span(
+            "curie.sandbox.cleanup",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "operation": "cleanup"},
+        ) as span:
+            try:
+                inventory = self._affinity.route_inventory()
+                deleted, observed_claims = self._reap_orphans(inventory)
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "sandbox.cleanup.failed",
+                    {"outcome": "failed", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event(
+                    "sandbox.cleanup.completed",
+                    {"outcome": "orphan-cleaned" if deleted else "observed"},
+                )
+        outcome = "failed" if error is not None else ("orphan-cleaned" if deleted else "observed")
+        attributes = _sandbox_attributes("cleanup", outcome)
+        record_metric("curie.sandbox.lifecycle", attributes=attributes)
+        record_metric("curie.sandbox.cleanup", float(len(deleted)), attributes=attributes)
+        if error is not None:
+            raise error
+        active_routes = inventory[RouteState.LIVE]
+        suspended_routes = inventory[RouteState.SUSPENDED]
+        _record_inventory(
+            active=float(len(active_routes & observed_claims)),
+            suspended=float(len(suspended_routes & observed_claims)),
+        )
+        record_metric(
+            "curie.thread.route.active",
+            float(len(active_routes)),
+            attributes={
+                "service.name": "curie-worker",
+                "source": "worker",
+                "outcome": "observed",
+            },
+        )
+        return deleted
+
+    def _reap_orphans(
+        self, inventory: dict[RouteState, set[str]]
+    ) -> tuple[list[str], set[str]]:
         """Delete substrate-managed claims that no live route references AND
         that are older than the bind-window grace.
 
         Routes expire from Valkey by TTL (idle threads); the corresponding
         claims are then orphans on the cluster. Runs from a periodic worker
-        tick. Returns the deleted claim names.
+        tick. Returns the deleted claim names plus the still-observed claim
+        names so the caller can publish authoritative inventory without a
+        second cluster or Valkey scan.
 
         "No route" alone does NOT mean litter. ``_claim_fresh`` writes the
         thread's route only after the claim binds a sandbox and that sandbox
@@ -279,12 +475,13 @@ class SandboxSubstrate:
         REAP_GRACE_MARGIN_SECONDS pads for; do not unify the two clocks.
         """
 
-        live = self._affinity.live_claim_names()
+        live = set().union(*inventory.values())
         deleted: list[str] = []
         selector = f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}"
         grace = self._config.claim_timeout_seconds + REAP_GRACE_MARGIN_SECONDS
         cutoff = datetime.now(UTC) - timedelta(seconds=grace)
-        for claim in self._k8s.list_claims(label_selector=selector):
+        claims = self._k8s.list_claims(label_selector=selector)
+        for claim in claims:
             if claim.name in live:
                 continue
             if claim.created_at is None:
@@ -309,7 +506,8 @@ class SandboxSubstrate:
                 continue
             self._k8s.delete_claim(claim.name)
             deleted.append(claim.name)
-        return deleted
+        observed = {claim.name for claim in claims} - set(deleted)
+        return deleted, observed
 
     # -- internals --------------------------------------------------------------
 
@@ -397,9 +595,7 @@ class SandboxSubstrate:
         condition_detail = "no Ready condition was observed"
         if last_ready_condition is not None:
             reason, message = last_ready_condition
-            condition_detail = (
-                f"last Ready condition had reason={reason!r} and message={message!r}"
-            )
+            condition_detail = f"last Ready condition had reason={reason!r} and message={message!r}"
         raise ClaimTimeoutError(
             f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s; "
             f"{condition_detail}."

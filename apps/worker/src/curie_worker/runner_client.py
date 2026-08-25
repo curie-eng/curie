@@ -18,12 +18,16 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from types import TracebackType
+from typing import TypeVar
 
 import aiohttp
 from aci_protocol import Event, Interrupt, OutboundEvent, parse_ndjson_line
+from curie_telemetry import inject_trace_context, operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 
 # The interrupt RPC is a control-plane POST, not a streaming turn (#742, a
 # follow-up to #739): it exists only to hard-stop the live turn, never to carry
@@ -38,6 +42,7 @@ from aci_protocol import Event, Interrupt, OutboundEvent, parse_ndjson_line
 # going) instead of re-deriving the bound -- or a coupling to this client's
 # other timeouts -- at each call site.
 _DEFAULT_INTERRUPT_TIMEOUT_S = 5.0
+_T = TypeVar("_T")
 
 
 def _auth_headers(token: str | None) -> dict[str, str] | None:
@@ -127,28 +132,85 @@ class RunnerClient:
             4 * ((snapshot_patch_max_bytes + 2) // 3) + 131_072
         )
 
+    async def _rpc(
+        self,
+        operation: str,
+        token: str | None,
+        request: Callable[[dict[str, str] | None], Awaitable[tuple[_T, str]]],
+    ) -> _T:
+        """Measure one HTTP boundary and propagate only W3C trace context."""
+
+        attributes = {
+            "service.name": "curie-worker",
+            "operation": operation,
+            "role": "client",
+        }
+        started = time.monotonic()
+        result: _T | None = None
+        outcome = "failure"
+        error: Exception | None = None
+        with operation_span(
+            "curie.runner.rpc",
+            kind=SpanKind.CLIENT,
+            attributes=attributes,
+        ) as span:
+            headers = dict(_auth_headers(token) or {})
+            inject_trace_context(headers)
+            try:
+                result, outcome = await request(headers or None)
+            except Exception as exc:
+                error = exc
+                outcome = "timeout" if isinstance(exc, TimeoutError) else "failure"
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "runner.rpc.failed",
+                    {"outcome": outcome, "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event("runner.rpc.completed", {"outcome": outcome})
+
+        metric_attributes = {**attributes, "outcome": outcome}
+        record_metric(
+            "curie.runner.rpc.request.duration",
+            max(0.0, time.monotonic() - started),
+            attributes=metric_attributes,
+        )
+        record_metric("curie.runner.rpc.result", attributes=metric_attributes)
+        if error is not None:
+            raise error
+        return result  # type: ignore[return-value]
+
     async def start_turn(self, base_url: str, event: Event, token: str | None = None) -> TurnStream:
         """Open a turn. Returns once the runner has accepted it (turn active)."""
-        resp = await self._session.post(
-            f"{base_url}/v1/event", json=event.model_dump(), headers=_auth_headers(token)
-        )
-        if resp.status != 200:
-            body = await resp.text()
-            resp.release()
-            raise RunnerError(f"/v1/event -> {resp.status}: {body}")
-        return TurnStream(resp)
+
+        async def request(headers: dict[str, str] | None) -> tuple[TurnStream, str]:
+            resp = await self._session.post(
+                f"{base_url}/v1/event", json=event.model_dump(), headers=headers
+            )
+            if resp.status != 200:
+                body = await resp.text()
+                resp.release()
+                raise RunnerError(f"/v1/event -> {resp.status}: {body}")
+            return TurnStream(resp), "success"
+
+        return await self._rpc("event", token, request)
 
     async def steer(self, base_url: str, event: Event, token: str | None = None) -> bool:
         """Inject a follow-up into the live turn. False on 409 (no active turn)."""
-        async with self._session.post(
-            f"{base_url}/v1/steer", json=event.model_dump(), headers=_auth_headers(token)
-        ) as resp:
-            if resp.status == 409:
-                return False
-            if resp.status != 200:
-                body = await resp.text()
-                raise RunnerError(f"/v1/steer -> {resp.status}: {body}")
-            return True
+
+        async def request(headers: dict[str, str] | None) -> tuple[bool, str]:
+            async with self._session.post(
+                f"{base_url}/v1/steer", json=event.model_dump(), headers=headers
+            ) as resp:
+                if resp.status == 409:
+                    return False, "conflict"
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RunnerError(f"/v1/steer -> {resp.status}: {body}")
+                return True, "success"
+
+        return await self._rpc("steer", token, request)
 
     async def interrupt(self, base_url: str, reason: str, token: str | None = None) -> None:
         """Hard-stop the live turn; its final is reclassified to idle.
@@ -161,15 +223,20 @@ class RunnerClient:
         any other failure here -- callers already decide per call site whether
         to swallow-and-fallback or surface-and-continue."""
         frame = Interrupt(reason=reason)
-        async with self._session.post(
-            f"{base_url}/v1/interrupt",
-            json=frame.model_dump(),
-            headers=_auth_headers(token),
-            timeout=self._interrupt_timeout,
-        ) as resp:
-            if resp.status not in (200, 409):
-                body = await resp.text()
-                raise RunnerError(f"/v1/interrupt -> {resp.status}: {body}")
+
+        async def request(headers: dict[str, str] | None) -> tuple[None, str]:
+            async with self._session.post(
+                f"{base_url}/v1/interrupt",
+                json=frame.model_dump(),
+                headers=headers,
+                timeout=self._interrupt_timeout,
+            ) as resp:
+                if resp.status not in (200, 409):
+                    body = await resp.text()
+                    raise RunnerError(f"/v1/interrupt -> {resp.status}: {body}")
+                return None, "conflict" if resp.status == 409 else "success"
+
+        await self._rpc("interrupt", token, request)
 
     async def reset(self, base_url: str, token: str | None = None) -> None:
         """Discard the runner's conversation so the next turn starts fresh (#550).
@@ -180,10 +247,14 @@ class RunnerClient:
         never be live at reset time -- a 409 here is a real ordering bug, not a
         condition to swallow.
         """
-        async with self._session.post(f"{base_url}/v1/reset", headers=_auth_headers(token)) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RunnerError(f"/v1/reset -> {resp.status}: {body}")
+        async def request(headers: dict[str, str] | None) -> tuple[None, str]:
+            async with self._session.post(f"{base_url}/v1/reset", headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RunnerError(f"/v1/reset -> {resp.status}: {body}")
+                return None, "success"
+
+        await self._rpc("reset", token, request)
 
     async def snapshot(self, base_url: str, token: str | None = None) -> RunnerWorkspaceSnapshot:
         """Capture a bounded patch before a publication approval suspends.
@@ -246,12 +317,15 @@ class RunnerClient:
                 raise RunnerError("/v1/snapshot returned an invalid bounded payload") from exc
 
     async def status(self, base_url: str) -> dict[str, object]:
-        async with self._session.get(f"{base_url}/status") as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RunnerError(f"/status -> {resp.status}: {body}")
-            data: dict[str, object] = await resp.json()
-            return data
+        async def request(headers: dict[str, str] | None) -> tuple[dict[str, object], str]:
+            async with self._session.get(f"{base_url}/status", headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RunnerError(f"/status -> {resp.status}: {body}")
+                data: dict[str, object] = await resp.json()
+                return data, "success"
+
+        return await self._rpc("status", None, request)
 
     async def close(self) -> None:
         if self._own_session:

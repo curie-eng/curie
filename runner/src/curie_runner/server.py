@@ -34,6 +34,7 @@ from typing import cast
 from aci_protocol import Event, Interrupt, parse_inbound
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
+from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 
 from .session import SessionRunner
 from .workspace_snapshot import WorkspaceSnapshot, WorkspaceSnapshotError
@@ -182,7 +183,12 @@ async def _event(request: web.Request) -> web.StreamResponse:
     # asyncgen GC on a different task, releasing the turn lock cross-task (see
     # SessionRunner._turn_lock). aclosing keeps the teardown -- and the turn
     # interrupt in run_turn's finally -- on the task that opened it.
-    async with contextlib.aclosing(runner.run_turn(frame)) as stream:
+    carrier: dict[str, str] = {}
+    traceparent = request.headers.get(TRACEPARENT_STREAM_FIELD)
+    if traceparent is not None:
+        carrier[TRACEPARENT_STREAM_FIELD] = traceparent
+    parent = extract_trace_context(carrier)
+    async with contextlib.aclosing(runner.run_turn(frame, parent=parent)) as stream:
         async for line in stream:
             await response.write(line.encode("utf-8"))
     await response.write_eof()

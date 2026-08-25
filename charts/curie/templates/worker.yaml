@@ -117,8 +117,12 @@ spec:
         # credential they believe they revoked. Same sha256sum-of-the-rendered-
         # value idiom as otel-collector.yaml and clickhouse.yaml. Scoped to this
         # value on purpose: annotating the whole Secret would restart the workers
-        # on any unrelated credential change in it.
-        checksum/adapter-credentials: {{ .Values.worker.adapterCredentials | toJson | sha256sum }}
+        # on any unrelated credential change in it. The hashed value is the map
+        # coalesced by curie.adapterCredentials; see _helpers.tpl for why. That
+        # helper already emits JSON: piping it through toJson again would hash
+        # something the Secret never contained and roll every worker on every
+        # upgrade.
+        checksum/adapter-credentials: {{ include "curie.adapterCredentials" . | sha256sum }}
       labels:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 8 }}
@@ -140,12 +144,20 @@ spec:
       {{- end }}
       {{- $hasWorkerApiUrl := false }}
       {{- $hasWorkerApiKey := false }}
+      {{- $hasWorkerOtelEndpoint := false }}
+      {{- $hasWorkerOtelProtocol := false }}
       {{- range .Values.worker.extraEnv }}
       {{- if eq .name "CURIE_API_URL" }}
       {{- $hasWorkerApiUrl = true }}
       {{- end }}
       {{- if eq .name "CURIE_API_KEY" }}
       {{- $hasWorkerApiKey = true }}
+      {{- end }}
+      {{- if eq .name "OTEL_EXPORTER_OTLP_ENDPOINT" }}
+      {{- $hasWorkerOtelEndpoint = true }}
+      {{- end }}
+      {{- if eq .name "OTEL_EXPORTER_OTLP_PROTOCOL" }}
+      {{- $hasWorkerOtelProtocol = true }}
       {{- end }}
       {{- end }}
       containers:
@@ -243,6 +255,14 @@ spec:
               value: {{ index .Values.worker.publication.resources.requests "ephemeral-storage" | quote }}
             - name: CURIE_PUBLICATION_EPHEMERAL_LIMIT
               value: {{ index .Values.worker.publication.resources.limits "ephemeral-storage" | quote }}
+            {{- if and .Values.otelCollector.deploy (not $hasWorkerOtelEndpoint) }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
+            {{- end }}
+            {{- if and .Values.otelCollector.deploy (not $hasWorkerOtelProtocol) }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            {{- end }}
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:

@@ -1030,6 +1030,21 @@ async def list_approvals(
     return list(result)
 
 
+async def pending_approval_inventory(
+    session: AsyncSession,
+) -> tuple[int, datetime | None]:
+    """Fleet-wide pending count and oldest creation time, without pagination."""
+
+    count, oldest = (
+        await session.execute(
+            select(func.count(Approval.id), func.min(Approval.created_at)).where(
+                Approval.status == ApprovalStatus.pending
+            )
+        )
+    ).one()
+    return int(count), oldest
+
+
 async def claim_approval_resolution(
     session: AsyncSession,
     approval_id: uuid.UUID,

@@ -13,6 +13,7 @@ import uuid
 
 import pytest
 import redis.asyncio as aioredis
+from curie_api import graveyardwatcher as watcher_module
 from curie_api.graveyardwatcher import GraveyardWatcher
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
@@ -71,6 +72,64 @@ def test_alerts_once_per_new_dead_letter_and_seeds_at_tail() -> None:
         finally:
             await client.delete(stream)
             await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_failure_age_is_measured_from_the_prior_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        watcher = GraveyardWatcher(object(), stream="test:dead", interval_seconds=0.01)  # type: ignore[arg-type]
+        points: list[tuple[str, float, dict[str, str]]] = []
+        scans = 0
+        sleeps = 0
+
+        async def seed() -> None:
+            return None
+
+        async def scan() -> int:
+            nonlocal scans
+            scans += 1
+            if scans == 2:
+                raise RuntimeError("injected failure")
+            return 0
+
+        async def sleep(_seconds: float) -> None:
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 3:
+                raise asyncio.CancelledError
+
+        def capture(
+            name: str,
+            value: float = 1,
+            *,
+            attributes: dict[str, str],
+        ) -> None:
+            points.append((name, value, attributes))
+
+        times = iter([10.0, 17.0])
+        monkeypatch.setattr(watcher, "seed_cursor", seed)
+        monkeypatch.setattr(watcher, "scan_once", scan)
+        monkeypatch.setattr(watcher_module.asyncio, "sleep", sleep)
+        monkeypatch.setattr(watcher_module, "_monotonic", lambda: next(times))
+        monkeypatch.setattr(watcher_module, "record_metric", capture)
+
+        with pytest.raises(asyncio.CancelledError):
+            await watcher.run_forever()
+
+        ages = [point for point in points if point[0] == "curie.background.last_success.age"]
+        assert [point[1] for point in ages] == [0.0, 7.0]
+        assert all(
+            point[2]
+            == {
+                "service.name": "curie-api",
+                "operation": "graveyard-watcher",
+                "role": "background",
+            }
+            for point in ages
+        )
 
     asyncio.run(go())
 

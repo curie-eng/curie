@@ -5,6 +5,7 @@ description = "Curie dispatcher (Slack Bolt for Python, Socket Mode): ack + enqu
 requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
+    "curie-telemetry",
     "slack-bolt>=1.30.0",
     "redis>=5.2",
     "pydantic>=2.10",

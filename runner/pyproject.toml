@@ -5,11 +5,11 @@ description = "Curie runner: claude-agent-sdk streaming session server implement
 requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
+    "curie-telemetry",
     "plugin-format",
     "claude-agent-sdk>=0.2.135",
     "aiohttp>=3.14.3",
     "opentelemetry-sdk>=1.44.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.30",
     "anyio>=4.6",
 ]
 

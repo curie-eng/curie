@@ -1,4 +1,4 @@
-"""OTel tracing for the runner: gen_ai spans exported OTLP-HTTP to the collector.
+"""OTel tracing for the runner: gen_ai spans exported by standard OTLP.
 
 Productizes the PT-4/PT-E prototype span shape. Each turn is a root ``agent.run``
 (SERVER) span carrying a ``langfuse.trace.name``, with a child ``llm.generation``
@@ -7,13 +7,12 @@ child ``execute_tool`` span per tool call (``gen_ai.tool.name`` /
 ``gen_ai.operation.name``). Langfuse maps a model-bearing span to a generation and
 nests tool spans as observations, so this reconstructs the tool-call tree (S1).
 
-Traces go to the OTel Collector over OTLP-HTTP, never directly to Langfuse: the
+Traces go to the OTel Collector over OTLP, never directly to Langfuse: the
 collector is the adapter that authenticates and forwards (Langfuse OTLP ingest is
-HTTP-only). Endpoint/headers come from the standard ``OTEL_EXPORTER_OTLP_*`` env
-vars via ``SessionConfig.otel``; the exporter is constructed argument-free so the
-opentelemetry SDK's own env parsing applies (it appends ``/v1/traces`` to a base
-``OTEL_EXPORTER_OTLP_ENDPOINT``). When no endpoint is configured the tracer is a
-no-op, so unit tests and offline runs neither export nor fail.
+HTTP-only). Endpoint, headers, and protocol come from the standard
+``OTEL_EXPORTER_OTLP_*`` variables via ``SessionConfig.otel``; signal-specific
+configuration wins over the general variables. When no endpoint is configured
+the tracer is a no-op, so unit tests and offline runs neither export nor fail.
 
 Per ADR-0076, every attribute this module attaches comes from the closed
 ``SpanAttributeKey`` enum below rather than a bare string, so a future call site
@@ -26,23 +25,49 @@ drift gate diffs to catch a retype.
 
 from __future__ import annotations
 
+import os
+import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from enum import StrEnum
 from typing import Any, cast
 
-from aci_protocol import OtelConfig
+from aci_protocol import BootEnv, OtelConfig
+from curie_telemetry import (
+    build_otlp_span_exporter,
+    build_resource,
+    deployment_environment,
+    service_instance_id,
+)
 from opentelemetry import trace
 from opentelemetry.attributes import BoundedAttributes
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.context import Context
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.trace import SpanKind, Tracer
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import (
+    NonRecordingSpan,
+    SpanContext,
+    SpanKind,
+    StatusCode,
+    TraceFlags,
+    Tracer,
+    set_span_in_context,
+)
 
 from .redact import redact_span_attribute, redact_text
 
+_OTEL_ENDPOINT_ENV = BootEnv.env_key("otel_endpoint")
+_OTEL_PROTOCOL_ENV = BootEnv.env_key("otel_protocol")
+_OTEL_HEADERS_ENV = BootEnv.env_key("otel_headers")
+_OTEL_TRACES_ENDPOINT_ENV = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+_OTEL_TRACES_PROTOCOL_ENV = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"
+_OTEL_TRACES_HEADERS_ENV = "OTEL_EXPORTER_OTLP_TRACES_HEADERS"
 _SERVICE_NAME = "curie-runner"
+_EXPORT_TIMEOUT_MILLIS = 5000
+_MAX_QUEUE_SIZE = 2048
+_MAX_EXPORT_BATCH_SIZE = 512
+_SCHEDULE_DELAY_MILLIS = 1000
 
 # ADR-0076 decision 2: additive (a new optional key) does not bump this; removing,
 # renaming, or retyping an existing key does.
@@ -200,33 +225,107 @@ def build_tracer_provider(
 ) -> TracerProvider | None:
     """Build a TracerProvider exporting to the collector, or None if unconfigured.
 
-    ``session_id`` is attached as a resource attribute so traces are attributable
-    to the sandbox session that produced them. ``sandbox_id`` (the ACI
-    ``CURIE_SANDBOX_ID``) is stamped alongside it when present so a trace is
-    attributable to the concrete sandbox that ran it; an absent or empty value is
-    omitted rather than stamped as an empty string.
+    The resource uses the same stable process identity as every Curie service.
+    Per-turn session and sandbox correlation stays on the root span so backends
+    do not create a resource for every sandbox.
     """
 
-    if not otel.endpoint:
+    exporter_env = dict(os.environ)
+    if otel.endpoint and not any(
+        key in exporter_env
+        for key in (
+            _OTEL_ENDPOINT_ENV,
+            _OTEL_TRACES_ENDPOINT_ENV,
+        )
+    ):
+        exporter_env[_OTEL_ENDPOINT_ENV] = otel.endpoint
+    if otel.protocol and not any(
+        key in exporter_env
+        for key in (
+            _OTEL_PROTOCOL_ENV,
+            _OTEL_TRACES_PROTOCOL_ENV,
+        )
+    ):
+        exporter_env[_OTEL_PROTOCOL_ENV] = otel.protocol
+    if otel.headers and not any(
+        key in exporter_env
+        for key in (
+            _OTEL_HEADERS_ENV,
+            _OTEL_TRACES_HEADERS_ENV,
+        )
+    ):
+        exporter_env[_OTEL_HEADERS_ENV] = otel.headers
+    exporter = build_otlp_span_exporter(
+        exporter_env,
+    )
+    if exporter is None:
         return None
-
-    attributes: dict[str, str] = {
-        SpanAttributeKey.SERVICE_NAME.value: _SERVICE_NAME,
-        SpanAttributeKey.CURIE_SESSION_ID.value: session_id,
-        SpanAttributeKey.SCHEMA_VERSION_KEY.value: SCHEMA_VERSION,
-    }
-    if sandbox_id:
-        attributes[SpanAttributeKey.CURIE_SANDBOX_ID.value] = sandbox_id
-    resource = Resource.create(attributes)
-    provider = TracerProvider(resource=resource)
+    resource = build_resource(
+        _SERVICE_NAME,
+        service_version="0.0.0",
+        service_instance_id=service_instance_id(_SERVICE_NAME),
+        deployment_environment=deployment_environment(exporter_env),
+    ).merge(Resource({SpanAttributeKey.SCHEMA_VERSION_KEY.value: SCHEMA_VERSION}))
+    provider = TracerProvider(resource=resource, shutdown_on_exit=False)
+    # The provider crosses the existing construction seam into RunTracer. Keep
+    # correlation off its Resource while preserving that seam and avoiding a
+    # second runner configuration surface.
+    provider._curie_session_id = session_id  # type: ignore[attr-defined]
+    provider._curie_sandbox_id = sandbox_id or None  # type: ignore[attr-defined]
     # The validator must run before the exporting processor (registration order)
     # so the exporter only ever sees attributes the closed schema allows.
     provider.add_span_processor(_SchemaValidatingSpanProcessor())
-    # The exporter reads OTEL_EXPORTER_OTLP_ENDPOINT / _HEADERS / _PROTOCOL from
-    # the environment itself; SessionConfig.otel is the typed view of the same
-    # vars, so an argument-free exporter and the config agree by construction.
-    provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter()))
+    provider.add_span_processor(
+        BatchSpanProcessor(
+            exporter,
+            max_queue_size=_MAX_QUEUE_SIZE,
+            schedule_delay_millis=_SCHEDULE_DELAY_MILLIS,
+            max_export_batch_size=_MAX_EXPORT_BATCH_SIZE,
+            export_timeout_millis=_EXPORT_TIMEOUT_MILLIS,
+        )
+    )
     return provider
+
+
+def _bounded_provider_call(provider: TracerProvider, method: str, timeout_millis: int) -> bool:
+    """Call one exporter lifecycle method without trusting its wall clock bound."""
+
+    complete = threading.Event()
+    succeeded = False
+
+    def invoke() -> None:
+        nonlocal succeeded
+        try:
+            function = getattr(provider, method)
+            result = (
+                function(timeout_millis=timeout_millis) if method == "force_flush" else function()
+            )
+            succeeded = result is not False
+        except BaseException:
+            succeeded = False
+        finally:
+            complete.set()
+
+    threading.Thread(target=invoke, daemon=True).start()
+    return complete.wait(timeout_millis / 1000) and succeeded
+
+
+def _normalize_parent(parent: Context | None) -> Context:
+    """Return an explicit clean parent with SDK-compatible trace flags."""
+
+    if parent is None:
+        return Context()
+    span_context = trace.get_current_span(parent).get_span_context()
+    if not span_context.is_valid:
+        return parent
+    normalized = SpanContext(
+        trace_id=span_context.trace_id,
+        span_id=span_context.span_id,
+        is_remote=span_context.is_remote,
+        trace_flags=TraceFlags(int(span_context.trace_flags)),
+        trace_state=span_context.trace_state,
+    )
+    return set_span_in_context(NonRecordingSpan(normalized), parent)
 
 
 class RunTracer:
@@ -237,6 +336,8 @@ class RunTracer:
 
     def __init__(self, provider: TracerProvider | None) -> None:
         self._provider = provider
+        self._session_id = getattr(provider, "_curie_session_id", None)
+        self._sandbox_id = getattr(provider, "_curie_sandbox_id", None)
         self._tracer: Tracer = (
             provider.get_tracer("curie-runner")
             if provider is not None
@@ -251,6 +352,8 @@ class RunTracer:
         session_id: str | None = None,
         user_id: str | None = None,
         approval_decision: str | None = None,
+        *,
+        parent: Context | None = None,
     ) -> Iterator[_GenerationSpan]:
         """Open the root ``agent.run`` span and its child ``llm.generation`` span.
 
@@ -267,36 +370,91 @@ class RunTracer:
         an operator can see the outcome from the trace.
         """
 
-        with self._tracer.start_as_current_span("agent.run", kind=SpanKind.SERVER) as root:
-            _set(root, SpanAttributeKey.TRACE_NAME, trace_name)
-            if session_id:
-                _set(root, SpanAttributeKey.SESSION_ID, session_id)
-            if user_id:
-                _set(root, SpanAttributeKey.USER_ID, user_id)
-            if approval_decision:
-                _set(root, SpanAttributeKey.APPROVAL_DECISION, approval_decision)
-            with self._tracer.start_as_current_span("llm.generation") as gen:
-                span = _GenerationSpan(self._tracer, gen)
-                # Stamp the configured model at span open when CURIE_MODEL is
-                # set; otherwise the span stays model-less until the SDK reports
-                # the actual model on its first assistant message (record_model).
-                span.record_model(model)
-                yield span
+        # An absent carrier is deliberately a fresh root. Passing ``None`` to
+        # start_as_current_span would inherit ambient task context and let an
+        # unrelated request become the parent of this long lived session.
+        safe_parent = _normalize_parent(parent)
+        with self._tracer.start_as_current_span(
+            "agent.run",
+            context=safe_parent,
+            kind=SpanKind.SERVER,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as root:
+            span: _GenerationSpan | None = None
+            try:
+                _set(root, SpanAttributeKey.TRACE_NAME, trace_name)
+                if session_id:
+                    _set(root, SpanAttributeKey.SESSION_ID, session_id)
+                effective_session_id = session_id or self._session_id
+                if effective_session_id:
+                    _set(root, SpanAttributeKey.CURIE_SESSION_ID, effective_session_id)
+                if self._sandbox_id:
+                    _set(root, SpanAttributeKey.CURIE_SANDBOX_ID, self._sandbox_id)
+                if user_id:
+                    _set(root, SpanAttributeKey.USER_ID, user_id)
+                if approval_decision:
+                    _set(root, SpanAttributeKey.APPROVAL_DECISION, approval_decision)
+                with self._tracer.start_as_current_span(
+                    "llm.generation",
+                    record_exception=False,
+                    set_status_on_exception=False,
+                ) as gen:
+                    span = _GenerationSpan(self._tracer, root, gen)
+                    try:
+                        # Stamp the configured model at span open when CURIE_MODEL is
+                        # set; otherwise the span stays model-less until the SDK reports
+                        # the actual model on its first assistant message (record_model).
+                        span.record_model(model)
+                        yield span
+                    except BaseException:
+                        # Classify both spans while the generation is still open.
+                        # Doing this in the outer handler is too late: exiting
+                        # start_as_current_span ends the generation first.
+                        span.set_failed()
+                        raise
+                    else:
+                        span.set_succeeded()
+            except BaseException:
+                if span is None:
+                    root.set_status(StatusCode.ERROR)
+                raise
 
-    def shutdown(self) -> None:
-        """Flush and shut down the exporter if one was configured."""
+    def force_flush(self, *, timeout_millis: int = _EXPORT_TIMEOUT_MILLIS) -> bool:
+        """Flush current spans within a hard wall clock bound."""
+
+        if self._provider is None:
+            return True
+        return _bounded_provider_call(self._provider, "force_flush", timeout_millis)
+
+    def shutdown(self, *, timeout_millis: int = _EXPORT_TIMEOUT_MILLIS) -> None:
+        """Flush and shut down the exporter within a hard wall clock bound."""
 
         if self._provider is not None:
-            self._provider.shutdown()
+            _bounded_provider_call(self._provider, "shutdown", timeout_millis)
 
 
 class _GenerationSpan:
     """Handle for annotating the generation span and emitting tool child spans."""
 
-    def __init__(self, tracer: Tracer, span: Any) -> None:
+    def __init__(self, tracer: Tracer, root: Any, span: Any) -> None:
         self._tracer = tracer
+        self._root = root
         self._span = span
         self._model_recorded = False
+
+    def set_succeeded(self) -> None:
+        """Mark both generation and run successful unless already classified."""
+
+        for span in (self._span, self._root):
+            if span.is_recording() and span.status.status_code is StatusCode.UNSET:
+                span.set_status(StatusCode.OK)
+
+    def set_failed(self) -> None:
+        """Mark both generation and run failed without exporting error text."""
+
+        self._span.set_status(StatusCode.ERROR)
+        self._root.set_status(StatusCode.ERROR)
 
     def record_model(self, model: str | None) -> None:
         """Stamp the generation model attribute once, first non-empty value wins.
@@ -338,6 +496,10 @@ class _GenerationSpan:
     def tool_span(self, tool_name: str) -> None:
         """Emit a short ``execute_tool`` child span for one tool call."""
 
-        with self._tracer.start_as_current_span("execute_tool") as tool:
+        with self._tracer.start_as_current_span(
+            "execute_tool",
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as tool:
             _set(tool, SpanAttributeKey.TOOL_NAME, tool_name)
             _set(tool, SpanAttributeKey.OPERATION_NAME, "execute_tool")

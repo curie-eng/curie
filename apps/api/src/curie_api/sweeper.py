@@ -42,8 +42,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 
+from curie_telemetry import operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import crud
@@ -51,6 +54,28 @@ from .config import get_settings
 from .resumequeue import ResumeQueue, build_expiry_resume_turn
 
 logger = logging.getLogger(__name__)
+_monotonic = time.monotonic
+
+
+async def observe_pending_approvals(
+    session: AsyncSession, *, now: datetime | None = None
+) -> None:
+    """Publish authoritative fleet inventory; observation never gates a sweep."""
+
+    try:
+        count, oldest = await crud.pending_approval_inventory(session)
+    except Exception as exc:
+        logger.warning("pending approval telemetry observation failed (%s)", type(exc).__name__)
+        return
+    observed_at = now or datetime.now(UTC).replace(tzinfo=None)
+    attributes = {
+        "service.name": "curie-api",
+        "operation": "observe",
+        "outcome": "pending",
+    }
+    record_metric("curie.approval.pending", count, attributes=attributes)
+    age = 0.0 if oldest is None else max(0.0, (observed_at - oldest).total_seconds())
+    record_metric("curie.approval.pending.age", age, attributes=attributes)
 
 
 async def sweep_expired_approvals(
@@ -88,7 +113,15 @@ async def sweep_expired_approvals(
     flipped = 0
     for approval_id in approval_ids:
         try:
-            expired = await crud.expire_approval(session, approval_id)
+            with operation_span(
+                "curie.approval.expire",
+                kind=SpanKind.INTERNAL,
+                attributes={
+                    "service.name": "curie-api",
+                    "operation": "expire",
+                },
+            ):
+                expired = await crud.expire_approval(session, approval_id)
             if expired is None:
                 # A concurrent resolver or another replica's sweeper won the CAS;
                 # the winner owns the audit and enqueue. No side effects here.
@@ -113,6 +146,14 @@ async def sweep_expired_approvals(
             # stream is written off. The mark's ``resumed_at IS NULL`` guard
             # makes a race with the reconciler a no-op rather than a conflict.
             await crud.mark_approval_resumed(session, expired.id)
+            record_metric(
+                "curie.approval.lifecycle",
+                attributes={
+                    "service.name": "curie-api",
+                    "operation": "expire",
+                    "outcome": "expired",
+                },
+            )
             logger.info(
                 "approval %s expired by sweeper; resume turn enqueued (%s)",
                 expired.id,
@@ -145,6 +186,7 @@ async def sweep_expired_approvals(
                 retry,
             )
             continue
+    await observe_pending_approvals(session, now=now)
     return flipped
 
 
@@ -171,6 +213,7 @@ async def run_expiry_sweeper(
     interval rather than crashing the process.
     """
 
+    last_success_monotonic: float | None = None
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_s)
@@ -178,14 +221,52 @@ async def run_expiry_sweeper(
             pass
         if stop.is_set():
             break
-        try:
-            async with sessionmaker() as session:
-                await sweep_expired_approvals(session, resume_queue)
-                await crud.reap_terminal_publication_patches(
-                    session,
-                    terminal_before=datetime.now(UTC).replace(tzinfo=None)
-                    - timedelta(seconds=publication_patch_retention_seconds),
-                    limit=100,
+        attributes = {
+            "service.name": "curie-api",
+            "operation": "approval-sweeper",
+            "role": "background",
+        }
+        error: Exception | None = None
+        with operation_span(
+            "curie.background.approval-sweeper",
+            kind=SpanKind.INTERNAL,
+            attributes=attributes,
+        ) as span:
+            try:
+                async with sessionmaker() as session:
+                    await sweep_expired_approvals(session, resume_queue)
+                    await crud.reap_terminal_publication_patches(
+                        session,
+                        terminal_before=datetime.now(UTC).replace(tzinfo=None)
+                        - timedelta(seconds=publication_patch_retention_seconds),
+                        limit=100,
+                    )
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "background.pass.failed",
+                    {"outcome": "failure", "error.class": type(exc).__name__},
                 )
-        except Exception:
-            logger.exception("expiry sweep pass failed; retrying next interval")
+            else:
+                span.add_event("background.pass.completed", {"outcome": "success"})
+        outcome = "failure" if error is not None else "success"
+        record_metric(
+            "curie.background.loop",
+            attributes={**attributes, "outcome": outcome},
+        )
+        now = _monotonic()
+        if error is None:
+            last_success_monotonic = now
+        if last_success_monotonic is not None:
+            record_metric(
+                "curie.background.last_success.age",
+                max(0.0, now - last_success_monotonic),
+                attributes=attributes,
+            )
+        if error is not None:
+            logger.error(
+                "expiry sweep pass failed; retrying next interval (%s)",
+                type(error).__name__,
+            )

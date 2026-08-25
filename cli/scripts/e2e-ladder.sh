@@ -193,6 +193,22 @@ fi
 # when the ladder started is reused and left alone.
 LOCAL_STACK_OWNED=0
 
+# The local observability proof owns one uniquely named Collector sink. It is
+# deliberately separate from the product Collector: querying the product's own
+# exporter would only prove configuration, while this receiver proves bytes
+# crossed the API -> worker -> sandbox boundary. The stubbed CLI contract tests
+# set STUB_STATE; they exercise ladder decisions without a Docker daemon and do
+# not pretend to be this runtime proof.
+LOCAL_OTEL_SINK_NAME="curie-ladder-otel-sink-$$"
+LOCAL_OTEL_SINK_OWNED=0
+LOCAL_OTEL_NETWORK_OWNED=0
+LOCAL_OTEL_SINK_ACTIVE=0
+LOCAL_OTEL_ENDPOINT=""
+LOCAL_OTEL_METRICS_ENDPOINT=""
+LOCAL_OTEL_FAILURE_MODE=0
+OTEL_E2E_SECRET_SENTINEL="xapp-"
+OTEL_E2E_SECRET_SENTINEL+="0-0000000000-0000000000-$$"
+
 # Cross-rung artifact identity, pinned by the first rung to report a digest and
 # matched by every later one (see assert_bundle_identity). Empty until then.
 PARITY_DIGEST=""
@@ -269,6 +285,7 @@ cleanup() {
             docker rm -f $orphans >/dev/null 2>&1
         fi
     fi
+    stop_local_otel_sink
     # Only the container THIS run created, matched by its exact unique name, so
     # the sweep can never reach a runner belonging to another session. Cleared by
     # the case itself once `skill down` has removed it.
@@ -1596,6 +1613,621 @@ case_connector_registry_missing_cluster() {
     echo "cluster: deployment/$object still runs $before -- the refusal changed nothing on the cluster"
 }
 
+start_local_otel_sink() {
+    # The Rust executing-contract tests intentionally replace docker/curie with
+    # stubs. Keep those tests about ladder branching; only the real local rung
+    # claims runtime OTel evidence.
+    if [[ -n "${STUB_STATE:-}" ]]; then
+        echo "local: runtime OTel sink skipped under the command-stub harness"
+        return 0
+    fi
+    if [[ -n "$(docker ps -q --filter 'name=^/curie-api$' 2>/dev/null)" ]]; then
+        echo "local: a compose stack is already running, so this rung cannot replace its immutable OTel endpoint with the task-owned sink." >&2
+        echo "fix: let the owning session run \`curie local down\`, then re-run CURIE_E2E_TIERS=local curie dev e2e-ladder." >&2
+        return 1
+    fi
+
+    local network=curie_runner
+    if ! docker network inspect "$network" >/dev/null 2>&1; then
+        docker network create \
+            --label com.docker.compose.project=curie \
+            --label com.docker.compose.network=curie_runner \
+            "$network" >/dev/null
+        LOCAL_OTEL_NETWORK_OWNED=1
+    fi
+
+    local output_dir="$WORKDIR/otel-sink"
+    mkdir -p "$output_dir"
+    chmod 0777 "$output_dir"
+    local sink_config="$WORKDIR/otel-e2e-sink-config.yaml"
+    awk '
+        { print }
+        $0 == "service:" {
+            print "  telemetry:"
+            print "    metrics:"
+            print "      level: detailed"
+            print "      address: 0.0.0.0:8888"
+        }
+    ' "$REPO_ROOT/cli/scripts/fixtures/otel-e2e-sink-config.yaml" > "$sink_config"
+    LOCAL_OTEL_SINK_OWNED=1
+    local start_log="$WORKDIR/otel-sink-start.log" attempt started=0
+    # Docker's ephemeral host-port allocator can race the kernel's current
+    # listeners even on a fresh CI runner. Retry only that explicit bind race;
+    # configuration/image failures remain immediately loud.
+    for attempt in $(seq 1 5); do
+        if docker run -d \
+            --name "$LOCAL_OTEL_SINK_NAME" \
+            --label "curietech.ai/e2e-owner=$LOCAL_OTEL_SINK_NAME" \
+            --network "$network" \
+            --user 0 \
+            -p 0.0.0.0::4318 \
+            -p 127.0.0.1::13133 \
+            -p 127.0.0.1::8888 \
+            -v "$sink_config:/etc/otelcol-contrib/config.yaml:ro" \
+            -v "$output_dir:/var/lib/otel-e2e" \
+            otel/opentelemetry-collector-contrib:0.119.0 \
+            --config=/etc/otelcol-contrib/config.yaml >"$start_log" 2>&1; then
+            started=1
+            break
+        fi
+        if ! grep -Fq 'address already in use' "$start_log"; then
+            cat "$start_log" >&2
+            return 1
+        fi
+        docker rm -f "$LOCAL_OTEL_SINK_NAME" >/dev/null 2>&1 || true
+        echo "local: Docker host-port allocation raced on attempt $attempt; retrying task-owned sink" >&2
+        sleep 1
+    done
+    if (( ! started )); then
+        cat "$start_log" >&2
+        echo "local: Docker could not allocate private sink ports after 5 attempts" >&2
+        return 1
+    fi
+
+    local gateway otlp_port health_port metrics_port
+    gateway="$(docker network inspect "$network" --format '{{(index .IPAM.Config 0).Gateway}}')"
+    otlp_port="$(docker port "$LOCAL_OTEL_SINK_NAME" 4318/tcp | awk -F: 'END {print $NF}')"
+    health_port="$(docker port "$LOCAL_OTEL_SINK_NAME" 13133/tcp | awk -F: 'END {print $NF}')"
+    metrics_port="$(docker port "$LOCAL_OTEL_SINK_NAME" 8888/tcp | awk -F: 'END {print $NF}')"
+    if [[ -z "$gateway" || -z "$otlp_port" || -z "$health_port" || -z "$metrics_port" ]]; then
+        echo "local: task-owned OTel sink did not publish its gateway and ports" >&2
+        return 1
+    fi
+    LOCAL_OTEL_ENDPOINT="http://$gateway:$otlp_port"
+    LOCAL_OTEL_METRICS_ENDPOINT="http://127.0.0.1:$metrics_port/metrics"
+    export OTEL_EXPORTER_OTLP_ENDPOINT="$LOCAL_OTEL_ENDPOINT"
+    export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+
+    local attempt
+    for attempt in $(seq 1 30); do
+        if curl -fsS "http://127.0.0.1:$health_port/" >/dev/null 2>&1; then
+            LOCAL_OTEL_SINK_ACTIVE=1
+            echo "local: task-owned OTel sink is healthy at $LOCAL_OTEL_ENDPOINT"
+            assert_local_otel_zero_export_control
+            return 0
+        fi
+        sleep 1
+    done
+    docker logs "$LOCAL_OTEL_SINK_NAME" >&2 || true
+    echo "local: task-owned OTel sink did not become healthy" >&2
+    return 1
+}
+
+stop_local_otel_sink() {
+    if (( LOCAL_OTEL_SINK_OWNED )); then
+        docker rm -f "$LOCAL_OTEL_SINK_NAME" >/dev/null 2>&1 || true
+        LOCAL_OTEL_SINK_OWNED=0
+    fi
+    if (( LOCAL_OTEL_NETWORK_OWNED )); then
+        docker network rm curie_runner >/dev/null 2>&1 || true
+        LOCAL_OTEL_NETWORK_OWNED=0
+    fi
+    LOCAL_OTEL_SINK_ACTIVE=0
+    LOCAL_OTEL_METRICS_ENDPOINT=""
+}
+
+local_otel_query() {
+    local mode="$1" baseline="${2:-}"
+    python3 - "$mode" "$WORKDIR/otel-sink" "$baseline" "$PROMPT" "$OTEL_E2E_SECRET_SENTINEL" <<'PY'
+import json
+import pathlib
+import sys
+
+mode, root_raw, baseline_raw, prompt, sentinel = sys.argv[1:]
+root = pathlib.Path(root_raw)
+
+def documents(name):
+    path = root / f"{name}.json"
+    if not path.exists():
+        return []
+    result = []
+    for line in path.read_text(errors="replace").splitlines():
+        if line.strip():
+            result.append(json.loads(line))
+    return result
+
+def attr_map(items):
+    values = {}
+    for item in items or []:
+        value = item.get("value", {})
+        scalar = next((value[k] for k in (
+            "stringValue", "intValue", "doubleValue", "boolValue"
+        ) if k in value), None)
+        values[item.get("key")] = scalar
+    return values
+
+spans = []
+for doc in documents("traces"):
+    for resource_spans in doc.get("resourceSpans", []):
+        resource = attr_map(resource_spans.get("resource", {}).get("attributes"))
+        for scope_spans in resource_spans.get("scopeSpans", []):
+            for span in scope_spans.get("spans", []):
+                spans.append((span, resource))
+
+logs = []
+for doc in documents("logs"):
+    for resource_logs in doc.get("resourceLogs", []):
+        resource = attr_map(resource_logs.get("resource", {}).get("attributes"))
+        for scope_logs in resource_logs.get("scopeLogs", []):
+            for record in scope_logs.get("logRecords", []):
+                logs.append((record, resource))
+
+metrics = []
+for doc in documents("metrics"):
+    for resource_metrics in doc.get("resourceMetrics", []):
+        resource = attr_map(resource_metrics.get("resource", {}).get("attributes"))
+        for scope_metrics in resource_metrics.get("scopeMetrics", []):
+            for metric in scope_metrics.get("metrics", []):
+                points = []
+                kind = next(
+                    (kind for kind in ("gauge", "sum", "histogram", "exponentialHistogram")
+                     if kind in metric),
+                    None,
+                )
+                if kind is not None:
+                    points.extend(metric[kind].get("dataPoints", []))
+                metrics.append((metric.get("name"), kind, points, resource))
+
+def point_value(kind, point):
+    if kind in ("histogram", "exponentialHistogram"):
+        return float(point.get("count", 0))
+    for key in ("asInt", "asDouble"):
+        if key in point:
+            return float(point[key])
+    return 0.0
+
+def metric_series():
+    # OTLP cumulative exports repeat the same time series. Retain only its
+    # latest point, keyed by stable resource identity plus bounded attributes,
+    # so a before/after delta is a real instrument change rather than a count of
+    # export cycles. A recreated service has a new instance id and therefore a
+    # separate monotonically increasing series instead of looking like a reset.
+    latest = {}
+    sequence = 0
+    for name, kind, points, resource in metrics:
+        for point in points:
+            sequence += 1
+            attrs = attr_map(point.get("attributes"))
+            key = (
+                name,
+                resource.get("service.name"),
+                resource.get("service.instance.id"),
+                json.dumps(attrs, sort_keys=True, separators=(",", ":")),
+            )
+            stamp = int(point.get("timeUnixNano") or sequence)
+            candidate = {
+                "name": name,
+                "service": resource.get("service.name"),
+                "instance": resource.get("service.instance.id"),
+                "attributes": attrs,
+                "value": point_value(kind, point),
+            }
+            if key not in latest or stamp >= latest[key][0]:
+                latest[key] = (stamp, candidate)
+    return [candidate for _, candidate in latest.values()]
+
+def snapshot():
+    return {
+        "trace_ids": sorted({span.get("traceId") for span, _ in spans if span.get("traceId")}),
+        "metrics": metric_series(),
+    }
+
+def load_baseline():
+    assert baseline_raw, f"{mode} requires a before snapshot"
+    return json.loads(pathlib.Path(baseline_raw).read_text())
+
+def metric_total(series, name, **wanted):
+    return sum(
+        item["value"] for item in series
+        if item["name"] == name
+        and all(item["attributes"].get(key) == value for key, value in wanted.items())
+    )
+
+def delta(before, current, name, **wanted):
+    return metric_total(current, name, **wanted) - metric_total(before, name, **wanted)
+
+if mode == "snapshot":
+    print(json.dumps(snapshot(), sort_keys=True))
+    raise SystemExit(0)
+
+if mode == "no-turn":
+    series = metric_series()
+    assert metric_total(series, "curie.turn.accepted") == 0, (
+        "turn.accepted changed before the ladder sent a turn"
+    )
+    assert metric_total(series, "curie.turn.completed") == 0, (
+        "turn.completed changed before the ladder sent a turn"
+    )
+    raise SystemExit(0)
+
+# `curie local message` delegates its producer write to a bounded, Slack-free
+# process in the real dispatcher image. Its producer span injects the carrier
+# beside the frozen payload, so this exact runtime proof must start at dispatcher
+# enqueue and cross Valkey into worker -> sandbox -> runner -> reply.
+required_spans = {
+    "curie.queue.enqueue", "curie.queue.process", "curie.turn.process",
+    "curie.sandbox.claim", "curie.runner.rpc", "agent.run",
+}
+by_trace = {}
+for span, resource in spans:
+    by_trace.setdefault(span.get("traceId"), []).append((span, resource))
+healthy = []
+for trace_id, trace_spans in by_trace.items():
+    names = {span.get("name") for span, _ in trace_spans}
+    services = {resource.get("service.name") for _, resource in trace_spans}
+    has_reply = bool({"curie.reply.post", "curie.reply.update"} & names)
+    if required_spans <= names and has_reply and {
+        "curie-dispatcher", "curie-worker", "curie-runner"
+    } <= services:
+        healthy.append(trace_id)
+
+if mode == "healthy":
+    before = load_baseline()
+    new_trace_ids = set(by_trace) - set(before["trace_ids"])
+    new_healthy = [trace_id for trace_id in healthy if trace_id in new_trace_ids]
+    assert new_healthy, (
+        "expected a new end-to-end trace after the before snapshot; "
+        f"span names={sorted({span.get('name') for span, _ in spans})}; "
+        f"services={sorted({resource.get('service.name') for _, resource in spans})}"
+    )
+    for trace_id in new_healthy:
+        trace_spans = by_trace[trace_id]
+        assert all(
+            span.get("status", {}).get("code") not in (2, "STATUS_CODE_ERROR")
+            for span, _ in trace_spans
+        ), f"healthy trace {trace_id} contains an ERROR span"
+        agent_runs = [span for span, _ in trace_spans if span.get("name") == "agent.run"]
+        assert agent_runs and all(
+            span.get("status", {}).get("code") in (1, "STATUS_CODE_OK")
+            for span in agent_runs
+        ), f"healthy trace {trace_id} did not finish agent.run with explicit OK"
+        failure_events = [
+            attrs.get("curie.outcome")
+            for span, _ in trace_spans
+            for event in span.get("events", [])
+            for attrs in [attr_map(event.get("attributes"))]
+            if attrs.get("curie.outcome") in ("failure", "classified_failure")
+        ]
+        assert not failure_events, (
+            f"healthy trace {trace_id} carried failure outcomes {failure_events}"
+        )
+
+    # The health probe immediately before the turn exercises API telemetry;
+    # the one-shot producer and turn exercise dispatcher, worker, and runner.
+    # Every platform service must therefore emit both a new span and a log with
+    # the same trace/span context after the baseline snapshot.
+    platform_services = {"curie-api", "curie-dispatcher", "curie-worker", "curie-runner"}
+    exercised = {
+        resource.get("service.name")
+        for trace_id in new_trace_ids
+        for _, resource in by_trace[trace_id]
+        if resource.get("service.name") in platform_services
+    }
+    correlated_services = {
+        resource.get("service.name")
+        for record, resource in logs
+        if record.get("traceId") in new_trace_ids
+        and record.get("spanId")
+        and resource.get("service.name") in exercised
+    }
+    assert exercised == platform_services, (
+        "expected every platform service to emit a new span: "
+        f"{sorted(platform_services - exercised)}"
+    )
+    assert platform_services <= correlated_services, (
+        "services emitted spans without correlated OTLP logs: "
+        f"{sorted(platform_services - correlated_services)}"
+    )
+
+    required_metrics = {
+        "curie.turn.accepted", "curie.turn.completed", "curie.turn.duration",
+        "curie.queue.message.age", "curie.sandbox.lifecycle", "curie.runner.rpc.result",
+    }
+    names = {name for name, _, _, _ in metrics}
+    assert required_metrics <= names, f"missing operational metrics: {sorted(required_metrics - names)}"
+    forbidden = {"event.id", "session.id", "sandbox.id", "user.id", "trace_id", "span_id"}
+    for name, _, points, _ in metrics:
+        for point in points:
+            keys = set(attr_map(point.get("attributes")))
+            assert not keys & forbidden, f"metric {name} has high-cardinality attributes {sorted(keys & forbidden)}"
+
+    current = metric_series()
+    previous = before["metrics"]
+    positive_deltas = {
+        "curie.turn.accepted": delta(previous, current, "curie.turn.accepted"),
+        "curie.turn.completed[done]": delta(
+            previous, current, "curie.turn.completed", outcome="done"
+        ),
+        "curie.turn.duration[done]": delta(
+            previous, current, "curie.turn.duration", outcome="done"
+        ),
+        "curie.queue.message.age": delta(previous, current, "curie.queue.message.age"),
+        "curie.sandbox.lifecycle": delta(previous, current, "curie.sandbox.lifecycle"),
+        "curie.runner.rpc.result[success]": delta(
+            previous, current, "curie.runner.rpc.result", outcome="success"
+        ),
+    }
+    assert all(value > 0 for value in positive_deltas.values()), (
+        f"successful turn did not move every required counter/measurement: {positive_deltas}"
+    )
+    classified_delta = delta(
+        previous, current, "curie.turn.completed", outcome="classified_failure"
+    )
+    assert classified_delta == 0, (
+        "healthy control changed the classified_failure counter by "
+        f"{classified_delta}"
+    )
+    print(json.dumps({
+        "healthy_new_traces": len(new_healthy),
+        "correlated_services": sorted(correlated_services),
+        "metric_deltas": positive_deltas,
+        "classified_failure_delta": classified_delta,
+    }, sort_keys=True))
+    raise SystemExit(0)
+
+if mode == "redacted":
+    payload = "\n".join(
+        (root / name).read_text(errors="replace")
+        for name in ("traces.json", "logs.json", "metrics.json")
+        if (root / name).exists()
+    )
+    assert prompt not in payload, "the user prompt was exported verbatim"
+    assert sentinel not in payload, "the credential-shaped sentinel was exported"
+    raise SystemExit(0)
+
+if mode == "failed":
+    before = load_baseline()
+    new_trace_ids = set(by_trace) - set(before["trace_ids"])
+    failed_trace_ids = []
+    for trace_id in new_trace_ids:
+        trace_spans = by_trace[trace_id]
+        names = {span.get("name") for span, _ in trace_spans}
+        if not required_spans <= names:
+            continue
+        error_span_names = {
+            span.get("name")
+            for span, _ in trace_spans
+            if span.get("status", {}).get("code") in (2, "STATUS_CODE_ERROR")
+        }
+        has_error = {"curie.turn.process", "agent.run"} <= error_span_names
+        has_classified = any(
+            attr_map(event.get("attributes")).get("curie.outcome") == "classified_failure"
+            for span, _ in trace_spans
+            for event in span.get("events", [])
+        )
+        if has_error and has_classified:
+            failed_trace_ids.append(trace_id)
+    assert failed_trace_ids, (
+        "no new worker-to-runner trace carried ERROR on turn.process + agent.run and classified_failure"
+    )
+    error_log_traces = {
+        record.get("traceId")
+        for record, _ in logs
+        if record.get("traceId") in failed_trace_ids
+        and record.get("spanId")
+        and (
+            int(record.get("severityNumber") or 0) >= 17
+            or str(record.get("severityText") or "").upper() in ("ERROR", "FATAL")
+        )
+    }
+    assert error_log_traces, (
+        "the new failed trace had no ERROR LogRecord with the same traceId"
+    )
+    current = metric_series()
+    previous = before["metrics"]
+    classified_delta = delta(
+        previous, current, "curie.turn.completed", outcome="classified_failure"
+    )
+    assert classified_delta > 0, (
+        "the injected failure did not increase curie.turn.completed{outcome=classified_failure}"
+    )
+    done_delta = delta(previous, current, "curie.turn.completed", outcome="done")
+    assert done_delta == 0, (
+        f"the injected failure incorrectly increased successful completions by {done_delta}"
+    )
+    print(json.dumps({
+        "failed_new_traces": len(failed_trace_ids),
+        "error_log_trace_matches": len(error_log_traces),
+        "classified_failure_delta": classified_delta,
+        "done_delta": done_delta,
+    }, sort_keys=True))
+    raise SystemExit(0)
+
+raise AssertionError(f"unknown local OTel query mode: {mode}")
+PY
+}
+
+assert_bounded_metric_attributes() {
+    # The query's forbidden set is intentionally repeated at the call site so a
+    # source review cannot mistake this for an unexercised helper: event.id,
+    # session.id, sandbox.id, user.id, trace_id, and span_id are rejected.
+    local_otel_query healthy "$1"
+}
+
+local_otel_write_snapshot() {
+    local destination="$1"
+    local_otel_query snapshot > "$destination"
+}
+
+wait_for_local_otel_metric_settle() {
+    # App readers export every 10s; cross one full interval plus margin so a
+    # prior turn cannot arrive after the failure baseline is captured.
+    sleep 12
+}
+
+local_otel_self_metric_value() {
+    local metric="$1"
+    curl -fsS "$LOCAL_OTEL_METRICS_ENDPOINT" | python3 -c '
+import re, sys
+name = sys.argv[1]
+total = 0.0
+for line in sys.stdin:
+    if re.match(r"^" + re.escape(name) + r"(?:\{|\s)", line):
+        total += float(line.rsplit(None, 1)[1])
+print(total)
+' "$metric"
+}
+
+assert_local_otel_zero_export_control() {
+    local accepted sent
+    local_otel_query no-turn
+    accepted="$(local_otel_self_metric_value otelcol_receiver_accepted_metric_points)"
+    sent="$(local_otel_self_metric_value otelcol_exporter_sent_metric_points)"
+    python3 -c '
+import sys
+raise SystemExit(0 if all(float(value) == 0 for value in sys.argv[1:]) else 1)
+' "$accepted" "$sent" || {
+        echo "local: fresh sink received/exported metric points before any platform service started (accepted=$accepted sent=$sent)" >&2
+        return 1
+    }
+    echo "local: zero-export negative proved a fresh sink has no turn counters and accepted=0 sent=0 metric points"
+}
+
+assert_local_otel_no_turn_pipeline_live() {
+    local attempt accepted=0 sent=0
+    for attempt in $(seq 1 45); do
+        if local_otel_query no-turn >/dev/null 2>&1; then
+            accepted="$(local_otel_self_metric_value otelcol_receiver_accepted_metric_points)"
+            sent="$(local_otel_self_metric_value otelcol_exporter_sent_metric_points)"
+            if python3 -c '
+import sys
+raise SystemExit(0 if all(float(value) > 0 for value in sys.argv[1:]) else 1)
+' "$accepted" "$sent"; then
+                local_otel_query no-turn
+                echo "local: no-turn control kept app turn counters at zero while Collector accepted=$accepted and exported=$sent metric points"
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    echo "local: no-turn control could not distinguish a live metric pipeline from zero export (accepted=$accepted sent=$sent)" >&2
+    return 1
+}
+
+assert_local_otel_redacted() {
+    local_otel_query redacted
+}
+
+assert_local_otel_healthy_turn() {
+    local baseline="$1" attempt
+    # Local causal trace: curie.queue.enqueue -> curie.queue.process ->
+    # curie.turn.process -> curie.sandbox.claim -> curie.runner.rpc ->
+    # agent.run -> curie.reply.update or curie.reply.post. Correlated logs must carry traceId,
+    # spanId, and resource service.name for dispatcher, worker, and runner.
+    # Operational metrics pinned here are
+    # curie.turn.accepted, curie.turn.completed, curie.turn.duration,
+    # curie.queue.message.age, curie.sandbox.lifecycle, and
+    # curie.runner.rpc.result. Metric points must reject event.id, session.id,
+    # sandbox.id, user.id, trace_id, and span_id.
+    for attempt in $(seq 1 45); do
+        if assert_bounded_metric_attributes "$baseline" >/dev/null 2>&1; then
+            assert_bounded_metric_attributes "$baseline"
+            assert_local_otel_redacted
+            echo "local: OTel healthy control proved causality, log correlation, bounded metric attributes, and redaction"
+            return 0
+        fi
+        sleep 2
+    done
+    assert_bounded_metric_attributes "$baseline"
+}
+
+inject_local_runner_failure() {
+    LOCAL_OTEL_FAILURE_MODE=1
+    export CURIE_FAKE_MODEL=0
+    export CURIE_MODEL_BASE_URL="$LOCAL_OTEL_ENDPOINT"
+    export CURIE_MODEL_API_BACKEND=messages
+    docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+        up -d --force-recreate --no-deps curie-worker >/dev/null
+    sleep 3
+}
+
+restore_local_runner_health() {
+    if [[ "$LIVE" == "1" ]]; then
+        export CURIE_FAKE_MODEL=0
+    else
+        export CURIE_FAKE_MODEL=1
+    fi
+    unset CURIE_MODEL_BASE_URL CURIE_MODEL_API_BACKEND
+    docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+        up -d --force-recreate --no-deps curie-worker >/dev/null
+    LOCAL_OTEL_FAILURE_MODE=0
+    sleep 3
+}
+
+assert_local_otel_failed_turn() {
+    local baseline="$1" attempt
+    for attempt in $(seq 1 45); do
+        if local_otel_query failed "$baseline" >/dev/null 2>&1; then
+            local_otel_query failed "$baseline"
+            echo "local: injected non-retryable runner failure exported a new causally matched ERROR trace/log and classified_failure metric delta"
+            return 0
+        fi
+        sleep 2
+    done
+    local_otel_query failed "$baseline"
+}
+
+case_local_otel_runner_failure() {
+    (( LOCAL_OTEL_SINK_ACTIVE )) || return 0
+    echo
+    echo "=== case: local runner failure is observable and recovers ==="
+    # Negative evidence requires explicit ERROR status and classified_failure
+    # outcome before the restored healthy trace. This injected model_not_found
+    # is deliberately non-retryable; manufacturing a retry would weaken the
+    # kernel's bounded failure classification rather than strengthen the proof.
+    local failure_before="$WORKDIR/otel-before-failure.json"
+    local restored_before="$WORKDIR/otel-before-restored.json"
+    local failure_out failure_code=0 restored_out
+    wait_for_local_otel_metric_settle
+    local_otel_write_snapshot "$failure_before"
+    inject_local_runner_failure
+    failure_out="$("$BIN" --json local message --channel C0LOCALDEV "runner failure control" 2>&1)" || failure_code=$?
+    printf '%s\n' "$failure_out"
+    if (( failure_code != 0 )) && [[ "$failure_out" != *'"finalized":true'* ]]; then
+        # An unexpectedly shaped failure cannot be allowed to strand the
+        # injected worker configuration.
+        restore_local_runner_health
+        echo "local: injected runner failure produced neither a finalized escalation nor a queryable reply" >&2
+        return 1
+    fi
+    # Assert before recreating the worker: the live BatchSpanProcessor owns
+    # the failed turn's pending export, so restoring first can erase the very
+    # trace/log/metric evidence this control is meant to observe.
+    if ! assert_local_otel_failed_turn "$failure_before"; then
+        # The evidence assertion itself may fail, but failure must still leave
+        # the ordinary local runner configuration restored for later cleanup.
+        restore_local_runner_health
+        return 1
+    fi
+    restore_local_runner_health
+
+    local_otel_write_snapshot "$restored_before"
+    restored_out="$("$BIN" --json local message --channel C0LOCALDEV "restored healthy control" || true)"
+    printf '%s\n' "$restored_out"
+    assert_finalized_reply "local" "$restored_out"
+    assert_local_otel_healthy_turn "$restored_before"
+}
+
 # Rung 1: the existing skill-tier round trip. Still exactly one implementation
 # and never copied -- but no longer unparameterized: it is handed THIS run's
 # bundle copy through CURIE_E2E_BUNDLE, so rung 1 boots and grades the same
@@ -1661,6 +2293,8 @@ rung_local() {
     echo "########## rung 2/3: local (compose) ##########"
     RAN_RUNGS="$RAN_RUNGS local"
 
+    start_local_otel_sink
+
     assert_stub_port_free
 
     if [[ -n "$(docker ps -q --filter 'name=curie-api' 2>/dev/null)" ]]; then
@@ -1675,7 +2309,7 @@ rung_local() {
     else
         echo
         local up_args=(local up)
-        if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
+        if (( ! LOCAL_OTEL_SINK_ACTIVE )) && [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
             up_args+=(--minimal)
         fi
         echo "=== curie ${up_args[*]} ==="
@@ -1754,12 +2388,31 @@ rung_local() {
     # Re-probe: the precheck above ran before `local up` and `local deploy`,
     # potentially minutes ago, and the stub binds the port only now.
     assert_stub_port_free
-    local out
+    local out healthy_before="$WORKDIR/otel-before-healthy.json"
+    if (( LOCAL_OTEL_SINK_ACTIVE )); then
+        # This is the falsifiable half of the "no turns" distinction: the
+        # platform has already exported ordinary metric points, yet no turn
+        # counter has moved. A dead/zero-export pipeline cannot pass it.
+        assert_local_otel_no_turn_pipeline_live
+        local_otel_write_snapshot "$healthy_before"
+    fi
     # `|| true`: the timeout shape exits non-zero, and the assertion helper is
     # what must classify it, not set -e.
-    out="$("$BIN" --json local message "$PROMPT" || true)"
+    # Exercise one API span/log after the baseline. Pinning the channel on the
+    # message still keeps the turn's causal trace independent of API lookup.
+    curl -fsS "${CURIE_API_URL:-http://localhost:28000}/health" >/dev/null
+    # The credential-shaped fake user reaches an args-style runner log and the
+    # closed user correlation span attribute. The sink assertion below proves
+    # neither dangerous path exports it; the prompt also proves content stays
+    # out of telemetry.
+    out="$("$BIN" --json local message --channel C0LOCALDEV --user "$OTEL_E2E_SECRET_SENTINEL" "$PROMPT $OTEL_E2E_SECRET_SENTINEL" || true)"
     printf '%s\n' "$out"
     assert_finalized_reply "local" "$out"
+
+    if (( LOCAL_OTEL_SINK_ACTIVE )); then
+        assert_local_otel_healthy_turn "$healthy_before"
+        case_local_otel_runner_failure
+    fi
 
     echo
     echo "=== curie local eval --dry-run (suite parity) ==="
@@ -1780,6 +2433,7 @@ rung_local() {
         echo "=== curie local down ==="
         "$BIN" local down
         LOCAL_STACK_OWNED=0
+        stop_local_otel_sink
 
         echo
         echo "=== assert nothing curie-related survived ==="
@@ -1862,7 +2516,8 @@ rung_local_release() {
             echo "error: image '$image' is required by compose.release.yaml's $compose_profile profile and is not present locally." >&2
             missing=1
         fi
-    done < <(docker compose -f "$release_compose" --profile "$compose_profile" config --images)
+    done < <(docker compose -f "$release_compose" \
+        --profile "$compose_profile" --profile slack config --images)
     if (( missing )); then
         echo "fix: build and tag the missing image(s) locally under the tag compose.release.yaml pins (see .github/workflows/ci.yaml's e2e-ladder job for the exact build+tag steps CI uses), then re-run." >&2
         return 1

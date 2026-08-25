@@ -1,10 +1,11 @@
 # OTel Collector config for the Curie dev stack.
 #
-# Receives OTLP from our services over BOTH gRPC (4317) and HTTP (4318), and
-# forwards to Langfuse. Langfuse OTLP ingest is HTTP-only (gRPC is silently
-# unsupported), so the collector is the adapter: services may speak gRPC, but
-# the export to Langfuse is always otlphttp. Langfuse appends /v1/traces to the
-# otlphttp endpoint's base path itself.
+# Receives OTLP traces, logs, and metrics from our services over BOTH gRPC
+# (4317) and HTTP (4318). Traces go to Langfuse; development logs and metrics
+# use debug plus explicit nop exporters until #1765 supplies their backends.
+# Langfuse OTLP ingest is HTTP-only (gRPC is silently unsupported), so the
+# collector adapts trace traffic to otlphttp. Langfuse appends /v1/traces to
+# the otlphttp endpoint's base path itself.
 receivers:
   otlp:
     protocols:
@@ -14,6 +15,10 @@ receivers:
         endpoint: 0.0.0.0:4318
 
 processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
   batch: {}
 
 exporters:
@@ -23,15 +28,49 @@ exporters:
       # Basic auth for the LANGFUSE_INIT project keys baked into compose.dev.yaml.
       # Value is base64("<public-key>:<secret-key>"), supplied via .env.
       Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 5m
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 1000
+      num_consumers: 2
+  nop/logs: {}
+  nop/metrics: {}
   debug:
     verbosity: normal
 
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol/storage
+    timeout: 1s
+    create_directory: true
+    fsync: true
+    compaction:
+      on_start: true
+      on_rebound: true
+      directory: /var/lib/otelcol/storage
+      cleanup_on_start: true
+
 service:
+  extensions: [file_storage]
   telemetry:
     metrics:
-      level: none
+      level: normal
+      address: 0.0.0.0:8888
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [batch]
+      processors: [memory_limiter, batch]
       exporters: [otlphttp/langfuse, debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [nop/logs, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [nop/metrics, debug]

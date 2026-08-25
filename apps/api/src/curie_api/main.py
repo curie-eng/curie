@@ -6,14 +6,24 @@ startup and stored on app.state; dependencies (deps.py) read them per request.
 
 import asyncio
 import logging
-import sys
+import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
 import redis.asyncio as redis
-from fastapi import FastAPI
+from curie_telemetry import (
+    bootstrap_service_telemetry,
+    configure_service_logging,
+    operation_span,
+    record_metric,
+)
+from fastapi import FastAPI, Request
+from opentelemetry.trace import SpanKind, StatusCode
+from starlette.routing import Match
 
+from . import __version__
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
 from .db import create_engine, create_sessionmaker
@@ -52,6 +62,8 @@ from .slack_usergroups import SlackUserGroupClient
 from .storage import BundleStore
 from .sweeper import run_expiry_sweeper
 from .threadreset import ThreadResetRequests
+
+_LOG = logging.getLogger("curie_api")
 
 
 @asynccontextmanager
@@ -178,6 +190,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.commit_poller_task = asyncio.create_task(poller.run_forever())
     else:
         app.state.commit_poller_task = None
+    telemetry = bootstrap_service_telemetry(
+        "curie-api",
+        service_version=__version__,
+        logger=logging.getLogger("curie_api"),
+        environ=os.environ,
+        level=settings.log_level.upper(),
+    )
+    app.state.telemetry = telemetry
     try:
         yield
     finally:
@@ -219,9 +239,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await poller_task
             except asyncio.CancelledError:
                 pass
-        await valkey.aclose()
-        await http_client.aclose()
-        await engine.dispose()
+        try:
+            await valkey.aclose()
+            await http_client.aclose()
+            await engine.dispose()
+        finally:
+            telemetry.shutdown()
 
 
 def configure_logging(level: str | None = None) -> logging.Logger:
@@ -243,15 +266,46 @@ def configure_logging(level: str | None = None) -> logging.Logger:
     """
 
     resolved = (level or get_settings().log_level).upper()
-    logger = logging.getLogger("curie_api")
-    logger.setLevel(resolved)
-    logger.propagate = False
-    if not any(getattr(h, "_curie_api_handler", False) for h in logger.handlers):
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter("%(levelname)s: %(name)s: %(message)s"))
-        handler._curie_api_handler = True  # type: ignore[attr-defined]
-        logger.addHandler(handler)
-    return logger
+    return configure_service_logging(
+        logging.getLogger("curie_api"),
+        service_name="curie-api",
+        level=resolved,
+    )
+
+
+def _route_template(app: FastAPI, request: Request) -> str:
+    """Resolve a bounded route template without using identifier-bearing paths."""
+
+    partial: str | None = None
+    for route in app.routes:
+        match, _child_scope = route.matches(request.scope)
+        if match is Match.FULL:
+            path = getattr(route, "path", None)
+            if path:
+                return str(path)
+            included = getattr(route, "original_router", None)
+            for candidate in getattr(included, "routes", ()):
+                candidate_match, _ = candidate.matches(request.scope)
+                candidate_path = getattr(candidate, "path", None)
+                if candidate_match is Match.FULL and candidate_path:
+                    return str(candidate_path)
+                if candidate_match is Match.PARTIAL and candidate_path:
+                    partial = str(candidate_path)
+        elif match is Match.PARTIAL:
+            path = getattr(route, "path", None)
+            if path:
+                partial = str(path)
+    return partial or "unmatched"
+
+
+_HTTP_METHOD_DOMAIN = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"})
+
+
+def _metric_http_method(method: str) -> str:
+    """Map arbitrary HTTP tokens onto the metric schema's finite domain."""
+
+    normalized = method.upper()
+    return normalized if normalized in _HTTP_METHOD_DOMAIN else "OTHER"
 
 
 def create_app() -> FastAPI:
@@ -285,6 +339,47 @@ def create_app() -> FastAPI:
     app.include_router(workspaces.router)
     app.include_router(channels.router)
     app.include_router(hooks.router)
+
+    @app.middleware("http")
+    async def observe_http(request: Request, call_next):  # type: ignore[no-untyped-def]
+        operation = _route_template(app, request)
+        active_attributes = {
+            "service.name": "curie-api",
+            "operation": operation,
+            "role": "server",
+            "source": _metric_http_method(request.method),
+        }
+        started = time.monotonic()
+        status_code = 500
+        record_metric("curie.http.server.active", 1, attributes=active_attributes)
+        try:
+            with operation_span(
+                "http.server.request",
+                kind=SpanKind.SERVER,
+                attributes=active_attributes,
+            ) as span:
+                response = await call_next(request)
+                status_code = response.status_code
+                if status_code >= 500 and hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                _LOG.info(
+                    "http request completed method=%s route=%s status_class=%s",
+                    _metric_http_method(request.method),
+                    operation,
+                    f"{status_code // 100}xx",
+                )
+                return response
+        finally:
+            outcome = f"{status_code // 100}xx" if 100 <= status_code < 600 else "5xx"
+            completed_attributes = {**active_attributes, "outcome": outcome}
+            record_metric("curie.http.server.request", attributes=completed_attributes)
+            record_metric(
+                "curie.http.server.request.duration",
+                time.monotonic() - started,
+                attributes=completed_attributes,
+            )
+            record_metric("curie.http.server.active", -1, attributes=active_attributes)
+
     return app
 
 

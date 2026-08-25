@@ -8,6 +8,25 @@ metadata:
 data:
   collector-config.yaml: |
 {{ include "curie.otelCollector.config" . | indent 4 }}
+{{- if .Values.otelCollector.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "curie.fullname" . }}-otel-collector
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+spec:
+  accessModes:
+    {{- toYaml .Values.otelCollector.persistence.accessModes | nindent 4 }}
+  {{- with .Values.otelCollector.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.otelCollector.persistence.size }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -25,6 +44,9 @@ spec:
     - name: otlp-http
       port: {{ .Values.otelCollector.service.httpPort }}
       targetPort: 4318
+    - name: metrics
+      port: {{ .Values.otelCollector.service.metricsPort }}
+      targetPort: metrics
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -34,6 +56,10 @@ metadata:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  {{- if .Values.otelCollector.persistence.enabled }}
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "otel-collector") | nindent 6 }}
@@ -45,10 +71,23 @@ spec:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "otel-collector") | nindent 8 }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.otelCollector.terminationGracePeriodSeconds }}
+      {{- with .Values.otelCollector.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ include "curie.fullname" . }}-otel-collector
+        - name: storage
+          {{- if .Values.otelCollector.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "curie.fullname" . }}-otel-collector
+          {{- else }}
+          emptyDir:
+            sizeLimit: {{ .Values.otelCollector.persistence.size }}
+          {{- end }}
       containers:
         - name: otel-collector
           image: {{ .Values.otelCollector.image }}
@@ -64,6 +103,9 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.otlpAuthHeaderSecretName" . }}
                   key: otlpAuthHeader
+            {{- with .Values.otelCollector.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: otlp-grpc
               containerPort: 4317
@@ -71,6 +113,8 @@ spec:
               containerPort: 4318
             - name: health
               containerPort: 13133
+            - name: metrics
+              containerPort: {{ .Values.otelCollector.service.metricsPort }}
           readinessProbe:
             httpGet:
               path: /
@@ -92,4 +136,8 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/otel
+              readOnly: true
+            - name: storage
+              mountPath: {{ .Values.otelCollector.persistence.mountPath }}
+              readOnly: false
 {{- end }}

@@ -478,6 +478,7 @@ def _populate_runtime_stack(stack: RuntimeStack, root: Path, images: dict[str, s
     front = stack.front_network
     loki_data = _create_volume(stack, "loki-data")
     tempo_data = _create_volume(stack, "tempo-data")
+    collector_data = _create_volume(stack, "collector-data")
 
     loki = _container_name("loki", suffix)
     _run_container(
@@ -551,6 +552,7 @@ def _populate_runtime_stack(stack: RuntimeStack, root: Path, images: dict[str, s
         back,
         env={"LANGFUSE_OTLP_AUTH_HEADER": "Basic runtime-test"},
         volumes=((root / "collector.yaml", "/etc/otel/collector.yaml"),),
+        named_volumes=((collector_data, "/var/lib/otelcol"),),
         publish=(4318,),
         args=("--config=/etc/otel/collector.yaml",),
     )

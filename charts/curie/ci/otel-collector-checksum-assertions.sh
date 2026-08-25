@@ -22,11 +22,25 @@ manifest_for() {
 }
 
 render default
+render dev -f "$CHART/values-dev.yaml"
 render port-3001 --set langfuse.web.service.port=3001
 render auth-header --set otelCollector.otlpAuthHeader='Basic YXNzZXJ0OmFzc2VydA=='
-render tempo \
-  --set 'otelCollector.extraExporters.otlphttp/tempo.endpoint=http://tempo:4318' \
-  --set 'otelCollector.extraPipelineExporters[0]=otlphttp/tempo'
+cat > "$TMP/tempo-values.yaml" <<'YAML'
+otelCollector:
+  extraExporters:
+    otlphttp/tempo:
+      endpoint: http://tempo:4318
+      retry_on_failure:
+        enabled: true
+        max_interval: 5s
+        max_elapsed_time: 30s
+      sending_queue:
+        enabled: true
+        storage: file_storage
+        queue_size: 8
+  extraPipelineExporters: [otlphttp/tempo]
+YAML
+render tempo -f "$TMP/tempo-values.yaml"
 
 missing_exporter_stderr="$TMP/missing-exporter.stderr"
 if helm template curie "$CHART" \
@@ -40,7 +54,7 @@ missing_exporter_error="$(<"$missing_exporter_stderr")"
 [[ "$missing_exporter_error" == *"otelCollector.extraExporters"* ]] || \
   fail "Missing exporter error did not name otelCollector.extraExporters"
 
-python3 - "$(manifest_for "$TMP/default")" "$(manifest_for "$TMP/port-3001")" "$(manifest_for "$TMP/auth-header")" "$(manifest_for "$TMP/tempo")" <<'PY'
+python3 - "$(manifest_for "$TMP/default")" "$(manifest_for "$TMP/dev")" "$(manifest_for "$TMP/port-3001")" "$(manifest_for "$TMP/auth-header")" "$(manifest_for "$TMP/tempo")" <<'PY'
 import sys
 import yaml
 
@@ -57,27 +71,52 @@ def config_and_checksum(path):
     return config, checksum
 
 default_config, default_checksum = config_and_checksum(sys.argv[1])
-changed_config, changed_checksum = config_and_checksum(sys.argv[2])
-auth_config, auth_checksum = config_and_checksum(sys.argv[3])
-tempo_config, tempo_checksum = config_and_checksum(sys.argv[4])
+dev_config, dev_checksum = config_and_checksum(sys.argv[2])
+changed_config, changed_checksum = config_and_checksum(sys.argv[3])
+auth_config, auth_checksum = config_and_checksum(sys.argv[4])
+tempo_config, tempo_checksum = config_and_checksum(sys.argv[5])
 
 default_parsed = yaml.safe_load(default_config)
+dev_parsed = yaml.safe_load(dev_config)
 tempo_parsed = yaml.safe_load(tempo_config)
 default_exporters = default_parsed["exporters"]
 default_trace_exporters = default_parsed["service"]["pipelines"]["traces"]["exporters"]
+dev_exporters = dev_parsed["exporters"]
 tempo_exporters = tempo_parsed["exporters"]
 tempo_trace_exporters = tempo_parsed["service"]["pipelines"]["traces"]["exporters"]
 
-assert set(default_exporters) == {"otlphttp/langfuse", "debug"}, (
-    "Default collector exporters changed or unexpectedly include Tempo"
+assert set(default_exporters) == {"otlphttp/langfuse", "nop/logs", "nop/metrics"}, (
+    "Production-default collector exporters changed, unexpectedly include debug, or include Tempo"
 )
-assert default_trace_exporters == ["otlphttp/langfuse", "debug"], (
-    "Default traces pipeline exporters changed or unexpectedly include Tempo"
+assert default_trace_exporters == ["otlphttp/langfuse"], (
+    "Production-default traces pipeline changed, unexpectedly includes debug, or includes Tempo"
 )
-assert tempo_exporters.get("otlphttp/tempo") == {"endpoint": "http://tempo:4318"}, (
+assert set(dev_exporters) == {
+    "otlphttp/langfuse", "nop/logs", "nop/metrics", "debug"
+}, "Development overlay must explicitly opt into debug"
+for signal in ("traces", "logs", "metrics"):
+    assert "debug" in dev_parsed["service"]["pipelines"][signal]["exporters"], (
+        f"Development {signal} pipeline did not opt into debug"
+    )
+assert dev_config != default_config, "Development debug opt-in did not change the ConfigMap body"
+assert dev_checksum != default_checksum, "Development debug opt-in did not roll the Collector pod"
+
+assert tempo_exporters.get("otlphttp/tempo") == {
+    "endpoint": "http://tempo:4318",
+    "retry_on_failure": {
+        "enabled": True,
+        "max_interval": "5s",
+        "max_elapsed_time": "30s",
+    },
+    "sending_queue": {
+        "enabled": True,
+        "storage": "file_storage",
+        "queue_size": 8,
+    },
+}, (
     "Tempo exporter configuration was not rendered exactly"
 )
-assert tempo_trace_exporters == ["otlphttp/langfuse", "debug", "otlphttp/tempo"], (
+assert tempo_trace_exporters == ["otlphttp/langfuse", "otlphttp/tempo"], (
     "Tempo exporter was not appended to the traces pipeline"
 )
 assert default_config != tempo_config, "Tempo values did not change the collector ConfigMap body"

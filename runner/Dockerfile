@@ -44,12 +44,13 @@ RUN npm install -g @modelcontextprotocol/server-github@2025.4.8
 
 WORKDIR /app
 
-# The three source trees the runner needs: the two frozen workspace packages and
-# the runner itself. Copied by path so the image is reproducible from the lockfile
+# The four source trees the runner needs: the two frozen workspace packages,
+# the shared telemetry package, and the runner itself. Copied by path so the image is reproducible from the lockfile
 # above them (root pyproject/uv.lock are the workspace source of truth).
 COPY uv.lock ./uv.lock
 COPY packages/aci-protocol ./packages/aci-protocol
 COPY packages/plugin-format ./packages/plugin-format
+COPY packages/telemetry ./packages/telemetry
 COPY runner ./runner
 
 # One venv. Install every local project without dependencies, then install the
@@ -59,7 +60,7 @@ COPY runner ./runner
 # a same-named PyPI distribution.
 RUN python3 -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /app/.venv/bin/pip install --no-cache-dir --no-deps ./packages/aci-protocol ./packages/plugin-format \
+    && /app/.venv/bin/pip install --no-cache-dir --no-deps ./packages/aci-protocol ./packages/plugin-format ./packages/telemetry \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner \
     && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps -r /tmp/runner-dependency-pins.txt

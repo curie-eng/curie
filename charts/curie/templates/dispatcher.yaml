@@ -32,6 +32,16 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- $hasDispatcherOtelEndpoint := false }}
+      {{- $hasDispatcherOtelProtocol := false }}
+      {{- range .Values.dispatcher.extraEnv }}
+      {{- if eq .name "OTEL_EXPORTER_OTLP_ENDPOINT" }}
+      {{- $hasDispatcherOtelEndpoint = true }}
+      {{- end }}
+      {{- if eq .name "OTEL_EXPORTER_OTLP_PROTOCOL" }}
+      {{- $hasDispatcherOtelProtocol = true }}
+      {{- end }}
+      {{- end }}
       containers:
         - name: dispatcher
           image: {{ include "curie.image" (dict "repository" .Values.dispatcher.image.repository "tag" .Values.dispatcher.image.tag "digest" .Values.dispatcher.image.digest "defaultTag" .Chart.AppVersion) | quote }}
@@ -57,11 +67,24 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: slackSigningSecret
             {{- include "curie.env.api" . | nindent 12 }}
+            {{- if and .Values.otelCollector.deploy (not $hasDispatcherOtelEndpoint) }}
+            # Do not synthesize an endpoint when the operator uses an external
+            # Collector; absent configuration keeps SDK export disabled.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
+            {{- end }}
+            {{- if and .Values.otelCollector.deploy (not $hasDispatcherOtelProtocol) }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            {{- end }}
             # Heartbeat file a background daemon thread in the dispatcher touches
             # each tick; the exec probes below read this same path so template and
             # app cannot drift.
             - name: CURIE_HEARTBEAT_FILE
               value: /tmp/curie-dispatcher.heartbeat
+            {{- with .Values.dispatcher.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           # No HTTP port on the dispatcher (Slack Socket Mode is outbound-only),
           # so an exec probe checks a heartbeat file a background daemon thread
           # touches each tick. The dispatcher blocks the main thread in

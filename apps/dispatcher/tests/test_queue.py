@@ -1,10 +1,13 @@
 """Queue seam + dedupe against real Valkey."""
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import redis
 from aci_protocol import QueuedTurn, ReplyHandle
+from curie_dispatcher import queue as queue_module
 from curie_dispatcher.config import DispatcherConfig
 from curie_dispatcher.queue import (
     claim_event,
@@ -12,6 +15,10 @@ from curie_dispatcher.queue import (
     from_stream_fields,
     to_stream_fields,
 )
+from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
+from opentelemetry import context as otel_context
+from opentelemetry import trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 
 # The committed wire golden the Rust CLI consumer (cli/src/queue.rs) round-trips too.
 _GOLDEN_FIXTURE = (
@@ -21,6 +28,26 @@ _GOLDEN_FIXTURE = (
     / "schema"
     / "queued-turn.fixture.json"
 )
+
+_TRACE_ID = int("0123456789abcdef0123456789abcdef", 16)
+_SPAN_ID = int("0123456789abcdef", 16)
+_TRACEPARENT = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+
+
+@contextmanager
+def _remote_parent() -> Iterator[None]:
+    parent = SpanContext(
+        trace_id=_TRACE_ID,
+        span_id=_SPAN_ID,
+        is_remote=True,
+        trace_flags=TraceFlags.SAMPLED,
+        trace_state=TraceState(),
+    )
+    token = otel_context.attach(trace.set_span_in_context(NonRecordingSpan(parent)))
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
 
 
 def _event(event_id: str = "Ev1") -> QueuedTurn:
@@ -52,6 +79,46 @@ def test_from_stream_fields_tolerates_unknown_payload_field() -> None:
     fields = {"payload": json.dumps(payload)}
 
     assert from_stream_fields(fields) == event
+
+
+def test_traceparent_is_transport_owned_beside_byte_identical_payload() -> None:
+    """The carrier is Stream transport metadata, never a QueuedTurn field."""
+
+    event = _event("Ev-traced")
+    with _remote_parent():
+        fields = to_stream_fields(event)
+
+    assert fields == {
+        "payload": event.model_dump_json(),
+        TRACEPARENT_STREAM_FIELD: _TRACEPARENT,
+    }
+    assert from_stream_fields(fields) == event
+    extracted = trace.get_current_span(extract_trace_context(fields)).get_span_context()
+    assert extracted.trace_id == _TRACE_ID
+    assert extracted.span_id == _SPAN_ID
+    assert extracted.is_remote is True
+
+
+def test_removing_dispatcher_injection_produces_a_safe_root_not_a_false_parent(
+    monkeypatch,
+) -> None:
+    """Falsifiable control: severing the producer removes only causality.
+
+    The payload still deserializes and the consumer receives an invalid parent
+    context, which is the signal to start a safe root. This test must stay beside
+    the positive injection test so a carrierless green path cannot mask a broken
+    dispatcher producer.
+    """
+
+    monkeypatch.setattr(queue_module, "inject_trace_context", lambda _carrier: None)
+    event = _event("Ev-carrierless")
+    with _remote_parent():
+        fields = to_stream_fields(event)
+
+    assert fields == {"payload": event.model_dump_json()}
+    assert from_stream_fields(fields) == event
+    extracted = trace.get_current_span(extract_trace_context(fields)).get_span_context()
+    assert extracted.is_valid is False
 
 
 def test_queued_turn_matches_cross_language_golden() -> None:
@@ -96,3 +163,47 @@ def test_claim_event_sets_a_ttl_so_the_guard_is_bounded(
     claim_event(redis_client, config, "Ev-ttl")
     ttl = redis_client.ttl(config.dedupe_key("Ev-ttl"))
     assert 0 < ttl <= config.dedupe_ttl_seconds
+
+
+def test_dedupe_decision_is_observed_without_exporting_the_event_id(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str], list[tuple[str, dict[str, str]]]]] = []
+
+    class Span:
+        def __init__(self, events: list[tuple[str, dict[str, str]]]) -> None:
+            self.events = events
+
+        def add_event(self, name: str, attributes: dict[str, str]) -> None:
+            self.events.append((name, attributes))
+
+        def set_status(self, _status) -> None:
+            pass
+
+    @contextmanager
+    def capture(name: str, *, kind, attributes: dict[str, str]):
+        del kind
+        events: list[tuple[str, dict[str, str]]] = []
+        calls.append((name, attributes, events))
+        yield Span(events)
+
+    monkeypatch.setattr(queue_module, "operation_span", capture)
+
+    assert claim_event(redis_client, config, "Ev-private-example") is True
+    assert claim_event(redis_client, config, "Ev-private-example") is False
+
+    assert calls == [
+        (
+            "curie.queue.dedupe",
+            {"service.name": "curie-dispatcher", "source": "dispatcher"},
+            [("queue.dedupe.decided", {"outcome": "claimed"})],
+        ),
+        (
+            "curie.queue.dedupe",
+            {"service.name": "curie-dispatcher", "source": "dispatcher"},
+            [("queue.dedupe.decided", {"outcome": "duplicate"})],
+        ),
+    ]
+    assert "Ev-private-example" not in repr(calls)
