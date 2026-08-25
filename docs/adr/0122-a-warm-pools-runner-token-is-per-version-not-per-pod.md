@@ -185,19 +185,9 @@ does not exist yet and has not been spiked.
 Three questions from review that this record does not answer, listed rather than
 papered over. None is known to be unanswerable; none has been verified.
 
-1. **Generation skew during a roll.** Mid-roll, old pods hold the old bootstrap
-   and replacements hold the new one, and both may be claimable. A worker binding
-   from the pool has to present the right one. Reading the Secret named by the
-   pool it is binding from is the obvious answer and may simply be correct, but
-   the window where a pod outlives its pool's Secret version has not been walked
-   through.
+1. ~~**Generation skew during a roll.**~~ **Spiked; see below.**
 
-2. **Concurrent pool creation.** Two workers deciding a version needs a pool at
-   the same time must not end with two Secrets and pods disagreeing about which
-   bootstrap is canonical. Standard create-or-adopt reconciliation applies. It is
-   named here because the first version of this record assumed a single creating
-   process, which is the same assumption that produced the wrong claim about read
-   grants.
+2. ~~**Concurrent pool creation.**~~ **Spiked; see below.**
 
 3. ~~**What retiring the bootstrap means concretely.**~~ **Spiked; see below.**
 
@@ -244,6 +234,62 @@ The spike is throwaway and deliberately minimal -- it proves the shape is
 reachable and cheap, not that this is the final surface. What it settles is the
 question review actually asked: retirement is expressible, an in-flight turn is
 not collateral, and a bad adopt cannot brick a pod.
+
+## Skew and concurrent creation, measured
+
+Both leftovers turn out to be questions about Kubernetes rather than about
+Curie, so they were settled in a scratch namespace with one busybox Deployment
+and two Secrets.
+
+**Concurrent creation is already solved by the API.** Two actors racing to create
+the same Secret: exactly one succeeded, and the loser got `AlreadyExists` rather
+than a partial write or a silent overwrite. That is a deterministic signal to
+**adopt the winner's value instead of guessing**, which is all a reconciler needs.
+No design is required here beyond using create-or-adopt.
+
+**Generation skew is real, and it lasts longer than "mid-roll" suggests.**
+
+| | |
+| --- | --- |
+| pod boots, reads Secret | `WORKER-ONE-TOKEN` |
+| Secret rotated underneath it | pod still reports `WORKER-ONE-TOKEN` |
+| pod replaced | replacement reports `ROTATED-GEN-TWO` |
+
+Environment is read once at start, so a running pod keeps its generation and only
+a replacement picks up the new one. **A pool therefore holds two live token
+generations at once**, and a binder that reads only the current Secret will
+present the wrong one to an older pod.
+
+How long that lasts is the part worth naming. `SandboxWarmPool.updateStrategy`
+takes `Recreate` or `OnReplenish`, and **`OnReplenish` is the default** the chart
+uses. On that setting a pool does not roll itself when its template changes; an
+old warm pod persists until something consumes it. The two generations coexist
+for as long as the pool is left alone, not for the length of a roll.
+
+**So the answer is not to reconcile the skew but to avoid creating it.** A pool is
+keyed by agent version, and a version's bundle is immutable
+([`bundles.py`](../../apps/api/src/curie_api/routers/bundles.py) refuses a second
+write: "bundles are immutable"). A token change should therefore be **a new pool,
+not a mutation of an existing one**: pod and Secret are created together, retire
+together, and no pod ever outlives the Secret it booted from. Rotation becomes
+pool replacement, which is the same operation a new version already performs.
+
+The generic mechanic above is measured. The pool-controller half -- that
+`OnReplenish` leaves old pods in place while `Recreate` rolls them -- is read from
+the CRD rather than run, because a `SandboxWarmPool` in a scratch namespace could
+not start: the shipped template references Secrets that live in the release
+namespace. Worth confirming before implementation, and flagged rather than
+presented as measured.
+
+### A related question, answered from the code
+
+Whether a live pod can have its bundle's `approvalPolicy` change underneath it:
+**no.** `resolve_approval_policy` is called inside `build_runner`, so the gate is
+resolved once at boot from the bundle in that pod, and a bundle is immutable for
+its version. A policy change is a new bundle, a new version, and therefore a
+different pool with different pods. It is the same structural fact as the token:
+what is baked at boot does not change under a running pod, which is why the
+answer to both is to replace the pool rather than mutate it.
 
 ## Out of scope
 

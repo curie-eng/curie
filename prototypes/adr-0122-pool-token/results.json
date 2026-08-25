@@ -1,0 +1,14 @@
+{
+ "concurrent": {
+  "winners": 1,
+  "loser_already_exists": true,
+  "canonical": "WORKER-ONE-TOKEN"
+ },
+ "skew": {
+  "before": "WORKER-ONE-TOKEN",
+  "after_rotate_same_pod": "WORKER-ONE-TOKEN",
+  "replacement": "ROTATED-GEN-TWO",
+  "running_pod_keeps_old": true,
+  "replacement_gets_new": true
+ }
+}
