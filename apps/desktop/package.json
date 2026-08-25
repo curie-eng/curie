@@ -59,7 +59,7 @@
     "productName": "Curie",
     "directories": {
       "output": "release",
-      "buildResources": "build"
+      "buildResources": "assets"
     },
     "files": [
       "dist/**",
@@ -76,7 +76,7 @@
           ]
         }
       ],
-      "icon": "build/icon.png",
+      "icon": "assets/icon.png",
       "identity": null,
       "darkModeSupport": true
     },
@@ -85,13 +85,13 @@
         "AppImage"
       ],
       "category": "Development",
-      "icon": "build/icon.png"
+      "icon": "assets/icon.png"
     },
     "win": {
       "target": [
         "nsis"
       ],
-      "icon": "build/icon.png"
+      "icon": "assets/icon.png"
     }
   },
   "pnpm": {

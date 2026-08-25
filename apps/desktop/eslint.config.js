@@ -6,7 +6,19 @@ import reactHooks from "eslint-plugin-react-hooks";
 import reactRefresh from "eslint-plugin-react-refresh";
 
 export default [
-  { ignores: ["dist", "dist-electron", "src/generated", "node_modules"] },
+  // `release` holds the packaged application, which contains Electron's own
+  // bundled JavaScript plus a copy of `dist`. Linting a build output is
+  // meaningless and it drowns the real findings.
+  {
+    ignores: [
+      "dist",
+      "dist-electron",
+      "release",
+      "src/generated",
+      "node_modules",
+      "coverage",
+    ],
+  },
   js.configs.recommended,
   {
     files: ["src/**/*.{ts,tsx}"],

@@ -1,0 +1,28 @@
+<!-- The app icon. A dark squircle carrying the Curie mark: the same green arc
+     the favicon uses, so the dock icon, the browser tab and the accent in the UI
+     are recognisably one brand. macOS does not round app icons for you, so the
+     shape is drawn here. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2f2f33"/>
+      <stop offset="100%" stop-color="#17171a"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5ce0a4"/>
+      <stop offset="100%" stop-color="#2bb377"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Squircle plate, inset the way macOS icons are so it sits right in the dock. -->
+  <path d="M300 92h424c115 0 208 93 208 208v424c0 115-93 208-208 208H300C185 932 92 839 92 724V300C92 185 185 92 300 92z"
+        fill="url(#plate)"/>
+  <!-- A hairline top highlight: the same trick the buttons in the app use. -->
+  <path d="M300 92h424c115 0 208 93 208 208v14c0-115-93-208-208-208H300C185 106 92 199 92 314v-14C92 185 185 92 300 92z"
+        fill="#ffffff" opacity="0.10"/>
+
+  <!-- The mark: an open arc, drawn with a round cap so it reads as a C. -->
+  <path d="M654 372a190 190 0 1 0 0 280" fill="none" stroke="url(#mark)"
+        stroke-width="76" stroke-linecap="round"/>
+  <circle cx="678" cy="512" r="40" fill="#5ce0a4"/>
+</svg>
