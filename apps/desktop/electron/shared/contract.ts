@@ -232,6 +232,10 @@ export interface CurieBridge {
     open(): Promise<Workspace | null>;
     add(path: string): Promise<Workspace | null>;
     forget(path: string): Promise<void>;
+    /** Paths, relative to the bundle root, of the files a human edits. The
+     *  walker lives in the shell because it needs the filesystem; what counts as
+     *  worth showing is decided in the renderer. */
+    files(root: string): Promise<readonly string[]>;
     readFile(root: string, relative: string): Promise<string>;
     writeFile(root: string, relative: string, contents: string): Promise<void>;
     revealInFileManager(path: string): Promise<void>;
@@ -278,6 +282,7 @@ export const CH = {
   wsOpen: "curie:ws:open",
   wsAdd: "curie:ws:add",
   wsForget: "curie:ws:forget",
+  wsFiles: "curie:ws:files",
   wsRead: "curie:ws:read",
   wsWrite: "curie:ws:write",
   wsReveal: "curie:ws:reveal",

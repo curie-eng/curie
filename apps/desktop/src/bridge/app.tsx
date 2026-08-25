@@ -21,7 +21,14 @@ import {
 import { bridge } from "./bridge";
 import type { ApiConnection, ShellEnvironment, Workspace } from "./bridge";
 
-export type Route = "overview" | "resources" | "canvas" | "commands" | "activity" | "settings";
+export type Route =
+  | "overview"
+  | "build"
+  | "resources"
+  | "canvas"
+  | "commands"
+  | "activity"
+  | "settings";
 
 export interface AgentSummary {
   id: string;
@@ -192,7 +199,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setRoute("commands");
         return setFocus(target.slice("commands:".length));
       }
-      const known: Route[] = ["overview", "resources", "canvas", "commands", "activity", "settings"];
+      const known: Route[] = [
+        "overview",
+        "build",
+        "resources",
+        "canvas",
+        "commands",
+        "activity",
+        "settings",
+      ];
       if ((known as string[]).includes(target)) setRoute(target as Route);
     });
     return off;

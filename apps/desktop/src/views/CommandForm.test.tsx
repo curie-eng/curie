@@ -49,6 +49,7 @@ function stubShell(): CurieBridge {
       open: async () => null,
       add: async () => null,
       forget: async () => {},
+      files: async () => [],
       readFile: async () => "",
       writeFile: async () => {},
       revealInFileManager: async () => {},
