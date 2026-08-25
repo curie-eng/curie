@@ -149,4 +149,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0117 | [A tool that changes the world reports what it changed, and the platform can put it back](0117-a-tool-that-changes-the-world-reports-what-it-changed.md) | Accepted |
 | 0118 | [Binding cardinality is the multi surface opt in](0118-binding-cardinality-is-the-multi-surface-opt-in.md) | Accepted |
 | 0119 | [A resumed thread rebuilds its prefix so the prompt cache still hits](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md) | Draft |
+| 0122 | [A warm pool's runner token is per version, not per pod](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md) | Draft |
 <!-- END GENERATED: adr-index -->
