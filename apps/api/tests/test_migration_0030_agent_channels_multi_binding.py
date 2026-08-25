@@ -1,6 +1,6 @@
-"""Migration 0029 drops the one-binding-per-agent constraint (ADR-0118, #1459).
+"""Migration 0030 drops the one-binding-per-agent constraint (ADR-0118, #1459).
 
-`0029_agent_channels_multi_binding.py` drops `agent_channels_agent_id_key`
+`0030_agent_channels_multi_binding.py` drops `agent_channels_agent_id_key`
 so one agent may hold more than one row in `agent_channels`. Two things about
 it are load-bearing beyond the DDL:
 
@@ -38,10 +38,10 @@ from sqlalchemy.sql import text
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 # Targeted explicitly, never as a relative "-1": a later migration moving head
-# would make "-1" stop short of undoing 0029 and the test would go green
+# would make "-1" stop short of undoing 0030 and the test would go green
 # while proving nothing (#1391).
-BELOW = "0028"
-REVISION = "0029"
+BELOW = "0029"
+REVISION = "0030"
 
 OLD_CONSTRAINT = "agent_channels_agent_id_key"
 # NOT touched by this migration: two agents still cannot share one (kind,
@@ -194,13 +194,13 @@ def test_agent_id_is_still_indexed_after_the_constraint_is_dropped(
     assert _agent_id_indexes() == [(AGENT_ID_INDEX, False)]
 
 
-def test_downgrade_leaves_exactly_the_pre_0029_indexes(
+def test_downgrade_leaves_exactly_the_pre_0030_indexes(
     isolated_migration_db: None,
 ) -> None:
     """[FAIL-FIRST] The downgrade's other half: the plain index must go back
     out with the constraint coming back in. The restored unique constraint
     brings its own index on the same column, so a downgrade that only recreated
-    the constraint would leave the pre-0029 schema carrying a duplicate index
+    the constraint would leave the pre-0030 schema carrying a duplicate index
     it never had -- a write amplification that survives every later revision.
     """
 
@@ -222,7 +222,7 @@ def test_two_bindings_for_one_agent_insert_after_upgrade(
     while some other guard still refused the insert; only the actual INSERT
     proves which rows the database accepts post-upgrade.
 
-    Also proves the negative first: against the pre-0029 schema, the second
+    Also proves the negative first: against the pre-0030 schema, the second
     insert still raises IntegrityError -- confirming this is genuinely a
     widening this revision performs, not already-true behavior.
     """
@@ -251,12 +251,12 @@ def test_a_duplicate_pair_still_raises_after_upgrade(
     """[BASELINE-GREEN] The pair-identity constraint 0023 established is not
     this revision's concern (its docstring: `agent_channels_kind_address_key`
     is deliberately untouched) and must still refuse a duplicate (kind,
-    address) after 0029 lands -- proven by execution, per AGENTS.md's
+    address) after 0030 lands -- proven by execution, per AGENTS.md's
     guards-are-outcome-tested discipline, not by reading the DDL.
 
     Tagged BASELINE-GREEN: the property under test already holds today
-    (0023 established it, five revisions before this one). Nothing 0029 adds
-    is what makes this pass; only a REGRESSION in 0029 -- a migration that
+    (0023 established it, five revisions before this one). Nothing 0030 adds
+    is what makes this pass; only a REGRESSION in 0030 -- a migration that
     touches or drops the wrong constraint -- could break it.
     """
 

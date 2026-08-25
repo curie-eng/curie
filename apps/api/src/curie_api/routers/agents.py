@@ -68,7 +68,7 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
         "agent per route (move or delete the other agent, or pick another "
         "address)"
     ),
-    # No entry for `agent_channels_agent_id_key`: migration 0029 drops that
+    # No entry for `agent_channels_agent_id_key`: migration 0030 drops that
     # constraint (ADR-0118), so its message can never fire again, and it said
     # the opposite of what this API now does. A dead entry is worse than none --
     # it reads as a protection. The pair constraint above is the ONLY binding

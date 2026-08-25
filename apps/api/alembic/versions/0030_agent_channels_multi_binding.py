@@ -31,8 +31,8 @@ which pairs they belong to. The message lists the agent id, the kind(s) it
 holds, and the row count per agent instead -- never the bound addresses,
 which would otherwise land in deployment logs.
 
-Revision ID: 0029
-Revises: 0028
+Revision ID: 0030
+Revises: 0029
 Create Date: 2026-08-21
 """
 
@@ -41,8 +41,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0029"
-down_revision: str | None = "0028"
+revision: str = "0030"
+down_revision: str | None = "0029"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -100,6 +100,6 @@ def downgrade() -> None:
 
     # Dropped BEFORE the constraint goes back: the restored unique constraint
     # brings its own backing index on the same column, and leaving both would
-    # hand the pre-0029 schema a duplicate index it never had.
+    # hand the pre-0030 schema a duplicate index it never had.
     op.drop_index(AGENT_ID_INDEX, table_name=TABLE, schema=SCHEMA)
     op.create_unique_constraint(OLD_CONSTRAINT, TABLE, ["agent_id"], schema=SCHEMA)

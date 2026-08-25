@@ -160,7 +160,7 @@ def test_the_map_no_longer_carries_the_retired_one_binding_per_agent_entry() -> 
     """
 
     assert "agent_channels_agent_id_key" not in _UNIQUE_CONSTRAINT_MESSAGES, (
-        "the one-binding-per-agent constraint is dropped by migration 0029 "
+        "the one-binding-per-agent constraint is dropped by migration 0030 "
         "(ADR-0118); its 409 message can never fire again and tells an operator "
         "the opposite of what the API now does"
     )

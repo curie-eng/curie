@@ -132,7 +132,7 @@ class Agent(Base):
         back_populates="agent", cascade="all, delete-orphan"
     )
     # The agent's channel bindings (ADR-0096, #1459; PLURAL since ADR-0118,
-    # migration 0029): an agent may hold more than one, so the API surface is a
+    # migration 0030): an agent may hold more than one, so the API surface is a
     # list rather than an object.
     #
     # `order_by` is load-bearing, not cosmetic: `agent_channels` has no
@@ -193,14 +193,14 @@ class AgentChannel(Base):
         # exists to close, which is why the cutover proves no old worker pod is
         # running before migration 0023 applies.
         UniqueConstraint("kind", "address", name="agent_channels_kind_address_key"),
-        # No agent_id uniqueness here (ADR-0118, migration 0029): an agent may
+        # No agent_id uniqueness here (ADR-0118, migration 0030): an agent may
         # hold more than one binding now. ADR-0089's "one agent still binds one
         # channel" is amended in part -- the (kind, address) constraint above is
         # still what stops two agents claiming the same channel; nothing stops
         # one agent from claiming several.
         #
         # PLAIN index on agent_id, because dropping that uniqueness dropped the
-        # column's only index with it (migration 0029 recreates it as this).
+        # column's only index with it (migration 0030 recreates it as this).
         # `crud.lock_agent_bindings` filters and orders by agent_id under
         # `FOR UPDATE` on every add, move and delete; unindexed, each of those
         # scans the whole table while holding locks.
