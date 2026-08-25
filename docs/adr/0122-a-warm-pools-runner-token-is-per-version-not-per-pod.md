@@ -182,8 +182,9 @@ does not exist yet and has not been spiked.
 
 ## Unresolved
 
-Three questions from review that this record does not answer, listed rather than
-papered over. None is known to be unanswerable; none has been verified.
+Three questions from review, listed rather than papered over. All three have
+since been spiked and are answered in the sections below; the wording is kept so
+the record shows what review asked before the evidence existed.
 
 1. ~~**Generation skew during a roll.**~~ **Spiked; see below.**
 
@@ -281,15 +282,53 @@ not start: the shipped template references Secrets that live in the release
 namespace. Worth confirming before implementation, and flagged rather than
 presented as measured.
 
-### A related question, answered from the code
+### The same fact for the policy gate, and what it means for revocation
 
 Whether a live pod can have its bundle's `approvalPolicy` change underneath it:
-**no.** `resolve_approval_policy` is called inside `build_runner`, so the gate is
-resolved once at boot from the bundle in that pod, and a bundle is immutable for
-its version. A policy change is a new bundle, a new version, and therefore a
-different pool with different pods. It is the same structural fact as the token:
-what is baked at boot does not change under a running pod, which is why the
-answer to both is to replace the pool rather than mutate it.
+**no.** `resolve_approval_policy` is called inside `build_runner`
+(`__main__.py:180`), so the gate is resolved once at boot from the bundle in that
+pod, and a bundle is immutable for its version. A second session exercised this
+on the live cluster in the fail-closed direction only, by adding a gate to a read
+tool rather than removing one: a thread continued with `--continue` after the new
+bundle shipped still ran the tool ungated, while a new thread stopped for
+approval. The gate was then removed and the cluster returned to its prior gate
+set.
+
+That confirmation carries a consequence worth stating plainly, because "different
+pods of different versions" reads as though the two generations are contemporaries
+that will sort themselves out. They are not. `adopt` refreshes the route on every
+use (`kernel.py:1748`), so `routeTtlSeconds: 3600` is an **idle** bound rather
+than a cap: a thread used more often than hourly pins its sandbox indefinitely.
+There is no elapsed time after which an operator may assume an added gate has
+reached existing threads. The edge points the wrong way, too, since
+`suspendedRouteTtlSeconds` is `86400`: a thread suspended awaiting an approval
+pins its pod for a day, so the threads that hold a pre-change policy longest are
+exactly the ones already doing approval-gated work.
+
+The token behaves identically, and this decision depends on it. Exercised against
+shipped code with the route round-tripped through its JSON form and the source
+already rotated to a second generation, `adopt` returned the pinned first
+generation and refreshed the TTL:
+
+```
+token persisted through Valkey   yes
+source has rotated to            gen-two
+adopt() presented                gen-one (pinned)
+touch refreshed the TTL          [('affinity.touch', 'T1', 3600)]
+```
+
+`RouteRecord.to_json` serializes the whole handle, and `adopt` returns
+`record.handle` after checking claim and sandbox readiness. It never consults a
+live source for the credential. That is what makes this decision safe to ship:
+rotating a pool's Secret cannot strand an in-flight thread with a token its pod
+will refuse, because the binder presents the one the route recorded.
+
+The same property is why rotation is **not** revocation. A live thread keeps
+presenting its pinned token, its pod keeps accepting it, and replacing the pool
+does not disturb either. Revoking a token that is already bound to a thread means
+cycling the thread itself, with `curie <tier> reset-thread <agent> --thread-key
+<key> --yes`, and the blast radius until someone does is "for as long as the
+thread stays active", not "until the pool drains".
 
 ## Out of scope
 

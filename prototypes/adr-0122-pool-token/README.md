@@ -31,6 +31,15 @@ docker run -d --name adopt-spike -p 7300:8080 \
 python3 test.py       # adoption and retirement, 8 checks
 python3 fail.py       # what a failed adoption leaves behind, 8 checks
 python3 inflight.py   # rotation during a live turn (needs a real model)
+
+`pin.py` needs no cluster and no runner: it drives the shipped
+`SandboxSubstrate.adopt` with fakes to show that an adopted thread presents
+the token its route recorded rather than a rotated source. Run it from the
+repo root so the worker package resolves:
+
+```
+uv run python prototypes/adr-0122-pool-token/pin.py
+```
 ```
 
 `inflight.py` needs turns slow enough to rotate underneath, so point the runner
