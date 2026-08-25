@@ -117,6 +117,27 @@ React + TypeScript renderer. Full structure and rationale in
   keyed off the route). A pane that repeats its own name under the window's title
   bar is a web header.
 
+- **Bundle judgement lives in `src/lib/bundle.ts`, not in the Build view.**
+  Parsing a manifest, reading eval cases, reading SKILL.md frontmatter and
+  deciding what is wrong with a bundle are pure functions with tests, including
+  a suite in `electron/bundle-examples.test.ts` that runs them over every bundle
+  in the repo's `examples/`.
+
+  Two rules there are load bearing:
+  - **Never be stricter than the platform.** Severity must match what
+    `packages/plugin-format` actually says: its validator emits `skills.empty`
+    as a *warn*, and the repo ships `examples/compat-fixture` with no skills, so
+    calling that invalid would flag a shipped bundle. The examples test is what
+    catches this, and it caught it once already.
+  - **A file that cannot be parsed produces a stated problem, never a silent
+    default.** "Your bundle looks fine" is the one answer a broken bundle must
+    never get.
+
+  `validateForSave` refuses to write a contract file that would not parse, and
+  deliberately does not stand in the way of prose: a half-written SKILL.md is a
+  normal state to save in. YAML is left to the CLI because there is no parser
+  here and guessing would be worse.
+
 - **Table logic lives in `src/lib/workloads.ts`, not in the view.** Filtering,
   sorting, grouping and roll-up are pure functions with tests, because grouping
   that only exists inside a component can only be checked by opening a browser

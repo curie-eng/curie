@@ -91,10 +91,11 @@ drag regions carry both `-webkit-app-region` and `data-tauri-drag-region`.
 | View | What it answers |
 |---|---|
 | **Overview** | What is the state of things, ordered by urgency -- anything blocked on a human first, then anything broken, then the steady state. |
+| **Build** | The authoring half. What is in this bundle, what is wrong with it, the file you are editing, and the rungs of the ladder in order. |
 | **Resources** | What is each agent consuming right now. Docker Desktop's container list as a starting point, plus the things it cannot do: attribution to an agent, history for the sparklines, and per-row commands that are `curie` commands. |
 | **Canvas** | How is this wired. Agents, channels, models, MCP servers, and infra as one editable graph, derived from live state. |
-| **Commands** | Everything the CLI can do. All 79 commands, as real forms. |
-| **Activity** | What has this app run. Every invocation with its full transcript. |
+| **Commands** | Everything the CLI can do, as real forms. |
+| **Activity** | What this app has run. Every invocation with its full transcript. |
 
 ### The resource monitor
 
@@ -122,6 +123,41 @@ it does is a `curie` command you can see and copy. So each row offers the
 commands that actually map -- `skill down` for a runner, `local rebuild <service>`
 for a compose service -- and raw container control is left to Docker Desktop,
 which is better at it.
+
+### Build: the authoring half
+
+Curie builds and deploys agents. This app could always *run* `curie init` and
+`curie skill up` through the generic command forms, but there was nowhere to
+author a bundle, which left half the product unrepresented.
+
+The Build view is a workbench over the open bundle:
+
+- **What it declares.** Name, version, description, skill count, whether it has
+  eval cases and MCP servers, plus Curie's plugin.json extensions: declared
+  secrets, approval gates and trigger count. Otherwise only visible by reading
+  the manifest by hand.
+- **What is wrong with it**, worst first, each item naming the command that
+  fixes it. Severity follows the platform's own validator rather than a stricter
+  opinion: `plugin_format` emits `skills.empty` as a *warning*, and the repo
+  ships `examples/compat-fixture` with no skills at all, so a skill-less bundle
+  is reported as pointless rather than invalid.
+- **An editor** over the real files, grouped the way a bundle is read: manifest,
+  skills, integrations, evals, deploy target, docs. Contract files (plugin.json,
+  evals/cases.json, deploy.yaml) are validated before writing, so a save that
+  would not parse is refused here instead of failing later in the CLI with less
+  context. Prose is never blocked: a half-written SKILL.md is a normal thing to
+  save.
+- **The eval suite**, read from the file rather than described: every case with
+  its grader kind and expected value, and whether it expects an approval gate to
+  hold or chains onto the previous case.
+- **The loop**, in order, with the runner's live state, and the one thing that
+  is expensive to learn the hard way stated on screen: a runner executes an
+  immutable snapshot taken at `skill up`, so a SKILL.md edit reaches it only
+  after a restart, while `evals/cases.json` is read live from source.
+
+The judgements are pure functions in `src/lib/bundle.ts` with tests, including a
+suite that runs the parsers over every bundle in the repo's `examples/`. If the
+bundle format moves, that fails rather than someone's editor.
 
 ## CLI parity is structural, not a promise
 

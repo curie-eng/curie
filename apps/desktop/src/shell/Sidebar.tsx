@@ -54,6 +54,12 @@ const ITEMS: readonly Item[] = [
     icon: <Icon d="M2.2 8.6 8 3.2l5.8 5.4M4 7.6V13h8V7.6" />,
   },
   {
+    id: "build",
+    label: "Build",
+    hint: "Author the open bundle",
+    icon: <Icon d="M3.4 12.6h9.2M5.4 10.2V5.6M8 10.2V3.4M10.6 10.2V7.2" />,
+  },
+  {
     id: "resources",
     label: "Resources",
     hint: "Live CPU, memory, I/O",

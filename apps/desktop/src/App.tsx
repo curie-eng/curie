@@ -16,6 +16,7 @@ import { Toolbar } from "./shell/Toolbar";
 import { RunDrawer } from "./shell/RunDrawer";
 import { Palette } from "./shell/Palette";
 import { Overview } from "./views/Overview";
+import { Build } from "./views/Build";
 import { Resources } from "./views/Resources";
 import { Canvas } from "./views/Canvas";
 import { Commands } from "./views/Commands";
@@ -26,6 +27,8 @@ import { R, S } from "./tokens";
 function View() {
   const { route } = useApp();
   switch (route) {
+    case "build":
+      return <Build />;
     case "resources":
       return <Resources />;
     case "canvas":
@@ -62,9 +65,16 @@ function Keys() {
         e.preventDefault();
         return runs.setDrawerOpen(!runs.drawerOpen);
       }
-      if (mod && /^[1-5]$/.test(e.key)) {
+      if (mod && /^[1-6]$/.test(e.key)) {
         e.preventDefault();
-        const routes = ["overview", "resources", "canvas", "commands", "activity"] as const;
+        const routes = [
+          "overview",
+          "build",
+          "resources",
+          "canvas",
+          "commands",
+          "activity",
+        ] as const;
         return app.navigate(routes[Number(e.key) - 1]);
       }
       if (e.key === "Escape" && !typing && runs.drawerOpen) {

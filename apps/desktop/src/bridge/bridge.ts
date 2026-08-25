@@ -80,6 +80,7 @@ const detached: CurieBridge = {
     open: async () => null,
     add: async () => null,
     forget: async () => {},
+    files: async () => [],
     readFile: reject("Reading a bundle file"),
     writeFile: reject("Writing a bundle file"),
     revealInFileManager: async () => {},

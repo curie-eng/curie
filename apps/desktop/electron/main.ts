@@ -234,6 +234,7 @@ function registerIpc(): void {
   ipcMain.handle(CH.wsOpen, () => workspace.open(requireWindow()));
   ipcMain.handle(CH.wsAdd, (_e, path: string) => workspace.add(path));
   ipcMain.handle(CH.wsForget, (_e, path: string) => workspace.forget(path));
+  ipcMain.handle(CH.wsFiles, (_e, root: string) => workspace.bundleFiles(root));
   ipcMain.handle(CH.wsRead, (_e, root: string, rel: string) => workspace.readFile(root, rel));
   ipcMain.handle(CH.wsWrite, (_e, root: string, rel: string, body: string) =>
     workspace.writeFile(root, rel, body),
