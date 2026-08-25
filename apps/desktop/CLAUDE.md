@@ -221,6 +221,17 @@ change "did not work", check which of the two is on screen. The two also keep
 separate `userData` directories, because Electron derives that from the product
 name: `Curie` for the packaged app, `@curie/desktop` for dev.
 
+The dev build calls itself **Curie (Dev)** (`APP_NAME` in `main.ts`), because
+having the packaged app open beside it is the normal state and the two windows are
+near identical. That name reaches the menu bar, the About panel and the window
+title. It does not reach the Dock or the app switcher, which read `CFBundleName`
+from the running bundle -- Electron's own, in dev. Cloning and patching that
+bundle was tried and rejected: it invalidates the nested Electron Framework
+signature and macOS kills the process, and signing an Electron app correctly needs
+an inside-out pass that does not belong in a dev loop. `app.setName` also feeds
+the userData path, so the old path is captured and restored around it; without
+that, renaming the app reads as every workspace and setting having been lost.
+
 `scripts/dev-electron.mjs` verifies the Electron binary exists before spawning it.
 The `electron` package computes that path by reading its own `path.txt` and
 joining it onto `dist/`, so a bad install produces a plausible string pointing at
@@ -230,6 +241,14 @@ holds, and the reinstall that fixes it. A trailing newline in `path.txt` is
 trimmed, since whitespace at the end of a path is never meaningful; nothing else
 is guessed at, because pointing the dev loop at a binary chosen by heuristic
 would be worse than stopping.
+
+Its restart-on-change handler compares the exited process against the current one
+before treating a clean exit as "the developer quit". Without that the watcher
+fired exactly **once**: the first `electron/` edit restarted the app and the dying
+child's own exit then killed the launcher, so every later edit was silently
+ignored and the new window was left orphaned to launchd. A test that restarts once
+cannot see this, which is how it survived a verification pass; assert several
+consecutive restarts, and that the launcher is still alive after them.
 
 ## Drift between this app and the installed CLI
 
