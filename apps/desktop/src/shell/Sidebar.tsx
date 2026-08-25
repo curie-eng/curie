@@ -11,14 +11,15 @@
 // It also carries the traffic lights, which is why the top has a reserved inset:
 // on macOS the OS draws them over our content.
 
-import type { CSSProperties, ReactNode } from "react";
+import type { ReactNode } from "react";
 import { useState } from "react";
 
+import { BundleMenu } from "./BundleMenu";
 import { useApp, type Route } from "../bridge/app";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
-import { ACCENT, F, LINE, M, R, S, STATUS, T, tint } from "../tokens";
-import { Badge, Dot, Mono, Spinner } from "../primitives";
+import { ACCENT, F, M, R, S, STATUS, T, tint } from "../tokens";
+import { Spinner } from "../primitives";
 import { bytes, percent } from "../lib/format";
 
 interface Item {
@@ -264,120 +265,10 @@ function WorkspacePicker() {
         <span style={{ color: T.tertiary, fontSize: 9 }}>⌃</span>
       </button>
 
-      {open ? <WorkspaceMenu onClose={() => setOpen(false)} /> : null}
+      {open ? <BundleMenu panel={{ left: 10, right: 10 }} onClose={() => setOpen(false)} /> : null}
     </div>
   );
 }
-
-function WorkspaceMenu({ onClose }: { onClose(): void }) {
-  const app = useApp();
-  return (
-    <>
-      <div className="no-drag" onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 70 }} />
-      <div
-        className="no-drag rise"
-        style={{
-          position: "absolute",
-          top: "calc(100% + 4px)",
-          left: 10,
-          right: 10,
-          minWidth: 260,
-          zIndex: 80,
-          background: S.overlay,
-          borderRadius: R.group,
-          boxShadow: "0 16px 40px rgba(0,0,0,0.5)",
-          overflow: "hidden",
-          padding: 5,
-        }}
-      >
-        {app.workspaces.length === 0 ? (
-          <div style={{ ...F.caption, color: T.tertiary, padding: "10px 9px" }}>
-            No bundles yet. Open one, or scaffold a new bundle with{" "}
-            <Mono style={{ fontSize: 11 }}>curie init</Mono>.
-          </div>
-        ) : (
-          app.workspaces.map((w) => {
-            const active = w.path === app.workspace?.path;
-            return (
-              <button
-                key={w.path}
-                onClick={() => {
-                  app.selectWorkspace(w.path);
-                  onClose();
-                }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  width: "100%",
-                  border: "none",
-                  background: active ? "rgba(255,255,255,0.12)" : "transparent",
-                  borderRadius: R.control,
-                  padding: "6px 8px",
-                  textAlign: "left",
-                  cursor: "default",
-                }}
-              >
-                <span style={{ width: 12, color: ACCENT, fontSize: 11 }}>{active ? "✓" : ""}</span>
-                <span style={{ flex: 1, minWidth: 0 }}>
-                  <span style={{ ...F.body, display: "block" }}>{w.name}</span>
-                  <Mono
-                    style={{
-                      fontSize: 10,
-                      color: T.tertiary,
-                      display: "block",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                      direction: "rtl",
-                      textAlign: "left",
-                    }}
-                  >
-                    {w.path}
-                  </Mono>
-                </span>
-                {w.hasEvals ? <Badge color={STATUS.warn}>evals</Badge> : null}
-              </button>
-            );
-          })
-        )}
-        <div style={{ height: 1, background: LINE.separator, margin: "5px 8px" }} />
-        <button
-          onClick={() => {
-            void app.openWorkspace();
-            onClose();
-          }}
-          style={menuAction}
-        >
-          Open bundle…
-        </button>
-        <button
-          onClick={() => {
-            app.navigate("commands", "init");
-            onClose();
-          }}
-          style={menuAction}
-        >
-          Scaffold a new bundle…
-        </button>
-      </div>
-    </>
-  );
-}
-
-const menuAction: CSSProperties = {
-  display: "block",
-  width: "100%",
-  border: "none",
-  background: "transparent",
-  borderRadius: 6,
-  padding: "6px 8px",
-  textAlign: "left",
-  fontSize: 13,
-  letterSpacing: -0.08,
-  color: "rgba(235,235,245,0.62)",
-  cursor: "default",
-};
 
 /** What this machine can actually do, at the foot of the sidebar.
  *
@@ -431,14 +322,27 @@ function MachineStatus() {
         </div>
       ) : null}
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: "3px 10px" }}>
+      {/* The tool names ARE the indicator.
+          Four green dots in a row is the same picture whether you read it or not:
+          when everything works it is four identical marks carrying nothing, and
+          the one case that matters -- something missing -- looks like the others
+          but a different hue. So only absence gets ink. A present tool is plain
+          text, a missing one is struck through, and an unknown one is dimmed.
+          Nothing here shouts while the machine is fine, which is what a monitor
+          in a corner should do. It also survives colour blindness, because the
+          state is in the glyphs and not only in the hue. */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "3px 9px" }}>
         {tools.map((t) => (
           <span
             key={t.name}
             title={`${t.name}: ${t.detail}`}
-            style={{ display: "inline-flex", alignItems: "center", gap: 4, ...F.footnote, color: T.tertiary }}
+            style={{
+              ...F.footnote,
+              color: t.ok === false ? STATUS.danger : t.ok === null ? T.quaternary : T.tertiary,
+              textDecoration: t.ok === false ? "line-through" : undefined,
+              textDecorationThickness: t.ok === false ? "1px" : undefined,
+            }}
           >
-            <Dot color={t.ok === null ? T.quaternary : t.ok ? STATUS.ok : STATUS.danger} />
             {t.name}
           </span>
         ))}
@@ -461,7 +365,6 @@ function MachineStatus() {
             gap: 4,
           }}
         >
-          <Dot color={STATUS.warn} />
           command surface drifted
         </button>
       ) : null}

@@ -7,7 +7,7 @@
 
 import { useApp, type Route } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
-import { F, LINE, M, R, S, T } from "../tokens";
+import { F, LINE, M, R, S, STATUS, T } from "../tokens";
 import { Button, Kbd, Spinner } from "../primitives";
 
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
@@ -125,20 +125,14 @@ function ApiPill() {
         borderRadius: R.pill,
         padding: "4px 10px",
         ...F.caption,
-        color: T.secondary,
+        // The label says which state this is ("API offline", "No API", or the org
+        // name), so a coloured dot beside it only repeats the word. Colour the
+        // word instead: a connected org reads as calm secondary text, and a
+        // failure is the only thing that takes a warning colour.
+        color: state === "down" ? STATUS.danger : state === "unset" ? T.quaternary : T.secondary,
         cursor: "default",
       }}
     >
-      <span
-        style={{
-          width: 6,
-          height: 6,
-          borderRadius: 999,
-          flex: "none",
-          background:
-            state === "ok" ? "#32d74b" : state === "down" ? "#ff453a" : "rgba(235,235,245,0.3)",
-        }}
-      />
       {label}
     </button>
   );

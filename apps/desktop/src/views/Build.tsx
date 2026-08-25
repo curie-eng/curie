@@ -18,6 +18,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useApp } from "../bridge/app";
+import { BundleMenu } from "../shell/BundleMenu";
 import { SlackPacks } from "./BuildPacks";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
@@ -38,7 +39,7 @@ import {
   type PluginManifest,
   type SkillMeta,
 } from "../lib/bundle";
-import { ACCENT, F, FONT, LINE, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, FONT, LINE, R, S, STATUS, T, tint } from "../tokens";
 import {
   Badge,
   Button,
@@ -303,13 +304,38 @@ function Header({ checks, plugin }: { checks: readonly Check[]; plugin?: PluginM
   const ws = app.workspace!;
   const v = verdict(checks);
   const color = v.level === "ok" ? ACCENT : LEVEL_COLOR[v.level];
+  const [picking, setPicking] = useState(false);
 
   return (
     <Group style={{ padding: 16 }}>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-            <span style={{ ...F.title }}>{plugin?.name ?? ws.name}</span>
+            {/* The bundle's name is the switcher. This tab is entirely about the
+                open bundle, so the list of bundles belongs here and not only in
+                the sidebar, where it was the single place to change it. */}
+            <span style={{ position: "relative" }}>
+              <button
+                onClick={() => setPicking((o) => !o)}
+                title="Switch bundle"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "baseline",
+                  gap: 7,
+                  border: "none",
+                  background: "transparent",
+                  borderRadius: R.control,
+                  padding: "1px 6px 1px 0",
+                  margin: 0,
+                  cursor: "default",
+                  color: "inherit",
+                }}
+              >
+                <span style={{ ...F.title }}>{plugin?.name ?? ws.name}</span>
+                <span style={{ ...F.caption, color: T.quaternary }}>{picking ? "▲" : "▼"}</span>
+              </button>
+              {picking ? <BundleMenu panel={{ left: 0 }} onClose={() => setPicking(false)} /> : null}
+            </span>
             {plugin?.version ? <Badge>{plugin.version}</Badge> : null}
             <Badge color={color} filled>
               {v.text}
@@ -326,11 +352,6 @@ function Header({ checks, plugin }: { checks: readonly Check[]; plugin?: PluginM
           >
             {ws.path}
           </Mono>
-        </div>
-        <div style={{ display: "flex", gap: 6 }}>
-          <Button size="sm" onClick={() => void app.openWorkspace()}>
-            Open another
-          </Button>
         </div>
       </div>
 

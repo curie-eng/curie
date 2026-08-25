@@ -103,6 +103,18 @@ React + TypeScript renderer. Full structure and rationale in
     `Sheet` drops from the top, it is not a centred modal. A bare
     `<input type="checkbox">` is rendered by the engine and looks like a form
     control on a web page -- that is the tell to avoid.
+  - **A status dot is the last resort, not the first.** The coloured dot was
+    becoming the answer to every "show state" question, and it is a weak one:
+    four green dots in a row are four identical marks carrying nothing, the case
+    that matters looks like the others in a different hue, and the whole signal
+    dies in greyscale or for a colourblind reader. Prefer, in order: **the label
+    itself** (a missing tool is struck through, not dotted); **the word already on
+    screen** ("API offline" needs no red dot beside it, it needs to BE red); a
+    **distinct shape** per state; and only then a dot. Absence and failure get
+    ink; a healthy system should be quiet. `Dot` still exists and is still right
+    for one thing -- a *live* marker that pulses, where the animation is the
+    information -- so run state in Activity and the transcript drawer keeps it.
+
   - **Scrollbars are overlay-only** and the window itself never scrolls; panes
     do. A permanently visible scrollbar track is the most recognisable web tell
     there is.
