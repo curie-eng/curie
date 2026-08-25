@@ -199,12 +199,51 @@ papered over. None is known to be unanswerable; none has been verified.
    process, which is the same assumption that produced the wrong claim about read
    grants.
 
-3. **What retiring the bootstrap means concretely.** "The runner stops accepting
-   it" is a requirement, not a design. Whether the runner holds one active
-   credential or a set, what happens to an in-flight request during the swap, and
-   what a failed adoption leaves behind, are all unspecified. This is the part
-   that most needs a spike before it is written as a decision, given that the
-   previous two versions of this clause were written without one.
+3. ~~**What retiring the bootstrap means concretely.**~~ **Spiked; see below.**
+
+## Retiring the bootstrap, measured
+
+Review asked what "the runner stops accepting it" means concretely: whether the
+runner holds one active credential or a set, what happens to an in-flight request
+during the swap, and what a failed adoption leaves behind. Rather than answer on
+paper a third time, the mechanism was built and run.
+
+The runner's gate today captures the token in a closure at app construction, and
+says so: *"The configured token is invariant for the process, so encode it once
+here rather than on every gated request."* The spike replaced that with a holder
+the middleware reads per request, and added a gated `POST /v1/adopt` that swaps
+it. **One active credential, replaced outright** -- not a set, not an overlap
+window.
+
+**Adoption and retirement, 8/8:**
+
+| | |
+| --- | --- |
+| `event`, no auth / wrong token, before adoption | 401 / 401 |
+| `event`, bootstrap, before adoption | 200 |
+| `adopt` presenting the bootstrap | 200 |
+| `event`, **bootstrap, after adoption** | **401** |
+| `event`, new conversation token | 200 |
+| `adopt` again presenting the bootstrap | 401 |
+
+So the bootstrap's authority ends exactly at adoption, and it cannot re-adopt.
+
+**An in-flight turn survives the swap.** Rotating while a turn was genuinely
+running -- `/status` reporting `turn_active: true` at the moment of the call,
+against a real streaming model rather than the fake one -- the turn completed
+normally: HTTP 200 after 11.4s. The reason is structural rather than lucky: the
+gate runs at admission, in middleware, so a request already past it is not
+re-checked. Afterwards the old token returned 401 and the new one 200.
+
+**A failed adoption is inert, 8/8.** Malformed JSON, a missing `token` field, an
+empty string, and a non-string all return 400, and after each one the current
+credential still returns 200. The swap happens only after validation, so a failed
+adoption leaves no partial state.
+
+The spike is throwaway and deliberately minimal -- it proves the shape is
+reachable and cheap, not that this is the final surface. What it settles is the
+question review actually asked: retirement is expressible, an in-flight turn is
+not collateral, and a bad adopt cannot brick a pod.
 
 ## Out of scope
 
