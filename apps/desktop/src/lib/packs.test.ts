@@ -12,6 +12,7 @@ import {
   crc32,
   deelongate,
   enabledPacks,
+  inertPacks,
   isInert,
   matchGreeting,
   matchHelp,
@@ -470,5 +471,29 @@ describe("PACK_KINDS", () => {
     // Grounded in the repo: resolve_settings and coerce_setting have no call
     // site outside behaviorpacks.py, and the doc says the runtime is deferred.
     expect(PACK_KINDS.filter((k) => !k.live).map((k) => k.id)).toEqual(["settings"]);
+  });
+});
+
+describe("inertPacks", () => {
+  it("is empty when nothing is on", () => {
+    expect(inertPacks(EMPTY_PACKS)).toEqual([]);
+  });
+
+  it("is empty when every enabled pack is usable", () => {
+    const p = packs({
+      load: { enabled: true, lines: ["working"] },
+      nav: { enabled: true, hub_label: "Help", hub_command: "hub" },
+    });
+    expect(inertPacks(p)).toEqual([]);
+  });
+
+  it("lists only the enabled packs that cannot fire, in pack order", () => {
+    const p = packs({
+      load: { enabled: true, lines: [] },
+      tips: { enabled: true, tips: ["a tip"] },
+      greeting: { enabled: true, phrases: ["hi"], reply: "" },
+      nav: { enabled: false, hub_label: "", hub_command: "" },
+    });
+    expect(inertPacks(p)).toEqual(["load", "greeting"]);
   });
 });

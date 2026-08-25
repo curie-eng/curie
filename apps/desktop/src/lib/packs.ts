@@ -617,6 +617,13 @@ export function isInert(packs: BehaviorPacks, id: PackId): boolean {
   }
 }
 
+/** The packs that are on but carry nothing the runtime can use. What an
+ *  inventory of agents needs: "this one is configured" and "this one only looks
+ *  configured" are different answers. */
+export function inertPacks(packs: BehaviorPacks): readonly PackId[] {
+  return PACK_IDS.filter((id) => isInert(packs, id));
+}
+
 export function samePacks(a: BehaviorPacks, b: BehaviorPacks): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }

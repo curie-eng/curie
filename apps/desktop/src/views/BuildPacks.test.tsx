@@ -14,6 +14,7 @@ import { SlackPacks } from "./BuildPacks";
 import type { ApiRequest, CurieBridge } from "../bridge/bridge";
 
 const AGENT = "11111111-2222-3333-4444-555555555555";
+const SECOND_AGENT = "22222222-2222-3333-4444-555555555555";
 
 interface Recorded {
   readonly method: string;
@@ -87,6 +88,11 @@ function stubShell(): CurieBridge {
   };
 }
 
+/** Open an agent from the list, the way an operator reaches the editor. */
+async function openAgent(name = "sre-bot") {
+  await userEvent.click(await screen.findByText(name));
+}
+
 function mount(plugin?: Parameters<typeof SlackPacks>[0]["plugin"]) {
   return render(
     <AppProvider>
@@ -105,11 +111,26 @@ async function toggle(title: string) {
   await userEvent.click(within(label).getByRole("switch"));
 }
 
+/** Mount and walk straight into the agent, for the editor's own behaviours. */
+async function mountOpen(plugin?: Parameters<typeof SlackPacks>[0]["plugin"]) {
+  const r = mount(plugin);
+  await openAgent();
+  return r;
+}
+
 beforeEach(() => {
+  // The screen remembers the operator's place in localStorage, so a leaked
+  // cursor would make these tests depend on the order they ran in.
+  localStorage.clear();
   calls = [];
   reachable = true;
   stored = null;
-  agents = [{ id: AGENT, name: "sre-bot", channel: { kind: "slack" } }];
+  // Two by default: a one-agent fixture cannot tell "lists the agents" apart
+  // from "opens the only agent", which is the distinction this screen turns on.
+  agents = [
+    { id: AGENT, name: "sre-bot", channel: { kind: "slack" } },
+    { id: SECOND_AGENT, name: "deal-desk", channel: { kind: "slack" } },
+  ];
   window.curie = stubShell();
 });
 
@@ -138,9 +159,147 @@ describe("gating", () => {
   });
 });
 
+describe("the agent list is the way in", () => {
+  it("lists the agents rather than opening one, even when there is exactly one", async () => {
+    // The point of the list. Landing straight in a single agent's editor reads as
+    // "this is THE agent" and hides that the screen is per-agent at all.
+    agents = [{ id: AGENT, name: "sre-bot", channel: { kind: "slack" } }];
+    mount();
+    expect(await screen.findByText("sre-bot")).toBeInTheDocument();
+    // The editor's own furniture must not be on screen yet.
+    expect(screen.queryByText("Load lines")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save to agent" })).not.toBeInTheDocument();
+  });
+
+  it("shows every agent, not just the first", async () => {
+    mount();
+    expect(await screen.findByText("sre-bot")).toBeInTheDocument();
+    expect(screen.getByText("deal-desk")).toBeInTheDocument();
+  });
+
+  it("reads each agent's packs so the row can say what state it is in", async () => {
+    stored = { load: { enabled: true, lines: ["working"] }, tips: { enabled: true, tips: ["a tip"] } };
+    mount();
+    await waitFor(() => expect(screen.getAllByText(`2 of ${6} on`).length).toBe(2));
+    // One read per agent, and none of them a write.
+    expect(calls.filter((c) => c.path.endsWith("/behavior-packs"))).toHaveLength(2);
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
+  });
+
+  it("says a pack is on but unusable without making you open it", async () => {
+    stored = { greeting: { enabled: true, phrases: ["hi"], reply: "" } };
+    mount();
+    expect((await screen.findAllByText("1 will not fire")).length).toBeGreaterThan(0);
+  });
+
+  it("distinguishes no packs from packs it could not read", async () => {
+    mount();
+    expect((await screen.findAllByText("no packs")).length).toBe(2);
+
+    // A failing read must not render as "off": that would be a lie about the
+    // agent's configuration, which is the one thing this list is for.
+    calls = [];
+    const shell = stubShell();
+    window.curie = {
+      ...shell,
+      api: {
+        ...shell.api,
+        request: async (req: ApiRequest) => {
+          if (req.path === "/agents") return { status: 200, ok: true, body: agents as never };
+          return { status: 500, ok: false, body: undefined as never, error: "500" };
+        },
+      },
+    };
+    mount();
+    expect((await screen.findAllByText("unreadable")).length).toBe(2);
+  });
+
+  it("flags an agent with no surface bound", async () => {
+    agents = [{ id: AGENT, name: "sre-bot", channel: null }];
+    mount();
+    expect(await screen.findByText("no surface")).toBeInTheDocument();
+  });
+
+  it("opens the agent you click, and comes back to the list", async () => {
+    mount();
+    await openAgent("deal-desk");
+    expect(await screen.findByText("Load lines")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /All agents/ }));
+    expect(await screen.findByText("sre-bot")).toBeInTheDocument();
+    expect(screen.queryByText("Load lines")).not.toBeInTheDocument();
+  });
+
+  it("reads the packs of the agent you opened, not of the first one", async () => {
+    mount();
+    await openAgent("deal-desk");
+    await waitFor(() =>
+      expect(calls.some((c) => c.path === `/agents/${SECOND_AGENT}/behavior-packs`)).toBe(true),
+    );
+  });
+});
+
+describe("remembering where the operator was", () => {
+  it("returns to the agent they had open", async () => {
+    const first = mount();
+    await openAgent();
+    await screen.findByText("Load lines");
+    first.unmount();
+
+    // Remounting is what leaving the tab and coming back does.
+    mount();
+    expect(await screen.findByText("Load lines")).toBeInTheDocument();
+  });
+
+  it("returns to the list when that is where they left off", async () => {
+    const first = mount();
+    await openAgent();
+    await userEvent.click(await screen.findByRole("button", { name: /All agents/ }));
+    first.unmount();
+
+    mount();
+    expect(await screen.findByText("sre-bot")).toBeInTheDocument();
+    expect(screen.queryByText("Load lines")).not.toBeInTheDocument();
+  });
+
+  it("shows the list when the remembered agent is gone", async () => {
+    const first = mount();
+    await openAgent();
+    await screen.findByText("Load lines");
+    first.unmount();
+
+    // The agent was deleted while the app was elsewhere. Restoring a cursor that
+    // points at nothing would be worse than forgetting it.
+    agents = [{ id: "99999999-2222-3333-4444-555555555555", name: "other-bot", channel: { kind: "slack" } }];
+    mount();
+    expect(await screen.findByText("other-bot")).toBeInTheDocument();
+    expect(screen.queryByText("Load lines")).not.toBeInTheDocument();
+  });
+
+  it("does not fall over when the browser denies localStorage", async () => {
+    // Private-mode Safari and a locked-down profile both throw on access. A
+    // cursor is a convenience; it must never take the screen down with it.
+    const real = globalThis.localStorage;
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      get() {
+        throw new Error("denied");
+      },
+    });
+    try {
+      mount();
+      expect(await screen.findByText("sre-bot")).toBeInTheDocument();
+      await openAgent();
+      expect(await screen.findByText("Load lines")).toBeInTheDocument();
+    } finally {
+      Object.defineProperty(globalThis, "localStorage", { configurable: true, value: real });
+    }
+  });
+});
+
 describe("opening an agent", () => {
   it("reads that agent's packs and offers all six", async () => {
-    mount();
+    await mountOpen();
     await waitFor(() =>
       expect(calls).toContainEqual({
         method: "GET",
@@ -158,25 +317,25 @@ describe("opening an agent", () => {
     // BehaviorPacks.from_config never raises for exactly this reason: a corrupt
     // blob must not brick the agent. An editor that threw could not open it.
     stored = { load: "not a pack", greeting: { phrases: "hi" }, future_pack: 1 };
-    mount();
+    await mountOpen();
     expect(await screen.findByText("all packs off")).toBeInTheDocument();
   });
 
   it("marks the settings pack as having no runtime, because it has none", async () => {
-    mount();
+    await mountOpen();
     expect(await screen.findByText("no runtime yet")).toBeInTheDocument();
   });
 
   it("warns when the agent has no surface bound", async () => {
     agents = [{ id: AGENT, name: "sre-bot", channel: null }];
-    mount();
+    await mountOpen();
     expect(await screen.findByText(/no surface bound/)).toBeInTheDocument();
   });
 });
 
 describe("the ways a pack is silently inert", () => {
   it("names an enabled greeting with no reply, and marks the card", async () => {
-    mount();
+    await mountOpen();
     await screen.findByText("Greeting");
     await toggle("Greeting");
 
@@ -188,7 +347,7 @@ describe("the ways a pack is silently inert", () => {
   });
 
   it("stops saying it once the pack is usable", async () => {
-    mount();
+    await mountOpen();
     await screen.findByText("Load lines");
     await toggle("Load lines");
     expect(await screen.findByText(/no lines/)).toBeInTheDocument();
@@ -209,7 +368,7 @@ describe("the preview", () => {
   });
 
   it("shows the canned reply for a bare greeting, and says no model was called", async () => {
-    mount();
+    await mountOpen();
     await screen.findByDisplayValue("hey there team");
     // "hey there team" trails filler, but "hey" is not one of this pack's phrases,
     // so it must NOT match. That is what proves the preview runs the real matcher
@@ -227,7 +386,7 @@ describe("the preview", () => {
   });
 
   it("does not fire when a real request is glued to the greeting", async () => {
-    mount();
+    await mountOpen();
     await screen.findByDisplayValue("hey there team");
     await userEvent.clear(screen.getByDisplayValue("hey there team"));
     await userEvent.type(screen.getByPlaceholderText("hi"), "hi show me the report");
@@ -235,13 +394,13 @@ describe("the preview", () => {
   });
 
   it("shows the caption the load pack produces", async () => {
-    mount();
+    await mountOpen();
     await waitFor(() => expect(screen.getAllByText("is triaging").length).toBeGreaterThan(0));
   });
 
   it("shows the platform default when no caption pack is on", async () => {
     stored = null;
-    mount();
+    await mountOpen();
     expect(await screen.findByText(/That is the platform default/)).toBeInTheDocument();
     expect(screen.getAllByText("is working on your request...").length).toBe(3);
   });
@@ -249,7 +408,7 @@ describe("the preview", () => {
 
 describe("saving", () => {
   it("writes the draft to that agent and nothing else", async () => {
-    mount();
+    await mountOpen();
     await screen.findByText("Hub button");
     await toggle("Hub button");
 
@@ -269,13 +428,13 @@ describe("saving", () => {
   });
 
   it("cannot save until something changed", async () => {
-    mount();
+    await mountOpen();
     await screen.findByText("Hub button");
     expect(screen.getByRole("button", { name: "Save to agent" })).toBeDisabled();
   });
 
   it("reports a rejected write instead of pretending it landed", async () => {
-    mount();
+    await mountOpen();
     await screen.findByText("Hub button");
     await toggle("Hub button");
     window.curie!.api.request = async () => ({
@@ -290,7 +449,7 @@ describe("saving", () => {
   });
 
   it("reverts to what the agent holds", async () => {
-    mount();
+    await mountOpen();
     await screen.findByText("Hub button");
     await toggle("Hub button");
     await waitFor(() => expect(screen.getByText("unsaved")).toBeInTheDocument());
@@ -301,7 +460,7 @@ describe("saving", () => {
 
 describe("drafting from the bundle", () => {
   it("turns the bundle's starter prompts into tips and writes a greeting", async () => {
-    mount({
+    await mountOpen({
       name: "sre-bot",
       description: "Triages alerts and ranks cost leaks.",
       starterPrompts: ["Rank our cost leaks by dollars"],
@@ -323,7 +482,7 @@ describe("drafting from the bundle", () => {
   });
 
   it("offers nothing to draft from when there is no manifest", async () => {
-    mount();
+    await mountOpen();
     await screen.findByText("Tips");
     expect(screen.queryByRole("button", { name: "Draft from this bundle" })).not.toBeInTheDocument();
   });
