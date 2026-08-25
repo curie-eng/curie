@@ -34,6 +34,13 @@ export interface GraphNode {
   readonly actions?: readonly string[];
   /** Set on nodes the operator added, which are the only ones that persist. */
   readonly userAdded?: boolean;
+  /** Which band of the diagram this belongs to. Drawn as a labelled lane, so
+   *  the graph reads as an architecture view rather than as loose boxes. */
+  readonly lane?: string;
+  /** Live load, when this node is backed by a container. A topology diagram
+   *  that also shows load is a monitoring surface; one that does not is a
+   *  picture that happens to be accurate. */
+  readonly metric?: { readonly cpu: number | null; readonly mem: number | null };
 }
 
 export interface GraphEdge {
@@ -46,9 +53,17 @@ export interface GraphEdge {
   readonly kind: "flow" | "deploy" | "data" | "planned";
 }
 
+/** A labelled vertical band covering one or more columns. */
+export interface Lane {
+  readonly label: string;
+  readonly x: number;
+  readonly width: number;
+}
+
 export interface Graph {
   readonly nodes: readonly GraphNode[];
   readonly edges: readonly GraphEdge[];
+  readonly lanes: readonly Lane[];
 }
 
 /** What is persisted between sessions: positions, plus whatever was added by
@@ -158,6 +173,16 @@ interface Placed {
   readonly row: number;
 }
 
+/** Lane label per logical column. Infrastructure spans several columns and they
+ *  all carry one label, so the band is drawn once across the whole run. */
+function laneFor(column: number): string {
+  if (column <= COL.source) return "Bundle";
+  if (column === COL.agent) return "Agents";
+  if (column === COL.runtime) return "Runtime";
+  if (column >= COL.external) return "Integrations";
+  return "Platform";
+}
+
 /** Hands out the next free row in a logical column.
  *
  *  A cursor rather than an index-of-N calculation, because the number of nodes a
@@ -182,14 +207,31 @@ function rowCursor() {
  * without this the graph would be pushed to column four's x, leaving three
  * columns of blank canvas to its left and reading as a rendering fault.
  */
-function materialise(placed: readonly Placed[]): GraphNode[] {
+function materialise(placed: readonly Placed[]): { nodes: GraphNode[]; lanes: Lane[] } {
   const occupied = [...new Set(placed.map((p) => p.column))].sort((a, b) => a - b);
   const compacted = new Map(occupied.map((c, i) => [c, i]));
-  return placed.map((p) => ({
+  const xOf = (column: number) => 30 + (compacted.get(column) ?? 0) * COL_WIDTH;
+
+  const nodes = placed.map((p) => ({
     ...p.node,
-    x: 30 + (compacted.get(p.column) ?? 0) * COL_WIDTH,
+    lane: laneFor(p.column),
+    x: xOf(p.column),
     y: 60 + p.row * GAP,
   }));
+
+  // Merge adjacent occupied columns that share a label into one band.
+  const lanes: Lane[] = [];
+  for (const column of occupied) {
+    const label = laneFor(column);
+    const last = lanes[lanes.length - 1];
+    const right = xOf(column) + NODE_W;
+    if (last && last.label === label) {
+      lanes[lanes.length - 1] = { ...last, width: right - last.x };
+    } else {
+      lanes.push({ label, x: xOf(column), width: NODE_W });
+    }
+  }
+  return { nodes, lanes };
 }
 
 export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
@@ -323,6 +365,7 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
       label: sample.name,
       sub: sample.state === "running" ? "runner · live" : `runner · ${sample.state}`,
       status: sample.state === "running" ? "live" : "known",
+      metric: { cpu: sample.cpuPercent, mem: sample.memBytes },
       detail: {
         Image: sample.image ?? undefined,
         State: sample.state,
@@ -369,6 +412,7 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
       label: sample.role,
       sub: sample.state === "running" ? "live" : sample.state,
       status: sample.state === "running" ? "live" : "known",
+      metric: { cpu: sample.cpuPercent, mem: sample.memBytes },
       detail: { Container: sample.name, Image: sample.image ?? undefined, State: sample.state },
       actions: ["local.status", "local.rebuild", "local.observability"],
     }, COL.infra + (FLOW_DEPTH[sample.role] ?? 0));
@@ -387,7 +431,8 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
   }
 
   // --- position, then overlay what the operator saved or drew ----------------
-  const nodes: GraphNode[] = materialise(placed).map((n) => {
+  const built = materialise(placed);
+  const nodes: GraphNode[] = built.nodes.map((n) => {
     const saved = doc.positions[n.id];
     return saved ? { ...n, x: saved.x, y: saved.y } : n;
   });
@@ -403,7 +448,14 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
     if (byId.has(extra.from) && byId.has(extra.to)) edges.push(extra);
   }
 
-  return { nodes, edges: edges.filter((e) => byId.has(e.from) && byId.has(e.to)) };
+  return {
+    nodes,
+    edges: edges.filter((e) => byId.has(e.from) && byId.has(e.to)),
+    // Lanes describe the derived layout. Once the operator has dragged nodes
+    // around, the bands no longer describe where anything is, so they are
+    // dropped rather than left pointing at the wrong columns.
+    lanes: Object.keys(doc.positions).length ? [] : built.lanes,
+  };
 }
 
 /** Bounding box of the graph, for fit-to-view. */

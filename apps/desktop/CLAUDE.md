@@ -61,6 +61,26 @@ React + TypeScript renderer. Full structure and rationale in
   Only node positions and operator-added nodes persist. Do not cache derived
   nodes -- a saved graph that disagrees with reality is worse than no graph.
 
+  Four rules fell out of bugs, each with a test in `model.test.ts`:
+  - Roles must be **canonical**, never raw compose service names. `curie-api` is
+    the api service, and matching on a bare `api` silently drops it.
+  - Layout is **logical columns, compacted**. Empty columns are removed, so a
+    graph with only infrastructure starts at the left edge instead of at column
+    four's x with blank canvas beside it.
+  - Saved positions carry the **`LAYOUT` version** that produced them. Bump it
+    when the derived layout changes shape; stale absolute pixels pin nodes where
+    an algorithm that no longer exists put them, and nothing on screen says so.
+  - Only a **real drag** persists a layout. A click that merely selects a node
+    used to save its position, which pinned everything and disabled relayout
+    from one click.
+
+- **The shell is Electron, deliberately.** Tauri was considered and rejected; the
+  reasoning is recorded in the README. The renderer nevertheless stays shell
+  agnostic because that keeps the decision reversible at no maintenance cost:
+  everything privileged crosses `electron/shared/contract.ts`, and drag regions
+  carry both `-webkit-app-region` and `data-tauri-drag-region`. Do not reach for
+  an Electron API from `src/`.
+
 - **The design vocabulary is the platform's, not the web console's.** This is a
   deliberate divergence from `apps/ui`, which is styled as what it is -- a page in
   a browser -- and whose canon this app does *not* copy. Reproducing flat cards on

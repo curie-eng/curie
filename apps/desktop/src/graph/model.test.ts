@@ -104,6 +104,54 @@ describe("infrastructure-only graph", () => {
   });
 });
 
+describe("lanes and live load", () => {
+  it("labels the band the nodes actually sit in", () => {
+    const { lanes, nodes } = buildGraph({ ...NO_SOURCES, samples: PLATFORM }, EMPTY_DOC);
+    expect(lanes.map((l) => l.label)).toEqual(["Platform"]);
+    // The band must span the columns it claims to.
+    const lane = lanes[0];
+    for (const n of nodes) {
+      expect(n.x).toBeGreaterThanOrEqual(lane.x);
+      expect(n.x).toBeLessThan(lane.x + lane.width);
+      expect(n.lane).toBe("Platform");
+    }
+  });
+
+  it("merges adjacent columns that share a label into one band", () => {
+    // Six infrastructure nodes occupy five columns; that is one Platform band,
+    // not five.
+    const { lanes } = buildGraph({ ...NO_SOURCES, samples: PLATFORM }, EMPTY_DOC);
+    expect(lanes).toHaveLength(1);
+  });
+
+  it("drops the bands once the operator has arranged things by hand", () => {
+    // A band that claims to cover a column stops being true the moment a node
+    // is dragged out of it.
+    const dragged: GraphDoc = {
+      version: 1,
+      layout: LAYOUT,
+      positions: { "infra:api": { x: 5, y: 900 } },
+      extraNodes: [],
+      extraEdges: [],
+    };
+    expect(buildGraph({ ...NO_SOURCES, samples: PLATFORM }, dragged).lanes).toEqual([]);
+  });
+
+  it("carries live load onto the nodes backed by a container", () => {
+    const busy = [container({ name: "curie-curie-api-1", role: "api", cpuPercent: 61.5 })];
+    const { nodes } = buildGraph({ ...NO_SOURCES, samples: busy }, EMPTY_DOC);
+    expect(nodes[0].metric).toEqual({ cpu: 61.5, mem: 1024 });
+  });
+
+  it("keeps an unmeasurable load null rather than zero", () => {
+    const stopped = [
+      container({ name: "curie-curie-api-1", role: "api", state: "exited", cpuPercent: null, memBytes: null }),
+    ];
+    const { nodes } = buildGraph({ ...NO_SOURCES, samples: stopped }, EMPTY_DOC);
+    expect(nodes[0].metric).toEqual({ cpu: null, mem: null });
+  });
+});
+
 describe("saved layouts", () => {
   const stale: GraphDoc = {
     version: 1,
