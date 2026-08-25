@@ -211,6 +211,26 @@ React + TypeScript renderer. Full structure and rationale in
   `FitWidth` (`primitives/charts.tsx`). A hardcoded chart width in a resizable
   window is a bug.
 
+## Live edits vs a packaged build
+
+`pnpm dev` is the only mode where an edit reaches an open window: Vite HMR for
+`src/`, and a rebundle-plus-restart for `electron/` (the main and preload bundles
+are read once at launch). `release/Curie.app` is a snapshot of the code at the
+moment `pnpm package` ran and never picks up a source edit. Before concluding a
+change "did not work", check which of the two is on screen. The two also keep
+separate `userData` directories, because Electron derives that from the product
+name: `Curie` for the packaged app, `@curie/desktop` for dev.
+
+`scripts/dev-electron.mjs` verifies the Electron binary exists before spawning it.
+The `electron` package computes that path by reading its own `path.txt` and
+joining it onto `dist/`, so a bad install produces a plausible string pointing at
+nothing and a bare `spawn ENOENT` that names no cause. That has cost real time
+here more than once, so the launcher reports the resolved path, what `path.txt`
+holds, and the reinstall that fixes it. A trailing newline in `path.txt` is
+trimmed, since whitespace at the end of a path is never meaningful; nothing else
+is guessed at, because pointing the dev loop at a binary chosen by heuristic
+would be worse than stopping.
+
 ## Drift between this app and the installed CLI
 
 The app is built against this repo's manifest but drives whatever `curie` is on

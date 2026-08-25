@@ -298,12 +298,38 @@ src/
 
 ## Opening it
 
+Two ways to run it, and the difference is the one thing worth knowing up front:
+**one is live, the other is a snapshot.**
+
+**While working on it, `pnpm dev`.** Vite serves the renderer with hot module
+replacement, so an edit under `src/` appears in the open window with no restart.
+An edit under `electron/` is rebundled and the app restarted for you, because the
+main and preload bundles are read once at launch and cannot be swapped under a
+running process.
+
 ```bash
 cd apps/desktop
 pnpm install
+pnpm dev
+```
+
+**For an app you can double-click, `pnpm package`.** This is a build, not a link.
+`release/Curie.app` contains the code as it was when you ran that command and goes
+on running it until you build again; it never picks up a source edit. If you are
+ever unsure whether the change you just made is in the window in front of you,
+that is the question to ask, and the answer is no unless you rebuilt or you are
+in `pnpm dev`.
+
+```bash
 pnpm package     # builds release/Curie.app
 pnpm app         # opens it
 ```
+
+The two also keep **separate settings**: Electron derives its `userData`
+directory from the product name, so the packaged app stores its workspaces, API
+URL and layout under `Curie` while `pnpm dev` uses `@curie/desktop`. A bundle you
+opened in one does not appear in the other, which is worth remembering before
+concluding that state was lost.
 
 `pnpm package` produces a real application bundle: it is named Curie, carries the
 Curie mark rather than the Electron logo, and shows up in Spotlight once you move

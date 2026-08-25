@@ -4,13 +4,49 @@
 // see-it loop the renderer gets from HMR.
 
 import { spawn } from "node:child_process";
-import { watch } from "node:fs";
+import { existsSync, readFileSync, watch } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import electron from "electron";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const URL_ = process.env.VITE_DEV_SERVER_URL ?? "http://localhost:5273";
+
+/**
+ * The Electron binary, checked before we try to spawn it.
+ *
+ * The `electron` package computes this by reading its own `path.txt` and joining
+ * it onto `dist/`, so a bad install yields a plausible-looking string pointing at
+ * nothing. Spawning that fails with a bare `spawn ENOENT`, which says nothing
+ * about the real problem, and this is not hypothetical: a `path.txt` left holding
+ * `dist/Electron.app/...` (its own prefix, plus a trailing newline) produced a
+ * `dist/dist/...` path and cost an afternoon twice.
+ *
+ * The trailing newline is fixed here because whitespace at the end of a path is
+ * never meaningful. Everything else is reported rather than guessed at: pointing
+ * the dev loop at a binary we picked by heuristic would be worse than stopping.
+ */
+function electronBinary() {
+  const resolved = String(electron).trim();
+  if (existsSync(resolved)) return resolved;
+
+  let hint = "";
+  try {
+    const pathFile = join(dirname(resolved.split("/dist/")[0]), "electron", "path.txt");
+    if (existsSync(pathFile)) hint = `\n  path.txt holds: ${JSON.stringify(readFileSync(pathFile, "utf8"))}`;
+  } catch {
+    // The hint is a nicety; never let it become the error.
+  }
+  throw new Error(
+    `The Electron binary is missing.\n  resolved to: ${resolved}${hint}\n` +
+      `This is an install problem, not a code one. Reinstall it with:\n` +
+      `  rm -rf node_modules/.pnpm/electron@* && pnpm install\n` +
+      `If that ran with ELECTRON_SKIP_BINARY_DOWNLOAD=1 (as CI does), the binary ` +
+      `was never downloaded -- install again without it.`,
+  );
+}
+
+const BIN = electronBinary();
 
 async function waitForVite() {
   for (let i = 0; i < 100; i++) {
@@ -36,7 +72,7 @@ function bundle() {
 
 let child = null;
 function start() {
-  child = spawn(electron, [root], {
+  child = spawn(BIN, [root], {
     stdio: "inherit",
     env: { ...process.env, VITE_DEV_SERVER_URL: URL_ },
   });
