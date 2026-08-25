@@ -9,7 +9,7 @@ how long do two generations coexist?
 Scratch namespace only. Never touches the curie namespace, its Helm release, or
 curie/curie-runner-pool.
 """
-import base64, json, os, subprocess, sys, time
+import base64, hmac, json, os, subprocess, sys, time
 NS = os.environ.get("POOL_NS", "skew-pool")
 CTX = os.environ["POOL_CONTEXT"]
 assert NS.startswith("skew-"), f"refusing namespace {NS!r}"
@@ -29,6 +29,24 @@ def pods():
 def tok(pod):
     out, _ = kc("exec", pod, "-c", "runner", "--", "sh", "-c", 'printf %s "$CURIE_RUNNER_TOKEN"')
     return out.strip()
+
+# Every check below is an identity comparison, so the spike never needs a token's
+# value -- only which planted generation an observation matches. `which` returns a
+# name out of this table, so no secret material ever flows into stdout or the
+# results file.
+_PLANTED = [
+    ("the first generation", "GEN-ONE"),
+    ("the rotated generation", "GEN-TWO"),
+]
+
+def which(value):
+    if value is None:
+        return "absent"
+    probe = value.encode("utf-8")
+    for name, known in _PLANTED:
+        if hmac.compare_digest(known.encode("utf-8"), probe):
+            return name
+    return "an unplanted value"
 
 print(f"{B}=== does a pool replace its warm pods when the template changes? ==={X}")
 kc("create", "namespace", NS, ns=False)
@@ -71,8 +89,8 @@ while time.time() - t0 < 240:
 if not first:
     print(f"  {R}pool never produced a running pod; aborting{X}")
     kc("delete", "namespace", NS, ns=False); sys.exit(1)
-print(f"  warm pod {first[0]} booted with token={G}{first[1]}{X}  ({time.time()-t0:.0f}s)")
-OUT["gen1"] = {"pod": first[0], "token": first[1]}
+print(f"  warm pod {first[0]} booted with {G}{which(first[1])}{X}  ({time.time()-t0:.0f}s)")
+OUT["gen1"] = {"pod": first[0], "token": which(first[1])}
 
 print(f"\n{D}  rotating the Secret to GEN-TWO (template ref unchanged){X}")
 kc("patch", "secret", "pool-tok", "--type=merge", "-p",
@@ -81,10 +99,10 @@ time.sleep(25)
 still = tok(first[0])
 same_pod_stale = (still == first[1])
 replaced = first[0] not in pods()
-print(f"  {(G+'PASS'+X) if same_pod_stale else (R+'FAIL'+X)}  the warm pod still holds {Y}{still}{X}")
+print(f"  {(G+'PASS'+X) if same_pod_stale else (R+'FAIL'+X)}  the warm pod still holds {Y}{which(still)}{X}")
 print(f"  {(Y+'pod NOT replaced'+X) if not replaced else (G+'pod was replaced'+X)}  "
       f"-> {D}rotating the Secret alone does not roll the pool{X}")
-OUT["after_secret_rotate"] = {"token": still, "replaced": replaced}
+OUT["after_secret_rotate"] = {"token": which(still), "replaced": replaced}
 
 print(f"\n{D}  now deleting the warm pod, so the pool replenishes{X}")
 kc("delete", "pod", first[0], "--ignore-not-found")
@@ -97,8 +115,8 @@ while time.time() - t0 < 240:
     time.sleep(3)
 if second:
     fresh = second[1] == "GEN-TWO"
-    print(f"  {(G+'PASS'+X) if fresh else (R+'FAIL'+X)}  replenished pod {second[0]} holds {G}{second[1]}{X}")
-    OUT["gen2"] = {"pod": second[0], "token": second[1]}
+    print(f"  {(G+'PASS'+X) if fresh else (R+'FAIL'+X)}  replenished pod {second[0]} holds {G}{which(second[1])}{X}")
+    OUT["gen2"] = {"pod": second[0], "token": which(second[1])}
 
 print(f"\n{B}=== what this settles ==={X}")
 print(f"  {Y}A pool does not roll itself when its Secret changes.{X}")

@@ -2,12 +2,12 @@
  "concurrent": {
   "winners": 1,
   "loser_already_exists": true,
-  "canonical": "WORKER-ONE-TOKEN"
+  "canonical": "actor A's value"
  },
  "skew": {
-  "before": "WORKER-ONE-TOKEN",
-  "after_rotate_same_pod": "WORKER-ONE-TOKEN",
-  "replacement": "ROTATED-GEN-TWO",
+  "before": "actor A's value",
+  "after_rotate_same_pod": "actor A's value",
+  "replacement": "the rotated value",
   "running_pod_keeps_old": true,
   "replacement_gets_new": true
  }
