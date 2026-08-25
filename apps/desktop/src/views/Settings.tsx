@@ -1,0 +1,477 @@
+// Settings: the connection, the secrets, and what this shell actually is.
+//
+// The secrets panel is deliberately thin. It lists names and can add or remove
+// one, and that is all -- values go straight to `curie secrets` and are never
+// read back, because a desktop app that could show you a secret is a second
+// place secrets live.
+
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+
+import { useApp } from "../bridge/app";
+import { commands } from "../lib/manifest";
+import { bridge, hasShell } from "../bridge/bridge";
+import { ACCENT, FONT, R, S, STATUS, T } from "../tokens";
+import { Badge, Button, Field, Group, Input, Mono, Notice, SectionHeader, Sheet } from "../primitives";
+
+/**
+ * A settings panel: a section header *outside* a grouped box.
+ *
+ * That placement is most of what makes a grouped list read as native rather than
+ * as a card with a title bar. It exists as a component so no panel can get it
+ * wrong by hand.
+ */
+function Panel({
+  title,
+  right,
+  children,
+}: {
+  title: ReactNode;
+  right?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section>
+      <SectionHeader right={right}>{title}</SectionHeader>
+      <Group style={{ padding: 14 }}>{children}</Group>
+    </section>
+  );
+}
+
+export function Settings() {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 760 }}>
+      <ApiPanel />
+      <CommandSurfacePanel />
+      <SecretsPanel />
+      <EnvironmentPanel />
+      <AboutPanel />
+    </div>
+  );
+}
+
+function ApiPanel() {
+  const app = useApp();
+  const [baseUrl, setBaseUrl] = useState(app.api?.baseUrl ?? "");
+  const [apiKey, setApiKey] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // The stored URL can arrive after this panel mounts. Adopt it during render
+  // rather than in an effect, and only when it actually changed, so a URL being
+  // typed is never yanked back to the stored one.
+  const [lastKnownUrl, setLastKnownUrl] = useState(app.api?.baseUrl);
+  if (app.api?.baseUrl !== lastKnownUrl) {
+    setLastKnownUrl(app.api?.baseUrl);
+    if (app.api?.baseUrl) setBaseUrl(app.api.baseUrl);
+  }
+
+  const connect = async () => {
+    setBusy(true);
+    try {
+      // An empty key field means "leave the stored key alone", which is what
+      // lets someone change the URL without re-pasting a key they cannot see.
+      await app.connectApi(baseUrl, apiKey === "" ? null : apiKey);
+      setApiKey("");
+      app.refreshAgents();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Panel
+      title="Platform API"
+      right={
+        app.api ? (
+          <Badge color={app.api.reachable ? ACCENT : STATUS.danger} filled>
+            {app.api.reachable ? "reachable" : "unreachable"}
+          </Badge>
+        ) : null
+      }
+    >
+      <div style={{ fontSize: 12, color: T.tertiary, marginBottom: 12, lineHeight: 1.6 }}>
+        Agents, versions, memory, approvals and traces all come from here. Requests go through the
+        native shell rather than the page, which is why this app can reach an API on any host — and
+        why the key never enters the renderer.
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <Field label="Base URL" hint="Local stack default is http://localhost:8000">
+          <Input
+            value={baseUrl}
+            spellCheck={false}
+            placeholder="http://localhost:8000"
+            onChange={(e) => setBaseUrl(e.target.value)}
+            style={{ fontFamily: FONT.mono }}
+          />
+        </Field>
+        <Field
+          label="API key"
+          hint={app.api?.hasKey ? "A key is stored. Leave blank to keep it." : "Sent as X-API-Key."}
+        >
+          <Input
+            type="password"
+            value={apiKey}
+            autoComplete="off"
+            placeholder={app.api?.hasKey ? "•••••••• (stored)" : ""}
+            onChange={(e) => setApiKey(e.target.value)}
+          />
+        </Field>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <Button tone="primary" busy={busy} onClick={() => void connect()}>
+          Connect
+        </Button>
+        <Button onClick={() => app.refreshApi()}>Test again</Button>
+        {app.api?.hasKey ? (
+          <Button
+            tone="plain"
+            onClick={() => void app.connectApi(baseUrl, "")}
+            title="Forget the stored API key"
+          >
+            Clear key
+          </Button>
+        ) : null}
+        <div style={{ flex: 1 }} />
+        {app.api?.reachable ? (
+          <span style={{ fontSize: 11, color: T.tertiary }}>
+            {app.agents.length} agent{app.agents.length === 1 ? "" : "s"} ·{" "}
+            {app.api.orgName ?? "unnamed workspace"}
+          </span>
+        ) : null}
+      </div>
+
+      {app.api && !app.api.reachable && app.api.baseUrl ? (
+        <div style={{ marginTop: 12 }}>
+          <Notice tone="warn" title="Could not reach that API">
+            Nothing answered at <Mono>{app.api.baseUrl}/config</Mono>. If you meant the local stack,
+            bring it up with{" "}
+            <button
+              onClick={() => app.navigate("commands", "local.up")}
+              style={{ background: "none", border: "none", color: ACCENT, cursor: "pointer", padding: 0 }}
+            >
+              <Mono>curie local up</Mono>
+            </button>
+            .
+          </Notice>
+        </div>
+      ) : null}
+    </Panel>
+  );
+}
+
+function SecretsPanel() {
+  const [names, setNames] = useState<readonly string[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const [nonce, setNonce] = useState(0);
+  const refresh = useCallback(() => setNonce((n) => n + 1), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const list = await bridge().secrets.list();
+        if (cancelled) return;
+        setNames(list);
+        setError(null);
+      } catch (err) {
+        if (!cancelled) setError((err as Error).message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [nonce]);
+
+  return (
+    <Panel
+      title="Secrets"
+      right={
+        <Button size="sm" onClick={() => setAdding(true)} disabled={!hasShell()}>
+          Add secret
+        </Button>
+      }
+    >
+      <div style={{ fontSize: 12, color: T.tertiary, marginBottom: 12, lineHeight: 1.6 }}>
+        Stored by <Mono>curie secrets</Mono> in its own private storage — this app only ever sees the
+        names. A value you type here is handed to the CLI through the environment, never as a command
+        argument, so it does not appear in <Mono>ps</Mono>.
+      </div>
+
+      {error ? (
+        <Notice tone="warn">{error}</Notice>
+      ) : names.length === 0 ? (
+        <div style={{ fontSize: 12, color: T.tertiary }}>No secrets saved.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          {names.map((name) => (
+            <div
+              key={name}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "6px 9px",
+                borderRadius: R.control,
+                background: S.well,
+              }}
+            >
+              <Mono style={{ flex: 1, color: T.secondary }}>{name}</Mono>
+              <span style={{ fontSize: 10, color: T.tertiary }}>value hidden</span>
+              <Button
+                size="sm"
+                tone="plain"
+                onClick={async () => {
+                  await bridge().secrets.unset(name);
+                  refresh();
+                }}
+              >
+                Remove
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {adding ? (
+        <AddSecret
+          onClose={() => setAdding(false)}
+          onSaved={() => {
+            setAdding(false);
+            refresh();
+          }}
+        />
+      ) : null}
+    </Panel>
+  );
+}
+
+function AddSecret({ onClose, onSaved }: { onClose(): void; onSaved(): void }) {
+  const [name, setName] = useState("");
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const valid = /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && value.length > 0;
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await bridge().secrets.set(name, value);
+      onSaved();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Sheet
+      title="Save a secret"
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button tone="primary" disabled={!valid} busy={busy} onClick={() => void save()}>
+            Save
+          </Button>
+        </>
+      }
+    >
+      <Field
+        label="Name"
+        hint="Upper snake case, like an environment variable: ANTHROPIC_API_KEY."
+        error={name && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? "Letters, digits and underscores only." : null}
+      >
+        <Input value={name} autoFocus spellCheck={false} onChange={(e) => setName(e.target.value.toUpperCase())} />
+      </Field>
+      <Field label="Value" hint="Written straight to Curie private storage. It is never read back.">
+        <Input type="password" value={value} autoComplete="off" onChange={(e) => setValue(e.target.value)} />
+      </Field>
+      {error ? <Notice tone="error">{error}</Notice> : null}
+    </Sheet>
+  );
+}
+
+/** The app's command surface versus the CLI it is actually driving.
+ *
+ *  This app generates its whole UI from `cli/command-manifest.json` at build
+ *  time, but it runs whatever `curie` is on PATH. When those disagree the app is
+ *  either offering buttons that cannot work or hiding commands the CLI has --
+ *  the second being exactly the "GUI is the lesser surface" failure this app is
+ *  built to avoid. Neither is allowed to be silent. */
+function CommandSurfacePanel() {
+  const app = useApp();
+  const drift = app.env?.drift;
+
+  if (!app.env?.cliPath) return null;
+
+  const ahead = drift?.missingFromApp ?? [];
+  const behind = drift?.missingFromCli ?? [];
+  const clean = drift && !ahead.length && !behind.length;
+
+  return (
+    <Panel
+      title="Command surface"
+      right={
+          <Badge color={clean ? ACCENT : drift ? STATUS.warn : T.tertiary} filled={!!drift}>
+            {clean ? "in sync" : drift ? "drifted" : "not checked"}
+          </Badge>
+        }
+    >
+
+      <div style={{ fontSize: 12, color: T.tertiary, marginBottom: 12, lineHeight: 1.6 }}>
+        Every command in this app is generated from the CLI&apos;s own manifest, then checked
+        against the binary on PATH at startup.{" "}
+        {clean
+          ? `All ${commands.length} commands this app offers match ${drift?.cliVersion ?? "the installed CLI"}.`
+          : "Below is where the two disagree."}
+      </div>
+
+      {behind.length ? (
+        <div style={{ marginBottom: 10 }}>
+          <Notice
+            tone="error"
+            title={
+              behind.length === 1
+                ? "This app offers a command the installed CLI does not have"
+                : `This app offers ${behind.length} commands the installed CLI does not have`
+            }
+          >
+            <Mono style={{ fontSize: 11 }}>{behind.join(", ")}</Mono>
+            <div style={{ marginTop: 6 }}>
+              Running {behind.length === 1 ? "it" : "them"} will fail. The app was built against a
+              different version of the CLI.
+            </div>
+          </Notice>
+        </div>
+      ) : null}
+
+      {ahead.length ? (
+        <Notice
+          tone="warn"
+          title={
+            ahead.length === 1
+              ? "The installed CLI has a command this app does not offer"
+              : `The installed CLI has ${ahead.length} commands this app does not offer`
+          }
+        >
+          <Mono style={{ fontSize: 11 }}>{ahead.join(", ")}</Mono>
+          <div style={{ marginTop: 6 }}>
+            Until the app is rebuilt, reach {ahead.length === 1 ? "it" : "them"} from a terminal.
+            Fix with{" "}
+            <Mono>pnpm gen:manifest</Mono> in <Mono>apps/desktop</Mono>, then rebuild.
+          </div>
+        </Notice>
+      ) : null}
+    </Panel>
+  );
+}
+
+function EnvironmentPanel() {
+  const app = useApp();
+  const env = app.env;
+
+  const rows: [string, string, boolean | null][] = env
+    ? [
+        ["curie", env.cliPath ?? "not found on PATH", !!env.cliPath],
+        ["version", env.cliVersion ?? "unknown", env.cliVersion ? true : null],
+        ["source checkout", env.sourceCheckout ? "yes — curie dev commands available" : "no", null],
+        ["docker", env.dockerAvailable ? "reachable" : "not reachable", env.dockerAvailable],
+        ["kubectl", env.kubectlAvailable ? "found" : "not found", env.kubectlAvailable],
+        ["helm", env.helmAvailable ? "found" : "not found", env.helmAvailable],
+      ]
+    : [];
+
+  return (
+    <Panel
+      title="This machine"
+      right={
+        <Button size="sm" onClick={() => app.refreshEnv()}>
+          Re-detect
+        </Button>
+      }
+    >
+      {env ? (
+        <div style={{ display: "grid", gap: 5, fontSize: 12 }}>
+          {rows.map(([label, value, ok]) => (
+            <div key={label} style={{ display: "grid", gridTemplateColumns: "140px 1fr", gap: 10 }}>
+              <span style={{ color: T.tertiary }}>{label}</span>
+              <Mono
+                style={{
+                  fontSize: 11,
+                  color: ok === false ? STATUS.danger : T.secondary,
+                  wordBreak: "break-all",
+                }}
+              >
+                {value}
+              </Mono>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ fontSize: 12, color: T.tertiary }}>Detecting…</div>
+      )}
+
+      {env && !env.cliPath ? (
+        <div style={{ marginTop: 12 }}>
+          <Notice tone="error" title="curie is not on PATH">
+            A GUI launch does not inherit your login shell&apos;s PATH. This app also looks in{" "}
+            <Mono>~/.cargo/bin</Mono>, <Mono>~/.local/bin</Mono>, <Mono>/opt/homebrew/bin</Mono> and{" "}
+            <Mono>/usr/local/bin</Mono>. If yours lives somewhere else, set{" "}
+            <Mono>CURIE_CLI_PATH</Mono> and reopen the app.
+          </Notice>
+        </div>
+      ) : null}
+    </Panel>
+  );
+}
+
+function AboutPanel() {
+  const app = useApp();
+  const env = app.env;
+  return (
+    <Panel title="About this shell">
+      <div style={{ fontSize: 12, color: T.secondary, lineHeight: 1.7 }}>
+        Curie Desktop is Chromium with the browser removed. It keeps the renderer — one engine that
+        draws identically on macOS, Windows and Linux — and drops tabs, history, extensions, profile
+        sync, translation, autofill, safe browsing, print preview and the media router. The window
+        can load exactly one document, cannot navigate away from it, and grants no permissions;
+        every link opens in your real browser instead.
+        <br />
+        <br />
+        The renderer itself is an ordinary sandboxed web app with no Node access. Everything
+        privileged — running <Mono>curie</Mono>, reading Docker, opening a directory, holding the API
+        key — happens in the main process behind a fixed set of IPC calls.
+      </div>
+      {env ? (
+        <div style={{ marginTop: 12, display: "flex", gap: 14, fontSize: 11, color: T.tertiary }}>
+          <span>
+            app <Mono>{env.appVersion}</Mono>
+          </span>
+          <span>
+            electron <Mono>{env.electronVersion}</Mono>
+          </span>
+          <span>
+            chromium <Mono>{env.chromeVersion}</Mono>
+          </span>
+          <span>
+            platform <Mono>{env.platform}</Mono>
+          </span>
+        </div>
+      ) : null}
+      {!hasShell() ? (
+        <div style={{ marginTop: 12 }}>
+          <Notice tone="warn" title="Running without the desktop shell">
+            This window is a plain web page, so anything needing the local machine is disabled. Start
+            it with <Mono>pnpm dev</Mono> from <Mono>apps/desktop</Mono> to get the full app.
+          </Notice>
+        </div>
+      ) : null}
+    </Panel>
+  );
+}
