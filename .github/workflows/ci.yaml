@@ -707,7 +707,7 @@ jobs:
         run: |
           pnpm gen:manifest
           git diff --exit-code src/generated/commandManifest.ts src/generated/commandManifest.json \
-            || (echo "commandManifest is stale; run 'pnpm gen:manifest' in apps/desktop and commit." && exit 1)
+            || (echo "commandManifest is stale; run 'pnpm gen:manifest' in this job's working directory and commit." && exit 1)
       - name: Typecheck
         run: pnpm typecheck
       - name: Lint
