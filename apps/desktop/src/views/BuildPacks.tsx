@@ -30,6 +30,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useApp, type AgentSummary } from "../bridge/app";
 import { bridge } from "../bridge/bridge";
 import type { PluginManifest } from "../lib/bundle";
+import { DASH } from "../lib/format";
 import {
   DEFAULT_MAX_BYTES,
   EMPTY_PACKS,
@@ -38,6 +39,7 @@ import {
   byteSize,
   caption,
   enabledPacks,
+  inertPacks,
   isInert,
   matchGreeting,
   matchHelp,
@@ -51,7 +53,7 @@ import {
   type PackKind,
   type Setting,
 } from "../lib/packs";
-import { ACCENT, F, LINE, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, FONT, LINE, S, STATUS, T, tint } from "../tokens";
 import {
   Badge,
   Button,
@@ -79,17 +81,54 @@ const ISSUE_COLOR: Record<IssueLevel, string> = {
   info: T.tertiary,
 };
 
+/**
+ * Where the operator last was in this screen, so returning to the tab does not
+ * throw away their place.
+ *
+ * localStorage rather than the main process's prefs file: this is a UI cursor,
+ * not platform state, and `sticky` (the values remembered across command forms)
+ * already establishes that the renderer keeps its own position here. Adding an
+ * IPC channel for a cursor would be a bigger surface than the thing deserves.
+ *
+ * Cleared when the operator goes back to the list, because "I was looking at the
+ * list" is a place too.
+ */
+const CURSOR_KEY = "curie.desktop.packsAgent";
+
+function readCursor(): string | null {
+  try {
+    return localStorage.getItem(CURSOR_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeCursor(id: string | null): void {
+  try {
+    if (id) localStorage.setItem(CURSOR_KEY, id);
+    else localStorage.removeItem(CURSOR_KEY);
+  } catch {
+    // A cursor is a convenience; losing it must never break the screen.
+  }
+}
+
 export function SlackPacks({ plugin }: { plugin?: PluginManifest }) {
   const app = useApp();
   const agents = app.agents;
 
-  const [agentId, setAgentId] = useState<string | null>(null);
+  // Read once, on mount: after that the operator's clicks are the truth.
+  const [cursor, setCursor] = useState<string | null>(() => readCursor());
 
-  // Default to the first agent once the list arrives, and drop a selection whose
-  // agent has gone away. Adjusted during render rather than in an effect: it is
-  // derived from a prop, so an effect would render once with a stale value.
-  const selected = agentId && agents.some((a) => a.id === agentId) ? agentId : (agents[0]?.id ?? null);
-  if (selected !== agentId) setAgentId(selected);
+  // A remembered agent the platform no longer has resolves to no selection, so a
+  // deleted agent lands you on the list instead of on a screen pointing at
+  // nothing. `cursor` is deliberately NOT cleared -- if the agent comes back (a
+  // reachable API after a blip, say) the place comes back with it.
+  const open = cursor && agents.some((a) => a.id === cursor) ? cursor : null;
+
+  const choose = (id: string | null) => {
+    setCursor(id);
+    writeCursor(id);
+  };
 
   return (
     <section>
@@ -113,36 +152,155 @@ export function SlackPacks({ plugin }: { plugin?: PluginManifest }) {
         <Notice tone="error" title="Cannot list agents">
           {app.agentsError}
         </Notice>
-      ) : !selected ? (
+      ) : agents.length === 0 ? (
         <Notice tone="info" title="No agents deployed yet">
           A pack is written against an agent that already exists. Run this bundle up the ladder
           first; the rungs above end at <Mono>skill up</Mono> or <Mono>cluster deploy</Mono>.
         </Notice>
-      ) : (
+      ) : open ? (
         // Keyed by agent: switching agents remounts, which resets the draft, the
         // errors and the dirty flag together. An effect that reset them by hand
         // would have to get all four right on every path.
         <AgentPacks
-          key={selected}
-          agentId={selected}
+          key={open}
+          agentId={open}
           agents={agents}
-          onSelect={setAgentId}
+          onBack={() => choose(null)}
           plugin={plugin}
         />
+      ) : (
+        <AgentList agents={agents} onOpen={choose} />
       )}
     </section>
+  );
+}
+
+/**
+ * The agents you can write packs to, as an inventory.
+ *
+ * Shown even when there is exactly one, which is the point: opening straight
+ * into a single agent's editor reads as "this is THE agent" rather than "this is
+ * one of your agents", and hides the fact that the screen is per-agent at all.
+ * A list of one still answers "what can I configure, and what state is it in".
+ *
+ * Each row carries that state, which is why this is a list and not a menu of
+ * names: an operator wants to see which agents have packs configured, and which
+ * only look configured, without opening each one.
+ */
+function AgentList({
+  agents,
+  onOpen,
+}: {
+  agents: readonly AgentSummary[];
+  onOpen: (id: string) => void;
+}) {
+  // `undefined` = not read yet, `null` = the read failed. Distinguished because
+  // "unknown" and "broken" are different things to show, and neither is "off".
+  const [packs, setPacks] = useState<Readonly<Record<string, BehaviorPacks | null>>>({});
+
+  // Keyed on the ids, not the array: `agents` is refreshed on a timer and gets a
+  // new identity each poll, which would refetch every agent's packs forever.
+  const key = agents.map((a) => a.id).join(",");
+  useEffect(() => {
+    const ids = key ? key.split(",") : [];
+    if (!ids.length) return;
+    let cancelled = false;
+    void (async () => {
+      const entries = await Promise.all(
+        ids.map(async (id) => {
+          const res = await bridge().api.request<unknown>({
+            method: "GET",
+            path: `/agents/${id}/behavior-packs`,
+          });
+          return [id, res.ok ? parsePacks(res.body) : null] as const;
+        }),
+      );
+      if (cancelled) return;
+      setPacks(Object.fromEntries(entries));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [key]);
+
+  return (
+    <Group>
+      {agents.map((agent, i) => (
+        <AgentRow
+          key={agent.id}
+          agent={agent}
+          packs={packs[agent.id]}
+          first={i === 0}
+          onOpen={() => onOpen(agent.id)}
+        />
+      ))}
+    </Group>
+  );
+}
+
+function AgentRow({
+  agent,
+  packs,
+  first,
+  onOpen,
+}: {
+  agent: AgentSummary;
+  packs: BehaviorPacks | null | undefined;
+  first?: boolean;
+  onOpen: () => void;
+}) {
+  const on = packs ? enabledPacks(packs) : null;
+  const dead = packs ? inertPacks(packs) : [];
+  const kind = agent.channel?.kind;
+
+  return (
+    <Row first={first} onClick={onOpen}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ ...F.body, color: T.primary }}>{agent.name}</div>
+        <div style={{ ...F.footnote, color: T.tertiary, marginTop: 1 }}>
+          {agent.model ?? "platform default model"}
+          {kind ? ` · ${kind}${agent.channel?.channel_id ? ` ${agent.channel.channel_id}` : ""}` : ""}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 6, alignItems: "center", flex: "none" }}>
+        {!kind ? (
+          <Badge color={STATUS.warn} title="Nothing renders a pack until a surface is bound.">
+            no surface
+          </Badge>
+        ) : null}
+        {dead.length ? (
+          <Badge
+            color={STATUS.warn}
+            title={`On but unusable: ${dead.join(", ")}. Open the agent to see why.`}
+          >
+            {dead.length} will not fire
+          </Badge>
+        ) : null}
+        <span style={{ ...F.footnote, color: T.tertiary, minWidth: 74, textAlign: "right" }}>
+          {packs === undefined
+            ? DASH
+            : packs === null
+              ? "unreadable"
+              : on && on.length
+                ? `${on.length} of ${PACK_KINDS.length} on`
+                : "no packs"}
+        </span>
+        <span style={{ color: T.quaternary, fontFamily: FONT.mono, fontSize: 12 }}>›</span>
+      </div>
+    </Row>
   );
 }
 
 function AgentPacks({
   agentId,
   agents,
-  onSelect,
+  onBack,
   plugin,
 }: {
   agentId: string;
   agents: readonly AgentSummary[];
-  onSelect: (id: string) => void;
+  onBack: () => void;
   plugin?: PluginManifest;
 }) {
   const [server, setServer] = useState<BehaviorPacks | null>(null);
@@ -179,6 +337,7 @@ function AgentPacks({
   const issues = useMemo(() => packIssues(draft), [draft]);
   const size = byteSize(draft);
   const on = enabledPacks(draft);
+  const agent = agents.find((a) => a.id === agentId);
 
   const save = useCallback(async () => {
     setSaving(true);
@@ -199,83 +358,79 @@ function AgentPacks({
     setDraft(stored);
   }, [agentId, draft]);
 
-  const agent = agents.find((a) => a.id === agentId);
-
   return (
     <>
       <Group style={{ marginBottom: 12 }}>
         <Row first>
-          <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
-            <Field
-              label="Agent"
-              hint="Packs apply to this agent alone, and take effect on its next message."
-            >
-              <Select value={agentId} onChange={(e) => onSelect(e.target.value)}>
-                {agents.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.name}
-                  </option>
-                ))}
-              </Select>
-            </Field>
-
-            <div style={{ flex: 1, minWidth: 0 }} />
-
-            {server === null && !loadError ? (
-              <span style={{ ...F.footnote, color: T.quaternary }}>reading...</span>
-            ) : null}
-            {server ? (
-              <>
-                <span style={{ ...F.footnote, color: T.tertiary }}>
-                  {on.length ? `${on.length} of ${PACK_KINDS.length} on` : "all packs off"}
-                </span>
-                <span
-                  style={{
-                    ...F.footnote,
-                    color: size > DEFAULT_MAX_BYTES ? STATUS.danger : T.quaternary,
-                  }}
-                  title={`The API caps a pack write at ${DEFAULT_MAX_BYTES} bytes by default.`}
-                >
-                  {size} B
-                </span>
-                {plugin ? (
-                  <Button
-                    size="sm"
-                    tone="plain"
-                    title="Draft greeting, help and tips from this bundle's description and starter prompts"
-                    onClick={() =>
-                      setDraft((d) =>
-                        proposeFromBundle(
-                          {
-                            name: plugin.name,
-                            description: plugin.description,
-                            starterPrompts: plugin.starterPrompts,
-                          },
-                          d,
-                        ),
-                      )
-                    }
-                  >
-                    Draft from this bundle
-                  </Button>
-                ) : null}
-                {dirty ? <span style={{ ...F.footnote, color: STATUS.warn }}>unsaved</span> : null}
-                <Button size="sm" tone="plain" disabled={!dirty} onClick={() => setDraft(server)}>
-                  Revert
-                </Button>
-                <Button
-                  size="sm"
-                  tone="primary"
-                  disabled={!dirty}
-                  busy={saving}
-                  onClick={() => void save()}
-                >
-                  Save to agent
-                </Button>
-              </>
-            ) : null}
+          <Button size="sm" tone="plain" onClick={onBack}>
+            {"\u2039 All agents"}
+          </Button>
+          <div style={{ flex: 1, minWidth: 0, marginLeft: 4 }}>
+            <div style={{ ...F.headline, color: T.primary }}>{agent?.name ?? agentId}</div>
+            <div style={{ ...F.footnote, color: T.tertiary }}>
+              {agent?.model ?? "platform default model"}
+            </div>
           </div>
+          {server === null && !loadError ? (
+            <span style={{ ...F.footnote, color: T.quaternary }}>reading...</span>
+          ) : (
+            <>
+              <span style={{ ...F.footnote, color: T.tertiary }}>
+                {on.length ? `${on.length} of ${PACK_KINDS.length} on` : "all packs off"}
+              </span>
+              <span
+                style={{
+                  ...F.footnote,
+                  color: size > DEFAULT_MAX_BYTES ? STATUS.danger : T.quaternary,
+                }}
+                title={`The API caps a pack write at ${DEFAULT_MAX_BYTES} bytes by default.`}
+              >
+                {size} B
+              </span>
+            </>
+          )}
         </Row>
+
+        {server ? (
+          <Row>
+            {plugin ? (
+              <Button
+                size="sm"
+                tone="plain"
+                title="Draft greeting, help and tips from this bundle's description and starter prompts"
+                onClick={() =>
+                  setDraft((d) =>
+                    proposeFromBundle(
+                      {
+                        name: plugin.name,
+                        description: plugin.description,
+                        starterPrompts: plugin.starterPrompts,
+                      },
+                      d,
+                    ),
+                  )
+                }
+              >
+                Draft from this bundle
+              </Button>
+            ) : null}
+            <div style={{ flex: 1 }} />
+            {dirty ? <span style={{ ...F.footnote, color: STATUS.warn }}>unsaved</span> : null}
+            <Button size="sm" tone="plain" disabled={!dirty} onClick={() => setDraft(server)}>
+              Revert
+            </Button>
+            <Button
+              size="sm"
+              tone="primary"
+              disabled={!dirty}
+              busy={saving}
+              onClick={() => void save()}
+            >
+              Save to agent
+            </Button>
+          </Row>
+        ) : null}
+
         {agent ? <Binding agent={agent} /> : null}
       </Group>
 

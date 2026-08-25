@@ -170,6 +170,17 @@ React + TypeScript renderer. Full structure and rationale in
     Everything else -- load, tips, greeting, help, nav -- is wired in `kernel.py`
     and `blocks.py`.
 
+  The screen is a **list of agents first, one agent's editor second**, and the
+  list is shown even when there is exactly one agent. Opening straight into a
+  single agent reads as "this is THE agent" and hides that packs are per-agent at
+  all, so the rows carry state (how many packs are on, how many are on but cannot
+  fire, whether a surface is bound) and the list doubles as an inventory. The one
+  case that skips the list is restoring where the operator actually was: the
+  cursor lives in `localStorage`, the same place `sticky` keeps its values, since
+  it is a UI position and not platform state. Going back to the list clears it,
+  because that is a place too, and a cursor pointing at a deleted agent resolves
+  to the list rather than to an empty screen.
+
   As in `bundle.ts`, an `error` here means "this will not fire", never "the API
   will reject it". Every pack the checker flags is schema-valid, so refusing to
   save one would make this app stricter than the platform it is a client of.

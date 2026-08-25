@@ -176,6 +176,14 @@ facts**, since a manifest's description and starter prompts are already the
 material a greeting, a help reply and a set of tips are made of. Drafting is the
 part that belongs to Build; the write goes to the agent.
 
+It opens on the agents you can write packs to, as an inventory: each row says how
+many packs are on, how many are on but cannot fire, and whether a surface is
+bound, so you can see which agents are configured without opening each one. The
+list appears even when there is only one agent, because landing straight in a
+single agent's editor reads as "this is THE agent" and hides that the screen is
+per-agent at all. The exception is returning to where you were: the app remembers
+the agent you had open, and going back to the list is remembered too.
+
 Two things it tells you that nothing else does:
 
 - **Which of your packs will not fire.** A pack can be enabled and inert with no
