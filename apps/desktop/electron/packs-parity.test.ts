@@ -33,40 +33,56 @@ const HERE = dirname(new URL(import.meta.url).pathname);
 const WORKER = resolve(HERE, "..", "..", "..", "apps", "worker");
 
 /**
- * `behaviorpacks` imports nothing but the standard library and pydantic, so this
- * runs with `--no-project`: syncing the worker's whole environment to compare a
+ * `behaviorpacks.py` itself imports nothing but the standard library and pydantic,
+ * so this runs `--no-project`: syncing the worker's whole environment to compare a
  * regex would put a heavy dependency install in the desktop CI job for no gain.
- * If the module ever grows a real dependency, this fails loudly on the import
- * rather than quietly skipping -- see `probe`.
  */
 const UV = ["run", "--no-project", "--with", "pydantic", "python"];
 
-/** Runs in the worker's own environment; prints one JSON answer per case. */
+/**
+ * Load the module by FILE PATH, rather than importing `curie_worker.behaviorpacks`.
+ *
+ * The package's `__init__.py` imports `binding`, which imports `aci_protocol`,
+ * which pulls in the rest of the worker. So importing the module the normal way
+ * needs the worker's entire environment even though the module under test needs
+ * only pydantic -- which is what CI found, and what the probe below reported.
+ * Loading the file directly keeps this test's dependencies equal to its subject's.
+ *
+ * The module must be registered in `sys.modules` BEFORE it executes: it uses
+ * `from __future__ import annotations`, so pydantic resolves its forward
+ * references by looking the module up by name, and a module that is not there yet
+ * fails with "SettingsPack is not fully defined".
+ */
+const LOADER = `
+import importlib.util, sys
+_spec = importlib.util.spec_from_file_location("bp", "src/curie_worker/behaviorpacks.py")
+bp = importlib.util.module_from_spec(_spec)
+sys.modules["bp"] = bp
+_spec.loader.exec_module(bp)
+`;
+
+/** Prints one JSON answer per case, for the whole corpus. */
 const SCRIPT = `
 import json, sys
-sys.path.insert(0, "src")
-from curie_worker.behaviorpacks import (
-    BehaviorPacks, Setting, SettingError, _deelongate, _matches_bare,
-    _normalize, _pick, coerce_setting, sample_load, sample_tip,
-)
+${LOADER}
 
 req = json.load(sys.stdin)
 out = {
-    "normalize": [_normalize(t) for t in req["normalize"]],
-    "deelongate": [_deelongate(t) for t in req["deelongate"]],
-    "matches_bare": [_matches_bare(p, t) for p, t in req["matches_bare"]],
-    "pick": [_pick(seq, seed, salt) for seq, seed, salt in req["pick"]],
+    "normalize": [bp._normalize(t) for t in req["normalize"]],
+    "deelongate": [bp._deelongate(t) for t in req["deelongate"]],
+    "matches_bare": [bp._matches_bare(p, t) for p, t in req["matches_bare"]],
+    "pick": [bp._pick(seq, seed, salt) for seq, seed, salt in req["pick"]],
     "coerce": [],
     "sample": [],
 }
 for raw_setting, raw in req["coerce"]:
     try:
-        out["coerce"].append({"ok": True, "value": coerce_setting(Setting(**raw_setting), raw)})
-    except SettingError as exc:
+        out["coerce"].append({"ok": True, "value": bp.coerce_setting(bp.Setting(**raw_setting), raw)})
+    except bp.SettingError as exc:
         out["coerce"].append({"ok": False, "error": str(exc)})
 for blob, seed in req["sample"]:
-    packs = BehaviorPacks.from_config(blob)
-    out["sample"].append([sample_load(packs, seed), sample_tip(packs, seed)])
+    packs = bp.BehaviorPacks.from_config(blob)
+    out["sample"].append([bp.sample_load(packs, seed), bp.sample_tip(packs, seed)])
 json.dump(out, sys.stdout)
 `;
 
@@ -87,7 +103,7 @@ function probe(): string | null {
     return "uv is not on PATH";
   }
   try {
-    execFileSync("uv", [...UV, "-c", "import curie_worker.behaviorpacks"], {
+    execFileSync("uv", [...UV, "-c", LOADER], {
       cwd: WORKER,
       env: { ...process.env, PYTHONPATH: "src" },
       stdio: "pipe",
@@ -96,7 +112,7 @@ function probe(): string | null {
   } catch (err) {
     const detail = (err as { stderr?: Buffer }).stderr?.toString().trim().split("\n").slice(-3).join(" ");
     throw new Error(
-      `uv is available but curie_worker.behaviorpacks would not import, so the ` +
+      `uv is available but behaviorpacks.py would not load, so the ` +
         `behavior-pack mirror cannot be checked against it. If the module grew a ` +
         `dependency, add it to the --with list in UV above. ${detail ?? ""}`,
       { cause: err },
