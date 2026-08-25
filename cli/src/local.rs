@@ -239,6 +239,87 @@ pub struct LocalOpts {
     /// Without it, `up` refuses rather than fetching ~11.4 GB implicitly. Only
     /// `up` consumes it; the other verbs set `false`.
     pub pull_model: bool,
+    /// Build the stack's images from THIS checkout instead of pulling the
+    /// published ones (#1915). Only `up` consumes it.
+    ///
+    /// Without it a contributor gets a source-built CLI talking to whatever the
+    /// registry last published, and the gap shows up as a serde error about a
+    /// field name or a missing Python module inside a container.
+    pub build: bool,
+}
+
+/// The tag `--build` writes and runs. Fixed rather than content-derived: the
+/// flag means "build now", so a stale `dev` is an explicit choice rather than a
+/// silent one, and a fixed name keeps `docker images` readable.
+pub const SOURCE_IMAGE_TAG: &str = "dev";
+
+/// One published image the dev stack can run, and where its source lives.
+pub struct SourceImage {
+    /// The ghcr repository name, matching `compose.dev.yaml`.
+    pub image: &'static str,
+    /// Dockerfile path, relative to the repo root.
+    pub dockerfile: &'static str,
+    /// The compose variable that points at this image, when it has its own.
+    ///
+    /// `None` means the image rides `CURIE_BASE_TAG` (the api, and the worker
+    /// overlay's base). Everything else gets a variable of its own, because
+    /// `CURIE_BASE_TAG` means "the platform images THIS caller built" and CI sets
+    /// it while building only those two -- widening its reach made compose pull
+    /// tags nothing had built and fail the stack with `manifest unknown`.
+    pub env: Option<&'static str>,
+}
+
+/// The images `--build` builds for this invocation, in dependency-ish order.
+///
+/// Skips only what nothing can reach: a `--minimal` run starts no UI, and
+/// building one is minutes of pnpm for a container that never starts.
+///
+/// The dispatcher is built ALWAYS, including without `--slack`, and that is not
+/// symmetry for its own sake. The compose profile governs the long-running
+/// dispatcher service, but `curie local message` runs a ONE-SHOT container from
+/// the same image on every invocation (`message.rs`'s
+/// `curie_dispatcher.enqueue_once`), outside any profile. Keying the build set on
+/// profiles alone left the main dev-loop verb still failing with
+/// `No module named curie_dispatcher.enqueue_once` -- observed, not theorised.
+///
+/// `curie-api` covers `curie-migrate` too: same image, and it is what applies
+/// the migrations, which is how a stale one leaves the database behind the tree.
+pub fn source_images(o: &LocalOpts) -> Vec<SourceImage> {
+    let mut images = vec![
+        SourceImage {
+            image: "curie-api",
+            dockerfile: "apps/api/Dockerfile",
+            env: None,
+        },
+        SourceImage {
+            image: "curie-worker",
+            dockerfile: "apps/worker/Dockerfile",
+            env: None,
+        },
+        SourceImage {
+            image: "curie-dispatcher",
+            dockerfile: "apps/dispatcher/Dockerfile",
+            env: Some("CURIE_DISPATCHER_IMAGE"),
+        },
+        // The one that decides whether the AGENT runs this checkout. The worker
+        // spawns it per turn from CURIE_RUNNER_IMAGE, so leaving it out rebuilt
+        // the platform and left the sandbox on the registry's runner -- which is
+        // how a turn kept producing the OLD fake model's frames while every
+        // other service was current.
+        SourceImage {
+            image: "curie-runner",
+            dockerfile: "runner/Dockerfile",
+            env: Some("CURIE_RUNNER_IMAGE"),
+        },
+    ];
+    if !o.minimal {
+        images.push(SourceImage {
+            image: "curie-ui",
+            dockerfile: "apps/ui/Dockerfile",
+            env: Some("CURIE_UI_IMAGE"),
+        });
+    }
+    images
 }
 
 pub struct LocalDownOpts {
@@ -330,6 +411,26 @@ fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)
     // above, not inside it, because the `--local-model` arm does not fall
     // through to the else: `--minimal --local-model` needs suppressing too.
     env.extend(otel_endpoint_env_override(o.minimal));
+    // #1915: point every published image at what `--build` just built. Set here
+    // rather than in `up` so `--dry-run` shows it, and so the one variable drives
+    // api, migrate, worker, ui and dispatcher uniformly -- which is why the two
+    // that were pinned to `latest` were changed to read it.
+    if o.build {
+        // The two that ride the base tag (the api, and the worker overlay's
+        // base), then one explicit reference per image that has its own variable.
+        // Named outright rather than derived: CURIE_BASE_TAG means "the platform
+        // images this caller built", and CI sets it while building only those
+        // two, so anything else reading it goes looking for a tag nothing built.
+        env.push(("CURIE_BASE_TAG".into(), SOURCE_IMAGE_TAG.into()));
+        for image in source_images(o) {
+            if let Some(name) = image.env {
+                env.push((
+                    name.into(),
+                    format!("ghcr.io/curie-eng/{}:{SOURCE_IMAGE_TAG}", image.image),
+                ));
+            }
+        }
+    }
     env
 }
 
@@ -342,6 +443,14 @@ fn up_command_with_model(o: &LocalOpts, model: Option<&str>) -> OpsCommand {
         plain("-d"),
         plain("--wait"),
     ]);
+    // #1915: `curie-worker` is a compose-built OVERLAY over the published base.
+    // Rebuilding the base is not enough -- without this, compose reuses the
+    // overlay it baked over the PREVIOUS base, so the stack runs yesterday's
+    // worker on today's base and nothing says so until a turn behaves like old
+    // code. Only under `--build`: a plain `up` must stay a fast restart.
+    if o.build {
+        args.push(plain("--build"));
+    }
     let mut cmd = OpsCommand::new("docker", args);
     let env = compose_model_env(o, model);
     if !env.is_empty() {
@@ -533,6 +642,49 @@ pub fn apply_credential_plan(
     Ok(resolved)
 }
 
+/// Build every image this run needs from THIS checkout, tagged [`SOURCE_IMAGE_TAG`].
+///
+/// The gap this closes: `curie update` refreshes the CLI and the runner image,
+/// and nothing refreshed api, worker, ui or dispatcher -- so a contributor on a
+/// feature branch ran a source-built CLI against whatever the registry last
+/// published. The failures do not look like version skew: a serde error about a
+/// missing field, or `No module named` from inside a container.
+async fn build_source_images(o: &LocalOpts) -> Result<()> {
+    let ui = crate::ui::ui();
+    let root = crate::commands::find_repo_root().context(
+        "not inside a curie source checkout. `--build` builds the stack's images from \
+         source; a release binary runs the published images and has nothing to build.",
+    )?;
+    let images = source_images(o);
+    ui.note(&format!(
+        "building {} image(s) from {} as :{SOURCE_IMAGE_TAG}",
+        images.len(),
+        root.display()
+    ));
+    for image in &images {
+        let tag = format!("ghcr.io/curie-eng/{}:{SOURCE_IMAGE_TAG}", image.image);
+        ui.note(&format!(
+            "=== docker build -f {} -t {tag} . ===",
+            image.dockerfile
+        ));
+        // Inherit stdio so the build log streams, matching `curie build`.
+        let status = tokio::process::Command::new("docker")
+            .args(["build", "-f", image.dockerfile, "-t", &tag, "."])
+            .current_dir(&root)
+            .status()
+            .await
+            .context("failed to invoke docker")?;
+        if !status.success() {
+            bail!("docker build failed for {} ({status})", image.image);
+        }
+    }
+    ui.success(&format!(
+        "built {} image(s) as :{SOURCE_IMAGE_TAG}; the stack below runs them",
+        images.len()
+    ));
+    Ok(())
+}
+
 pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput> {
     let ui = crate::ui::ui();
     // #749/ADR-0070: an opt-in bundle `.env` is the LOWEST-priority model
@@ -548,6 +700,11 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
         }));
     }
     require_on_path("docker")?;
+    // #1915: build before compose starts anything, so a failed build never
+    // leaves a half-source stack running. Streams its log like `curie build`.
+    if o.build {
+        build_source_images(&o).await?;
+    }
     // ADR 0093: `--local-model` never downloads its ~11.4 GB of assets
     // implicitly. Refuse before anything is brought up, unless the operator
     // asked for the fetch on this invocation.
@@ -895,6 +1052,7 @@ mod tests {
             slack: false,
             model_mode: ModelMode::DefaultFake,
             env_file: None,
+            build: false,
         }
     }
 
@@ -908,6 +1066,7 @@ mod tests {
             slack: false,
             model_mode: ModelMode::DefaultFake,
             env_file: None,
+            build: false,
         }
     }
 
@@ -1772,5 +1931,197 @@ mod tests {
         assert!(!dispatcher.contains("profiles: *full_profiles"));
         assert!(dispatcher.contains("      VALKEY_HOST: valkey"));
         assert!(dispatcher.contains("      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}"));
+    }
+
+    /// Regression: rebuilding the BASE images is not enough. `curie-worker` is a
+    /// compose-built overlay over the published base, and without `--build` on
+    /// the compose child, compose reuses the overlay it baked over the PREVIOUS
+    /// base -- so a stack reported as source-built ran yesterday's worker on
+    /// today's base, and a real turn recorded no `post_state` because the code
+    /// that extracts it was in the layer that never got rebuilt.
+    #[test]
+    fn build_rebuilds_the_compose_overlays_too() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+
+        let display = up_command(&o).display();
+
+        assert!(
+            display.contains(" up -d --build") || display.contains(" --build"),
+            "expected compose to rebuild its overlays, got: {display}"
+        );
+    }
+
+    /// #1915: `--build` has to reach the compose child as the tag override, or
+    /// the images it just built are not the images the stack runs.
+    #[test]
+    fn build_pins_every_published_image_to_the_locally_built_tag() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+
+        let display = up_command(&o).display();
+
+        assert!(
+            display.contains(&format!("CURIE_BASE_TAG={SOURCE_IMAGE_TAG}")),
+            "expected the source tag in the compose env, got: {display}"
+        );
+    }
+
+    /// Without the flag nothing is pinned: a plain `local up` keeps pulling the
+    /// published images, which is what a non-contributor wants.
+    #[test]
+    fn without_build_the_tag_is_left_to_compose() {
+        let display = up_command(&opts(DEFAULT_COMPOSE_FILE)).display();
+
+        assert!(!display.contains("CURIE_BASE_TAG"), "got: {display}");
+    }
+
+    /// `--minimal` starts no UI, so building one is minutes of pnpm for a
+    /// container that never starts.
+    #[test]
+    fn minimal_skips_the_ui_it_never_starts() {
+        let mut minimal = opts(DEFAULT_COMPOSE_FILE);
+        minimal.minimal = true;
+        minimal.build = true;
+
+        let names: Vec<&str> = source_images(&minimal).iter().map(|i| i.image).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "curie-api",
+                "curie-worker",
+                "curie-dispatcher",
+                "curie-runner"
+            ]
+        );
+        let mut full = opts(DEFAULT_COMPOSE_FILE);
+        full.build = true;
+        let full_names: Vec<&str> = source_images(&full).iter().map(|i| i.image).collect();
+        assert!(full_names.contains(&"curie-ui"));
+    }
+
+    /// Regression: the runner was the image left out, and it is the one that
+    /// decides whether the AGENT runs this checkout. Without it `--build`
+    /// rebuilt every platform service and the sandbox still ran the registry's
+    /// runner, so a turn kept producing the OLD fake model's frames.
+    #[test]
+    fn the_runner_is_in_the_build_set() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+        o.minimal = true;
+
+        let names: Vec<&str> = source_images(&o).iter().map(|i| i.image).collect();
+
+        assert!(names.contains(&"curie-runner"), "got {names:?}");
+    }
+
+    /// Regression: keying the build set on the `slack` PROFILE left
+    /// `curie local message` failing with `No module named
+    /// curie_dispatcher.enqueue_once`, because that verb runs a one-shot
+    /// container from the dispatcher image on every invocation, profile or not.
+    #[test]
+    fn the_dispatcher_is_built_even_without_the_slack_profile() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+        o.slack = false;
+
+        let names: Vec<&str> = source_images(&o).iter().map(|i| i.image).collect();
+
+        assert!(
+            names.contains(&"curie-dispatcher"),
+            "local message needs this image with no slack profile: {names:?}"
+        );
+    }
+
+    /// Every image compose can pull under the override must be buildable here,
+    /// or `--build` produces a stack that is partly source and partly registry
+    /// -- the exact split #1915 is about.
+    #[test]
+    fn every_overridable_compose_image_is_in_the_build_set() {
+        let compose = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(DEFAULT_COMPOSE_FILE),
+        )
+        .expect("compose file");
+
+        // Three forms carry an override, and missing one is how this test went
+        // wrong twice: an `image:` line interpolating CURIE_BASE_TAG, the worker
+        // overlay taking it as a build ARG for its own `FROM`, and the runner,
+        // which is not a compose service at all -- the worker spawns it from
+        // CURIE_RUNNER_IMAGE, on its own axis. All three are scanned, so an
+        // image the stack can be pointed at cannot escape the build set.
+        let overlay = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("compose/worker-local.Dockerfile"),
+        )
+        .expect("worker overlay");
+
+        let mut overridable = std::collections::BTreeSet::new();
+        for line in compose.lines().chain(overlay.lines()) {
+            let line = line.trim();
+            let interpolates = line.contains("${CURIE_BASE_TAG")
+                || line.contains("${BASE_TAG")
+                || line.contains("${CURIE_RUNNER_IMAGE")
+                || line.contains("${CURIE_UI_IMAGE")
+                || line.contains("${CURIE_DISPATCHER_IMAGE");
+            if !interpolates {
+                continue;
+            }
+            if let Some(idx) = line.find("ghcr.io/curie-eng/") {
+                let rest = &line[idx + "ghcr.io/curie-eng/".len()..];
+                let name = rest.split(':').next().unwrap_or_default();
+                overridable.insert(name.to_string());
+            }
+        }
+
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+        let buildable: std::collections::BTreeSet<String> = source_images(&o)
+            .iter()
+            .map(|i| i.image.to_string())
+            .collect();
+
+        assert_eq!(
+            overridable, buildable,
+            "compose can override these images but --build does not build them all"
+        );
+    }
+
+    /// Regression, caught by CI rather than by reasoning: the runner is a
+    /// SEPARATE axis from the published platform images, and coupling it to
+    /// CURIE_BASE_TAG broke the e2e ladder.
+    ///
+    /// CI sets `CURIE_BASE_TAG=ci-local` for the platform images and builds its
+    /// runner as a plain `curie-runner`, so making CURIE_RUNNER_IMAGE read that
+    /// variable sent the worker looking for `curie-runner:ci-local`, which
+    /// nothing had built. `--build` names the runner image outright instead.
+    #[test]
+    fn build_names_the_runner_image_without_borrowing_the_base_tag() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+
+        let display = up_command(&o).display();
+
+        assert!(
+            display.contains(&format!(
+                "CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:{SOURCE_IMAGE_TAG}"
+            )),
+            "got: {display}"
+        );
+    }
+
+    /// The other half: without `--build`, the runner variable is untouched, so a
+    /// caller that sets CURIE_BASE_TAG for the platform images (CI does) keeps
+    /// whatever runner it built.
+    #[test]
+    fn without_build_the_runner_image_is_left_alone() {
+        let display = up_command(&opts(DEFAULT_COMPOSE_FILE)).display();
+
+        assert!(!display.contains("CURIE_RUNNER_IMAGE"), "got: {display}");
     }
 }

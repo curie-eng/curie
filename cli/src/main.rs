@@ -868,6 +868,17 @@ enum LocalAction {
         /// and the value never reaches argv or logs (#749).
         #[arg(long = "env-file", value_name = "PATH")]
         env_file: Option<PathBuf>,
+        /// Build the stack's images from THIS checkout instead of pulling the
+        /// published ones, and run them (#1915).
+        ///
+        /// `curie update` refreshes the CLI and the runner image; nothing
+        /// refreshed api, worker, ui or dispatcher, so a contributor on a feature
+        /// branch ran a source-built CLI against whatever the registry last
+        /// published. The skew does not announce itself: it surfaces as a serde
+        /// error about a field name, or `No module named` from inside a
+        /// container. Builds only what the selected profiles run.
+        #[arg(long)]
+        build: bool,
     },
     /// Rebuild + recreate ONE compose service (e.g. after a code change) without
     /// losing the stack's already-resolved credential/model-mode wiring.
@@ -2348,6 +2359,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 pull_model,
                 slack,
                 env_file,
+                build,
             } => {
                 let file = resolve_compose_file(file, dry_run).await?;
                 emit(
@@ -2361,6 +2373,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             slack,
                             model_mode: local::model_mode_from_env(),
                             env_file,
+                            build,
                         },
                         model,
                     )
@@ -2389,6 +2402,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                             slack,
                             model_mode: local::model_mode_from_env(),
                             env_file,
+                            // `local rebuild` recreates ONE service against the
+                            // stack already running; it never re-tags images.
+                            build: false,
                         },
                         service,
                         model,
@@ -2414,6 +2430,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             slack: false,
                             model_mode: local::ModelMode::DefaultFake,
                             env_file: None,
+                            build: false,
                         },
                         wipe,
                         yes,
@@ -2433,6 +2450,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         slack: false,
                         model_mode: local::ModelMode::DefaultFake,
                         env_file: None,
+                        build: false,
                     })
                     .await?,
                 )
@@ -2466,6 +2484,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     slack: true,
                     model_mode: local::model_mode_from_env(),
                     env_file: None,
+                    build: false,
                 };
                 let model_credentials =
                     local::apply_credential_plan(&mut model_opts, crate::ui::ui())?;

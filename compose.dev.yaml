@@ -435,7 +435,12 @@ services:
   # The image is fixture-by-default, so the CLI advertises the wired
   # `http://localhost:28080/?api=1` URL and `local up` opens it connected to the API.
   curie-ui:
-    image: ghcr.io/curie-eng/curie-ui:latest
+    # Its OWN variable, defaulting to the `latest` this line used to hardcode
+    # (#1915). NOT CURIE_BASE_TAG: that variable means "the platform images this
+    # caller built", and CI sets it while building only api and worker -- so
+    # reading it here made compose pull a `curie-ui:ci-local` that does not
+    # exist and fail the whole stack with `manifest unknown`.
+    image: ${CURIE_UI_IMAGE:-ghcr.io/curie-eng/curie-ui:latest}
     profiles: *full_profiles
     depends_on:
       curie-api:
@@ -524,7 +529,16 @@ services:
       - /tmp/curie-bundles:/tmp/curie-bundles
     environment:
       - CURIE_SANDBOX_SUBSTRATE=docker
-      - CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:latest
+      # The image the worker spawns per turn -- the one that decides whether the
+      # AGENT runs your checkout, which is why `local up --build` sets it (#1915).
+      #
+      # Its OWN variable, deliberately NOT CURIE_BASE_TAG. The runner is not a
+      # compose service: it is spawned by the worker, and it is built and tagged
+      # on a different axis from the published platform images. Reading the base
+      # tag here broke the e2e ladder, which sets CURIE_BASE_TAG=ci-local for the
+      # platform and builds its runner as a plain `curie-runner` -- so the worker
+      # went looking for a `curie-runner:ci-local` nothing had built.
+      - CURIE_RUNNER_IMAGE=${CURIE_RUNNER_IMAGE:-ghcr.io/curie-eng/curie-runner:latest}
       - TMPDIR=/tmp/curie-bundles
       - VALKEY_HOST=localhost
       - VALKEY_PORT=26379
@@ -648,7 +662,11 @@ services:
   # Use one dispatcher per app. This is why the service is behind the `slack`
   # profile and disabled by default.
   curie-dispatcher:
-    image: ghcr.io/curie-eng/curie-dispatcher:latest
+    # Its own variable, same reasoning as curie-ui above (#1915). This one bit
+    # hardest locally: the CLI invoked `curie_dispatcher.enqueue_once`, the
+    # published image predated that module, and the failure surfaced as a bare
+    # `No module named` from inside a container.
+    image: ${CURIE_DISPATCHER_IMAGE:-ghcr.io/curie-eng/curie-dispatcher:latest}
     profiles: [slack]
     depends_on:
       valkey:

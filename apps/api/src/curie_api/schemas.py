@@ -676,6 +676,37 @@ class ChannelBinding(BaseModel):
         return self
 
 
+class ChannelBindingOut(BaseModel):
+    """The READ side of a binding: the stored pair, serialized as it is stored.
+
+    Deliberately NOT a subclass of `ChannelBinding`, and that is the whole point.
+    `ChannelBinding` carries the address-shape rule three write paths inherit
+    (`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be
+    the element type of `AgentOut.channels` as well -- so the rule that guards a
+    BIND also ran when an existing row was READ, and one row it rejected failed
+    the whole response for every agent in it (#1914).
+
+    An install reaches that state by upgrading: migration 0021 backfills
+    `agent_channels.address` from `agents.slack_channel` verbatim, and that column
+    is exactly where a literal `#name` from before the validator lived. So an
+    install that was merely mis-routed became one whose agent list was
+    unavailable, reporting a Pydantic error instead of the bad value.
+
+    Serializing a stored row must not re-litigate whether it should have been
+    stored. Showing the bad address is also the more useful outcome: an operator
+    cannot fix a value the API refuses to tell them.
+
+    The shape stays `{kind, address}`, identical to what `ChannelBinding`
+    serialized, so this is not a wire change -- `ChannelBindingWrite`'s docstring
+    already describes that as the read contract.
+    """
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    kind: str
+    address: str
+
+
 class ChannelBindingWrite(ChannelBinding):
     """The WRITE side of a binding: the public pair plus its reply ROUTE.
 
@@ -886,7 +917,7 @@ class AgentOut(BaseModel):
     # has no `created_at` and an unordered list makes two identical GETs differ
     # -- which re-renders the console's rows on every poll. The LOADING strategy
     # lives on the relationship too (`models.Agent.channels`, lazy="selectin").
-    channels: list[ChannelBinding]
+    channels: list[ChannelBindingOut]
     repo_full_name: str | None
     behavior_packs: dict[str, Any] | None
     model: str | None

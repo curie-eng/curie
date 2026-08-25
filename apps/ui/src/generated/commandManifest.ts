@@ -705,6 +705,18 @@ export const commandManifest = {
               "long": "env-file",
               "positional": false,
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Build the stack's images from THIS checkout instead of pulling the published ones, and run them (#1915)",
+              "id": "build",
+              "long": "build",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
             }
           ],
           "hidden": false,

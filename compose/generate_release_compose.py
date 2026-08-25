@@ -71,6 +71,21 @@ CURIE_LATEST_RE = re.compile(
     r"(ghcr\.io/curie-eng/curie-[a-z-]+):(?:latest|\$\{CURIE_BASE_TAG:-latest\})"
 )
 
+# The other override shape, added by #1915: an image whose WHOLE reference is a
+# defaulted variable, `${CURIE_UI_IMAGE:-ghcr.io/curie-eng/curie-ui:latest}`.
+# Those images (ui, dispatcher, runner) are not on CURIE_BASE_TAG, because that
+# variable means "the platform images this caller built" and CI sets it while
+# building only api and worker.
+#
+# T3's pattern matches the ref INSIDE the braces, which would pin the tag and
+# leave the `${...}` wrapper in place -- and the release asset has no shell to
+# resolve it, so compose would try to pull an image literally named `${...}`.
+# Unwrapping first collapses the form to the plain ref T3 then pins, which is the
+# same outcome the dev file's own unset default already produces.
+CURIE_DEFAULTED_IMAGE_RE = re.compile(
+    r"\$\{[A-Z_]+:-(ghcr\.io/curie-eng/curie-[a-z-]+:latest)\}"
+)
+
 DEV_COMPOSE = Path("compose.dev.yaml")
 OTEL_CONFIG = Path("otel/collector-config.yaml")
 
@@ -100,7 +115,11 @@ def generate(dev_text: str, otel_text: str, version: str) -> str:
         )
     text = text.replace(OTEL_VOLUME_BLOCK, OTEL_CONFIGS_REF, 1)
 
-    # T3: pin every curie-* image tag to the release version (worker-local too).
+    # T3a: unwrap a defaulted whole-reference override to its plain ref, so T3b
+    # pins it like any other and no `${...}` survives into the release asset.
+    text = CURIE_DEFAULTED_IMAGE_RE.sub(r"\1", text)
+
+    # T3b: pin every curie-* image tag to the release version (worker-local too).
     text = CURIE_LATEST_RE.sub(rf"\1:{version}", text)
 
     return text

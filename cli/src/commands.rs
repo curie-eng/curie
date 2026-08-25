@@ -1266,7 +1266,11 @@ fn on_path(bin: &str) -> bool {
 
 /// Walk up from the current directory to the repo root: the nearest ancestor
 /// that contains `runner/Dockerfile`.
-fn find_repo_root() -> Option<PathBuf> {
+///
+/// `pub(crate)` for `local::build_source_images` (#1915), which builds the dev
+/// stack's images from the same root and wants the same "are we in a checkout"
+/// answer rather than a second walk with its own anchor file.
+pub(crate) fn find_repo_root() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
         if dir.join("runner/Dockerfile").is_file() {

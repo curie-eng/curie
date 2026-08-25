@@ -795,6 +795,7 @@ mod tests {
                 slack: false,
                 model_mode: mode,
                 env_file: None,
+                build: false,
             })
             .env;
             let connect_env = local_connect_commands(&local_comms_opts(false, mode))[0]
@@ -831,6 +832,7 @@ mod tests {
                 slack: false,
                 model_mode: mode,
                 env_file: None,
+                build: false,
             })
             .env;
             let disconnect_env = local_disconnect_commands(&local_comms_opts(true, mode))[1]
@@ -865,6 +867,7 @@ mod tests {
                 slack: false,
                 model_mode: ModelMode::DefaultFake,
                 env_file: None,
+                build: false,
             })
             .env;
             let connect_env = local_connect_commands(&local_comms_opts_with(
@@ -903,6 +906,7 @@ mod tests {
                 slack: false,
                 model_mode: ModelMode::DefaultFake,
                 env_file: None,
+                build: false,
             })
             .env;
             let disconnect_env = local_disconnect_commands(&local_comms_opts_with(

@@ -647,7 +647,7 @@
           },
           "channels": {
             "items": {
-              "$ref": "#/components/schemas/ChannelBinding"
+              "$ref": "#/components/schemas/ChannelBindingOut"
             },
             "title": "Channels",
             "type": "array"
@@ -1530,9 +1530,9 @@
         "title": "BundleOut",
         "type": "object"
       },
-      "ChannelBinding": {
+      "ChannelBindingOut": {
         "additionalProperties": false,
-        "description": "Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).\n\nAn agent holds ONE OR MORE of these (ADR-0118, #1525, amending ADR-0089's\nsingular clause). `AgentCreate` still carries one `channel` OBJECT -- the\nfirst binding, required, since an agent with none cannot receive a turn --\n`AgentOut` carries the `channels` LIST, and every write after the create\ngoes through the `/agents/{id}/channels` subresource. `AgentUpdate` carries\nno binding key at all.\n\n`kind` names the adapter that owns the binding, selects the address-shape\ncheck, AND routes: since ADR-0096 phase 2 the worker resolves on the\n`(kind, address)` PAIR, so the two together are the routing key the worker\nmatches on equality (a Slack channel id for `kind=\"slack\"`). One address can\ntherefore be bound twice under two different kinds.",
+        "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe shape stays `{kind, address}`, identical to what `ChannelBinding`\nserialized, so this is not a wire change -- `ChannelBindingWrite`'s docstring\nalready describes that as the read contract.",
         "properties": {
           "address": {
             "title": "Address",
@@ -1547,7 +1547,7 @@
           "kind",
           "address"
         ],
-        "title": "ChannelBinding",
+        "title": "ChannelBindingOut",
         "type": "object"
       },
       "ChannelBindingPatch": {

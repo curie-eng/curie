@@ -28,7 +28,7 @@
     },
     {
       "struct": "ChannelBinding",
-      "schema": "ChannelBinding",
+      "schema": "ChannelBindingOut",
       "omissions": []
     },
     {

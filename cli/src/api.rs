@@ -69,6 +69,11 @@ pub struct ConnectorManifests {
 /// ingress (`"slack"` today) and `address` is the kind-specific identifier the
 /// worker resolver matches turns against. An agent holds one or more, so the
 /// pair -- never the address alone -- identifies a binding.
+///
+/// Mirrors the API's `ChannelBindingOut`, which is the READ shape and carries no
+/// address-shape rule (#1914): an upgraded install can hold an address the write
+/// path would now refuse, and the CLI has to be able to PRINT that value rather
+/// than fail to parse the agent it belongs to.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChannelBinding {
     pub kind: String,
