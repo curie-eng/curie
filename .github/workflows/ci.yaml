@@ -662,6 +662,52 @@ jobs:
       - name: E2E (Playwright, stackless)
         run: pnpm exec playwright test
 
+  desktop:
+    name: Desktop (lint + vitest + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 9
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - name: Install dependencies
+        # Electron downloads a ~100MB Chromium in postinstall and the packaged
+        # app is not built here, so skip it: this job type checks, lints, tests
+        # and bundles, none of which need the runtime binary.
+        run: pnpm install --frozen-lockfile
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      - name: Command manifest is current
+        # The desktop app's entire command surface is generated from
+        # cli/command-manifest.json. A stale committed manifest means the app
+        # describes a CLI that no longer exists, so drift is a hard failure.
+        run: |
+          pnpm gen:manifest
+          git diff --exit-code src/generated/commandManifest.ts src/generated/commandManifest.json \
+            || (echo "commandManifest is stale; run 'pnpm gen:manifest' in apps/desktop and commit." && exit 1)
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+      - name: Unit tests (vitest)
+        # The CLI and Docker integration suites skip themselves when neither is
+        # present, which is the case on a clean runner.
+        run: pnpm test
+      - name: Build renderer and shell bundles
+        run: pnpm build
+
   compose:
     name: Compose (release stack validates)
     runs-on: ubuntu-latest
