@@ -45,6 +45,7 @@ function stubShell(): CurieBridge {
       kubectlAvailable: false,
       helmAvailable: false,
       platform: "darwin",
+      defaultCwd: "/Users/dev",
       appVersion: "0.1.0",
       electronVersion: "34",
       chromeVersion: "132",
