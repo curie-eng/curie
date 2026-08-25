@@ -207,12 +207,16 @@ The native operator console (Electron shell + React renderer) -- see
 `apps/desktop/CLAUDE.md`. Its whole command surface is generated from
 `cli/command-manifest.json`, so **after changing the CLI surface run
 `pnpm gen:manifest` there and commit `src/generated/`**, the same discipline
-`apps/ui` follows; the `desktop` CI job fails on drift. Two suites skip
+`apps/ui` follows; the `desktop` CI job fails on drift. Three suites skip
 themselves when their dependency is absent: `cli.integration.test.ts` drives the
-real `curie` binary, and `resources.integration.test.ts` drives the real Docker
-daemon. Run them where both are present -- they are the only checks that prove
-the argv this app builds is argv the CLI accepts, and that the resource feed
-parses what Docker actually emits.
+real `curie` binary, `resources.integration.test.ts` drives the real Docker
+daemon, and `packs-parity.test.ts` runs the worker's own
+`curie_worker.behaviorpacks` next to the TypeScript mirror the Build view previews
+Slack behavior packs with (it needs `uv`, which the `desktop` job installs, so it
+does run in CI). Run them where their dependency is present -- they are the only
+checks that prove the argv this app builds is argv the CLI accepts, that the
+resource feed parses what Docker actually emits, and that a pack preview agrees
+with the matcher that will actually answer the message.
 
 **UI:** `cd apps/ui && pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm e2e`.
 The app is a real Vite + React + TS project -- see `apps/ui/CLAUDE.md`. The
