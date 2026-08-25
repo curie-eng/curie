@@ -4,11 +4,13 @@ Date: 2026-08-25
 
 Status: Draft
 
-**Supersedes in part [ADR-0116](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md)**,
-whose decision 2 says the pool "mints one per pod at creation". It cannot, and
-this record replaces that clause. Everything else in ADR-0116 stands, including
-the half of decision 2 that moves session identity onto the ACI `Event` frame,
-and including the ordering that puts the token before decision 3's warm pool.
+**Supersedes in part, when accepted,
+[ADR-0116](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md)**,
+whose decision 2 says the pool "mints one per pod at creation". It cannot. While
+this record is Draft it replaces nothing; ADR-0116's clause stands until this one
+is Accepted. Everything else in ADR-0116 is unaffected either way, including the
+half of decision 2 that moves session identity onto the ACI `Event` frame, and
+including the ordering that puts the token before decision 3's warm pool.
 
 ## Context
 
@@ -57,45 +59,71 @@ rails and ADR-0008's boundary are worth more than avoiding a shared secret.
 
 ## Decision
 
-**A warm pool's runner token is one secret per pool, and because a pool is keyed
-by agent version (ADR-0116 decision 3), that is one token per version.** The
-component that creates a version's pool also generates its token, creates the
-`Secret` holding it, and references that Secret from the pool's
-`SandboxTemplate` with `secretKeyRef`. Every pod the pool produces boots with
-`CURIE_RUNNER_TOKEN` set, so the ACI is gated from the moment it is ready.
+**A pre-baked pool token may authenticate adoption and nothing else. It must
+stop being sufficient the moment a pod is bound to a conversation.**
 
-1. **The creator of the pool is the creator of the token.** It generates the
-   value, so it already knows it and does not have to read the Secret back. This
-   keeps the change to a `create`, not a new read grant on secrets.
+That constraint, not the shape of the secret, is what this ADR decides. An
+earlier version of this record decided "one token per version" outright, and
+review showed why that is not enough on its own: pool pods are interchangeable
+only while unbound. Once several are claimed concurrently they hold different
+conversations, and a credential every one of them accepts is a credential that
+reaches a sibling's live conversation. The reasoning is recorded below under
+*What review found*, because it is the substance of this decision.
 
-2. **A bound claim does not re-mint.** The worker uses the pool's token for a pod
-   it binds from that pool, rather than generating a per-claim one it has no way
-   to deliver. The existing per-claim mint stays for the cold-create path, which
-   still builds a pod from scratch and can still inject env.
+1. **The pool's token is a bootstrap credential.** Every pod of a pool boots with
+   it, supplied from one `Secret` per pool via `secretKeyRef`, since a static
+   `SandboxTemplate` can express nothing per-pod. Its only authority is to let a
+   claim adopt an unbound pod.
 
-3. **The token's lifecycle is the version's.** It is created with the pool,
-   rotated only by replacing the pool's pods, since a running container reads its
-   environment once, and deleted when the version's pool is retired.
+2. **Adoption installs a per-conversation credential and retires the bootstrap.**
+   ADR-0116 decision 2 already sends session identity to a bound runner over the
+   ACI; that same call is where a fresh per-conversation token is delivered and
+   the bootstrap stops being accepted for that pod. After it, possession of the
+   version token authenticates nothing against that pod.
 
-### Why a shared token is the right shape here, not merely the available one
+3. **The per-conversation token lives where the route lives.** The substrate
+   already carries a token on its `RouteRecord`
+   ([`substrate.py`](../../apps/worker/src/curie_worker/sandbox/substrate.py)), and
+   that record is in Valkey rather than in a worker's memory, which is how any
+   replica already recovers a bound thread's token today.
 
-ADR-0116 rejected this with "a shared pool token would let one compromised
-sandbox authenticate as its siblings." That objection assumed the siblings hold
-something the attacker does not. Before a conversation binds them, they do not:
+4. **Reading the bootstrap needs a read grant, and this ADR asks for one.** An
+   earlier version claimed the creator "already knows the value and does not have
+   to read the Secret back". That only holds for the single process that created
+   it; a restart or a second worker replica has neither. The grant is `get` on
+   that one Secret.
+
+### What review found, and why the decision changed
+
+The first version of this record argued that a shared token is harmless because
 **pool pods of one version are interchangeable by construction** -- same bundle,
-same credentials, same environment, no session, no transcript. That is the entire
-point of pre-binding. An attacker who has compromised one such pod gains nothing
-from being able to reach another.
+same credentials, no session, no transcript -- so reaching a sibling gains an
+attacker nothing. That is true, and it is true only of *unbound* pods.
 
-The boundaries that do carry meaning are preserved exactly:
+The token does not stop at binding. Once several pods of a pool are claimed
+concurrently they are no longer interchangeable: each holds a different live
+conversation, and every one of them still accepts the same credential. So
+possession of the version token authenticates `event`, `steer`, and `interrupt`
+against **a sibling's conversation**. Sandbox egress does not save this, because
+the runner's ingress policy admits the whole release namespace rather than only
+the worker.
+
+That is why decision 1's authority is bounded to adoption and decision 2 retires
+the bootstrap. With those, the shared credential's reach is exactly the set of
+pods for which the original argument holds -- unbound, interchangeable, holding
+nothing.
+
+The claim in the first version that a token "never spans two conversations' data"
+was wrong as written. Destroying a pod on release prevents *sequential* reuse,
+which ADR-0116 measured; it says nothing about pods bound *simultaneously*, which
+is the case that matters here.
+
+The boundaries that are preserved, and were not the issue:
 
 - **Cross-version**: a different agent version is a different pool with a
-  different Secret, so its pods are not reachable with this token.
-- **Cross-tenant**: unchanged, because ADR-0008's namespace boundary is where
-  tenants are separated and this adds nothing across it.
-- **Bound versus unbound**: a pod bound to a conversation is destroyed on
-  release rather than returned to the pool, which ADR-0116 measured, so a token
-  never spans two conversations' data.
+  different Secret.
+- **Cross-tenant**: unchanged; ADR-0008's namespace boundary is where tenants are
+  separated and nothing here crosses it.
 
 ## Evidence (measured 2026-08-25)
 
@@ -117,30 +145,66 @@ And the property this must not break:
 | --- | --- |
 | env-free claim binds the tokened pool pod | **0.16s** |
 
-So the fix costs nothing that ADR-0116 bought. It also requires **no product code
-change to prove**: `secretKeyRef` is already expressible in the shipped
+So a pre-baked token costs nothing that ADR-0116 bought, and proving it required
+**no product code**: `secretKeyRef` is already expressible in the shipped
 `SandboxTemplate`, which is why the spike is configuration only.
+
+What this measures is narrow, and worth stating precisely. It shows a pre-baked
+token gates the ACI and does not cost the sub-second bind. It says **nothing**
+about the adoption-and-retire behaviour that decisions 1 and 2 now rest on: that
+does not exist yet and has not been spiked.
 
 ## Consequences
 
-- **The gap ADR-0116 measured closes with the pool, not after it.** Since the
-  same component creates both, there is no window in which a pool exists with
-  untokened pods, which is what made the ordering constraint delicate before.
+- **This is no longer separable from ADR-0116 decision 2.** The bootstrap is only
+  safe because something retires it at adoption, and the only place to do that is
+  the ACI call decision 2 introduces. If decision 2 does not land, this does not
+  either, and the warm pool cannot be raised safely at all. That is a tighter
+  coupling than the first version of this record implied.
 
-- **Rotation means replacing pods.** A container reads its environment once, so
-  rotating a version's token is a pool roll. That is acceptable for a value whose
-  lifetime is already a version's lifetime, and it is worth stating because it is
-  the one operational difference from a per-claim token.
+- **A leaked bootstrap exposes that version's *unbound* pods until the pool
+  rolls.** An attacker can adopt one, which means getting a runner of that agent
+  version to run turns with that version's credentials. That is real, and it is
+  the trade being made against a status quo of no token at all. What it does not
+  reach, once the bootstrap is retired at adoption, is a conversation already
+  bound.
 
-- **A leaked version token exposes that version's warm pods until the pool
-  rolls.** The blast radius is bounded by the argument above -- those pods are
-  interchangeable and hold no conversation -- but it is wider than a per-claim
-  token's, which dies with its claim. This is the trade this ADR is making, and
-  it is made against a status quo of *no token at all* on those pods.
+- **Rotation means replacing pods**, since a container reads its environment
+  once. Acceptable for a value whose lifetime is a version's lifetime, and worth
+  stating as the operational difference from a per-claim token.
 
 - **Two token paths exist during the transition**, per-claim for cold creates and
-  per-pool for pool binds. That is not a permanent split: it lasts as long as the
-  cold path does.
+  bootstrap-then-per-conversation for pool binds. That lasts as long as the cold
+  path does.
+
+- **The worker gains `get` on one Secret per pool.** Small, but it is a new grant,
+  and the first version of this record wrongly claimed it was avoidable.
+
+## Unresolved
+
+Three questions from review that this record does not answer, listed rather than
+papered over. None is known to be unanswerable; none has been verified.
+
+1. **Generation skew during a roll.** Mid-roll, old pods hold the old bootstrap
+   and replacements hold the new one, and both may be claimable. A worker binding
+   from the pool has to present the right one. Reading the Secret named by the
+   pool it is binding from is the obvious answer and may simply be correct, but
+   the window where a pod outlives its pool's Secret version has not been walked
+   through.
+
+2. **Concurrent pool creation.** Two workers deciding a version needs a pool at
+   the same time must not end with two Secrets and pods disagreeing about which
+   bootstrap is canonical. Standard create-or-adopt reconciliation applies. It is
+   named here because the first version of this record assumed a single creating
+   process, which is the same assumption that produced the wrong claim about read
+   grants.
+
+3. **What retiring the bootstrap means concretely.** "The runner stops accepting
+   it" is a requirement, not a design. Whether the runner holds one active
+   credential or a set, what happens to an in-flight request during the swap, and
+   what a failed adoption leaves behind, are all unspecified. This is the part
+   that most needs a spike before it is written as a decision, given that the
+   previous two versions of this clause were written without one.
 
 ## Out of scope
 
