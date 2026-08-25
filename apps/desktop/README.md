@@ -86,7 +86,7 @@ maintain and is what makes the decision reversible: everything privileged crosse
 [`electron/shared/contract.ts`](electron/shared/contract.ts) and nothing else, and
 drag regions carry both `-webkit-app-region` and `data-tauri-drag-region`.
 
-## The five surfaces
+## The six surfaces
 
 | View | What it answers |
 |---|---|
@@ -158,6 +158,49 @@ The Build view is a workbench over the open bundle:
 The judgements are pure functions in `src/lib/bundle.ts` with tests, including a
 suite that runs the parsers over every bundle in the repo's `examples/`. If the
 bundle format moves, that fails rather than someone's editor.
+
+#### Slack behavior packs
+
+The one surface here with no CLI equivalent. Behavior packs
+([`docs/behavior-packs.md`](../../docs/behavior-packs.md)) are the per-agent,
+opt-in Slack layer: rotating "working..." captions, capability tips, canned
+replies to a bare "hi" or "what can you do" that never call the model, and a hub
+button so a structured reply is never a dead end. There is no `curie` verb for
+them; the only surface is `GET|PUT /agents/{id}/behavior-packs`.
+
+They also do not live in the bundle -- a pack is JSON on an agent's row -- which
+is a real tension with a screen whose subject is files on disk. The view resolves
+it by saying so rather than by blurring it: the section names its scope, targets
+a deployed agent explicitly, and offers to **draft packs from the bundle's own
+facts**, since a manifest's description and starter prompts are already the
+material a greeting, a help reply and a set of tips are made of. Drafting is the
+part that belongs to Build; the write goes to the agent.
+
+Two things it tells you that nothing else does:
+
+- **Which of your packs will not fire.** A pack can be enabled and inert with no
+  complaint from anywhere: `match_greeting` returns early when the reply is
+  empty, so ten trigger phrases with no reply is a switched-on pack that does
+  nothing, and an empty load pack quietly falls back to the platform's generic
+  caption. The view also catches phrases that are the same phrase once
+  normalised, and a help phrase the greeting pack already owns -- the greeting is
+  tried first, so that help reply can never send. The settings pack is marked as
+  having no runtime, because it has none: its schema is validated and stored, and
+  nothing reads it yet.
+- **What Slack will actually do with a message.** Type one and see whether it is
+  answered by a pack with no model call or reaches the model as a normal turn,
+  plus the caption three different threads would get. The matcher's rules are not
+  guessable from a form -- the phrase must start the utterance, only a fixed
+  filler set may follow it ("hey there team" matches, "hi show me the report"
+  does not) -- so this is where an author finds them out, rather than in a
+  channel.
+
+That preview is only worth having if it is right, so `src/lib/packs.ts` is a
+faithful mirror of `curie_worker.behaviorpacks` and
+`electron/packs-parity.test.ts` runs both implementations over one corpus --
+normalisation, every bare-utterance decision, the seeded sampler, every branch of
+setting coercion -- and fails when they disagree. CI installs `uv` so it runs
+there rather than skipping.
 
 ## CLI parity is structural, not a promise
 
@@ -236,9 +279,12 @@ electron/
 src/
   bridge/             typed window.curie access + app/runs/resources state
   lib/manifest.ts     the renderer's view of the command manifest
+  lib/bundle.ts       what a bundle declares, and what is wrong with it
+  lib/packs.ts        behavior packs, mirroring curie_worker.behaviorpacks
+  lib/workloads.ts    filtering, grouping and roll-up for the resource table
   primitives/         controls and hand-drawn charts
   shell/              title bar, rail, status bar, palette, transcript drawer
-  views/              the five surfaces + CommandForm
+  views/              the six surfaces + CommandForm
   graph/model.ts      derives the canvas graph from live state
 ```
 
@@ -296,8 +342,8 @@ pnpm package
 
 | | |
 |---|---|
-| `⌘K` | Command palette -- search all 79 commands |
-| `⌘1`–`⌘5` | Overview, Resources, Canvas, Commands, Activity |
+| `⌘K` | Command palette -- search every command the CLI has |
+| `⌘1`-`⌘6` | Overview, Build, Resources, Canvas, Commands, Activity |
 | `⌘J` | Toggle the transcript drawer |
 | `⌘O` | Open a plugin bundle |
 

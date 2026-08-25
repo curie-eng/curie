@@ -18,6 +18,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useApp } from "../bridge/app";
+import { SlackPacks } from "./BuildPacks";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
 import { bridge } from "../bridge/bridge";
@@ -284,6 +285,8 @@ function Workbench() {
       </section>
 
       <Evals suite={evals} onOpen={() => setSelected("evals/cases.json")} />
+
+      <SlackPacks plugin={plugin?.ok ? plugin.value : undefined} />
 
       {runs.runs.length ? (
         <div style={{ ...F.footnote, color: T.quaternary }}>
