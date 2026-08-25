@@ -206,6 +206,38 @@ src/
   graph/model.ts      derives the canvas graph from live state
 ```
 
+## Opening it
+
+```bash
+cd apps/desktop
+pnpm install
+pnpm package     # builds release/Curie.app
+pnpm app         # opens it
+```
+
+`pnpm package` produces a real application bundle: it is named Curie, carries the
+Curie mark rather than the Electron logo, and shows up in Spotlight once you move
+it somewhere permanent.
+
+```bash
+cp -R apps/desktop/release/Curie.app /Applications/
+```
+
+The bundle is unsigned. That is fine for running your own build; a distributed
+one needs a Developer ID and notarisation, which is a release concern and not
+wired up here.
+
+For the edit loop, `pnpm dev` runs Vite plus Electron with hot reload on both
+halves. Note that the dev server on `5273` is a build tool, not a way to use the
+app: opening it in a browser gives you the renderer with no shell, so every
+privileged action fails and you get a browser tab wrapped around an app that
+expects a window.
+
+The icon is committed as both `build/icon.svg`, which is the source, and
+`build/icon.png`, which is generated from it. Rendering SVG to PNG needs a
+browser engine, and adding one as a build dependency to produce a single asset is
+not worth it, so the PNG is committed the way the generated command manifest is.
+
 ## Verify
 
 ```bash

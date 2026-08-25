@@ -20,7 +20,9 @@
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "package": "pnpm build && electron-builder"
+    "package": "pnpm build && electron-builder --dir",
+    "package:dmg": "pnpm build && electron-builder",
+    "app": "open -n release/Curie.app || open release/Curie.app"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",
@@ -55,27 +57,41 @@
   "build": {
     "appId": "net.curietech.curie.desktop",
     "productName": "Curie",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
     "files": [
       "dist/**",
       "dist-electron/**"
     ],
+    "asar": true,
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [
-        "dmg",
-        "zip"
-      ]
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "identity": null,
+      "darkModeSupport": true
     },
     "linux": {
       "target": [
-        "AppImage",
-        "deb"
-      ]
+        "AppImage"
+      ],
+      "category": "Development",
+      "icon": "build/icon.png"
     },
     "win": {
       "target": [
         "nsis"
-      ]
+      ],
+      "icon": "build/icon.png"
     }
   },
   "pnpm": {
