@@ -37,11 +37,25 @@ import {
   type GraphDoc,
   type GraphEdge,
   type GraphNode,
+  type Lane as GraphLane,
   LAYOUT,
 } from "../graph/model";
 import { command } from "../lib/manifest";
+import { percent } from "../lib/format";
 import { CommandForm } from "./CommandForm";
-import { ACCENT, F, FONT, KIND_COLOR, LINE, R, S, STATUS, T, type NodeKind } from "../tokens";
+import {
+  ACCENT,
+  F,
+  FONT,
+  KIND_COLOR,
+  LINE,
+  R,
+  S,
+  STATUS,
+  T,
+  tint,
+  type NodeKind,
+} from "../tokens";
 import { Badge, Button, EmptyState, Group, Mono, Notice, SectionHeader, Select } from "../primitives";
 
 interface Viewport {
@@ -62,6 +76,7 @@ export function Canvas() {
   const [view, setView] = useState<Viewport>({ x: 40, y: 20, scale: 0.9 });
   const [selected, setSelected] = useState<string | null>(null);
   const [connecting, setConnecting] = useState<string | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
   const [panning, setPanning] = useState(false);
   const [adding, setAdding] = useState<NodeKind | "">("");
   const svgRef = useRef<SVGSVGElement>(null);
@@ -209,7 +224,39 @@ export function Canvas() {
     fit();
   }, [fitNonce, loaded, graph.nodes.length, hasCustomLayout, fit]);
 
+  // What the graph cannot show, and the way to fix it.
+  const missing = useMemo(() => {
+    const out: { label: string; onClick(): void }[] = [];
+    if (!app.workspace) {
+      out.push({
+        label: "No bundle open — nothing you author is shown",
+        onClick: () => void app.openWorkspace(),
+      });
+    }
+    if (!app.api?.reachable) {
+      out.push({
+        label: "API unreachable — no agents or channels are shown",
+        onClick: () => app.navigate("commands", "local.up"),
+      });
+    }
+    return out;
+  }, [app]);
+
   const selectedNode = graph.nodes.find((n) => n.id === selected) ?? null;
+
+  // Tracing a path is the main thing you do with a graph, and it is impossible
+  // when everything is drawn at the same weight. Hovering (or selecting) a node
+  // keeps it and its immediate neighbours lit and drops everything else back.
+  const focusId = hovered ?? selected;
+  const related = useMemo(() => {
+    if (!focusId) return null;
+    const set = new Set<string>([focusId]);
+    for (const e of graph.edges) {
+      if (e.from === focusId) set.add(e.to);
+      if (e.to === focusId) set.add(e.from);
+    }
+    return set;
+  }, [focusId, graph.edges]);
 
   const addNode = (kind: NodeKind) => {
     const rect = svgRef.current?.getBoundingClientRect();
@@ -342,8 +389,18 @@ export function Canvas() {
           />
 
           <g transform={`translate(${view.x},${view.y}) scale(${view.scale})`}>
+            {/* Lane bands first, so everything else sits on top of them. */}
+            {graph.lanes.map((lane) => (
+              <Lane key={`${lane.label}:${lane.x}`} lane={lane} nodes={graph.nodes} />
+            ))}
             {graph.edges.map((edge) => (
-              <Edge key={edge.id} edge={edge} nodes={graph.nodes} />
+              <Edge
+                key={edge.id}
+                edge={edge}
+                nodes={graph.nodes}
+                dimmed={!!related && !(related.has(edge.from) && related.has(edge.to))}
+                lit={!!focusId && (edge.from === focusId || edge.to === focusId)}
+              />
             ))}
             {graph.nodes.map((node) => (
               <Node
@@ -351,6 +408,9 @@ export function Canvas() {
                 node={node}
                 selected={node.id === selected}
                 connecting={connecting === node.id}
+                dimmed={!!related && !related.has(node.id)}
+                onMouseEnter={() => setHovered(node.id)}
+                onMouseLeave={() => setHovered(null)}
                 onMouseDown={(e) => {
                   e.stopPropagation();
                   if (connecting) {
@@ -366,6 +426,43 @@ export function Canvas() {
             ))}
           </g>
         </svg>
+
+        {/* The graph is only ever as complete as its sources. With no bundle
+            open and no API reachable it shows infrastructure and nothing else,
+            which reads as a broken diagram unless the canvas says why. */}
+        {missing.length ? (
+          <div
+            style={{
+              position: "absolute",
+              left: 12,
+              top: 12,
+              maxWidth: "58%",
+              display: "flex",
+              flexDirection: "column",
+              gap: 6,
+              alignItems: "flex-start",
+            }}
+          >
+            {missing.map((m) => (
+              <button
+                key={m.label}
+                onClick={m.onClick}
+                style={{
+                  border: "none",
+                  background: tint(STATUS.warn, 0.11),
+                  borderRadius: R.pill,
+                  padding: "4px 11px",
+                  ...F.footnote,
+                  color: STATUS.warn,
+                  cursor: "default",
+                  textAlign: "left",
+                }}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+        ) : null}
 
         <div
           style={{
@@ -479,7 +576,49 @@ function Legend() {
   );
 }
 
-function Edge({ edge, nodes }: { edge: GraphEdge; nodes: readonly GraphNode[] }) {
+/** A labelled band behind one stage of the pipeline. Cheap, and it turns six
+ *  boxes and five arrows into something you can read as an architecture. */
+function Lane({ lane, nodes }: { lane: GraphLane; nodes: readonly GraphNode[] }) {
+  const inLane = nodes.filter((n) => n.x >= lane.x && n.x < lane.x + lane.width);
+  if (!inLane.length) return null;
+  const top = Math.min(...inLane.map((n) => n.y)) - 34;
+  const bottom = Math.max(...inLane.map((n) => n.y + NODE_H)) + 14;
+  return (
+    <g style={{ pointerEvents: "none" }}>
+      <rect
+        x={lane.x - 14}
+        y={top}
+        width={lane.width + 28}
+        height={bottom - top}
+        rx={12}
+        fill="rgba(255,255,255,0.018)"
+      />
+      <text
+        x={lane.x - 4}
+        y={top + 15}
+        fill={T.quaternary}
+        fontSize={9.5}
+        fontWeight={600}
+        letterSpacing={0.6}
+        fontFamily={FONT.ui}
+      >
+        {lane.label.toUpperCase()}
+      </text>
+    </g>
+  );
+}
+
+function Edge({
+  edge,
+  nodes,
+  dimmed,
+  lit,
+}: {
+  edge: GraphEdge;
+  nodes: readonly GraphNode[];
+  dimmed?: boolean;
+  lit?: boolean;
+}) {
   const from = nodes.find((n) => n.id === edge.from);
   const to = nodes.find((n) => n.id === edge.to);
   if (!from || !to) return null;
@@ -527,15 +666,15 @@ function Edge({ edge, nodes }: { edge: GraphEdge; nodes: readonly GraphNode[] })
     edge.kind === "data" ? "#38bdf8" : edge.kind === "deploy" ? "#a78bfa" : edge.kind === "planned" ? STATUS.warn : LINE.strong;
 
   return (
-    <g>
+    <g style={{ transition: "opacity 120ms ease" }} opacity={dimmed ? 0.12 : 1}>
       <path
         d={d}
         fill="none"
         stroke={color}
-        strokeWidth={1.2}
+        strokeWidth={lit ? 2 : 1.2}
         strokeDasharray={edge.kind === "planned" ? "5 4" : undefined}
         markerEnd="url(#arrow)"
-        opacity={0.75}
+        opacity={lit ? 1 : 0.7}
       />
       {edge.label ? (
         <text
@@ -558,17 +697,35 @@ function Node({
   node,
   selected,
   connecting,
+  dimmed,
   onMouseDown,
+  onMouseEnter,
+  onMouseLeave,
 }: {
   node: GraphNode;
   selected: boolean;
   connecting: boolean;
+  dimmed?: boolean;
   onMouseDown(e: ReactMouseEvent): void;
+  onMouseEnter?(): void;
+  onMouseLeave?(): void;
 }) {
   const color = KIND_COLOR[node.kind];
   const planned = node.status === "planned";
+  // Load is drawn against one core, not against the machine: a container at
+  // 60% of a core is the interesting reading, and dividing by twelve would
+  // flatten every bar to nothing.
+  const load = node.metric?.cpu ?? null;
+  const loadRatio = load === null ? null : Math.min(1, load / 100);
   return (
-    <g transform={`translate(${node.x},${node.y})`} onMouseDown={onMouseDown} style={{ cursor: "grab" }}>
+    <g
+      transform={`translate(${node.x},${node.y})`}
+      onMouseDown={onMouseDown}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      opacity={dimmed ? 0.22 : 1}
+      style={{ cursor: "grab", transition: "opacity 120ms ease" }}
+    >
       <rect
         width={NODE_W}
         height={NODE_H}
@@ -593,6 +750,39 @@ function Node({
         <circle cx={NODE_W - 13} cy={14} r={3.5} fill={ACCENT}>
           <animate attributeName="opacity" values="1;0.35;1" dur="1.8s" repeatCount="indefinite" />
         </circle>
+      ) : null}
+
+      {/* Live load, as a hairline along the bottom edge. This is what makes the
+          canvas a view of a running system rather than a diagram of one. */}
+      {loadRatio !== null ? (
+        <>
+          <rect
+            x={10}
+            y={NODE_H - 6}
+            width={NODE_W - 20}
+            height={2.5}
+            rx={1.25}
+            fill="rgba(255,255,255,0.07)"
+          />
+          <rect
+            x={10}
+            y={NODE_H - 6}
+            width={Math.max(2, (NODE_W - 20) * loadRatio)}
+            height={2.5}
+            rx={1.25}
+            fill={loadRatio > 0.85 ? STATUS.warn : color}
+          />
+          <text
+            x={NODE_W - 13}
+            y={NODE_H - 9}
+            textAnchor="end"
+            fill={T.quaternary}
+            fontSize={8.5}
+            fontFamily={FONT.mono}
+          >
+            {percent(load, 0)}
+          </text>
+        </>
       ) : null}
     </g>
   );

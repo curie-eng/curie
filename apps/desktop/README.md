@@ -52,21 +52,39 @@ and the spare renderer process. The window can reach exactly one document,
 refuses every outbound navigation, grants no permissions, and hands external
 links to your real browser.
 
-### On dropping Chromium
+### Decision: stay on Electron
 
-Electron bundles Chromium (~150MB). If that dependency is unwanted, the intended
-path is **Tauri**: WKWebView on macOS, WebKitGTK on Linux, at roughly 10MB, with
-a Rust backend that fits a repo whose CLI is already Rust. One honest caveat:
-**on Windows, Tauri uses WebView2, which is Chromium** -- so "no Chromium" is true
-on macOS and Linux, not everywhere.
+Electron bundles Chromium, roughly 150MB, and the alternative was Tauri: the OS
+webview instead, at roughly 10MB, with a Rust backend that would suit a repo
+whose CLI is already Rust. That was considered and **rejected**.
 
-The renderer is shell-agnostic by construction. Everything privileged crosses
-[`electron/shared/contract.ts`](electron/shared/contract.ts) and nothing else, so
-a port re-implements that one file's handlers and leaves `src/` alone. Drag
-regions already carry both `-webkit-app-region` and `data-tauri-drag-region`.
+What Chromium is actually buying here is narrow but real:
 
-The renderer is also untrusted by construction under either shell: `sandbox:
-true`, `contextIsolation: true`, no Node, and a strict CSP (`default-src 'none'`).
+- **One engine to target.** Nothing in this renderer touches Chromium's
+  differentiated capability. There is no WebGL, WebRTC, video, wasm, worker, or
+  untrusted web content: it is CSS grid, hand drawn SVG, and IPC. All of it would
+  run on WebKit. The value is not capability, it is only having to verify
+  `ResizeObserver`, `backdrop-filter`, `::-webkit-scrollbar`,
+  `font-variant-numeric` and the drag region against one engine rather than
+  three.
+- **The DevTools protocol.** Not theoretical. The canvas layout bugs recorded in
+  this repo were found and fixed by driving the live native window over CDP,
+  because the environment had no way to send it a keystroke.
+- **The shell stays TypeScript.** Roughly 700 lines that would otherwise be
+  rewritten in Rust.
+
+Against that, the Tauri case was only ever "smaller download, and no bundled
+Chromium". Neither was worth the port, and on Windows Tauri uses WebView2, which
+is Chromium anyway, so even the second benefit would only have held on two
+platforms of three.
+
+One consequence worth stating: this also settles WebKit compatibility, which was
+an open unknown rather than a verified fact. It is now moot.
+
+The renderer nevertheless stays shell agnostic, because that costs nothing to
+maintain and is what makes the decision reversible: everything privileged crosses
+[`electron/shared/contract.ts`](electron/shared/contract.ts) and nothing else, and
+drag regions carry both `-webkit-app-region` and `data-tauri-drag-region`.
 
 ## The five surfaces
 
