@@ -325,10 +325,36 @@ will refuse, because the binder presents the one the route recorded.
 
 The same property is why rotation is **not** revocation. A live thread keeps
 presenting its pinned token, its pod keeps accepting it, and replacing the pool
-does not disturb either. Revoking a token that is already bound to a thread means
-cycling the thread itself, with `curie <tier> reset-thread <agent> --thread-key
-<key> --yes`, and the blast radius until someone does is "for as long as the
-thread stays active", not "until the pool drains".
+does not disturb either.
+
+Neither finding is a hole the platform did not know about. `reset-thread` was
+shipped for exactly this (#737), and its own help text names the condition:
+
+> The worker's next maintenance tick deletes the thread's claim and route, so its
+> next message cold-creates a fresh sandbox instead of adopting one that may be
+> running stale env.
+
+So the acknowledged mechanism is stale **env**. What review and this record add is
+that two things nobody wrote down travel inside it. State it once, since it is a
+single property with two instances:
+
+**What a sandbox booted with is what it keeps. Changing the source changes new
+sandboxes only. Revocation requires cycling the thread.** The credential is one
+instance and the resolved `approvalPolicy` is another, and a reader who knows the
+rule does not have to rediscover it per field.
+
+Two operational details belong with that, because "cycle the thread" is easy to
+read as instant and free:
+
+- It is **not immediate.** The release lands on the worker's maintenance tick,
+  `reclaim_interval_s` defaulting to `30.0`; `reset-thread` polls and reports the
+  release as still pending after `RESET_RELEASE_TIMEOUT`, 45s.
+- It **interrupts a live turn**, which is why the command refuses without `--yes`.
+  The remedy for "a gate I just added does not cover this thread" costs whatever
+  that thread was mid-way through.
+
+So the blast radius of a rotation until someone cycles the thread is "for as long
+as the thread stays active", not "until the pool drains".
 
 ## Out of scope
 
