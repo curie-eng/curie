@@ -1,0 +1,180 @@
+/* Base styles.
+ *
+ * The job of this file is to stop the renderer from behaving like a document.
+ * A web page scrolls as a whole, shows permanent scrollbars, lets you drag-select
+ * across the chrome, and rasterises text the way a browser does. An app does
+ * none of those, and each one left in place is a tell.
+ */
+
+:root {
+  color-scheme: dark;
+
+  --accent: #3ecf8e;
+  --window: #1c1c1e;
+  --sidebar-fallback: #1f1f21;
+  --content: #242426;
+  --raised: #2c2c2e;
+  --well: #1a1a1c;
+  --text: rgba(255, 255, 255, 0.92);
+  --text-2: rgba(235, 235, 245, 0.62);
+  --text-3: rgba(235, 235, 245, 0.38);
+  --separator: rgba(255, 255, 255, 0.07);
+  --border: rgba(255, 255, 255, 0.1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  /* Transparent so the window's real vibrancy shows through. The sidebar is
+     the only region that stays translucent; the content pane paints over it. */
+  background: transparent;
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui,
+    sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  letter-spacing: -0.08px;
+
+  /* The window never scrolls; panes inside it do. */
+  overflow: hidden;
+
+  /* This is an app, not an article. A stray drag that selects the sidebar and
+     half the toolbar reads as a bug. Anything meant to be copied opts back in. */
+  user-select: none;
+  cursor: default;
+
+  /* Match AppKit's text rendering rather than the browser's heavier default. */
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Platforms without window vibrancy get a solid sidebar instead of a
+   see-through one over nothing. */
+@supports not (backdrop-filter: blur(1px)) {
+  body {
+    background: var(--window);
+  }
+}
+
+input,
+textarea,
+[data-selectable],
+pre {
+  user-select: text;
+  cursor: auto;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+}
+
+/* Overlay scrollbars: thin, dark, and only while the pane is hovered. A
+   permanently visible scrollbar track is the most recognisable web-page tell
+   there is. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3) !important;
+  background-clip: content-box;
+}
+
+/* Keyboard-only focus. A ring on every mouse click is noise in a dense UI;
+   losing it for keyboard users is an accessibility bug. */
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 5px;
+}
+
+/* Drag regions. Electron reads `-webkit-app-region`; Tauri reads the data
+   attribute. Both are declared so the same markup works under either shell. */
+.drag,
+[data-tauri-drag-region] {
+  -webkit-app-region: drag;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+@keyframes curie-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes curie-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@keyframes curie-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.rise {
+  animation: curie-rise 160ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise,
+  [class*="curie-"] {
+    animation: none !important;
+  }
+}
