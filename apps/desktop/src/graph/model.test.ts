@@ -205,3 +205,72 @@ describe("saved layouts", () => {
     expect([pg.x, pg.y]).toEqual([999, 111]);
   });
 });
+
+describe("an agent with a model override", () => {
+  // The fourth layout bug, and the worst: the model-node dedup checked the
+  // `nodes` array that buildGraph returns, which is declared further down the
+  // same function. Reading it threw "Cannot access 'm' before initialization"
+  // and React unmounted the tree, so the ENTIRE WINDOW went blank -- not just
+  // the canvas. Every other test here passed, because none of them gave an agent
+  // a model: with no reachable API there are no agents at all, so the crash only
+  // reached anyone whose platform actually had one.
+  const agent = (id: string, name: string, model: string | null) => ({ id, name, model });
+
+  it("does not throw, and draws the model", () => {
+    const { nodes } = buildGraph(
+      { workspace: null, samples: [], agents: [agent("a1", "sre-bot", "claude-opus-5")] },
+      EMPTY_DOC,
+    );
+    expect(nodes.map((n) => n.label)).toContain("claude-opus-5");
+  });
+
+  it("draws one model node for two agents on the same model", () => {
+    // What the dedup was there for.
+    const { nodes } = buildGraph(
+      {
+        workspace: null,
+        samples: [],
+        agents: [agent("a1", "sre-bot", "claude-opus-5"), agent("a2", "deal-desk", "claude-opus-5")],
+      },
+      EMPTY_DOC,
+    );
+    expect(nodes.filter((n) => n.kind === "model")).toHaveLength(1);
+    // ...and both agents point at it.
+    expect(nodes.filter((n) => n.kind === "agent")).toHaveLength(2);
+  });
+
+  it("draws a model node per distinct model", () => {
+    const { nodes } = buildGraph(
+      {
+        workspace: null,
+        samples: [],
+        agents: [agent("a1", "sre-bot", "claude-opus-5"), agent("a2", "deal-desk", "claude-sonnet-5")],
+      },
+      EMPTY_DOC,
+    );
+    expect(nodes.filter((n) => n.kind === "model").map((n) => n.label).sort()).toEqual([
+      "claude-opus-5",
+      "claude-sonnet-5",
+    ]);
+  });
+
+  it("draws no model node for an agent on the platform default", () => {
+    const { nodes } = buildGraph(
+      { workspace: null, samples: [], agents: [agent("a1", "sre-bot", null)] },
+      EMPTY_DOC,
+    );
+    expect(nodes.filter((n) => n.kind === "model")).toHaveLength(0);
+  });
+
+  it("keeps every node id unique, which is what the React keys rely on", () => {
+    const { nodes } = buildGraph(
+      {
+        workspace: null,
+        samples: PLATFORM,
+        agents: [agent("a1", "sre-bot", "claude-opus-5"), agent("a2", "deal-desk", "claude-opus-5")],
+      },
+      EMPTY_DOC,
+    );
+    expect(new Set(nodes.map((n) => n.id)).size).toBe(nodes.length);
+  });
+});
