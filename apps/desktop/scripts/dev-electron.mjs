@@ -76,7 +76,22 @@ function start() {
     stdio: "inherit",
     env: { ...process.env, VITE_DEV_SERVER_URL: URL_ },
   });
+  // Which process this handler belongs to. A restart kills the old child and
+  // spawns a new one, and the old one's `close` arrives afterwards reporting a
+  // clean exit -- indistinguishable, without this, from the developer quitting.
+  //
+  // Conflating the two made the watcher fire exactly ONCE: the first change
+  // restarted Electron and then killed the launcher, so every later change to
+  // electron/ was silently ignored and the new window was left orphaned. It looks
+  // like a working dev loop right up until the second edit, which is why a test
+  // that restarts once cannot see it.
+  //
+  // The comparison is safe because kill/reassign/start is synchronous: no `close`
+  // callback can run in the middle of it, so by the time one does, `child` is
+  // already the replacement.
+  const mine = child;
   child.on("close", (code) => {
+    if (mine !== child) return; // we replaced it; not a quit
     // A clean exit means the developer quit the app; stop the whole dev run
     // rather than silently respawning a window they just closed.
     if (code === 0) process.exit(0);

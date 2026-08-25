@@ -39,6 +39,33 @@ declare const __dirname: string;
 const here = __dirname;
 const DEV_SERVER = process.env.VITE_DEV_SERVER_URL;
 
+/** What this build calls itself. Dev says so, because it is normal to have the
+ *  packaged app open at the same time and the two windows are near identical. */
+const APP_NAME = DEV_SERVER ? "Curie (Dev)" : "Curie";
+
+// In dev the running binary is Electron's own, so macOS labels the app "Electron"
+// wherever it reads the bundle. With a packaged Curie.app open beside it -- the
+// normal state while working on this -- the two are hard to tell apart, and it is
+// genuinely easy to conclude a change did not land while looking at the snapshot.
+//
+// `setName` reaches the menu bar (menu.ts labels the first submenu with
+// `app.getName()`), the About panel, and the window title. It does NOT reach the
+// Dock or the app switcher: those read CFBundleName from the running bundle's
+// Info.plist, which belongs to node_modules' Electron.app. Patching a copy of
+// that bundle was tried and rejected -- it invalidates the nested Electron
+// Framework signature and macOS kills the process on launch, and re-signing an
+// Electron app correctly needs a real inside-out signing pass, which has no place
+// in a dev loop. So the Dock still says "Electron"; the menu bar is the tell.
+//
+// `setName` also feeds the userData path, so the existing one is captured and put
+// back afterwards: renaming the app must not look like every workspace and
+// setting was lost.
+if (DEV_SERVER) {
+  const userData = app.getPath("userData");
+  app.setName(APP_NAME);
+  app.setPath("userData", userData);
+}
+
 // --- Chromium, trimmed -----------------------------------------------------
 // Each of these is a browser subsystem this app has no use for. Disabling them
 // at the command line keeps them from initializing at all, which is where the
@@ -73,6 +100,7 @@ function createWindow(): BrowserWindow {
     minWidth: 1040,
     minHeight: 680,
     show: false,
+    title: APP_NAME,
     // Transparent, because the window is given real translucency below and a
     // painted background would sit in front of it.
     backgroundColor: "#00000000",
@@ -111,6 +139,11 @@ function createWindow(): BrowserWindow {
   });
 
   w.once("ready-to-show", () => w.show());
+
+  // index.html says <title>Curie</title>, and a page title replaces the window
+  // title by default -- which would undo the dev rename the moment the renderer
+  // loaded. The window's name is the shell's to decide, not the page's.
+  w.on("page-title-updated", (e) => e.preventDefault());
 
   // A window created with `show: false` that never becomes ready is invisible
   // with no explanation -- the worst failure mode this app has, because there is
