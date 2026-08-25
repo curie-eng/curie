@@ -244,6 +244,12 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
   const link = (from: string, to: string, kind: GraphEdge["kind"], label?: string) => {
     edges.push({ id: `${from}->${to}`, from, to, kind, label });
   };
+  // "Has this node been added yet?" against the accumulator `add` writes into.
+  // Declared here with the other helpers rather than further down, because the
+  // model-node dedup below needs it too, and reaching for the finished `nodes`
+  // array instead threw a temporal-dead-zone ReferenceError that blanked the
+  // whole window (see the test named for it).
+  const has = (id: string) => placed.some((p) => p.node.id === id);
 
   // --- what you author ----------------------------------------------------
   const ws = sources.workspace;
@@ -341,7 +347,7 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
 
     if (agent.model) {
       const modelId = `model:${agent.model}`;
-      if (!nodes.some((n) => n.id === modelId)) {
+      if (!has(modelId)) {
         add({
           id: modelId,
           kind: "model",
@@ -419,7 +425,6 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
   }
   // The message path the product's own architecture doc describes, drawn only
   // between components that are actually present.
-  const has = (id: string) => placed.some((p) => p.node.id === id);
   if (has("infra:dispatcher") && has("infra:valkey")) link("infra:dispatcher", "infra:valkey", "flow", "enqueue");
   if (has("infra:valkey") && has("infra:worker")) link("infra:valkey", "infra:worker", "flow", "consume");
   if (has("infra:worker") && has("infra:api")) link("infra:worker", "infra:api", "flow", "aci");
