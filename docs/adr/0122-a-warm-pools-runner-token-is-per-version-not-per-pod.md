@@ -323,6 +323,22 @@ live source for the credential. That is what makes this decision safe to ship:
 rotating a pool's Secret cannot strand an in-flight thread with a token its pod
 will refuse, because the binder presents the one the route recorded.
 
+What has **not** been exercised, stated rather than composed away: the two halves
+are the binder handing back the recorded token (above) and the pod keeping the
+token it booted with (measured separately, in the skew spike). Nobody has run a
+gated write against a long-lived adopted thread, which is where they meet. Half of
+that is reachable today and half is not, because in shipped code the token is
+minted per claim, so the shared per-version source this decision introduces does
+not exist yet to be rotated underneath a live thread. Concretely:
+
+- **Reachable now, and worth doing before decision 2 ships:** a gated write on a
+  thread adopted well after its claim still admits with its recorded token. This
+  exercises the runner's admission check end to end, which neither half above did.
+- **Not reachable until decision 2 exists:** the same write after the per-version
+  source has rotated. Simulating it with a patched runner would test the spike,
+  not the decision, so it is named here as a pre-merge check on the implementing
+  PR instead of being claimed now.
+
 The same property is why rotation is **not** revocation. A live thread keeps
 presenting its pinned token, its pod keeps accepting it, and replacing the pool
 does not disturb either.
