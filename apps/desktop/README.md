@@ -86,16 +86,21 @@ maintain and is what makes the decision reversible: everything privileged crosse
 [`electron/shared/contract.ts`](electron/shared/contract.ts) and nothing else, and
 drag regions carry both `-webkit-app-region` and `data-tauri-drag-region`.
 
-## The six surfaces
+## The seven surfaces
 
 | View | What it answers |
 |---|---|
 | **Overview** | What is the state of things, ordered by urgency -- anything blocked on a human first, then anything broken, then the steady state. |
 | **Build** | The authoring half. What is in this bundle, what is wrong with it, the file you are editing, and the rungs of the ladder in order. |
+| **Tiers** | Where can this run, and what does each rung cost. The skill, local and cluster deployments as three panels with their own lifecycle controls, plus the declarative `curie.yaml` install. |
 | **Resources** | What is each agent consuming right now. Docker Desktop's container list as a starting point, plus the things it cannot do: attribution to an agent, history for the sparklines, and per-row commands that are `curie` commands. |
 | **Canvas** | How is this wired. Agents, channels, models, MCP servers, and infra as one editable graph, derived from live state. |
-| **Commands** | Everything the CLI can do, as real forms. |
+| **Commands** | Everything the CLI can do, as real forms -- the complete reference, and the map of where each command lives. |
 | **Activity** | What this app has run. Every invocation with its full transcript. |
+
+An agent also has a surface of its own: a sheet, opened from its row on the
+Overview or from its node on the Canvas, carrying the twenty-six agent-scoped
+commands with the agent already filled in and the tier chosen once at the top.
 
 ### The resource monitor
 
@@ -239,6 +244,40 @@ The integration test (`electron/ipc/cli.integration.test.ts`) goes further and
 runs `curie <command> --help` for every command both sides have, proving the argv
 is one the real binary accepts. It skips itself when `curie` is not installed.
 
+## Every command has a place, and the place is checked
+
+Generating a complete form per command makes the app *complete*. It does not make
+it usable: a filter box over eighty monospace strings is `--help` in a window, and
+that is what the Commands view was on its own. Completeness is table stakes;
+knowing where to look is the part a GUI is supposed to add.
+
+So every command also belongs to a **surface** -- a named group of controls on a
+real screen, in the place an operator would already be when they want it.
+Deploying is on the bundle you have open. Killing an agent is on that agent's row.
+Bringing the cluster up is on the tier that owns it. The repo checks are in
+Settings, next to everything else about this machine.
+
+The map lives in `src/lib/surfaces.ts` and it is not a description of the UI --
+the views render directly from it, so a control cannot exist without an entry and
+an entry cannot claim a screen it is not on. Three tests hold that together:
+
+1. **Coverage.** Every command in the manifest is on at least one surface, and no
+   surface names a command the CLI does not have. A command added to the CLI
+   fails the build until somebody decides where in the app it belongs. That
+   decision was the one being skipped when everything defaulted into the list.
+2. **Rendering.** Every declared surface is named by an actual view. This caught a
+   real bug the moment it was written: a group of authoring commands was declared,
+   filed, listed in the reference as having a home -- and rendered nowhere.
+3. **Behaviour.** Pressing a control opens the generated form *over the screen you
+   are on*, with the row's own values filled in, and starts the argv you would
+   expect. "Memory" on `deal-desk` runs `curie local memory deal-desk`, not a blank
+   form. A control whose behaviour is "go to the list and find it yourself" has not
+   placed the command anywhere.
+
+The Commands view keeps its job as the complete reference, and gains two things:
+each command says where it lives with a button that goes there, and the list can be
+grouped by the CLI's shape (**by tier**) or by the app's (**by place**).
+
 ## What the GUI adds, and what it refuses to hide
 
 Adds: arguments are discoverable instead of remembered; the values that repeat
@@ -378,7 +417,7 @@ pnpm package
 | | |
 |---|---|
 | `⌘K` | Command palette -- search every command the CLI has |
-| `⌘1`-`⌘6` | Overview, Build, Resources, Canvas, Commands, Activity |
+| `⌘1`-`⌘7` | Overview, Build, Tiers, Resources, Canvas, Commands, Activity |
 | `⌘J` | Toggle the transcript drawer |
 | `⌘O` | Open a plugin bundle |
 

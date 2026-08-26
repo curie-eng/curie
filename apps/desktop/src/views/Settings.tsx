@@ -10,6 +10,8 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useApp } from "../bridge/app";
 import { THEMES } from "../../electron/shared/themes";
 import { commands } from "../lib/manifest";
+import { surfacesById } from "../lib/surfaces";
+import { Actions, DrivenBy, RunButton } from "./Actions";
 import { bridge, hasShell } from "../bridge/bridge";
 import { ACCENT, F, FONT, LINE, R, S, STATUS, T, tint } from "../tokens";
 import {
@@ -57,6 +59,9 @@ export function Settings() {
       <CommandSurfacePanel />
       <SecretsPanel />
       <EnvironmentPanel />
+      <MaintenancePanel />
+      <ReferencePanel />
+      <DevPanel />
       <AboutPanel />
     </div>
   );
@@ -300,12 +305,9 @@ function ApiPanel() {
           <Notice tone="warn" title="Could not reach that API">
             Nothing answered at <Mono>{app.api.baseUrl}/config</Mono>. If you meant the local stack,
             bring it up with{" "}
-            <button
-              onClick={() => app.navigate("commands", "local.up")}
-              style={{ background: "none", border: "none", color: ACCENT, cursor: "pointer", padding: 0 }}
-            >
-              <Mono>curie local up</Mono>
-            </button>
+            <RunButton id="local.up" tone="plain">
+              curie local up
+            </RunButton>
             .
           </Notice>
         </div>
@@ -349,9 +351,10 @@ function SecretsPanel() {
       }
     >
       <div style={{ fontSize: 12, color: T.tertiary, marginBottom: 12, lineHeight: 1.6 }}>
-        Stored by <Mono>curie secrets</Mono> in its own private storage — this app only ever sees the
-        names. A value you type here is handed to the CLI through the environment, never as a command
-        argument, so it does not appear in <Mono>ps</Mono>.
+        {surfacesById.get("settings.secrets")!.blurb} Stored by <Mono>curie secrets</Mono> in its own
+        private storage. A value you type here is handed to the CLI through the environment, never as
+        a command argument, so it does not appear in <Mono>ps</Mono> — which is why this panel does
+        the job natively rather than opening the generic form.
       </div>
 
       {error ? (
@@ -388,6 +391,8 @@ function SecretsPanel() {
           ))}
         </div>
       )}
+
+      <DrivenBy ids={["secrets.list", "secrets.set", "secrets.unset"]} />
 
       {adding ? (
         <AddSecret
@@ -543,11 +548,14 @@ function EnvironmentPanel() {
 
   return (
     <Panel
-      title="This machine"
+      title="What this app can see"
       right={
-        <Button size="sm" onClick={() => app.refreshEnv()}>
-          Re-detect
-        </Button>
+        <div style={{ display: "flex", gap: 6 }}>
+          <RunButton id="doctor">Full diagnosis</RunButton>
+          <Button size="sm" onClick={() => app.refreshEnv()}>
+            Re-detect
+          </Button>
+        </div>
       }
     >
       {env ? (
@@ -582,6 +590,57 @@ function EnvironmentPanel() {
         </div>
       ) : null}
     </Panel>
+  );
+}
+
+/** Setting the CLI up, updating it, and finding out what is wrong with it.
+ *
+ *  These have no natural home anywhere else: they act on the machine rather than
+ *  on a bundle, a tier or an agent. Settings is where a person already goes to
+ *  ask "what is this app pointed at", so it is where the commands that change
+ *  that answer belong. */
+function MaintenancePanel() {
+  return (
+    <Actions surface={surfacesById.get("settings.machine")!}>
+      <div style={{ ...F.footnote, color: T.quaternary, marginTop: 10, lineHeight: 1.55 }}>
+        <Mono style={{ fontSize: 10 }}>curie interactive</Mono> is the CLI&apos;s own terminal UI and
+        needs a real terminal, so it opens here as a reference rather than as something this app can
+        launch — this window is the same thing with a mouse.
+      </div>
+    </Actions>
+  );
+}
+
+/** The two commands that print something to read. Their output is the point, so
+ *  they land in the transcript drawer and stay there. */
+function ReferencePanel() {
+  return <Actions surface={surfacesById.get("settings.reference")!} />;
+}
+
+/** The contributor checks, gated on an actual source checkout.
+ *
+ *  Sixteen commands that a released binary refuses outright. They are shown
+ *  regardless -- hiding them would make this app quietly smaller than the CLI --
+ *  but the group says up front when this machine cannot run them, which is the
+ *  same treatment every other precondition gets. */
+function DevPanel() {
+  const app = useApp();
+  const surface = surfacesById.get("settings.dev")!;
+  return (
+    <Actions
+      surface={surface}
+      right={
+        <span style={{ ...F.footnote, color: T.quaternary }}>
+          {app.env?.sourceCheckout ? (app.env.repoRoot ?? "source checkout") : "needs a checkout"}
+        </span>
+      }
+    >
+      <div style={{ ...F.footnote, color: T.quaternary, marginTop: 10, lineHeight: 1.55 }}>
+        Each of these is a script in the repo, run through <Mono style={{ fontSize: 10 }}>curie dev</Mono>{" "}
+        so there is one entry point rather than a scatter of shell files. Output goes to the
+        transcript drawer.
+      </div>
+    </Actions>
   );
 }
 

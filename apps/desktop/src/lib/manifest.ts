@@ -121,6 +121,11 @@ const MUTATING = new Set([
   "apply",
   "seal",
   "secrets.set",
+  // These two rewrite files in the checkout rather than doing anything to a
+  // deployment, but "it edited tracked files" is still a change somebody has to
+  // review, so they are not `safe`.
+  "dev.schema-baseline",
+  "dev.bump-version",
 ]);
 
 /** Commands the CLI itself refuses without a terminal, and what this app offers

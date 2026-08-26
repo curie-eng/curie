@@ -30,11 +30,42 @@ import type {
 export type Route =
   | "overview"
   | "build"
+  | "tiers"
   | "resources"
   | "canvas"
   | "commands"
   | "activity"
   | "settings";
+
+/** Every route, in sidebar order. Exported so the menu, the keyboard shortcuts
+ *  and the placement map cannot drift from the type. */
+export const ROUTES: readonly Route[] = [
+  "overview",
+  "build",
+  "tiers",
+  "resources",
+  "canvas",
+  "commands",
+  "activity",
+  "settings",
+];
+
+/**
+ * Values a contextual control hands to the command form it opens.
+ *
+ * This is what makes a button on an agent row better than the same command
+ * found by searching: "Memory" on `billing-bot` opens
+ * `curie local memory billing-bot`, already filled, rather than a blank form
+ * with the agent name to be retyped. Agent-scoped commands take the agent as a
+ * *positional*, so the sticky-flag mechanism cannot carry it -- hence this.
+ *
+ * It is a seed, not a lock: the form is fully editable afterwards, and the
+ * rendered command string still shows exactly what will run.
+ */
+export interface Prefill {
+  readonly positionals?: readonly string[];
+  readonly flags?: Readonly<Record<string, string | boolean>>;
+}
 
 export interface AgentSummary {
   id: string;
@@ -53,11 +84,14 @@ interface AppValue {
   /** `focus` names something inside the destination -- a command id, an agent
    *  name -- and is passed with the route so the two can never be set in the
    *  wrong order. */
-  navigate(route: Route, focus?: string): void;
+  navigate(route: Route, focus?: string, prefill?: Prefill): void;
   /** Set when a route wants to land on something specific -- a command id from
    *  the palette, an agent from the canvas. Consumed by the target view. */
   readonly focus: string | null;
   setFocus(value: string | null): void;
+  /** Seed values for whatever `focus` names. Set and cleared with `focus`, so a
+   *  stale prefill can never land on the next command opened without one. */
+  readonly prefill: Prefill | null;
 
   readonly env: ShellEnvironment | null;
   refreshEnv(): void;
@@ -85,6 +119,19 @@ interface AppValue {
 
   readonly paletteOpen: boolean;
   setPaletteOpen(open: boolean): void;
+
+  /**
+   * The command whose form is open in the run sheet, if any.
+   *
+   * A control on an agent's row that navigated to the Commands list would be
+   * answering "where do I do this" with "go to the list and find it" -- which is
+   * the thing the placement map exists to stop. So a contextual control opens
+   * the same generated form *in place*, over the screen the operator is already
+   * reading, and the list stays what it is: the reference.
+   */
+  readonly runTarget: { readonly id: string; readonly prefill: Prefill | null } | null;
+  runCommand(id: string, prefill?: Prefill): void;
+  closeRun(): void;
 }
 
 const Ctx = createContext<AppValue | null>(null);
@@ -101,7 +148,9 @@ function loadSticky(): Record<string, string> {
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [route, setRoute] = useState<Route>("overview");
-  const [focus, setFocus] = useState<string | null>(null);
+  const [focus, setFocusState] = useState<string | null>(null);
+  const [prefill, setPrefill] = useState<Prefill | null>(null);
+  const [runTarget, setRunTarget] = useState<{ id: string; prefill: Prefill | null } | null>(null);
   const [env, setEnv] = useState<ShellEnvironment | null>(null);
   const [workspaces, setWorkspaces] = useState<readonly Workspace[]>([]);
   const [workspacePath, setWorkspacePath] = useState<string | null>(null);
@@ -245,18 +294,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (target === "workspace:open") return void openWorkspace();
       if (target.startsWith("commands:")) {
         setRoute("commands");
-        return setFocus(target.slice("commands:".length));
+        setPrefill(null);
+        return setFocusState(target.slice("commands:".length));
       }
-      const known: Route[] = [
-        "overview",
-        "build",
-        "resources",
-        "canvas",
-        "commands",
-        "activity",
-        "settings",
-      ];
-      if ((known as string[]).includes(target)) setRoute(target as Route);
+      if ((ROUTES as readonly string[]).includes(target)) setRoute(target as Route);
     });
     return off;
   }, [openWorkspace]);
@@ -284,9 +325,26 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [workspaces, workspacePath],
   );
 
-  const navigate = useCallback((next: Route, nextFocus?: string) => {
+  // Focus and prefill move together: a prefill outliving the focus it was meant
+  // for would silently fill the *next* command someone opened.
+  const setFocus = useCallback((value: string | null) => {
+    setFocusState(value);
+    setPrefill(null);
+  }, []);
+
+  const runCommand = useCallback((id: string, nextPrefill?: Prefill) => {
+    setRunTarget({ id, prefill: nextPrefill ?? null });
+  }, []);
+
+  const closeRun = useCallback(() => setRunTarget(null), []);
+
+  const navigate = useCallback((next: Route, nextFocus?: string, nextPrefill?: Prefill) => {
+    // Moving somewhere else dismisses the sheet: a panel floating over a screen
+    // it was not opened from has lost the context that made it make sense.
+    setRunTarget(null);
     setRoute(next);
-    setFocus(nextFocus ?? null);
+    setFocusState(nextFocus ?? null);
+    setPrefill(nextFocus ? (nextPrefill ?? null) : null);
   }, []);
 
   const value = useMemo<AppValue>(
@@ -295,6 +353,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       navigate,
       focus,
       setFocus,
+      prefill,
       env,
       refreshEnv,
       theme,
@@ -314,11 +373,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
       remember,
       paletteOpen,
       setPaletteOpen,
+      runTarget,
+      runCommand,
+      closeRun,
     }),
     [
       route,
       navigate,
       focus,
+      setFocus,
+      prefill,
       env,
       refreshEnv,
       theme,
@@ -336,6 +400,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       sticky,
       remember,
       paletteOpen,
+      runTarget,
+      runCommand,
+      closeRun,
     ],
   );
 

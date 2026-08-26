@@ -15,7 +15,7 @@
 
 import { useCallback, useMemo, useState } from "react";
 
-import { useApp } from "../bridge/app";
+import { useApp, type Prefill } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
 import { ACCENT, F, FONT, HUE, LINE, R, S, STATUS, T } from "../tokens";
 import { Badge, Button, CopyButton, Field, Input, Mono, Notice, Select, Sheet, Textarea, Toggle } from "../primitives";
@@ -69,7 +69,11 @@ function RunDirectory() {
 
 function seedValues(
   cmd: Command,
-  ctx: { workspacePath: string | null; sticky: Readonly<Record<string, string>> },
+  ctx: {
+    workspacePath: string | null;
+    sticky: Readonly<Record<string, string>>;
+    prefill?: Prefill;
+  },
 ): { positionals: string[]; flags: Values } {
   const flags: Values = {};
   for (const arg of cmd.flags) {
@@ -95,7 +99,19 @@ function seedValues(
     const seeded = fromContext || fallback;
     if (seeded) flags[long] = seeded;
   }
-  return { positionals: cmd.positionals.map(() => ""), flags };
+  // A contextual control's own values win over everything: the operator pressed
+  // "Memory" on a particular agent's row, so that agent is the answer, not the
+  // one they typed into an unrelated form ten minutes ago. Unknown flags and
+  // surplus positionals are dropped rather than smuggled into argv -- the form
+  // renders only what the manifest declares, and the preview must stay the
+  // whole truth about what will run.
+  const declared = new Set(cmd.flags.map((f) => f.long!));
+  for (const [long, value] of Object.entries(ctx.prefill?.flags ?? {})) {
+    if (declared.has(long)) flags[long] = value;
+  }
+  const positionals = cmd.positionals.map((_spec, i) => ctx.prefill?.positionals?.[i] ?? "");
+
+  return { positionals, flags };
 }
 
 /** Flags worth showing without a disclosure: the ones that carry a value the
@@ -122,16 +138,24 @@ export function CommandForm({
   cmd,
   onRan,
   compact,
+  prefill,
 }: {
   cmd: Command;
   onRan?(runId: string): void;
   compact?: boolean;
+  /** Values a contextual control seeded this form with. Read once, at mount,
+   *  like every other seed here. */
+  prefill?: Prefill;
 }) {
   const app = useApp();
   const runs = useRuns();
 
   const seeded = useState(() =>
-    seedValues(cmd, { workspacePath: app.workspace?.path ?? null, sticky: app.sticky }),
+    seedValues(cmd, {
+      workspacePath: app.workspace?.path ?? null,
+      sticky: app.sticky,
+      prefill,
+    }),
   )[0];
   const [positionals, setPositionals] = useState<string[]>(seeded.positionals);
   const [flags, setFlags] = useState<Values>(seeded.flags);

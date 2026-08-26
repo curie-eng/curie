@@ -154,7 +154,7 @@ function Row({ run }: { run: Run }) {
               Open transcript
             </Button>
             {cmd ? (
-              <Button size="sm" onClick={() => app.navigate("commands", cmd.id)}>
+              <Button size="sm" onClick={() => app.runCommand(cmd.id)}>
                 Run again
               </Button>
             ) : null}

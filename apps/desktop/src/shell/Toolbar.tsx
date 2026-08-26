@@ -13,6 +13,7 @@ import { Button, Kbd, Spinner } from "../primitives";
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "What is happening right now" },
   build: { title: "Build", subtitle: "Author this bundle, then run it up the ladder" },
+  tiers: { title: "Tiers", subtitle: "The same agent, on a laptop or on a cluster" },
   resources: { title: "Resources", subtitle: "What each agent is consuming" },
   canvas: { title: "Canvas", subtitle: "Agents, integrations, and the infra under them" },
   commands: { title: "Commands", subtitle: "Everything the CLI can do" },

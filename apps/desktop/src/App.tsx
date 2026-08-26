@@ -17,11 +17,13 @@ import { RunDrawer } from "./shell/RunDrawer";
 import { Palette } from "./shell/Palette";
 import { Overview } from "./views/Overview";
 import { Build } from "./views/Build";
+import { Tiers } from "./views/Tiers";
 import { Resources } from "./views/Resources";
 import { Canvas } from "./views/Canvas";
 import { Commands } from "./views/Commands";
 import { Activity } from "./views/Activity";
 import { Settings } from "./views/Settings";
+import { RunSheetHost } from "./views/Actions";
 import { R, S } from "./tokens";
 
 function View() {
@@ -29,6 +31,8 @@ function View() {
   switch (route) {
     case "build":
       return <Build />;
+    case "tiers":
+      return <Tiers />;
     case "resources":
       return <Resources />;
     case "canvas":
@@ -65,11 +69,12 @@ function Keys() {
         e.preventDefault();
         return runs.setDrawerOpen(!runs.drawerOpen);
       }
-      if (mod && /^[1-6]$/.test(e.key)) {
+      if (mod && /^[1-7]$/.test(e.key)) {
         e.preventDefault();
         const routes = [
           "overview",
           "build",
+          "tiers",
           "resources",
           "canvas",
           "commands",
@@ -152,6 +157,10 @@ function Frame() {
         <RunDrawer />
       </div>
 
+      {/* One sheet host for the whole app: any control anywhere opens the
+          generated form over the screen it was pressed on, rather than sending
+          the operator to the Commands list to find it again. */}
+      <RunSheetHost />
       <Palette />
       <Keys />
     </div>
