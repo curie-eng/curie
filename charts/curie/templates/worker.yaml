@@ -402,6 +402,12 @@ spec:
                   {{- /* BYO (issue #1759): the referenced key must already
                          hold the JSON-encoded map. */}}
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.worker.adapterCredentialsExistingSecret "existingSecretKey" .Values.worker.adapterCredentialsExistingSecretKey "defaultKey" "adapterCredentials") | nindent 18 }}
+            # Which agent gets a fleet-control token minted (ADR-0133).
+            # Unconditional and empty-by-default for the same reason as the
+            # API's CONTROL_AGENT: empty is the closed state, and saying so in
+            # the manifest beats an absent key.
+            - name: CURIE_CONTROL_AGENT
+              value: {{ .Values.worker.controlAgent | quote }}
             # No-Slack egress routing: when set, the worker's Slack sink posts its
             # placeholder edits at this base URL (the `curie cluster message` CLI stub)
             # instead of real Slack. Empty (the default) leaves the sink on real

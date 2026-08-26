@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "curie-fleet": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/fleet_server.py"]
+    }
+  }
+}

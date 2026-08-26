@@ -54,6 +54,43 @@ class Settings(BaseSettings):
         ),
     )
 
+    # The one agent allowed to reach the fleet control plane (ADR-0125), by name.
+    #
+    # Empty is the default and means the control plane authenticates NOBODY but
+    # the platform key: no scoped token verifies, whatever it claims. So the
+    # elevated agent does not exist until an operator names it here, and naming
+    # it is a deliberate install-time act rather than a consequence of deploying
+    # a bundle. A bundle cannot opt itself in -- this is operator scope, read
+    # from settings and never from an agent row, the same rule ADR-0098 applies
+    # to thinking depth.
+    #
+    # A name rather than an id because the operator picks it before the agent
+    # row exists, and because the worker's mint site decides by name too; both
+    # sides comparing the same string is what keeps them from disagreeing about
+    # which agent is privileged.
+    control_agent: str = ""
+
+    # Who may press a button on a control screen (ADR-0125), as a comma-separated
+    # list of channel user ids.
+    #
+    # Deliberately provider-neutral opaque ids, not Slack-shaped ones: the same
+    # list authorizes a Discord click, because the operator set is a policy fact
+    # and the channel is a rendering detail (ADR-0020). It is matched with
+    # ``approvers.ExplicitUsers``, the one approver set that needs no upstream
+    # lookup, so a button still resolves while Slack is unreachable.
+    #
+    # Empty -- the default -- admits NOBODY. Screens still render (they are
+    # reads), and every invoke is refused. That is the right closed state: an
+    # install that has not decided who its operators are has not decided that
+    # everyone is.
+    control_operators: str = ""
+
+    def control_operator_ids(self) -> tuple[str, ...]:
+        """The parsed operator list. Blank entries dropped so a trailing comma in
+        a values file does not silently authorize the empty-string actor."""
+
+        return tuple(part.strip() for part in self.control_operators.split(",") if part.strip())
+
     # Human-readable org/workspace name the UI reads (open /config endpoint) to
     # brand the app. Overridable via ORG_NAME for a white-labeled deployment.
     org_name: str = "Curie"

@@ -66,12 +66,16 @@ is a judgement call, not something derivable from the tree.
    column is a native Postgres `Enum(Environment, name="environment", schema=SCHEMA)`
    (`apps/api/src/curie_api/models.py::Deployment`), which materializes as a `CREATE TYPE` in the `curie` schema.
 3. **`JSONB` column type** — `apps/api/src/curie_api/models.py::JSONB` is imported from
-   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **thirteen** columns:
-   `behavior_packs`, `approval_required_tools`, `approval_routes`, `secrets`,
-   `changed_paths`, `evidence`, `arguments`, `result`, `prior_state`, `target`,
-   `post_state`, and `value`. The last one is
-   `apps/api/src/curie_api/models.py::WorkflowStateEntry.value`; `evidence` is used
-   by both approval and action audit rows. Two of them are
+   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **fifteen** columns:
+   `behavior_packs`, `approval_required_tools`, `approval_routes` and `secrets` on
+   `apps/api/src/curie_api/models.py::Agent`, `changed_paths` on
+   `apps/api/src/curie_api/models.py::Publication`, `evidence` on
+   `apps/api/src/curie_api/models.py::ApprovalAuditEntry`, `value` on
+   `apps/api/src/curie_api/models.py::WorkflowStateEntry`, `arguments`, `result`,
+   `prior_state`, `post_state` and `target` on
+   `apps/api/src/curie_api/models.py::AgentAction`,
+   `evidence` on `apps/api/src/curie_api/models.py::ActionAuditEntry`, and `params`
+   and `result` on `apps/api/src/curie_api/models.py::ControlProposal`. Two of them are
    load-bearing rather than incidental: the workflow-state store exists precisely because
    Postgres JSONB meant no new datastore was needed (see that class's docstring), and the
    action ledger's `prior_state` holds a snapshot whose shape belongs to whatever resource

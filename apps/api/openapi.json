@@ -1838,6 +1838,73 @@
         "title": "ChannelTokenRequest",
         "type": "object"
       },
+      "CommandCoverageOut": {
+        "properties": {
+          "covered": {
+            "title": "Covered",
+            "type": "integer"
+          },
+          "exempt": {
+            "title": "Exempt",
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/CommandCoverageRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "covered",
+          "exempt",
+          "rows"
+        ],
+        "title": "CommandCoverageOut",
+        "type": "object"
+      },
+      "CommandCoverageRow": {
+        "description": "One CLI leaf command and where it is answered in chat.",
+        "properties": {
+          "command": {
+            "title": "Command",
+            "type": "string"
+          },
+          "exempt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exempt"
+          },
+          "screen": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Screen"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "title": "CommandCoverageRow",
+        "type": "object"
+      },
       "ConnectorManifests": {
         "description": "Kubernetes objects derived from a version's ``connectors.yaml``.\n\nThe API renders; the caller applies. Rendering is a pure function of the\nbundle plus the deployment context the caller supplies, so producing this\nneeds no cluster access and the API's read-only RBAC is untouched\n(ADR-0086, #1063).",
         "properties": {
@@ -2560,6 +2627,119 @@
         "title": "EvalTriggerResult",
         "type": "object"
       },
+      "FleetAgentSummary": {
+        "description": "One agent as the control agent sees it: enough to answer \"what is running\nand is anything wrong\", and nothing that confers reach.\n\nDeliberately omits ``secrets``, ``repo_full_name``, and the approval-route\nbindings. The control agent reports on the fleet to a human in a chat\nthread, so every field here is a field that may end up pasted into Slack.",
+        "properties": {
+          "dev_version_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dev Version Label"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "killed": {
+            "title": "Killed",
+            "type": "boolean"
+          },
+          "max_usd_per_day": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Usd Per Day"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "prod_version_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prod Version Label"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "killed"
+        ],
+        "title": "FleetAgentSummary",
+        "type": "object"
+      },
+      "FleetVersionSummary": {
+        "description": "A version the control agent can name in a rollback proposal.",
+        "properties": {
+          "active_in": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Active In",
+            "type": "array"
+          },
+          "commit_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Sha"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "created_at"
+        ],
+        "title": "FleetVersionSummary",
+        "type": "object"
+      },
       "GateKind": {
         "description": "Which gate raised an approval: a permission gate or a policy gate.\n\nA ``StrEnum`` rather than a ``Literal`` for two reasons. It is what the Rust\ngenerator can express (a multi-valued ``Literal`` raises; the ``Enum`` branch\nis the sanctioned path, exactly as ``SessionStatus`` uses). And the field is\nauthority-bearing per #544/ADR-0046, so the value domain is a named, exported\npart of the contract rather than an inline annotation.",
         "enum": [
@@ -3161,6 +3341,219 @@
         "title": "PodLogs",
         "type": "object"
       },
+      "ProposalActionInfo": {
+        "description": "One entry of the closed action vocabulary, so a caller can discover what\nis proposable without reading the source.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description"
+        ],
+        "title": "ProposalActionInfo",
+        "type": "object"
+      },
+      "ProposalCreate": {
+        "description": "What a proposer supplies. Note what is NOT here: the summary.\n\nThe proposer names an action and a target and passes parameters. The\nconsequence line a human reads is rendered by the API from the store\n(``proposals.prepare``), because the click on that line is the actual\nauthorization and the model must not be able to write it.\n\n``requested_by`` and ``thread_key`` are provenance only. The control agent\nfills them from the conversation it is in, and nothing on the execute path\nreads them to decide anything -- they are supplied by the model, so treating\nthem as authority would be trusting the caller's own claim about who asked.",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "title": "Params",
+            "type": "object"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "target_agent_id": {
+            "format": "uuid",
+            "title": "Target Agent Id",
+            "type": "string"
+          },
+          "thread_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Key"
+          }
+        },
+        "required": [
+          "target_agent_id",
+          "action"
+        ],
+        "title": "ProposalCreate",
+        "type": "object"
+      },
+      "ProposalExecute": {
+        "description": "The human executing a proposal, for the audit record.\n\nAuthorization is the platform key on the request; this names the person who\nclicked so the durable record has a human on it (ADR-0046) rather than\n\"the platform key did it\".",
+        "properties": {
+          "executed_by": {
+            "title": "Executed By",
+            "type": "string"
+          }
+        },
+        "required": [
+          "executed_by"
+        ],
+        "title": "ProposalExecute",
+        "type": "object"
+      },
+      "ProposalOut": {
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "executed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed At"
+          },
+          "executed_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executed By"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "title": "Params",
+            "type": "object"
+          },
+          "proposed_by_agent_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proposed By Agent Id"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          },
+          "target_agent_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Agent Id"
+          },
+          "target_agent_name": {
+            "title": "Target Agent Name",
+            "type": "string"
+          },
+          "thread_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Key"
+          }
+        },
+        "required": [
+          "id",
+          "target_agent_name",
+          "action",
+          "params",
+          "summary",
+          "status",
+          "created_at",
+          "expires_at"
+        ],
+        "title": "ProposalOut",
+        "type": "object"
+      },
       "PublicationCreate": {
         "description": "Trusted snapshot facts used to atomically create approval + publication.",
         "properties": {
@@ -3565,6 +3958,251 @@
           "pods"
         ],
         "title": "RunnerPods",
+        "type": "object"
+      },
+      "ScreenActionIn": {
+        "description": "A human pressing a button.\n\n``actor`` is the channel user id the adapter resolved, and it is the whole\nauthorization: it is checked against the operator set server-side. It is a\ncaller assertion, carrying the same residual ADR-0033 named for approvals --\nit proves the asserted identity satisfied policy, not who physically\ntapped -- and the dispatcher holding the platform key is what makes the\nassertion worth anything.",
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "button": {
+            "title": "Button",
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "title": "Params",
+            "type": "object"
+          },
+          "screen": {
+            "title": "Screen",
+            "type": "string"
+          },
+          "typed_confirmation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Typed Confirmation"
+          }
+        },
+        "required": [
+          "actor",
+          "screen",
+          "button"
+        ],
+        "title": "ScreenActionIn",
+        "type": "object"
+      },
+      "ScreenActionOut": {
+        "description": "What happened, plus the screen to show next.\n\nReturning the next screen rather than only a result is what makes a chat\nsurface feel like an app: the adapter replaces the message in place and the\noperator sees the new state, instead of reading \"ok\" and having to ask again.",
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "proposal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proposal Id"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
+          "screen": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScreenOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "message"
+        ],
+        "title": "ScreenActionOut",
+        "type": "object"
+      },
+      "ScreenBlockOut": {
+        "description": "One block of a screen's body, in the channel-neutral vocabulary.\n\nCarries no Slack or Discord shape by design (ADR-0020): the adapter turns a\n``rows`` block into a Block Kit table, a Discord embed, or three lines of\ntext, and none of those choices belong in the port.",
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "fields": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Fields",
+            "type": "object"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "ScreenBlockOut",
+        "type": "object"
+      },
+      "ScreenButtonOut": {
+        "properties": {
+          "confirm": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirm"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "params": {
+            "additionalProperties": true,
+            "title": "Params",
+            "type": "object"
+          },
+          "style": {
+            "title": "Style",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "kind",
+          "style",
+          "target"
+        ],
+        "title": "ScreenButtonOut",
+        "type": "object"
+      },
+      "ScreenOut": {
+        "properties": {
+          "blocks": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenBlockOut"
+            },
+            "title": "Blocks",
+            "type": "array"
+          },
+          "buttons": {
+            "items": {
+              "$ref": "#/components/schemas/ScreenButtonOut"
+            },
+            "title": "Buttons",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "parent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent"
+          },
+          "subtitle": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subtitle"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title"
+        ],
+        "title": "ScreenOut",
         "type": "object"
       },
       "SettingConfig": {
@@ -8708,6 +9346,705 @@
         "summary": "Trigger Eval",
         "tags": [
           "evals"
+        ]
+      }
+    },
+    "/fleet/actions": {
+      "get": {
+        "description": "The closed vocabulary of proposable actions.\n\nServed rather than documented so the control agent's own description of what\nit can ask for cannot drift from what the API will accept.",
+        "operationId": "list_actions_fleet_actions_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProposalActionInfo"
+                  },
+                  "title": "Response List Actions Fleet Actions Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Actions",
+        "tags": [
+          "fleet"
+        ]
+      }
+    },
+    "/fleet/agents": {
+      "get": {
+        "description": "Every agent, with what is deployed and whether it is killed.\n\nThis is the read the whole feature exists to serve: a human asks \"what is\nrunning\" in a thread and gets an answer without opening the console.",
+        "operationId": "list_fleet_fleet_agents_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/FleetAgentSummary"
+                  },
+                  "title": "Response List Fleet Fleet Agents Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Fleet",
+        "tags": [
+          "fleet"
+        ]
+      }
+    },
+    "/fleet/agents/{agent_id}/versions": {
+      "get": {
+        "description": "An agent's versions, marked with where each is currently active.\n\nThe control agent needs this to propose a rollback at all: a rollback names\na version id, and it has no other way to learn a legal one. Marking which\nare live is what lets it tell a human \"back to the version that was running\nbefore this morning\" instead of reciting UUIDs.",
+        "operationId": "list_agent_versions_fleet_agents__agent_id__versions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/FleetVersionSummary"
+                  },
+                  "title": "Response List Agent Versions Fleet Agents  Agent Id  Versions Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Versions",
+        "tags": [
+          "fleet"
+        ]
+      }
+    },
+    "/fleet/coverage": {
+      "get": {
+        "description": "Which CLI command each screen answers, and why the rest have none.\n\nServed rather than only tested so the agent can answer \"can you do X?\"\nhonestly, from the same table the coverage gate checks, instead of guessing\nfrom its system prompt.",
+        "operationId": "command_coverage_fleet_coverage_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandCoverageOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Command Coverage",
+        "tags": [
+          "fleet"
+        ]
+      }
+    },
+    "/fleet/proposals": {
+      "get": {
+        "operationId": "list_proposals_fleet_proposals_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status_filter",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status Filter"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProposalOut"
+                  },
+                  "title": "Response List Proposals Fleet Proposals Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Proposals",
+        "tags": [
+          "fleet"
+        ]
+      },
+      "post": {
+        "description": "Record a fleet action for a human to run. Executes nothing.\n\nThe control agent is allowed here, and that is the point of the whole\ndesign: proposing is the most it can do. ``proposals.prepare`` validates the\nparameters against the closed vocabulary and renders the consequence line\nfrom the store, so what gets written is the API's description of the action,\nnot the caller's.",
+        "operationId": "create_proposal_fleet_proposals_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposalCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProposalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Proposal",
+        "tags": [
+          "fleet"
+        ]
+      }
+    },
+    "/fleet/proposals/{proposal_id}": {
+      "get": {
+        "operationId": "get_proposal_fleet_proposals__proposal_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProposalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Proposal",
+        "tags": [
+          "fleet"
+        ]
+      }
+    },
+    "/fleet/proposals/{proposal_id}/execute": {
+      "post": {
+        "description": "Run a pending proposal. **Platform key only.**\n\nThis is the line the whole ADR is about. The control agent authenticates\nfine on this router -- it reads the fleet and writes proposals through the\nsame dependency -- and is refused *here*, by caller kind, server-side. There\nis no configuration that grants it, and no tool it can reach that reaches\nthis. A model's authority ends at the pending row.\n\nExecute-once is a compare-and-set on ``status``, the same shape as\n``claim_approval_resolution``: the row moves out of ``pending`` in the same\ntransaction that runs the action, so a double click cannot roll the same\nagent back twice.",
+        "operationId": "execute_proposal_fleet_proposals__proposal_id__execute_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposalExecute"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProposalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Execute Proposal",
+        "tags": [
+          "fleet"
+        ]
+      }
+    },
+    "/fleet/proposals/{proposal_id}/reject": {
+      "post": {
+        "description": "Decline a proposal. Platform key only, for the same reason execute is:\na model that could reject its own proposals could hide them.",
+        "operationId": "reject_proposal_fleet_proposals__proposal_id__reject_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposalExecute"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProposalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reject Proposal",
+        "tags": [
+          "fleet"
+        ]
+      }
+    },
+    "/fleet/screens/actions": {
+      "post": {
+        "description": "Press a button.\n\n**The caller names a screen and a button id, never an action.** The server\nre-renders that screen and looks the button up in what it just built, so the\naction and its parameters are the ones the platform authored a moment ago.\nA caller cannot compose ``{\"action\": \"delete_agent\"}`` and send it: there is\nno field to put it in, and a button that the current screen does not render\ndoes not exist.\n\nThat is what makes the confirm text meaningful too. The operator approved a\nsentence the API wrote; the API then runs the parameters that sentence was\nrendered from, not parameters that arrived alongside it.\n\nA press runs immediately -- it is a human act, not a model's -- and still\nwrites an executed ``ControlProposal`` row, so a change made from a phone\nand one made from the CLI land in the same audit trail rather than only in a\nchat log somebody can delete.",
+        "operationId": "invoke_button_fleet_screens_actions_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenActionIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenActionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Invoke Button",
+        "tags": [
+          "fleet"
+        ]
+      }
+    },
+    "/fleet/screens/{screen_id}": {
+      "get": {
+        "description": "Render one screen. A read, so the control agent may call it.\n\nQuery parameters rather than a body because a screen is addressable: the\nsame (id, params) pair renders the same page, which is what lets a button's\n``navigate`` target be a plain reference the adapter can re-fetch.",
+        "operationId": "get_screen_fleet_screens__screen_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "screen_id",
+            "required": true,
+            "schema": {
+              "title": "Screen Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "thread_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Thread Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Screen",
+        "tags": [
+          "fleet"
         ]
       }
     },

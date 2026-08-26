@@ -852,6 +852,17 @@ class WorkerConfig(BaseSettings):
     # runner-reachable.
     runner_api_base_url: str = Field(default="", validation_alias="CURIE_RUNNER_API_URL")
     api_key: str = Field(default="curie-dev-key", validation_alias=API_KEY_ENV)
+    # The one agent this worker mints a fleet-control token for (ADR-0125), by
+    # name. Empty -- the default -- means it mints none, ever, so no sandbox on
+    # this worker can reach the control plane.
+    #
+    # Compared against the RESOLVED deployment's agent name at boot, so the
+    # privilege follows the agent identity the platform assigned, not anything
+    # the bundle declares about itself. Must match the API's own
+    # ``CONTROL_AGENT``: the worker minting is necessary but not sufficient,
+    # because the API independently checks the token names ITS configured
+    # control agent. Two operator settings have to agree before the plane opens.
+    control_agent: str = Field(default="", validation_alias="CURIE_CONTROL_AGENT")
     # ---------------------------------------------------------------------
     # Connector reconciler (ADR-0090, #1184). Off by default: enabling it is
     # what makes the worker's Role grant create/patch/delete on Deployments,

@@ -392,6 +392,11 @@ services:
       DB_SCHEMA: curie
       API_KEY: curie-dev-key
       CURIE_INTERNAL_WORKER_TOKEN: curie-dev-worker-token
+      # Which agent may reach the fleet control plane (ADR-0125). Empty by
+      # default, and empty means the plane authenticates nobody but the platform
+      # key -- so a stock `curie local up` has the feature off. Must match the
+      # worker's CURIE_CONTROL_AGENT below; both sides check independently.
+      CONTROL_AGENT: ${CONTROL_AGENT:-}
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       VALKEY_PASSWORD: ${VALKEY_PASSWORD:-valkeypass}
@@ -580,6 +585,11 @@ services:
       # Empty (the default) means no non-Slack channel can be delivered to: that
       # egress fails CLOSED rather than sending an unauthenticated request.
       - CURIE_ADAPTER_CREDENTIALS=${CURIE_ADAPTER_CREDENTIALS:-}
+      # The one agent this worker mints a fleet-control token for (ADR-0125).
+      # Empty -- the default -- means it mints none, so no sandbox here can
+      # reach the control plane. Set BOTH this and the API's CONTROL_AGENT to
+      # the same deployed agent name to turn the feature on.
+      - CURIE_CONTROL_AGENT=${CONTROL_AGENT:-}
       # The Slack assistant-thread "shimmer" (#1182), on by default. One knob,
       # one consumer: the worker raises and lowers the caption, and the
       # dispatcher does not touch it (#1312), so setting this false here turns

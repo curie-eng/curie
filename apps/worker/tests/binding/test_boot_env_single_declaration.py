@@ -164,6 +164,13 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # The Slack shimmer caption. Read from the WORKER's env since #1312 moved
         # the whole shimmer to this side; it reaches Slack, never a sandbox.
         "CURIE_STATUS_TEXT",
+        # Which agent this worker mints a fleet-control token FOR (ADR-0125),
+        # read from the WORKER's env by WorkerConfig. Emphatically not a boot
+        # key: a sandbox that could read the name could learn whether it is
+        # privileged, and a sandbox that could SET it would name itself. The
+        # boot pair this setting gates (CURIE_CONTROL_URL / CURIE_CONTROL_TOKEN)
+        # is declared on BootEnv like every other injected key.
+        "CURIE_CONTROL_AGENT",
         # The cluster sealing keys (ADR-0094), read from the WORKER's env at
         # reconcile time. Never a sandbox boot key -- quite the opposite: the
         # decrypted VALUE reaches a connector's Secret, and the private key

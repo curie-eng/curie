@@ -181,6 +181,12 @@ spec:
               value: {{ .Values.api.environment | quote }}
             - name: ORG_NAME
               value: {{ .Values.api.orgName | quote }}
+            # The fleet control plane's opt-in (ADR-0125). Rendered
+            # unconditionally, empty included: empty is the CLOSED state, so an
+            # explicit empty value states the posture in the manifest rather
+            # than leaving a reader to infer it from an absent key.
+            - name: CONTROL_AGENT
+              value: {{ .Values.api.controlAgent | quote }}
             - name: COMMIT_POLL_INTERVAL_S
               value: {{ .Values.api.commitPollIntervalSeconds | quote }}
             - name: GITHUB_CLONE_BASE

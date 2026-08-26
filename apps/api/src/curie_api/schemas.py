@@ -1921,3 +1921,184 @@ class ConsoleSessionOut(BaseModel):
     """
 
     expires_at: datetime
+
+
+# -- fleet control plane (ADR-0125) --------------------------------------------
+
+
+class FleetAgentSummary(BaseModel):
+    """One agent as the control agent sees it: enough to answer "what is running
+    and is anything wrong", and nothing that confers reach.
+
+    Deliberately omits ``secrets``, ``repo_full_name``, and the approval-route
+    bindings. The control agent reports on the fleet to a human in a chat
+    thread, so every field here is a field that may end up pasted into Slack.
+    """
+
+    id: uuid.UUID
+    name: str
+    killed: bool
+    model: str | None = None
+    max_usd_per_day: float | None = None
+    prod_version_label: str | None = None
+    dev_version_label: str | None = None
+
+
+class FleetVersionSummary(BaseModel):
+    """A version the control agent can name in a rollback proposal."""
+
+    id: uuid.UUID
+    label: str
+    commit_sha: str | None = None
+    created_at: datetime
+    active_in: list[str] = Field(default_factory=list)
+
+
+class ProposalCreate(BaseModel):
+    """What a proposer supplies. Note what is NOT here: the summary.
+
+    The proposer names an action and a target and passes parameters. The
+    consequence line a human reads is rendered by the API from the store
+    (``proposals.prepare``), because the click on that line is the actual
+    authorization and the model must not be able to write it.
+
+    ``requested_by`` and ``thread_key`` are provenance only. The control agent
+    fills them from the conversation it is in, and nothing on the execute path
+    reads them to decide anything -- they are supplied by the model, so treating
+    them as authority would be trusting the caller's own claim about who asked.
+    """
+
+    target_agent_id: uuid.UUID
+    action: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    requested_by: str | None = None
+    thread_key: str | None = None
+
+
+class ProposalExecute(BaseModel):
+    """The human executing a proposal, for the audit record.
+
+    Authorization is the platform key on the request; this names the person who
+    clicked so the durable record has a human on it (ADR-0046) rather than
+    "the platform key did it".
+    """
+
+    executed_by: str
+
+
+class ProposalOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    # NULL once the agent is deleted; the name below is what keeps the row
+    # readable after that.
+    target_agent_id: uuid.UUID | None = None
+    target_agent_name: str
+    action: str
+    params: dict[str, Any]
+    summary: str
+    proposed_by_agent_id: uuid.UUID | None = None
+    requested_by: str | None = None
+    thread_key: str | None = None
+    status: str
+    created_at: datetime
+    expires_at: datetime
+    executed_at: datetime | None = None
+    executed_by: str | None = None
+    result: dict[str, Any] | None = None
+
+
+class ProposalActionInfo(BaseModel):
+    """One entry of the closed action vocabulary, so a caller can discover what
+    is proposable without reading the source."""
+
+    name: str
+    description: str
+
+
+# -- control screens (ADR-0125) ------------------------------------------------
+
+
+class ScreenBlockOut(BaseModel):
+    """One block of a screen's body, in the channel-neutral vocabulary.
+
+    Carries no Slack or Discord shape by design (ADR-0020): the adapter turns a
+    ``rows`` block into a Block Kit table, a Discord embed, or three lines of
+    text, and none of those choices belong in the port.
+    """
+
+    kind: str
+    text: str | None = None
+    fields: dict[str, str] = Field(default_factory=dict)
+    columns: list[str] = Field(default_factory=list)
+    rows: list[dict[str, str]] = Field(default_factory=list)
+
+
+class ScreenButtonOut(BaseModel):
+    id: str
+    label: str
+    kind: str
+    style: str
+    target: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    confirm: str | None = None
+
+
+class ScreenOut(BaseModel):
+    id: str
+    title: str
+    subtitle: str | None = None
+    parent: str | None = None
+    blocks: list[ScreenBlockOut] = Field(default_factory=list)
+    buttons: list[ScreenButtonOut] = Field(default_factory=list)
+
+
+class ScreenActionIn(BaseModel):
+    """A human pressing a button.
+
+    ``actor`` is the channel user id the adapter resolved, and it is the whole
+    authorization: it is checked against the operator set server-side. It is a
+    caller assertion, carrying the same residual ADR-0033 named for approvals --
+    it proves the asserted identity satisfied policy, not who physically
+    tapped -- and the dispatcher holding the platform key is what makes the
+    assertion worth anything.
+    """
+
+    actor: str
+    screen: str
+    button: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    # Echoed back from a danger button's ``confirm_agent_name``. Compared to the
+    # agent's real name server-side, so a mis-tap on a phone cannot delete an
+    # agent: the operator has to have typed it.
+    typed_confirmation: str | None = None
+
+
+class ScreenActionOut(BaseModel):
+    """What happened, plus the screen to show next.
+
+    Returning the next screen rather than only a result is what makes a chat
+    surface feel like an app: the adapter replaces the message in place and the
+    operator sees the new state, instead of reading "ok" and having to ask again.
+    """
+
+    ok: bool
+    message: str
+    proposal_id: uuid.UUID | None = None
+    result: dict[str, Any] | None = None
+    screen: ScreenOut | None = None
+
+
+class CommandCoverageRow(BaseModel):
+    """One CLI leaf command and where it is answered in chat."""
+
+    command: str
+    screen: str | None = None
+    exempt: str | None = None
+
+
+class CommandCoverageOut(BaseModel):
+    total: int
+    covered: int
+    exempt: int
+    rows: list[CommandCoverageRow]

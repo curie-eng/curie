@@ -747,3 +747,88 @@ class ConsoleSession(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(default=None)
     revoked_at: Mapped[datetime | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ProposalStatus(enum.StrEnum):
+    """Lifecycle of a control proposal. Stored as a plain string column (like
+    ``Deployment.status`` and ``Approval.status``) so execute-once is a
+    conditional UPDATE guarded on the value."""
+
+    pending = "pending"
+    executed = "executed"
+    rejected = "rejected"
+    expired = "expired"
+
+
+class ControlProposal(Base):
+    """A fleet action the control agent has PROPOSED and a human has not yet run.
+
+    The control agent (ADR-0125) reads the fleet and writes rows here. It cannot
+    execute one: ``POST /fleet/proposals/{id}/execute`` refuses every caller but
+    the platform key, so the model's authority ends at this table. A row is a
+    request for a human to act, not an action.
+
+    Two columns carry the security weight.
+
+    ``summary`` is rendered by the API from facts it looked up itself -- the
+    agent's name, what is actually deployed, the current budget -- and never
+    from caller-supplied text. That matters because the human's click is the
+    real authorization: if the model could write the sentence the human reads
+    when deciding, prompt injection would not need tool access, only a
+    persuasive summary. So the proposer names an action and an agent id, and the
+    API writes the prose.
+
+    ``expires_at`` bounds how long a proposal stays clickable. A stale proposal
+    describes a fleet state that may no longer hold, and executing it would
+    apply a decision a human made about a system that has since moved.
+    """
+
+    __tablename__ = "control_proposals"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # The agent this proposal acted ON, or NULL once that agent is gone.
+    #
+    # SET NULL, not CASCADE. CASCADE was the first instinct and it is wrong in
+    # exactly one case, which is the case that matters most: deleting an agent
+    # would erase the record of the deletion itself, along with every kill,
+    # rollback, and budget change ever made to it. The one action with no undo
+    # would be the one action leaving no trace.
+    target_agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    # The agent's name AS IT WAS, denormalized on purpose. Once the id goes NULL
+    # this is the only thing that says what the row was about, and a proposal
+    # reading "deleted 5242cca3" is not an audit trail anyone can use.
+    target_agent_name: Mapped[str] = mapped_column()
+    # One of ``proposals.ACTIONS``. A plain string, validated against that
+    # closed vocabulary at create time, so adding an action is a code change
+    # rather than an enum migration -- and an action absent from the vocabulary
+    # is refused rather than stored for a later executor to interpret.
+    action: Mapped[str] = mapped_column()
+    # Action arguments, already validated and normalized against the action's
+    # declared parameter spec. Never echoed into ``summary``.
+    params: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    # The API-rendered consequence line. See the class docstring.
+    summary: Mapped[str] = mapped_column()
+    # Which control agent proposed this. NULL when the platform key created it
+    # directly (an operator or a test), which is a different provenance fact
+    # than "an agent asked for it" and is kept distinguishable on purpose.
+    proposed_by_agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="SET NULL"), index=True, default=None
+    )
+    # Free text: who was talking to the control agent when it proposed this, and
+    # where. Provenance for a human reading the record later, and deliberately
+    # NOT authority -- nothing reads these to decide whether an execute is
+    # allowed, because the proposer supplies them and the proposer is the model.
+    requested_by: Mapped[str | None] = mapped_column(default=None)
+    thread_key: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column(server_default=ProposalStatus.pending.value)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    expires_at: Mapped[datetime]
+    executed_at: Mapped[datetime | None] = mapped_column(default=None)
+    # The human the executing caller named. Recorded for the audit trail
+    # (ADR-0046 wants a human on every mutation); the platform key is what
+    # authorizes, this is who claims to have clicked.
+    executed_by: Mapped[str | None] = mapped_column(default=None)
+    # Whatever the executed action returned, for the record.
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)

@@ -697,6 +697,34 @@ class BindingResolver:
                 scope="state.app",
                 exp=exp,
             )
+        # The fleet control token (ADR-0125). Minted for ONE agent and no other:
+        # the operator names it in CURIE_CONTROL_AGENT, and the comparison is
+        # against the RESOLVED agent name, which the platform assigned at deploy
+        # -- not against anything the bundle says about itself, so a bundle
+        # cannot claim the privilege by naming itself in plugin.json.
+        #
+        # This branch is the reason no ordinary agent can reach /fleet: not a
+        # permission it fails at call time, but a credential it is never given.
+        # The API re-checks the same name independently (its own `control_agent`
+        # setting), so a worker misconfigured to mint one opens nothing on its
+        # own.
+        #
+        # `scope="control"` is mirrored byte-identically in the API's
+        # `routers/fleet.py::CONTROL_SCOPE`, exactly like the state scopes above.
+        control_token: str | None = None
+        control_url: str | None = None
+        if (
+            self._config.api_key
+            and self._config.control_agent
+            and resolved.agent_name == self._config.control_agent
+        ):
+            control_url = f"{base}/fleet"
+            control_token = sandbox_token.mint(
+                self._config.api_key,
+                agent=str(resolved.agent_id),
+                scope="control",
+                exp=exp,
+            )
         env = BootEnv.render_worker(
             plugin_dir=self._config.bundle_plugin_dir,
             session_id=f"agent-{resolved.agent_id}-thread-{thread_key}",
@@ -744,6 +772,10 @@ class BindingResolver:
             # (and the URL still emitted) on the no-key fake/local path.
             state_url=state_url,
             state_token=app_state_token,
+            # Both or neither (render_worker enforces the pair): every agent but
+            # the control agent gets neither.
+            control_url=control_url,
+            control_token=control_token,
         )
         # #517/#669 opt-in false-completion check: NOT a BootEnv.render_worker
         # kwarg (it is deliberately kept out of the frozen ACI contract, see

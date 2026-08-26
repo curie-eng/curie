@@ -936,6 +936,16 @@
           "/evals/matrix",
           "/evals/report",
           "/evals/trigger",
+          "/fleet/actions",
+          "/fleet/agents",
+          "/fleet/agents/{agent_id}/versions",
+          "/fleet/coverage",
+          "/fleet/proposals",
+          "/fleet/proposals/{proposal_id}",
+          "/fleet/proposals/{proposal_id}/execute",
+          "/fleet/proposals/{proposal_id}/reject",
+          "/fleet/screens/actions",
+          "/fleet/screens/{screen_id}",
           "/github/webhook",
           "/health",
           "/hooks/{agent_id}/{hook}",
@@ -979,7 +989,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2640
+      "cardinality_bound": 3040
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1036,6 +1046,16 @@
           "/evals/matrix",
           "/evals/report",
           "/evals/trigger",
+          "/fleet/actions",
+          "/fleet/agents",
+          "/fleet/agents/{agent_id}/versions",
+          "/fleet/coverage",
+          "/fleet/proposals",
+          "/fleet/proposals/{proposal_id}",
+          "/fleet/proposals/{proposal_id}/execute",
+          "/fleet/proposals/{proposal_id}/reject",
+          "/fleet/screens/actions",
+          "/fleet/screens/{screen_id}",
           "/github/webhook",
           "/health",
           "/hooks/{agent_id}/{hook}",
@@ -1079,7 +1099,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2640
+      "cardinality_bound": 3040
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1136,6 +1156,16 @@
           "/evals/matrix",
           "/evals/report",
           "/evals/trigger",
+          "/fleet/actions",
+          "/fleet/agents",
+          "/fleet/agents/{agent_id}/versions",
+          "/fleet/coverage",
+          "/fleet/proposals",
+          "/fleet/proposals/{proposal_id}",
+          "/fleet/proposals/{proposal_id}/execute",
+          "/fleet/proposals/{proposal_id}/reject",
+          "/fleet/screens/actions",
+          "/fleet/screens/{screen_id}",
           "/github/webhook",
           "/health",
           "/hooks/{agent_id}/{hook}",
@@ -1172,7 +1202,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 528
+      "cardinality_bound": 608
     },
     "curie.background.loop": {
       "type": "counter",

@@ -325,6 +325,34 @@ class BootEnv(_AciModel):
     state_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_STATE_TOKEN", "worker")
     )
+    # The fleet control plane (ADR-0125), delivered to exactly ONE agent: the
+    # operator-named control agent. control_url is the API's ``/fleet`` base and
+    # control_token is a scoped sandbox token (ADR-0033) carrying scope
+    # ``control`` -- a sibling of the state pair above in shape, and its
+    # opposite in reach: the state token names the agent's OWN namespace, this
+    # one authorizes reads across every agent.
+    #
+    # Declared here, in the closed-world contract, precisely BECAUSE it is the
+    # most authority any boot key carries. An undeclared env var would carry the
+    # same privilege while being invisible to the schema, the .env.example
+    # export, and the drift gate -- and the one credential worth typing once, in
+    # public, is the one that reaches the whole fleet.
+    #
+    # Absent on every other agent, which is the security property, not a
+    # degraded boot: the worker mints this pair only when the resolved agent
+    # name matches the operator's ``CURIE_CONTROL_AGENT``, so a bundle that
+    # looks for it and finds nothing is correctly reading "you are not the
+    # control agent here".
+    #
+    # Reaching the fleet plane still needs the API to agree (its own
+    # ``control_agent`` setting must name the same agent), so a token minted by
+    # a misconfigured worker authorizes nothing.
+    control_url: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CONTROL_URL", "worker")
+    )
+    control_token: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CONTROL_TOKEN", "worker")
+    )
     # Per-agent permission gates (#245, ADR-0010).
     approval_required_tools: list[str] | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_REQUIRED_TOOLS", "worker")
@@ -522,6 +550,8 @@ class BootEnv(_AciModel):
         memory_token: str | None = None,
         state_url: str | None = None,
         state_token: str | None = None,
+        control_url: str | None = None,
+        control_token: str | None = None,
         approval_required_tools: Sequence[str] | None = None,
         connector_release: str | None = None,
         connector_agent: str | None = None,
@@ -584,6 +614,13 @@ class BootEnv(_AciModel):
             env[cls.env_key("state_url")] = state_url
         if state_token:
             env[cls.env_key("state_token")] = state_token
+        # Emitted as a SET or not at all, like the connector scope below: a URL
+        # with no token is an unauthenticated dial the control agent would
+        # retry against, and a token with no URL is a credential with nowhere
+        # to go. Neither half is useful alone, so a partial mint emits nothing.
+        if control_url and control_token:
+            env[cls.env_key("control_url")] = control_url
+            env[cls.env_key("control_token")] = control_token
         # Emitted as a SET or not at all: the runner derives a connector URL
         # from all three or derives nothing, so a partial scope would name a
         # Service that cannot exist.
@@ -618,6 +655,10 @@ class BootEnv(_AciModel):
             env[self.env_key("history_ref")] = self.history_ref
         if self.history_token is not None:
             env[self.env_key("history_token")] = self.history_token
+        if self.control_url is not None:
+            env[self.env_key("control_url")] = self.control_url
+        if self.control_token is not None:
+            env[self.env_key("control_token")] = self.control_token
         if self.memory_token is not None:
             env[self.env_key("memory_token")] = self.memory_token
         if self.connector_release is not None:
@@ -684,6 +725,8 @@ class BootEnv(_AciModel):
             memory_token=_str_or_none(env.get("CURIE_MEMORY_TOKEN")),
             state_url=_str_or_none(env.get("CURIE_STATE_URL")),
             state_token=_str_or_none(env.get("CURIE_STATE_TOKEN")),
+            control_url=_str_or_none(env.get("CURIE_CONTROL_URL")),
+            control_token=_str_or_none(env.get("CURIE_CONTROL_TOKEN")),
             approval_required_tools=_list_or_none(env.get("CURIE_APPROVAL_REQUIRED_TOOLS")),
             approval_grant_tool=_stripped_or_none(env.get("CURIE_APPROVAL_GRANT_TOOL")),
             approval_resumed_kind=_stripped_or_none(env.get("CURIE_APPROVAL_RESUMED_KIND")),
