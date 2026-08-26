@@ -77,6 +77,10 @@ export function Build() {
     <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
       <AgentList />
       <div style={{ flex: 1, minWidth: 0 }}>
+        {/* A header the list column already has, so the two columns start on the
+            same line. Without it the detail began 22px higher than the list and
+            every section below inherited the offset. */}
+        <SectionHeader>{ws ? "Agent" : "No agent"}</SectionHeader>
         {/* Keyed on the path so switching resets every bit of editing state
             rather than carrying a half-typed SKILL.md across. */}
         {ws ? <Workbench key={ws.path} /> : <NoBundle />}
@@ -309,7 +313,7 @@ function Workbench() {
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <Header checks={checks} plugin={plugin?.ok ? plugin.value : undefined} />
       <Ladder />
       {checks.length ? <Checklist checks={checks} /> : null}
@@ -337,7 +341,10 @@ function Workbench() {
           Bundle files
         </SectionHeader>
 
-        <div style={{ display: "grid", gridTemplateColumns: "232px 1fr", gap: 14, alignItems: "start" }}>
+        {/* `stretch`, not `start`: the file list is usually taller than the editor,
+            and starting both at the top left the editor floating above a band of
+            empty pane. Matching heights makes the row read as one object. */}
+        <div style={{ display: "grid", gridTemplateColumns: "232px 1fr", gap: 14, alignItems: "stretch" }}>
           <Group>
             {groups.length === 0 ? (
               <div style={{ padding: 14, ...F.callout, color: T.tertiary }}>
@@ -411,7 +418,7 @@ function Header({ checks, plugin }: { checks: readonly Check[]; plugin?: PluginM
   const color = v.level === "ok" ? ACCENT : LEVEL_COLOR[v.level];
 
   return (
-    <Group style={{ padding: 16 }}>
+    <Group style={{ padding: 14 }}>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
@@ -438,7 +445,7 @@ function Header({ checks, plugin }: { checks: readonly Check[]; plugin?: PluginM
 
       {/* What the bundle declares, which is otherwise only visible by reading
           plugin.json by hand. */}
-      <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginTop: 14 }}>
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginTop: 12 }}>
         <Fact label="Skills" value={String(ws.skills.length)} detail={ws.skills.join(", ")} />
         <Fact
           label="Eval cases"
@@ -728,7 +735,7 @@ function Editor({
             }}
             style={{
               width: "100%",
-              minHeight: 420,
+              minHeight: 300,
               resize: "vertical",
               border: "none",
               outline: "none",

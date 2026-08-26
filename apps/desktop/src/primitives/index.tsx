@@ -118,6 +118,9 @@ export function Group({
       style={{
         background: S.raised,
         borderRadius: inset ? R.group : 0,
+        // `none` on dark; a hairline plus a faint lift on light, where a surface
+        // alone does not separate a card from the pane behind it.
+        boxShadow: SHADOW.card,
         overflow: "hidden",
         ...style,
       }}
@@ -222,7 +225,7 @@ export function Stat({
   accent?: string;
 }) {
   return (
-    <div style={{ background: S.raised, borderRadius: R.group, padding: "12px 14px" }}>
+    <div style={{ background: S.raised, borderRadius: R.group, boxShadow: SHADOW.card, padding: "12px 14px" }}>
       <div style={{ ...F.caption, color: T.tertiary, marginBottom: 4 }}>{label}</div>
       <div
         style={{
@@ -323,7 +326,7 @@ export function EmptyState({
         alignItems: "center",
         justifyContent: "center",
         textAlign: "center",
-        padding: "56px 24px",
+        padding: "30px 24px",
         color: T.tertiary,
       }}
     >

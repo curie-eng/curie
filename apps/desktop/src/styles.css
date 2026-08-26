@@ -67,6 +67,10 @@
   --accent-hover: #4bdc9a;
   /* Behind a modal overlay, and under the travelling dot of a switch. */
   --scrim: rgba(0, 0, 0, 0.4);
+  /* Dark needs no card elevation: a lighter surface on a darker one already
+     reads as raised. Light does, which is why this is a token and not a literal
+     in `Group`. */
+  --shadow-card: none;
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
   --shadow-sheet: 0 24px 60px rgba(0, 0, 0, 0.55);
@@ -96,50 +100,61 @@
   /* The accent darkens: the dark theme's green is a light colour, and light text
      on it fails on white while it fails as text itself. Darkening lets it serve
      both as a fill (with white on top) and as text. */
-  --accent: #12996b;
-  --accent-deep: #0d7a55;
+  --accent: #0f8f62;
+  --accent-deep: #0b6f4c;
   --on-accent: #ffffff;
 
-  --s-window: #e6e6ea;
+  /* The surfaces carry more separation than the dark set, because the eye reads
+     a light stack by contrast against white and there is far less headroom above
+     #ffffff than there is below #1c1c1e. A content pane three percent off its
+     own cards is why the first attempt read as one flat sheet. */
+  --s-window: #d6d8de;
   --s-sidebar: transparent;
-  --s-sidebar-fallback: #ededf0;
-  --s-content: #f6f6f8;
+  --s-sidebar-fallback: #e4e6eb;
+  --s-content: #eaecf1;
   --s-raised: #ffffff;
-  --s-hover: #f0f0f3;
-  --s-selected: #e3e3ea;
-  --s-well: #eeeef1;
+  --s-hover: #f1f3f7;
+  --s-selected: #e0e5ee;
+  /* Recessed, and clearly below the card it sits on rather than beside it. */
+  --s-well: #e3e6ec;
   --s-field: #ffffff;
   --s-overlay: #ffffff;
   /* Black at low alpha, not white: a translucent white control on a white
      surface is invisible, which is the single most common way a dark-first
      palette breaks when it is inverted. */
-  --s-control: rgba(0, 0, 0, 0.06);
-  --s-control-hover: rgba(0, 0, 0, 0.11);
-  --s-subtle: rgba(0, 0, 0, 0.04);
+  --s-control: rgba(0, 0, 0, 0.07);
+  --s-control-hover: rgba(0, 0, 0, 0.12);
+  --s-subtle: rgba(0, 0, 0, 0.05);
   --s-stripe: rgba(0, 0, 0, 0.022);
 
-  --t-primary: rgba(0, 0, 0, 0.88);
-  --t-secondary: rgba(60, 60, 67, 0.68);
-  --t-tertiary: rgba(60, 60, 67, 0.44);
-  --t-quaternary: rgba(60, 60, 67, 0.28);
+  /* Each level is darker than the dark theme's mirror image. Grey-on-white at
+     the alpha that works on black is washed out, and the labels that carry the
+     structure -- section headers, field names, units -- are the first to go. */
+  --t-primary: rgba(0, 0, 0, 0.9);
+  --t-secondary: rgba(48, 48, 54, 0.76);
+  --t-tertiary: rgba(48, 48, 54, 0.56);
+  --t-quaternary: rgba(48, 48, 54, 0.4);
 
-  --line-separator: rgba(0, 0, 0, 0.08);
-  --line-border: rgba(0, 0, 0, 0.12);
-  --line-strong: rgba(0, 0, 0, 0.2);
+  --line-separator: rgba(0, 0, 0, 0.09);
+  --line-border: rgba(0, 0, 0, 0.14);
+  --line-strong: rgba(0, 0, 0, 0.26);
 
   /* Darkened for contrast on white. The dark theme's status colours are all
      light, and yellow especially is unreadable on a white surface. */
-  --status-ok: #1c8c33;
-  --status-warn: #8a6100;
-  --status-danger: #d70015;
-  --status-info: #0060df;
-  --status-neutral: rgba(60, 60, 67, 0.44);
+  --status-ok: #17803a;
+  --status-warn: #7a5600;
+  --status-danger: #c9000f;
+  --status-info: #0057c8;
+  --status-neutral: rgba(48, 48, 54, 0.56);
 
   --knob: #ffffff;
-  --focus-ring: rgba(18, 153, 107, 0.5);
+  --focus-ring: rgba(15, 143, 98, 0.5);
 
-  --accent-hover: #15ab77;
+  --accent-hover: #0b7a53;
   --scrim: rgba(0, 0, 0, 0.22);
+  /* A hairline plus the faintest lift. On light, a card needs an edge as well as
+     a surface; without it the grouped lists dissolve into the pane. */
+  --shadow-card: 0 0 0 0.5px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.05);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
   --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);
