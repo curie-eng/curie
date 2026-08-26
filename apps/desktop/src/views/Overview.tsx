@@ -124,9 +124,14 @@ export function Overview() {
       </div>
 
       <div
-        style={{ display: "grid", gridTemplateColumns: "1.35fr 1fr", gap: 18, alignItems: "start" }}
+        // `stretch`, so the two cards in this row are the same height. With
+        // `start` each sized to its own content, and a sparkline next to a
+        // seven-row bar list left the shorter card floating in dead pane. The
+        // sections are flex columns and the cards take the remaining height, so
+        // the taller content sets the row and both cards meet at the bottom.
+        style={{ display: "grid", gridTemplateColumns: "1.35fr 1fr", gap: 18, alignItems: "stretch" }}
       >
-        <section>
+        <section style={{ display: "flex", flexDirection: "column" }}>
           <SectionHeader
             right={
               <Button size="sm" tone="plain" onClick={() => app.navigate("resources")}>
@@ -136,23 +141,35 @@ export function Overview() {
           >
             Runner CPU
           </SectionHeader>
-          <Group style={{ padding: 14 }}>
+          {/* A column, so the totals sit on the card's bottom edge like a footer
+              and the chart or its empty state takes the rest. The card is as tall
+              as the bar list beside it, and without this the content bunched at
+              the top and left the height it had been given unused. */}
+          <Group
+            style={{ padding: 14, flex: 1, display: "flex", flexDirection: "column" }}
+          >
             {runnerCpu.length ? (
               <FitWidth height={96}>
                 {(w) => <Sparkline values={runnerCpu} width={w} height={96} color={ACCENT} />}
               </FitWidth>
             ) : (
+              // The centring wrapper is separate from the sentence on purpose: a
+              // flex container makes each child its own item, which trims the
+              // space between the text and the <Mono> and reads as "withcurie".
               <div
-                style={{ ...F.callout, color: T.tertiary, padding: "34px 0", textAlign: "center" }}
+                style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}
               >
-                No runner sandboxes are running. Start one with <Mono>curie skill up</Mono>.
+                <div style={{ ...F.callout, color: T.tertiary, textAlign: "center" }}>
+                  No runner sandboxes are running. Start one with <Mono>curie skill up</Mono>.
+                </div>
               </div>
             )}
             <div
               style={{
                 display: "flex",
                 gap: 18,
-                marginTop: 12,
+                marginTop: "auto",
+                paddingTop: 12,
                 ...F.footnote,
                 color: T.tertiary,
                 fontVariantNumeric: "tabular-nums",
@@ -176,7 +193,7 @@ export function Overview() {
           </Group>
         </section>
 
-        <section>
+        <section style={{ display: "flex", flexDirection: "column" }}>
           <SectionHeader
             right={
               <Button size="sm" tone="plain" onClick={() => app.navigate("canvas")}>
@@ -186,7 +203,7 @@ export function Overview() {
           >
             Memory by workload
           </SectionHeader>
-          <Group style={{ padding: 14 }}>
+          <Group style={{ padding: 14, flex: 1 }}>
             {res.samples.length ? (
               <RankedBars
                 rows={res.samples
