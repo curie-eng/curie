@@ -117,7 +117,19 @@ function AgentList() {
       >
         Agents
       </SectionHeader>
-      <Group>
+      {/* One container for the whole column: the list scrolls inside it, the
+          actions are pinned to its foot.
+
+          The actions used to sit OUTSIDE the group, so the column had no outer
+          boundary and nothing said where the list ended. It simply ran on, and a
+          long list would have pushed the buttons away down the page rather than
+          scrolling. A bounded panel with a footer says both things at once: this
+          is one module, and growth happens inside it. */}
+      <Group style={{ display: "flex", flexDirection: "column" }}>
+        {/* Bounded, so a twentieth agent scrolls here instead of stretching the
+            column. `minHeight: 0` because a flex child will otherwise refuse to
+            shrink below its content and the overflow never engages. */}
+        <div style={{ maxHeight: 264, overflowY: "auto", minHeight: 0 }}>
         {app.workspaces.length === 0 ? (
           <div style={{ padding: "12px 14px", ...F.footnote, color: T.tertiary }}>
             None yet.
@@ -190,7 +202,7 @@ function AgentList() {
             );
           })
         )}
-      </Group>
+        </div>
 
       {/* Two actions with a clear ranking. Authoring a new agent is what this
           column is for, so it takes the accent; importing one that already exists
@@ -202,7 +214,16 @@ function AgentList() {
           Both keep the trailing ellipsis, which on this platform means "opens
           something you then complete" -- one lands on a form, the other on a
           directory chooser. */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
+        <div
+          style={{
+            flex: "none",
+            borderTop: `1px solid ${LINE.separator}`,
+            padding: 8,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
         <Button
           size="sm"
           tone="primary"
@@ -222,7 +243,8 @@ function AgentList() {
         >
           Import…
         </Button>
-      </div>
+        </div>
+      </Group>
     </section>
   );
 }
