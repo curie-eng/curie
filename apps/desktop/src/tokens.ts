@@ -46,6 +46,9 @@ export const SHADOW = {
   sheet: "var(--shadow-sheet)",
   /** The top inner highlight that makes a control look raised. */
   raised: "var(--shadow-raised)",
+  /** A grouped list or panel. `none` on dark, a hairline plus a faint lift on
+   *  light, where a surface alone does not separate a card from its pane. */
+  card: "var(--shadow-card)",
   knob: "var(--shadow-knob)",
   /** Behind a modal. */
   scrim: "var(--scrim)",

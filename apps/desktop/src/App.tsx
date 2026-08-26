@@ -143,7 +143,9 @@ function Frame() {
             padding: bleed ? 16 : "18px 22px 32px",
           }}
         >
-          <div style={{ maxWidth: bleed ? "none" : 1080, height: bleed ? "100%" : undefined }}>
+          {/* Wide enough that a large window is used rather than framed by a dead
+            band, still capped so prose never runs to a 2000px measure. */}
+        <div style={{ maxWidth: bleed ? "none" : 1320, height: bleed ? "100%" : undefined }}>
             <View />
           </div>
         </main>
