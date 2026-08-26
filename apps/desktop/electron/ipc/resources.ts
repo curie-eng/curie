@@ -8,6 +8,7 @@
 // unknown metrics null, so the UI can say "not measurable at this tier" instead
 // of drawing a zero.
 
+import { cpus, totalmem } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { BrowserWindow } from "electron";
@@ -230,6 +231,8 @@ export async function daemonCapacity(): Promise<DaemonCapacity | null> {
       cpus: typeof info.NCPU === "number" && info.NCPU > 0 ? info.NCPU : null,
       memBytes: typeof info.MemTotal === "number" && info.MemTotal > 0 ? info.MemTotal : null,
       serverVersion: info.ServerVersion ?? null,
+      hostCpus: cpus().length || null,
+      hostMemBytes: totalmem() || null,
     };
     capacityCache = { at: Date.now(), value };
     return value;
