@@ -79,9 +79,18 @@ export interface PortBinding {
  *  2-core machine and idle on a 12-core one. Docker Desktop gets this right by
  *  always showing usage over capacity, and so should this. */
 export interface DaemonCapacity {
+  /** What the DAEMON has, which on macOS and Windows is a VM's allocation and
+   *  not the machine's. Containers cannot exceed it, so it is the right ceiling
+   *  for a container total -- but showing it unlabelled next to a host-sized
+   *  number invites the reader to think it is the machine. */
   readonly cpus: number | null;
   readonly memBytes: number | null;
   readonly serverVersion: string | null;
+  /** What the machine has, so the UI can name the gap. Docker Desktop's memory
+   *  allocation is a setting, so a limit well below the host is actionable
+   *  rather than just surprising. */
+  readonly hostCpus: number | null;
+  readonly hostMemBytes: number | null;
 }
 
 /** One row of the resource monitor. Shaped after `docker stats` because that is

@@ -33,14 +33,7 @@ import { useRuns } from "../bridge/runs";
 import { bridge } from "../bridge/bridge";
 import type { PortBinding, ResourceSample } from "../bridge/bridge";
 import { ago, bytes, DASH, percent } from "../lib/format";
-import {
-  aggregate,
-  groupRows,
-  selectRows,
-  type GroupKey,
-  type Section,
-  type SortKey,
-} from "../lib/workloads";
+import { aggregate, capacityNotes, groupRows, selectRows, type GroupKey, type Section, type SortKey } from "../lib/workloads";
 import { ACCENT, F, KNOB, LINE, R, S, SHADOW, STATUS, T, roleColor, tint } from "../tokens";
 import { FitWidth, Sparkline, StackedArea, UsageBar } from "../primitives/charts";
 import {
@@ -372,6 +365,10 @@ function Headline() {
   const cpuCeiling = res.totals.cpuCeiling;
   const mem = res.totals.mem;
   const memCeiling = res.totals.memCeiling;
+  // The ceilings come from `docker info`, which on macOS and Windows describes a
+  // VM and not the machine. Naming that is the difference between a limit and an
+  // apparently wrong number.
+  const notes = capacityNotes(res.capacity ?? null);
 
   return (
     <div style={{ display: "flex", gap: 40, alignItems: "flex-start", flexWrap: "wrap" }}>
@@ -379,18 +376,14 @@ function Headline() {
         label="Container CPU"
         value={percent(cpu, 2)}
         ceiling={cpuCeiling ? percent(cpuCeiling, 0) : null}
-        note={
-          res.capacity?.cpus
-            ? `${res.capacity.cpus} CPU${res.capacity.cpus === 1 ? "" : "s"} available`
-            : "capacity unknown"
-        }
+        note={notes.cpu}
         ratio={cpu !== null && cpuCeiling ? cpu / cpuCeiling : null}
       />
       <Meter
         label="Container memory"
         value={bytes(mem)}
         ceiling={memCeiling ? bytes(memCeiling) : null}
-        note={res.capacity?.serverVersion ? `Docker ${res.capacity.serverVersion}` : ""}
+        note={notes.mem}
         ratio={mem !== null && memCeiling ? mem / memCeiling : null}
       />
       <div style={{ flex: 1 }} />

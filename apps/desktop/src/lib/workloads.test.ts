@@ -6,15 +6,8 @@
 import { describe, expect, it } from "vitest";
 
 import type { ResourceSample } from "../bridge/bridge";
-import {
-  aggregate,
-  groupRows,
-  matches,
-  NO_AGENT_OTHER,
-  NO_AGENT_RUNNER,
-  NO_PROJECT,
-  selectRows,
-} from "./workloads";
+import { NO_AGENT_OTHER, NO_AGENT_RUNNER, NO_PROJECT, aggregate, capacityNotes, groupRows, matches, selectRows } from "./workloads";
+import type { DaemonCapacity } from "../../electron/shared/contract";
 
 function sample(over: Partial<ResourceSample> & { name: string }): ResourceSample {
   return {
@@ -200,5 +193,52 @@ describe("aggregate", () => {
       sample({ name: "new", startedAt: new Date("2026-08-24T00:00:00Z").toISOString() }),
     ];
     expect(aggregate(rows).startedAt).toBe(Date.parse("2026-08-24T00:00:00Z"));
+  });
+});
+
+describe("capacityNotes", () => {
+  // The case that prompted this: a 36 GB machine showing a 7.7 GB ceiling. The
+  // number was right -- containers cannot exceed the Docker VM -- but unlabelled
+  // it reads as a bug rather than as a limit you can raise.
+  const cap = (over: Partial<DaemonCapacity> = {}): DaemonCapacity => ({
+    cpus: 12,
+    memBytes: 8_217_165_824,
+    serverVersion: "29.1.3",
+    hostCpus: 12,
+    hostMemBytes: 38_654_705_664,
+    ...over,
+  });
+
+  it("names the daemon's memory as a limit, with the machine's figure", () => {
+    expect(capacityNotes(cap()).mem).toBe("Docker's limit, of 36.0 GB on this machine");
+  });
+
+  it("does not call it a limit when the daemon has essentially all of it", () => {
+    // A Linux host, where the daemon sees the machine. 35.9 of 36 is rounding.
+    const note = capacityNotes(cap({ memBytes: 38_000_000_000 })).mem;
+    expect(note).toBe("Docker 29.1.3");
+  });
+
+  it("says how many CPUs Docker has when it is fewer than the machine's", () => {
+    expect(capacityNotes(cap({ cpus: 4 })).cpu).toBe("4 of 12 CPUs, Docker's share");
+  });
+
+  it("does not imply a CPU limit when there is none", () => {
+    expect(capacityNotes(cap()).cpu).toBe("12 CPUs available");
+  });
+
+  it("gets the singular right", () => {
+    expect(capacityNotes(cap({ cpus: 1, hostCpus: 1 })).cpu).toBe("1 CPU available");
+  });
+
+  it("admits it does not know rather than inventing a ceiling", () => {
+    expect(capacityNotes(null)).toEqual({ cpu: "capacity unknown", mem: "capacity unknown" });
+    expect(capacityNotes(cap({ cpus: null })).cpu).toBe("capacity unknown");
+    expect(capacityNotes(cap({ memBytes: null, serverVersion: null })).mem).toBe("capacity unknown");
+  });
+
+  it("falls back to the version when the host total is unknown", () => {
+    // No host figure means no gap can be claimed either way.
+    expect(capacityNotes(cap({ hostMemBytes: null })).mem).toBe("Docker 29.1.3");
   });
 });

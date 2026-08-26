@@ -1,3 +1,5 @@
+import { bytes } from "./format";
+import type { DaemonCapacity } from "../../electron/shared/contract";
 // Filtering, sorting and grouping for the resource monitor.
 //
 // Pulled out of the view as pure functions because this is where the bugs live.
@@ -124,3 +126,45 @@ export function aggregate(rows: readonly ResourceSample[]): Aggregate {
     state: running === 0 ? "stopped" : running === rows.length ? "running" : "mixed",
   };
 }
+
+/**
+ * What the CPU and memory ceilings actually mean.
+ *
+ * On macOS and Windows the Docker daemon runs in a VM, so `docker info` reports
+ * that VM's allocation and not the machine's. That is the correct denominator for
+ * a container total -- a container cannot exceed it -- but printed bare next to a
+ * host-sized figure it reads as a wrong number: "7.7 GB" on a 36 GB machine looks
+ * like a bug rather than a limit. Naming the limit is also the useful half, since
+ * Docker Desktop's allocation is a setting.
+ *
+ * A gap is only worth mentioning when it is real, hence the threshold: Docker
+ * reporting 35.9 of 36 GB is rounding, not a limit.
+ */
+export function capacityNotes(cap: DaemonCapacity | null): { cpu: string; mem: string } {
+  const version = cap?.serverVersion ? `Docker ${cap.serverVersion}` : "";
+
+  if (!cap) return { cpu: "capacity unknown", mem: "capacity unknown" };
+
+  const cpuNote = (() => {
+    if (!cap.cpus) return "capacity unknown";
+    const plural = cap.cpus === 1 ? "" : "s";
+    if (cap.hostCpus && cap.hostCpus > cap.cpus) {
+      return `${cap.cpus} of ${cap.hostCpus} CPU${plural}, Docker's share`;
+    }
+    return `${cap.cpus} CPU${plural} available`;
+  })();
+
+  const memNote = (() => {
+    if (!cap.memBytes) return version || "capacity unknown";
+    if (cap.hostMemBytes && cap.memBytes < cap.hostMemBytes * LIMIT_THRESHOLD) {
+      return `Docker's limit, of ${bytes(cap.hostMemBytes)} on this machine`;
+    }
+    return version;
+  })();
+
+  return { cpu: cpuNote, mem: memNote };
+}
+
+/** Below this share of host memory, the daemon's total is a deliberate limit
+ *  rather than the machine's capacity minus overhead. */
+const LIMIT_THRESHOLD = 0.9;
