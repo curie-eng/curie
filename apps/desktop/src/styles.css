@@ -70,6 +70,11 @@
   /* Dark needs no card elevation: a lighter surface on a darker one already
      reads as raised. Light does, which is why this is a token and not a literal
      in `Group`. */
+  /* What a grouped list actually paints. Separate from `--s-raised` because that
+     one has to stay a plain colour: the canvas uses it as an SVG fill, and a
+     gradient there is invalid. Dark keeps the flat surface -- a lighter panel on a
+     darker pane already reads as raised. */
+  --card-fill: #2c2c2e;
   --shadow-card: none;
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
@@ -152,9 +157,24 @@
 
   --accent-hover: #0b7a53;
   --scrim: rgba(0, 0, 0, 0.22);
-  /* A hairline plus the faintest lift. On light, a card needs an edge as well as
-     a surface; without it the grouped lists dissolve into the pane. */
-  --shadow-card: 0 0 0 0.5px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.05);
+  /* Flat white with a hairline is the thing that reads as unstyled. A card gets
+     three treatments instead, all of them subtle: a vertical gradient, real
+     translucency so the bottom edge picks up the pane behind it, and a layered
+     shadow. */
+  --card-fill: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.98) 0%,
+    rgba(255, 255, 255, 0.82) 100%
+  );
+  /* Four layers, each doing one job: an inner top highlight so the edge catches
+     the light, a hairline to define it, a tight shadow to seat it, and a wide
+     soft one to lift it off the pane. A single 1px shadow is what made the first
+     attempt look printed rather than placed. */
+  --shadow-card:
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    0 0 0 0.5px rgba(16, 24, 40, 0.07),
+    0 1px 2px rgba(16, 24, 40, 0.04),
+    0 8px 20px -6px rgba(16, 24, 40, 0.1);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
   --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);

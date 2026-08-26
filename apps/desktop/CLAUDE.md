@@ -154,6 +154,17 @@ React + TypeScript renderer. Full structure and rationale in
     resolve "system" in the renderer with a media query -- two places deciding
     what the OS is doing will disagree.
 
+  - **A card paints `S.cardFill`, not `S.raised`.** `raised` has to stay a plain
+    colour because the canvas uses it as an SVG fill, where a gradient is invalid.
+    `cardFill` is what a panel actually paints and on every light theme it is a
+    gradient: flat white with a hairline is the thing that reads as unstyled, so a
+    light card gets three subtle treatments instead -- a vertical gradient, real
+    translucency so its bottom edge picks up the pane behind it, and a four-layer
+    shadow (inner top highlight, hairline, tight seat, wide lift). Dark themes stay
+    flat, because a lighter panel on a darker pane already reads as raised, and
+    high contrast stays flat with a hard 1px edge. All of it is derived per theme
+    by the generator, so a new theme gets the treatment without being told.
+
   - **A status dot is the last resort, not the first.** The coloured dot was
     becoming the answer to every "show state" question, and it is a weak one:
     four green dots in a row are four identical marks carrying nothing, the case

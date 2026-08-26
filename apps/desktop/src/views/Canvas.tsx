@@ -539,7 +539,9 @@ function Legend() {
         display: "flex",
         gap: 10,
         padding: "6px 10px",
-        background: `${S.raised}dd`,
+        // `${S.raised}dd` before, which stopped meaning anything the moment the
+        // token became a var(): you cannot append a hex alpha to a variable.
+        background: tint(S.raised, 0.87),
         border: `1px solid ${LINE.separator}`,
         borderRadius: R.control,
         fontSize: 10,

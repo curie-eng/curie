@@ -116,7 +116,7 @@ export function Group({
   return (
     <div
       style={{
-        background: S.raised,
+        background: S.cardFill,
         borderRadius: inset ? R.group : 0,
         // `none` on dark; a hairline plus a faint lift on light, where a surface
         // alone does not separate a card from the pane behind it.
