@@ -174,3 +174,61 @@ describe("the agent list", () => {
     expect(within(detail()).queryByTitle("/w/weather")).not.toBeInTheDocument();
   });
 });
+
+describe("the list is a bounded container", () => {
+  // The reason this exists: with two agents nothing tells you what happens at
+  // twenty. The actions used to live outside the group, so a long list pushed
+  // them away down the page and the column had no boundary at all.
+  const many = Array.from({ length: 24 }, (_, i) => ({
+    path: `/w/agent-${i}`,
+    name: `agent-${i}`,
+    plugin: { name: `agent-${i}` },
+    skills: ["s"],
+    hasEvals: false,
+    hasMcp: false,
+    lastOpened: 24 - i,
+  }));
+
+  it("scrolls the rows instead of growing the column", async () => {
+    listed = many;
+    mount();
+    await waitFor(() => expect(within(list()).getByText("agent-0")).toBeInTheDocument());
+    const scroller = within(list()).getByText("agent-0").closest("div[style*='max-height']")!;
+    expect(scroller).toBeTruthy();
+    const style = (scroller as HTMLElement).style;
+    expect(style.overflowY).toBe("auto");
+    expect(style.maxHeight).toBe("264px");
+    // A flex child that will not shrink below its content never overflows.
+    expect(style.minHeight).toBe("0px");
+  });
+
+  it("keeps the actions reachable however long the list is", async () => {
+    listed = many;
+    mount();
+    await waitFor(() => expect(screen.getByRole("button", { name: "New Agent…" })).toBeInTheDocument());
+    // Pinned in the footer, not pushed past the twenty-fourth row: they must be
+    // outside the scrolling region but inside the container.
+    const scroller = within(list()).getByText("agent-0").closest("div[style*='max-height']")!;
+    const newAgent = screen.getByRole("button", { name: "New Agent…" });
+    expect(scroller.contains(newAgent)).toBe(false);
+    expect(list().contains(newAgent)).toBe(true);
+  });
+
+  it("puts the rows and the actions in one container", async () => {
+    mount();
+    await waitFor(() => expect(within(list()).getByText("weather")).toBeInTheDocument());
+    const row = within(list()).getByText("weather");
+    const importBtn = screen.getByRole("button", { name: "Import…" });
+    // The nearest common ancestor is the panel; before, the buttons were a
+    // sibling of it and the column had no outer edge.
+    const panel = row.closest("div[style*='flex-direction: column']");
+    expect(panel).toBeTruthy();
+    expect(list().contains(row) && list().contains(importBtn)).toBe(true);
+  });
+
+  it("still reports the real count in the header", async () => {
+    listed = many;
+    mount();
+    await waitFor(() => expect(within(list()).getByText("24")).toBeInTheDocument());
+  });
+});
