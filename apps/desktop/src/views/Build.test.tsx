@@ -130,10 +130,10 @@ describe("the agent list", () => {
     expect(within(list()).getByText("2 skills")).toBeInTheDocument();
   });
 
-  it("offers a way to add one", async () => {
+  it("offers a way to add one, and to import one that exists", async () => {
     mount();
-    await waitFor(() => expect(screen.getByRole("button", { name: "+ New Agent" })).toBeInTheDocument());
-    expect(screen.getByRole("button", { name: "Open existing…" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "New Agent…" })).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Import…" })).toBeInTheDocument();
   });
 
   it("no longer hides switching behind the bundle's own name", async () => {
