@@ -54,7 +54,6 @@ function stubShell(): CurieBridge {
       drift: null,
     }),
     cli: {
-      preview: async () => ({ argv: [], display: "", cwd: "/tmp" }),
       run: async () => ({ runId: "r1", command: { argv: [], display: "", cwd: "/tmp" } }),
       cancel: async () => {},
       write: async () => {},
