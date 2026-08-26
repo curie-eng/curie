@@ -15,6 +15,8 @@ import type {
   ResourceFrame,
   RunChunk,
   RunResult,
+  ThemePreference,
+  ThemeState,
 } from "./shared/contract.js";
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
@@ -70,6 +72,16 @@ const bridge: CurieBridge = {
   graph: {
     load: () => ipcRenderer.invoke(CH.graphLoad),
     save: (doc: unknown) => ipcRenderer.invoke(CH.graphSave, doc),
+  },
+
+  theme: {
+    get: () => ipcRenderer.invoke(CH.themeGet),
+    set: (preference: ThemePreference) => ipcRenderer.invoke(CH.themeSet, preference),
+    onChange: (cb: (state: ThemeState) => void) => {
+      const h = (_e: unknown, state: ThemeState) => cb(state);
+      ipcRenderer.on(CH.themeChanged, h);
+      return () => ipcRenderer.removeListener(CH.themeChanged, h);
+    },
   },
 
   shell: {

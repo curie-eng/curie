@@ -53,7 +53,7 @@ import {
   type PackKind,
   type Setting,
 } from "../lib/packs";
-import { ACCENT, F, FONT, LINE, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, FONT, KNOB, LINE, S, STATUS, T, tint } from "../tokens";
 import {
   Badge,
   Button,
@@ -897,7 +897,7 @@ function TryIt({ packs }: { packs: BehaviorPacks }) {
                     ...F.footnote,
                     color: cap === DEFAULT_STATUS && fromPack ? T.quaternary : T.secondary,
                     whiteSpace: "pre-wrap",
-                    background: tint("#ffffff", 0.04),
+                    background: tint(KNOB, 0.04),
                     borderRadius: 6,
                     padding: "6px 8px",
                   }}

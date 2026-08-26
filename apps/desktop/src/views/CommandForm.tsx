@@ -17,7 +17,7 @@ import { useCallback, useMemo, useState } from "react";
 
 import { useApp } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
-import { ACCENT, F, FONT, LINE, R, S, STATUS, T } from "../tokens";
+import { ACCENT, F, FONT, HUE, LINE, R, S, STATUS, T } from "../tokens";
 import { Badge, Button, CopyButton, Field, Input, Mono, Notice, Select, Sheet, Textarea, Toggle } from "../primitives";
 import {
   fieldKind,
@@ -369,9 +369,9 @@ function TierChip({ cmd }: { cmd: Command }) {
     cmd.tier === "skill"
       ? ACCENT
       : cmd.tier === "local"
-        ? "#3b82f6"
+        ? STATUS.info
         : cmd.tier === "cluster"
-          ? "#a78bfa"
+          ? HUE.violet
           : cmd.tier === "dev"
             ? STATUS.warn
             : T.tertiary;

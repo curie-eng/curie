@@ -12,15 +12,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useApp } from "../bridge/app";
 import { commands, search, type Command } from "../lib/manifest";
 import { CommandForm } from "../views/CommandForm";
-import { ACCENT, FONT, LINE, R, S, STATUS, T } from "../tokens";
+import { ACCENT, FONT, HUE, LINE, R, S, SHADOW, STATUS, T } from "../tokens";
 import { Badge, Kbd, Mono } from "../primitives";
 
 const TIER_COLOR: Record<string, string> = {
   skill: ACCENT,
-  local: "#3b82f6",
-  cluster: "#a78bfa",
+  local: STATUS.info,
+  cluster: HUE.violet,
   dev: STATUS.warn,
-  author: "#2dd4bf",
+  author: HUE.teal,
   platform: T.tertiary,
 };
 
@@ -94,7 +94,7 @@ export function Palette() {
           background: S.raised,
           border: `1px solid ${LINE.border}`,
           borderRadius: R.sheet,
-          boxShadow: "0 24px 64px #00000077",
+          boxShadow: SHADOW.sheet,
           overflow: "hidden",
         }}
       >

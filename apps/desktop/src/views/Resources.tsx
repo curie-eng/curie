@@ -41,7 +41,7 @@ import {
   type Section,
   type SortKey,
 } from "../lib/workloads";
-import { ACCENT, F, LINE, R, S, STATUS, T, roleColor, tint } from "../tokens";
+import { ACCENT, F, KNOB, LINE, R, S, SHADOW, STATUS, T, roleColor, tint } from "../tokens";
 import { FitWidth, Sparkline, StackedArea, UsageBar } from "../primitives/charts";
 import {
   Badge,
@@ -550,7 +550,7 @@ function ProjectRow({
         gap: 10,
         alignItems: "center",
         padding: "8px 14px",
-        background: tint("#ffffff", 0.03),
+        background: tint(KNOB, 0.03),
         borderBottom: `1px solid ${LINE.separator}`,
         cursor: "default",
       }}
@@ -814,7 +814,7 @@ function ColumnMenu({
           minWidth: 190,
           background: S.overlay,
           borderRadius: R.group,
-          boxShadow: "0 16px 40px rgba(0,0,0,0.5)",
+          boxShadow: SHADOW.overlay,
           padding: 5,
         }}
       >

@@ -19,7 +19,13 @@ import {
 } from "react";
 
 import { bridge } from "./bridge";
-import type { ApiConnection, ShellEnvironment, Workspace } from "./bridge";
+import type {
+  ApiConnection,
+  ShellEnvironment,
+  ThemePreference,
+  ThemeState,
+  Workspace,
+} from "./bridge";
 
 export type Route =
   | "overview"
@@ -55,6 +61,9 @@ interface AppValue {
 
   readonly env: ShellEnvironment | null;
   refreshEnv(): void;
+
+  readonly theme: ThemeState | null;
+  setTheme(preference: ThemePreference): void;
 
   readonly workspaces: readonly Workspace[];
   readonly workspace: Workspace | null;
@@ -99,6 +108,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [api, setApi] = useState<ApiConnection | null>(null);
   const [agents, setAgents] = useState<readonly AgentSummary[]>([]);
   const [agentsError, setAgentsError] = useState<string | null>(null);
+  const [theme, setThemeState] = useState<ThemeState | null>(null);
   const [sticky, setSticky] = useState<Record<string, string>>(loadSticky);
   const [paletteOpen, setPaletteOpen] = useState(false);
 
@@ -114,6 +124,27 @@ export function AppProvider({ children }: { children: ReactNode }) {
     // one is available.
     setWorkspacePath((prev) => (prev && list.some((w) => w.path === prev) ? prev : (list[0]?.path ?? null)));
   }, []);
+
+  /**
+   * Put the effective theme on <html>, which is what `styles.css` keys the
+   * palette off.
+   *
+   * Written to the DOM rather than held only in React state because the palette
+   * is CSS, not props: every colour in `tokens.ts` is a `var(--x)`, so one
+   * attribute swaps sixteen screens at once and no component re-renders to
+   * change colour.
+   */
+  const applyTheme = useCallback((next: ThemeState) => {
+    setThemeState(next);
+    document.documentElement.dataset.theme = next.effective;
+  }, []);
+
+  const setTheme = useCallback(
+    (preference: ThemePreference) => {
+      void bridge().theme.set(preference).then(applyTheme);
+    },
+    [applyTheme],
+  );
 
   const refreshApi = useCallback(() => {
     void bridge().api.connection().then(setApi);
@@ -189,6 +220,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [refreshWorkspaces],
   );
 
+  // Read the theme once, then follow the shell. The subscription matters only
+  // while the preference is "system", which is the default, so most installs
+  // depend on it.
+  useEffect(() => {
+    let cancelled = false;
+    void bridge()
+      .theme.get()
+      .then((state) => {
+        if (!cancelled) applyTheme(state);
+      });
+    const off = bridge().theme.onChange(applyTheme);
+    return () => {
+      cancelled = true;
+      off();
+    };
+  }, [applyTheme]);
+
   // The native menu drives navigation through one channel; a route it sends
   // that this app does not know is ignored rather than crashing the view.
   useEffect(() => {
@@ -249,6 +297,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setFocus,
       env,
       refreshEnv,
+      theme,
+      setTheme,
       workspaces,
       workspace,
       selectWorkspace: setWorkspacePath,
@@ -271,6 +321,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       focus,
       env,
       refreshEnv,
+      theme,
+      setTheme,
       workspaces,
       workspace,
       openWorkspace,
