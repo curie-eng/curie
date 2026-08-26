@@ -86,8 +86,8 @@ function stubShell(): CurieBridge {
     secrets: { list: async () => [], set: async () => {}, unset: async () => {} },
     graph: { load: async () => null, save: async () => {} },
     theme: {
-      get: async () => ({ preference: "system" as const, effective: "dark" as const }),
-      set: async () => ({ preference: "system" as const, effective: "dark" as const }),
+      get: async () => ({ preference: "system" as const, effective: "dark" as const, appearance: "dark" as const }),
+      set: async () => ({ preference: "system" as const, effective: "dark" as const, appearance: "dark" as const }),
       onChange: () => () => {},
     },
     shell: { openExternal: async () => {}, copy: async () => {} },

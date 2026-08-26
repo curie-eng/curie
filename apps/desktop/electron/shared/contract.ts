@@ -183,8 +183,11 @@ export interface Workspace {
 /** Platform API request proxied through the shell. Going through main rather
  *  than `fetch` in the renderer is what lets the desktop app talk to an API on
  *  any host without CORS, and keeps the API key out of the page. */
-/** What the operator asked for. "system" defers to the OS. */
-export type ThemePreference = "system" | "light" | "dark";
+import type { ThemeId } from "./themes.js";
+
+/** What the operator asked for. "system" defers to the OS, which can only mean
+ *  light or dark, so it resolves to one of the two base themes. */
+export type ThemePreference = "system" | ThemeId;
 
 /**
  * The preference and what it currently resolves to.
@@ -196,7 +199,12 @@ export type ThemePreference = "system" | "light" | "dark";
  */
 export interface ThemeState {
   readonly preference: ThemePreference;
-  readonly effective: "light" | "dark";
+  /** The theme actually in force, which is what `data-theme` is set to. */
+  readonly effective: ThemeId;
+  /** Whether that theme wants a light or dark native window. Carried separately
+   *  because `nativeTheme` only understands those two, and a theme id does not
+   *  tell you which without the registry. */
+  readonly appearance: "light" | "dark";
 }
 
 export interface ApiRequest {

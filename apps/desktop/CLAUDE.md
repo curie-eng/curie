@@ -120,6 +120,31 @@ React + TypeScript renderer. Full structure and rationale in
     and the categorical hues get a separate set because the dark ones are all
     light colours and yellow in particular vanishes on white.
 
+  - **Themes are generated, never hand-written.** `scripts/gen-themes.mjs` emits
+    `src/generated/themes.css` and `electron/shared/themes.ts` from a handful of
+    anchor colours per theme (an editor background, a foreground, an accent, and
+    any signature hues). Seventeen themes times fifty variables is 850 values;
+    hand-written they would be unreviewable and inconsistent within a week, and
+    nobody could tell whether the tertiary text in Abyss is the same relative step
+    as in Kimbie Dark. Surfaces step away from the background by fixed amounts and
+    text sits at fixed alphas of the foreground, which is what makes the set feel
+    like one system rather than fifteen downloads.
+
+    The two hand-tuned Curie palettes in `styles.css` are the **bases**: the
+    generator reads them and every theme inherits anything it does not override,
+    so status colours, shadows and the categorical hues stay values a human chose.
+    Add a theme by adding an entry to `THEMES` in the generator, not a CSS block.
+
+    **Every block must declare the complete variable set**, and
+    `electron/themes.test.ts` asserts it. Switching themes only replaces the
+    variables the incoming block declares, so a partial block silently inherits
+    the outgoing theme's values -- invisible until someone switches from Monokai
+    to Abyss and one colour stays green.
+
+    The palettes are keyed to the MIT-licensed VS Code built-ins' editor
+    background/foreground/accent. They are not ports of the syntax token sets;
+    this app has no syntax to highlight.
+
   - **The shell owns the theme; the renderer is told.** The preference lives in
     the store, `nativeTheme.themeSource` is set from it (which is what makes
     vibrancy and the traffic lights follow), and the effective theme is pushed to

@@ -7,9 +7,9 @@
   "main": "dist-electron/main.cjs",
   "scripts": {
     "gen:manifest": "node scripts/gen-command-manifest.mjs",
-    "pretypecheck": "pnpm gen:manifest",
-    "predev": "pnpm gen:manifest",
-    "prebuild": "pnpm gen:manifest",
+    "pretypecheck": "pnpm gen:manifest && pnpm gen:themes",
+    "predev": "pnpm gen:manifest && pnpm gen:themes",
+    "prebuild": "pnpm gen:manifest && pnpm gen:themes",
     "dev": "concurrently -k -n vite,electron -c cyan,magenta \"vite\" \"pnpm dev:electron\"",
     "dev:electron": "node scripts/dev-electron.mjs",
     "build:renderer": "vite build",
@@ -22,7 +22,8 @@
     "test:watch": "vitest",
     "package": "pnpm build && electron-builder --dir",
     "package:dmg": "pnpm build && electron-builder",
-    "app": "open -n release/Curie.app || open release/Curie.app"
+    "app": "open -n release/Curie.app || open release/Curie.app",
+    "gen:themes": "node scripts/gen-themes.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",
