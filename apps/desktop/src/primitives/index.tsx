@@ -18,7 +18,7 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 
-import { ACCENT, FONT, F, LINE, M, ON_ACCENT, R, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, ACCENT_HOVER, F, FONT, KNOB, LINE, M, ON_ACCENT, R, S, SHADOW, STATUS, T, tint } from "../tokens";
 
 // --- text ------------------------------------------------------------------
 
@@ -90,7 +90,7 @@ export function Kbd({ children }: { children: ReactNode }) {
         justifyContent: "center",
         padding: "1px 4px",
         borderRadius: 4,
-        background: "rgba(255,255,255,0.08)",
+        background: S.subtle,
         color: T.tertiary,
       }}
     >
@@ -362,7 +362,7 @@ export function Badge({
         padding: "2px 7px",
         borderRadius: R.pill,
         whiteSpace: "nowrap",
-        background: filled ? tint(color, 0.18) : "rgba(255,255,255,0.06)",
+        background: filled ? tint(color, 0.18) : S.subtle,
         color: filled ? color : T.secondary,
       }}
     >
@@ -395,7 +395,7 @@ export function Spinner({ size = 13, color = T.tertiary }: { size?: number; colo
         height: size,
         display: "inline-block",
         borderRadius: 999,
-        border: `2px solid ${tint("#ffffff", 0.12)}`,
+        border: `2px solid ${tint(KNOB, 0.12)}`,
         borderTopColor: color,
         animation: "curie-spin 700ms linear infinite",
       }}
@@ -433,12 +433,12 @@ export function Button({
 
   const palette: Record<ButtonTone, CSSProperties> = {
     default: {
-      background: hover && !off ? "rgba(255,255,255,0.15)" : "rgba(255,255,255,0.10)",
+      background: hover && !off ? S.controlHover : S.control,
       color: T.primary,
-      boxShadow: `inset 0 1px 0 rgba(255,255,255,0.07)`,
+      boxShadow: SHADOW.raised,
     },
     primary: {
-      background: hover && !off ? "#4bdc9a" : ACCENT,
+      background: hover && !off ? ACCENT_HOVER : ACCENT,
       color: ON_ACCENT,
       fontWeight: 600,
     },
@@ -448,7 +448,7 @@ export function Button({
       fontWeight: 500,
     },
     plain: {
-      background: hover && !off ? "rgba(255,255,255,0.08)" : "transparent",
+      background: hover && !off ? S.subtle : "transparent",
       color: T.secondary,
     },
   };
@@ -527,7 +527,7 @@ export function CopyButton({
 
 const FIELD_BASE: CSSProperties = {
   width: "100%",
-  background: "rgba(0,0,0,0.22)",
+  background: S.field,
   border: `1px solid ${LINE.border}`,
   borderRadius: R.field,
   color: T.primary,
@@ -573,9 +573,9 @@ export function Select({ style, children, ...rest }: SelectHTMLAttributes<HTMLSe
       {...rest}
       style={{
         ...FIELD_BASE,
-        background: "rgba(255,255,255,0.10)",
+        background: S.control,
         border: "none",
-        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.07)",
+        boxShadow: SHADOW.raised,
         padding: "4px 8px",
         ...style,
       }}
@@ -614,7 +614,7 @@ export function Toggle({
         height: 20,
         flex: "none",
         borderRadius: 999,
-        background: checked ? ACCENT : "rgba(255,255,255,0.14)",
+        background: checked ? ACCENT : S.controlHover,
         position: "relative",
         transition: "background 140ms ease",
       }}
@@ -628,7 +628,7 @@ export function Toggle({
           height: 16,
           borderRadius: 999,
           background: "#fff",
-          boxShadow: "0 1px 2px rgba(0,0,0,0.35)",
+          boxShadow: SHADOW.knob,
           transition: "left 140ms cubic-bezier(0.22,1,0.36,1)",
         }}
       />
@@ -667,7 +667,7 @@ export function Segmented<V extends string>({
         display: "inline-flex",
         padding: 2,
         gap: 2,
-        background: "rgba(0,0,0,0.22)",
+        background: S.well,
         borderRadius: R.control + 2,
       }}
     >
@@ -686,8 +686,8 @@ export function Segmented<V extends string>({
               fontWeight: on ? 600 : 500,
               letterSpacing: -0.05,
               color: on ? T.primary : T.secondary,
-              background: on ? "rgba(255,255,255,0.14)" : "transparent",
-              boxShadow: on ? "inset 0 1px 0 rgba(255,255,255,0.08)" : undefined,
+              background: on ? S.controlHover : "transparent",
+              boxShadow: on ? SHADOW.raised : undefined,
               cursor: "default",
               transition: "background 90ms ease",
             }}
@@ -779,7 +779,7 @@ export function Sheet({
       style={{
         position: "fixed",
         inset: 0,
-        background: "rgba(0,0,0,0.4)",
+        background: SHADOW.scrim,
         display: "flex",
         alignItems: "flex-start",
         justifyContent: "center",
@@ -801,7 +801,7 @@ export function Sheet({
           flexDirection: "column",
           background: S.overlay,
           borderRadius: `0 0 ${R.sheet}px ${R.sheet}px`,
-          boxShadow: "0 24px 64px rgba(0,0,0,0.55)",
+          boxShadow: SHADOW.sheet,
           animation: "curie-sheet 220ms cubic-bezier(0.22,1,0.36,1)",
         }}
       >

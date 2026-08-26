@@ -7,19 +7,156 @@
  */
 
 :root {
+  /* The palette, and the only place a literal colour is written.
+   *
+   * `src/tokens.ts` holds no colours of its own any more: every token is a
+   * reference into this block. That is what makes a second theme a matter of
+   * redefining variables rather than editing sixteen screens, and it is why a
+   * component must never hardcode a colour -- a hardcoded white stays white when
+   * the surface under it turns white.
+   *
+   * The theme is set explicitly by the shell (`data-theme` on <html>), never by
+   * a media query alone: the main process owns the preference, including
+   * "follow the system", and the renderer is told the answer. One source of
+   * truth beats two that can disagree. */
   color-scheme: dark;
 
   --accent: #3ecf8e;
-  --window: #1c1c1e;
-  --sidebar-fallback: #1f1f21;
-  --content: #242426;
-  --raised: #2c2c2e;
-  --well: #1a1a1c;
-  --text: rgba(255, 255, 255, 0.92);
-  --text-2: rgba(235, 235, 245, 0.62);
-  --text-3: rgba(235, 235, 245, 0.38);
-  --separator: rgba(255, 255, 255, 0.07);
-  --border: rgba(255, 255, 255, 0.1);
+  --accent-deep: #2bb377;
+  --on-accent: #062015;
+
+  --s-window: #1c1c1e;
+  /* Transparent in both themes: the window has real vibrancy and painting here
+     would defeat it. */
+  --s-sidebar: transparent;
+  --s-sidebar-fallback: #1f1f21;
+  --s-content: #242426;
+  --s-raised: #2c2c2e;
+  --s-hover: #333336;
+  --s-selected: #3a3a3d;
+  --s-well: #1a1a1c;
+  /* A text input. Recessed on dark; on light it is the paper, with the border
+     doing the work of defining it. */
+  --s-field: rgba(0, 0, 0, 0.22);
+  --s-overlay: #2e2e31;
+  /* A filled control sitting on a raised surface, and its hover. */
+  --s-control: rgba(255, 255, 255, 0.1);
+  --s-control-hover: rgba(255, 255, 255, 0.15);
+  --s-subtle: rgba(255, 255, 255, 0.06);
+  --s-stripe: rgba(255, 255, 255, 0.018);
+
+  --t-primary: rgba(255, 255, 255, 0.92);
+  --t-secondary: rgba(235, 235, 245, 0.62);
+  --t-tertiary: rgba(235, 235, 245, 0.38);
+  --t-quaternary: rgba(235, 235, 245, 0.22);
+
+  --line-separator: rgba(255, 255, 255, 0.07);
+  --line-border: rgba(255, 255, 255, 0.1);
+  --line-strong: rgba(255, 255, 255, 0.16);
+
+  --status-ok: #32d74b;
+  --status-warn: #ffd426;
+  --status-danger: #ff453a;
+  --status-info: #0a84ff;
+  --status-neutral: rgba(235, 235, 245, 0.38);
+
+  /* The travelling dot on a switch, and the ring on a focused control. */
+  --knob: #ffffff;
+  --focus-ring: rgba(62, 207, 142, 0.5);
+
+  --accent-hover: #4bdc9a;
+  /* Behind a modal overlay, and under the travelling dot of a switch. */
+  --scrim: rgba(0, 0, 0, 0.4);
+  --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
+  --shadow-sheet: 0 24px 60px rgba(0, 0, 0, 0.55);
+  --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+
+  /* Categorical hues, for container roles and canvas node kinds. These identify
+     rather than rank, so they need to stay distinguishable from each other AND
+     legible on the surface behind them -- which is why light has its own set
+     rather than reusing these at a different opacity. */
+  --hue-blue: #0a84ff;
+  --hue-blue-soft: #5e9eff;
+  --hue-purple: #bf5af2;
+  --hue-violet: #da8fff;
+  --hue-orange: #ff9f0a;
+  --hue-orange-soft: #ffb340;
+  --hue-cyan: #64d2ff;
+  --hue-teal: #66d4cf;
+  --hue-yellow: #ffd426;
+  --hue-red: #ff6961;
+  --hue-grey: #98989d;
+  --hue-grey-dim: #8e8e93;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* The accent darkens: the dark theme's green is a light colour, and light text
+     on it fails on white while it fails as text itself. Darkening lets it serve
+     both as a fill (with white on top) and as text. */
+  --accent: #12996b;
+  --accent-deep: #0d7a55;
+  --on-accent: #ffffff;
+
+  --s-window: #e6e6ea;
+  --s-sidebar: transparent;
+  --s-sidebar-fallback: #ededf0;
+  --s-content: #f6f6f8;
+  --s-raised: #ffffff;
+  --s-hover: #f0f0f3;
+  --s-selected: #e3e3ea;
+  --s-well: #eeeef1;
+  --s-field: #ffffff;
+  --s-overlay: #ffffff;
+  /* Black at low alpha, not white: a translucent white control on a white
+     surface is invisible, which is the single most common way a dark-first
+     palette breaks when it is inverted. */
+  --s-control: rgba(0, 0, 0, 0.06);
+  --s-control-hover: rgba(0, 0, 0, 0.11);
+  --s-subtle: rgba(0, 0, 0, 0.04);
+  --s-stripe: rgba(0, 0, 0, 0.022);
+
+  --t-primary: rgba(0, 0, 0, 0.88);
+  --t-secondary: rgba(60, 60, 67, 0.68);
+  --t-tertiary: rgba(60, 60, 67, 0.44);
+  --t-quaternary: rgba(60, 60, 67, 0.28);
+
+  --line-separator: rgba(0, 0, 0, 0.08);
+  --line-border: rgba(0, 0, 0, 0.12);
+  --line-strong: rgba(0, 0, 0, 0.2);
+
+  /* Darkened for contrast on white. The dark theme's status colours are all
+     light, and yellow especially is unreadable on a white surface. */
+  --status-ok: #1c8c33;
+  --status-warn: #8a6100;
+  --status-danger: #d70015;
+  --status-info: #0060df;
+  --status-neutral: rgba(60, 60, 67, 0.44);
+
+  --knob: #ffffff;
+  --focus-ring: rgba(18, 153, 107, 0.5);
+
+  --accent-hover: #15ab77;
+  --scrim: rgba(0, 0, 0, 0.22);
+  --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
+  --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
+  --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);
+  --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+
+  --hue-blue: #0063cc;
+  --hue-blue-soft: #2f6fd0;
+  --hue-purple: #8a2fd0;
+  --hue-violet: #8e44c4;
+  --hue-orange: #a85c00;
+  --hue-orange-soft: #8f5f18;
+  --hue-cyan: #0b7099;
+  --hue-teal: #0e756e;
+  --hue-yellow: #806400;
+  --hue-red: #c0392b;
+  --hue-grey: #6a6a70;
+  --hue-grey-dim: #85858a;
 }
 
 * {
@@ -38,7 +175,7 @@ body {
   /* Transparent so the window's real vibrancy shows through. The sidebar is
      the only region that stays translucent; the content pane paints over it. */
   background: transparent;
-  color: var(--text);
+  color: var(--t-primary);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui,
     sans-serif;
   font-size: 13px;
@@ -62,7 +199,7 @@ body {
    see-through one over nothing. */
 @supports not (backdrop-filter: blur(1px)) {
   body {
-    background: var(--window);
+    background: var(--s-window);
   }
 }
 

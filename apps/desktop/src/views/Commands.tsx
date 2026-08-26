@@ -12,7 +12,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useApp } from "../bridge/app";
 import { commands, type Command, type Tier } from "../lib/manifest";
 import { CommandForm } from "./CommandForm";
-import { ACCENT, LINE, R, S, STATUS, T } from "../tokens";
+import { ACCENT, HUE, LINE, R, S, STATUS, T } from "../tokens";
 import { Badge, EmptyState, Group, Input, Mono, Notice, SectionHeader } from "../primitives";
 
 const TIER_ORDER: readonly Tier[] = ["author", "skill", "local", "cluster", "platform", "dev"];
@@ -20,7 +20,7 @@ const TIER_ORDER: readonly Tier[] = ["author", "skill", "local", "cluster", "pla
 const TIER_META: Record<Tier, { label: string; color: string; blurb: string }> = {
   author: {
     label: "Author",
-    color: "#2dd4bf",
+    color: HUE.teal,
     blurb: "Scaffold a bundle and see what you have built.",
   },
   skill: {
@@ -30,12 +30,12 @@ const TIER_META: Record<Tier, { label: string; color: string; blurb: string }> =
   },
   local: {
     label: "Local tier",
-    color: "#3b82f6",
+    color: STATUS.info,
     blurb: "The whole platform on Docker Compose, on this machine.",
   },
   cluster: {
     label: "Cluster tier",
-    color: "#a78bfa",
+    color: HUE.violet,
     blurb: "The same platform on Kubernetes, via Helm.",
   },
   platform: {

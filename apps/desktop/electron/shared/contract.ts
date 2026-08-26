@@ -183,6 +183,22 @@ export interface Workspace {
 /** Platform API request proxied through the shell. Going through main rather
  *  than `fetch` in the renderer is what lets the desktop app talk to an API on
  *  any host without CORS, and keeps the API key out of the page. */
+/** What the operator asked for. "system" defers to the OS. */
+export type ThemePreference = "system" | "light" | "dark";
+
+/**
+ * The preference and what it currently resolves to.
+ *
+ * Both are sent because they answer different questions: the control reflects
+ * `preference` (so "System" stays selected), and the palette is driven by
+ * `effective`. Deriving `effective` in the renderer would mean two places
+ * deciding what the OS is currently doing, and they would disagree.
+ */
+export interface ThemeState {
+  readonly preference: ThemePreference;
+  readonly effective: "light" | "dark";
+}
+
 export interface ApiRequest {
   readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   readonly path: string;
@@ -264,6 +280,13 @@ export interface CurieBridge {
     save(doc: unknown): Promise<void>;
   };
 
+  theme: {
+    get(): Promise<ThemeState>;
+    set(preference: ThemePreference): Promise<ThemeState>;
+    /** Fires when the OS appearance changes under a "system" preference. */
+    onChange(cb: (state: ThemeState) => void): () => void;
+  };
+
   shell: {
     openExternal(url: string): Promise<void>;
     copy(text: string): Promise<void>;
@@ -298,6 +321,9 @@ export const CH = {
   secUnset: "curie:sec:unset",
   graphLoad: "curie:graph:load",
   graphSave: "curie:graph:save",
+  themeGet: "curie:theme:get",
+  themeSet: "curie:theme:set",
+  themeChanged: "curie:theme:changed",
   openExternal: "curie:shell:open",
   copy: "curie:shell:copy",
 } as const;

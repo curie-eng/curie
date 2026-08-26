@@ -43,19 +43,7 @@ import {
 import { command } from "../lib/manifest";
 import { percent } from "../lib/format";
 import { CommandForm } from "./CommandForm";
-import {
-  ACCENT,
-  F,
-  FONT,
-  KIND_COLOR,
-  LINE,
-  R,
-  S,
-  STATUS,
-  T,
-  tint,
-  type NodeKind,
-} from "../tokens";
+import { ACCENT, F, FONT, HUE, KIND_COLOR, LINE, R, S, STATUS, T, tint, type NodeKind } from "../tokens";
 import { Badge, Button, EmptyState, Group, Mono, Notice, SectionHeader, Select } from "../primitives";
 
 interface Viewport {
@@ -591,7 +579,7 @@ function Lane({ lane, nodes }: { lane: GraphLane; nodes: readonly GraphNode[] })
         width={lane.width + 28}
         height={bottom - top}
         rx={12}
-        fill="rgba(255,255,255,0.018)"
+        fill={S.stripe}
       />
       <text
         x={lane.x - 4}
@@ -663,7 +651,7 @@ function Edge({
   const labelY = (y1 + y2) / 2;
 
   const color =
-    edge.kind === "data" ? "#38bdf8" : edge.kind === "deploy" ? "#a78bfa" : edge.kind === "planned" ? STATUS.warn : LINE.strong;
+    edge.kind === "data" ? HUE.cyan : edge.kind === "deploy" ? HUE.violet : edge.kind === "planned" ? STATUS.warn : LINE.strong;
 
   return (
     <g style={{ transition: "opacity 120ms ease" }} opacity={dimmed ? 0.12 : 1}>
@@ -762,7 +750,7 @@ function Node({
             width={NODE_W - 20}
             height={2.5}
             rx={1.25}
-            fill="rgba(255,255,255,0.07)"
+            fill={LINE.separator}
           />
           <rect
             x={10}

@@ -182,7 +182,7 @@ function NavItem({
         // with a coloured left border is the web version of this.
         borderRadius: R.control,
         padding: "5px 8px",
-        background: active ? "rgba(255,255,255,0.13)" : hover ? "rgba(255,255,255,0.06)" : "transparent",
+        background: active ? S.controlHover : hover ? S.subtle : "transparent",
         color: active ? T.primary : T.secondary,
         fontSize: 13,
         fontWeight: active ? 600 : 500,

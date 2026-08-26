@@ -22,7 +22,13 @@
 import { app, BrowserWindow, ipcMain, shell, clipboard, nativeTheme, Menu } from "electron";
 import { join } from "node:path";
 
-import { CH, type ApiRequest, type CliInvocation } from "./shared/contract.js";
+import {
+  CH,
+  type ApiRequest,
+  type CliInvocation,
+  type ThemePreference,
+  type ThemeState,
+} from "./shared/contract.js";
 import * as cli from "./ipc/cli.js";
 import { compareToLive } from "./ipc/manifest.js";
 import * as resources from "./ipc/resources.js";
@@ -92,6 +98,19 @@ app.commandLine.appendSwitch("disable-domain-reliability");
 app.commandLine.appendSwitch("disable-print-preview");
 
 let win: BrowserWindow | null = null;
+
+/**
+ * The stored preference and what it resolves to right now.
+ *
+ * `shouldUseDarkColors` is Chromium's answer after `themeSource` is applied, so
+ * it already accounts for "system" without this having to read the OS itself.
+ */
+function themeState(): ThemeState {
+  return {
+    preference: prefs().theme,
+    effective: nativeTheme.shouldUseDarkColors ? "dark" : "light",
+  };
+}
 
 function createWindow(): BrowserWindow {
   const w = new BrowserWindow({
@@ -283,6 +302,13 @@ function registerIpc(): void {
   ipcMain.handle(CH.secSet, (_e, name: string, value: string) => secrets.set(name, value));
   ipcMain.handle(CH.secUnset, (_e, name: string) => secrets.unset(name));
 
+  ipcMain.handle(CH.themeGet, (): ThemeState => themeState());
+  ipcMain.handle(CH.themeSet, (_e, preference: ThemePreference): ThemeState => {
+    update({ theme: preference });
+    nativeTheme.themeSource = preference;
+    return themeState();
+  });
+
   ipcMain.handle(CH.graphLoad, () => prefs().graph);
   ipcMain.handle(CH.graphSave, (_e, doc: unknown) => void update({ graph: doc }));
 
@@ -321,12 +347,22 @@ if (!app.requestSingleInstanceLock()) {
     }
   });
 
-  nativeTheme.themeSource = "dark";
+  // The operator's preference drives Chromium AND the native window: vibrancy,
+  // the traffic lights and any OS-drawn control follow `themeSource`, so setting
+  // it is what makes a light window actually look native rather than a dark app
+  // with pale colours in it.
+  nativeTheme.themeSource = prefs().theme;
 
   void app.whenReady().then(() => {
     registerIpc();
     win = createWindow();
     Menu.setApplicationMenu(buildMenu(() => win));
+    // Only meaningful while the preference is "system", but harmless otherwise:
+    // an explicit choice pins `shouldUseDarkColors`, so the state we send back
+    // is unchanged and the renderer re-applies the same attribute.
+    nativeTheme.on("updated", () => {
+      if (win && !win.isDestroyed()) win.webContents.send(CH.themeChanged, themeState());
+    });
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) win = createWindow();
     });

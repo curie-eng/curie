@@ -22,10 +22,57 @@
 
 /** The accent. Unchanged from the console -- this is the one thing that should
  *  make the two surfaces recognisably the same product. */
-export const ACCENT = "#3ecf8e";
-export const ACCENT_DEEP = "#2bb377";
+export const ACCENT = "var(--accent)";
+export const ACCENT_DEEP = "var(--accent-deep)";
 /** Text drawn on top of a filled accent surface. */
-export const ON_ACCENT = "#062015";
+export const ON_ACCENT = "var(--on-accent)";
+
+/** Hover state of a filled accent surface. */
+export const ACCENT_HOVER = "var(--accent-hover)";
+
+/** The travelling dot on a switch: white on both themes, because it rides on the
+ *  accent in one state and on a grey track in the other. */
+export const KNOB = "var(--knob)";
+
+/**
+ * Elevation and the scrim, as whole shadow values rather than colours.
+ *
+ * A dark theme's shadow is near-black at high alpha; a light theme's is much
+ * softer, and the same value reads as dirt. Keeping the entire shadow in the
+ * palette means a call site never has to know which theme it is in.
+ */
+export const SHADOW = {
+  overlay: "var(--shadow-overlay)",
+  sheet: "var(--shadow-sheet)",
+  /** The top inner highlight that makes a control look raised. */
+  raised: "var(--shadow-raised)",
+  knob: "var(--shadow-knob)",
+  /** Behind a modal. */
+  scrim: "var(--scrim)",
+} as const;
+
+/**
+ * Categorical hues, for container roles and canvas node kinds.
+ *
+ * These identify rather than rank, so they must stay distinguishable from each
+ * other and legible on the surface behind them. Light is not dark at a different
+ * opacity: the dark set is all light colours, and yellow in particular vanishes
+ * on white, so the two sets are defined independently in `styles.css`.
+ */
+export const HUE = {
+  blue: "var(--hue-blue)",
+  blueSoft: "var(--hue-blue-soft)",
+  purple: "var(--hue-purple)",
+  violet: "var(--hue-violet)",
+  orange: "var(--hue-orange)",
+  orangeSoft: "var(--hue-orange-soft)",
+  cyan: "var(--hue-cyan)",
+  teal: "var(--hue-teal)",
+  yellow: "var(--hue-yellow)",
+  red: "var(--hue-red)",
+  grey: "var(--hue-grey)",
+  greyDim: "var(--hue-grey-dim)",
+} as const;
 
 /**
  * Surfaces, back to front.
@@ -36,22 +83,33 @@ export const ON_ACCENT = "#062015";
  */
 export const S = {
   /** Behind everything; only visible where vibrancy is unavailable. */
-  window: "#1c1c1e",
-  sidebar: "transparent",
-  sidebarFallback: "#1f1f21",
+  window: "var(--s-window)",
+  sidebar: "var(--s-sidebar)",
+  sidebarFallback: "var(--s-sidebar-fallback)",
   /** The inset pane holding the current view. Opaque, so text on it stays
    *  readable regardless of what is behind the window. */
-  content: "#242426",
+  content: "var(--s-content)",
   /** A grouped list or panel sitting on `content`. */
-  raised: "#2c2c2e",
+  raised: "var(--s-raised)",
   /** A row inside a grouped list, on hover. */
-  hover: "#333336",
+  hover: "var(--s-hover)",
   /** A selected row. */
-  selected: "#3a3a3d",
+  selected: "var(--s-selected)",
   /** Recessed wells: transcripts, code, command previews. */
-  well: "#1a1a1c",
+  well: "var(--s-well)",
+  /** A text input's own surface. */
+  field: "var(--s-field)",
   /** Overlays (palette, sheets) float above everything. */
-  overlay: "#2e2e31",
+  overlay: "var(--s-overlay)",
+  /** A filled control on a raised surface, and its hover. Named because the
+   *  literal it replaced -- a translucent white -- is invisible on a white
+   *  surface, so every inline use of it was a light-mode bug. */
+  control: "var(--s-control)",
+  controlHover: "var(--s-control-hover)",
+  /** A barely-there fill: pills, inline chips. */
+  subtle: "var(--s-subtle)",
+  /** Alternating row wash. */
+  stripe: "var(--s-stripe)",
 } as const;
 
 /**
@@ -60,28 +118,28 @@ export const S = {
  * sixteen screens.
  */
 export const T = {
-  primary: "rgba(255,255,255,0.92)",
-  secondary: "rgba(235,235,245,0.62)",
-  tertiary: "rgba(235,235,245,0.38)",
-  quaternary: "rgba(235,235,245,0.22)",
+  primary: "var(--t-primary)",
+  secondary: "var(--t-secondary)",
+  tertiary: "var(--t-tertiary)",
+  quaternary: "var(--t-quaternary)",
   accent: ACCENT,
 } as const;
 
 /** Hairlines. `separator` is for inside a grouped list; `border` outlines a
  *  surface; `strong` is for a control that must read as interactive. */
 export const LINE = {
-  separator: "rgba(255,255,255,0.07)",
-  border: "rgba(255,255,255,0.10)",
-  strong: "rgba(255,255,255,0.16)",
+  separator: "var(--line-separator)",
+  border: "var(--line-border)",
+  strong: "var(--line-strong)",
 } as const;
 
 /** Semantic status colours, tuned to sit on a dark surface without vibrating. */
 export const STATUS = {
-  ok: "#32d74b",
-  warn: "#ffd426",
-  danger: "#ff453a",
-  info: "#0a84ff",
-  neutral: "rgba(235,235,245,0.38)",
+  ok: "var(--status-ok)",
+  warn: "var(--status-warn)",
+  danger: "var(--status-danger)",
+  info: "var(--status-info)",
+  neutral: "var(--status-neutral)",
 } as const;
 
 /**
@@ -138,25 +196,25 @@ export const M = {
  *  a runner is the same colour wherever you meet it. */
 export const ROLE_COLOR: Record<string, string> = {
   runner: ACCENT,
-  api: "#0a84ff",
-  worker: "#bf5af2",
-  dispatcher: "#ff9f0a",
-  postgres: "#64d2ff",
-  valkey: "#ff6961",
-  langfuse: "#ff9f0a",
-  "langfuse-web": "#ff9f0a",
-  "langfuse-worker": "#ffb340",
-  clickhouse: "#ffd426",
-  objectstore: "#66d4cf",
-  rustfs: "#66d4cf",
-  otel: "#98989d",
-  "otel-collector": "#98989d",
-  model: "#da8fff",
-  ui: "#5e9eff",
+  api: "var(--hue-blue)",
+  worker: "var(--hue-purple)",
+  dispatcher: "var(--hue-orange)",
+  postgres: "var(--hue-cyan)",
+  valkey: "var(--hue-red)",
+  langfuse: "var(--hue-orange)",
+  "langfuse-web": "var(--hue-orange)",
+  "langfuse-worker": "var(--hue-orange-soft)",
+  clickhouse: "var(--hue-yellow)",
+  objectstore: "var(--hue-teal)",
+  rustfs: "var(--hue-teal)",
+  otel: "var(--hue-grey)",
+  "otel-collector": "var(--hue-grey)",
+  model: "var(--hue-violet)",
+  ui: "var(--hue-blue-soft)",
   /** One-shot init/migrate containers. Normally exited, and not part of the
    *  running topology, so they are dimmer than a live service. */
-  job: "#8e8e93",
-  other: "#98989d",
+  job: "var(--hue-grey-dim)",
+  other: "var(--hue-grey)",
 };
 
 export function roleColor(role: string): string {
@@ -166,13 +224,13 @@ export function roleColor(role: string): string {
 /** Canvas node kinds: what you author, what it talks to, what carries it. */
 export const KIND_COLOR = {
   agent: ACCENT,
-  channel: "#ff9f0a",
-  model: "#da8fff",
-  mcp: "#64d2ff",
-  infra: "#98989d",
-  repo: "#bf5af2",
-  eval: "#ffd426",
-  approval: "#ff9f0a",
+  channel: "var(--hue-orange)",
+  model: "var(--hue-violet)",
+  mcp: "var(--hue-cyan)",
+  infra: "var(--hue-grey)",
+  repo: "var(--hue-purple)",
+  eval: "var(--hue-yellow)",
+  approval: "var(--hue-orange)",
 } as const;
 
 export type NodeKind = keyof typeof KIND_COLOR;
@@ -181,9 +239,9 @@ export type NodeKind = keyof typeof KIND_COLOR;
  *  flat rather than glowing. Alpha is expressed as a two-digit hex suffix,
  *  which every colour above supports because they are all 6-digit hex or rgba. */
 export function tint(color: string, alpha: number): string {
-  if (color.startsWith("rgba")) return color;
-  const hex = Math.round(Math.max(0, Math.min(1, alpha)) * 255)
-    .toString(16)
-    .padStart(2, "0");
-  return `${color}${hex}`;
+  // `color-mix` rather than appending a hex alpha, because every colour is now a
+  // `var(--x)` and you cannot concatenate an alpha onto a variable reference.
+  // This also works for the rgba() literals the old implementation had to skip.
+  const pct = Math.round(Math.max(0, Math.min(1, alpha)) * 100);
+  return `color-mix(in srgb, ${color} ${pct}%, transparent)`;
 }

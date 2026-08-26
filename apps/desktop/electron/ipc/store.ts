@@ -7,6 +7,8 @@
 // lost when the window closes.
 
 import { app } from "electron";
+
+import type { ThemePreference } from "../shared/contract.js";
 import { mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -19,6 +21,9 @@ export interface Prefs {
   activeWorkspace: string | null;
   resourceIntervalMs: number;
   graph: unknown;
+  /** "system" follows the OS. The effective theme is derived from this, never
+   *  stored: a stored answer goes stale the moment the OS changes. */
+  theme: ThemePreference;
 }
 
 const DEFAULTS: Prefs = {
@@ -28,6 +33,7 @@ const DEFAULTS: Prefs = {
   activeWorkspace: null,
   resourceIntervalMs: 2000,
   graph: null,
+  theme: "system",
 };
 
 let cache: Prefs | null = null;

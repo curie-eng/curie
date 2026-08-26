@@ -103,6 +103,32 @@ React + TypeScript renderer. Full structure and rationale in
     `Sheet` drops from the top, it is not a centred modal. A bare
     `<input type="checkbox">` is rendered by the engine and looks like a form
     control on a web page -- that is the tell to avoid.
+  - **`tokens.ts` holds no colours, only references.** Every colour token is a
+    `var(--x)` defined in `src/styles.css`, which is the one file with a literal
+    colour in it. That is what makes the second theme a matter of redefining
+    variables rather than editing sixteen screens, and it is why a component must
+    never hardcode a colour: a hardcoded translucent white is invisible on a white
+    surface, so every inline `rgba(255,255,255,...)` was a light-mode bug waiting
+    to happen. If you need a value that is not in `S`/`T`/`LINE`/`STATUS`/`HUE`/
+    `SHADOW`, add a token to both palettes rather than a literal to a component.
+    `tint()` uses `color-mix` for the same reason: you cannot concatenate an alpha
+    onto a variable reference.
+
+    Light is not dark inverted. Three things needed their own values rather than a
+    reused one: the accent darkens (the dark theme's green is a light colour and
+    fails as text on white), control fills flip from white-alpha to black-alpha,
+    and the categorical hues get a separate set because the dark ones are all
+    light colours and yellow in particular vanishes on white.
+
+  - **The shell owns the theme; the renderer is told.** The preference lives in
+    the store, `nativeTheme.themeSource` is set from it (which is what makes
+    vibrancy and the traffic lights follow), and the effective theme is pushed to
+    the renderer, which writes it to `data-theme` on `<html>`. `preference` and
+    `effective` are both carried because they answer different questions: the
+    control shows "System" while the palette needs a concrete answer. Do not
+    resolve "system" in the renderer with a media query -- two places deciding
+    what the OS is doing will disagree.
+
   - **A status dot is the last resort, not the first.** The coloured dot was
     becoming the answer to every "show state" question, and it is a weak one:
     four green dots in a row are four identical marks carrying nothing, the case

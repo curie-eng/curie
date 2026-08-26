@@ -10,8 +10,20 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useApp } from "../bridge/app";
 import { commands } from "../lib/manifest";
 import { bridge, hasShell } from "../bridge/bridge";
-import { ACCENT, FONT, R, S, STATUS, T } from "../tokens";
-import { Badge, Button, Field, Group, Input, Mono, Notice, SectionHeader, Sheet } from "../primitives";
+import { ACCENT, F, FONT, R, S, STATUS, T } from "../tokens";
+import {
+  Badge,
+  Button,
+  Field,
+  Group,
+  Input,
+  Mono,
+  Notice,
+  Row,
+  SectionHeader,
+  Segmented,
+  Sheet,
+} from "../primitives";
 
 /**
  * A settings panel: a section header *outside* a grouped box.
@@ -40,12 +52,52 @@ function Panel({
 export function Settings() {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 760 }}>
+      <AppearancePanel />
       <ApiPanel />
       <CommandSurfacePanel />
       <SecretsPanel />
       <EnvironmentPanel />
       <AboutPanel />
     </div>
+  );
+}
+
+function AppearancePanel() {
+  const app = useApp();
+  const theme = app.theme;
+
+  return (
+    <Panel
+      title="Appearance"
+      right={
+        <span style={{ ...F.footnote, color: T.quaternary }}>
+          System follows the OS, including when it switches at sunset
+        </span>
+      }
+    >
+      <Row first>
+        <Field label="Theme">
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <Segmented
+              value={theme?.preference ?? "system"}
+              onChange={(v) => app.setTheme(v)}
+              options={[
+                { value: "system", label: "System" },
+                { value: "light", label: "Light" },
+                { value: "dark", label: "Dark" },
+              ]}
+            />
+            {/* Under "System" the choice alone does not say what you will get,
+                so the resolved answer is shown next to it. */}
+            {theme?.preference === "system" ? (
+              <span style={{ ...F.footnote, color: T.tertiary }}>
+                currently {theme.effective}
+              </span>
+            ) : null}
+          </div>
+        </Field>
+      </Row>
+    </Panel>
   );
 }
 

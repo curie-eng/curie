@@ -26,6 +26,8 @@ export type {
   RunResult,
   RunState,
   ShellEnvironment,
+  ThemePreference,
+  ThemeState,
   Workspace,
 } from "../../electron/shared/contract";
 
@@ -107,6 +109,12 @@ const detached: CurieBridge = {
     unset: reject("Removing a secret"),
   },
   graph: { load: async () => null, save: async () => {} },
+  theme: {
+    get: async () => ({ preference: "system" as const, effective: "dark" as const }),
+    set: reject("Changing the theme"),
+    onChange: noop,
+  },
+
   shell: {
     openExternal: async (url: string) => {
       window.open(url, "_blank", "noopener");
