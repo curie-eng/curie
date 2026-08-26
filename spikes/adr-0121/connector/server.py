@@ -49,6 +49,7 @@ from typing import Any
 
 import httpx
 import yaml
+from nacl.public import PrivateKey, SealedBox
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
@@ -86,7 +87,7 @@ SCALE = ToolAnnotations(
 )
 
 
-def _reply(ok, summary, prior=None, post=None, target=None):
+def _reply(ok, summary, **fields):
     """Every return path is this shape, so a caller never has to guess.
 
     `prior` is what a restore puts back. `post` is what a restore is checked
@@ -98,10 +99,7 @@ def _reply(ok, summary, prior=None, post=None, target=None):
     A refusal carries neither, so a failed call can never be mistaken for a
     captured snapshot.
     """
-    return json.dumps(
-        {"ok": ok, "summary": summary, "prior": prior, "post": post, "target": target},
-        sort_keys=True,
-    )
+    return json.dumps({"ok": ok, "summary": summary, **fields}, sort_keys=True)
 
 
 def _client() -> Any:
@@ -178,6 +176,23 @@ def _client() -> Any:
 # transport, not about Kubernetes: a real cluster would only add a way for the
 # probe to fail for reasons that are not the thing under test.
 _WORLD = {"public/api": 3}
+# A version token per resource, bumped on every write. Kubernetes has
+# resourceVersion, S3 has ETag; this stands in for one.
+_VERSION = {"public/api": "v1"}
+
+# The connector's OWN sealing key, mounted like its kubeconfig would be. The
+# platform never has it, which is the point: it stores a blob it cannot read.
+_SEALING_KEY = PrivateKey.generate()
+
+
+def _seal(payload):
+    return base64.b64encode(
+        SealedBox(_SEALING_KEY.public_key).encrypt(json.dumps(payload).encode())
+    ).decode()
+
+
+def _open(blob):
+    return json.loads(SealedBox(_SEALING_KEY).decrypt(base64.b64decode(blob)))
 
 
 def _client():  # type: ignore[no-redef]
@@ -185,7 +200,7 @@ def _client():  # type: ignore[no-redef]
 
 
 @mcp.tool(annotations=SCALE)
-def restore(target: dict, prior_state: dict) -> str:
+def restore(target: dict, prior_sealed: str) -> str:
     """Put back a state this connector previously reported (ADR-0121).
 
     The verb ADR-0121 proposes. It takes the recorded `target` and `prior_state`
@@ -199,18 +214,15 @@ def restore(target: dict, prior_state: dict) -> str:
     if key not in ALLOWLIST:
         return _reply(False, f"refusing: {key} is not in this connector's allowlist")
     try:
+        prior_state = _open(prior_sealed)
         replicas = prior_state["spec"]["replicas"]
-    except (KeyError, TypeError):
-        return _reply(False, "prior_state is not a shape this connector wrote")
+    except Exception:
+        return _reply(False, "this connector cannot open that snapshot")
     before = _WORLD.get(key)
     _WORLD[key] = replicas
-    return _reply(
-        True,
-        f"restored {key} from {before} to {replicas}",
-        prior={"spec": {"replicas": before}},
-        post={"spec": {"replicas": replicas}},
-        target={"kind": "Deployment", "namespace": target.get("namespace"), "name": target.get("name")},
-    )
+    _VERSION[key] = f"v{int(_VERSION[key][1:]) + 1}"
+    return _reply(True, f"restored {key} from {before} to {replicas}",
+                  left_version=_VERSION[key])
 
 
 @mcp.tool(annotations=SCALE)
@@ -264,14 +276,26 @@ def scale_deployment(namespace: str, name: str, replicas: int) -> str:
     prior_replicas = _WORLD.get(key)
     if not isinstance(prior_replicas, int):
         return _reply(False, f"could not read a replica count for {key}")
+    prior_sealed = _seal({"spec": {"replicas": prior_replicas}})
     _WORLD[key] = replicas
+    _VERSION[key] = f"v{int(_VERSION[key][1:]) + 1}"
     return _reply(
         True,
         f"scaled {key} from {prior_replicas} to {replicas}",
-        prior={"spec": {"replicas": prior_replicas}},
-        post={"spec": {"replicas": replicas}},
+        # SEALED. The platform stores this and cannot read it.
+        prior_sealed=prior_sealed,
+        # The version this call LEFT. What a conflict check compares, instead of
+        # a state the platform would have to be able to read.
+        left_version=_VERSION[key],
         target={"kind": "Deployment", "namespace": namespace, "name": name},
     )
+
+
+@mcp.tool(annotations=SCALE)
+def current_version(namespace: str, name: str) -> str:
+    """The resource's version token now. Opaque to everyone but this connector."""
+    key = f"{namespace}/{name}"
+    return _reply(True, f"version of {key}", left_version=_VERSION.get(key))
 
 
 def main() -> None:

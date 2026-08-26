@@ -63,3 +63,48 @@ cannot perform.** One of the two has to give:
 - `prior_state` is not sealed, and its exposure is answered another way.
 
 Not a thing to resolve in an implementation PR.
+
+## What I concluded, and why it is not one of the four
+
+The four ways out all argue about **which platform component holds the key**.
+That is the wrong question. Exactly one party ever needs to read a snapshot: the
+connector that produced it. Not the API, not the worker, not the runner.
+
+So: **the connector seals to its own key.** `probe_sealed_to_connector.py` and
+`probe_sealed_roundtrip.py`, run against the real API and real Postgres:
+
+```
+prior_sealed : oXQXOYtoi8OkdJ8px94XTl8s9qWWbMqaKnCHU+bn...
+platform can read the replica count from it: False
+ledger row   : undoable=True, and prior_state is opaque
+conflict     : left=v2 observed=v3 -> HTTP 409, refused
+authorized   : HTTP 200; the API hands back a blob it never read
+connector    : "restored public/api from 10 to 3"
+```
+
+Why this is better than any of the four:
+
+- **The tension disappears rather than being traded.** The runner needs no key
+  because it never opens anything. ADR-0121 keeps its executor and its
+  reachability argument intact.
+- **It is a stronger property than ADR-0122 proposed.** Sealed to the cluster,
+  the platform holds the key and the operator has to evaluate that. Sealed to the
+  connector, the platform *cannot* read it — there is nothing left to evaluate.
+- **It follows ADR-0117 decision 1 to its conclusion.** The tool's reply is the
+  declaration; now the tool also decides what the platform may read.
+
+### The one thing it breaks, and the fix that is better than what it replaces
+
+A sealed box is non-deterministic, so ciphertexts cannot be compared and
+ADR-0117's conflict check (live state vs `post_state`) stops working.
+
+The comparison moves onto a **version token** the connector reports —
+`resourceVersion`, ETag, generation. Opaque to the platform, compared by
+equality, and a better question than state equality anyway: it catches a change
+that reverted to the same value, and it does not false-positive on
+`managedFields` churn.
+
+The cost is honest and belongs in the ADR: a refusal can no longer name both
+states, so "10 vs 7" becomes "v2 vs v3". A system with no version token has no
+conflict check and its actions are not undoable — which is the same
+deny-by-default the rest of this design already runs on.
