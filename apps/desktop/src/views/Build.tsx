@@ -106,39 +106,89 @@ function AgentList() {
 
   return (
     <section style={{ width: 196, flex: "none" }}>
-      <SectionHeader>Agents</SectionHeader>
+      {/* The count says this is a collection with a size, not a fixed pair of
+          labels. */}
+      <SectionHeader
+        right={
+          app.workspaces.length ? (
+            <span style={{ ...F.footnote, color: T.quaternary }}>{app.workspaces.length}</span>
+          ) : null
+        }
+      >
+        Agents
+      </SectionHeader>
       <Group>
         {app.workspaces.length === 0 ? (
           <div style={{ padding: "12px 14px", ...F.footnote, color: T.tertiary }}>
             None yet.
           </div>
         ) : (
-          app.workspaces.map((w, i) => (
-            <Row
-              key={w.path}
-              first={i === 0}
-              selected={w.path === active}
-              onClick={() => app.selectWorkspace(w.path)}
-            >
-              <div style={{ minWidth: 0 }} title={w.path}>
-                <div
+          app.workspaces.map((w, i) => {
+            const on = w.path === active;
+            return (
+              <Row
+                key={w.path}
+                first={i === 0}
+                selected={on}
+                onClick={() => app.selectWorkspace(w.path)}
+              >
+                {/* Two things make a row read as one of several interchangeable
+                    items rather than a line of text: it carries its own mark, and
+                    the selected one is marked at the edge as well as tinted. A
+                    background tint alone is easy to miss and says nothing about
+                    what the row IS. */}
+                {on ? (
+                  <span
+                    aria-hidden
+                    style={{
+                      position: "absolute",
+                      left: 0,
+                      top: 0,
+                      bottom: 0,
+                      width: 3,
+                      background: ACCENT,
+                      borderRadius: "0 2px 2px 0",
+                    }}
+                  />
+                ) : null}
+                <span
+                  aria-hidden
                   style={{
-                    ...F.body,
-                    color: w.path === active ? T.primary : T.secondary,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
+                    width: 22,
+                    height: 22,
+                    flex: "none",
+                    borderRadius: 6,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: on ? tint(ACCENT, 0.18) : S.control,
+                    color: on ? ACCENT : T.tertiary,
+                    ...F.caption,
+                    fontWeight: 600,
                   }}
                 >
-                  {w.plugin?.name ?? w.name}
+                  {(w.plugin?.name ?? w.name).slice(0, 1).toUpperCase()}
+                </span>
+                <div style={{ flex: 1, minWidth: 0 }} title={w.path}>
+                  <div
+                    style={{
+                      ...F.body,
+                      color: on ? T.primary : T.secondary,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {w.plugin?.name ?? w.name}
+                  </div>
+                  <div style={{ ...F.footnote, color: T.quaternary, marginTop: 1 }}>
+                    {w.skills.length} skill{w.skills.length === 1 ? "" : "s"}
+                    {w.hasEvals ? " · evals" : ""}
+                  </div>
                 </div>
-                <div style={{ ...F.footnote, color: T.quaternary, marginTop: 1 }}>
-                  {w.skills.length} skill{w.skills.length === 1 ? "" : "s"}
-                  {w.hasEvals ? " · evals" : ""}
-                </div>
-              </div>
-            </Row>
-          ))
+              </Row>
+            );
+          })
         )}
       </Group>
 
