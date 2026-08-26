@@ -85,6 +85,16 @@ export function Build() {
   );
 }
 
+/** Same stroke weight and cap style as the rail's icons, so a button glyph here
+ *  does not read as a different icon set. */
+function Glyph({ d }: { d: string }) {
+  return (
+    <svg width={13} height={13} viewBox="0 0 16 16" aria-hidden style={{ flex: "none" }}>
+      <path d={d} fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 /** The agents this app knows about, and the way to add one. */
 function AgentList() {
   const app = useApp();
@@ -128,14 +138,35 @@ function AgentList() {
         )}
       </Group>
 
+      {/* Two actions with a clear ranking. Authoring a new agent is what this
+          column is for, so it takes the accent; importing one that already exists
+          on disk is the occasional case and takes the ordinary treatment.
+          Neither is `plain`: a transparent button with dimmed text is
+          indistinguishable from a disabled one, which is how the second action
+          read before.
+
+          Both keep the trailing ellipsis, which on this platform means "opens
+          something you then complete" -- one lands on a form, the other on a
+          directory chooser. */}
       <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
-        <Button size="sm" onClick={() => app.navigate("commands", "init")}>
-          + New Agent
+        <Button
+          size="sm"
+          tone="primary"
+          icon={<Glyph d="M8 3.5v9M3.5 8h9" />}
+          onClick={() => app.navigate("commands", "init")}
+          style={{ width: "100%" }}
+          title="Scaffold a new agent with curie init"
+        >
+          New Agent…
         </Button>
-        {/* Adding an agent that already exists on disk. Also File -> Open
-            Bundle, but a menu-only action is not discoverable from here. */}
-        <Button size="sm" tone="plain" onClick={() => void app.openWorkspace()}>
-          Open existing…
+        <Button
+          size="sm"
+          icon={<Glyph d="M8 2.5v6.8M5.4 6.9 8 9.5l2.6-2.6M3 10.8v1.7a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-1.7" />}
+          onClick={() => void app.openWorkspace()}
+          style={{ width: "100%" }}
+          title="Import an agent that already exists on disk"
+        >
+          Import…
         </Button>
       </div>
     </section>
