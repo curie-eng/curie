@@ -14,11 +14,10 @@
 import type { ReactNode } from "react";
 import { useState } from "react";
 
-import { BundleMenu } from "./BundleMenu";
 import { useApp, type Route } from "../bridge/app";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
-import { ACCENT, F, M, R, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, M, R, S, STATUS, T } from "../tokens";
 import { Spinner } from "../primitives";
 import { bytes, percent } from "../lib/format";
 
@@ -105,9 +104,12 @@ export function Sidebar() {
         paddingTop: M.trafficLights - 24,
       }}
     >
-      <WorkspacePicker />
-
-      <div style={{ padding: "10px 10px 0", display: "flex", flexDirection: "column", gap: 1 }}>
+      {/* No bundle picker here. The open bundle is the Build tab's subject and it
+          carries the switcher; a second one in the window's chrome implied the
+          bundle was global chrome, and left two places to change the same thing.
+          The global ACTION still exists where a global action belongs: File ->
+          Open Bundle (Cmd+O). */}
+      <div style={{ padding: "14px 10px 0", display: "flex", flexDirection: "column", gap: 1 }}>
         {ITEMS.map((item) => (
           <NavItem
             key={item.id}
@@ -198,75 +200,6 @@ function NavItem({
         </span>
       ) : null}
     </button>
-  );
-}
-
-/** The open bundle. Every skill-tier command is parameterised by it, so it sits
- *  at the top of the sidebar the way a document title would. */
-function WorkspacePicker() {
-  const app = useApp();
-  const [open, setOpen] = useState(false);
-
-  return (
-    <div style={{ padding: "0 10px", position: "relative" }}>
-      <button
-        className="no-drag"
-        onClick={() => setOpen((v) => !v)}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          width: "100%",
-          border: "none",
-          background: open ? "rgba(255,255,255,0.10)" : "transparent",
-          borderRadius: R.control,
-          padding: "6px 8px",
-          cursor: "default",
-          textAlign: "left",
-        }}
-      >
-        <span
-          aria-hidden
-          style={{
-            width: 22,
-            height: 22,
-            flex: "none",
-            borderRadius: 5,
-            background: app.workspace ? tint(ACCENT, 0.2) : "rgba(255,255,255,0.08)",
-            color: app.workspace ? ACCENT : T.tertiary,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontSize: 11,
-            fontWeight: 700,
-          }}
-        >
-          {app.workspace ? app.workspace.name.slice(0, 1).toUpperCase() : "—"}
-        </span>
-        <span style={{ flex: 1, minWidth: 0 }}>
-          <span
-            style={{
-              ...F.headline,
-              display: "block",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-              color: app.workspace ? T.primary : T.tertiary,
-            }}
-          >
-            {app.workspace ? app.workspace.name : "No bundle"}
-          </span>
-          <span style={{ ...F.footnote, color: T.tertiary }}>
-            {app.workspace
-              ? `${app.workspace.skills.length} skill${app.workspace.skills.length === 1 ? "" : "s"}`
-              : "Open one to begin"}
-          </span>
-        </span>
-        <span style={{ color: T.tertiary, fontSize: 9 }}>⌃</span>
-      </button>
-
-      {open ? <BundleMenu panel={{ left: 10, right: 10 }} onClose={() => setOpen(false)} /> : null}
-    </div>
   );
 }
 
