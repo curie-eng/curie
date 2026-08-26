@@ -60,6 +60,13 @@ const ITEMS: readonly Item[] = [
     icon: <Icon d="M3.4 12.6h9.2M5.4 10.2V5.6M8 10.2V3.4M10.6 10.2V7.2" />,
   },
   {
+    id: "tiers",
+    label: "Tiers",
+    hint: "Skill, local and cluster",
+    // Three rungs, ascending: the ladder itself.
+    icon: <Icon d="M3 12.6h3.2V9.4H3zM6.4 12.6h3.2V6.2H6.4zM9.8 12.6H13V3.4H9.8z" />,
+  },
+  {
     id: "resources",
     label: "Resources",
     hint: "Live CPU, memory, I/O",

@@ -22,7 +22,7 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 
-import { useApp } from "../bridge/app";
+import { useApp, type AgentSummary } from "../bridge/app";
 import { useResources } from "../bridge/resources";
 import { bridge } from "../bridge/bridge";
 import {
@@ -43,6 +43,7 @@ import {
 import { command } from "../lib/manifest";
 import { percent } from "../lib/format";
 import { CommandForm } from "./CommandForm";
+import { AgentSheet } from "./AgentSheet";
 import { ACCENT, F, FONT, HUE, KIND_COLOR, LINE, R, S, STATUS, T, tint, type NodeKind } from "../tokens";
 import { Badge, Button, EmptyState, Group, Mono, Notice, SectionHeader, Select } from "../primitives";
 
@@ -224,7 +225,7 @@ export function Canvas() {
     if (!app.api?.reachable) {
       out.push({
         label: "API unreachable — no agents or channels are shown",
-        onClick: () => app.navigate("commands", "local.up"),
+        onClick: () => app.runCommand("local.up"),
       });
     }
     return out;
@@ -302,7 +303,7 @@ export function Canvas() {
             <Button tone="primary" onClick={() => void app.openWorkspace()}>
               Open a bundle
             </Button>
-            <Button onClick={() => app.navigate("commands", "local.up")}>Start the local stack</Button>
+            <Button onClick={() => app.runCommand("local.up")}>Start the local stack</Button>
           </div>
         }
       >
@@ -800,6 +801,16 @@ function Inspector({
   // Keyed by the caller on `node.id`, so the chosen action resets by remount
   // rather than by an effect that would briefly render the previous command.
   const [action, setAction] = useState<string | null>(null);
+  const [sheetAgent, setSheetAgent] = useState<AgentSummary | null>(null);
+  const app = useApp();
+
+  // Node ids for API agents are `agent:<uuid>`, so the match is on the id the
+  // graph was built from rather than on the label -- two agents can share a
+  // display name, and a runner node borrows one.
+  const agent =
+    node && node.kind === "agent" && node.id.startsWith("agent:")
+      ? (app.agents.find((a) => `agent:${a.id}` === node.id) ?? null)
+      : null;
 
   if (!node) {
     return (
@@ -887,6 +898,15 @@ function Inspector({
           >
             {connecting === node.id ? "Pick a target…" : "Draw a link"}
           </Button>
+          {/* A deployed agent has twenty-six commands of its own, and the four or
+              five listed below are the subset this node happens to name. The
+              sheet is the whole set, and it is the same one the Overview's rows
+              open -- an agent should not mean different things on two screens. */}
+          {agent ? (
+            <Button size="sm" onClick={() => setSheetAgent(agent)}>
+              Everything for this agent
+            </Button>
+          ) : null}
           {node.userAdded ? (
             <Button size="sm" tone="danger" onClick={() => onDelete(node.id)}>
               Remove
@@ -931,10 +951,21 @@ function Inspector({
 
         {cmd ? (
           <div style={{ borderTop: `1px solid ${LINE.separator}`, paddingTop: 12 }}>
-            <CommandForm key={cmd.id} cmd={cmd} compact onRan={() => setAction(null)} />
+            <CommandForm
+              key={cmd.id}
+              cmd={cmd}
+              compact
+              // The node IS the target, so the form opens pointed at it.
+              prefill={agent ? { positionals: [agent.name] } : undefined}
+              onRan={() => setAction(null)}
+            />
           </div>
         ) : null}
       </Group>
+
+      {sheetAgent && !app.runTarget ? (
+        <AgentSheet agent={sheetAgent} onClose={() => setSheetAgent(null)} />
+      ) : null}
     </div>
   );
 }

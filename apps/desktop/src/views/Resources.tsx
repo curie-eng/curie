@@ -28,6 +28,8 @@
 import { useMemo, useState, type ReactNode } from "react";
 
 import { useApp } from "../bridge/app";
+import { ActionButtons, RunButton } from "./Actions";
+import { resolve, surfacesById } from "../lib/surfaces";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
 import { bridge } from "../bridge/bridge";
@@ -276,9 +278,9 @@ export function Resources() {
               query ? (
                 <Button onClick={() => setQuery("")}>Clear search</Button>
               ) : (
-                <Button tone="primary" onClick={() => app.navigate("commands", "local.up")}>
+                <RunButton id="local.up" tone="primary" size="md">
                   Bring the local stack up
-                </Button>
+                </RunButton>
               )
             }
           >
@@ -335,19 +337,9 @@ export function Resources() {
         <Mono style={{ fontSize: 10 }}>docker info</Mono> on this machine. Cluster workloads are not
         measured here — the platform API reports runner pod names, not their resource use, so this
         view would be guessing.{" "}
-        <button
-          onClick={() => app.navigate("commands", "cluster.status")}
-          style={{
-            background: "none",
-            border: "none",
-            color: ACCENT,
-            cursor: "default",
-            padding: 0,
-            font: "inherit",
-          }}
-        >
+        <RunButton id="cluster.status" tone="plain">
           Check cluster status instead
-        </button>
+        </RunButton>
         .
       </div>
 
@@ -847,22 +839,19 @@ function ColumnMenu({
  *  container because it is a Docker client; this app's contract is that every
  *  action is a `curie` command you can read and copy, so a container with no
  *  `curie` equivalent gets no button rather than a raw `docker stop`. */
-function actionsFor(sample: ResourceSample): { id: string; label: string; flags?: string }[] {
-  if (sample.role === "runner") {
-    return [
-      { id: "skill.status", label: "Check session status" },
-      { id: "skill.message", label: "Send a message" },
-      { id: "skill.down", label: "Stop this runner" },
-    ];
-  }
-  if (sample.service) {
-    return [
-      { id: "local.status", label: "Stack status" },
-      { id: "local.rebuild", label: `Rebuild ${sample.service}` },
-      { id: "local.down", label: "Stop the whole stack" },
-    ];
-  }
-  return [{ id: "local.status", label: "Stack status" }];
+/** Which of the inspector surface's commands apply to the container in front of
+ *  you. The labels and the tones come from the placement map -- this only picks
+ *  the subset, because "what applies to a runner" is a fact about the sample,
+ *  not about the command. */
+function actionsFor(sample: ResourceSample) {
+  const surface = surfacesById.get("resources.inspect")!;
+  const wanted =
+    sample.role === "runner"
+      ? ["skill.status", "skill.message", "skill.down"]
+      : sample.service
+        ? ["local.status", "local.rebuild", "local.down"]
+        : ["local.status"];
+  return resolve(surface).filter(({ action }) => wanted.includes(action.id));
 }
 
 function InspectSheet({ sample, onClose }: { sample: ResourceSample; onClose(): void }) {
@@ -870,6 +859,10 @@ function InspectSheet({ sample, onClose }: { sample: ResourceSample; onClose(): 
   const app = useApp();
   const runs = useRuns();
   const history = res.history.get(sample.name);
+  // A command form opened from inside this sheet takes over; two stacked sheets
+  // is a modal over a modal, and the one being read is the form. The inspector
+  // is still here underneath and comes back when the form closes.
+  const covered = !!app.runTarget;
   const [logs, setLogs] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -881,6 +874,8 @@ function InspectSheet({ sample, onClose }: { sample: ResourceSample; onClose(): 
       setLoading(false);
     }
   };
+
+  if (covered) return null;
 
   return (
     <Sheet
@@ -975,20 +970,13 @@ function InspectSheet({ sample, onClose }: { sample: ResourceSample; onClose(): 
 
       <SectionHeader>Run against this</SectionHeader>
       <Group style={{ padding: 8, marginBottom: 16 }}>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-          {actionsFor(sample).map((a) => (
-            <Button
-              key={a.id}
-              size="sm"
-              onClick={() => {
-                app.navigate("commands", a.id);
-                onClose();
-              }}
-            >
-              {a.label}
-            </Button>
-          ))}
-        </div>
+        {/* Prefilled with the service this container actually is, so
+            "Rebuild" on the api row opens `curie local rebuild api` rather than
+            a form asking which service you meant. */}
+        <ActionButtons
+          actions={actionsFor(sample)}
+          prefill={sample.service ? { positionals: [sample.service] } : undefined}
+        />
         <div style={{ ...F.footnote, color: T.quaternary, marginTop: 8, lineHeight: 1.5 }}>
           Only commands the CLI actually has. Raw container control — start, restart, remove — is
           not offered here on purpose: it has no <Mono style={{ fontSize: 10 }}>curie</Mono>

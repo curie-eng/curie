@@ -19,6 +19,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useApp } from "../bridge/app";
 import { SlackPacks } from "./BuildPacks";
+import { Actions, RunButton } from "./Actions";
+import { surfacesById } from "../lib/surfaces";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
 import { bridge } from "../bridge/bridge";
@@ -84,6 +86,14 @@ export function Build() {
         {/* Keyed on the path so switching resets every bit of editing state
             rather than carrying a half-typed SKILL.md across. */}
         {ws ? <Workbench key={ws.path} /> : <NoBundle />}
+
+        {/* Scaffolding is not a property of the bundle you have open, so this
+            group sits outside the workbench and is here either way. With
+            nothing open it is the only thing to do; with something open it is
+            how you start the next one. */}
+        <div style={{ marginTop: 16 }}>
+          <Actions surface={surfacesById.get("build.author")!} />
+        </div>
       </div>
     </div>
   );
@@ -228,7 +238,7 @@ function AgentList() {
           size="sm"
           tone="primary"
           icon={<Glyph d="M8 3.5v9M3.5 8h9" />}
-          onClick={() => app.navigate("commands", "init")}
+          onClick={() => app.runCommand("init")}
           style={{ width: "100%" }}
           title="Scaffold a new agent with curie init"
         >
@@ -260,7 +270,9 @@ function NoBundle() {
             <Button tone="primary" onClick={() => void app.openWorkspace()}>
               Open a bundle
             </Button>
-            <Button onClick={() => app.navigate("commands", "init")}>Scaffold a new one</Button>
+            <RunButton id="init" size="md">
+              Scaffold a new one
+            </RunButton>
           </div>
         }
       >
@@ -565,50 +577,22 @@ function Fact({ label, value, detail }: { label: string; value: string; detail?:
  * learn the hard way, so the view says it rather than leaving it to the docs.
  */
 function Ladder() {
-  const app = useApp();
   const res = useResources();
   const runnerUp = res.samples.some((s) => s.role === "runner" && s.state === "running");
 
-  const rungs: { id: string; label: string; hint: string }[] = [
-    { id: "skill.check", label: "Check", hint: "Do the MCP servers load, offline?" },
-    {
-      id: runnerUp ? "skill.down" : "skill.up",
-      label: runnerUp ? "Stop runner" : "Boot runner",
-      hint: runnerUp ? "A runner is live" : "One container, straight from this directory",
-    },
-    { id: "skill.message", label: "Message", hint: "Send a synthetic event and read the reply" },
-    { id: "skill.eval", label: "Grade", hint: "Run evals/cases.json through the runner" },
-    { id: "local.deploy", label: "Deploy local", hint: "Push to the local platform" },
-    { id: "cluster.deploy", label: "Deploy cluster", hint: "Push to Kubernetes" },
-  ];
-
+  // Rendered from the placement map rather than a local list of rungs. The
+  // buttons here and the ones on the Tiers view are the same declarations, so a
+  // command cannot be quietly dropped from one of them.
   return (
-    <section>
-      <SectionHeader
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <Actions
+        surface={surfacesById.get("build.loop")!}
         right={
           <span style={{ ...F.footnote, color: runnerUp ? ACCENT : T.quaternary }}>
             {runnerUp ? "runner live" : "no runner"}
           </span>
         }
       >
-        The loop
-      </SectionHeader>
-      <Group style={{ padding: 12 }}>
-        <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
-          {rungs.map((r, i) => (
-            <span key={r.id} style={{ display: "inline-flex", alignItems: "center", gap: 7 }}>
-              {i > 0 ? <span style={{ color: T.quaternary, fontSize: 10 }}>›</span> : null}
-              <Button
-                size="sm"
-                tone={r.id === "skill.down" ? "danger" : i === 0 ? "primary" : "default"}
-                title={r.hint}
-                onClick={() => app.navigate("commands", r.id)}
-              >
-                {r.label}
-              </Button>
-            </span>
-          ))}
-        </div>
         <div style={{ ...F.footnote, color: T.quaternary, marginTop: 10, lineHeight: 1.55 }}>
           A runner executes an immutable snapshot taken at <Mono style={{ fontSize: 10 }}>skill up</Mono>,
           so a SKILL.md edit reaches it only after a restart. Grading without that restart grades
@@ -616,13 +600,26 @@ function Ladder() {
           <Mono style={{ fontSize: 10 }}>skill up --replace</Mono> is the restart.
           {" "}evals/cases.json is read live from source, so the contract needs no restart.
         </div>
-      </Group>
-    </section>
+      </Actions>
+
+      <Actions surface={surfacesById.get("build.ship")!}>
+        <div style={{ ...F.footnote, color: T.quaternary, marginTop: 10, lineHeight: 1.55 }}>
+          Deploying creates an immutable version and points the agent at it. What each tier can
+          reach, and what it costs to start, is on the Tiers view.
+        </div>
+      </Actions>
+
+      {/* Two verbs the ladder has further up and this tier does not. They are
+          here rather than omitted because "why can I not do X here" is a real
+          question, and the CLI answers it -- these commands exist precisely to
+          print that answer. Hiding them would make the app the surface that
+          silently has less than the CLI. */}
+      <Actions surface={surfacesById.get("build.not-here")!} />
+    </div>
   );
 }
 
 function Checklist({ checks }: { checks: readonly Check[] }) {
-  const app = useApp();
   const [open, setOpen] = useState(true);
   const errors = checks.filter((c) => c.level === "error").length;
 
@@ -658,9 +655,7 @@ function Checklist({ checks }: { checks: readonly Check[] }) {
                 <div style={{ ...F.callout, color: T.tertiary, marginTop: 1 }}>{c.detail}</div>
               </div>
               {c.fix ? (
-                <Button size="sm" onClick={() => app.navigate("commands", c.fix!)}>
-                  Fix
-                </Button>
+                <RunButton id={c.fix}>Fix</RunButton>
               ) : null}
             </Row>
           ))}
@@ -834,8 +829,6 @@ function Evals({
   suite: ReturnType<typeof parseEvalSuite> | undefined;
   onOpen(): void;
 }) {
-  const app = useApp();
-
   if (!suite) {
     return (
       <section>
@@ -846,9 +839,7 @@ function Evals({
             does not change across tiers, so a bundle without them is deployable but not
             falsifiable.
           </div>
-          <Button size="sm" onClick={() => app.navigate("commands", "skill.eval-init")}>
-            Generate a starter suite
-          </Button>
+          <RunButton id="skill.eval-init">Generate a starter suite</RunButton>
         </Group>
       </section>
     );
@@ -882,9 +873,7 @@ function Evals({
             <Button size="sm" tone="plain" onClick={onOpen}>
               Edit
             </Button>
-            <Button size="sm" onClick={() => app.navigate("commands", "skill.eval")}>
-              Run
-            </Button>
+            <RunButton id="skill.eval">Run</RunButton>
           </div>
         }
       >

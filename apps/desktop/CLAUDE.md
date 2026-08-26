@@ -16,6 +16,45 @@ React + TypeScript renderer. Full structure and rationale in
   as a bespoke screen. `src/lib/manifest.test.ts` asserts the app exposes exactly
   the manifest's commands; a hand-written surface will not survive it.
 
+- **A generated command surface is complete, not usable -- every command also
+  needs a place.** Generating a form per command is what makes the app's coverage
+  total; it is not what makes a command findable. On its own the Commands view is
+  a filter box over eighty monospace strings, which is `--help` in a window.
+
+  So every command also belongs to a **surface** in `src/lib/surfaces.ts`: a named
+  group of controls on a real screen, in the place an operator is already standing
+  when they want it. The views render straight from that array -- `Actions`,
+  `ActionButtons` and `RunButton` in `src/views/Actions.tsx` are the only things
+  that bind a control to a command id. Do not hand-write a button that runs a
+  command; add it to the map and let the screen render it.
+
+  `src/lib/surfaces.test.ts` holds three things, and the second one caught a real
+  bug the day it was written:
+  - **Coverage**: every manifest command is on a surface, and no surface names a
+    command that does not exist. A new CLI command fails the build until somebody
+    decides where it belongs.
+  - **Rendering**: every declared surface is named by a view. A surface nobody
+    renders is the same failure one level up -- a home with no door -- and
+    `build.author` was exactly that until the test existed. Note the glob keys are
+    relative to the test file, so the map next door is `./surfaces.ts`; filtering
+    on `/lib/surfaces.ts` left the map in its own corpus and the check passed while
+    proving nothing.
+  - **Behaviour** (`src/views/Actions.test.tsx`): a control opens the form *in
+    place* and starts the argv you would expect, with the row's values filled in.
+
+  A contextual control must never navigate to the Commands list. Answering "where
+  do I do this" with "go to the list and find it" is the problem, not the fix --
+  the control opens the same generated form over the screen it was pressed on
+  (`RunSheetHost`, mounted once in `App.tsx`), and the list stays what it is: the
+  complete reference, which additionally names each command's home and can group
+  itself by tier or by place.
+
+  Values a control seeds the form with travel as `Prefill` (`src/bridge/app.tsx`),
+  not as sticky flags: the agent-scoped commands take the agent as a *positional*,
+  which the sticky-flag mechanism cannot carry. A prefill is a seed, never a lock,
+  and unknown flags are dropped rather than smuggled into argv -- the preview under
+  the form has to stay the whole truth about what will run.
+
 - **The rendered preview and the executed argv are two implementations that must
   agree.** `renderCommand()` (renderer) produces the string the operator reads;
   `resolve()` (`electron/ipc/manifest.ts`) produces the argv that runs. They are
@@ -206,6 +245,15 @@ React + TypeScript renderer. Full structure and rationale in
   it reads as a fixed slab that happens to have two things in it. `minHeight: 0` on
   the scroller is load bearing: a flex child will not shrink below its content, so
   without it `maxHeight` is ignored and the overflow never engages.
+
+- **The agent is a surface, not a prefix.** Twenty-six commands are agent-scoped:
+  thirteen verbs at the local and the cluster tier. They live in one sheet
+  (`src/views/AgentSheet.tsx`), opened from the agent's own row, with the tier
+  chosen once at the top rather than twenty-six times in the middle of a command
+  name. Each `agent.*` surface declares *both* tiers' half and the sheet renders
+  one, which is what lets the coverage test see that `cluster budget` has a home
+  while the operator is looking at the local one. The tier choice is a UI position,
+  so it lives in `localStorage` beside the Build cursor, not in platform state.
 
 - **Views do not render their own title.** The toolbar owns it (`shell/Toolbar.tsx`,
   keyed off the route). A pane that repeats its own name under the window's title

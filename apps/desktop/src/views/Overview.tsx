@@ -16,6 +16,9 @@ import { bridge } from "../bridge/bridge";
 import { ago, bytes, count, duration, percent, usd } from "../lib/format";
 import { ACCENT, F, STATUS, T } from "../tokens";
 import { FitWidth, RankedBars, Sparkline } from "../primitives/charts";
+import { RunButton } from "./Actions";
+import { useAgentSheet } from "./AgentSheet";
+import { LadderStrip } from "./Tiers";
 import {
   Badge,
   Button,
@@ -224,6 +227,8 @@ export function Overview() {
         </section>
       </div>
 
+      <LadderStrip />
+
       <Agents />
 
       {runs.runs.length ? (
@@ -284,17 +289,12 @@ export function Overview() {
  *  everything unconditionally: an approval nobody notices is the failure mode
  *  that costs the most. */
 function Blockers({ approvals }: { approvals: readonly ApprovalOut[] }) {
-  const app = useApp();
   if (!approvals.length) return null;
   return (
     <Notice
       tone="warn"
       title={`${approvals.length} approval${approvals.length === 1 ? "" : "s"} waiting on a human`}
-      action={
-        <Button size="sm" onClick={() => app.navigate("commands", "local.approvals")}>
-          Resolve
-        </Button>
-      }
+      action={<RunButton id="local.approvals">Resolve</RunButton>}
     >
       {approvals
         .slice(0, 3)
@@ -338,12 +338,13 @@ function Health({ onRefresh }: { onRefresh(): void }) {
           key={i}
           tone="error"
           action={
-            <Button
-              size="sm"
-              onClick={() => (issue.fix ? app.navigate("commands", issue.fix) : onRefresh())}
-            >
-              {issue.label ?? "Recheck"}
-            </Button>
+            issue.fix ? (
+              <RunButton id={issue.fix}>{issue.label ?? "Fix"}</RunButton>
+            ) : (
+              <Button size="sm" onClick={onRefresh}>
+                {issue.label ?? "Recheck"}
+              </Button>
+            )
           }
         >
           {issue.text}
@@ -356,6 +357,9 @@ function Health({ onRefresh }: { onRefresh(): void }) {
 function Agents() {
   const app = useApp();
   const res = useResources();
+  // One sheet for the whole list. Opening it from a row is what gives the 26
+  // agent-scoped commands somewhere to be that is not a search box.
+  const sheet = useAgentSheet();
 
   if (!app.api?.reachable) {
     return (
@@ -377,9 +381,9 @@ function Agents() {
         <EmptyState
           title="No agents deployed yet"
           action={
-            <Button tone="primary" onClick={() => app.navigate("commands", "local.deploy")}>
+            <RunButton id="local.deploy" tone="primary" size="md">
               Deploy a bundle
-            </Button>
+            </RunButton>
           }
         >
           The API is reachable and reports no agents. Deploy the bundle you have open with{" "}
@@ -391,12 +395,27 @@ function Agents() {
 
   return (
     <section>
-      <SectionHeader>Agents</SectionHeader>
+      <SectionHeader
+        right={
+          <span style={{ ...F.footnote, color: T.quaternary }}>
+            a row opens everything you can do to it
+          </span>
+        }
+      >
+        Agents
+      </SectionHeader>
       <Group>
         {app.agents.map((agent, i) => (
-          <AgentRow key={agent.id} agent={agent} first={i === 0} samples={res.samples} />
+          <AgentRow
+            key={agent.id}
+            agent={agent}
+            first={i === 0}
+            samples={res.samples}
+            onOpen={() => sheet.open(agent)}
+          />
         ))}
       </Group>
+      {sheet.element}
     </section>
   );
 }
@@ -405,18 +424,22 @@ function AgentRow({
   agent,
   first,
   samples,
+  onOpen,
 }: {
   agent: AgentSummary;
   first: boolean;
   samples: readonly { name: string; role: string; state: string }[];
+  onOpen(): void;
 }) {
-  const app = useApp();
   const live = samples.some(
     (s) => s.role === "runner" && s.state === "running" && s.name.includes(agent.name),
   );
 
+  // The row itself opens the agent, rather than jumping to the Canvas. A list
+  // whose rows navigate somewhere the row is not the subject of is a list you
+  // cannot act on.
   return (
-    <Row first={first} onClick={() => app.navigate("canvas")}>
+    <Row first={first} onClick={onOpen}>
       <Dot color={live ? ACCENT : T.quaternary} pulse={live} />
 
       <div style={{ width: 160, minWidth: 0 }}>
@@ -444,13 +467,15 @@ function AgentRow({
         ) : null}
       </div>
 
+      {/* The two most common verbs inline, already pointed at this agent; the
+          rest are one click away in the sheet the row opens. */}
       <div style={{ display: "flex", gap: 6 }} onClick={(e) => e.stopPropagation()}>
-        <Button size="sm" onClick={() => app.navigate("commands", "local.message")}>
+        <RunButton id="local.message" prefill={{ positionals: [agent.name] }}>
           Message
-        </Button>
-        <Button size="sm" tone="plain" onClick={() => app.navigate("commands", "local.memory")}>
+        </RunButton>
+        <RunButton id="local.memory" tone="plain" prefill={{ positionals: [agent.name] }}>
           Memory
-        </Button>
+        </RunButton>
       </div>
     </Row>
   );
