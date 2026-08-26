@@ -29,6 +29,7 @@ import {
   type ThemePreference,
   type ThemeState,
 } from "./shared/contract.js";
+import { type ThemeId, themeInfo } from "./shared/themes.js";
 import * as cli from "./ipc/cli.js";
 import { compareToLive } from "./ipc/manifest.js";
 import * as resources from "./ipc/resources.js";
@@ -106,10 +107,20 @@ let win: BrowserWindow | null = null;
  * it already accounts for "system" without this having to read the OS itself.
  */
 function themeState(): ThemeState {
-  return {
-    preference: prefs().theme,
-    effective: nativeTheme.shouldUseDarkColors ? "dark" : "light",
-  };
+  const preference = prefs().theme;
+  // "system" is the only preference the OS has an opinion about, and the OS only
+  // says light or dark, so it resolves to whichever base theme matches. Any other
+  // preference names a theme outright and the OS is irrelevant to it.
+  const effective: ThemeId =
+    preference === "system" ? (nativeTheme.shouldUseDarkColors ? "dark" : "light") : preference;
+  return { preference, effective, appearance: themeInfo(effective)?.appearance ?? "dark" };
+}
+
+/** What `nativeTheme` should be told, which is not the same as the preference:
+ *  picking Solarized Light has to put the window's own chrome in light too. */
+function nativeSourceFor(preference: ThemePreference): "system" | "light" | "dark" {
+  if (preference === "system") return "system";
+  return themeInfo(preference)?.appearance ?? "dark";
 }
 
 function createWindow(): BrowserWindow {
@@ -304,8 +315,11 @@ function registerIpc(): void {
 
   ipcMain.handle(CH.themeGet, (): ThemeState => themeState());
   ipcMain.handle(CH.themeSet, (_e, preference: ThemePreference): ThemeState => {
+    // Reject an id this build does not have rather than storing a preference
+    // that would resolve to nothing on the next launch.
+    if (preference !== "system" && !themeInfo(preference)) return themeState();
     update({ theme: preference });
-    nativeTheme.themeSource = preference;
+    nativeTheme.themeSource = nativeSourceFor(preference);
     return themeState();
   });
 
@@ -351,7 +365,7 @@ if (!app.requestSingleInstanceLock()) {
   // the traffic lights and any OS-drawn control follow `themeSource`, so setting
   // it is what makes a light window actually look native rather than a dark app
   // with pale colours in it.
-  nativeTheme.themeSource = prefs().theme;
+  nativeTheme.themeSource = nativeSourceFor(prefs().theme);
 
   void app.whenReady().then(() => {
     registerIpc();

@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppProvider, useApp } from "./app";
 import type { CurieBridge, ThemePreference, ThemeState } from "./bridge";
 
-let state: ThemeState = { preference: "system", effective: "dark" };
+let state: ThemeState = { preference: "system", effective: "dark", appearance: "dark" };
 let listener: ((s: ThemeState) => void) | null = null;
 const setCalls: ThemePreference[] = [];
 
@@ -66,7 +66,7 @@ function stubShell(): CurieBridge {
         setCalls.push(preference);
         // The shell resolves the preference; the renderer must not.
         const effective = preference === "system" ? "dark" : preference;
-        state = { preference, effective };
+        state = { preference, effective, appearance: effective === "light" ? "light" : "dark" };
         return state;
       },
       onChange: (cb) => {
@@ -92,7 +92,7 @@ function Probe() {
 }
 
 beforeEach(() => {
-  state = { preference: "system", effective: "dark" };
+  state = { preference: "system", effective: "dark", appearance: "dark" };
   listener = null;
   setCalls.length = 0;
   delete document.documentElement.dataset.theme;
@@ -147,7 +147,7 @@ describe("theme", () => {
       </AppProvider>,
     );
     await waitFor(() => expect(listener).not.toBeNull());
-    listener!({ preference: "system", effective: "light" });
+    listener!({ preference: "system", effective: "light", appearance: "light" });
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
     // Still "System" in the control: the OS changed, the choice did not.
     expect(screen.getByTestId("pref").textContent).toBe("system");

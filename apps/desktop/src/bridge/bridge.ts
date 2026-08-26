@@ -110,7 +110,7 @@ const detached: CurieBridge = {
   },
   graph: { load: async () => null, save: async () => {} },
   theme: {
-    get: async () => ({ preference: "system" as const, effective: "dark" as const }),
+    get: async () => ({ preference: "system" as const, effective: "dark" as const, appearance: "dark" as const }),
     set: reject("Changing the theme"),
     onChange: noop,
   },

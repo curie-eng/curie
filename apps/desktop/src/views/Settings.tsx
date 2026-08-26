@@ -8,9 +8,10 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 import { useApp } from "../bridge/app";
+import { THEMES } from "../../electron/shared/themes";
 import { commands } from "../lib/manifest";
 import { bridge, hasShell } from "../bridge/bridge";
-import { ACCENT, F, FONT, R, S, STATUS, T } from "../tokens";
+import { ACCENT, F, FONT, LINE, R, S, STATUS, T, tint } from "../tokens";
 import {
   Badge,
   Button,
@@ -21,7 +22,6 @@ import {
   Notice,
   Row,
   SectionHeader,
-  Segmented,
   Sheet,
 } from "../primitives";
 
@@ -65,39 +65,141 @@ export function Settings() {
 function AppearancePanel() {
   const app = useApp();
   const theme = app.theme;
+  const preference = theme?.preference ?? "system";
 
   return (
     <Panel
       title="Appearance"
       right={
         <span style={{ ...F.footnote, color: T.quaternary }}>
-          System follows the OS, including when it switches at sunset
+          {THEMES.length} themes
         </span>
       }
     >
       <Row first>
-        <Field label="Theme">
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <Segmented
-              value={theme?.preference ?? "system"}
-              onChange={(v) => app.setTheme(v)}
-              options={[
-                { value: "system", label: "System" },
-                { value: "light", label: "Light" },
-                { value: "dark", label: "Dark" },
-              ]}
+        <Field
+          label="Theme"
+          hint="System follows the OS, including when it switches at sunset. Anything else is absolute."
+        >
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <ThemeChoice
+              id="system"
+              label="System"
+              swatch={null}
+              active={preference === "system"}
+              note={theme?.preference === "system" ? `currently ${theme.effective}` : undefined}
+              onPick={() => app.setTheme("system")}
             />
-            {/* Under "System" the choice alone does not say what you will get,
-                so the resolved answer is shown next to it. */}
-            {theme?.preference === "system" ? (
-              <span style={{ ...F.footnote, color: T.tertiary }}>
-                currently {theme.effective}
-              </span>
-            ) : null}
+            {/* A grid rather than a list: seventeen themes read as a palette to
+                scan, and each one is recognisable from its own colours without
+                being applied. */}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(168px, 1fr))",
+                gap: 6,
+              }}
+            >
+              {THEMES.map((t) => (
+                <ThemeChoice
+                  key={t.id}
+                  id={t.id}
+                  label={t.label}
+                  swatch={t.swatch}
+                  active={preference === t.id}
+                  onPick={() => app.setTheme(t.id)}
+                />
+              ))}
+            </div>
           </div>
         </Field>
       </Row>
     </Panel>
+  );
+}
+
+/** One theme, drawn in its own colours. */
+function ThemeChoice({
+  id,
+  label,
+  swatch,
+  active,
+  note,
+  onPick,
+}: {
+  id: string;
+  label: string;
+  swatch: readonly [string, string, string] | null;
+  active: boolean;
+  note?: string;
+  onPick(): void;
+}) {
+  return (
+    <button
+      onClick={onPick}
+      title={id}
+      aria-pressed={active}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 9,
+        width: "100%",
+        textAlign: "left",
+        border: `1px solid ${active ? ACCENT : LINE.border}`,
+        background: active ? tint(ACCENT, 0.1) : S.control,
+        borderRadius: R.control,
+        padding: "6px 9px",
+        cursor: "default",
+        color: "inherit",
+      }}
+    >
+      {swatch ? (
+        // The theme's own content, raised and accent colours, so the swatch is
+        // the palette rather than a label with a dot next to it.
+        <span
+          aria-hidden
+          style={{
+            display: "flex",
+            flex: "none",
+            width: 26,
+            height: 18,
+            borderRadius: 4,
+            overflow: "hidden",
+            border: `1px solid ${LINE.border}`,
+          }}
+        >
+          <span style={{ flex: 1, background: swatch[0] }} />
+          <span style={{ flex: 1, background: swatch[1] }} />
+          <span style={{ flex: "none", width: 6, background: swatch[2] }} />
+        </span>
+      ) : (
+        <span
+          aria-hidden
+          style={{
+            flex: "none",
+            width: 26,
+            height: 18,
+            borderRadius: 4,
+            border: `1px dashed ${LINE.strong}`,
+          }}
+        />
+      )}
+      <span style={{ minWidth: 0, flex: 1 }}>
+        <span
+          style={{
+            ...F.body,
+            display: "block",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            color: active ? T.primary : T.secondary,
+          }}
+        >
+          {label}
+        </span>
+        {note ? <span style={{ ...F.footnote, color: T.tertiary }}>{note}</span> : null}
+      </span>
+    </button>
   );
 }
 
