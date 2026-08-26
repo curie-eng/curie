@@ -18,7 +18,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useApp } from "../bridge/app";
-import { BundleMenu } from "../shell/BundleMenu";
 import { SlackPacks } from "./BuildPacks";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
@@ -39,7 +38,7 @@ import {
   type PluginManifest,
   type SkillMeta,
 } from "../lib/bundle";
-import { ACCENT, F, FONT, LINE, R, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, FONT, LINE, S, STATUS, T, tint } from "../tokens";
 import {
   Badge,
   Button,
@@ -62,10 +61,85 @@ export function Build() {
   const app = useApp();
   const ws = app.workspace;
 
-  if (!ws) return <NoBundle />;
-  // Keyed on the path so switching bundles resets every bit of editing state
-  // rather than carrying a half-typed SKILL.md across.
-  return <Workbench key={ws.path} />;
+  // Master-detail, with the list on the left.
+  //
+  // Switching used to be a chevron on the bundle's own name in the header, which
+  // hid the set of agents behind a click on the thing you had already chosen. A
+  // standing list says how many there are and which one you are in without being
+  // opened.
+  //
+  // It goes to the LEFT of the detail, not into the empty band on the right: that
+  // band is not free space, it is the content pane's `maxWidth: 1080` cap, so a
+  // list out there would sit outside the column every other view is measured
+  // against. Inside the cap, list-then-detail is also the order these panes are
+  // read in.
+  return (
+    <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+      <AgentList />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        {/* Keyed on the path so switching resets every bit of editing state
+            rather than carrying a half-typed SKILL.md across. */}
+        {ws ? <Workbench key={ws.path} /> : <NoBundle />}
+      </div>
+    </div>
+  );
+}
+
+/** The agents this app knows about, and the way to add one. */
+function AgentList() {
+  const app = useApp();
+  const active = app.workspace?.path ?? null;
+
+  return (
+    <section style={{ width: 196, flex: "none" }}>
+      <SectionHeader>Agents</SectionHeader>
+      <Group>
+        {app.workspaces.length === 0 ? (
+          <div style={{ padding: "12px 14px", ...F.footnote, color: T.tertiary }}>
+            None yet.
+          </div>
+        ) : (
+          app.workspaces.map((w, i) => (
+            <Row
+              key={w.path}
+              first={i === 0}
+              selected={w.path === active}
+              onClick={() => app.selectWorkspace(w.path)}
+            >
+              <div style={{ minWidth: 0 }} title={w.path}>
+                <div
+                  style={{
+                    ...F.body,
+                    color: w.path === active ? T.primary : T.secondary,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {w.plugin?.name ?? w.name}
+                </div>
+                <div style={{ ...F.footnote, color: T.quaternary, marginTop: 1 }}>
+                  {w.skills.length} skill{w.skills.length === 1 ? "" : "s"}
+                  {w.hasEvals ? " · evals" : ""}
+                </div>
+              </div>
+            </Row>
+          ))
+        )}
+      </Group>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
+        <Button size="sm" onClick={() => app.navigate("commands", "init")}>
+          + New Agent
+        </Button>
+        {/* Adding an agent that already exists on disk. Also File -> Open
+            Bundle, but a menu-only action is not discoverable from here. */}
+        <Button size="sm" tone="plain" onClick={() => void app.openWorkspace()}>
+          Open existing…
+        </Button>
+      </div>
+    </section>
+  );
 }
 
 function NoBundle() {
@@ -304,38 +378,14 @@ function Header({ checks, plugin }: { checks: readonly Check[]; plugin?: PluginM
   const ws = app.workspace!;
   const v = verdict(checks);
   const color = v.level === "ok" ? ACCENT : LEVEL_COLOR[v.level];
-  const [picking, setPicking] = useState(false);
 
   return (
     <Group style={{ padding: 16 }}>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-            {/* The bundle's name is the switcher. This tab is entirely about the
-                open bundle, so the list of bundles belongs here and not only in
-                the sidebar, where it was the single place to change it. */}
-            <span style={{ position: "relative" }}>
-              <button
-                onClick={() => setPicking((o) => !o)}
-                title="Switch bundle"
-                style={{
-                  display: "inline-flex",
-                  alignItems: "baseline",
-                  gap: 7,
-                  border: "none",
-                  background: "transparent",
-                  borderRadius: R.control,
-                  padding: "1px 6px 1px 0",
-                  margin: 0,
-                  cursor: "default",
-                  color: "inherit",
-                }}
-              >
-                <span style={{ ...F.title }}>{plugin?.name ?? ws.name}</span>
-                <span style={{ ...F.caption, color: T.quaternary }}>{picking ? "▲" : "▼"}</span>
-              </button>
-              {picking ? <BundleMenu panel={{ left: 0 }} onClose={() => setPicking(false)} /> : null}
-            </span>
+            {/* A label, not a control: switching is the list on the left. */}
+            <span style={{ ...F.title }}>{plugin?.name ?? ws.name}</span>
             {plugin?.version ? <Badge>{plugin.version}</Badge> : null}
             <Badge color={color} filled>
               {v.text}

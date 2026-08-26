@@ -125,6 +125,17 @@ React + TypeScript renderer. Full structure and rationale in
   accent (`ACCENT`), and monospace for anything that is literally a command,
   path, digest, or id.
 
+- **Build is master-detail: the agent list, then the open bundle.** Switching was
+  briefly a chevron on the bundle's own name in the header, which hid the set of
+  agents behind a click on the one already chosen. A standing list says what
+  exists, which one is open, and how to add one, without being opened.
+
+  It sits to the **left** of the detail, inside the content pane's
+  `maxWidth: 1080`. The empty band on the right of a wide window is that cap, not
+  free space, so a list placed there would sit outside the column every other
+  view is measured against. Verified down to the 1040px minimum window width: no
+  horizontal overflow, and the file list and editor both stay legible.
+
 - **Views do not render their own title.** The toolbar owns it (`shell/Toolbar.tsx`,
   keyed off the route). A pane that repeats its own name under the window's title
   bar is a web header.
