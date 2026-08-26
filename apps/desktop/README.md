@@ -291,7 +291,8 @@ src/
   lib/packs.ts        behavior packs, mirroring curie_worker.behaviorpacks
   lib/workloads.ts    filtering, grouping and roll-up for the resource table
   primitives/         controls and hand-drawn charts
-  shell/              title bar, rail, status bar, palette, transcript drawer
+  shell/              toolbar, rail, machine status, palette, transcript drawer
+  shell/BundleMenu    the list of known bundles, shown by the Build header
   views/              the six surfaces + CommandForm
   graph/model.ts      derives the canvas graph from live state
 ```
