@@ -282,7 +282,6 @@ function registerIpc(): void {
     };
   });
 
-  ipcMain.handle(CH.cliPreview, (_e, inv: CliInvocation) => cli.previewCommand(inv));
   ipcMain.handle(CH.cliRun, (_e, inv: CliInvocation) => cli.startRun(requireWindow(), inv));
   ipcMain.handle(CH.cliCancel, (_e, runId: string) => cli.cancelRun(runId));
   ipcMain.handle(CH.cliWrite, (_e, runId: string, data: string) => cli.writeToRun(runId, data));

@@ -245,9 +245,6 @@ export interface CurieBridge {
   env(): Promise<ShellEnvironment>;
 
   cli: {
-    /** Resolve an invocation to argv without running it -- powers the live
-     *  command preview under every form in the app. */
-    preview(inv: CliInvocation): Promise<ResolvedCommand>;
     run(inv: CliInvocation): Promise<RunHandle>;
     cancel(runId: string): Promise<void>;
     /** stdin for the interactive commands (`init`, `skill eval-init`). */
@@ -312,7 +309,6 @@ export interface CurieBridge {
 
 export const CH = {
   env: "curie:env",
-  cliPreview: "curie:cli:preview",
   cliRun: "curie:cli:run",
   cliCancel: "curie:cli:cancel",
   cliWrite: "curie:cli:write",

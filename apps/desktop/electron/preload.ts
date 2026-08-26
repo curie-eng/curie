@@ -29,7 +29,6 @@ const bridge: CurieBridge = {
   env: () => ipcRenderer.invoke(CH.env),
 
   cli: {
-    preview: (inv: CliInvocation) => ipcRenderer.invoke(CH.cliPreview, inv),
     run: (inv: CliInvocation) => ipcRenderer.invoke(CH.cliRun, inv),
     cancel: (runId: string) => ipcRenderer.invoke(CH.cliCancel, runId),
     write: (runId: string, data: string) => ipcRenderer.invoke(CH.cliWrite, runId, data),

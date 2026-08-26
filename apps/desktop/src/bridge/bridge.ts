@@ -67,7 +67,6 @@ const detached: CurieBridge = {
     drift: null,
   }),
   cli: {
-    preview: reject("Previewing a command"),
     run: reject("Running a command"),
     cancel: async () => {},
     write: async () => {},

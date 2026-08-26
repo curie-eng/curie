@@ -85,10 +85,6 @@ export function defaultCwd(): string {
   return process.env.CURIE_WORKSPACE ?? homedir();
 }
 
-export function previewCommand(inv: CliInvocation): ResolvedCommand {
-  return resolveInvocation(inv, inv.cwd || defaultCwd());
-}
-
 /** One-shot run collected into a string. Used for the shell's own probes
  *  (`curie --version`, `secrets list`), never for anything long-running. */
 export async function runOnce(

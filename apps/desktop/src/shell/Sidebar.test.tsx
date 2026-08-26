@@ -36,7 +36,6 @@ function stubShell(env: Partial<ShellEnvironment>): CurieBridge {
       ...env,
     }),
     cli: {
-      preview: async () => ({ argv: [], display: "", cwd: "/tmp" }),
       run: async () => ({ runId: "r1", command: { argv: [], display: "", cwd: "/tmp" } }),
       cancel: async () => {},
       write: async () => {},
