@@ -92,8 +92,13 @@ export const S = {
   /** The inset pane holding the current view. Opaque, so text on it stays
    *  readable regardless of what is behind the window. */
   content: "var(--s-content)",
-  /** A grouped list or panel sitting on `content`. */
+  /** A grouped list or panel sitting on `content`. A plain colour, because the
+   *  canvas uses it as an SVG fill. */
   raised: "var(--s-raised)",
+  /** What a card actually paints: may be a gradient, and on light themes is one.
+   *  Use this for a panel's background and `raised` only where a flat colour is
+   *  required. */
+  cardFill: "var(--card-fill)",
   /** A row inside a grouped list, on hover. */
   hover: "var(--s-hover)",
   /** A selected row. */

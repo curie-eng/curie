@@ -59,11 +59,24 @@ const css = readFileSync(join(root, "src", "styles.css"), "utf8");
 function baseVars(selector) {
   const start = css.indexOf(selector);
   if (start < 0) throw new Error(`no ${selector} block in styles.css`);
-  const end = css.indexOf("}", start);
+  const end = css.indexOf("\n}", start);
+  // Comments come out FIRST, then split. A prose comment can contain a
+  // semicolon -- one of them does -- and splitting first severs the declaration
+  // that follows it from its own name, which drops the variable silently.
+  const body = css.slice(start + selector.length, end).replace(/\/\*[\s\S]*?\*\//g, "");
   const out = {};
-  for (const line of css.slice(start, end).split("\n")) {
-    const m = line.match(/^\s*(--[\w-]+)\s*:\s*(.+?);\s*$/);
-    if (m) out[m[1]] = m[2];
+  // Split on declarations rather than lines: a gradient or a layered shadow is
+  // written across several lines, and a line-based reader silently drops it.
+  for (const decl of body.split(";")) {
+    const clean = decl.trim();
+    const i = clean.indexOf(":");
+    if (i < 0 || !clean.startsWith("--")) continue;
+    out[clean.slice(0, i).trim()] = clean
+      .slice(i + 1)
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .join(" ");
   }
   return out;
 }
@@ -215,6 +228,9 @@ function derive(theme) {
       "--s-control-hover": alpha(fg, 0.17),
       "--s-subtle": alpha(fg, 0.07),
       "--s-stripe": alpha(fg, 0.02),
+      // Flat: a lighter panel on a darker pane already reads as raised, and a
+      // gradient here only muddies it.
+      "--card-fill": mix(bg, fg, 0.1),
     });
   } else {
     Object.assign(vars, {
@@ -231,6 +247,15 @@ function derive(theme) {
       "--s-control-hover": alpha("#000000", 0.12),
       "--s-subtle": alpha("#000000", 0.05),
       "--s-stripe": alpha("#000000", 0.022),
+      // Gradient plus real translucency, so the bottom edge picks up the pane.
+      // Flat white with a hairline is what reads as unstyled.
+      "--card-fill": `linear-gradient(180deg, ${alpha(bg, 0.98)} 0%, ${alpha(bg, 0.82)} 100%)`,
+      "--shadow-card": [
+        "inset 0 1px 0 rgba(255, 255, 255, 0.9)",
+        `0 0 0 0.5px ${alpha(mix(bg, "#000000", 0.85), 0.09)}`,
+        `0 1px 2px ${alpha(mix(bg, "#000000", 0.85), 0.05)}`,
+        `0 8px 20px -6px ${alpha(mix(bg, "#000000", 0.85), 0.12)}`,
+      ].join(", "),
     });
   }
 
@@ -260,6 +285,7 @@ function derive(theme) {
 
   // High contrast means a visible edge, not a soft one, and no elevation blur.
   if (contrast) {
+    vars["--card-fill"] = dark ? mix(bg, fg, 0.1) : bg;
     vars["--shadow-card"] = `0 0 0 1px ${alpha(lineBase, 0.7)}`;
     vars["--shadow-overlay"] = `0 0 0 1px ${alpha(lineBase, 0.7)}`;
     vars["--shadow-sheet"] = `0 0 0 1px ${alpha(lineBase, 0.7)}`;
