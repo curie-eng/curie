@@ -163,13 +163,15 @@ React + TypeScript renderer. Full structure and rationale in
 
     **A surface reaching the seam has two honest options, and fading is only
     one of them.** Either take the same ramp (`paneFadeTo(fill)`), or do not
-    touch the seam at all. The console tried the first and it looked wrong: a
-    terminal is an object with a boundary, and an edge that dissolves into the
-    chrome reads as a rendering fault rather than as softness. It is inset with a
-    2px outline instead, which sidesteps the question -- nothing to blend into,
-    because it no longer reaches. Reserve the ramp for surfaces that genuinely
-    are the pane (the pane itself, its toolbar); give anything that is an object
-    a boundary and keep it off the edge.
+    touch the seam at all. The console tried the ramp and it looked wrong, then
+    tried a heavy outline of its own and looked like a stranger. It is a `Group`
+    inset by the pane's own horizontal padding: the same glass, radius and shadow
+    as every card, on the same left edge as the content above it. Reserve the
+    ramp for surfaces that genuinely *are* the pane -- the pane and its toolbar.
+    Anything sitting inside it is a card, and gets a card's treatment.
+
+    The inset comes from one `padX` in `App.tsx` that `main` and the console both
+    read, rather than a number copied into two files that then drift apart.
 
   - **Grouping is `Group` + `Row`** -- one rounded container, hairline separators
     inset from the left, a small uppercase `SectionHeader` *outside* the box. Not

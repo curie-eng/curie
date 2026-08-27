@@ -32,8 +32,8 @@ import { useApp } from "../bridge/app";
 import { transcriptText, useRuns, type Run } from "../bridge/runs";
 import { complete, parseCommand } from "../lib/parseCommand";
 import { duration } from "../lib/format";
-import { ACCENT, F, FONT, LINE, R, S, STATUS, T } from "../tokens";
-import { Button, CopyButton, Dot, Kbd, Mono } from "../primitives";
+import { ACCENT, F, FONT, LINE, STATUS, T } from "../tokens";
+import { Button, CopyButton, Dot, Group, Kbd, Mono } from "../primitives";
 
 /** A line the console itself wrote, as opposed to one a process wrote. */
 interface Note {
@@ -58,7 +58,7 @@ function loadHistory(): string[] {
   }
 }
 
-export function Console() {
+export function Console({ padX }: { padX: number }) {
   const app = useApp();
   const runs = useRuns();
 
@@ -78,6 +78,7 @@ export function Console() {
   const focused = runs.focused ? runs.get(runs.focused) : undefined;
   const active = focused?.state === "running" || focused?.state === "pending";
   const expanded = runs.consoleOpen;
+  const hidden = runs.consoleHidden;
 
   const say = useCallback((kind: Note["kind"], text: string) => {
     setNotes((prev) => [...prev, { id: nextNoteId++, kind, text }].slice(-200));
@@ -225,23 +226,21 @@ export function Console() {
     }
   };
 
+  // Dismissed is dismissed: no residual strip, or the button would not have
+  // done what it said. ⌘L brings it back, and so does anything that starts a
+  // run, because output needs somewhere to land.
+  if (hidden) return null;
+
   return (
-    <div
+    <Group
       style={{
         flex: "none",
-        // An inset panel, not a full-bleed band. Reaching the sidebar seam meant
-        // matching the pane's fade there, and a fading terminal edge reads as a
-        // rendering fault rather than as softness -- a terminal is an object with
-        // a boundary. Insetting it sidesteps the seam entirely: nothing to blend
-        // into, because it no longer touches.
-        margin: "0 14px 14px",
-        borderRadius: R.group,
-        // Deliberately thicker than a hairline. This is the one surface that is
-        // a container for something else's output rather than a card of its own
-        // content, and the outline is what says where that container ends.
-        border: `2px solid ${LINE.strong}`,
-        overflow: "hidden",
-        background: S.well,
+        // Inset rather than full-bleed, and by the pane's OWN horizontal
+        // padding, so the console's edges sit on the same lines as every card
+        // above it. Reaching the sidebar seam meant matching the pane's fade
+        // there, and a fading terminal edge reads as a rendering fault rather
+        // than as softness. Insetting sidesteps the seam entirely.
+        margin: `0 ${padX}px ${padX}px`,
         display: "flex",
         flexDirection: "column",
         // Bounded: the console is a strip you type into, and the pane above is
@@ -274,7 +273,7 @@ export function Console() {
           if (!expanded) runs.setConsoleOpen(true);
         }}
       />
-    </div>
+    </Group>
   );
 }
 
@@ -361,6 +360,14 @@ function Header({
             History
           </Button>
         ) : null}
+        <Button
+          size="sm"
+          tone="plain"
+          title="Hide the console — ⌘L brings it back, and so does running anything"
+          onClick={() => runs.setConsoleHidden(true)}
+        >
+          ✕
+        </Button>
       </span>
       <span style={{ ...F.footnote, color: T.quaternary }}>{expanded ? "⌄" : "⌃"}</span>
     </button>
@@ -457,7 +464,11 @@ function Prompt({
         gap: 8,
         padding: "8px 12px",
         borderTop: `1px solid ${LINE.separator}`,
-        background: S.field,
+        // Transparent, not a field fill. The console is a glass card now, and an
+        // opaque white input row punched a solid rectangle through it. A prompt
+        // line is not boxed in a terminal either -- the lead glyph and the
+        // hairline above are what mark it.
+        background: "transparent",
       }}
     >
       <Mono style={{ fontSize: 12, color: leadColour, flex: "none", fontWeight: 600 }}>{lead}</Mono>
