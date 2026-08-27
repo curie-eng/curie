@@ -69,17 +69,18 @@ function Keys() {
         e.preventDefault();
         return runs.setDrawerOpen(!runs.drawerOpen);
       }
-      if (mod && /^[1-7]$/.test(e.key)) {
+      if (mod && /^[1-6]$/.test(e.key)) {
         e.preventDefault();
         // Top to bottom as the sidebar draws them, Commands last: a number
         // that does not match the row it lands on is worse than no shortcut.
+        // History has no number of its own -- it is a pane of Commands, reached
+        // with the toolbar's switch or from the Go menu.
         const routes = [
           "overview",
           "build",
           "tiers",
           "resources",
           "canvas",
-          "activity",
           "commands",
         ] as const;
         return app.navigate(routes[Number(e.key) - 1]);

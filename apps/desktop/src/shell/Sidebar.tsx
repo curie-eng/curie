@@ -78,12 +78,6 @@ const ITEMS: readonly Item[] = [
     hint: "Agents, pipelines, infra",
     icon: <Icon d="M3.2 3.6h3.4v3.2H3.2zM9.4 9.2h3.4v3.2H9.4zM6.6 5.2h2.2a2 2 0 0 1 2 2v2" />,
   },
-  {
-    id: "activity",
-    label: "Activity",
-    hint: "What this app has run",
-    icon: <Icon d="M1.8 8h2.9l1.9-4.4L9.9 12.4l1.7-4.4h2.6" />,
-  },
 ];
 
 export function Sidebar() {
@@ -120,11 +114,8 @@ export function Sidebar() {
             badge={
               item.id === "resources" && res.totals.running
                 ? String(res.totals.running)
-                : item.id === "activity" && runs.active.length
-                  ? String(runs.active.length)
-                  : undefined
+                : undefined
             }
-            busy={item.id === "activity" && runs.active.length > 0}
           />
         ))}
       </div>
@@ -135,20 +126,27 @@ export function Sidebar() {
 
       {/* Commands and Settings sit together at the foot, below the flex spacer.
           The rail above is where the work is: a bundle, the tiers it runs on,
-          what is consuming the machine. Commands is the reference you fall back
-          to -- every command it lists has a control on one of those screens --
-          and a reference that sits fifth in the primary rail reads as the place
-          you are supposed to start. It is not. */}
+          what is consuming the machine. Commands is where you go to look
+          something up or to read back what ran -- both panes are ABOUT commands
+          rather than places you operate -- and a tab like that sitting in the
+          primary rail reads as somewhere you are supposed to start. It is not.
+
+          Its badge is the number of commands running right now, which is why
+          Activity does not need a rail slot of its own: the one signal it
+          carried lives here. */}
       <div style={{ padding: "0 10px 10px", display: "flex", flexDirection: "column", gap: 1 }}>
         <NavItem
           item={{
             id: "commands",
             label: "Commands",
-            hint: "Every curie command, and where each one lives",
+            hint: "Every curie command, where each one lives, and what has run",
             icon: <Icon d="m3 4.6 3 3-3 3M8.4 11.4H13" />,
           }}
-          active={app.route === "commands"}
+          // Active for either pane: History is not a separate destination.
+          active={app.route === "commands" || app.route === "activity"}
           onClick={() => app.navigate("commands")}
+          badge={runs.active.length ? String(runs.active.length) : undefined}
+          busy={runs.active.length > 0}
         />
         <NavItem
           item={{

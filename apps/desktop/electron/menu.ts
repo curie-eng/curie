@@ -70,9 +70,11 @@ export function buildMenu(getWin: () => BrowserWindow | null): Menu {
         { label: "Tiers", accelerator: "CmdOrCtrl+3", click: go(getWin, "tiers") },
         { label: "Resources", accelerator: "CmdOrCtrl+4", click: go(getWin, "resources") },
         { label: "Canvas", accelerator: "CmdOrCtrl+5", click: go(getWin, "canvas") },
-        { label: "Activity", accelerator: "CmdOrCtrl+6", click: go(getWin, "activity") },
         { type: "separator" },
-        { label: "Commands", accelerator: "CmdOrCtrl+7", click: go(getWin, "commands") },
+        // Two panes of one tab, so they sit together and only the tab gets a
+        // number -- matching the single row the sidebar draws for both.
+        { label: "Commands", accelerator: "CmdOrCtrl+6", click: go(getWin, "commands") },
+        { label: "Command History", click: go(getWin, "activity") },
       ],
     },
     {
