@@ -7,7 +7,7 @@
 
 import { useApp, type Route } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
-import { F, LINE, M, R, S, STATUS, T } from "../tokens";
+import { F, LINE, M, PANE_FADE, R, S, STATUS, T } from "../tokens";
 import { Button, Kbd, Segmented, Spinner } from "../primitives";
 
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
@@ -43,7 +43,7 @@ export function Toolbar({ scrolled }: { scrolled: boolean }) {
         // strip over a translucent pane would read as a title bar stuck on top,
         // and a strip that did not fade would put a hard corner back at the top
         // of the seam the pane just softened.
-        background: `linear-gradient(90deg, transparent 0, ${S.contentFill} 40px)`,
+        background: PANE_FADE,
         // The separator appears only once content has scrolled under the
         // toolbar, which is exactly how the platform handles it. A permanent
         // rule under the header is the giveaway.

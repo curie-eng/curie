@@ -276,6 +276,42 @@ export function readable(color: string): string {
   return `color-mix(in srgb, ${color} 68%, var(--t-primary))`;
 }
 
+/**
+ * The ramp the content pane and its toolbar paint at the sidebar seam.
+ *
+ * Eased, not linear, and that is the whole point. A linear ramp is smooth in
+ * VALUE -- measured across the seam the largest step is 2/255, far under
+ * anything the eye can resolve -- but its SLOPE jumps from zero to constant on
+ * one pixel, and a first-derivative discontinuity is exactly what triggers Mach
+ * banding: lateral inhibition in the visual system exaggerates the junction and
+ * paints a band that is not in the signal. The line people see there is real
+ * perception of a real geometric fact, not a rendering artifact.
+ *
+ * The stops approximate smoothstep (t^2 * (3 - 2t)), so the ramp leaves zero and
+ * arrives at full strength with the slope near zero at both ends. Over the first
+ * 5px it rises about an eighth as fast as the linear version did.
+ *
+ * Shared because the toolbar has to paint the identical ramp from the identical
+ * origin -- it is a child of the pane at the same left edge, and any divergence
+ * puts a corner back at the top of the seam.
+ */
+export const PANE_FADE = [
+  "linear-gradient(90deg",
+  "transparent 0",
+  `${tintOf("var(--s-content-fill)", 0.014)} 5px`,
+  `${tintOf("var(--s-content-fill)", 0.156)} 10px`,
+  `${tintOf("var(--s-content-fill)", 0.5)} 20px`,
+  `${tintOf("var(--s-content-fill)", 0.844)} 30px`,
+  `${tintOf("var(--s-content-fill)", 0.986)} 35px`,
+  "var(--s-content-fill) 40px)",
+].join(", ");
+
+/** `tint` by another name, declared before the const above can use it. */
+function tintOf(color: string, alpha: number): string {
+  const pct = Math.round(Math.max(0, Math.min(1, alpha)) * 100);
+  return `color-mix(in srgb, ${color} ${pct}%, transparent)`;
+}
+
 export function tint(color: string, alpha: number): string {
   // `color-mix` rather than appending a hex alpha, because every colour is now a
   // `var(--x)` and you cannot concatenate an alpha onto a variable reference.
