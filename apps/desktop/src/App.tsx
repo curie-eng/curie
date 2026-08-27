@@ -74,8 +74,13 @@ function Keys() {
       // button with extra steps.
       if (mod && e.key.toLowerCase() === "l") {
         e.preventDefault();
+        runs.setConsoleHidden(false);
         runs.setConsoleOpen(true);
-        document.querySelector<HTMLInputElement>("[data-console-input]")?.focus();
+        // The console may have been hidden a moment ago, so the input does not
+        // exist until this render commits.
+        requestAnimationFrame(() =>
+          document.querySelector<HTMLInputElement>("[data-console-input]")?.focus(),
+        );
         return;
       }
       if (mod && /^[1-6]$/.test(e.key)) {
@@ -113,6 +118,10 @@ function Frame() {
   // Canvas and Commands manage their own scrolling and want the whole pane;
   // the rest are documents and get padding and a comfortable measure.
   const bleed = route === "canvas" || route === "commands";
+  // One value for the pane's horizontal inset, so the console at the foot lines
+  // up with the content above it by construction rather than by a number copied
+  // into two files that then drift.
+  const padX = bleed ? 16 : 22;
 
   // Two halves of "start the new view at the top", each in the place it belongs.
   //
@@ -175,7 +184,7 @@ function Frame() {
             flex: 1,
             minWidth: 0,
             overflow: bleed ? "hidden" : "auto",
-            padding: bleed ? 16 : "18px 22px 32px",
+            padding: bleed ? padX : `18px ${padX}px 32px`,
           }}
         >
           {/* Wide enough that a large window is used rather than framed by a dead
@@ -184,7 +193,7 @@ function Frame() {
             <View />
           </div>
         </main>
-        <Console />
+        <Console padX={padX} />
       </div>
 
       {/* One sheet host for the whole app: any control anywhere opens the

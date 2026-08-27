@@ -60,6 +60,11 @@ interface RunsValue {
    *  scrollback. It lives here rather than in the console because three other
    *  places open it: a run starting, the ⌘L focus shortcut, and History's
    *  "Open transcript". */
+  /** Dismissed entirely, not merely collapsed. Cleared whenever a command
+   *  starts: output with nowhere visible to land is worse than a panel someone
+   *  asked to hide, and every other surface in the app starts runs too. */
+  readonly consoleHidden: boolean;
+  setConsoleHidden(hidden: boolean): void;
   readonly consoleOpen: boolean;
   setConsoleOpen(open: boolean): void;
 }
@@ -92,6 +97,7 @@ export function RunsProvider({ children }: { children: ReactNode }) {
   const [runs, setRuns] = useState<Run[]>([]);
   const [focused, setFocused] = useState<string | null>(null);
   const [consoleOpen, setConsoleOpen] = useState(false);
+  const [consoleHidden, setConsoleHidden] = useState(false);
   // Chunks can arrive before `start()`'s promise resolves and puts the run in
   // state, so early output is parked here and flushed when the run appears.
   const pending = useRef(new Map<string, RunChunk[]>());
@@ -153,6 +159,7 @@ export function RunsProvider({ children }: { children: ReactNode }) {
     setRuns((prev) => [run, ...prev].slice(0, 200));
     setFocused(handle.runId);
     setConsoleOpen(true);
+    setConsoleHidden(false);
     return handle.runId;
   }, []);
 
@@ -178,8 +185,10 @@ export function RunsProvider({ children }: { children: ReactNode }) {
       focus: setFocused,
       consoleOpen,
       setConsoleOpen,
+      consoleHidden,
+      setConsoleHidden,
     }),
-    [runs, start, cancel, send, clear, focused, consoleOpen],
+    [runs, start, cancel, send, clear, focused, consoleOpen, consoleHidden],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
