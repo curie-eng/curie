@@ -253,6 +253,25 @@ export type NodeKind = keyof typeof KIND_COLOR;
 /** Mix a colour with the surface behind it, for tinted backgrounds that stay
  *  flat rather than glowing. Alpha is expressed as a two-digit hex suffix,
  *  which every colour above supports because they are all 6-digit hex or rgba. */
+/**
+ * A categorical colour, pulled far enough toward the text colour to be read as
+ * text on a tint of itself.
+ *
+ * The hue tokens carry one value doing two jobs: a *fill* (a chart stroke, a
+ * dot, a badge background) wants saturation, and *text* wants contrast against
+ * the surface. Those pull in opposite directions, and in each theme it is the
+ * text job that loses -- a saturated blue is unreadable on dark, and a blue dark
+ * enough to read on white is mud as a bar.
+ *
+ * Mixing toward `--t-primary` resolves it without a second token per hue,
+ * because the direction is whatever the theme's ink is: on dark that lightens
+ * the colour, on light it darkens it. So the palette keeps one vivid value per
+ * hue and the ink is derived where it is used.
+ */
+export function readable(color: string): string {
+  return `color-mix(in srgb, ${color} 68%, var(--t-primary))`;
+}
+
 export function tint(color: string, alpha: number): string {
   // `color-mix` rather than appending a hex alpha, because every colour is now a
   // `var(--x)` and you cannot concatenate an alpha onto a variable reference.

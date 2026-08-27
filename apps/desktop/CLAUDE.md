@@ -219,6 +219,23 @@ React + TypeScript renderer. Full structure and rationale in
     pane made the whole window gloomy and the faintest text unreadable. Raise
     `--card-fill` instead and leave the pane where it is.
 
+  - **Dark ink sits far above the platform's own label alphas, deliberately.**
+    Apple's dark ladder is tuned for text on an OPAQUE dark surface. This window
+    is translucent, so every surface brightens toward whatever is behind it and
+    dim ink loses the contrast it was budgeted. Dark is 1.0 / 0.88 / 0.68 / 0.5.
+    Two earlier passes were still unreadable at 0.62 and then 0.7 for
+    `secondary`, which carries most of the body copy in the app. Most text in
+    dark mode should read as white; the ladder is there to rank it, not to hide
+    it. Do not "correct" these back toward the system values.
+
+  - **A categorical colour used as text goes through `readable()`.** The hue
+    tokens are one value doing two jobs -- a fill wants saturation, text wants
+    contrast -- and the text job loses in both themes: a saturated blue is
+    unreadable on dark, and a blue dark enough to read on white is mud as a bar.
+    `readable()` mixes toward `--t-primary`, so the direction is whatever the
+    theme's ink is, and one vivid token per hue serves both. `Badge` uses it for
+    its label while keeping the raw colour for the tint behind it.
+
   - **The ink ladder is four fixed alphas, and the base must match the
     generator.** `gen-themes.mjs` gives every derived theme
     0.95 / 0.7 / 0.48 / 0.3 (dark). The hand-tuned Curie Dark block in

@@ -53,16 +53,20 @@
   --s-subtle: rgba(255, 255, 255, 0.06);
   --s-stripe: rgba(255, 255, 255, 0.018);
 
-  /* The ink ladder, at the same alphas `gen-themes.mjs` gives every derived
-     theme (0.95 / 0.7 / 0.48 / 0.3). This block used to sit lower than all of
-     them -- 0.92 / 0.62 / 0.38 / 0.22 -- which made the hand-tuned Curie Dark
-     the faintest theme in the app rather than the reference the others are
-     measured against. `quaternary` in particular carries real prose in ~60
-     places, not just disabled chrome, and at 0.22 it was not readable. */
-  --t-primary: rgba(255, 255, 255, 0.95);
-  --t-secondary: rgba(235, 235, 245, 0.7);
-  --t-tertiary: rgba(235, 235, 245, 0.48);
-  --t-quaternary: rgba(235, 235, 245, 0.3);
+  /* The ink ladder: 1.0 / 0.88 / 0.68 / 0.5, matching `gen-themes.mjs` so the
+     hand-tuned base is not the faintest theme in the app.
+
+     These sit far higher than the platform's own dark label alphas, on purpose.
+     Apple's ladder is tuned for text on an OPAQUE dark surface; this window is
+     translucent, so every surface brightens toward whatever is behind it and
+     dim ink loses the contrast it was budgeted. Two earlier passes at this were
+     still too dark to read -- 0.62 and then 0.7 for secondary, which carries
+     most of the body copy in the app. Most text in dark mode should simply read
+     as white; the ladder exists to rank it, not to hide it. */
+  --t-primary: #ffffff;
+  --t-secondary: rgba(235, 235, 245, 0.88);
+  --t-tertiary: rgba(235, 235, 245, 0.68);
+  --t-quaternary: rgba(235, 235, 245, 0.5);
 
   --line-separator: rgba(255, 255, 255, 0.07);
   --line-border: rgba(255, 255, 255, 0.1);
@@ -72,7 +76,7 @@
   --status-warn: #ffd426;
   --status-danger: #ff453a;
   --status-info: #0a84ff;
-  --status-neutral: rgba(235, 235, 245, 0.38);
+  --status-neutral: rgba(235, 235, 245, 0.62);
 
   /* The travelling dot on a switch, and the ring on a focused control. */
   --knob: #ffffff;
