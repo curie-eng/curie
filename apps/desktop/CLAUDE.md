@@ -213,6 +213,20 @@ React + TypeScript renderer. Full structure and rationale in
     resolve "system" in the renderer with a media query -- two places deciding
     what the OS is doing will disagree.
 
+  - **Depth is a value gap plus a shadow, and translucency eats the gap.** A
+    card reads as raised because it is lighter than the pane *and* casts onto it.
+    Letting vibrancy through the pane brightens it toward whatever is behind the
+    window, which closes the gap and flattens every card on the screen -- the
+    shadow is still there and no longer has anything to sit on. So the pane's own
+    colour steps further from the cards than it needs to when opaque
+    (`--s-content-fill` is a markedly darker mix than `--s-content`), and the
+    card shadow is strong enough to survive a bright backdrop. If you change one
+    of those, look at the other.
+
+    Dark used to be flat on purpose, on the reasoning that a lighter panel on a
+    darker pane already reads as raised. Translucency retired that reasoning:
+    dark now gets the same four shadow layers in its own register.
+
   - **A card paints `S.cardFill`, not `S.raised`.** `raised` has to stay a plain
     colour because the canvas uses it as an SVG fill, where a gradient is invalid.
     `cardFill` is what a panel actually paints and on every light theme it is a

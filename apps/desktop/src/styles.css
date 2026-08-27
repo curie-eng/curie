@@ -38,7 +38,7 @@
      Light is the riskier direction if you push this further -- dark text over a
      bright wallpaper loses contrast faster than light text does -- so check a
      light theme before a dark one. */
-  --s-content-fill: rgba(36, 36, 38, 0.6);
+  --s-content-fill: rgba(26, 26, 28, 0.62);
   --s-raised: #2c2c2e;
   --s-hover: #333336;
   --s-selected: #3a3a3d;
@@ -83,7 +83,17 @@
      gradient there is invalid. Dark keeps the flat surface -- a lighter panel on a
      darker pane already reads as raised. */
   --card-fill: #2c2c2e;
-  --shadow-card: none;
+  /* Dark used to be flat, on the reasoning that a lighter panel on a darker
+     pane already reads as raised. Translucency weakened that: the pane now
+     brightens toward whatever is behind the window, so the panel's edge can
+     land on something close to its own value and the card flattens out. It
+     gets the same four jobs as light, in dark's register -- a faint top
+     highlight, a dark hairline, a tight seat, a wide lift. */
+  --shadow-card:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 0 0 0.5px rgba(0, 0, 0, 0.55),
+    0 1px 3px rgba(0, 0, 0, 0.3),
+    0 10px 28px -10px rgba(0, 0, 0, 0.55);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
   --shadow-sheet: 0 24px 60px rgba(0, 0, 0, 0.55);
@@ -125,7 +135,7 @@
   --s-sidebar: transparent;
   --s-sidebar-fallback: #e4e6eb;
   --s-content: #eaecf1;
-  --s-content-fill: rgba(234, 236, 241, 0.6);
+  --s-content-fill: rgba(211, 216, 226, 0.62);
   --s-raised: #ffffff;
   --s-hover: #f1f3f7;
   --s-selected: #e0e5ee;
@@ -181,9 +191,9 @@
      attempt look printed rather than placed. */
   --shadow-card:
     inset 0 1px 0 rgba(255, 255, 255, 0.9),
-    0 0 0 0.5px rgba(16, 24, 40, 0.07),
-    0 1px 2px rgba(16, 24, 40, 0.04),
-    0 8px 20px -6px rgba(16, 24, 40, 0.1);
+    0 0 0 0.5px rgba(16, 24, 40, 0.12),
+    0 1px 3px rgba(16, 24, 40, 0.07),
+    0 10px 28px -8px rgba(16, 24, 40, 0.2);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
   --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);

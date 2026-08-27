@@ -219,7 +219,7 @@ function derive(theme) {
       "--s-sidebar-fallback": mix(bg, fg, 0.05),
       "--s-content": mix(bg, fg, 0.05),
       // Same colour, vibrancy allowed through. See the note in styles.css.
-      "--s-content-fill": alpha(mix(bg, fg, 0.05), 0.6),
+      "--s-content-fill": alpha(mix(bg, "#000000", 0.22), 0.62),
       "--s-raised": mix(bg, fg, 0.1),
       "--s-hover": mix(bg, fg, 0.15),
       "--s-selected": mix(bg, fg, 0.21),
@@ -230,16 +230,23 @@ function derive(theme) {
       "--s-control-hover": alpha(fg, 0.17),
       "--s-subtle": alpha(fg, 0.07),
       "--s-stripe": alpha(fg, 0.02),
-      // Flat: a lighter panel on a darker pane already reads as raised, and a
-      // gradient here only muddies it.
+      // Flat *fill* -- a gradient in dark only muddies it -- but not a flat
+      // card: the shadow below does the lifting, because a translucent pane
+      // brightens toward the desktop and can meet the panel at its own value.
       "--card-fill": mix(bg, fg, 0.1),
+      "--shadow-card": [
+        `inset 0 1px 0 ${alpha(fg, 0.06)}`,
+        "0 0 0 0.5px rgba(0, 0, 0, 0.55)",
+        "0 1px 3px rgba(0, 0, 0, 0.3)",
+        "0 10px 28px -10px rgba(0, 0, 0, 0.55)",
+      ].join(", "),
     });
   } else {
     Object.assign(vars, {
       "--s-window": mix(bg, "#000000", 0.11),
       "--s-sidebar-fallback": mix(bg, "#000000", 0.06),
       "--s-content": mix(bg, "#000000", 0.045),
-      "--s-content-fill": alpha(mix(bg, "#000000", 0.045), 0.6),
+      "--s-content-fill": alpha(mix(bg, "#000000", 0.13), 0.62),
       "--s-raised": bg,
       "--s-hover": mix(bg, "#000000", 0.045),
       "--s-selected": mix(bg, accent, 0.14),
@@ -255,9 +262,9 @@ function derive(theme) {
       "--card-fill": `linear-gradient(180deg, ${alpha(bg, 0.98)} 0%, ${alpha(bg, 0.82)} 100%)`,
       "--shadow-card": [
         "inset 0 1px 0 rgba(255, 255, 255, 0.9)",
-        `0 0 0 0.5px ${alpha(mix(bg, "#000000", 0.85), 0.09)}`,
-        `0 1px 2px ${alpha(mix(bg, "#000000", 0.85), 0.05)}`,
-        `0 8px 20px -6px ${alpha(mix(bg, "#000000", 0.85), 0.12)}`,
+        `0 0 0 0.5px ${alpha(mix(bg, "#000000", 0.85), 0.14)}`,
+        `0 1px 3px ${alpha(mix(bg, "#000000", 0.85), 0.08)}`,
+        `0 10px 28px -8px ${alpha(mix(bg, "#000000", 0.85), 0.22)}`,
       ].join(", "),
     });
   }
