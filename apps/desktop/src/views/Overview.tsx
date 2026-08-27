@@ -264,7 +264,7 @@ export function Overview() {
                 first={i === 0}
                 onClick={() => {
                   runs.focus(r.id);
-                  runs.setDrawerOpen(true);
+                  runs.setConsoleOpen(true);
                 }}
               >
                 <Dot

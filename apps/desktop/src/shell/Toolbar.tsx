@@ -8,7 +8,7 @@
 import { useApp, type Route } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
 import { F, LINE, M, PANE_FADE, R, S, STATUS, T } from "../tokens";
-import { Button, Kbd, Segmented, Spinner } from "../primitives";
+import { Segmented, Spinner } from "../primitives";
 
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "What is happening right now" },
@@ -66,7 +66,7 @@ export function Toolbar({ scrolled }: { scrolled: boolean }) {
           className="no-drag"
           onClick={() => {
             runs.focus(runs.active[0].id);
-            runs.setDrawerOpen(true);
+            runs.setConsoleOpen(true);
           }}
           title="Show the running command"
           style={{
@@ -91,16 +91,6 @@ export function Toolbar({ scrolled }: { scrolled: boolean }) {
 
       <ApiPill />
 
-      <Button
-        tone="default"
-        size="md"
-        onClick={() => app.setPaletteOpen(true)}
-        title="Search every curie command"
-        style={{ gap: 8 }}
-      >
-        Run a command
-        <Kbd>{isMac ? "⌘K" : "^K"}</Kbd>
-      </Button>
     </header>
   );
 }

@@ -13,7 +13,7 @@ import { ResourcesProvider } from "./bridge/resources";
 import { RunsProvider, useRuns } from "./bridge/runs";
 import { Sidebar } from "./shell/Sidebar";
 import { Toolbar } from "./shell/Toolbar";
-import { RunDrawer } from "./shell/RunDrawer";
+import { Console } from "./shell/Console";
 import { Palette } from "./shell/Palette";
 import { Overview } from "./views/Overview";
 import { Build } from "./views/Build";
@@ -67,7 +67,16 @@ function Keys() {
       }
       if (mod && e.key.toLowerCase() === "j") {
         e.preventDefault();
-        return runs.setDrawerOpen(!runs.drawerOpen);
+        return runs.setConsoleOpen(!runs.consoleOpen);
+      }
+      // The console is always on screen, so this focuses its prompt rather than
+      // opening anything. A console you have to reach for with the mouse is a
+      // button with extra steps.
+      if (mod && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        runs.setConsoleOpen(true);
+        document.querySelector<HTMLInputElement>("[data-console-input]")?.focus();
+        return;
       }
       if (mod && /^[1-6]$/.test(e.key)) {
         e.preventDefault();
@@ -85,8 +94,8 @@ function Keys() {
         ] as const;
         return app.navigate(routes[Number(e.key) - 1]);
       }
-      if (e.key === "Escape" && !typing && runs.drawerOpen) {
-        return runs.setDrawerOpen(false);
+      if (e.key === "Escape" && !typing && runs.consoleOpen) {
+        return runs.setConsoleOpen(false);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -175,7 +184,7 @@ function Frame() {
             <View />
           </div>
         </main>
-        <RunDrawer />
+        <Console />
       </div>
 
       {/* One sheet host for the whole app: any control anywhere opens the

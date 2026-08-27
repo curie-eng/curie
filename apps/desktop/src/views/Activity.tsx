@@ -148,7 +148,7 @@ function Row({ run }: { run: Run }) {
               size="sm"
               onClick={() => {
                 runs.focus(run.id);
-                runs.setDrawerOpen(true);
+                runs.setConsoleOpen(true);
               }}
             >
               Open transcript

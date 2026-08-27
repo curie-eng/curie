@@ -56,8 +56,12 @@ interface RunsValue {
   /** Which run the transcript drawer is showing, and whether it is open. */
   readonly focused: string | null;
   focus(id: string | null): void;
-  readonly drawerOpen: boolean;
-  setDrawerOpen(open: boolean): void;
+  /** Whether the console at the foot of the pane is expanded to show
+   *  scrollback. It lives here rather than in the console because three other
+   *  places open it: a run starting, the ⌘L focus shortcut, and History's
+   *  "Open transcript". */
+  readonly consoleOpen: boolean;
+  setConsoleOpen(open: boolean): void;
 }
 
 const Ctx = createContext<RunsValue | null>(null);
@@ -87,7 +91,7 @@ function appendChunk(lines: readonly TranscriptLine[], chunk: RunChunk): Transcr
 export function RunsProvider({ children }: { children: ReactNode }) {
   const [runs, setRuns] = useState<Run[]>([]);
   const [focused, setFocused] = useState<string | null>(null);
-  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [consoleOpen, setConsoleOpen] = useState(false);
   // Chunks can arrive before `start()`'s promise resolves and puts the run in
   // state, so early output is parked here and flushed when the run appears.
   const pending = useRef(new Map<string, RunChunk[]>());
@@ -148,7 +152,7 @@ export function RunsProvider({ children }: { children: ReactNode }) {
     };
     setRuns((prev) => [run, ...prev].slice(0, 200));
     setFocused(handle.runId);
-    setDrawerOpen(true);
+    setConsoleOpen(true);
     return handle.runId;
   }, []);
 
@@ -172,10 +176,10 @@ export function RunsProvider({ children }: { children: ReactNode }) {
       get: (id: string) => runs.find((r) => r.id === id),
       focused,
       focus: setFocused,
-      drawerOpen,
-      setDrawerOpen,
+      consoleOpen,
+      setConsoleOpen,
     }),
-    [runs, start, cancel, send, clear, focused, drawerOpen],
+    [runs, start, cancel, send, clear, focused, consoleOpen],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
