@@ -11,14 +11,14 @@
 // has not placed the command anywhere; it has just added a signpost pointing at
 // the problem.
 
-import { useMemo, type ReactNode } from "react";
+import { useMemo, type CSSProperties, type ReactNode } from "react";
 
 import { useApp, type Prefill } from "../bridge/app";
 import { commandsById } from "../lib/manifest";
 import { resolve, type Action, type Need, type Surface } from "../lib/surfaces";
 import { CommandForm } from "./CommandForm";
 import { F, LINE, S, STATUS, T } from "../tokens";
-import { Button, Group, Mono, SectionHeader, Sheet } from "../primitives";
+import { Button, Group, Mono, SectionHeader, Sheet, type ButtonTone } from "../primitives";
 
 /** What each precondition means, and the surface that fixes it. Kept here rather
  *  than in `surfaces.ts` so the data file stays free of copy. */
@@ -69,6 +69,81 @@ function useMet(need: Need | undefined): boolean | null {
   }
 }
 
+/**
+ * The one line that says a group's precondition is unmet.
+ *
+ * One line, not a warning block. Two groups on the same screen can share a
+ * precondition, and a full-width banner repeated under each header shouts twice
+ * about one fact -- and shouts louder than the controls it is describing. The
+ * commands are not hidden either: each one says what is wrong when it is
+ * opened, which is where the operator can do something about it.
+ */
+export function NeedNotice({
+  need,
+  style,
+}: {
+  readonly need: Need | undefined;
+  readonly style?: CSSProperties;
+}) {
+  const met = useMet(need);
+  if (!need || met !== false) return null;
+  return (
+    <div
+      style={{ ...F.footnote, color: STATUS.warn, display: "flex", gap: 6, ...style }}
+      title={NEED_COPY[need].why}
+    >
+      <span aria-hidden>⚠</span>
+      <span>
+        {NEED_COPY[need].unmet}. {NEED_COPY[need].why}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * One resolved action as a control.
+ *
+ * The single place an `Action` becomes a button, so the tone, the tooltip and
+ * the run call are decided once. Layouts that are not a wrapping row -- the
+ * tiers matrix, which puts one action per grid cell -- render these directly
+ * rather than reimplementing the binding.
+ */
+export function ActionButton({
+  action,
+  cmd,
+  prefill,
+  size = "sm",
+  style,
+  tone,
+}: {
+  readonly action: Action;
+  readonly cmd: { id: string; about: string };
+  readonly prefill?: Prefill;
+  readonly size?: "sm" | "md";
+  readonly style?: CSSProperties;
+  /** Overrides the tone the action asks for. The tiers matrix uses it: `quiet`
+   *  means "unfilled" in a wrapping row of buttons, where the filled ones around
+   *  it still say the row is controls -- but in a grid an unfilled cell beside a
+   *  label column reads as a *value*, and "Release health" stopped looking like
+   *  something you could press. */
+  readonly tone?: ButtonTone;
+}) {
+  const app = useApp();
+  return (
+    <Button
+      size={size}
+      tone={tone ?? action.tone ?? (action.quiet ? "plain" : "default")}
+      // The command itself in the tooltip, because a button that hides which
+      // command it runs is the failure this app is built against.
+      title={`curie ${action.id.replace(/\./g, " ")} — ${action.hint ?? cmd.about}`}
+      onClick={() => app.runCommand(action.id, prefill)}
+      style={style}
+    >
+      {action.label}
+    </Button>
+  );
+}
+
 export interface ActionsProps {
   readonly surface: Surface;
   /** Seed values handed to whichever command is opened from this group. */
@@ -89,7 +164,6 @@ export interface ActionsProps {
  * inside the box is what makes a native list read as a card with a title bar.
  */
 export function Actions({ surface, prefill, only, children, right }: ActionsProps) {
-  const met = useMet(surface.needs);
   const items = useMemo(
     () => resolve(surface).filter(({ action }) => (only ? only(action) : true)),
     [surface, only],
@@ -105,29 +179,7 @@ export function Actions({ surface, prefill, only, children, right }: ActionsProp
           {surface.blurb}
         </div>
 
-        {met === false && surface.needs ? (
-          // One line, not a warning block. Two groups on the same screen can
-          // share a precondition, and a full-width banner repeated under each
-          // header shouts twice about one fact -- and shouts louder than the
-          // controls it is describing. The commands are not hidden either: each
-          // one says what is wrong when it is opened, which is where the
-          // operator can do something about it.
-          <div
-            style={{
-              ...F.footnote,
-              color: STATUS.warn,
-              marginBottom: 10,
-              display: "flex",
-              gap: 6,
-            }}
-            title={NEED_COPY[surface.needs].why}
-          >
-            <span aria-hidden>⚠</span>
-            <span>
-              {NEED_COPY[surface.needs].unmet}. {NEED_COPY[surface.needs].why}
-            </span>
-          </div>
-        ) : null}
+        <NeedNotice need={surface.needs} style={{ marginBottom: 10 }} />
 
         <ActionButtons actions={items} prefill={prefill} />
         {children}
@@ -147,21 +199,10 @@ export function ActionButtons({
   readonly prefill?: Prefill;
   readonly size?: "sm" | "md";
 }) {
-  const app = useApp();
   return (
     <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
       {actions.map(({ action, cmd }) => (
-        <Button
-          key={action.id}
-          size={size}
-          tone={action.tone ?? (action.quiet ? "plain" : "default")}
-          // The command itself in the tooltip, because a button that hides which
-          // command it runs is the failure this app is built against.
-          title={`curie ${action.id.replace(/\./g, " ")} — ${action.hint ?? cmd.about}`}
-          onClick={() => app.runCommand(action.id, prefill)}
-        >
-          {action.label}
-        </Button>
+        <ActionButton key={action.id} action={action} cmd={cmd} prefill={prefill} size={size} />
       ))}
     </div>
   );
