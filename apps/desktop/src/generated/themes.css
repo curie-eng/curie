@@ -42,8 +42,9 @@
   --focus-ring: rgba(62, 207, 142, 0.5);
   --accent-hover: #4bdc9a;
   --scrim: rgba(0, 0, 0, 0.4);
-  --card-fill: #313134;
-  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.3), 0 10px 28px -10px rgba(0, 0, 0, 0.55);
+  --card-fill: linear-gradient( 180deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.045) 100% );
+  --card-backdrop: blur(22px) saturate(180%);
+  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 0 0 0.5px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.28), 0 10px 28px -10px rgba(0, 0, 0, 0.5);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
   --shadow-sheet: 0 24px 60px rgba(0, 0, 0, 0.55);
@@ -98,8 +99,9 @@
   --focus-ring: rgba(15, 143, 98, 0.5);
   --accent-hover: #0b7a53;
   --scrim: rgba(0, 0, 0, 0.22);
-  --card-fill: linear-gradient( 180deg, rgba(255, 255, 255, 0.98) 0%, rgba(255, 255, 255, 0.82) 100% );
-  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 0 0 0.5px rgba(16, 24, 40, 0.12), 0 1px 3px rgba(16, 24, 40, 0.07), 0 10px 28px -8px rgba(16, 24, 40, 0.2);
+  --card-fill: linear-gradient( 180deg, rgba(255, 255, 255, 0.52) 0%, rgba(255, 255, 255, 0.32) 100% );
+  --card-backdrop: blur(22px) saturate(180%);
+  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.85), 0 0 0 0.5px rgba(16, 24, 40, 0.14), 0 1px 3px rgba(16, 24, 40, 0.06), 0 10px 28px -8px rgba(16, 24, 40, 0.18);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
   --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);
@@ -154,7 +156,8 @@
   --focus-ring: rgba(0, 122, 204, 0.5);
   --accent-hover: #268ed4;
   --scrim: rgba(0, 0, 0, 0.4);
-  --card-fill: #373737;
+  --card-fill: linear-gradient(180deg, rgba(212, 212, 212, 0.1) 0%, rgba(212, 212, 212, 0.045) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(212, 212, 212, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.3), 0 10px 28px -10px rgba(0, 0, 0, 0.55);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
@@ -210,7 +213,8 @@
   --focus-ring: rgba(0, 122, 204, 0.5);
   --accent-hover: #0068ad;
   --scrim: rgba(0, 0, 0, 0.22);
-  --card-fill: linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(255, 255, 255, 0.82) 100%);
+  --card-fill: linear-gradient(180deg, rgba(255, 255, 255, 0.52) 0%, rgba(255, 255, 255, 0.32) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 0 0 0.5px rgba(38, 38, 38, 0.14), 0 1px 3px rgba(38, 38, 38, 0.08), 0 10px 28px -8px rgba(38, 38, 38, 0.22);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
@@ -266,7 +270,8 @@
   --focus-ring: rgba(0, 120, 212, 0.5);
   --accent-hover: #268cda;
   --scrim: rgba(0, 0, 0, 0.4);
-  --card-fill: #373737;
+  --card-fill: linear-gradient(180deg, rgba(204, 204, 204, 0.1) 0%, rgba(204, 204, 204, 0.045) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(204, 204, 204, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.3), 0 10px 28px -10px rgba(0, 0, 0, 0.55);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
@@ -322,7 +327,8 @@
   --focus-ring: rgba(0, 95, 184, 0.5);
   --accent-hover: #00519c;
   --scrim: rgba(0, 0, 0, 0.22);
-  --card-fill: linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(255, 255, 255, 0.82) 100%);
+  --card-fill: linear-gradient(180deg, rgba(255, 255, 255, 0.52) 0%, rgba(255, 255, 255, 0.32) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 0 0 0.5px rgba(38, 38, 38, 0.14), 0 1px 3px rgba(38, 38, 38, 0.08), 0 10px 28px -8px rgba(38, 38, 38, 0.22);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
@@ -379,6 +385,7 @@
   --accent-hover: #f5973b;
   --scrim: rgba(0, 0, 0, 0.4);
   --card-fill: #1a1a1a;
+  --card-backdrop: none;
   --shadow-card: 0 0 0 1px rgba(255, 255, 255, 0.7);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 0 0 1px rgba(255, 255, 255, 0.7);
@@ -435,6 +442,7 @@
   --accent-hover: #0d3f71;
   --scrim: rgba(0, 0, 0, 0.22);
   --card-fill: #ffffff;
+  --card-backdrop: none;
   --shadow-card: 0 0 0 1px rgba(0, 0, 0, 0.7);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
   --shadow-overlay: 0 0 0 1px rgba(0, 0, 0, 0.7);
@@ -490,7 +498,8 @@
   --focus-ring: rgba(34, 119, 255, 0.5);
   --accent-hover: #438bff;
   --scrim: rgba(0, 0, 0, 0.4);
-  --card-fill: #0e1d31;
+  --card-fill: linear-gradient(180deg, rgba(102, 136, 204, 0.1) 0%, rgba(102, 136, 204, 0.045) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(102, 136, 204, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.3), 0 10px 28px -10px rgba(0, 0, 0, 0.55);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
@@ -546,7 +555,8 @@
   --focus-ring: rgba(165, 122, 76, 0.5);
   --accent-hover: #b38e67;
   --scrim: rgba(0, 0, 0, 0.4);
-  --card-fill: #3b2f20;
+  --card-fill: linear-gradient(180deg, rgba(211, 175, 134, 0.1) 0%, rgba(211, 175, 134, 0.045) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(211, 175, 134, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.3), 0 10px 28px -10px rgba(0, 0, 0, 0.55);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
@@ -602,7 +612,8 @@
   --focus-ring: rgba(166, 226, 46, 0.5);
   --accent-hover: #b3e64d;
   --scrim: rgba(0, 0, 0, 0.4);
-  --card-fill: #44453f;
+  --card-fill: linear-gradient(180deg, rgba(248, 248, 242, 0.1) 0%, rgba(248, 248, 242, 0.045) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(248, 248, 242, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.3), 0 10px 28px -10px rgba(0, 0, 0, 0.55);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
@@ -658,7 +669,8 @@
   --focus-ring: rgba(106, 159, 181, 0.5);
   --accent-hover: #80adc0;
   --scrim: rgba(0, 0, 0, 0.4);
-  --card-fill: #353636;
+  --card-fill: linear-gradient(180deg, rgba(197, 200, 198, 0.1) 0%, rgba(197, 200, 198, 0.045) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(197, 200, 198, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.3), 0 10px 28px -10px rgba(0, 0, 0, 0.55);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
@@ -714,7 +726,8 @@
   --focus-ring: rgba(112, 86, 151, 0.5);
   --accent-hover: #5f4980;
   --scrim: rgba(0, 0, 0, 0.22);
-  --card-fill: linear-gradient(180deg, rgba(245, 245, 245, 0.98) 0%, rgba(245, 245, 245, 0.82) 100%);
+  --card-fill: linear-gradient(180deg, rgba(245, 245, 245, 0.52) 0%, rgba(245, 245, 245, 0.32) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 0 0 0.5px rgba(37, 37, 37, 0.14), 0 1px 3px rgba(37, 37, 37, 0.08), 0 10px 28px -8px rgba(37, 37, 37, 0.22);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
@@ -770,7 +783,8 @@
   --focus-ring: rgba(227, 83, 83, 0.5);
   --accent-hover: #e76d6d;
   --scrim: rgba(0, 0, 0, 0.4);
-  --card-fill: #542323;
+  --card-fill: linear-gradient(180deg, rgba(248, 248, 248, 0.1) 0%, rgba(248, 248, 248, 0.045) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(248, 248, 248, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.3), 0 10px 28px -10px rgba(0, 0, 0, 0.55);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
@@ -826,7 +840,8 @@
   --focus-ring: rgba(38, 139, 210, 0.5);
   --accent-hover: #479cd9;
   --scrim: rgba(0, 0, 0, 0.4);
-  --card-fill: #153c45;
+  --card-fill: linear-gradient(180deg, rgba(147, 161, 161, 0.1) 0%, rgba(147, 161, 161, 0.045) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(147, 161, 161, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.3), 0 10px 28px -10px rgba(0, 0, 0, 0.55);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);
@@ -882,7 +897,8 @@
   --focus-ring: rgba(38, 139, 210, 0.5);
   --accent-hover: #2076b3;
   --scrim: rgba(0, 0, 0, 0.22);
-  --card-fill: linear-gradient(180deg, rgba(253, 246, 227, 0.98) 0%, rgba(253, 246, 227, 0.82) 100%);
+  --card-fill: linear-gradient(180deg, rgba(253, 246, 227, 0.52) 0%, rgba(253, 246, 227, 0.32) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 0 0 0.5px rgba(38, 37, 34, 0.14), 0 1px 3px rgba(38, 37, 34, 0.08), 0 10px 28px -8px rgba(38, 37, 34, 0.22);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
@@ -938,7 +954,8 @@
   --focus-ring: rgba(187, 218, 255, 0.5);
   --accent-hover: #c5e0ff;
   --scrim: rgba(0, 0, 0, 0.4);
-  --card-fill: #244369;
+  --card-fill: linear-gradient(180deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.045) 100%);
+  --card-backdrop: blur(22px) saturate(180%);
   --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 3px rgba(0, 0, 0, 0.3), 0 10px 28px -10px rgba(0, 0, 0, 0.55);
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.35);
   --shadow-overlay: 0 16px 40px rgba(0, 0, 0, 0.5);

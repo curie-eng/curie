@@ -117,6 +117,11 @@ export function Group({
     <div
       style={{
         background: S.cardFill,
+        // Glass: the fill is a thin film and this is what makes what shows
+        // through read as seen THROUGH it. Both spellings -- Safari and older
+        // Chromium still want the prefix, and Electron is Chromium.
+        backdropFilter: S.cardBackdrop,
+        WebkitBackdropFilter: S.cardBackdrop,
         borderRadius: inset ? R.group : 0,
         // `none` on dark; a hairline plus a faint lift on light, where a surface
         // alone does not separate a card from the pane behind it.

@@ -233,7 +233,10 @@ function derive(theme) {
       // Flat *fill* -- a gradient in dark only muddies it -- but not a flat
       // card: the shadow below does the lifting, because a translucent pane
       // brightens toward the desktop and can meet the panel at its own value.
-      "--card-fill": mix(bg, fg, 0.14),
+      // Glass: a light film over the pane, not an opaque panel on it. Tinting a
+      // dark surface darker reads as a hole; tinting it lighter reads as glass.
+      "--card-fill": `linear-gradient(180deg, ${alpha(fg, 0.1)} 0%, ${alpha(fg, 0.045)} 100%)`,
+      "--card-backdrop": "blur(22px) saturate(180%)",
       "--shadow-card": [
         `inset 0 1px 0 ${alpha(fg, 0.06)}`,
         "0 0 0 0.5px rgba(0, 0, 0, 0.55)",
@@ -259,7 +262,8 @@ function derive(theme) {
       "--s-stripe": alpha("#000000", 0.022),
       // Gradient plus real translucency, so the bottom edge picks up the pane.
       // Flat white with a hairline is what reads as unstyled.
-      "--card-fill": `linear-gradient(180deg, ${alpha(bg, 0.98)} 0%, ${alpha(bg, 0.82)} 100%)`,
+      "--card-fill": `linear-gradient(180deg, ${alpha(bg, 0.52)} 0%, ${alpha(bg, 0.32)} 100%)`,
+      "--card-backdrop": "blur(22px) saturate(180%)",
       "--shadow-card": [
         "inset 0 1px 0 rgba(255, 255, 255, 0.9)",
         `0 0 0 0.5px ${alpha(mix(bg, "#000000", 0.85), 0.14)}`,
@@ -300,6 +304,10 @@ function derive(theme) {
   // High contrast means a visible edge, not a soft one, and no elevation blur.
   if (contrast) {
     vars["--card-fill"] = dark ? mix(bg, fg, 0.1) : bg;
+    // A high-contrast theme exists to remove ambiguity between surfaces, so it
+    // gets an opaque card and a hard edge rather than something to see through.
+    vars["--card-fill"] = vars["--s-raised"];
+    vars["--card-backdrop"] = "none";
     vars["--shadow-card"] = `0 0 0 1px ${alpha(lineBase, 0.7)}`;
     vars["--shadow-overlay"] = `0 0 0 1px ${alpha(lineBase, 0.7)}`;
     vars["--shadow-sheet"] = `0 0 0 1px ${alpha(lineBase, 0.7)}`;

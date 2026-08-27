@@ -264,16 +264,29 @@ React + TypeScript renderer. Full structure and rationale in
     darker pane already reads as raised. Translucency retired that reasoning:
     dark now gets the same four shadow layers in its own register.
 
-  - **A card paints `S.cardFill`, not `S.raised`.** `raised` has to stay a plain
-    colour because the canvas uses it as an SVG fill, where a gradient is invalid.
-    `cardFill` is what a panel actually paints and on every light theme it is a
-    gradient: flat white with a hairline is the thing that reads as unstyled, so a
-    light card gets three subtle treatments instead -- a vertical gradient, real
-    translucency so its bottom edge picks up the pane behind it, and a four-layer
-    shadow (inner top highlight, hairline, tight seat, wide lift). Dark themes stay
-    flat, because a lighter panel on a darker pane already reads as raised, and
-    high contrast stays flat with a hard 1px edge. All of it is derived per theme
-    by the generator, so a new theme gets the treatment without being told.
+  - **A card is glass, not paper.** `cardFill` is a thin translucent film with a
+    `--card-backdrop` blur under it, so the window's vibrancy carries through a
+    card the way it always has through the sidebar. Cards used to be near-opaque
+    (0.98 white in light, a flat colour in dark) and read exactly as what they
+    were: printed sheets laid on a pane.
+
+    The direction of the film flips by appearance and that is not cosmetic. In
+    light it is white over a lighter pane; in dark it is **light over dark too**,
+    because tinting a dark surface darker reads as a hole punched in the pane
+    while tinting it lighter reads as glass catching the light.
+
+    `raised` stays a plain colour because the canvas uses it as an SVG fill,
+    where a gradient is invalid -- `cardFill` is free to be a gradient precisely
+    because `Group` is its only consumer.
+
+    Two things hold the card together once the fill stops separating it by value
+    alone: the **hairline** in `--shadow-card`, which is now what draws the edge,
+    and the **inner top highlight**, which is what makes it read as a surface
+    with a lit edge rather than a hole. Do not drop either while tuning alpha.
+
+    **High contrast opts out entirely** -- an opaque fill, `--card-backdrop:
+    none`, and a hard 1px edge. A theme whose job is to remove ambiguity between
+    surfaces should not hand you something to see through.
 
   - **A status dot is the last resort, not the first.** The coloured dot was
     becoming the answer to every "show state" question, and it is a weak one:

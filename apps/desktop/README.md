@@ -39,6 +39,11 @@ Instead:
   contrast and this is where the text is.
 - A **unified toolbar** that belongs to the content pane and owns the view's
   title, with its separator appearing only once content scrolls under it.
+- **Glass cards.** A panel is a thin translucent film over a blurred backdrop,
+  not an opaque sheet: the window's vibrancy carries through it the way it does
+  through the sidebar. In dark the film is light rather than dark, because
+  tinting a dark surface darker reads as a hole and tinting it lighter reads as
+  glass. High-contrast themes opt out and get an opaque card with a hard edge.
 - **Grouped inset lists** (one rounded container, hairline separators, a small
   uppercase header outside the box) instead of a card per item.
 - **Platform controls**: switches, segmented controls, sheets that drop from the

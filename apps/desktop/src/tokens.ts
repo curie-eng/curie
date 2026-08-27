@@ -106,6 +106,8 @@ export const S = {
    *  Use this for a panel's background and `raised` only where a flat colour is
    *  required. */
   cardFill: "var(--card-fill)",
+  /** The filter a card runs over what is behind it. See `--card-backdrop`. */
+  cardBackdrop: "var(--card-backdrop)",
   /** A row inside a grouped list, on hover. */
   hover: "var(--s-hover)",
   /** A selected row. */
