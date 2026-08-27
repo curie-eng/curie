@@ -292,24 +292,42 @@ function Header({
   const running = run?.state === "running" || run?.state === "pending";
 
   return (
-    <button
-      onClick={onToggle}
+    // A row, not a button. It used to be one big toggle with the controls
+    // nested inside it, which is invalid HTML -- a button cannot contain a
+    // button -- and cost real behaviour, not just a warning: nested interactive
+    // elements are not reachable in tab order, and every inner click needed a
+    // `stopPropagation` to avoid also toggling the panel. The toggle and the
+    // controls are siblings now, so each is one thing you can click or tab to.
+    <div
       className="no-drag"
       style={{
         display: "flex",
         alignItems: "center",
         gap: 9,
-        border: "none",
-        background: "transparent",
         padding: "6px 12px",
-        cursor: "default",
-        textAlign: "left",
-        color: "inherit",
       }}
     >
-      <span style={{ ...F.footnote, color: T.tertiary, letterSpacing: 0.5, fontWeight: 600 }}>
-        CONSOLE
-      </span>
+      <button
+        onClick={onToggle}
+        aria-expanded={expanded}
+        title={expanded ? "Collapse the console" : "Expand the console"}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 9,
+          flex: 1,
+          minWidth: 0,
+          border: "none",
+          background: "transparent",
+          padding: 0,
+          cursor: "default",
+          textAlign: "left",
+          color: "inherit",
+        }}
+      >
+        <span style={{ ...F.footnote, color: T.tertiary, letterSpacing: 0.5, fontWeight: 600 }}>
+          CONSOLE
+        </span>
 
       {run ? (
         <>
@@ -348,7 +366,9 @@ function Header({
         </span>
       )}
 
-      <span onClick={(e) => e.stopPropagation()} style={{ display: "flex", gap: 6 }}>
+      </button>
+
+      <span style={{ display: "flex", gap: 6 }}>
         {running ? (
           <Button size="sm" tone="danger" onClick={() => runs.cancel(run!.id)}>
             Cancel
@@ -369,8 +389,23 @@ function Header({
           ✕
         </Button>
       </span>
-      <span style={{ ...F.footnote, color: T.quaternary }}>{expanded ? "⌄" : "⌃"}</span>
-    </button>
+
+      <button
+        onClick={onToggle}
+        aria-expanded={expanded}
+        title={expanded ? "Collapse the console" : "Expand the console"}
+        style={{
+          border: "none",
+          background: "transparent",
+          padding: "0 2px",
+          cursor: "default",
+          ...F.footnote,
+          color: T.quaternary,
+        }}
+      >
+        {expanded ? "⌄" : "⌃"}
+      </button>
+    </div>
   );
 }
 

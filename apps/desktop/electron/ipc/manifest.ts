@@ -156,9 +156,19 @@ export function resolve(inv: CliInvocation, defaultCwd: string): ResolvedCommand
   });
 
   for (const [long, raw] of Object.entries(inv.flags ?? {})) {
+    // Skip BEFORE validating. A flag that is unset -- `false`, empty, absent --
+    // contributes nothing to argv, and `renderCommand` already omits it from the
+    // preview, so rejecting it here made the two disagree about a command that
+    // was going to run identically either way.
+    //
+    // What that cost in practice: the form seeds every boolean flag as `false`,
+    // so a renderer holding a manifest one command newer than the main process
+    // sent a `false` for a flag main had never heard of, and a preview reading
+    // `curie local up` refused to start. Validation belongs to what reaches
+    // argv, not to what was mentioned.
+    if (raw === undefined || raw === false || raw === "") continue;
     const spec = flagSpecs.get(long);
     if (!spec) throw new Error(`${inv.action} has no --${long} flag`);
-    if (raw === undefined || raw === false || raw === "") continue;
     if (raw === true) {
       argv.push(`--${long}`);
       continue;
