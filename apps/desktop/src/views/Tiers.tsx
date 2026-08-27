@@ -194,13 +194,20 @@ export function LadderStrip() {
                   gap: 6,
                   padding: "3px 9px",
                   borderRadius: R.pill,
-                  background: on ? tint(color, 0.16) : S.well,
+                  // `S.control` and not `S.well`: a chip sits ON a card, so it
+                  // wants the standard control fill, which is a step lighter
+                  // than the surface behind it. `well` is the RECESSED surface --
+                  // the darkest thing in the dark palette -- and putting the
+                  // dimmest ink on it made an idle tier genuinely unreadable.
+                  background: on ? tint(color, 0.16) : S.control,
                   ...F.caption,
-                  color: on ? T.primary : T.quaternary,
+                  // Idle is a real state, not a disabled control. `quaternary`
+                  // is the placeholder level and says "you cannot use this".
+                  color: on ? T.primary : T.secondary,
                 }}
               >
                 {label}
-                <span style={{ ...F.footnote, color: on ? color : T.quaternary }}>
+                <span style={{ ...F.footnote, color: on ? color : T.tertiary }}>
                   {on ? "live" : "idle"}
                 </span>
               </span>
