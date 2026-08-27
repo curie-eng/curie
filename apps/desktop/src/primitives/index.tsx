@@ -863,7 +863,7 @@ export function Sheet({
           // surface rather than as a system dialog dropped on top of it. The
           // blur is what keeps it legible: a translucent panel over a scrimmed
           // page would be muddy without it.
-          background: S.sheetFill,
+          background: S.cardFill,
           backdropFilter: S.cardBackdrop,
           WebkitBackdropFilter: S.cardBackdrop,
           borderRadius: R.sheet,
