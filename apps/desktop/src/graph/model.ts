@@ -34,6 +34,12 @@ export interface GraphNode {
   readonly actions?: readonly string[];
   /** Set on nodes the operator added, which are the only ones that persist. */
   readonly userAdded?: boolean;
+  /** The workload role behind this node, for the infrastructure ones. Carried
+   *  because `kind` is deliberately coarse -- every platform service is
+   *  `infra` -- and colouring by kind therefore painted valkey, postgres, the
+   *  api and the object store the same grey. The role is what tells them apart,
+   *  and `ROLE_COLOR` already has a hue per role for the Resources table. */
+  readonly role?: string;
   /** Which band of the diagram this belongs to. Drawn as a labelled lane, so
    *  the graph reads as an architecture view rather than as loose boxes. */
   readonly lane?: string;
@@ -415,6 +421,7 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
     add({
       id,
       kind: "infra",
+      role: sample.role,
       label: sample.role,
       sub: sample.state === "running" ? "live" : sample.state,
       status: sample.state === "running" ? "live" : "known",

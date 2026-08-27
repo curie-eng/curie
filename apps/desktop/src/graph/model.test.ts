@@ -58,6 +58,22 @@ describe("infrastructure-only graph", () => {
     ]);
   });
 
+  it("carries each node's role, which is what tells the services apart", () => {
+    // `kind` is `infra` for every one of these, so a canvas colouring by kind
+    // paints the whole platform one grey. The role is the distinguishing fact
+    // and `ROLE_COLOR` has a hue per role; if it stops reaching the node, the
+    // graph silently goes monochrome again and nothing else fails.
+    const { nodes } = buildGraph({ ...NO_SOURCES, samples: PLATFORM }, EMPTY_DOC);
+    const infra = nodes.filter((n) => n.kind === "infra");
+    expect(infra.length).toBeGreaterThan(1);
+    for (const node of infra) {
+      expect(node.role, `${node.label} has no role`).toBeTruthy();
+    }
+    // Distinct roles, so distinct colours are actually possible.
+    const roles = infra.map((n) => n.role);
+    expect(new Set(roles).size).toBe(infra.length);
+  });
+
   it("spreads them across columns instead of stacking them in one", () => {
     // The original bug drew all six at the same x, which reads as a list with
     // edges looping around the outside rather than as a flow.

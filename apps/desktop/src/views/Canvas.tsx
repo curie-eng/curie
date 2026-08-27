@@ -44,7 +44,7 @@ import { command } from "../lib/manifest";
 import { percent } from "../lib/format";
 import { CommandForm } from "./CommandForm";
 import { AgentSheet } from "./AgentSheet";
-import { ACCENT, F, FONT, HUE, KIND_COLOR, LINE, R, S, STATUS, T, tint, type NodeKind } from "../tokens";
+import { ACCENT, F, FONT, HUE, KIND_COLOR, LINE, R, S, STATUS, T, roleColor, tint, type NodeKind } from "../tokens";
 import { Badge, Button, EmptyState, Group, Mono, Notice, SectionHeader, Select } from "../primitives";
 
 interface Viewport {
@@ -582,7 +582,11 @@ function Lane({ lane, nodes }: { lane: GraphLane; nodes: readonly GraphNode[] })
         width={lane.width + 28}
         height={bottom - top}
         rx={12}
-        fill={S.stripe}
+        // `S.stripe` is 2% ink -- meant for alternating table rows, where the
+        // eye only has to feel a rhythm. A labelled band that groups nodes has
+        // to actually be seen, so it takes a real fill and an edge.
+        fill={S.subtle}
+        stroke={LINE.separator}
       />
       <text
         x={lane.x - 4}
@@ -653,8 +657,17 @@ function Edge({
     : (from.x + NODE_W + to.x) / 2;
   const labelY = (y1 + y2) / 2;
 
+  // A plain flow edge used to draw in `LINE.strong` at 0.7 opacity, which lands
+  // around 18% ink -- a hairline meant for separating stacked rows, not for a
+  // line crossing open canvas. It takes text ink instead.
   const color =
-    edge.kind === "data" ? HUE.cyan : edge.kind === "deploy" ? HUE.violet : edge.kind === "planned" ? STATUS.warn : LINE.strong;
+    edge.kind === "data"
+      ? HUE.cyan
+      : edge.kind === "deploy"
+        ? HUE.violet
+        : edge.kind === "planned"
+          ? STATUS.warn
+          : T.quaternary;
 
   return (
     <g style={{ transition: "opacity 120ms ease" }} opacity={dimmed ? 0.12 : 1}>
@@ -662,10 +675,10 @@ function Edge({
         d={d}
         fill="none"
         stroke={color}
-        strokeWidth={lit ? 2 : 1.2}
+        strokeWidth={lit ? 2 : 1.4}
         strokeDasharray={edge.kind === "planned" ? "5 4" : undefined}
         markerEnd="url(#arrow)"
-        opacity={lit ? 1 : 0.7}
+        opacity={lit ? 1 : 0.9}
       />
       {edge.label ? (
         <text
@@ -701,7 +714,10 @@ function Node({
   onMouseEnter?(): void;
   onMouseLeave?(): void;
 }) {
-  const color = KIND_COLOR[node.kind];
+  // Role first, kind second. `kind` is coarse on purpose -- everything the
+  // platform runs is `infra` -- so colouring by it alone drew every service in
+  // the same grey and the graph read as one undifferentiated cluster.
+  const color = node.role ? roleColor(node.role) : KIND_COLOR[node.kind];
   const planned = node.status === "planned";
   // Load is drawn against one core, not against the machine: a container at
   // 60% of a core is the interesting reading, and dividing by twelve would
