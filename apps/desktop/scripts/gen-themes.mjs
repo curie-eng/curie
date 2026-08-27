@@ -237,6 +237,9 @@ function derive(theme) {
       // dark surface darker reads as a hole; tinting it lighter reads as glass.
       "--card-fill": `linear-gradient(180deg, ${alpha(fg, 0.1)} 0%, ${alpha(fg, 0.045)} 100%)`,
       "--card-backdrop": "blur(22px) saturate(180%)",
+      // Same family as a card, far more of its own fill: a modal you can read
+      // the page through is the one thing a modal may not be.
+      "--sheet-fill": `linear-gradient(180deg, ${alpha(mix(bg, fg, 0.16), 0.95)} 0%, ${alpha(mix(bg, fg, 0.11), 0.9)} 100%)`,
       "--shadow-card": [
         `inset 0 1px 0 ${alpha(fg, 0.06)}`,
         "0 0 0 0.5px rgba(0, 0, 0, 0.55)",
@@ -264,6 +267,7 @@ function derive(theme) {
       // Flat white with a hairline is what reads as unstyled.
       "--card-fill": `linear-gradient(180deg, ${alpha(bg, 0.52)} 0%, ${alpha(bg, 0.32)} 100%)`,
       "--card-backdrop": "blur(22px) saturate(180%)",
+      "--sheet-fill": `linear-gradient(180deg, ${alpha(bg, 0.96)} 0%, ${alpha(bg, 0.9)} 100%)`,
       "--shadow-card": [
         "inset 0 1px 0 rgba(255, 255, 255, 0.9)",
         `0 0 0 0.5px ${alpha(mix(bg, "#000000", 0.85), 0.14)}`,
@@ -307,6 +311,7 @@ function derive(theme) {
     // A high-contrast theme exists to remove ambiguity between surfaces, so it
     // gets an opaque card and a hard edge rather than something to see through.
     vars["--card-fill"] = vars["--s-raised"];
+    vars["--sheet-fill"] = vars["--s-overlay"];
     vars["--card-backdrop"] = "none";
     vars["--shadow-card"] = `0 0 0 1px ${alpha(lineBase, 0.7)}`;
     vars["--shadow-overlay"] = `0 0 0 1px ${alpha(lineBase, 0.7)}`;

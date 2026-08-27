@@ -189,7 +189,14 @@ React + TypeScript renderer. Full structure and rationale in
     pick a pixel size and a grey per component.
   - **Controls are platform controls**: `Toggle` is a switch, not a checkbox;
     `Segmented` is a segmented control, not a row of buttons or a `<select>`;
-    `Sheet` drops from the top, it is not a centred modal. A bare
+    `Sheet` is a
+    **centred** panel. It used to drop from the top with only its bottom corners
+    rounded, on the platform-sheet reading; hanging off an edge it no longer
+    visually attaches to just looked unfinished. It carries the card family --
+    the same gradient, blur, radius and shadow -- at `--sheet-fill` rather than
+    `--card-fill`, because a card's alpha over the whole app let you read the
+    page's own buttons through a form you were filling in, which is the one
+    thing a modal may not do. A bare
     `<input type="checkbox">` is rendered by the engine and looks like a form
     control on a web page -- that is the tell to avoid.
   - **`tokens.ts` holds no colours, only references.** Every colour token is a
