@@ -71,14 +71,16 @@ function Keys() {
       }
       if (mod && /^[1-7]$/.test(e.key)) {
         e.preventDefault();
+        // Top to bottom as the sidebar draws them, Commands last: a number
+        // that does not match the row it lands on is worse than no shortcut.
         const routes = [
           "overview",
           "build",
           "tiers",
           "resources",
           "canvas",
-          "commands",
           "activity",
+          "commands",
         ] as const;
         return app.navigate(routes[Number(e.key) - 1]);
       }

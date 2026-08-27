@@ -70,8 +70,9 @@ export function buildMenu(getWin: () => BrowserWindow | null): Menu {
         { label: "Tiers", accelerator: "CmdOrCtrl+3", click: go(getWin, "tiers") },
         { label: "Resources", accelerator: "CmdOrCtrl+4", click: go(getWin, "resources") },
         { label: "Canvas", accelerator: "CmdOrCtrl+5", click: go(getWin, "canvas") },
-        { label: "Commands", accelerator: "CmdOrCtrl+6", click: go(getWin, "commands") },
-        { label: "Activity", accelerator: "CmdOrCtrl+7", click: go(getWin, "activity") },
+        { label: "Activity", accelerator: "CmdOrCtrl+6", click: go(getWin, "activity") },
+        { type: "separator" },
+        { label: "Commands", accelerator: "CmdOrCtrl+7", click: go(getWin, "commands") },
       ],
     },
     {

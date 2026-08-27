@@ -79,12 +79,6 @@ const ITEMS: readonly Item[] = [
     icon: <Icon d="M3.2 3.6h3.4v3.2H3.2zM9.4 9.2h3.4v3.2H9.4zM6.6 5.2h2.2a2 2 0 0 1 2 2v2" />,
   },
   {
-    id: "commands",
-    label: "Commands",
-    hint: "Every curie command",
-    icon: <Icon d="m3 4.6 3 3-3 3M8.4 11.4H13" />,
-  },
-  {
     id: "activity",
     label: "Activity",
     hint: "What this app has run",
@@ -139,7 +133,23 @@ export function Sidebar() {
 
       <MachineStatus />
 
-      <div style={{ padding: "0 10px 10px" }}>
+      {/* Commands and Settings sit together at the foot, below the flex spacer.
+          The rail above is where the work is: a bundle, the tiers it runs on,
+          what is consuming the machine. Commands is the reference you fall back
+          to -- every command it lists has a control on one of those screens --
+          and a reference that sits fifth in the primary rail reads as the place
+          you are supposed to start. It is not. */}
+      <div style={{ padding: "0 10px 10px", display: "flex", flexDirection: "column", gap: 1 }}>
+        <NavItem
+          item={{
+            id: "commands",
+            label: "Commands",
+            hint: "Every curie command, and where each one lives",
+            icon: <Icon d="m3 4.6 3 3-3 3M8.4 11.4H13" />,
+          }}
+          active={app.route === "commands"}
+          onClick={() => app.navigate("commands")}
+        />
         <NavItem
           item={{
             id: "settings",

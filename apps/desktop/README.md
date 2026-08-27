@@ -417,7 +417,7 @@ pnpm package
 | | |
 |---|---|
 | `⌘K` | Command palette -- search every command the CLI has |
-| `⌘1`-`⌘7` | Overview, Build, Tiers, Resources, Canvas, Commands, Activity |
+| `⌘1`-`⌘7` | Overview, Build, Tiers, Resources, Canvas, Activity, Commands |
 | `⌘J` | Toggle the transcript drawer |
 | `⌘O` | Open a plugin bundle |
 
