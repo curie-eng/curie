@@ -233,6 +233,40 @@ describe("preview matches the command that runs", () => {
   });
 });
 
+describe("argv resolution ignores what never reaches argv", () => {
+  // The form seeds every boolean flag as `false`, so these are the ordinary
+  // payload, not a malformed one. `renderCommand` omits them from the preview;
+  // `resolve` has to omit them from argv without objecting to them, or the two
+  // disagree about a command that runs identically either way.
+  it("drops an unset flag rather than validating it", () => {
+    const cmd = commandsById.get("local.up")!;
+    const flags: Record<string, string | boolean> = { minimal: false, model: "" };
+    expect(renderCommand(cmd, [], flags)).toBe("curie local up");
+    expect(argvDisplay(cmd, [], flags)).toBe("curie local up");
+  });
+
+  it("ignores an unset flag it has never heard of", () => {
+    // A renderer one manifest ahead of the main process sends exactly this. It
+    // contributes nothing to argv, so it must not be able to fail the run --
+    // that turned a harmless version skew into "could not start".
+    expect(() =>
+      resolveArgv(
+        { action: "local.up", positionals: [], flags: { "not-a-real-flag": false }, cwd: "/tmp" },
+        "/tmp",
+      ),
+    ).not.toThrow();
+  });
+
+  it("still refuses an unknown flag that WOULD reach argv", () => {
+    expect(() =>
+      resolveArgv(
+        { action: "local.up", positionals: [], flags: { "not-a-real-flag": true }, cwd: "/tmp" },
+        "/tmp",
+      ),
+    ).toThrow(/no --not-a-real-flag/);
+  });
+});
+
 describe("argv resolution refuses what the CLI would reject", () => {
   it("rejects an unknown command", () => {
     expect(() => resolveArgv({ action: "local.nope" }, "/tmp")).toThrow(/not a subcommand/);
