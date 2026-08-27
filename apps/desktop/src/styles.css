@@ -109,16 +109,6 @@
      its colour pushed, so what shows through reads as something seen THROUGH a
      surface rather than as a weaker version of the surface. */
   --card-backdrop: blur(22px) saturate(180%);
-  /* A sheet is a card by family -- same gradient, blur, radius and shadow -- but
-     it sits over the whole app rather than on a pane, so it carries far more of
-     its own fill. At the card's alpha you could read the page's own buttons
-     straight through a form you were filling in, which is the one thing a modal
-     may not do. Glass, but glass you cannot see the far side of. */
-  --sheet-fill: linear-gradient(
-    180deg,
-    rgba(64, 64, 68, 0.95) 0%,
-    rgba(52, 52, 56, 0.9) 100%
-  );
   /* Dark used to be flat, on the reasoning that a lighter panel on a darker
      pane already reads as raised. Translucency weakened that: the pane now
      brightens toward whatever is behind the window, so the panel's edge can
@@ -222,11 +212,6 @@
     rgba(255, 255, 255, 0.32) 100%
   );
   --card-backdrop: blur(22px) saturate(180%);
-  --sheet-fill: linear-gradient(
-    180deg,
-    rgba(255, 255, 255, 0.96) 0%,
-    rgba(255, 255, 255, 0.9) 100%
-  );
   /* Four layers, each doing one job: an inner top highlight so the edge catches
      the light, a hairline to define it, a tight shadow to seat it, and a wide
      soft one to lift it off the pane. A single 1px shadow is what made the first

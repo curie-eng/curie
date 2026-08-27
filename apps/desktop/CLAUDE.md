@@ -192,11 +192,16 @@ React + TypeScript renderer. Full structure and rationale in
     `Sheet` is a
     **centred** panel. It used to drop from the top with only its bottom corners
     rounded, on the platform-sheet reading; hanging off an edge it no longer
-    visually attaches to just looked unfinished. It carries the card family --
-    the same gradient, blur, radius and shadow -- at `--sheet-fill` rather than
-    `--card-fill`, because a card's alpha over the whole app let you read the
-    page's own buttons through a form you were filling in, which is the one
-    thing a modal may not do. A bare
+    visually attaches to just looked unfinished. It is a card like any other:
+    `--card-fill`, the same blur, radius and shadow.
+
+    A `--sheet-fill` at a modal's opacity was tried and reverted. The evidence
+    for it was a screenshot in which the page's buttons looked legible through
+    the sheet -- and screenshots taken through the debugger do not composite the
+    window's native vibrancy, so `backdrop-filter` renders far weaker there than
+    on a real display. The blur does its job on screen. **Do not judge
+    translucency from a captured image in this app**; that mistake has been made
+    on the cards, the seam, the pane and this sheet. A bare
     `<input type="checkbox">` is rendered by the engine and looks like a form
     control on a web page -- that is the tell to avoid.
   - **`tokens.ts` holds no colours, only references.** Every colour token is a
