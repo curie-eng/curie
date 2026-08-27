@@ -130,6 +130,12 @@ React + TypeScript renderer. Full structure and rationale in
     over the desktop (real window vibrancy), a less translucent content pane
     inset above it. Do not add an outline to a surface to make it look separate.
 
+    The seam between them is **square**. The pane's left corners were rounded
+    once, on the idea that letting the vibrancy through at the join was softer
+    than a hard edge. Both surfaces are full height, so rounding one cuts two
+    notches out of an edge running the whole window, and a notch reads as a
+    mistake rather than as softness. They already separate by value.
+
     The window gets vibrancy as a whole and each surface decides how much of it
     to let through. The sidebar paints nothing. The pane paints
     `--s-content-fill` -- its own colour at ~60% -- and so does the toolbar,
