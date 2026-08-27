@@ -45,8 +45,9 @@ export const ROUTES: readonly Route[] = [
   "tiers",
   "resources",
   "canvas",
-  "commands",
   "activity",
+  // Commands and Settings are the foot of the sidebar, below the spacer.
+  "commands",
   "settings",
 ];
 
