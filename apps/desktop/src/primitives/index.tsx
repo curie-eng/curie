@@ -313,7 +313,13 @@ export function Notice({
       style={{
         display: "flex",
         gap: 10,
-        alignItems: "flex-start",
+        // With a title the body runs to several lines and the glyph has to sit
+        // on the FIRST of them, so the row aligns to the top. Without one there
+        // is a single line of text next to a button half again as tall, and
+        // top-aligning pinned the glyph and the sentence to the ceiling while
+        // the button set the height -- which is the misalignment, not a stray
+        // margin. One line centres.
+        alignItems: title ? "flex-start" : "center",
         padding: "10px 12px",
         borderRadius: R.group,
         background: tint(color, 0.1),
@@ -325,7 +331,9 @@ export function Notice({
           flex: "none",
           width: 16,
           height: 16,
-          marginTop: 1,
+          // Nudges the glyph onto the first text line; only meaningful when the
+          // row is top-aligned.
+          marginTop: title ? 1 : 0,
           borderRadius: 999,
           background: color,
           color: "#000",

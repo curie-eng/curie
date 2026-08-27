@@ -210,7 +210,11 @@
   --shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.22);
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
   --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);
-  --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  /* A top highlight, not a hard line. At 0.7 this drew a bright white streak
+     across the top of every default button: the fill under it is only
+     `rgba(0,0,0,0.07)`, so a near-opaque white edge on top of it is the highest
+     contrast thing on the control. Light from above should be felt, not read. */
+  --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.28);
 
   --hue-blue: #0063cc;
   --hue-blue-soft: #2f6fd0;
