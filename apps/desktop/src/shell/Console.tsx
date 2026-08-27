@@ -266,14 +266,14 @@ export function Console({ padX }: { padX: number }) {
         // there, and a fading terminal edge reads as a rendering fault rather
         // than as softness. Insetting sidesteps the seam entirely.
         //
-        // The inset is on all four sides, and the top one is not cosmetic. The
-        // scroller above ends exactly where this begins, so a card the operator
-        // has scrolled part-way is clipped flat against this card's rounded top
-        // -- and a square edge butted onto a rounded one does not read as two
-        // cards, it reads as a badly drawn frame AROUND the console. A gap of
-        // pane between them says what is actually true: separate card, scrolled
-        // under the edge.
-        margin: padX,
+        // No top inset. A band of pane there was tried, to stop a part-scrolled
+        // card being clipped flat against this card's rounded top -- but the
+        // band is opaque, so it hid 22px MORE than the console itself covers.
+        // The problem was never the missing gap, it was the hard clip: the
+        // scroller fades its own last band out instead (`CONTENT_FADE` in
+        // `App.tsx`), so content dissolves as it reaches this edge and there is
+        // no square edge to collide with the rounded one.
+        margin: `0 ${padX}px ${padX}px`,
         display: "flex",
         flexDirection: "column",
         // Bounded: the console is a strip you type into, and the pane above is

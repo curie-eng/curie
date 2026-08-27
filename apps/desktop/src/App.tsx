@@ -110,6 +110,12 @@ function Keys() {
   return null;
 }
 
+/** The scroller's bottom band, as a mask: opaque until the last 28px, then out.
+ *  Eased rather than linear for the same reason `PANE_FADE` is -- a slope that
+ *  jumps from zero to constant on one pixel is what the eye reads as a line. */
+const CONTENT_FADE =
+  "linear-gradient(to bottom, #000 calc(100% - 28px), rgba(0,0,0,0.85) calc(100% - 20px), rgba(0,0,0,0.5) calc(100% - 11px), rgba(0,0,0,0.15) calc(100% - 4px), transparent 100%)";
+
 function Frame() {
   const { route } = useApp();
   const [scrolled, setScrolled] = useState(false);
@@ -185,6 +191,30 @@ function Frame() {
             minWidth: 0,
             overflow: bleed ? "hidden" : "auto",
             padding: bleed ? padX : `18px ${padX}px 32px`,
+            // The scroller ends where the console's card begins, so a card
+            // scrolled part-way is cut off flat against a rounded corner, and a
+            // square edge butted onto a rounded one reads as a frame around the
+            // console rather than as two cards. Insetting the console to put a
+            // band of pane between them fixes the collision and costs more than
+            // it is worth: the band is opaque, so it hides content the console
+            // was not covering.
+            //
+            // Fading the scroller's own last band costs nothing. Content
+            // dissolves as it reaches the edge instead of being guillotined, so
+            // there is no square edge left to collide with. At rest nothing
+            // fades -- the 32px bottom padding keeps the last card clear of the
+            // ramp -- so this is only ever visible mid-scroll, which is exactly
+            // when something is being cut.
+            //
+            // Applied on the full-bleed routes too, where the view scrolls
+            // inside itself rather than here: the mask is on this box, so it
+            // fades whatever reaches this edge either way, and the Commands
+            // list has exactly the same collision. Canvas is the one exception
+            // -- it is not a document meeting an edge, it is a graph, and a node
+            // fading out for a reason that is really about layout would read as
+            // state the node does not have.
+            maskImage: route === "canvas" ? undefined : CONTENT_FADE,
+            WebkitMaskImage: route === "canvas" ? undefined : CONTENT_FADE,
           }}
         >
           {/* Wide enough that a large window is used rather than framed by a dead

@@ -211,14 +211,30 @@ React + TypeScript renderer. Full structure and rationale in
     Anything sitting inside it is a card, and gets a card's treatment.
 
     The inset comes from one `padX` in `App.tsx` that `main` and the console both
-    read, rather than a number copied into two files that then drift apart, and
-    it is on **all four sides**. The top one is not symmetry for its own sake:
-    the scroller ends exactly where the console begins, so a card scrolled
-    part-way is clipped flat against the console's rounded top -- and a square
-    edge butted onto a rounded one does not read as two cards, it reads as a
-    badly drawn frame around the console. Somebody reported exactly that. A band
-    of pane between them says what is true: a separate card, scrolled under the
-    edge.
+    read, rather than a number copied into two files that then drift apart. It
+    is on three sides: **the scroller fades instead of the console insetting.**
+
+    The scroller ends at the pixel the console begins, so a card scrolled
+    part-way is clipped flat against the console's rounded top, and a square
+    edge butted onto a rounded one reads as a frame around the console rather
+    than as two cards. That was reported as "the wrapper is not rounded". The
+    obvious fix -- inset the console on top too, putting a band of pane between
+    them -- was tried and reverted, and the reason is worth keeping: **the band
+    is opaque, so it hides content the console was not covering.** Trading a bad
+    edge for lost content is not a fix.
+
+    `CONTENT_FADE` masks the scroller's own last 28px instead. Content dissolves
+    as it reaches the edge, so there is no square edge left to collide with, and
+    nothing is hidden that the console does not already cover. At rest nothing
+    fades at all -- `main`'s 32px bottom padding keeps the last card clear of the
+    ramp -- so it is only ever visible mid-scroll, which is exactly when
+    something is being cut. It is eased for the same reason `PANE_FADE` is.
+
+    It applies on the full-bleed routes too, where the view scrolls inside
+    itself: the mask is on `main`'s box, so it catches whatever reaches that edge
+    either way, and the Commands list has the same collision. Canvas opts out --
+    it is a graph, not a document meeting an edge, and a node faded for a reason
+    that is really about layout would read as state the node does not have.
 
   - **Grouping is `Group` + `Row`** -- one rounded container, hairline separators
     inset from the left, a small uppercase `SectionHeader` *outside* the box. Not
