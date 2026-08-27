@@ -47,6 +47,11 @@ function devCsp(): Plugin {
 function watchCodegen(): Plugin {
   const GENERATORS = [
     { input: join(here, "scripts", "gen-themes.mjs"), script: "gen-themes.mjs" },
+    // `styles.css` is an INPUT as well as a stylesheet: the generator reads the
+    // two hand-tuned palettes out of it and every derived theme inherits what it
+    // does not override. Editing a base colour there hot-reloads the base and
+    // left the other sixteen themes on the old value until the next `pre*` run.
+    { input: join(here, "src", "styles.css"), script: "gen-themes.mjs" },
     { input: join(here, "..", "..", "cli", "command-manifest.json"), script: "gen-command-manifest.mjs" },
     { input: join(here, "scripts", "gen-command-manifest.mjs"), script: "gen-command-manifest.mjs" },
   ];

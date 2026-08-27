@@ -234,6 +234,20 @@ React + TypeScript renderer. Full structure and rationale in
     dark mode should read as white; the ladder is there to rank it, not to hide
     it. Do not "correct" these back toward the system values.
 
+  - **`--hue-*` are fills; `--status-*` and `--accent` are also text.** That
+    split decides how saturated each may be. The hues feed canvas rails, chart
+    strokes, dots and the tint behind a badge, so they are vivid and spread out.
+    The status colours are used as raw text in about fifteen places, so they stay
+    dark enough to read on a light card.
+
+    The light hues were once darkened too, so they could double as badge text.
+    The cost was measurable: seventeen colliding pairs under an RGB distance of
+    60, `status-warn` and `hue-yellow` only 15 apart. A category colour that
+    cannot be told from the next category carries nothing, and the canvas is
+    where it showed -- a graph of services in one muddy band. `readable()`
+    derives badge ink now, so the tokens were freed to separate. If you add a
+    hue, check it against the others rather than only against the background.
+
   - **A categorical colour used as text goes through `readable()`.** The hue
     tokens are one value doing two jobs -- a fill wants saturation, text wants
     contrast -- and the text job loses in both themes: a saturated blue is
