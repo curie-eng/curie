@@ -148,6 +148,12 @@ React + TypeScript renderer. Full structure and rationale in
     a card per item, and not a header inside the box: that placement is most of
     what makes a grouped list read as native. `Panel` in `Settings.tsx` exists so
     a panel cannot get it wrong.
+    `Stat` is the case that got this wrong and is worth remembering: it painted
+    its own `S.raised` card, so the Overview's four figures rendered as four
+    detached white slabs on a pale field with a small number adrift in each.
+    Four numbers are one fact about the system. They are now hairline-divided
+    cells inside a single `Stats` group, and `Stat` paints no chrome at all.
+
   - **Text uses the named roles in `F`** (`title`, `headline`, `body`, `callout`,
     `section`, `caption`, `footnote`) and the four emphasis levels in `T`. Do not
     pick a pixel size and a grey per component.
