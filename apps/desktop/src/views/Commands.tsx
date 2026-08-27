@@ -320,7 +320,10 @@ export function Commands() {
         {selected ? (
           <>
             <WhereItLives cmd={selected} />
-            <Group>
+            {/* `Group` has no padding of its own -- a grouped LIST gets it from
+                its rows. A form is not a list, so it has to say so, and without
+                this the whole form sat flush against the card's edges. */}
+            <Group style={{ padding: 16 }}>
               <CommandForm key={selected.id} cmd={selected} prefill={app.prefill ?? undefined} />
             </Group>
             <RelatedCommands cmd={selected} onPick={setSelectedId} />
