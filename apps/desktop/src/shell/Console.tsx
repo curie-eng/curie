@@ -89,6 +89,20 @@ export function Console({ padX }: { padX: number }) {
     setNotes((prev) => [...prev, { id: nextNoteId++, kind, text }].slice(-200));
   }, []);
 
+  // Coming back from dismissed puts the cursor in the prompt: the console is
+  // being shown because somebody wants to type in it. The caller cannot do this
+  // reliably -- the input does not exist until this component re-renders, and
+  // the control that was clicked unmounts on the same commit, which drops focus
+  // to the body -- so the console focuses itself on the transition. Tracked
+  // against the previous value rather than just `!hidden`, or it would also
+  // fire on mount and steal focus at every launch.
+  const wasHidden = useRef(hidden);
+  useEffect(() => {
+    const returned = wasHidden.current && !hidden;
+    wasHidden.current = hidden;
+    if (returned) inputRef.current?.focus();
+  }, [hidden]);
+
   // Scrollback follows the tail, which is what a console is for. Reading back
   // is the History pane's job, and it has search and filters.
   useEffect(() => {
@@ -236,8 +250,10 @@ export function Console({ padX }: { padX: number }) {
   };
 
   // Dismissed is dismissed: no residual strip, or the button would not have
-  // done what it said. ⌘L brings it back, and so does anything that starts a
-  // run, because output needs somewhere to land.
+  // done what it said. The way back is the toolbar's Console button, which
+  // appears only while this is hidden -- an affordance that costs no pane
+  // height. ⌘L also brings it back, and so does anything that starts a run,
+  // because output needs somewhere to land.
   if (hidden) return null;
 
   return (

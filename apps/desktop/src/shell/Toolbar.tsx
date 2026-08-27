@@ -8,7 +8,7 @@
 import { useApp, type Route } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
 import { F, LINE, M, PANE_FADE, R, S, STATUS, T } from "../tokens";
-import { Segmented, Spinner } from "../primitives";
+import { Mono, Segmented, Spinner } from "../primitives";
 
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "What is happening right now" },
@@ -89,9 +89,56 @@ export function Toolbar({ scrolled }: { scrolled: boolean }) {
         </button>
       ) : null}
 
+      <ConsoleButton />
       <ApiPill />
 
     </header>
+  );
+}
+
+/**
+ * The way back to a dismissed console.
+ *
+ * The console's dismiss button leaves nothing behind on purpose -- a residual
+ * strip would mean the button had not done what it said -- but that left the
+ * only routes back invisible: ⌘L, or something starting a run. A control you
+ * cannot see is not a way back. So the affordance moves up here, where it costs
+ * no pane height, and appears exactly when it is the only thing that will do.
+ *
+ * It is deliberately not permanent. The console is normally on screen, and a
+ * button offering to show you the thing you are looking at is the kind of
+ * always-there chrome this toolbar exists to avoid.
+ */
+function ConsoleButton() {
+  const runs = useRuns();
+  if (!runs.consoleHidden) return null;
+  return (
+    <button
+      className="no-drag"
+      onClick={() => {
+        runs.setConsoleHidden(false);
+        runs.setConsoleOpen(true);
+        // No focus call here: the console focuses its own prompt when it comes
+        // back, because this button unmounts on the same commit and whatever
+        // focus it set would be dropped.
+      }}
+      title="Show the console and put the cursor in it (⌘L)"
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        border: "none",
+        background: S.control,
+        borderRadius: R.pill,
+        padding: "4px 11px",
+        ...F.caption,
+        color: T.secondary,
+        cursor: "default",
+      }}
+    >
+      <Mono style={{ fontSize: 11, color: T.tertiary }}>›_</Mono>
+      Console
+    </button>
   );
 }
 
