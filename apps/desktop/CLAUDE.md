@@ -161,37 +161,16 @@ React + TypeScript renderer. Full structure and rationale in
     line. The stops approximate smoothstep so the slope leaves and arrives at
     zero. If you retune this, measure the SLOPE, not the value.
 
-    **Every full-width band inside the pane needs the ramp, not just the pane.**
-    The eye reads the whole left edge at once, so one flat band undoes the fade
-    for all of them: the console at the foot painted a solid `S.well` starting on
-    the exact seam pixel and the join looked wrong again one row lower. Use
-    `paneFadeTo(fill)`, or `bandFadeTo(fill, line)` when the band has a top
-    hairline -- `borderTop` cannot fade, so a bordered band drew its separator at
-    full strength across the pixels where its own fill was still at zero, leaving
-    a dark tick in the gap the fade had just opened. Inset pills and centred
-    overlays are exempt; they do not touch the seam. so the sidebar's vibrancy carries a little
-    way across and the two surfaces meet without a step. The toolbar paints the
-    same ramp from the same origin -- it is a child of the pane at the same left
-    edge, so any other value there puts a hard corner back at the top of the
-    seam. The pane's left corners were rounded
-    once, on the idea that letting the vibrancy through at the join was softer
-    than a hard edge. Both surfaces are full height, so rounding one cuts two
-    notches out of an edge running the whole window, and a notch reads as a
-    mistake rather than as softness. They already separate by value.
+    **A surface reaching the seam has two honest options, and fading is only
+    one of them.** Either take the same ramp (`paneFadeTo(fill)`), or do not
+    touch the seam at all. The console tried the first and it looked wrong: a
+    terminal is an object with a boundary, and an edge that dissolves into the
+    chrome reads as a rendering fault rather than as softness. It is inset with a
+    2px outline instead, which sidesteps the question -- nothing to blend into,
+    because it no longer reaches. Reserve the ramp for surfaces that genuinely
+    are the pane (the pane itself, its toolbar); give anything that is an object
+    a boundary and keep it off the edge.
 
-    The window gets vibrancy as a whole and each surface decides how much of it
-    to let through. The sidebar paints nothing. The pane paints
-    `--s-content-fill` -- its own colour at ~60% -- and so does the toolbar,
-    since a solid strip over a translucent pane reads as a title bar stuck on
-    top. `--s-content` stays opaque on purpose: the theme swatch needs a real
-    colour, and the `@supports not (backdrop-filter)` block falls
-    `--s-content-fill` back to it on platforms with no vibrancy.
-
-    Two things to check before pushing the alpha further, in this order. **Light
-    themes first**: dark text over a bright wallpaper loses contrast faster than
-    light text does, so light is the direction that breaks. And **a card's
-    text**, not just the pane's -- `--card-fill` is already translucent in the
-    light themes, so a card sits at two alphas over the desktop, not one.
   - **Grouping is `Group` + `Row`** -- one rounded container, hairline separators
     inset from the left, a small uppercase `SectionHeader` *outside* the box. Not
     a card per item, and not a header inside the box: that placement is most of

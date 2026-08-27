@@ -32,7 +32,7 @@ import { useApp } from "../bridge/app";
 import { transcriptText, useRuns, type Run } from "../bridge/runs";
 import { complete, parseCommand } from "../lib/parseCommand";
 import { duration } from "../lib/format";
-import { ACCENT, F, FONT, LINE, S, STATUS, T, bandFadeTo } from "../tokens";
+import { ACCENT, F, FONT, LINE, R, S, STATUS, T } from "../tokens";
 import { Button, CopyButton, Dot, Kbd, Mono } from "../primitives";
 
 /** A line the console itself wrote, as opposed to one a process wrote. */
@@ -229,11 +229,19 @@ export function Console() {
     <div
       style={{
         flex: "none",
-        // The same ramp the pane and toolbar use, toward this surface's own
-        // fill, and the separator ramped with it. A flat band starting on the
-        // seam pixel undoes the pane's fade one row lower, and the eye reads the
-        // whole left edge at once.
-        background: bandFadeTo(S.well, LINE.separator),
+        // An inset panel, not a full-bleed band. Reaching the sidebar seam meant
+        // matching the pane's fade there, and a fading terminal edge reads as a
+        // rendering fault rather than as softness -- a terminal is an object with
+        // a boundary. Insetting it sidesteps the seam entirely: nothing to blend
+        // into, because it no longer touches.
+        margin: "0 14px 14px",
+        borderRadius: R.group,
+        // Deliberately thicker than a hairline. This is the one surface that is
+        // a container for something else's output rather than a card of its own
+        // content, and the outline is what says where that container ends.
+        border: `2px solid ${LINE.strong}`,
+        overflow: "hidden",
+        background: S.well,
         display: "flex",
         flexDirection: "column",
         // Bounded: the console is a strip you type into, and the pane above is
@@ -407,7 +415,7 @@ function Hints({ hints }: { hints: readonly string[] }) {
         gap: 8,
         flexWrap: "wrap",
         padding: "6px 12px",
-        background: bandFadeTo("transparent", LINE.separator),
+        borderTop: `1px solid ${LINE.separator}`,
       }}
     >
       {hints.map((h) => (
@@ -448,7 +456,8 @@ function Prompt({
         alignItems: "center",
         gap: 8,
         padding: "8px 12px",
-        background: bandFadeTo(S.field, LINE.separator),
+        borderTop: `1px solid ${LINE.separator}`,
+        background: S.field,
       }}
     >
       <Mono style={{ fontSize: 12, color: leadColour, flex: "none", fontWeight: 600 }}>{lead}</Mono>

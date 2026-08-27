@@ -298,26 +298,6 @@ export function readable(color: string): string {
 export const PANE_FADE = paneFadeTo("var(--s-content-fill)");
 
 /**
- * A band that reaches the seam, with its top hairline ramped too.
- *
- * `borderTop` cannot fade, so a band using one drew its separator at full
- * strength across the exact pixels where its fill was still at zero -- a dark
- * tick sitting in the gap the fade had just opened. Two background layers fix
- * it: the hairline as a 1px-tall gradient pinned to the top, and the fill under
- * it, both on the same ramp.
- */
-export function bandFadeTo(fill: string, line: string): string {
-  const edge = [
-    "linear-gradient(90deg",
-    "transparent 0",
-    `${tintOf(line, 0.156)} 10px`,
-    `${tintOf(line, 0.5)} 20px`,
-    `${line} 40px)`,
-  ].join(", ");
-  return `${edge} top left / 100% 1px no-repeat, ${paneFadeTo(fill)}`;
-}
-
-/**
  * Any surface that reaches the sidebar seam, ramped in the same way.
  *
  * Every full-width band inside the content pane needs this, not just the pane
