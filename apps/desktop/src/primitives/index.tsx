@@ -213,35 +213,75 @@ export function Well({
 
 /** A number worth reading at a glance. Rendered as a tile in a grid rather than
  *  a bordered card. */
+/**
+ * One figure in a `Stats` row.
+ *
+ * Deliberately paints no chrome of its own. Four numbers are one fact about the
+ * system, not four unrelated ones, and the app's grouping rule is a single
+ * rounded container with hairline separators -- not a card per item. As four
+ * separate cards these read as four white slabs on a pale field with a small
+ * number lost in the middle of each, which is most of what made the Overview
+ * look unfinished.
+ *
+ * `first` suppresses the leading separator, the same way `Row` does it: the line
+ * belongs to the cell that follows it, so a row cannot end with a stray edge.
+ */
 export function Stat({
   label,
   value,
   sub,
   accent,
+  first,
 }: {
   label: string;
   value: ReactNode;
   sub?: ReactNode;
   accent?: string;
+  first?: boolean;
 }) {
   return (
-    <div style={{ background: S.raised, borderRadius: R.group, boxShadow: SHADOW.card, padding: "12px 14px" }}>
-      <div style={{ ...F.caption, color: T.tertiary, marginBottom: 4 }}>{label}</div>
+    <div
+      style={{
+        flex: 1,
+        minWidth: 0,
+        padding: "11px 14px",
+        borderLeft: first ? undefined : `1px solid ${LINE.separator}`,
+      }}
+    >
+      <div style={{ ...F.caption, color: T.tertiary, marginBottom: 3 }}>{label}</div>
       <div
         style={{
-          fontSize: 24,
+          fontSize: 22,
           fontWeight: 600,
           letterSpacing: -0.6,
-          lineHeight: 1.1,
+          lineHeight: 1.15,
           color: accent ?? T.primary,
           fontVariantNumeric: "tabular-nums",
         }}
       >
         {value}
       </div>
-      {sub ? <div style={{ ...F.footnote, color: T.tertiary, marginTop: 4 }}>{sub}</div> : null}
+      {sub ? (
+        <div
+          style={{
+            ...F.footnote,
+            color: T.tertiary,
+            marginTop: 2,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {sub}
+        </div>
+      ) : null}
     </div>
   );
+}
+
+/** The container `Stat` cells belong in: one card, hairline-divided. */
+export function Stats({ children }: { children: ReactNode }) {
+  return <Group style={{ display: "flex", alignItems: "stretch" }}>{children}</Group>;
 }
 
 export type NoticeTone = "info" | "warn" | "error" | "success";

@@ -30,6 +30,7 @@ import {
   Row,
   SectionHeader,
   Stat,
+  Stats,
 } from "../primitives";
 
 interface MetricsSummary {
@@ -102,8 +103,9 @@ export function Overview() {
       <Blockers approvals={approvals} />
       <Health onRefresh={refresh} />
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+      <Stats>
         <Stat
+          first
           label="Agents"
           value={app.agents.length}
           sub={reachable ? "deployed identities" : "API unreachable"}
@@ -124,7 +126,7 @@ export function Overview() {
           value={metrics ? duration(metrics.latency_p95_ms) : "—"}
           sub={metrics ? `${count(metrics.runs)} runs` : "unavailable"}
         />
-      </div>
+      </Stats>
 
       <div
         // `stretch`, so the two cards in this row are the same height. With
@@ -156,15 +158,28 @@ export function Overview() {
                 {(w) => <Sparkline values={runnerCpu} width={w} height={96} color={ACCENT} />}
               </FitWidth>
             ) : (
-              // The centring wrapper is separate from the sentence on purpose: a
-              // flex container makes each child its own item, which trims the
-              // space between the text and the <Mono> and reads as "withcurie".
+              // An empty chart card is the biggest block of dead space on this
+              // screen, so it carries the thing you would do about it rather
+              // than a sentence describing the absence. The centring wrapper is
+              // separate from the sentence on purpose: a flex container makes
+              // each child its own item, which trims the space between the text
+              // and the <Mono> and reads as "withcurie".
               <div
-                style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}
+                style={{
+                  flex: 1,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 10,
+                }}
               >
                 <div style={{ ...F.callout, color: T.tertiary, textAlign: "center" }}>
-                  No runner sandboxes are running. Start one with <Mono>curie skill up</Mono>.
+                  No runner sandboxes on this machine.
                 </div>
+                <RunButton id="skill.up" tone="primary">
+                  Boot a runner
+                </RunButton>
               </div>
             )}
             <div
@@ -366,9 +381,17 @@ function Agents() {
       <section>
         <SectionHeader>Agents</SectionHeader>
         <Group style={{ padding: 14 }}>
-          <div style={{ ...F.callout, color: T.tertiary }}>
-            Agents live in the platform API. Point this app at one in Settings, or bring the local
-            stack up with <Mono>curie local up</Mono>.
+          <div style={{ ...F.callout, color: T.tertiary, marginBottom: 10 }}>
+            Agents live in the platform API, and this app is not pointed at one that answers.
+          </div>
+          {/* Both ways out, rather than prose naming them. */}
+          <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+            <RunButton id="local.up" tone="primary">
+              Bring the local stack up
+            </RunButton>
+            <Button size="sm" onClick={() => app.navigate("settings")}>
+              Point at an API
+            </Button>
           </div>
         </Group>
       </section>

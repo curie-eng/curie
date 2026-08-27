@@ -166,7 +166,9 @@ export function LadderStrip() {
   return (
     <section>
       <SectionHeader>Where things are running</SectionHeader>
-      <Group style={{ padding: 12 }}>
+      {/* Slim: three pills and a link do not need a card's worth of padding,
+          and the band of empty space between them was reading as a mistake. */}
+      <Group style={{ padding: "7px 12px" }}>
         <button
           onClick={() => app.navigate("tiers")}
           title="Open the tiers view"
