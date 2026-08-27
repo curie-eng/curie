@@ -204,9 +204,27 @@ describe("the working directory", () => {
     expect(await screen.findByText("/Users/dev")).toBeInTheDocument();
   });
 
-  it("says a bundle is needed to run against one", async () => {
+  it("says WHICH directory it chose, not just the path", async () => {
+    // The path alone does not tell you whether the app picked the bundle you
+    // have open, your checkout, or a fallback -- and those produce different
+    // results for the same command. This stub has neither a bundle nor a
+    // checkout, so the honest answer is the default.
     mount("local.status");
-    expect(await screen.findByText(/no bundle open/)).toBeInTheDocument();
+    expect(await screen.findByText(/default directory/)).toBeInTheDocument();
+  });
+
+  it("prefers the checkout for a stack command when there is one", async () => {
+    // A dev build resolves `compose.dev.yaml` against cwd, so a stack command
+    // run from anywhere else fails on a missing file rather than on a wrong
+    // directory. This is the assertion that keeps that from regressing.
+    const shell = stubShell();
+    window.curie = {
+      ...shell,
+      env: async () => ({ ...(await shell.env()), repoRoot: "/src/curie" }),
+    };
+    mount("local.status");
+    expect(await screen.findByText("/src/curie")).toBeInTheDocument();
+    expect(await screen.findByText(/source checkout/)).toBeInTheDocument();
   });
 
   it("prints no directory at all when the shell cannot say", async () => {

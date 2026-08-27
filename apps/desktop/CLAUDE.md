@@ -98,6 +98,31 @@ React + TypeScript renderer. Full structure and rationale in
   "nothing goes through a shell" outright, and the no-TTY rule above means an
   interactive shell could not be answered anyway.
 
+- **A command's working directory is a decision, not a default.** `cwdFor`
+  (`src/lib/manifest.ts`) picks it, and both the form and the console go through
+  it. The skill tier and the scaffolding commands run in the **bundle**, because
+  there the directory IS the argument -- `skill up` snapshots the directory it is
+  invoked in. Everything else that cares about cwd is repo or stack work and runs
+  in the **checkout**, because a dev build of the CLI resolves `compose.dev.yaml`
+  relative to cwd.
+
+  Getting this wrong is quiet and expensive: the command runs, in the wrong
+  place, and the CLI complains about a missing file rather than about the
+  directory. `curie local up` failed from the home directory for exactly that
+  reason while the compose file sat in the checkout the app was running out of.
+
+  `repoRoot` is **found**, by `findRepoRoot` walking up from the app's own
+  location for a directory holding both `cli/` and `compose.dev.yaml`. It used to
+  be read straight from `CURIE_REPO_ROOT`, which nothing sets, so it was null in
+  every ordinary run and fed only a label. Both markers are required so a
+  lookalike parent cannot silently become the directory every stack command runs
+  in, and the env var still wins when set -- but only if it still looks like a
+  checkout, so a stale export cannot redirect everything.
+
+  The form says which of the three it chose and why, because the path alone does
+  not tell you whether the app picked your bundle, your checkout, or a fallback,
+  and those produce different results for the same command.
+
 - **No demo mode, no fixtures** -- the same rule as `apps/ui` (#542). Every view
   is backed by the live CLI, the live Docker daemon, or the live API. An
   unmeasurable value renders as an em dash (`DASH` in `src/lib/format.ts`), never

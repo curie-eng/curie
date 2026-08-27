@@ -292,6 +292,53 @@ function quote(token: string): string {
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(token) ? token : `'${token.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * Which directory a command should run in.
+ *
+ * Every invocation used to carry the open bundle's path, falling back to the
+ * shell's default -- the home directory. That is right for the skill tier, where
+ * the directory IS the argument, and wrong for everything else: a dev build of
+ * the CLI looks for `compose.dev.yaml` relative to cwd, so `curie local up` from
+ * the home directory fails with "dev build with no local compose.dev.yaml in
+ * cwd" while the file sits in the checkout the app already knows the path to.
+ *
+ * The split is what each command operates ON:
+ *
+ *   - The **skill tier** and the scaffolding commands work on a bundle
+ *     directory. `skill up` runs an immutable snapshot of the directory it is
+ *     invoked in; `init` writes a new bundle into it.
+ *   - **Everything else** that cares about cwd is repo or stack work -- compose
+ *     files, chart assertions, contributor scripts -- and wants the checkout.
+ *   - The agent-scoped commands talk to the platform API over HTTP and do not
+ *     care either way, so they take the same answer harmlessly.
+ *
+ * `repoRoot` comes from the shell's own probe rather than being guessed here,
+ * and is null when the installed binary is not a source checkout -- in which
+ * case there is no compose file to find and the bundle or the default is as good
+ * an answer as exists.
+ */
+export function cwdFor(
+  cmd: Command,
+  ctx: { workspace?: string | null; repoRoot?: string | null; fallback?: string | null },
+): string | undefined {
+  const bundleFirst = cmd.tier === "skill" || cmd.id === "init" || cmd.id === "try";
+  const order = bundleFirst
+    ? [ctx.workspace, ctx.repoRoot, ctx.fallback]
+    : [ctx.repoRoot, ctx.workspace, ctx.fallback];
+  return order.find((p): p is string => !!p);
+}
+
+/** Why `cwdFor` chose what it chose, for the line under a command form. */
+export function cwdReason(
+  chosen: string | undefined,
+  ctx: { workspace?: string | null; repoRoot?: string | null },
+): string {
+  if (!chosen) return "Working directory not known yet.";
+  if (chosen === ctx.workspace) return "the bundle you have open";
+  if (chosen === ctx.repoRoot) return "your source checkout";
+  return "this app's default directory";
+}
+
 /** Commands whose values are worth remembering between runs, keyed by the flag
  *  that identifies the target. Re-typing `--api-url` on every command is the
  *  main tax of driving this CLI by hand, and the desktop app is the right place

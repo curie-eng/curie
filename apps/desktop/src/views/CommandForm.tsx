@@ -20,6 +20,8 @@ import { useRuns } from "../bridge/runs";
 import { ACCENT, F, FONT, HUE, LINE, R, S, STATUS, T } from "../tokens";
 import { Badge, Button, CopyButton, Field, Input, Mono, Notice, Select, Sheet, Textarea, Toggle } from "../primitives";
 import {
+  cwdFor,
+  cwdReason,
   fieldKind,
   defaultValue,
   renderCommand,
@@ -48,19 +50,22 @@ type Values = Record<string, string | boolean | undefined>;
  * rather than being guessed here, because a directory this app prints and does
  * not actually use would be worse than printing none.
  */
-function RunDirectory() {
+function RunDirectory({ cmd }: { cmd: Command }) {
   const app = useApp();
-  const open = app.workspace;
-  const where = open?.path || app.env?.defaultCwd || null;
+  const ctx = {
+    workspace: app.workspace?.path,
+    repoRoot: app.env?.repoRoot,
+    fallback: app.env?.defaultCwd,
+  };
+  const where = cwdFor(cmd, ctx);
 
   return (
     <div style={{ ...F.footnote, color: T.quaternary, marginBottom: 12, marginTop: -6 }}>
-      {where === null ? (
+      {where === undefined ? (
         "Working directory not known yet."
       ) : (
         <>
-          Runs in <Mono style={{ color: T.tertiary }}>{where}</Mono>
-          {open ? null : " (no bundle open; pick one in the sidebar to run against it)"}
+          Runs in <Mono style={{ color: T.tertiary }}>{where}</Mono> — {cwdReason(where, ctx)}
         </>
       )}
     </div>
@@ -212,7 +217,11 @@ export function CommandForm({
           action: cmd.id,
           positionals: positionals.map((p) => p.trim()),
           flags: merged,
-          cwd: app.workspace?.path,
+          cwd: cwdFor(cmd, {
+            workspace: app.workspace?.path,
+            repoRoot: app.env?.repoRoot,
+            fallback: app.env?.defaultCwd,
+          }),
           json: asJson,
         });
         onRan?.(runId);
@@ -220,7 +229,7 @@ export function CommandForm({
         setError((err as Error).message);
       }
     },
-    [app, runs, cmd.id, positionals, flags, asJson, onRan],
+    [app, runs, cmd, positionals, flags, asJson, onRan],
   );
 
   const run = useCallback(() => {
@@ -320,7 +329,7 @@ export function CommandForm({
         <CopyButton text={preview} />
       </div>
 
-      <RunDirectory />
+      <RunDirectory cmd={cmd} />
 
       {missing.length ? (
         <div style={{ marginBottom: 10 }}>
