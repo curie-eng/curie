@@ -405,6 +405,35 @@ React + TypeScript renderer. Full structure and rationale in
   the scroller is load bearing: a flex child will not shrink below its content, so
   without it `maxHeight` is ignored and the overflow never engages.
 
+- **Tiers is a matrix, and the rows are derived.** One column per rung, one row
+  per verb, where a verb is whatever follows the tier in a command id. Three
+  stacked panels of buttons made the reader hold `skill up`, `local up` and
+  `cluster up` in their head and notice for themselves that they were the same
+  verb; a row does it for them, and a gap in a row says the other half -- the
+  skill tier has no `observability` because it has no platform to record a run
+  in. It also fixes the layout complaint that prompted it, and for the same
+  reason: three lists of six, ten and eleven buttons are a tall ribbon down the
+  left of a wide window with the width doing nothing.
+
+  Rows come out of `resolve()` on the three tier surfaces, never a list in the
+  view, so a command added to `tiers.cluster` grows a row or fills a gap in one
+  without this file being touched -- which is what stops the matrix quietly
+  dropping a command `surfaces.test.ts` believes has a home. A verb with no entry
+  in `VERB_LABEL` still renders, under a title-cased fallback.
+
+  Two things about the cells were got wrong first and are worth not repeating.
+  `quiet` renders as `plain` -- no fill -- which reads as a quieter *button* in a
+  wrapping row of filled ones, and as a *value* in a grid beside a label column:
+  "Release health" stopped looking like something you could press. The matrix
+  passes an explicit tone. And a cell stretched to the full column made "Stop" a
+  347px slab, while a natural-width button put the dead band back inside each
+  column; capped at 210px it lines up on both edges and still reads as a button.
+
+  Verbs only one rung offers are **not** rows. As rows they were four lines of
+  two dashes and a button under a band already headed "only at this rung", so
+  every blank was expected and the dash was noise, and the row label restated the
+  button beside it. They stack inside their own column instead.
+
 - **The agent is a surface, not a prefix.** Twenty-six commands are agent-scoped:
   thirteen verbs at the local and the cluster tier. They live in one sheet
   (`src/views/AgentSheet.tsx`), opened from the agent's own row, with the tier
