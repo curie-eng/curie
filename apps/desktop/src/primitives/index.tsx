@@ -18,7 +18,7 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 
-import { ACCENT, ACCENT_HOVER, F, FONT, KNOB, LINE, M, ON_ACCENT, R, S, SHADOW, STATUS, T, tint } from "../tokens";
+import { ACCENT, ACCENT_HOVER, F, FONT, KNOB, LINE, M, ON_ACCENT, R, S, SHADOW, STATUS, T, readable, tint } from "../tokens";
 
 // --- text ------------------------------------------------------------------
 
@@ -406,7 +406,11 @@ export function Badge({
         borderRadius: R.pill,
         whiteSpace: "nowrap",
         background: filled ? tint(color, 0.18) : S.subtle,
-        color: filled ? color : T.secondary,
+        // `readable(color)`, not `color`: the label sits on an 18% tint of its
+        // own hue, where the raw value has almost no contrast -- a saturated
+        // blue on dark, a dark green on light. `readable` pulls it toward the
+        // theme's ink, which is the right direction in both.
+        color: filled ? readable(color) : T.secondary,
       }}
     >
       {children}

@@ -272,10 +272,14 @@ function derive(theme) {
   // Text is the foreground at four fixed alphas, which is what keeps hierarchy
   // comparable across themes.
   Object.assign(vars, {
-    "--t-primary": alpha(fg, dark ? 0.95 : 0.9),
-    "--t-secondary": alpha(fg, dark ? 0.7 : 0.74),
-    "--t-tertiary": alpha(fg, dark ? 0.48 : 0.56),
-    "--t-quaternary": alpha(fg, dark ? 0.3 : 0.4),
+    // Dark sits much higher than the platform's own label alphas because this
+    // window is translucent: every surface brightens toward the desktop behind
+    // it, so dim ink loses the contrast it was budgeted. Most text in dark mode
+    // should read as white -- the ladder ranks it, it does not hide it.
+    "--t-primary": dark ? fg : alpha(fg, 0.9),
+    "--t-secondary": alpha(fg, dark ? 0.88 : 0.74),
+    "--t-tertiary": alpha(fg, dark ? 0.68 : 0.56),
+    "--t-quaternary": alpha(fg, dark ? 0.5 : 0.4),
   });
 
   const lineBase = dark ? fg : "#000000";
