@@ -177,15 +177,28 @@ export function UsageBar({
   color = ACCENT,
   height = 5,
   title,
+  warnAt = 0.85,
 }: {
   value: number | null;
   max: number | null;
   color?: string;
   height?: number;
   title?: string;
+  /**
+   * Fraction of `max` above which the bar turns into a warning, or `null` for a
+   * bar that never warns.
+   *
+   * `null` is not a style preference. A warning colour means "this is close to a
+   * ceiling", which is only true when `max` IS a ceiling -- a memory limit, a
+   * CPU count. When `max` is merely the largest value in a list, the leading row
+   * is at 100% by definition and warning about it says only that the biggest
+   * item is the biggest item. `RankedBars` passes `null` for exactly that
+   * reason.
+   */
+  warnAt?: number | null;
 }) {
   const ratio = value !== null && max && max > 0 ? Math.min(1, value / max) : null;
-  const warn = ratio !== null && ratio > 0.85;
+  const warn = warnAt !== null && ratio !== null && ratio > warnAt;
   return (
     <div
       title={title}
@@ -342,7 +355,13 @@ export function RankedBars({
             >
               {r.label}
             </div>
-            <UsageBar value={r.value} max={max} color={r.color ?? ACCENT} height={4} />
+            <UsageBar
+              value={r.value}
+              max={max}
+              color={r.color ?? ACCENT}
+              height={4}
+              warnAt={null}
+            />
           </div>
           <div
             style={{

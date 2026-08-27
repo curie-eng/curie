@@ -213,6 +213,20 @@ React + TypeScript renderer. Full structure and rationale in
     resolve "system" in the renderer with a media query -- two places deciding
     what the OS is doing will disagree.
 
+  - **Widen a value gap upward, not downward.** A card reads as raised because it
+    is lighter than the pane. Taking that gap out of the *pane* works on a
+    swatch and ruins the screen: dark has no headroom downward, so sinking the
+    pane made the whole window gloomy and the faintest text unreadable. Raise
+    `--card-fill` instead and leave the pane where it is.
+
+  - **The ink ladder is four fixed alphas, and the base must match the
+    generator.** `gen-themes.mjs` gives every derived theme
+    0.95 / 0.7 / 0.48 / 0.3 (dark). The hand-tuned Curie Dark block in
+    `styles.css` sat at 0.92 / 0.62 / 0.38 / 0.22, which made the *reference*
+    palette the faintest one in the app. `quaternary` is not decoration -- it
+    carries real prose in about sixty places -- so at 0.22 that copy simply could
+    not be read. If you retune one of the two, retune both.
+
   - **Depth is a value gap plus a shadow, and translucency eats the gap.** A
     card reads as raised because it is lighter than the pane *and* casts onto it.
     Letting vibrancy through the pane brightens it toward whatever is behind the
@@ -381,6 +395,15 @@ React + TypeScript renderer. Full structure and rationale in
   percentage is not information. The one place this was overdone: pinning the
   chart's axis to the ceiling drew a real 95% load as a flat line at 8% height.
   The axis follows the data; the caption carries the denominator.
+
+- **A warning colour claims proximity to a ceiling, so it needs a ceiling.**
+  `UsageBar` turns amber above `warnAt` (default 0.85 of `max`), which is right
+  when `max` is a real limit -- a memory cap, a CPU count. `RankedBars` scales
+  every row against the *largest row*, so its leader is at 100% by definition:
+  the bar was warning that the biggest item in a list is the biggest item, and
+  painting it `--status-warn`, which in light is a dark brown. `RankedBars`
+  passes `warnAt={null}`. Any new caller has to answer the same question -- is
+  `max` a ceiling, or just the top of this list?
 
 - **Charts must fill their container.** They draw into real pixel coordinates
   rather than a stretched `viewBox`, so they need a measured width: wrap them in

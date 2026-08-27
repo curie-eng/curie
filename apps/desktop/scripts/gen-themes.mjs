@@ -219,7 +219,7 @@ function derive(theme) {
       "--s-sidebar-fallback": mix(bg, fg, 0.05),
       "--s-content": mix(bg, fg, 0.05),
       // Same colour, vibrancy allowed through. See the note in styles.css.
-      "--s-content-fill": alpha(mix(bg, "#000000", 0.22), 0.62),
+      "--s-content-fill": alpha(mix(bg, "#000000", 0.08), 0.6),
       "--s-raised": mix(bg, fg, 0.1),
       "--s-hover": mix(bg, fg, 0.15),
       "--s-selected": mix(bg, fg, 0.21),
@@ -233,7 +233,7 @@ function derive(theme) {
       // Flat *fill* -- a gradient in dark only muddies it -- but not a flat
       // card: the shadow below does the lifting, because a translucent pane
       // brightens toward the desktop and can meet the panel at its own value.
-      "--card-fill": mix(bg, fg, 0.1),
+      "--card-fill": mix(bg, fg, 0.14),
       "--shadow-card": [
         `inset 0 1px 0 ${alpha(fg, 0.06)}`,
         "0 0 0 0.5px rgba(0, 0, 0, 0.55)",
@@ -246,7 +246,7 @@ function derive(theme) {
       "--s-window": mix(bg, "#000000", 0.11),
       "--s-sidebar-fallback": mix(bg, "#000000", 0.06),
       "--s-content": mix(bg, "#000000", 0.045),
-      "--s-content-fill": alpha(mix(bg, "#000000", 0.13), 0.62),
+      "--s-content-fill": alpha(mix(bg, "#000000", 0.09), 0.62),
       "--s-raised": bg,
       "--s-hover": mix(bg, "#000000", 0.045),
       "--s-selected": mix(bg, accent, 0.14),
