@@ -106,18 +106,18 @@
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
   --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);
   --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.28);
-  --hue-blue: #0063cc;
-  --hue-blue-soft: #2f6fd0;
-  --hue-purple: #8a2fd0;
-  --hue-violet: #8e44c4;
-  --hue-orange: #a85c00;
-  --hue-orange-soft: #8f5f18;
-  --hue-cyan: #0b7099;
-  --hue-teal: #0e756e;
-  --hue-yellow: #806400;
-  --hue-red: #c0392b;
-  --hue-grey: #6a6a70;
-  --hue-grey-dim: #85858a;
+  --hue-blue: #1a73e8;
+  --hue-blue-soft: #6aa6ff;
+  --hue-purple: #a435f0;
+  --hue-violet: #cf6bff;
+  --hue-orange: #ef6c00;
+  --hue-orange-soft: #ffa53d;
+  --hue-cyan: #00a4c4;
+  --hue-teal: #12a594;
+  --hue-yellow: #dfa000;
+  --hue-red: #e5484d;
+  --hue-grey: #8b8b93;
+  --hue-grey-dim: #b4b4bb;
 }
 
 :root[data-theme="dark-plus"] {
@@ -220,18 +220,18 @@
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
   --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);
   --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.28);
-  --hue-blue: #0063cc;
-  --hue-blue-soft: #2f6fd0;
-  --hue-purple: #8a2fd0;
-  --hue-violet: #8e44c4;
-  --hue-orange: #a85c00;
-  --hue-orange-soft: #8f5f18;
-  --hue-cyan: #0b7099;
-  --hue-teal: #0e756e;
-  --hue-yellow: #806400;
-  --hue-red: #c0392b;
-  --hue-grey: #6a6a70;
-  --hue-grey-dim: #85858a;
+  --hue-blue: #1a73e8;
+  --hue-blue-soft: #6aa6ff;
+  --hue-purple: #a435f0;
+  --hue-violet: #cf6bff;
+  --hue-orange: #ef6c00;
+  --hue-orange-soft: #ffa53d;
+  --hue-cyan: #00a4c4;
+  --hue-teal: #12a594;
+  --hue-yellow: #dfa000;
+  --hue-red: #e5484d;
+  --hue-grey: #8b8b93;
+  --hue-grey-dim: #b4b4bb;
 }
 
 :root[data-theme="dark-modern"] {
@@ -334,18 +334,18 @@
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
   --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);
   --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.28);
-  --hue-blue: #0063cc;
-  --hue-blue-soft: #2f6fd0;
-  --hue-purple: #8a2fd0;
-  --hue-violet: #8e44c4;
-  --hue-orange: #a85c00;
-  --hue-orange-soft: #8f5f18;
-  --hue-cyan: #0b7099;
-  --hue-teal: #0e756e;
-  --hue-yellow: #806400;
-  --hue-red: #c0392b;
-  --hue-grey: #6a6a70;
-  --hue-grey-dim: #85858a;
+  --hue-blue: #1a73e8;
+  --hue-blue-soft: #6aa6ff;
+  --hue-purple: #a435f0;
+  --hue-violet: #cf6bff;
+  --hue-orange: #ef6c00;
+  --hue-orange-soft: #ffa53d;
+  --hue-cyan: #00a4c4;
+  --hue-teal: #12a594;
+  --hue-yellow: #dfa000;
+  --hue-red: #e5484d;
+  --hue-grey: #8b8b93;
+  --hue-grey-dim: #b4b4bb;
 }
 
 :root[data-theme="hc-dark"] {
@@ -448,18 +448,18 @@
   --shadow-overlay: 0 0 0 1px rgba(0, 0, 0, 0.7);
   --shadow-sheet: 0 0 0 1px rgba(0, 0, 0, 0.7);
   --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.28);
-  --hue-blue: #0063cc;
-  --hue-blue-soft: #2f6fd0;
-  --hue-purple: #8a2fd0;
-  --hue-violet: #8e44c4;
-  --hue-orange: #a85c00;
-  --hue-orange-soft: #8f5f18;
-  --hue-cyan: #0b7099;
-  --hue-teal: #0e756e;
-  --hue-yellow: #806400;
-  --hue-red: #c0392b;
-  --hue-grey: #6a6a70;
-  --hue-grey-dim: #85858a;
+  --hue-blue: #1a73e8;
+  --hue-blue-soft: #6aa6ff;
+  --hue-purple: #a435f0;
+  --hue-violet: #cf6bff;
+  --hue-orange: #ef6c00;
+  --hue-orange-soft: #ffa53d;
+  --hue-cyan: #00a4c4;
+  --hue-teal: #12a594;
+  --hue-yellow: #dfa000;
+  --hue-red: #e5484d;
+  --hue-grey: #8b8b93;
+  --hue-grey-dim: #b4b4bb;
 }
 
 :root[data-theme="abyss"] {
@@ -733,18 +733,18 @@
   --shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.16);
   --shadow-sheet: 0 20px 48px rgba(0, 0, 0, 0.2);
   --shadow-raised: inset 0 1px 0 rgba(255, 255, 255, 0.28);
-  --hue-blue: #0063cc;
-  --hue-blue-soft: #2f6fd0;
-  --hue-purple: #8a2fd0;
-  --hue-violet: #8e44c4;
-  --hue-orange: #a85c00;
-  --hue-orange-soft: #8f5f18;
-  --hue-cyan: #0b7099;
-  --hue-teal: #0e756e;
-  --hue-yellow: #806400;
-  --hue-red: #c0392b;
-  --hue-grey: #6a6a70;
-  --hue-grey-dim: #85858a;
+  --hue-blue: #1a73e8;
+  --hue-blue-soft: #6aa6ff;
+  --hue-purple: #a435f0;
+  --hue-violet: #cf6bff;
+  --hue-orange: #ef6c00;
+  --hue-orange-soft: #ffa53d;
+  --hue-cyan: #00a4c4;
+  --hue-teal: #12a594;
+  --hue-yellow: #dfa000;
+  --hue-red: #e5484d;
+  --hue-grey: #8b8b93;
+  --hue-grey-dim: #b4b4bb;
 }
 
 :root[data-theme="red"] {
