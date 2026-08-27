@@ -130,7 +130,12 @@ React + TypeScript renderer. Full structure and rationale in
     over the desktop (real window vibrancy), a less translucent content pane
     inset above it. Do not add an outline to a surface to make it look separate.
 
-    The seam between them is **square**. The pane's left corners were rounded
+    The seam between them is **square but not abrupt**: the pane's fill ramps up
+    from nothing over its first 40px, so the sidebar's vibrancy carries a little
+    way across and the two surfaces meet without a step. The toolbar paints the
+    same ramp from the same origin -- it is a child of the pane at the same left
+    edge, so any other value there puts a hard corner back at the top of the
+    seam. The pane's left corners were rounded
     once, on the idea that letting the vibrancy through at the join was softer
     than a hard edge. Both surfaces are full height, so rounding one cuts two
     notches out of an edge running the whole window, and a notch reads as a
