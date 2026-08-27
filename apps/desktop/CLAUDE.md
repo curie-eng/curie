@@ -159,7 +159,17 @@ React + TypeScript renderer. Full structure and rationale in
     banding. People saw a line there, and they were right to: the band is real
     perception of a real geometric fact, even though nothing in the pixels is a
     line. The stops approximate smoothstep so the slope leaves and arrives at
-    zero. If you retune this, measure the SLOPE, not the value, so the sidebar's vibrancy carries a little
+    zero. If you retune this, measure the SLOPE, not the value.
+
+    **Every full-width band inside the pane needs the ramp, not just the pane.**
+    The eye reads the whole left edge at once, so one flat band undoes the fade
+    for all of them: the console at the foot painted a solid `S.well` starting on
+    the exact seam pixel and the join looked wrong again one row lower. Use
+    `paneFadeTo(fill)`, or `bandFadeTo(fill, line)` when the band has a top
+    hairline -- `borderTop` cannot fade, so a bordered band drew its separator at
+    full strength across the pixels where its own fill was still at zero, leaving
+    a dark tick in the gap the fade had just opened. Inset pills and centred
+    overlays are exempt; they do not touch the seam. so the sidebar's vibrancy carries a little
     way across and the two surfaces meet without a step. The toolbar paints the
     same ramp from the same origin -- it is a child of the pane at the same left
     edge, so any other value there puts a hard corner back at the top of the
