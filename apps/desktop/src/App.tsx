@@ -24,7 +24,7 @@ import { Commands } from "./views/Commands";
 import { Activity } from "./views/Activity";
 import { Settings } from "./views/Settings";
 import { RunSheetHost } from "./views/Actions";
-import { S } from "./tokens";
+import { PANE_FADE } from "./tokens";
 
 function View() {
   const { route } = useApp();
@@ -154,7 +154,7 @@ function Frame() {
           // The toolbar paints the same ramp from the same origin. It is a child
           // of this pane at the same left edge, so any other value there would
           // put a hard corner back at the top of the seam.
-          background: `linear-gradient(90deg, transparent 0, ${S.contentFill} 40px)`,
+          background: PANE_FADE,
           overflow: "hidden",
         }}
       >

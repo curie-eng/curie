@@ -131,7 +131,14 @@ React + TypeScript renderer. Full structure and rationale in
     inset above it. Do not add an outline to a surface to make it look separate.
 
     The seam between them is **square but not abrupt**: the pane's fill ramps up
-    from nothing over its first 40px, so the sidebar's vibrancy carries a little
+    from nothing over its first 40px on an EASED curve (`PANE_FADE`), not a
+    linear one. Linear was already smooth in value -- measured across the seam
+    the largest step is 2/255 -- but its slope jumped from zero to constant on a
+    single pixel, and a first-derivative discontinuity is what triggers Mach
+    banding. People saw a line there, and they were right to: the band is real
+    perception of a real geometric fact, even though nothing in the pixels is a
+    line. The stops approximate smoothstep so the slope leaves and arrives at
+    zero. If you retune this, measure the SLOPE, not the value, so the sidebar's vibrancy carries a little
     way across and the two surfaces meet without a step. The toolbar paints the
     same ramp from the same origin -- it is a child of the pane at the same left
     edge, so any other value there puts a hard corner back at the top of the
