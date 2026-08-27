@@ -35,8 +35,9 @@
      the theme swatch and the no-vibrancy fallback both need a real colour; this
      is the same colour with the window's vibrancy allowed through, so the
      desktop reads faintly behind the pane the way it does behind the sidebar.
-     Dark carries more translucency than light: light text over a bright
-     wallpaper loses less contrast than dark text does. */
+     Light is the riskier direction if you push this further -- dark text over a
+     bright wallpaper loses contrast faster than light text does -- so check a
+     light theme before a dark one. */
   --s-content-fill: rgba(36, 36, 38, 0.6);
   --s-raised: #2c2c2e;
   --s-hover: #333336;
@@ -124,7 +125,7 @@
   --s-sidebar: transparent;
   --s-sidebar-fallback: #e4e6eb;
   --s-content: #eaecf1;
-  --s-content-fill: rgba(234, 236, 241, 0.72);
+  --s-content-fill: rgba(234, 236, 241, 0.6);
   --s-raised: #ffffff;
   --s-hover: #f1f3f7;
   --s-selected: #e0e5ee;

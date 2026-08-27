@@ -132,17 +132,17 @@ React + TypeScript renderer. Full structure and rationale in
 
     The window gets vibrancy as a whole and each surface decides how much of it
     to let through. The sidebar paints nothing. The pane paints
-    `--s-content-fill` -- its own colour at ~60% (dark) or ~72% (light) -- and so
-    does the toolbar, since a solid strip over a translucent pane reads as a
-    title bar stuck on top. `--s-content` stays opaque on purpose: the theme
-    swatch needs a real colour, and the `@supports not (backdrop-filter)` block
-    falls `--s-content-fill` back to it on platforms with no vibrancy.
+    `--s-content-fill` -- its own colour at ~60% -- and so does the toolbar,
+    since a solid strip over a translucent pane reads as a title bar stuck on
+    top. `--s-content` stays opaque on purpose: the theme swatch needs a real
+    colour, and the `@supports not (backdrop-filter)` block falls
+    `--s-content-fill` back to it on platforms with no vibrancy.
 
-    Dark carries more translucency than light because the cost is asymmetric:
-    light text over a bright wallpaper loses less contrast than dark text does.
-    If you push these further, check a card's text too -- `--card-fill` is
-    already translucent in the light themes, so a card sits at two alphas over
-    the desktop, not one.
+    Two things to check before pushing the alpha further, in this order. **Light
+    themes first**: dark text over a bright wallpaper loses contrast faster than
+    light text does, so light is the direction that breaks. And **a card's
+    text**, not just the pane's -- `--card-fill` is already translucent in the
+    light themes, so a card sits at two alphas over the desktop, not one.
   - **Grouping is `Group` + `Row`** -- one rounded container, hairline separators
     inset from the left, a small uppercase `SectionHeader` *outside* the box. Not
     a card per item, and not a header inside the box: that placement is most of
@@ -387,6 +387,16 @@ signature and macOS kills the process, and signing an Electron app correctly nee
 an inside-out pass that does not belong in a dev loop. `app.setName` also feeds
 the userData path, so the old path is captured and restored around it; without
 that, renaming the app reads as every workspace and setting having been lost.
+
+Codegen is watched too, by the `watchCodegen()` plugin in `vite.config.ts`.
+`src/generated/themes.css` and the command manifest are *produced*, so Vite
+watching them meant editing the output hot-reloaded while editing what produces
+it -- `scripts/gen-themes.mjs`, or `cli/command-manifest.json` -- did nothing
+until the next `pre*` script ran. That is the confusing kind of hole: the file
+you changed is plainly saved and the window plainly does not move. The plugin
+re-runs the generator, which writes the output Vite is already watching, so HMR
+picks it up from there. It is `apply: "serve"` only, because `prebuild` already
+runs both generators.
 
 `scripts/dev-electron.mjs` verifies the Electron binary exists before spawning it.
 The `electron` package computes that path by reading its own `path.txt` and

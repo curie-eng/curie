@@ -138,8 +138,8 @@ function createWindow(): BrowserWindow {
     // native cue a windowed app has: the desktop shows through the way it does
     // in Finder and Mail. The renderer decides how much reaches each surface --
     // the sidebar paints nothing at all, the content pane paints
-    // `--s-content-fill`, which is its own colour at around 60-70% so the
-    // desktop reads faintly behind the text without costing much contrast.
+    // `--s-content-fill`, which is its own colour at ~60% so the desktop reads
+    // faintly behind the text without costing much contrast.
     ...(process.platform === "darwin"
       ? { vibrancy: "sidebar" as const, visualEffectState: "active" as const }
       : {}),
