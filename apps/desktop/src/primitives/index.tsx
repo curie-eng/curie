@@ -841,10 +841,10 @@ export function Sheet({
         inset: 0,
         background: SHADOW.scrim,
         display: "flex",
-        alignItems: "flex-start",
+        alignItems: "center",
         justifyContent: "center",
         zIndex: 200,
-        padding: "0 24px 24px",
+        padding: 24,
       }}
     >
       <div
@@ -859,13 +859,19 @@ export function Sheet({
           maxHeight: "84vh",
           display: "flex",
           flexDirection: "column",
-          background: S.overlay,
-          borderRadius: `0 0 ${R.sheet}px ${R.sheet}px`,
+          // The same glass every card gets, so a sheet reads as this app's own
+          // surface rather than as a system dialog dropped on top of it. The
+          // blur is what keeps it legible: a translucent panel over a scrimmed
+          // page would be muddy without it.
+          background: S.sheetFill,
+          backdropFilter: S.cardBackdrop,
+          WebkitBackdropFilter: S.cardBackdrop,
+          borderRadius: R.sheet,
           boxShadow: SHADOW.sheet,
-          animation: "curie-sheet 220ms cubic-bezier(0.22,1,0.36,1)",
+          animation: "curie-sheet 200ms cubic-bezier(0.22,1,0.36,1)",
         }}
       >
-        <style>{`@keyframes curie-sheet { from { transform: translateY(-14px); opacity: 0 } to { transform: none; opacity: 1 } }`}</style>
+        <style>{`@keyframes curie-sheet { from { transform: scale(0.97); opacity: 0 } to { transform: none; opacity: 1 } }`}</style>
         <div
           style={{
             padding: "14px 18px 12px",
