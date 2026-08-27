@@ -211,7 +211,14 @@ React + TypeScript renderer. Full structure and rationale in
     Anything sitting inside it is a card, and gets a card's treatment.
 
     The inset comes from one `padX` in `App.tsx` that `main` and the console both
-    read, rather than a number copied into two files that then drift apart.
+    read, rather than a number copied into two files that then drift apart, and
+    it is on **all four sides**. The top one is not symmetry for its own sake:
+    the scroller ends exactly where the console begins, so a card scrolled
+    part-way is clipped flat against the console's rounded top -- and a square
+    edge butted onto a rounded one does not read as two cards, it reads as a
+    badly drawn frame around the console. Somebody reported exactly that. A band
+    of pane between them says what is true: a separate card, scrolled under the
+    edge.
 
   - **Grouping is `Group` + `Row`** -- one rounded container, hairline separators
     inset from the left, a small uppercase `SectionHeader` *outside* the box. Not

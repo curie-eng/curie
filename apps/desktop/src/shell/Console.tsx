@@ -265,7 +265,15 @@ export function Console({ padX }: { padX: number }) {
         // above it. Reaching the sidebar seam meant matching the pane's fade
         // there, and a fading terminal edge reads as a rendering fault rather
         // than as softness. Insetting sidesteps the seam entirely.
-        margin: `0 ${padX}px ${padX}px`,
+        //
+        // The inset is on all four sides, and the top one is not cosmetic. The
+        // scroller above ends exactly where this begins, so a card the operator
+        // has scrolled part-way is clipped flat against this card's rounded top
+        // -- and a square edge butted onto a rounded one does not read as two
+        // cards, it reads as a badly drawn frame AROUND the console. A gap of
+        // pane between them says what is actually true: separate card, scrolled
+        // under the edge.
+        margin: padX,
         display: "flex",
         flexDirection: "column",
         // Bounded: the console is a strip you type into, and the pane above is
