@@ -292,7 +292,9 @@ context; commands that destroy something ask first, and typing the command's own
 name is what unlocks them.
 
 Refuses to hide: the exact `curie …` string is visible and copyable under every
-form, before and after it runs. The full interleaved stdout/stderr is kept for
+form, before and after it runs, and the console at the foot of the window takes
+one typed directly -- with history, Tab completion and scrollback -- rather than
+making a button the only way in. The full interleaved stdout/stderr is kept for
 every run in a drawer reachable from any screen, with the exit code and duration,
 plus a Copy button. A GUI that runs commands on your behalf owes you the
 scrollback it took away.
@@ -424,7 +426,8 @@ pnpm package
 |---|---|
 | `⌘K` | Command palette -- search every command the CLI has |
 | `⌘1`-`⌘6` | Overview, Build, Tiers, Resources, Canvas, Commands |
-| `⌘J` | Toggle the transcript drawer |
+| `⌘J` | Expand or collapse the console |
+| `⌘L` | Focus the console prompt |
 | `⌘O` | Open a plugin bundle |
 
 ## Notes

@@ -70,12 +70,33 @@ React + TypeScript renderer. Full structure and rationale in
 
 - **There is no TTY.** A spawned command cannot be answered at a prompt. Three
   paths cover this, and a new prompting command must land in one of them:
-  destructive commands get `--yes` from the app's confirm step (`CommandForm`);
-  commands that read *stdin* (`init`, `skill eval-init`) are answered in the
-  transcript drawer's stdin box; and commands the CLI itself refuses without a
-  terminal are listed in `NEEDS_TERMINAL` (`src/lib/manifest.ts`), where they get
-  a disabled Run button and a pointer to the surface that does the same job.
-  That list is grounded in the CLI's own `is_terminal()` guards, not in a guess.
+  destructive commands get `--yes` from a confirm step (`CommandForm`'s sheet, or
+  the console's type-the-name gate); commands that read *stdin* (`init`,
+  `skill eval-init`) are answered at the console prompt, which switches to
+  `stdin ›` and forwards the line verbatim while a run is live; and commands the
+  CLI itself refuses without a terminal are listed in `NEEDS_TERMINAL`
+  (`src/lib/manifest.ts`), where they get a disabled Run button and a pointer to
+  the surface that does the same job. That list is grounded in the CLI's own
+  `is_terminal()` guards, not in a guess.
+
+- **The console has a prompt but is not a terminal, and that is the invariant
+  rather than a limitation.** `src/shell/Console.tsx` replaced a "Run a command"
+  button that opened a palette. It does **not** execute text.
+  `src/lib/parseCommand.ts` turns typed text into `{ action, positionals, flags }`
+  where the action must name a command the manifest declares and every flag must
+  be one that command declares; that struct crosses the same IPC call every
+  button uses, and the main process resolves argv independently, so a parser bug
+  fails closed rather than running something.
+
+  Shell syntax is **refused with an explanation**, never dropped silently: a typed
+  `|`, `>`, `&&`, `;`, `$(...)`, backtick or glob is a parse error. A console that
+  ignored a `>` would look like it had redirected. Quotes ARE handled, because an
+  argument with a space in it is ordinary and the alternative is a console that
+  cannot express what every button can.
+
+  Do not "improve" this into a PTY. That is the one change that would break
+  "nothing goes through a shell" outright, and the no-TTY rule above means an
+  interactive shell could not be answered anyway.
 
 - **No demo mode, no fixtures** -- the same rule as `apps/ui` (#542). Every view
   is backed by the live CLI, the live Docker daemon, or the live API. An
@@ -324,7 +345,7 @@ React + TypeScript renderer. Full structure and rationale in
     **distinct shape** per state; and only then a dot. Absence and failure get
     ink; a healthy system should be quiet. `Dot` still exists and is still right
     for one thing -- a *live* marker that pulses, where the animation is the
-    information -- so run state in Activity and the transcript drawer keeps it.
+    information -- so run state in History and the console header keeps it.
 
   - **Scrollbars are overlay-only** and the window itself never scrolls; panes
     do. A permanently visible scrollbar track is the most recognisable web tell
