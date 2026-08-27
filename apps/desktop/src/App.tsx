@@ -145,7 +145,16 @@ function Frame() {
           minWidth: 0,
           display: "flex",
           flexDirection: "column",
-          background: S.contentFill,
+          // Eased in from the seam rather than starting at full strength on it.
+          // The edge is square (a notch in a full-height join reads as a
+          // mistake), but square does not have to mean abrupt: the first 40px
+          // of the pane fade up from nothing, so the sidebar's vibrancy carries
+          // a little way across and the two surfaces meet without a step.
+          //
+          // The toolbar paints the same ramp from the same origin. It is a child
+          // of this pane at the same left edge, so any other value there would
+          // put a hard corner back at the top of the seam.
+          background: `linear-gradient(90deg, transparent 0, ${S.contentFill} 40px)`,
           overflow: "hidden",
         }}
       >
