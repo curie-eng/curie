@@ -71,7 +71,7 @@
   --s-sidebar: transparent;
   --s-sidebar-fallback: #e4e6eb;
   --s-content: #eaecf1;
-  --s-content-fill: rgba(234, 236, 241, 0.72);
+  --s-content-fill: rgba(234, 236, 241, 0.6);
   --s-raised: #ffffff;
   --s-hover: #f1f3f7;
   --s-selected: #e0e5ee;
@@ -183,7 +183,7 @@
   --s-sidebar: transparent;
   --s-sidebar-fallback: #f0f0f0;
   --s-content: #f4f4f4;
-  --s-content-fill: rgba(244, 244, 244, 0.72);
+  --s-content-fill: rgba(244, 244, 244, 0.6);
   --s-raised: #ffffff;
   --s-hover: #f4f4f4;
   --s-selected: #dbecf8;
@@ -295,7 +295,7 @@
   --s-sidebar: transparent;
   --s-sidebar-fallback: #f0f0f0;
   --s-content: #f4f4f4;
-  --s-content-fill: rgba(244, 244, 244, 0.72);
+  --s-content-fill: rgba(244, 244, 244, 0.6);
   --s-raised: #ffffff;
   --s-hover: #f4f4f4;
   --s-selected: #dbe9f5;
@@ -407,7 +407,7 @@
   --s-sidebar: transparent;
   --s-sidebar-fallback: #f0f0f0;
   --s-content: #f4f4f4;
-  --s-content-fill: rgba(244, 244, 244, 0.72);
+  --s-content-fill: rgba(244, 244, 244, 0.6);
   --s-raised: #ffffff;
   --s-hover: #f4f4f4;
   --s-selected: #dde6ee;
@@ -687,7 +687,7 @@
   --s-sidebar: transparent;
   --s-sidebar-fallback: #e6e6e6;
   --s-content: #eaeaea;
-  --s-content-fill: rgba(234, 234, 234, 0.72);
+  --s-content-fill: rgba(234, 234, 234, 0.6);
   --s-raised: #f5f5f5;
   --s-hover: #eaeaea;
   --s-selected: #e2dfe8;
@@ -855,7 +855,7 @@
   --s-sidebar: transparent;
   --s-sidebar-fallback: #eee7d5;
   --s-content: #f2ebd9;
-  --s-content-fill: rgba(242, 235, 217, 0.72);
+  --s-content-fill: rgba(242, 235, 217, 0.6);
   --s-raised: #fdf6e3;
   --s-hover: #f2ebd9;
   --s-selected: #dfe7e1;

@@ -239,7 +239,7 @@ function derive(theme) {
       "--s-window": mix(bg, "#000000", 0.11),
       "--s-sidebar-fallback": mix(bg, "#000000", 0.06),
       "--s-content": mix(bg, "#000000", 0.045),
-      "--s-content-fill": alpha(mix(bg, "#000000", 0.045), 0.72),
+      "--s-content-fill": alpha(mix(bg, "#000000", 0.045), 0.6),
       "--s-raised": bg,
       "--s-hover": mix(bg, "#000000", 0.045),
       "--s-selected": mix(bg, accent, 0.14),
