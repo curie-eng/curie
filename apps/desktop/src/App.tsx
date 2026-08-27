@@ -24,7 +24,7 @@ import { Commands } from "./views/Commands";
 import { Activity } from "./views/Activity";
 import { Settings } from "./views/Settings";
 import { RunSheetHost } from "./views/Actions";
-import { R, S } from "./tokens";
+import { S } from "./tokens";
 
 function View() {
   const { route } = useApp();
@@ -132,8 +132,13 @@ function Frame() {
           than the sidebar (see `--s-content-fill`) because this is where the
           text is, and translucency is paid for in contrast.
 
-          Rounded on the left so the vibrancy shows at the corners rather than
-          the pane meeting the sidebar in a hard seam. */}
+          Square against the sidebar. The left corners used to be rounded, on the
+          idea that letting the vibrancy through at the seam was softer than a
+          hard edge. It is not: the sidebar is full height and the pane is full
+          height, so rounding one of them cuts two notches out of an edge that
+          runs the whole window, and the eye reads a notch as a mistake rather
+          than as softness. The two surfaces already separate by value; the seam
+          does not need a radius as well. */}
       <div
         style={{
           flex: 1,
@@ -141,7 +146,6 @@ function Frame() {
           display: "flex",
           flexDirection: "column",
           background: S.contentFill,
-          borderRadius: `${R.pane}px 0 0 ${R.pane}px`,
           overflow: "hidden",
         }}
       >

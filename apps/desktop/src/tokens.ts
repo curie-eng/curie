@@ -191,6 +191,8 @@ export const R = {
   control: 6,
   field: 6,
   group: 10,
+  /** Unused since the content pane went square against the sidebar; kept so a
+   *  future pane that genuinely floats has a value to reach for. */
   pane: 12,
   sheet: 14,
   pill: 999,
