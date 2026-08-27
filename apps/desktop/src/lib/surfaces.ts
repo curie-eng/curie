@@ -198,7 +198,9 @@ export const SURFACES: readonly Surface[] = [
   {
     id: "tiers.examples",
     route: "tiers",
-    title: "Worked example",
+    // "Worked example" is a textbook phrase, not a label. A section header is a
+    // short noun naming what is in the box.
+    title: "Example",
     blurb: "A complete installation you can read the source of, end to end.",
     where: "at the foot of the Tiers view",
     actions: [

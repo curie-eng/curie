@@ -205,8 +205,11 @@ export function Tiers() {
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
       <Explainer />
 
+      {/* No section header. The explainer directly above is this card's
+          introduction, and "The same verbs, three rungs" under a box already
+          headed "The same agent, three deployments" was the same sentence
+          twice -- and a slogan where a label belongs. */}
       <section>
-        <SectionHeader>The same verbs, three rungs</SectionHeader>
         <Group>
           <div
             style={{

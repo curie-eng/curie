@@ -94,6 +94,21 @@ React + TypeScript renderer. Full structure and rationale in
   argument with a space in it is ordinary and the alternative is a console that
   cannot express what every button can.
 
+  **Dismissing it leaves nothing behind in the pane, so the way back lives in
+  the toolbar.** The × means what it says -- a residual strip would be the
+  button not having worked -- but that left the only routes back invisible: ⌘L,
+  or something starting a run. A control you cannot see is not a way back. The
+  toolbar's Console button appears exactly while the console is hidden and costs
+  no pane height; it is not permanent, because a button offering to show you the
+  thing you are already looking at is the always-there chrome that toolbar
+  exists to avoid.
+
+  The console focuses its own prompt on the transition out of hidden, rather
+  than the caller doing it: the input does not exist until the console
+  re-renders, and the control that was clicked unmounts on the same commit, so
+  focus set by the caller lands on the body. Track it against the previous value
+  and not just `!hidden`, or it fires on mount and steals focus at every launch.
+
   Do not "improve" this into a PTY. That is the one change that would break
   "nothing goes through a shell" outright, and the no-TTY rule above means an
   interactive shell could not be answered anyway.
@@ -404,6 +419,15 @@ React + TypeScript renderer. Full structure and rationale in
   it reads as a fixed slab that happens to have two things in it. `minHeight: 0` on
   the scroller is load bearing: a flex child will not shrink below its content, so
   without it `maxHeight` is ignored and the overflow never engages.
+
+- **A section header is a short noun, not a sentence.** `SectionHeader` names
+  what is in the box so you can find it; it is not a place to restate the
+  argument. "The same verbs, three rungs" sat directly under an explainer headed
+  "The same agent, three deployments" -- the same sentence twice, and a slogan
+  where a label belongs -- so the matrix has no header at all and the explainer
+  introduces it. "Worked example" became "Example" for the same reason: a
+  textbook phrase is not a label. If a header wants to explain, the explaining
+  belongs in the surface's `blurb` or in a callout.
 
 - **Tiers is a matrix, and the rows are derived.** One column per rung, one row
   per verb, where a verb is whatever follows the tier in a command id. Three
