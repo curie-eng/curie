@@ -218,6 +218,8 @@ function derive(theme) {
       "--s-window": bg,
       "--s-sidebar-fallback": mix(bg, fg, 0.05),
       "--s-content": mix(bg, fg, 0.05),
+      // Same colour, vibrancy allowed through. See the note in styles.css.
+      "--s-content-fill": alpha(mix(bg, fg, 0.05), 0.6),
       "--s-raised": mix(bg, fg, 0.1),
       "--s-hover": mix(bg, fg, 0.15),
       "--s-selected": mix(bg, fg, 0.21),
@@ -237,6 +239,7 @@ function derive(theme) {
       "--s-window": mix(bg, "#000000", 0.11),
       "--s-sidebar-fallback": mix(bg, "#000000", 0.06),
       "--s-content": mix(bg, "#000000", 0.045),
+      "--s-content-fill": alpha(mix(bg, "#000000", 0.045), 0.72),
       "--s-raised": bg,
       "--s-hover": mix(bg, "#000000", 0.045),
       "--s-selected": mix(bg, accent, 0.14),

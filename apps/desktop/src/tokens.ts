@@ -9,7 +9,9 @@
 // So the vocabulary here is the platform's, not the web's:
 //
 //   - Depth comes from *layered surfaces* (a translucent sidebar over the
-//     desktop, an opaque content pane inset above it), not from borders.
+//     desktop, a less translucent content pane inset above it), not from
+//     borders. Both let the window's vibrancy through; the pane lets through
+//     much less, because that is where the text is.
 //   - Grouping comes from *inset grouped lists* -- one rounded container with
 //     hairline separators between rows -- not from a card per item.
 //   - Separators are hairlines at low alpha, used sparingly. A border around
@@ -88,6 +90,11 @@ export const S = {
   /** Behind everything; only visible where vibrancy is unavailable. */
   window: "var(--s-window)",
   sidebar: "var(--s-sidebar)",
+  /** What the content pane and its toolbar paint: `content` with the window's
+   *  vibrancy allowed through. `content` itself stays opaque -- the theme
+   *  swatch needs a real colour, and a platform without vibrancy falls back to
+   *  it. */
+  contentFill: "var(--s-content-fill)",
   sidebarFallback: "var(--s-sidebar-fallback)",
   /** The inset pane holding the current view. Opaque, so text on it stays
    *  readable regardless of what is behind the window. */

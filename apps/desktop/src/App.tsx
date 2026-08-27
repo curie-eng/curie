@@ -125,16 +125,21 @@ function Frame() {
     <div style={{ display: "flex", height: "100vh", background: "transparent", overflow: "hidden" }}>
       <Sidebar />
 
-      {/* The content pane. Opaque, so text stays readable over whatever is
-          behind the window, and rounded on the left so the vibrancy shows at
-          the corners rather than the pane meeting the sidebar in a hard seam. */}
+      {/* The content pane. Translucent, like the sidebar -- the window's vibrancy
+          carries through it, so the desktop reads faintly behind the whole app
+          rather than only behind the source list. It is far less translucent
+          than the sidebar (see `--s-content-fill`) because this is where the
+          text is, and translucency is paid for in contrast.
+
+          Rounded on the left so the vibrancy shows at the corners rather than
+          the pane meeting the sidebar in a hard seam. */}
       <div
         style={{
           flex: 1,
           minWidth: 0,
           display: "flex",
           flexDirection: "column",
-          background: S.content,
+          background: S.contentFill,
           borderRadius: `${R.pane}px 0 0 ${R.pane}px`,
           overflow: "hidden",
         }}

@@ -127,8 +127,22 @@ React + TypeScript renderer. Full structure and rationale in
   someone wrapped". The rules, all in `src/tokens.ts` and `src/primitives`:
 
   - **Depth comes from layered surfaces**, not borders: a translucent sidebar
-    over the desktop (real window vibrancy), an opaque content pane inset above
-    it. Do not add an outline to a surface to make it look separate.
+    over the desktop (real window vibrancy), a less translucent content pane
+    inset above it. Do not add an outline to a surface to make it look separate.
+
+    The window gets vibrancy as a whole and each surface decides how much of it
+    to let through. The sidebar paints nothing. The pane paints
+    `--s-content-fill` -- its own colour at ~60% (dark) or ~72% (light) -- and so
+    does the toolbar, since a solid strip over a translucent pane reads as a
+    title bar stuck on top. `--s-content` stays opaque on purpose: the theme
+    swatch needs a real colour, and the `@supports not (backdrop-filter)` block
+    falls `--s-content-fill` back to it on platforms with no vibrancy.
+
+    Dark carries more translucency than light because the cost is asymmetric:
+    light text over a bright wallpaper loses less contrast than dark text does.
+    If you push these further, check a card's text too -- `--card-fill` is
+    already translucent in the light themes, so a card sits at two alphas over
+    the desktop, not one.
   - **Grouping is `Group` + `Row`** -- one rounded container, hairline separators
     inset from the left, a small uppercase `SectionHeader` *outside* the box. Not
     a card per item, and not a header inside the box: that placement is most of

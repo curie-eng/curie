@@ -31,6 +31,13 @@
   --s-sidebar: transparent;
   --s-sidebar-fallback: #1f1f21;
   --s-content: #242426;
+  /* What the content pane actually paints. `--s-content` stays opaque because
+     the theme swatch and the no-vibrancy fallback both need a real colour; this
+     is the same colour with the window's vibrancy allowed through, so the
+     desktop reads faintly behind the pane the way it does behind the sidebar.
+     Dark carries more translucency than light: light text over a bright
+     wallpaper loses less contrast than dark text does. */
+  --s-content-fill: rgba(36, 36, 38, 0.6);
   --s-raised: #2c2c2e;
   --s-hover: #333336;
   --s-selected: #3a3a3d;
@@ -117,6 +124,7 @@
   --s-sidebar: transparent;
   --s-sidebar-fallback: #e4e6eb;
   --s-content: #eaecf1;
+  --s-content-fill: rgba(234, 236, 241, 0.72);
   --s-raised: #ffffff;
   --s-hover: #f1f3f7;
   --s-selected: #e0e5ee;
@@ -230,11 +238,16 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Platforms without window vibrancy get a solid sidebar instead of a
-   see-through one over nothing. */
+/* Platforms without window vibrancy get solid surfaces instead of see-through
+   ones over nothing: the sidebar falls back to the window colour, and the
+   content pane to its own opaque value. */
 @supports not (backdrop-filter: blur(1px)) {
   body {
     background: var(--s-window);
+  }
+
+  :root {
+    --s-content-fill: var(--s-content);
   }
 }
 

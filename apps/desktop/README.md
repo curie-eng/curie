@@ -33,8 +33,10 @@ separated by 1px borders.
 Instead:
 
 - A **translucent full-height sidebar** with real window vibrancy -- the desktop
-  shows through it, the way it does in Finder and Mail -- and an **opaque content
-  pane** inset above it with rounded left corners.
+  shows through it, the way it does in Finder and Mail -- and a **content pane**
+  inset above it with rounded left corners, translucent too but far less so: it
+  paints its own colour at around 60-70%, because translucency is paid for in
+  text contrast and this is where the text is.
 - A **unified toolbar** that belongs to the content pane and owns the view's
   title, with its separator appearing only once content scrolls under it.
 - **Grouped inset lists** (one rounded container, hairline separators, a small
