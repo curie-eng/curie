@@ -20,6 +20,8 @@ import {
   commandsById,
   fieldKind,
   NEEDS_TERMINAL,
+  cwdFor,
+  cwdReason,
   renderCommand,
   root,
   search,
@@ -305,6 +307,44 @@ describe("argv resolution refuses what the CLI would reject", () => {
       "/tmp",
     ).argv;
     expect(argv).toContain("/Users/me/My Agents/deal desk");
+  });
+});
+
+describe("which directory a command runs in", () => {
+  // Getting this wrong is quiet and expensive: the command runs, in the wrong
+  // place, and the CLI's complaint is about a missing file rather than about
+  // the directory. That is exactly how `curie local up` came to fail from the
+  // home directory with `compose.dev.yaml` sitting in the checkout.
+  const CTX = { workspace: "/bundles/deal-desk", repoRoot: "/src/curie", fallback: "/Users/dev" };
+
+  it("runs the skill tier in the bundle, because the directory IS the argument", () => {
+    for (const id of ["skill.up", "skill.check", "skill.eval"]) {
+      expect(cwdFor(commandsById.get(id)!, CTX)).toBe("/bundles/deal-desk");
+    }
+  });
+
+  it("scaffolds into the bundle directory too", () => {
+    expect(cwdFor(commandsById.get("init")!, CTX)).toBe("/bundles/deal-desk");
+  });
+
+  it("runs stack and repo work in the checkout, even with a bundle open", () => {
+    for (const id of ["local.up", "local.status", "local.rebuild", "dev.contracts"]) {
+      expect(cwdFor(commandsById.get(id)!, CTX)).toBe("/src/curie");
+    }
+  });
+
+  it("falls back through the list rather than returning nothing", () => {
+    const noRepo = { workspace: "/bundles/x", repoRoot: null, fallback: "/Users/dev" };
+    expect(cwdFor(commandsById.get("local.up")!, noRepo)).toBe("/bundles/x");
+    const nothing = { workspace: null, repoRoot: null, fallback: "/Users/dev" };
+    expect(cwdFor(commandsById.get("skill.up")!, nothing)).toBe("/Users/dev");
+    expect(cwdFor(commandsById.get("local.up")!, {})).toBeUndefined();
+  });
+
+  it("names the directory it picked, so the form can say why", () => {
+    expect(cwdReason("/bundles/deal-desk", CTX)).toMatch(/bundle/);
+    expect(cwdReason("/src/curie", CTX)).toMatch(/checkout/);
+    expect(cwdReason("/Users/dev", CTX)).toMatch(/default/);
   });
 });
 

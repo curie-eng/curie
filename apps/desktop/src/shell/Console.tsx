@@ -31,6 +31,7 @@ import type { KeyboardEvent as ReactKeyboardEvent, RefObject } from "react";
 import { useApp } from "../bridge/app";
 import { transcriptText, useRuns, type Run } from "../bridge/runs";
 import { complete, parseCommand } from "../lib/parseCommand";
+import { cwdFor } from "../lib/manifest";
 import { duration } from "../lib/format";
 import { ACCENT, F, FONT, LINE, STATUS, T } from "../tokens";
 import { Button, CopyButton, Dot, Group, Kbd, Mono } from "../primitives";
@@ -74,7 +75,11 @@ export function Console({ padX }: { padX: number }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const cwd = app.workspace?.path;
+  // Destructured rather than an inline object: a fresh object every render is a
+  // dependency that always changes, and the hook rules cannot see through it.
+  const wsPath = app.workspace?.path;
+  const repoRoot = app.env?.repoRoot;
+  const defaultCwd = app.env?.defaultCwd;
   const focused = runs.focused ? runs.get(runs.focused) : undefined;
   const active = focused?.state === "running" || focused?.state === "pending";
   const expanded = runs.consoleOpen;
@@ -126,14 +131,18 @@ export function Console({ padX }: { padX: number }) {
           action: parsed.cmd.id,
           positionals: parsed.positionals.map((p) => p.trim()),
           flags: { ...parsed.flags, ...extraFlags },
-          cwd,
+          cwd: cwdFor(parsed.cmd, {
+            workspace: wsPath,
+            repoRoot,
+            fallback: defaultCwd,
+          }),
           json: parsed.json,
         });
       } catch (err) {
         say("error", (err as Error).message);
       }
     },
-    [cwd, runs, say],
+    [wsPath, repoRoot, defaultCwd, runs, say],
   );
 
   const submit = useCallback(() => {

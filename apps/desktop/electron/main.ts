@@ -38,6 +38,7 @@ import * as api from "./ipc/api.js";
 import * as secrets from "./ipc/secrets.js";
 import { prefs, update } from "./ipc/store.js";
 import { buildMenu } from "./menu.js";
+import { findRepoRoot } from "./ipc/repo.js";
 
 // esbuild emits this file as CommonJS (Electron loads the preload as CJS
 // regardless, so both outputs share one format), which is why this is
@@ -256,7 +257,9 @@ function registerIpc(): void {
       ]);
       cliVersion = version.code === 0 ? version.stdout.trim() : null;
       sourceCheckout = devProbe.code === 0;
-      repoRoot = process.env.CURIE_REPO_ROOT ?? null;
+      // Found by walking up from the app's own location rather than read from
+      // an environment variable nobody sets. See `findRepoRoot`.
+      repoRoot = findRepoRoot(here);
       if (schema.code === 0) {
         try {
           drift = compareToLive(JSON.parse(schema.stdout), cliVersion);
