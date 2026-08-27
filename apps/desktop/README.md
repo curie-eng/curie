@@ -88,7 +88,7 @@ maintain and is what makes the decision reversible: everything privileged crosse
 [`electron/shared/contract.ts`](electron/shared/contract.ts) and nothing else, and
 drag regions carry both `-webkit-app-region` and `data-tauri-drag-region`.
 
-## The seven surfaces
+## The six surfaces
 
 | View | What it answers |
 |---|---|
@@ -97,8 +97,7 @@ drag regions carry both `-webkit-app-region` and `data-tauri-drag-region`.
 | **Tiers** | Where can this run, and what does each rung cost. The skill, local and cluster deployments as three panels with their own lifecycle controls, plus the declarative `curie.yaml` install. |
 | **Resources** | What is each agent consuming right now. Docker Desktop's container list as a starting point, plus the things it cannot do: attribution to an agent, history for the sparklines, and per-row commands that are `curie` commands. |
 | **Canvas** | How is this wired. Agents, channels, models, MCP servers, and infra as one editable graph, derived from live state. |
-| **Commands** | Everything the CLI can do, as real forms -- the complete reference, and the map of where each command lives. |
-| **Activity** | What this app has run. Every invocation with its full transcript. |
+| **Commands** | Two panes of one tab. **Reference**: everything the CLI can do, as real forms, and the map of where each command lives. **History**: every invocation this app has run, with its full transcript. Both are *about* commands rather than places you operate, which is why they share a slot at the foot of the sidebar. |
 
 An agent also has a surface of its own: a sheet, opened from its row on the
 Overview or from its node on the Canvas, carrying the twenty-six agent-scoped
@@ -419,7 +418,7 @@ pnpm package
 | | |
 |---|---|
 | `⌘K` | Command palette -- search every command the CLI has |
-| `⌘1`-`⌘7` | Overview, Build, Tiers, Resources, Canvas, Activity, Commands |
+| `⌘1`-`⌘6` | Overview, Build, Tiers, Resources, Canvas, Commands |
 | `⌘J` | Toggle the transcript drawer |
 | `⌘O` | Open a plugin bundle |
 

@@ -8,7 +8,7 @@
 import { useApp, type Route } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
 import { F, LINE, M, R, S, STATUS, T } from "../tokens";
-import { Button, Kbd, Spinner } from "../primitives";
+import { Button, Kbd, Segmented, Spinner } from "../primitives";
 
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "What is happening right now" },
@@ -16,8 +16,9 @@ const TITLES: Record<Route, { title: string; subtitle: string }> = {
   tiers: { title: "Tiers", subtitle: "The same agent, on a laptop or on a cluster" },
   resources: { title: "Resources", subtitle: "What each agent is consuming" },
   canvas: { title: "Canvas", subtitle: "Agents, integrations, and the infra under them" },
+  // Two panes of one tab, so they share a title and differ in the subtitle.
   commands: { title: "Commands", subtitle: "Everything the CLI can do" },
-  activity: { title: "Activity", subtitle: "What this app has run" },
+  activity: { title: "Commands", subtitle: "Every command this app has run" },
   settings: { title: "Settings", subtitle: "Connection, secrets, and what this app is" },
 };
 
@@ -56,6 +57,8 @@ export function Toolbar({ scrolled }: { scrolled: boolean }) {
         <div style={{ ...F.title }}>{meta.title}</div>
         <div style={{ ...F.footnote, color: T.tertiary, marginTop: -1 }}>{meta.subtitle}</div>
       </div>
+
+      <PaneSwitch />
 
       {runs.active.length ? (
         <button
@@ -98,6 +101,35 @@ export function Toolbar({ scrolled }: { scrolled: boolean }) {
         <Kbd>{isMac ? "⌘K" : "^K"}</Kbd>
       </Button>
     </header>
+  );
+}
+
+/**
+ * Reference or History, for the one tab that has both.
+ *
+ * The route IS the pane rather than local state in the view: the native menu,
+ * the Overview's "All activity" button and the sidebar all deep-link straight to
+ * one of them, and a pane kept in component state would be unreachable from any
+ * of those. It lives in the toolbar because the toolbar owns this view's chrome,
+ * and because the two panes want different frame padding -- Reference bleeds to
+ * the pane edges, History is a padded document -- so a control rendered inside
+ * either one would have to exist twice.
+ */
+function PaneSwitch() {
+  const app = useApp();
+  if (app.route !== "commands" && app.route !== "activity") return null;
+  return (
+    <span className="no-drag">
+      <Segmented<"commands" | "activity">
+        size="sm"
+        value={app.route}
+        onChange={(next) => app.navigate(next)}
+        options={[
+          { value: "commands", label: "Reference", title: "Every command the CLI has" },
+          { value: "activity", label: "History", title: "What this app has run, with full output" },
+        ]}
+      />
+    </span>
   );
 }
 

@@ -320,6 +320,20 @@ React + TypeScript renderer. Full structure and rationale in
   while the operator is looking at the local one. The tier choice is a UI position,
   so it lives in `localStorage` beside the Build cursor, not in platform state.
 
+- **Commands is one tab with two panes, and the ROUTE is the pane.** Reference
+  and History are `commands` and `activity`, switched from a `Segmented` in the
+  toolbar rather than from state inside the view. Three things deep-link straight
+  to History -- the native menu, the Overview's "All activity" button, and any
+  future notification -- and a pane held in component state would be unreachable
+  from all of them. The toolbar owns the control for a second reason too: the
+  panes want different frame padding (Reference bleeds to the pane edges, History
+  is a padded document), so a switch rendered inside either one would have to
+  exist twice.
+
+  They share a sidebar row because both are *about* commands rather than places
+  you operate, and the row's badge is the running-command count -- the one signal
+  Activity used to contribute to the rail.
+
 - **Views do not render their own title.** The toolbar owns it (`shell/Toolbar.tsx`,
   keyed off the route). A pane that repeats its own name under the window's title
   bar is a web header.
