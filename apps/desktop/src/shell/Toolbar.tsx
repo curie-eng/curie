@@ -38,7 +38,10 @@ export function Toolbar({ scrolled }: { scrolled: boolean }) {
         alignItems: "center",
         gap: 12,
         padding: "0 16px",
-        background: S.content,
+        // The same fill as the pane it belongs to: a solid strip over a
+        // translucent pane would read as a title bar stuck on top, which is the
+        // web header this toolbar exists to avoid.
+        background: S.contentFill,
         // The separator appears only once content has scrolled under the
         // toolbar, which is exactly how the platform handles it. A permanent
         // rule under the header is the giveaway.

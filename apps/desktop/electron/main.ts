@@ -134,10 +134,12 @@ function createWindow(): BrowserWindow {
     // Transparent, because the window is given real translucency below and a
     // painted background would sit in front of it.
     backgroundColor: "#00000000",
-    // Real macOS vibrancy behind the sidebar. This is the single strongest
-    // native cue a windowed app has: the desktop shows through the source list
-    // the way it does in Finder and Mail. The renderer cooperates by painting
-    // nothing behind the sidebar and painting the content pane opaque.
+    // Real macOS vibrancy behind the whole window. This is the single strongest
+    // native cue a windowed app has: the desktop shows through the way it does
+    // in Finder and Mail. The renderer decides how much reaches each surface --
+    // the sidebar paints nothing at all, the content pane paints
+    // `--s-content-fill`, which is its own colour at around 60-70% so the
+    // desktop reads faintly behind the text without costing much contrast.
     ...(process.platform === "darwin"
       ? { vibrancy: "sidebar" as const, visualEffectState: "active" as const }
       : {}),
