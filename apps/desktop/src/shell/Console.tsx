@@ -32,7 +32,7 @@ import { useApp } from "../bridge/app";
 import { transcriptText, useRuns, type Run } from "../bridge/runs";
 import { complete, parseCommand } from "../lib/parseCommand";
 import { duration } from "../lib/format";
-import { ACCENT, F, FONT, LINE, S, STATUS, T } from "../tokens";
+import { ACCENT, F, FONT, LINE, S, STATUS, T, bandFadeTo } from "../tokens";
 import { Button, CopyButton, Dot, Kbd, Mono } from "../primitives";
 
 /** A line the console itself wrote, as opposed to one a process wrote. */
@@ -229,8 +229,11 @@ export function Console() {
     <div
       style={{
         flex: "none",
-        borderTop: `1px solid ${LINE.separator}`,
-        background: S.well,
+        // The same ramp the pane and toolbar use, toward this surface's own
+        // fill, and the separator ramped with it. A flat band starting on the
+        // seam pixel undoes the pane's fade one row lower, and the eye reads the
+        // whole left edge at once.
+        background: bandFadeTo(S.well, LINE.separator),
         display: "flex",
         flexDirection: "column",
         // Bounded: the console is a strip you type into, and the pane above is
@@ -404,7 +407,7 @@ function Hints({ hints }: { hints: readonly string[] }) {
         gap: 8,
         flexWrap: "wrap",
         padding: "6px 12px",
-        borderTop: `1px solid ${LINE.separator}`,
+        background: bandFadeTo("transparent", LINE.separator),
       }}
     >
       {hints.map((h) => (
@@ -445,8 +448,7 @@ function Prompt({
         alignItems: "center",
         gap: 8,
         padding: "8px 12px",
-        borderTop: `1px solid ${LINE.separator}`,
-        background: S.field,
+        background: bandFadeTo(S.field, LINE.separator),
       }}
     >
       <Mono style={{ fontSize: 12, color: leadColour, flex: "none", fontWeight: 600 }}>{lead}</Mono>

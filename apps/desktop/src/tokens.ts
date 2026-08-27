@@ -295,16 +295,50 @@ export function readable(color: string): string {
  * origin -- it is a child of the pane at the same left edge, and any divergence
  * puts a corner back at the top of the seam.
  */
-export const PANE_FADE = [
-  "linear-gradient(90deg",
-  "transparent 0",
-  `${tintOf("var(--s-content-fill)", 0.014)} 5px`,
-  `${tintOf("var(--s-content-fill)", 0.156)} 10px`,
-  `${tintOf("var(--s-content-fill)", 0.5)} 20px`,
-  `${tintOf("var(--s-content-fill)", 0.844)} 30px`,
-  `${tintOf("var(--s-content-fill)", 0.986)} 35px`,
-  "var(--s-content-fill) 40px)",
-].join(", ");
+export const PANE_FADE = paneFadeTo("var(--s-content-fill)");
+
+/**
+ * A band that reaches the seam, with its top hairline ramped too.
+ *
+ * `borderTop` cannot fade, so a band using one drew its separator at full
+ * strength across the exact pixels where its fill was still at zero -- a dark
+ * tick sitting in the gap the fade had just opened. Two background layers fix
+ * it: the hairline as a 1px-tall gradient pinned to the top, and the fill under
+ * it, both on the same ramp.
+ */
+export function bandFadeTo(fill: string, line: string): string {
+  const edge = [
+    "linear-gradient(90deg",
+    "transparent 0",
+    `${tintOf(line, 0.156)} 10px`,
+    `${tintOf(line, 0.5)} 20px`,
+    `${line} 40px)`,
+  ].join(", ");
+  return `${edge} top left / 100% 1px no-repeat, ${paneFadeTo(fill)}`;
+}
+
+/**
+ * Any surface that reaches the sidebar seam, ramped in the same way.
+ *
+ * Every full-width band inside the content pane needs this, not just the pane
+ * itself. The console at the foot painted a flat `S.well` starting on the exact
+ * seam pixel and undid the pane's ramp one row lower -- the eye reads the whole
+ * left edge at once, so one hard band is enough to make the join look wrong
+ * again. The prompt row inside it had the same problem with an opaque field
+ * fill.
+ */
+export function paneFadeTo(fill: string): string {
+  return [
+    "linear-gradient(90deg",
+    "transparent 0",
+    `${tintOf(fill, 0.014)} 5px`,
+    `${tintOf(fill, 0.156)} 10px`,
+    `${tintOf(fill, 0.5)} 20px`,
+    `${tintOf(fill, 0.844)} 30px`,
+    `${tintOf(fill, 0.986)} 35px`,
+    `${fill} 40px)`,
+  ].join(", ");
+}
 
 /** `tint` by another name, declared before the const above can use it. */
 function tintOf(color: string, alpha: number): string {
