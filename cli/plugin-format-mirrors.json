@@ -33,7 +33,8 @@
         { "field": "systemPrompt", "why": "no approvals-verb output surfaces the agent's system prompt." },
         { "field": "starterPrompts", "why": "no approvals-verb output surfaces starter prompts." },
         { "field": "secrets", "why": "declared secret NAMES are surfaced by other verbs (skill up --secret), not skill approvals." },
-        { "field": "triggers", "why": "no approvals-verb output surfaces the manifest's trigger declarations." }
+        { "field": "triggers", "why": "no approvals-verb output surfaces the manifest's trigger declarations." },
+        { "field": "delegatesTo", "why": "declared delegate targets (ADR-0115) are an operator-arming concern, not an approvals-verb output; skill_approvals reports gate/route pairs only." }
       ]
     },
     {
