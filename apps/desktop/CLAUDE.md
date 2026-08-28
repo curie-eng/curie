@@ -720,6 +720,28 @@ ignored and the new window was left orphaned to launchd. A test that restarts on
 cannot see this, which is how it survived a verification pass; assert several
 consecutive restarts, and that the launcher is still alive after them.
 
+## The local API is on 28000
+
+The container listens on 8000 and `compose.dev.yaml` maps it to **28000** on the
+host, because a dev stack that squats on the obvious ports collides with
+everything else on a developer's machine. This app defaulted to
+`localhost:8000`, which nothing serves -- so the app that starts the stack could
+not then talk to it. Every API-backed screen sat empty behind "the platform API
+is not answering" while the stack was completely healthy, and nothing on screen
+named the port.
+
+`LOCAL_API_URL` in `cli/src/observability.rs` is the source of the value, and
+`electron/store.test.ts` reads that file so the two cannot drift; it skips
+loudly outside a checkout. Correcting the default was not enough on its own,
+because a default only applies to a key that is absent and anyone who had run
+the app already had the wrong URL written to disk -- `prefs()` rewrites that one
+value, and only when it is exactly the old default, since it is a port nothing
+has ever served rather than a preference somebody chose.
+
+A 401 from a reachable API is a **missing credential, not a fault to recheck**.
+The Overview says so and opens Settings; offering "Recheck" for it sent the
+operator round a loop that could not terminate.
+
 ## Drift between this app and the installed CLI
 
 The app is built against this repo's manifest but drives whatever `curie` is on
