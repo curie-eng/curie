@@ -237,6 +237,37 @@ export function AppProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  /**
+   * Keep asking whether the API still answers.
+   *
+   * It used to be probed exactly once, at mount, and after that only when
+   * somebody pressed Recheck or saved Settings. So the toolbar went on saying
+   * "Connected" and the Overview went on saying "the platform is up" for as
+   * long as the window stayed open after the stack went down -- a status
+   * surface reporting a dead API as live, which is the one thing this app's
+   * rules say a monitor must never do.
+   *
+   * Fifteen seconds: one `GET /config` is cheap against localhost and polite
+   * against a cluster, and it is the same order as the metrics poll next to it.
+   * `connection()` swallows its own failures and returns `reachable: false`, so
+   * a down API produces a state change rather than an unhandled rejection.
+   */
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      void bridge()
+        .api.connection()
+        .then((next) => {
+          if (!cancelled) setApi(next);
+        });
+    };
+    const t = setInterval(tick, 15_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
   useEffect(() => {
     if (!api?.reachable) return;
     let cancelled = false;

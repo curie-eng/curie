@@ -230,6 +230,24 @@ React + TypeScript renderer. Full structure and rationale in
   `eslint.config.js`: a context provider exported beside its own `use*` hook,
   where a full reload is the honest outcome anyway.
 
+- **The API connection is POLLED, not probed once.** It used to be asked exactly
+  at mount, and after that only when somebody pressed Recheck or saved Settings
+  -- so the toolbar went on saying "Connected" and the Overview went on saying
+  "the platform is up" for as long as the window stayed open after the stack went
+  down. A status surface reporting a dead API as live is the precise thing the
+  no-fixtures rule exists to stop, and it survived a long time because it only
+  shows up if you take the stack down while watching. Fifteen seconds, in
+  `AppProvider`.
+
+- **An empty state's own action must not be a dead end.** Three of them were:
+  "Deploy a bundle" with no bundle open, "Boot a runner" with none either (`skill
+  up` snapshots the directory it is invoked in, so it would have booted a
+  container over the fallback directory), and "Bring the local stack up" sitting
+  under a page whose top card is one button that does exactly that. Each now
+  names what is actually missing first and routes to the place that supplies it.
+  A first run has one primary control on the screen; count them before shipping a
+  change to the Overview.
+
 - **No demo mode, no fixtures** -- the same rule as `apps/ui` (#542). Every view
   is backed by the live CLI, the live Docker daemon, or the live API. An
   unmeasurable value renders as an em dash (`DASH` in `src/lib/format.ts`), never
