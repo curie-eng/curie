@@ -26,9 +26,28 @@ export interface Prefs {
   theme: ThemePreference;
 }
 
+/**
+ * Where `curie local up` actually publishes the API.
+ *
+ * The container listens on 8000 and compose maps it to **28000** on the host,
+ * because a dev stack that squats on the obvious ports collides with everything
+ * else on a developer's machine. This app defaulted to `localhost:8000`, which
+ * nothing serves, so the app that starts the stack could not then talk to it:
+ * every screen backed by the API sat empty behind "not answering" while the
+ * stack was perfectly healthy, and the fix was a port nothing on screen named.
+ *
+ * The CLI's `LOCAL_API_URL` (`cli/src/observability.rs`) is the source of this
+ * value and `store.test.ts` reads that file to keep the two in step.
+ */
+const LOCAL_API_URL = "http://localhost:28000";
+
+/** The old, wrong default. Kept only so a stored copy of it can be corrected --
+ *  see `prefs()`. */
+const WRONG_API_URL = "http://localhost:8000";
+
 const DEFAULTS: Prefs = {
   workspaces: [],
-  apiBaseUrl: "http://localhost:8000",
+  apiBaseUrl: LOCAL_API_URL,
   apiKey: null,
   activeWorkspace: null,
   resourceIntervalMs: 2000,
@@ -51,8 +70,16 @@ export function prefs(): Prefs {
     // Missing or corrupt: start from defaults rather than refusing to launch.
     cache = { ...DEFAULTS };
   }
+  // Correcting the default is not enough on its own: anyone who has already run
+  // this app has the wrong URL written to disk, and a default only applies to a
+  // key that is absent. This rewrites that one value and only that one value --
+  // it is not a preference anybody chose, it is a port nothing has ever served,
+  // so leaving it would mean the fix reached new installs only.
+  if (cache.apiBaseUrl === WRONG_API_URL) cache = { ...cache, apiBaseUrl: LOCAL_API_URL };
   return cache;
 }
+
+export { LOCAL_API_URL };
 
 export function update(patch: Partial<Prefs>): Prefs {
   const next = { ...prefs(), ...patch };

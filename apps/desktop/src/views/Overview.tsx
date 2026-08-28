@@ -355,7 +355,7 @@ function Health({ onRefresh }: { onRefresh(): void }) {
 
   if (!env) return null;
 
-  const issues: { text: string; fix?: string; label?: string }[] = [];
+  const issues: { text: string; fix?: string; label?: string; goto?: "settings" }[] = [];
   if (!env.cliPath) {
     issues.push({ text: "The curie binary is not on PATH, so this app cannot run anything." });
   }
@@ -376,7 +376,19 @@ function Health({ onRefresh }: { onRefresh(): void }) {
     });
   }
   if (app.agentsError && app.api?.reachable) {
-    issues.push({ text: `Reached the API but could not list agents: ${app.agentsError}` });
+    // A 401 is not a fault to recheck, it is a missing credential, and offering
+    // "Recheck" for it sends the operator round a loop that cannot terminate.
+    // Name the actual problem and open the place it is fixed.
+    const unauthorized = /\b40[13]\b|unauthorized|forbidden/i.test(app.agentsError);
+    issues.push(
+      unauthorized
+        ? {
+            text: `The API at ${app.api.baseUrl} answered, but rejected this app's credentials (${app.agentsError}). Agents, versions and memory need an API key.`,
+            label: "Add an API key",
+            goto: "settings",
+          }
+        : { text: `Reached the API but could not list agents: ${app.agentsError}` },
+    );
   }
   if (!issues.length && !starting) return null;
 
@@ -390,6 +402,10 @@ function Health({ onRefresh }: { onRefresh(): void }) {
           action={
             issue.fix ? (
               <RunButton id={issue.fix}>{issue.label ?? "Fix"}</RunButton>
+            ) : issue.goto ? (
+              <Button size="sm" onClick={() => app.navigate(issue.goto!)}>
+                {issue.label ?? "Open settings"}
+              </Button>
             ) : (
               <Button size="sm" onClick={onRefresh}>
                 {issue.label ?? "Recheck"}
