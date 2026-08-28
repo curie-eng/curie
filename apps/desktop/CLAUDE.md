@@ -94,8 +94,16 @@ React + TypeScript renderer. Full structure and rationale in
   argument with a space in it is ordinary and the alternative is a console that
   cannot express what every button can.
 
-  **Dismissing it leaves nothing behind in the pane, so the way back lives in
-  the toolbar, as a glyph.** A prompt is about as legible as an icon gets -- it
+  **The toolbar carries a permanent console toggle, on the right.** It was
+  briefly conditional -- rendered only while the console was hidden, on the
+  argument that a button offering to show you something already on screen is
+  redundant chrome. That argument is wrong for this control, and the symptom
+  said so: the console is usually visible, so usually there was no button in the
+  corner at all, which is indistinguishable from the dead end it was added to
+  fix. A control that only exists in the state you are not in cannot be found by
+  looking. It is a toggle now, `aria-pressed` while the console is showing.
+
+  **It is a glyph, not a labelled pill.** A prompt is about as legible as an icon gets -- it
   is what every terminal puts in its own corner -- so the word "Console" beside
   it was a caption on a picture of itself; `aria-label` carries the name. Visible
   means the GLYPH is strong, not that the button is a coloured badge: a filled

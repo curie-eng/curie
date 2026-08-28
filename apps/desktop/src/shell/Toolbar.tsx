@@ -99,47 +99,54 @@ export function Toolbar({ scrolled }: { scrolled: boolean }) {
 }
 
 /**
- * The way back to a dismissed console.
+ * The console toggle. Always here, on the right of the toolbar.
  *
- * The console's dismiss button leaves nothing behind on purpose -- a residual
- * strip would mean the button had not done what it said -- but that left the
- * only routes back invisible: ⌘L, or something starting a run. A control you
- * cannot see is not a way back. So the affordance moves up here, where it costs
- * no pane height, and appears exactly when it is the only thing that will do.
+ * It was briefly conditional -- rendered only while the console was hidden, on
+ * the argument that a button offering to show you something already on screen
+ * is redundant chrome. That argument is wrong for this control and the symptom
+ * said so: the console is usually visible, so usually there was no button in the
+ * corner at all, which is indistinguishable from the dead end it was added to
+ * fix. A control that is only there in the state you are not in cannot be found
+ * by looking.
  *
- * It is deliberately not permanent. The console is normally on screen, and a
- * button offering to show you the thing you are looking at is the kind of
- * always-there chrome this toolbar exists to avoid.
+ * So it is permanent and it is a toggle: pressed while the console is showing,
+ * and it hides it; unpressed while hidden, and it brings it back with the cursor
+ * in the prompt (the console focuses itself -- this button unmounts nothing now,
+ * but the transition effect is still the reliable place for it).
  *
  * The glyph carries it alone. A prompt is about as legible as an icon gets --
- * it is what every terminal in the world puts in its own corner -- and the word
- * "Console" beside it was a caption on a picture of itself. `aria-label` carries
- * the name the label used to.
+ * it is what every terminal in the world puts in its own corner -- so the word
+ * "Console" beside it was a caption on a picture of itself. `aria-label` and
+ * `aria-pressed` carry the name and the state.
  *
  * Visible means the GLYPH is strong, not that the button is a coloured badge. A
- * filled accent disc was tried and it read as a status light: the toolbar's
- * other two controls are pills reporting state, and a third round coloured thing
- * joins that set rather than standing out from it. Primary ink on no fill, with
- * the fill arriving on hover, is what the platform's own toolbar buttons do.
+ * filled accent disc was tried and read as a status light: the controls beside
+ * it are pills reporting state, so a third round coloured thing joins that set
+ * rather than standing out from it. Primary ink, no fill until it is pressed or
+ * hovered, which is what the platform's own toolbar toggles do.
  */
 function ConsoleButton() {
   const runs = useRuns();
   const [hover, setHover] = useState(false);
-  if (!runs.consoleHidden) return null;
+  const showing = !runs.consoleHidden;
+
   return (
     <button
       className="no-drag"
       onClick={() => {
+        if (showing) return runs.setConsoleHidden(true);
         runs.setConsoleHidden(false);
         runs.setConsoleOpen(true);
-        // No focus call here: the console focuses its own prompt when it comes
-        // back, because this button unmounts on the same commit and whatever
-        // focus it set would be dropped.
       }}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      aria-label="Show the console"
-      title="Show the console and put the cursor in it (⌘L)"
+      aria-label="Console"
+      aria-pressed={showing}
+      title={
+        showing
+          ? "Hide the console (⌘L focuses it)"
+          : "Show the console and put the cursor in it (⌘L)"
+      }
       style={{
         display: "inline-flex",
         alignItems: "center",
@@ -147,10 +154,10 @@ function ConsoleButton() {
         width: 27,
         height: 27,
         border: "none",
-        background: hover ? S.control : "transparent",
+        background: hover ? S.controlHover : showing ? S.control : "transparent",
         borderRadius: R.control,
         padding: 0,
-        color: T.primary,
+        color: showing ? T.primary : T.secondary,
         cursor: "default",
       }}
     >
