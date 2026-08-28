@@ -396,13 +396,10 @@ describe("runtimeDefault", () => {
     // The manifest says `null` for this flag because clap never sees the
     // default -- the CLI resolves it at runtime. Without this the box showed a
     // shape hint and left the answer in a two-line help string.
-    // The whole path: a bare filename is only an answer if you already know
-    // which directory the command runs in, which is the thing being explained.
-    expect(runtimeDefault(file as never, { repoRoot: "/repo" })).toBe("/repo/compose.dev.yaml");
-    expect(runtimeDefault(file as never, { repoRoot: "/repo/" })).toBe("/repo/compose.dev.yaml");
-    expect(runtimeDefault(file as never, { repoRoot: "C:\\src\\curie" })).toBe(
-      "C:\\src\\curie\\compose.dev.yaml",
-    );
+    // Elided, not absolute: the full path ran to 96 characters in a field that
+    // fits about 60, and the directory is not the interesting half -- the sheet
+    // already says on its own line where the command runs.
+    expect(runtimeDefault(file as never, { repoRoot: "/repo" })).toBe("…/compose.dev.yaml");
   });
 
   it("names the pinned release file when there is no checkout", () => {

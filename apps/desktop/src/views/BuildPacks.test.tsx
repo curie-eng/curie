@@ -46,7 +46,6 @@ function stubShell(): CurieBridge {
       helmAvailable: false,
       platform: "darwin",
       defaultCwd: "/Users/dev",
-      homeDir: "/Users/test",
       appVersion: "0.1.0",
       electronVersion: "34",
       chromeVersion: "132",

@@ -245,14 +245,11 @@ export function runtimeDefault(
   env: { repoRoot?: string | null } | null | undefined,
 ): string | null {
   if (arg.long !== "file") return null;
-  const root = env?.repoRoot;
-  if (!root) return "compose.release.yaml (pinned, from the remote)";
-  // The whole path. A bare filename is only an answer if you already know which
-  // directory the command runs in, and that is precisely the thing the operator
-  // is being told here -- the field takes an absolute path, so the placeholder
-  // shows one.
-  const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
-  return `${root.replace(/[/\\]+$/, "")}${sep}compose.dev.yaml`;
+  // Elided, not absolute. The full path ran to 96 characters in a field that
+  // fits about 60, and the directory is not the interesting half anyway --
+  // `local up` already runs in the checkout, and the sheet says so on its own
+  // line. What the operator needs from this box is the FILE that gets used.
+  return env?.repoRoot ? "…/compose.dev.yaml" : "…/compose.release.yaml (pinned)";
 }
 
 /** Search over id, name, and help text. Ranked so an exact command name beats a

@@ -71,22 +71,17 @@ React + TypeScript renderer. Full structure and rationale in
   only approximate. It was also, before that, a chip beside the label, which was
   reported as easy to miss and was.
 
-  **A path in a field is shortened the way the platform writes one** --
-  `shortPath` in `lib/format.ts`. `~` for the home directory, and the MIDDLE
-  elided rather than the end, because the tail is the file you are identifying
-  and the head says roughly where you are; the segments between them are the
-  least informative part. Finder's title bars and `NSPathControl` do exactly
-  this. It is greedy from the tail rather than keeping a fixed number of
-  parents, which would waste room on a short path and still overflow on a long
-  one, and the leading separator survives so an absolute path still reads as
-  absolute. `homeDir` is on the env probe because the renderer has no `os` and
-  `defaultCwd` is not home whenever `CURIE_WORKSPACE` is set.
-
   Some defaults are not in the manifest at all, because clap never sees them:
   `--file` resolves at runtime to the local `compose.dev.yaml` on a dev build and
   a pinned `compose.release.yaml` from the remote on a release one. `manifest.ts`
   supplies those as `runtimeDefault`, keyed off `repoRoot`, rather than leaving
-  the box with a shape hint and the answer buried in a two-line help string.
+  the box with a shape hint and the answer buried in a two-line help string. It
+  shows `…/compose.dev.yaml` and not the absolute path: the full one ran to 96
+  characters in a field that fits about sixty, and the directory is not the
+  interesting half -- `local up` runs in the checkout and the sheet already says
+  so on its own line. A general path shortener was written for this and thrown
+  away with it; if one is ever needed again, `~` plus a middle elision is the
+  platform's own convention.
 
   **Context IS a value.** The bundle the operator has open, what they typed last
   time (`STICKY_FLAGS`), and what a contextual control seeded are answers to the
