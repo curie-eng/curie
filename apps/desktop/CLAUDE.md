@@ -83,6 +83,17 @@ React + TypeScript renderer. Full structure and rationale in
   away with it; if one is ever needed again, `~` plus a middle elision is the
   platform's own convention.
 
+  **Which flags sit above "All options" is decided once, at mount, and then
+  fixed.** It used to be recomputed from the live values, so using a control
+  moved it: switching `Minimal` on made it "primary", it jumped out of the
+  disclosure and up the form -- out from under the cursor that had just pressed
+  it -- and every field below moved with it. Seeding from the INITIAL values is
+  still right and is the point: a flag a contextual control prefilled, or one
+  typed last time, is something already chosen and belongs in view when the
+  sheet opens. The form is keyed on `cmd.id` and never reseeds, so a lazy
+  `useState` initialiser is exactly the lifetime wanted. A control must not
+  relocate because you used it.
+
   **Context IS a value.** The bundle the operator has open, what they typed last
   time (`STICKY_FLAGS`), and what a contextual control seeded are answers to the
   question rather than restatements of the fallback, so those are typed in and
