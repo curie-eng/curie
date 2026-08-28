@@ -500,10 +500,28 @@ function StackCard({
 
   return (
     <Group style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "10px 12px" }}>
-      <span style={{ flex: "none", marginTop: up ? 5 : 2 }}>
+      {/* A 16px slot, whatever is in it. `Notice` gives its glyph exactly this,
+          and without it the marker's own width set the text column: a 9px ring
+          started the text 7px to the left of the notice stacked underneath, so
+          two cards on the same screen had two left margins. Centring inside a
+          16px box also puts the marker on the first line's optical middle
+          without a hand-tuned `marginTop` per state. */}
+      <span
+        style={{
+          flex: "none",
+          width: 16,
+          height: 16,
+          marginTop: 1,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
         {up ? <LiveRing color={color} /> : <Spinner size={14} color={color} />}
       </span>
-      <div style={{ flex: 1, minWidth: 0, display: "grid", gap: 6 }}>
+      {/* 6 when the bar is there and needs air on both sides of it, 2 when this
+          is two lines of prose -- at 6 they read as unrelated. */}
+      <div style={{ flex: 1, minWidth: 0, display: "grid", gap: up ? 2 : 6 }}>
         <div style={{ ...F.headline }}>{title}</div>
 
         {/* The bar belongs to the wait. Once there is nothing left to wait for
@@ -528,6 +546,21 @@ function StackCard({
           {detail}
         </div>
       </div>
+
+      {/* Taking the stack down belongs on the card that says it is up: that is
+          where somebody is standing when they decide they are done with it, and
+          sending them to Tiers to find the same command is the "go and look for
+          it yourself" answer this app is built against. Nothing about the
+          placement makes it easier to fire -- `local.down` is destructive, so
+          the button opens the same generated form with the same confirm gate as
+          everywhere else, and it is painted the same red it wears on Tiers. */}
+      {total ? (
+        <span style={{ flex: "none" }}>
+          <RunButton id="local.down" tone="danger">
+            Stop the stack
+          </RunButton>
+        </span>
+      ) : null}
     </Group>
   );
 }
