@@ -1104,6 +1104,25 @@ issue list: a start in progress and a problem worth naming are both true at once
 more often than not -- that is what a start IS -- and letting either suppress the
 other answers "what is happening" with half of it.
 
+## The failure this app can explain and the output cannot
+
+A CLI/platform contract mismatch arrives as a serde error naming a field --
+``missing field `channels` `` -- under a summary line that says only "failed",
+and the app has been reporting the version mismatch behind it in the corner of
+the sidebar the whole time without ever connecting the two. `src/lib/diagnose.ts`
+connects them, in the console, at the moment somebody is looking at the failure.
+
+The advice depends on which half moved. With a checkout, the likely skew is a
+source-built CLI against registry images, because that is the DEFAULT -- `local
+up` pulls published images unless asked not to -- so the fix is `local up
+--build`. Without one, both came from a release and updating the CLI is the
+shorter way round.
+
+It is offered in the prompt, never run: it changes what is running on the
+machine. And it fires only on that error shape -- a hint under every failure is
+noise, and a wrong hint costs more than none, because somebody follows it
+instead of reading the error in front of them.
+
 ## Drift between this app and the installed CLI
 
 The app is built against this repo's manifest but drives whatever `curie` is on

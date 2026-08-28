@@ -732,30 +732,21 @@ function Agents() {
     return (
       <Group>
         <EmptyState
-          title="No agents deployed yet"
+          title="Nothing running yet"
           action={
-            hasBundle ? (
-              <RunButton id="local.deploy" tone="primary" size="md">
-                Deploy {app.workspace!.name}
-              </RunButton>
-            ) : (
-              <Button tone="primary" size="md" onClick={() => app.navigate("build")}>
-                Author an agent
-              </Button>
-            )
+            // One destination, whether or not something happens to be open. This
+            // panel is about the PLATFORM being empty; which agent you last had
+            // open is incidental to that, and naming it here read as this screen
+            // having opinions about a particular agent. Build is where an agent
+            // is put to work, and it says there whether it already has been.
+            <Button tone="primary" size="md" onClick={() => app.navigate("build")}>
+              {hasBundle ? "Go to Build" : "Make an agent"}
+            </Button>
           }
         >
-          {hasBundle ? (
-            <>
-              The API is reachable and reports no agents. Deploy the bundle you have open with{" "}
-              <Mono>curie local deploy</Mono>.
-            </>
-          ) : (
-            <>
-              The platform is up and has nothing on it yet. Build is where an agent is scaffolded,
-              run and graded — then deployed here.
-            </>
-          )}
+          {hasBundle
+            ? "Curie is running and has no agents on it. Build is where you send one — it will show up here once it is answering."
+            : "Curie is running and has nothing on it yet. Build is where an agent is made, tried and sent — then it appears here."}
         </EmptyState>
       </Group>
     );

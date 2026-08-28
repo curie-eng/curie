@@ -29,11 +29,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent, RefObject } from "react";
 
 import { useApp } from "../bridge/app";
+import { diagnose } from "../lib/diagnose";
 import { transcriptText, useRuns, type Run } from "../bridge/runs";
 import { complete, parseCommand } from "../lib/parseCommand";
 import { cwdFor } from "../lib/manifest";
 import { duration } from "../lib/format";
-import { ACCENT, F, FONT, LINE, STATUS, T } from "../tokens";
+import { ACCENT, F, FONT, LINE, R, STATUS, T, tint } from "../tokens";
 import { Button, CopyButton, Dot, Group, Kbd, Mono } from "../primitives";
 
 /** A line the console itself wrote, as opposed to one a process wrote. */
@@ -443,6 +444,66 @@ function Header({
 }
 
 /** The console's own lines interleaved with the focused run's output. */
+/**
+ * The one failure this app can explain better than the output does.
+ *
+ * A contract mismatch between the CLI and the platform arrives as a serde error
+ * naming a field, under a summary line that says only "failed" -- and the app
+ * has been reporting the version mismatch behind it in the corner of the sidebar
+ * the whole time without ever connecting the two. This connects them, at the
+ * moment somebody is looking at the failure.
+ *
+ * The fix is offered, not run: it changes what is running on the machine, and
+ * that is a decision. Pressing it fills the prompt so the next keystroke is
+ * Enter.
+ */
+function Diagnosis({ run }: { run: Run | undefined }) {
+  const app = useApp();
+  const runs = useRuns();
+  if (!run || run.state !== "failed") return null;
+  const d = diagnose(run.lines.map((l) => l.text).join("\n"), app.env);
+  if (!d) return null;
+
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        padding: "9px 11px",
+        borderRadius: R.group,
+        background: tint(STATUS.warn, 0.1),
+        fontFamily: FONT.ui,
+        whiteSpace: "normal",
+      }}
+    >
+      <div style={{ ...F.body, color: T.primary }}>{d.title}</div>
+      <div style={{ ...F.footnote, color: T.secondary, marginTop: 3, lineHeight: 1.55 }}>
+        {d.detail}
+      </div>
+      {d.fix ? (
+        <div style={{ marginTop: 8, display: "flex", gap: 7, alignItems: "center" }}>
+          <Button
+            size="sm"
+            onClick={() => {
+              runs.setConsoleHidden(false);
+              runs.setConsoleOpen(true);
+              const el = document.querySelector<HTMLInputElement>("[data-console-input]");
+              if (el) {
+                el.focus();
+                // Typed into the prompt rather than run: this changes what is
+                // running, and the operator gets the last keystroke.
+                el.value = d.fix!;
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+              }
+            }}
+          >
+            Put <Mono style={{ fontSize: 11 }}>{d.fix}</Mono> in the prompt
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function Scrollback({ notes, run }: { notes: readonly Note[]; run: Run | undefined }) {
   const colour: Record<Note["kind"], string> = {
     input: T.primary,
@@ -470,6 +531,7 @@ function Scrollback({ notes, run }: { notes: readonly Note[]; run: Run | undefin
           {l.text}
         </div>
       ))}
+      <Diagnosis run={run} />
       {run?.result !== undefined ? (
         <div style={{ color: T.tertiary, marginTop: 6 }}>
           {`--json → ${JSON.stringify(run.result, null, 2)}`}
