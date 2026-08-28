@@ -6,7 +6,7 @@
 // unsubscribe function so React effects can clean up without the listener count
 // growing across re-renders.
 
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 import { CH } from "./shared/contract.js";
 import type {
   ApiRequest,
@@ -41,6 +41,22 @@ const bridge: CurieBridge = {
     stop: () => ipcRenderer.invoke(CH.resStop),
     onFrame: (cb: (frame: ResourceFrame) => void) => subscribe(CH.resFrame, cb),
     logs: (id: string, tail: number) => ipcRenderer.invoke(CH.resLogs, id, tail),
+  },
+
+  dialog: {
+    pick: (opts: { kind: "file" | "directory"; title?: string }) =>
+      ipcRenderer.invoke(CH.dialogPick, opts),
+    // `webUtils` is preload-only on purpose: it turns a `File` the renderer
+    // already holds into the path behind it, and handing that capability to the
+    // page would be handing it a filesystem read primitive. Electron dropped
+    // `File.path` in 32, so without this a dropped file is unusable.
+    pathForFile: (file: File) => {
+      try {
+        return webUtils.getPathForFile(file) || null;
+      } catch {
+        return null;
+      }
+    },
   },
 
   workspace: {

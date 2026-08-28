@@ -55,6 +55,27 @@ React + TypeScript renderer. Full structure and rationale in
   and unknown flags are dropped rather than smuggled into argv -- the preview under
   the form has to stay the whole truth about what will run.
 
+- **The form is an ABSTRACTION over the CLI, not a rendering of it.** Its
+  controls are labelled in words -- `humanArg`, acronyms preserved, so `api_url`
+  is "API URL" and not "Api url". They used to be labelled `--file`, `--model`,
+  `<NAME>`, which handed back the exact vocabulary the form exists to save
+  somebody from. Nothing is lost by dropping the token: the rendered preview
+  under the form is the argv, exactly, and that is the mapping.
+
+  **A default belongs in the box, not in a footnote.** It was a chip beside the
+  label; it is the input's placeholder now, in the position the value will
+  occupy. The chip was reported as easy to miss, and it was -- an unnoticed
+  `curie-dev-key` is a 401 somebody then has to diagnose.
+
+  **A path is chosen or dropped, not transcribed.** `file` and `path` kinds
+  render `PathInput`: a box, a "Choose…" button on a native panel, and the field
+  itself as the drop target (a zone that only appears mid-drag cannot be
+  discovered; one that is always there costs height on every form). Typing still
+  works and is still the field's state. Electron removed `File.path` in 32, so a
+  drop is resolved through `webUtils.getPathForFile` in the PRELOAD -- that
+  capability must not reach the page, and it returns null rather than guessing,
+  so a drop carrying no real file leaves a typed value alone.
+
 - **The rendered preview and the executed argv are two implementations that must
   agree.** `renderCommand()` (renderer) produces the string the operator reads;
   `resolve()` (`electron/ipc/manifest.ts`) produces the argv that runs. They are

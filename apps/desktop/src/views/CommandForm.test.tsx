@@ -44,6 +44,7 @@ function stubShell(): CurieBridge {
       onResult: () => () => {},
     },
     resources: { start: async () => {}, stop: async () => {}, onFrame: () => () => {}, logs: async () => "" },
+    dialog: { pick: async () => null, pathForFile: () => null },
     workspace: {
       list: async () => [],
       open: async () => null,
@@ -237,5 +238,55 @@ describe("the working directory", () => {
     };
     mount("local.status");
     expect(await screen.findByText(/not known yet/)).toBeInTheDocument();
+  });
+});
+
+describe("the form is an abstraction over the CLI, not a rendering of it", () => {
+  // The whole reason this form exists is so nobody has to know the flags.
+  // Labelling its controls `--file` and `--model` handed that back: it is the
+  // CLI's own vocabulary, in a window, with extra steps.
+  it("labels options in words, never as flag tokens", async () => {
+    mount("local.up");
+    await waitFor(() => expect(screen.getByTestId("command-preview")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: /All options/ }));
+
+    const labels = [...document.querySelectorAll("label, div")]
+      .filter((e) => e.children.length === 0)
+      .map((e) => e.textContent?.trim() ?? "");
+    expect(labels.filter((l) => l.startsWith("--"))).toEqual([]);
+    expect(labels).toContain("File");
+    expect(labels).toContain("Model");
+  });
+
+  it("gives a path a picker rather than asking for a typed absolute path", async () => {
+    // The field was a bare text box, so supplying a compose file meant knowing
+    // its absolute path and typing it correctly -- in a window that has a file
+    // dialog sitting right there.
+    mount("local.up");
+    await waitFor(() => expect(screen.getByTestId("command-preview")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: /All options/ }));
+
+    expect(screen.getAllByRole("button", { name: "Choose…" }).length).toBeGreaterThan(0);
+    const box = screen
+      .getAllByRole("textbox")
+      .find((i) => (i as HTMLInputElement).placeholder.startsWith("Choose a file"));
+    expect(box, "the file field should say it can be chosen or dropped").toBeTruthy();
+  });
+
+  it("puts a default in the box, not in a footnote beside the label", async () => {
+    // The default used to be a chip next to the label, which was reported as
+    // easy to miss. It belongs where the value will be.
+    mount("local.deploy");
+    await waitFor(() => expect(screen.getByTestId("command-preview")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: /All options/ }));
+
+    // Every input, not just the textboxes: the API key is a password field and
+    // is exactly the case where a default nobody notices costs a 401.
+    const placeholders = [...document.querySelectorAll("input")].map((i) => i.placeholder);
+    expect(placeholders).toContain("curie-dev-key");
+    expect(placeholders).toContain(".");
+
+    // And no "default X" chip left behind saying the same thing twice.
+    expect(screen.queryByText(/^default$/)).not.toBeInTheDocument();
   });
 });

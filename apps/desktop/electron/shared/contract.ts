@@ -335,6 +335,21 @@ export interface CurieBridge {
     logs(id: string, tailLines: number): Promise<string>;
   };
 
+  /** Native pickers. A path is something the operator points at, not something
+   *  they should have to transcribe; the renderer cannot open a file dialog and
+   *  must not be given the filesystem, so it asks the shell. */
+  dialog: {
+    /** Absolute path, or `null` if the operator cancelled. */
+    pick(opts: { kind: "file" | "directory"; title?: string }): Promise<string | null>;
+    /** The absolute path behind a dropped `File`.
+     *
+     *  Electron removed `File.path` in 32, so a drop handler in the renderer
+     *  gets a `File` with no way back to disk. `webUtils.getPathForFile` is the
+     *  replacement and it lives in the preload, which is the only side that may
+     *  hold it. */
+    pathForFile(file: File): string | null;
+  };
+
   workspace: {
     list(): Promise<readonly Workspace[]>;
     open(): Promise<Workspace | null>;
@@ -392,6 +407,7 @@ export const CH = {
   resStop: "curie:res:stop",
   resFrame: "curie:res:frame",
   resLogs: "curie:res:logs",
+  dialogPick: "curie:dialog:pick",
   wsList: "curie:ws:list",
   wsOpen: "curie:ws:open",
   wsAdd: "curie:ws:add",

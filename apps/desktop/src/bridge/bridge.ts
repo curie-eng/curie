@@ -79,6 +79,11 @@ const detached: CurieBridge = {
     onFrame: noop,
     logs: async () => "",
   },
+  dialog: {
+    pick: reject("choose a path"),
+    pathForFile: () => null,
+  },
+
   workspace: {
     list: async () => [],
     open: async () => null,

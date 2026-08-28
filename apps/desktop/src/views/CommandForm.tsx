@@ -17,6 +17,7 @@ import { useCallback, useMemo, useState } from "react";
 
 import { useApp, type Prefill } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
+import { bridge } from "../bridge/bridge";
 import { ACCENT, F, FONT, HUE, LINE, R, S, STATUS, T } from "../tokens";
 import { Badge, Button, CopyButton, Field, Input, Mono, Notice, Select, Sheet, Textarea, Toggle } from "../primitives";
 import {
@@ -482,7 +483,12 @@ function FlagField({
         <Toggle
           checked={value === true || value === "true"}
           onChange={(next) => onChange(long, next)}
-          label={<Mono>{`--${long}`}</Mono>}
+          // The option in words. This form IS the abstraction over the CLI, so
+          // labelling its controls with the flags they compile to hands the
+          // reader back the thing the form exists to save them from. The
+          // mapping is not lost: the rendered preview under the form is the
+          // argv, exactly.
+          label={humanArg(long)}
           hint={arg.help}
         />
       </div>
@@ -491,16 +497,12 @@ function FlagField({
 
   return (
     <Field
-      label={<Mono>{`--${long}`}</Mono>}
+      label={humanArg(long)}
       hint={arg.help}
       required={arg.required}
-      right={
-        arg.default_values?.length ? (
-          <span style={{ fontSize: 10, color: T.tertiary }}>
-            default <Mono style={{ fontSize: 10 }}>{arg.default_values[0]}</Mono>
-          </span>
-        ) : null
-      }
+      // No "default X" chip. The default is the placeholder now -- in the box,
+      // in the position the value will occupy -- rather than a footnote beside
+      // a label, where it was reported as easy to miss and was.
     >
       <ArgInput arg={arg} value={typeof value === "string" ? value : ""} onChange={(v) => onChange(long, v)} />
     </Field>
@@ -542,22 +544,105 @@ function ArgInput({
     );
   }
 
+  if (kind === "path" || kind === "file") {
+    return <PathInput arg={arg} kind={kind} value={value} onChange={onChange} />;
+  }
+
   return (
     <Input
       value={value}
       spellCheck={false}
       type={kind === "secret" ? "password" : kind === "number" ? "number" : "text"}
       autoComplete={kind === "secret" ? "off" : undefined}
-      placeholder={
-        kind === "path"
-          ? "/path/to/directory"
-          : kind === "file"
-            ? "/path/to/file"
-            : (arg.default_values?.[0] ?? "")
-      }
+      // The default goes in the box, where the value will be, rather than in a
+      // chip beside the label.
+      placeholder={arg.default_values?.[0] ?? ""}
       onChange={(e) => onChange(e.target.value)}
-      style={kind === "path" || kind === "file" ? { fontFamily: FONT.mono } : undefined}
     />
+  );
+}
+
+/**
+ * A path: choose it, drop it, or type it.
+ *
+ * It was a text box, so the only way to supply a compose file or a plugin
+ * directory was to know its absolute path and type it correctly -- the CLI's
+ * own ergonomics reproduced in a window that has a file dialog sitting right
+ * there. Typing still works and is still the field's own state; the button and
+ * the drop target are two more ways in, not a replacement.
+ *
+ * The drop target is the field, not a separate zone: a zone that appears only
+ * while dragging cannot be discovered, and one that is always there costs
+ * height on every form for a gesture most people will not use.
+ */
+function PathInput({
+  arg,
+  kind,
+  value,
+  onChange,
+}: {
+  arg: ManifestArg;
+  kind: "path" | "file";
+  value: string;
+  onChange(next: string): void;
+}) {
+  const [over, setOver] = useState(false);
+
+  const choose = async () => {
+    const picked = await bridge().dialog.pick({
+      kind: kind === "file" ? "file" : "directory",
+      title: `Choose ${humanArg(arg.long ?? arg.id).toLowerCase()}`,
+    });
+    if (picked) onChange(picked);
+  };
+
+  return (
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        setOver(true);
+      }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setOver(false);
+        const file = e.dataTransfer.files[0];
+        // Electron removed `File.path` in 32; the preload's `webUtils` shim is
+        // the only way back to a real path, and it returns null rather than
+        // guessing when there is not one.
+        const path = file ? bridge().dialog.pathForFile(file) : null;
+        if (path) onChange(path);
+      }}
+      style={{
+        display: "flex",
+        gap: 7,
+        alignItems: "center",
+        borderRadius: R.control,
+        outline: over ? `2px solid ${ACCENT}` : "2px solid transparent",
+        outlineOffset: 2,
+        transition: "outline-color 120ms ease",
+      }}
+    >
+      <Input
+        value={value}
+        spellCheck={false}
+        // The default in the box. Where there is none, say what shape of thing
+        // belongs here rather than leaving it blank.
+        placeholder={
+          arg.default_values?.[0] ??
+          (over
+            ? "Drop it here"
+            : kind === "file"
+              ? "Choose a file, or drop one here"
+              : "Choose a directory, or drop one here")
+        }
+        onChange={(e) => onChange(e.target.value)}
+        style={{ fontFamily: FONT.mono, flex: 1, minWidth: 0 }}
+      />
+      <Button size="sm" onClick={() => void choose()} style={{ flex: "none" }}>
+        Choose…
+      </Button>
+    </div>
   );
 }
 

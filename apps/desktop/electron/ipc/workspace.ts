@@ -75,6 +75,33 @@ export async function open(win: BrowserWindow): Promise<Workspace | null> {
   return add(res.filePaths[0]);
 }
 
+/**
+ * A native open panel for a single path.
+ *
+ * Generated command forms have flags that take a compose file, a plugin
+ * directory, an eval suite. Those were plain text boxes, so the only way to
+ * supply one was to know its absolute path and type it correctly -- which is
+ * the CLI's own ergonomics reproduced in a window that has a file dialog
+ * available to it.
+ *
+ * No filters. The manifest says what a flag is for in words, and a filter list
+ * guessed from a flag id would hide the file somebody actually meant more often
+ * than it would help.
+ */
+export async function pick(
+  win: BrowserWindow,
+  opts: { kind: "file" | "directory"; title?: string },
+): Promise<string | null> {
+  const res = await dialog.showOpenDialog(win, {
+    title: opts.title ?? (opts.kind === "file" ? "Choose a file" : "Choose a directory"),
+    properties:
+      opts.kind === "file"
+        ? ["openFile"]
+        : ["openDirectory", "createDirectory"],
+  });
+  return res.canceled ? null : (res.filePaths[0] ?? null);
+}
+
 export function forget(path: string): void {
   const p = prefs();
   update({
