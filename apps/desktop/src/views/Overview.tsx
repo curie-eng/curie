@@ -662,18 +662,38 @@ function Agents() {
   }
 
   if (!app.agents.length) {
+    // "Deploy a bundle" with no bundle open is a button that opens a form you
+    // cannot complete -- the empty state's own call to action being a dead end.
+    // What is actually missing first is something to deploy, so with nothing
+    // open this sends you to the tab that makes one.
+    const hasBundle = !!app.workspace;
     return (
       <Group>
         <EmptyState
           title="No agents deployed yet"
           action={
-            <RunButton id="local.deploy" tone="primary" size="md">
-              Deploy a bundle
-            </RunButton>
+            hasBundle ? (
+              <RunButton id="local.deploy" tone="primary" size="md">
+                Deploy {app.workspace!.name}
+              </RunButton>
+            ) : (
+              <Button tone="primary" size="md" onClick={() => app.navigate("build")}>
+                Author an agent
+              </Button>
+            )
           }
         >
-          The API is reachable and reports no agents. Deploy the bundle you have open with{" "}
-          <Mono>curie local deploy</Mono>.
+          {hasBundle ? (
+            <>
+              The API is reachable and reports no agents. Deploy the bundle you have open with{" "}
+              <Mono>curie local deploy</Mono>.
+            </>
+          ) : (
+            <>
+              The platform is up and has nothing on it yet. Build is where an agent is scaffolded,
+              run and graded — then deployed here.
+            </>
+          )}
         </EmptyState>
       </Group>
     );
