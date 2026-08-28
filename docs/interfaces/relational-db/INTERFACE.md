@@ -69,10 +69,10 @@ is a judgement call, not something derivable from the tree.
    `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **seven** columns:
    `behavior_packs`, `approval_required_tools`, `approval_routes` and `secrets` on
    `apps/api/src/curie_api/models.py::Agent`, `evidence` on
-   `apps/api/src/curie_api/models.py::ApprovalAuditEntry`, `value` on
-   `apps/api/src/curie_api/models.py::WorkflowStateEntry`, and `chain` on
+   `apps/api/src/curie_api/models.py::ApprovalAuditEntry`, `chain` on
    `apps/api/src/curie_api/models.py::DelegationCall` (ADR-0115's on-wire call
-   chain, written once at call time). The `WorkflowStateEntry` one is load-bearing
+   chain, written once at call time), and `value` on
+   `apps/api/src/curie_api/models.py::WorkflowStateEntry`. The last one is load-bearing
    rather than incidental: the workflow-state store exists precisely because Postgres
    JSONB meant no new datastore was needed (see that class's docstring).
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
