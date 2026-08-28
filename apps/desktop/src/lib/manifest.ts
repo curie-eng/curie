@@ -245,7 +245,14 @@ export function runtimeDefault(
   env: { repoRoot?: string | null } | null | undefined,
 ): string | null {
   if (arg.long !== "file") return null;
-  return env?.repoRoot ? "compose.dev.yaml" : "compose.release.yaml (pinned, from the remote)";
+  const root = env?.repoRoot;
+  if (!root) return "compose.release.yaml (pinned, from the remote)";
+  // The whole path. A bare filename is only an answer if you already know which
+  // directory the command runs in, and that is precisely the thing the operator
+  // is being told here -- the field takes an absolute path, so the placeholder
+  // shows one.
+  const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
+  return `${root.replace(/[/\\]+$/, "")}${sep}compose.dev.yaml`;
 }
 
 /** Search over id, name, and help text. Ranked so an exact command name beats a
