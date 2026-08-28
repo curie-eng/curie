@@ -1069,12 +1069,17 @@ export function Sheet({
   children,
   footer,
   width = 520,
+  bodyHeight,
 }: {
   title: ReactNode;
   onClose(): void;
   children: ReactNode;
   footer?: ReactNode;
   width?: number;
+  /** A fixed height for the body, for a sheet whose steps must not resize it.
+   *  Any CSS length; cap it against the sheet's own `84vh` or a short window
+   *  clips the body instead of scrolling it. */
+  bodyHeight?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -1190,7 +1195,22 @@ export function Sheet({
             Close
           </Button>
         </div>
-        <div style={{ padding: "0 18px 18px", overflow: "auto", flex: 1 }}>{children}</div>
+        {/* One scrolling box, and it is this one. A caller that wants a fixed
+            body passes `bodyHeight` rather than wrapping the children in a
+            second `overflow: auto` of its own -- that wrapper clips at ITS
+            padding edge, which was zero, so every card inside had its shadow
+            cut off at the left, right and bottom. This box already carries the
+            sheet's 18px inset, which is the room those shadows need. */}
+        <div
+          style={{
+            padding: "0 18px 18px",
+            overflow: "auto",
+            flex: bodyHeight ? "none" : 1,
+            height: bodyHeight,
+          }}
+        >
+          {children}
+        </div>
         {footer ? (
           <div
             style={{

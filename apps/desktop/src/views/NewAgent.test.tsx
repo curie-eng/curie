@@ -27,22 +27,25 @@ function mount() {
 }
 
 describe("the new-agent wizard", () => {
-  it("gives its body a fixed height, so no step resizes the sheet", () => {
-    // Every step and every template has a different amount to say. A body that
-    // sized itself made the sheet jump each time somebody pressed a card or
-    // Next -- the controls moving under the cursor that had just used them.
+  it("fixes the height on the SHEET's own body, not a second box inside it", () => {
+    // Two things at once. The height is fixed because every step has a different
+    // amount to say and a self-sizing body made the sheet jump on every press.
+    // And it belongs to the sheet's own scrolling box, because a wrapper with
+    // its own `overflow` clips at ITS padding edge -- which was zero, so every
+    // card inside had its shadow cut off left, right and bottom. There is one
+    // scrolling box, and it carries the sheet's 18px inset.
     mount();
-    const body = [...document.querySelectorAll("div")].find(
-      (d) => d.style.height !== "" && d.style.overflowY === "auto",
+    const scrollers = [...document.querySelectorAll("div")].filter((d) =>
+      /auto/.test(d.style.overflow + d.style.overflowY),
     );
-    expect(body, "the wizard body should have an explicit height").toBeTruthy();
-    // A `min()` of a fixed height and the room the sheet actually has: fixed so
-    // no step resizes the panel, capped so a short window shrinks and scrolls
-    // rather than clipping content with no scrollbar to say so.
+    expect(scrollers, "exactly one scrolling box").toHaveLength(1);
+
+    const body = scrollers[0];
+    expect(body.style.padding).toBe("0px 18px 18px");
     // jsdom rewrites `calc(84vh - 168px)` as `-168px + 84vh`, so match the parts
     // rather than the spelling.
-    expect(body!.style.height).toMatch(/^min\(\d+px, /);
-    expect(body!.style.height).toContain("84vh");
+    expect(body.style.height).toMatch(/^min\(\d+px, /);
+    expect(body.style.height).toContain("84vh");
   });
 
   it("does not put the description inside the card it belongs to", async () => {
