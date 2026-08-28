@@ -72,13 +72,13 @@ function stubShell(env: Partial<ShellEnvironment>): CurieBridge {
   };
 }
 
-function mount(env: Partial<ShellEnvironment> = {}) {
+function mount(env: Partial<ShellEnvironment> = {}, collapsed = false) {
   window.curie = stubShell(env);
   return render(
     <AppProvider>
       <ResourcesProvider>
         <RunsProvider>
-          <Sidebar />
+          <Sidebar collapsed={collapsed} />
         </RunsProvider>
       </ResourcesProvider>
     </AppProvider>,
@@ -132,5 +132,33 @@ describe("machine status", () => {
     mount({ helmAvailable: false });
     await waitFor(() => expect(tool("helm")).toBeInTheDocument());
     expect(tool("helm").title).toMatch(/cluster up cannot run/);
+  });
+});
+
+describe("the collapsed rail", () => {
+  it("keeps every destination reachable, named for a screen reader", async () => {
+    mount({}, true);
+    // Icons only, so the accessible name is the ONLY name a destination has:
+    // a rail of unlabelled glyphs is a rail nobody can use without sight.
+    for (const label of ["Overview", "Build", "Canvas", "Resources", "Where it runs", "Commands", "Settings"]) {
+      expect(await screen.findByRole("button", { name: label })).toBeInTheDocument();
+    }
+    // ...and no visible text, or the rail would not have narrowed.
+    expect(screen.queryByText("Overview")).not.toBeInTheDocument();
+  });
+
+  it("says nothing about the machine while the machine is fine", async () => {
+    mount({ cliPath: "/usr/local/bin/curie", dockerAvailable: true, kubectlAvailable: true, helmAvailable: true }, true);
+    await screen.findByRole("button", { name: "Overview" });
+    expect(screen.queryByRole("button", { name: /needs attention/ })).not.toBeInTheDocument();
+  });
+
+  it("still shows a missing tool, because absence is the only thing worth ink", async () => {
+    // The expanded rail strikes the tool's name through. There is no room for
+    // four names here, so what survives the collapse is the absence itself --
+    // and it still says which tool, on hover.
+    mount({ dockerAvailable: false }, true);
+    const mark = await screen.findByRole("button", { name: /needs attention/ });
+    expect(mark).toHaveAttribute("title", expect.stringContaining("docker"));
   });
 });

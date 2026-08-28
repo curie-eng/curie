@@ -125,6 +125,9 @@ beforeEach(() => {
   deleted.length = 0;
   refuse = null;
   listed = [WEATHER, SRE];
+  // The column's collapsed state is remembered across launches, so a test that
+  // did not clear it would depend on the one before it.
+  localStorage.clear();
   window.curie = stubShell();
 });
 
@@ -315,5 +318,50 @@ describe("deleting an agent", () => {
 
     await waitFor(() => expect(screen.getByText(/git repository/)).toBeInTheDocument());
     expect(screen.getByText("Delete this agent")).toBeInTheDocument();
+  });
+});
+
+describe("putting the agent list away", () => {
+  const toggle = () => screen.getByRole("button", { name: /(Show|Hide) the agent list/ });
+
+  it("hides the column and gives its width back", async () => {
+    mount();
+    await waitFor(() => expect(within(list()).getByText("weather")).toBeInTheDocument());
+
+    await userEvent.click(toggle());
+    expect(screen.queryByText("Agents")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Actions for weather" })).not.toBeInTheDocument();
+    // What is stored has to agree with what is on screen. Writing it from
+    // inside the state updater did not: React invokes an updater more than
+    // once, so the write ran an unknown number of times against an unknown
+    // previous value and the two drifted apart.
+    expect(localStorage.getItem("curie.ui.build.agents.collapsed")).toBe("true");
+  });
+
+  it("keeps the way back on screen while the list is gone", async () => {
+    // The toggle lives in the DETAIL column's header for exactly this reason: on
+    // the list's own header it would disappear with the panel it controls, and a
+    // column with no way back is not collapsed, it is lost.
+    mount();
+    await waitFor(() => expect(within(list()).getByText("weather")).toBeInTheDocument());
+
+    await userEvent.click(toggle());
+    expect(toggle()).toHaveAccessibleName("Show the agent list");
+    // And the count, which is the only thing left saying the list exists.
+    expect(screen.getByText("2 in all")).toBeInTheDocument();
+
+    await userEvent.click(toggle());
+    expect(screen.getByText("Agents")).toBeInTheDocument();
+  });
+
+  it("stays where it was left", async () => {
+    const first = mount();
+    await waitFor(() => expect(within(list()).getByText("weather")).toBeInTheDocument());
+    await userEvent.click(toggle());
+    first.unmount();
+
+    mount();
+    await waitFor(() => expect(screen.getByText("No agent")).toBeInTheDocument());
+    expect(screen.queryByText("Agents")).not.toBeInTheDocument();
   });
 });

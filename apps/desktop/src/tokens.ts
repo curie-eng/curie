@@ -207,6 +207,14 @@ export const R = {
 export const M = {
   titlebar: 52,
   sidebar: 218,
+  /** The rail, collapsed to icons.
+   *
+   *  Not narrower, and the number is not arbitrary: on macOS the OS draws the
+   *  traffic lights over our content at the window's top-left, and they end at
+   *  `trafficLights`. A rail thinner than that would hand the content pane a
+   *  top-left corner it cannot put anything in. Collapsed, the rail ends exactly
+   *  where the lights do. */
+  sidebarCollapsed: 78,
   /** Space reserved for the macOS traffic lights. */
   trafficLights: 78,
   rowHeight: 30,
