@@ -1006,6 +1006,70 @@ React + TypeScript renderer. Full structure and rationale in
   `FitWidth` (`primitives/charts.tsx`). A hardcoded chart width in a resizable
   window is a bug.
 
+## Furniture the operator moves
+
+Three panels can be resized or put away: the console (drag its top edge), the
+window's rail (the toolbar's leading toggle, or Cmd+B), and the Build tab's
+agent list (the toggle in the detail column's header). What holds them together:
+
+- **A panel size is a UI position, not platform state.** It belongs to this
+  window on this machine, it means nothing to the API, and losing one costs a
+  drag. That is why they live in `localStorage` through `lib/uiState.ts`
+  alongside the Build cursor, the agent-sheet tier and the Settings tab, and why
+  every read is guarded and clamped *on the way in*: a stored height outlives
+  the layout that produced it, and a panel nobody can drag back is worse than a
+  default.
+
+- **Persist from an effect, never from inside a state updater.** An updater has
+  to be pure -- React invokes it more than once, and in development twice on
+  purpose -- so a `setItem` in there runs an unknown number of times against an
+  unknown `prev`, and what is on disk drifts out of step with what is on screen.
+  It did, and the symptom was a rail that relaunched to the opposite of where it
+  was left. `useEffect(() => write(key, value), [value])`.
+
+- **The console sizes itself until you size it, and then it stays put.** Both
+  halves matter. An explicit height from the start is 350px of empty box in a
+  console nobody has run anything in yet; a `maxHeight` over self-sizing content
+  forever means a panel dragged to 400px on a full scrollback collapses on its
+  own when the run is cleared, which reads as the drag being undone. So `height`
+  is `null` until the first drag, a `ResizeObserver` tracks where the edge
+  actually is so that drag starts from there rather than jumping, and
+  double-clicking the handle clears the stored value rather than writing a
+  default -- which is what makes the reset a real undo.
+
+- **`ResizeHandle` uses pointer capture, not window listeners.** The app sets
+  `user-select: none` everywhere except the surfaces that opt back in, and the
+  console's scrollback is one of them. Without capture a drag crossing the
+  scrollback selects its text on the way past, so the gesture that exists to
+  make the history easier to copy would fight the copying. It is a
+  `role="separator"` with `aria-valuenow` because that is also the only way it is
+  reachable without a mouse: arrows move the edge, Home/End go to the stops.
+
+- **The collapsed rail is 78px because the traffic lights end there.** macOS
+  draws them over our content at the window's top-left, and the content pane
+  starts at y=0. A rail narrower than `M.trafficLights` hands the pane a
+  top-left corner it cannot put anything in.
+
+- **A toggle belongs in the panel that survives the collapse.** The Build tab's
+  agent-list toggle sits in the *detail* column's header, not on the list's own
+  header where it would disappear with the panel it controls. A column with no
+  way back is not collapsed, it is lost. The same reason puts the rail's toggle
+  in the toolbar.
+
+- **Collapsed, an icon's accessible name is its only name.** A rail of
+  unlabelled glyphs is unusable without sight, so `NavItem` carries an
+  `aria-label` regardless of state and folds the hint into the tooltip. What
+  cannot survive the collapse degrades rather than crowding: four tool names in
+  `MachineStatus` become a single mark, shown only when something is actually
+  missing, which is the same "only absence gets ink" rule the expanded block
+  follows.
+
+- **A CDP measurement taken right after a state change can be stale.** The
+  window throttles layout while it is behind something else, so
+  `getBoundingClientRect` read 500ms after a toggle can still report the old
+  width while `aria-pressed` and `localStorage` already agree. Read the state,
+  not only the geometry, before concluding the geometry is wrong.
+
 ## Live edits vs a packaged build
 
 `pnpm dev` is the only mode where an edit reaches an open window: Vite HMR for

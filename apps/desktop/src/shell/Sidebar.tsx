@@ -72,7 +72,7 @@ const ITEMS: readonly Item[] = [
   },
 ];
 
-export function Sidebar() {
+export function Sidebar({ collapsed = false }: { collapsed?: boolean }) {
   const app = useApp();
   const runs = useRuns();
   const res = useResources();
@@ -82,8 +82,13 @@ export function Sidebar() {
       className="drag"
       data-tauri-drag-region
       style={{
-        width: M.sidebar,
+        width: collapsed ? M.sidebarCollapsed : M.sidebar,
         flex: "none",
+        // Animated, because the pane beside it moves too: a rail that jumps
+        // between two widths reads as a re-layout, and one that slides reads as
+        // the same rail in a different state.
+        transition: "width 160ms cubic-bezier(0.32, 0.72, 0, 1)",
+        overflow: "hidden",
         // Paints nothing: the window's vibrancy is the background.
         background: S.sidebar,
         display: "flex",
@@ -101,6 +106,7 @@ export function Sidebar() {
           <NavItem
             key={item.id}
             item={item}
+            collapsed={collapsed}
             active={app.route === item.id}
             onClick={() => app.navigate(item.id)}
             badge={
@@ -114,7 +120,7 @@ export function Sidebar() {
 
       <div style={{ flex: 1 }} />
 
-      <MachineStatus />
+      <MachineStatus collapsed={collapsed} />
 
       {/* Commands and Settings sit together at the foot, below the flex spacer.
           The rail above is where the work is: a bundle, the tiers it runs on,
@@ -134,6 +140,7 @@ export function Sidebar() {
             hint: "Every command, where each one lives in this app, and what has run",
             icon: <Icon d={PROMPT} />,
           }}
+          collapsed={collapsed}
           // Active for either pane: History is not a separate destination.
           active={app.route === "commands" || app.route === "activity"}
           onClick={() => app.navigate("commands")}
@@ -149,6 +156,7 @@ export function Sidebar() {
               <Icon d="M8 5.9A2.1 2.1 0 1 0 8 10.1 2.1 2.1 0 0 0 8 5.9M8 2.4v1.4M8 12.2v1.4M2.4 8h1.4M12.2 8h1.4M4.05 4.05l1 1M10.95 10.95l1 1M11.95 4.05l-1 1M5.05 10.95l-1 1" />
             ),
           }}
+          collapsed={collapsed}
           active={app.route === "settings"}
           onClick={() => app.navigate("settings")}
         />
@@ -163,19 +171,25 @@ function NavItem({
   onClick,
   badge,
   busy,
+  collapsed,
 }: {
   item: Item;
   active: boolean;
   onClick(): void;
   badge?: string;
   busy?: boolean;
+  collapsed?: boolean;
 }) {
   const [hover, setHover] = useState(false);
   return (
     <button
       className="no-drag"
       onClick={onClick}
-      title={item.hint}
+      // Collapsed, the tooltip is the only place the label exists, so it has to
+      // carry the name as well as the hint. `aria-label` regardless: a button
+      // whose only content is an icon is unlabelled to a screen reader.
+      title={collapsed ? `${item.label} — ${item.hint}` : item.hint}
+      aria-label={item.label}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
@@ -188,7 +202,12 @@ function NavItem({
         // A rounded filled pill, inset from the sidebar edge. A full-bleed row
         // with a coloured left border is the web version of this.
         borderRadius: R.control,
-        padding: "5px 8px",
+        padding: collapsed ? "6px 0" : "5px 8px",
+        justifyContent: collapsed ? "center" : undefined,
+        // Collapsed, the badge floats rather than taking a column: in the flow
+        // it pushed the icon off centre, and one row's glyph sitting left of
+        // every other row's reads as a misalignment rather than as a count.
+        position: collapsed ? "relative" : undefined,
         background: active ? S.controlHover : hover ? S.subtle : "transparent",
         color: active ? T.primary : T.secondary,
         fontSize: 13,
@@ -199,10 +218,19 @@ function NavItem({
       }}
     >
       <span style={{ color: active ? ACCENT : T.tertiary, display: "flex" }}>{item.icon}</span>
-      <span style={{ flex: 1 }}>{item.label}</span>
+      {collapsed ? null : <span style={{ flex: 1 }}>{item.label}</span>}
       {busy ? <Spinner size={10} color={ACCENT} /> : null}
       {badge ? (
-        <span style={{ ...F.footnote, color: T.tertiary, fontVariantNumeric: "tabular-nums" }}>
+        <span
+          style={{
+            ...F.footnote,
+            color: T.tertiary,
+            fontVariantNumeric: "tabular-nums",
+            ...(collapsed
+              ? { position: "absolute" as const, top: 3, right: 7, lineHeight: 1 }
+              : null),
+          }}
+        >
           {badge}
         </span>
       ) : null}
@@ -216,7 +244,7 @@ function NavItem({
  *  so its absence has to be visible rather than showing up later as an
  *  inscrutable command failure. A compact block here rather than a full-width
  *  footer bar: a status strip spanning the window is a browser habit. */
-function MachineStatus() {
+function MachineStatus({ collapsed }: { collapsed?: boolean }) {
   const app = useApp();
   const res = useResources();
   const env = app.env;
@@ -246,6 +274,38 @@ function MachineStatus() {
 
   const drifted =
     !!env?.drift && (env.drift.missingFromApp.length > 0 || env.drift.missingFromCli.length > 0);
+
+  // Collapsed there is no room for four tool names, and cramming them in one
+  // per line would make a quiet corner into a column of text. The invariant
+  // holds either way -- only absence gets ink -- so what survives the collapse
+  // is the absence itself: a mark when something is missing, nothing when the
+  // machine is fine. Expanding gets you the names back.
+  if (collapsed) {
+    const missing = tools.filter((t) => t.ok === false);
+    if (!missing.length && !drifted) return null;
+    return (
+      <div className="no-drag" style={{ padding: "0 0 12px", textAlign: "center" }}>
+        <button
+          onClick={() => app.navigate("settings")}
+          title={
+            (missing.length ? missing.map((t) => `${t.name}: ${t.detail}`).join("\n") : "") +
+            (drifted ? "\nThis app was built against a different version of Curie." : "")
+          }
+          aria-label="Something on this machine needs attention"
+          style={{
+            border: "none",
+            background: "transparent",
+            padding: 4,
+            cursor: "default",
+            color: missing.length ? STATUS.danger : STATUS.warn,
+            ...F.footnote,
+          }}
+        >
+          !
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="no-drag" style={{ padding: "0 14px 12px" }}>

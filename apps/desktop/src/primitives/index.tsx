@@ -11,6 +11,9 @@ import {
   useRef,
   useState,
   type ButtonHTMLAttributes,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type Ref,
   type CSSProperties,
   type InputHTMLAttributes,
   type ReactNode,
@@ -108,14 +111,19 @@ export function Group({
   children,
   style,
   inset = true,
+  panelRef,
 }: {
   children: ReactNode;
   style?: CSSProperties;
   /** `false` for a group that fills its column edge to edge. */
   inset?: boolean;
+  /** For a group whose own box has to be measured -- a resizable panel needs to
+   *  know where its edge actually is before the first drag moves it. */
+  panelRef?: Ref<HTMLDivElement>;
 }) {
   return (
     <div
+      ref={panelRef}
       style={{
         background: S.cardFill,
         // Glass: the fill is a thin film and this is what makes what shows
@@ -1227,5 +1235,215 @@ export function Sheet({
       </div>
     </div>,
     document.body,
+  );
+}
+
+/**
+ * A grab strip on a panel's top edge. Drag it to resize the panel.
+ *
+ * Pointer *capture* rather than window listeners, for one reason that matters
+ * here: the app sets `user-select: none` everywhere except the few surfaces
+ * that opt back in, and the console's scrollback is one of them. Without
+ * capture, a drag that crosses the scrollback would select its text on the way
+ * past -- so the gesture that exists to make the history easier to copy would
+ * fight the copying. Capture routes every move to this element until release.
+ *
+ * `role="separator"` with a `valuenow` is the ARIA pattern for a splitter, and
+ * it is also the only way this is reachable without a mouse: focus it and the
+ * arrow keys move the edge, Home/End take it to its stops.
+ */
+export function ResizeHandle({
+  value,
+  min,
+  max,
+  step = 24,
+  label,
+  onChange,
+  onCommit,
+  onReset,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  label: string;
+  onChange(next: number): void;
+  /** Called once at the end of a gesture. Persist here, not on every move. */
+  onCommit?(next: number): void;
+  /** Double-click. Omit to make double-click do nothing. */
+  onReset?(): void;
+}) {
+  const [live, setLive] = useState(false);
+  const [warm, setWarm] = useState(false);
+  const drag = useRef<{ id: number; y: number; from: number } | null>(null);
+
+  const clamp = (n: number) => Math.min(max, Math.max(min, Math.round(n)));
+
+  // Up is taller. The handle sits on the panel's top edge, so the pointer and
+  // the edge it is holding travel together -- anything else feels like the
+  // panel is fighting the hand.
+  const at = (clientY: number) =>
+    drag.current ? clamp(drag.current.from + (drag.current.y - clientY)) : value;
+
+  const stop = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (drag.current?.id !== e.pointerId) return;
+    const next = at(e.clientY);
+    drag.current = null;
+    setLive(false);
+    onCommit?.(next);
+  };
+
+  const key = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const next =
+      e.key === "ArrowUp"
+        ? clamp(value + step)
+        : e.key === "ArrowDown"
+          ? clamp(value - step)
+          : e.key === "Home"
+            ? max
+            : e.key === "End"
+              ? min
+              : undefined;
+    if (next === undefined) return;
+    e.preventDefault();
+    onChange(next);
+    onCommit?.(next);
+  };
+
+  const lit = live || warm;
+
+  return (
+    <div
+      // `no-drag` because this strip can land inside a region the window itself
+      // is draggable by, and a resize that moved the whole window instead would
+      // be indistinguishable from a bug.
+      className="no-drag"
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label={label}
+      aria-valuenow={value}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      tabIndex={0}
+      onPointerDown={(e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        // Optional call: capture is what keeps the drag off the scrollback's
+        // text, but a browser (or a test environment) without it should still
+        // get a working handle rather than an exception thrown out of the very
+        // first event of the gesture.
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+        drag.current = { id: e.pointerId, y: e.clientY, from: value };
+        setLive(true);
+      }}
+      onPointerMove={(e) => {
+        if (drag.current?.id === e.pointerId) onChange(at(e.clientY));
+      }}
+      onPointerUp={stop}
+      onPointerCancel={stop}
+      onLostPointerCapture={() => {
+        if (drag.current) {
+          drag.current = null;
+          setLive(false);
+        }
+      }}
+      onKeyDown={key}
+      onDoubleClick={onReset}
+      onMouseEnter={() => setWarm(true)}
+      onMouseLeave={() => setWarm(false)}
+      onFocus={() => setWarm(true)}
+      onBlur={() => setWarm(false)}
+      style={{
+        flex: "none",
+        height: 11,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        cursor: "ns-resize",
+        // The pointer events are the whole gesture; letting the browser also
+        // interpret the drag as a scroll would steal every other move.
+        touchAction: "none",
+        outline: "none",
+      }}
+    >
+      <div
+        style={{
+          width: lit ? 46 : 30,
+          height: 3,
+          borderRadius: 2,
+          // Faint at rest, because a panel nobody has told you is resizable
+          // still needs to look it; solid under the hand, so the grab reads as
+          // taken.
+          background: live ? T.accent : lit ? LINE.strong : LINE.border,
+          transition: "width 120ms ease, background 120ms ease",
+        }}
+      />
+    </div>
+  );
+}
+
+/**
+ * Show or hide a panel that sits beside the content: the window's rail, the
+ * Build tab's agent column.
+ *
+ * One glyph for both states rather than a chevron that flips. A chevron says
+ * "there is more this way" and has to be read for direction; the platform's
+ * sidebar mark is a picture of the layout, and shading the panel it controls
+ * says which of the two states you are looking at without any direction to
+ * decode. `aria-pressed` carries the same fact to a screen reader.
+ */
+export function PanelToggle({
+  collapsed,
+  onToggle,
+  label,
+  style,
+}: {
+  collapsed: boolean;
+  onToggle(): void;
+  /** What the panel is, e.g. "agents". Used to build the title both ways. */
+  label: string;
+  style?: CSSProperties;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      className="no-drag"
+      onClick={onToggle}
+      aria-pressed={!collapsed}
+      title={collapsed ? `Show ${label}` : `Hide ${label}`}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        border: "none",
+        background: hover ? S.controlHover : "transparent",
+        color: collapsed ? T.tertiary : T.secondary,
+        borderRadius: R.control,
+        width: 24,
+        height: 22,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 0,
+        cursor: "default",
+        transition: "background 90ms ease",
+        ...style,
+      }}
+    >
+      <svg width={15} height={15} viewBox="0 0 16 16" aria-hidden>
+        <rect
+          x={2.2}
+          y={3.4}
+          width={11.6}
+          height={9.2}
+          rx={1.8}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.4}
+        />
+        <path d="M6.4 3.4v9.2" stroke="currentColor" strokeWidth={1.4} />
+        {/* The panel itself, shaded while it is showing. */}
+        {collapsed ? null : <path d="M4 3.6h2.2v8.8H4z" fill="currentColor" opacity={0.55} />}
+      </svg>
+    </button>
   );
 }

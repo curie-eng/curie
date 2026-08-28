@@ -10,7 +10,7 @@ import { useState } from "react";
 import { useApp, type Route } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
 import { F, LINE, M, PANE_FADE, R, S, STATUS, T } from "../tokens";
-import { Glyph, Segmented, Spinner } from "../primitives";
+import { Glyph, PanelToggle, Segmented, Spinner } from "../primitives";
 import { PROMPT } from "../primitives/glyphs";
 
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
@@ -25,7 +25,15 @@ const TITLES: Record<Route, { title: string; subtitle: string }> = {
   settings: { title: "Settings", subtitle: "Connection, secrets, and what this app is" },
 };
 
-export function Toolbar({ scrolled }: { scrolled: boolean }) {
+export function Toolbar({
+  scrolled,
+  railCollapsed,
+  onToggleRail,
+}: {
+  scrolled: boolean;
+  railCollapsed: boolean;
+  onToggleRail(): void;
+}) {
   const app = useApp();
   const runs = useRuns();
   const meta = TITLES[app.route];
@@ -57,6 +65,15 @@ export function Toolbar({ scrolled }: { scrolled: boolean }) {
         zIndex: 20,
       }}
     >
+      {/* Leading, where every native window puts it, and outside the title
+          block so the title still starts on the pane's own margin. */}
+      <PanelToggle
+        collapsed={railCollapsed}
+        onToggle={onToggleRail}
+        label="the sidebar"
+        style={{ marginLeft: -4, marginRight: -2 }}
+      />
+
       <div style={{ minWidth: 0, flex: 1 }}>
         <div style={{ ...F.title }}>{meta.title}</div>
         <div style={{ ...F.footnote, color: T.tertiary, marginTop: -1 }}>{meta.subtitle}</div>

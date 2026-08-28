@@ -26,6 +26,7 @@ import { Actions, RunButton } from "./Actions";
 import { surfacesById } from "../lib/surfaces";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
+import { readBool, write as remember } from "../lib/uiState";
 import { bridge, type Workspace } from "../bridge/bridge";
 import {
   GROUP_LABEL,
@@ -57,6 +58,7 @@ import {
   Row,
   SectionHeader,
   Sheet,
+  PanelToggle,
   Well,
 } from "../primitives";
 
@@ -69,6 +71,19 @@ const LEVEL_COLOR: Record<Level, string> = {
 export function Build() {
   const app = useApp();
   const ws = app.workspace;
+
+  // The list can be put away. It is a switcher, and on a narrow window or a
+  // long editing session it is 196px of column you are not using -- but it is
+  // also the only thing that says how many agents there are, so the way back
+  // has to be visible while it is gone. The toggle therefore lives in the
+  // DETAIL column's header, which is on screen in both states, rather than on
+  // the list's own header where it would vanish with the panel.
+  const [collapsed, setCollapsed] = useState(() => readBool("build.agents.collapsed", false));
+  const toggle = () => setCollapsed((prev) => !prev);
+  // From an effect, because a state updater must be pure -- see the same note
+  // in `App.tsx`, where writing from inside one put the stored value out of step
+  // with the screen.
+  useEffect(() => remember("build.agents.collapsed", collapsed), [collapsed]);
 
   // Master-detail, with the list on the left.
   //
@@ -84,12 +99,29 @@ export function Build() {
   // read in.
   return (
     <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
-      <AgentList />
+      {collapsed ? null : <AgentList />}
       <div style={{ flex: 1, minWidth: 0 }}>
         {/* A header the list column already has, so the two columns start on the
             same line. Without it the detail began 22px higher than the list and
             every section below inherited the offset. */}
-        <SectionHeader>{ws ? "Agent" : "No agent"}</SectionHeader>
+        <SectionHeader>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 7, minHeight: 16 }}>
+            <PanelToggle
+              collapsed={collapsed}
+              onToggle={toggle}
+              label="the agent list"
+              style={{ width: 20, height: 16, marginLeft: -4 }}
+            />
+            {ws ? "Agent" : "No agent"}
+            {/* Collapsed, the count is the only thing left saying the list is
+                there at all. */}
+            {collapsed && app.workspaces.length ? (
+              <span style={{ ...F.footnote, color: T.quaternary, textTransform: "none" }}>
+                {app.workspaces.length} in all
+              </span>
+            ) : null}
+          </span>
+        </SectionHeader>
         {/* Keyed on the path so switching resets every bit of editing state
             rather than carrying a half-typed SKILL.md across. */}
         {ws ? <Workbench key={ws.path} /> : <NoBundle first={!app.workspaces.length} />}
@@ -141,7 +173,7 @@ function AgentList() {
           ) : null
         }
       >
-        Agents
+        <span style={{ display: "inline-flex", alignItems: "center", minHeight: 16 }}>Agents</span>
       </SectionHeader>
       {/* One container for the whole column: the list scrolls inside it, the
           actions are pinned to its foot.

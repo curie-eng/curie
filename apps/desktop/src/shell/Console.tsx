@@ -35,7 +35,29 @@ import { complete, parseCommand } from "../lib/parseCommand";
 import { cwdFor } from "../lib/manifest";
 import { duration } from "../lib/format";
 import { ACCENT, F, FONT, LINE, R, STATUS, T, tint } from "../tokens";
-import { Button, CopyButton, Dot, Group, Kbd, Mono } from "../primitives";
+import { Button, CopyButton, Dot, Group, Kbd, Mono, ResizeHandle } from "../primitives";
+import { forget as forgetUi, readNumber, write as rememberUi } from "../lib/uiState";
+
+/**
+ * How short the console may be dragged: header, prompt and about two lines of
+ * scrollback. Below that the panel costs more than it shows.
+ */
+const CONSOLE_MIN = 148;
+
+/**
+ * How much of the window the console may never take: the toolbar, plus enough
+ * of the view above to still read as a view rather than as a sliver. The same
+ * number appears as a `calc()` in the panel's `maxHeight`, so a window that
+ * shrinks under a remembered height is clamped by CSS without this component
+ * having to watch for resizes.
+ */
+const PANE_RESERVE = 196;
+
+const tallest = () => Math.max(CONSOLE_MIN, window.innerHeight - PANE_RESERVE);
+
+/** Roughly a third of the window -- what the console was fixed at before it
+ *  could be dragged, so nobody's first launch changes. */
+const defaultHeight = () => Math.round(window.innerHeight * 0.38);
 
 /** A line the console itself wrote, as opposed to one a process wrote. */
 interface Note {
@@ -97,6 +119,36 @@ export function Console({ padX }: { padX: number }) {
   // to the body -- so the console focuses itself on the transition. Tracked
   // against the previous value rather than just `!hidden`, or it would also
   // fire on mount and steal focus at every launch.
+  // How tall the console stands when open, and `null` until somebody says.
+  //
+  // The two halves of that are both deliberate. Once you HAVE sized the panel it
+  // keeps the size you gave it -- an explicit height, not a cap over content
+  // that sizes itself, because a panel dragged to 400px on a full scrollback
+  // that collapsed to 120px when the run was cleared would look like the drag
+  // had been undone. But before you have sized it, an explicit height is 350px
+  // of empty box on a console nobody has run anything in yet, so until then the
+  // old behaviour stands: as tall as its output, capped at a third of the
+  // window. `null` is that "nobody has said yet", and it survives a relaunch.
+  const [height, setHeight] = useState<number | null>(() =>
+    readNumber("console.height", 0, 0, tallest()) || null,
+  );
+
+  // What the panel is measuring while it still sizes itself, so the first drag
+  // starts from where the edge actually is rather than jumping to a default.
+  const [natural, setNatural] = useState(defaultHeight());
+  const panelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // Only while unsized. Observing a panel whose height WE set would be a loop.
+    if (height !== null) return;
+    const el = panelRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => setNatural(el.getBoundingClientRect().height));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [height]);
+
+  const shown = height ?? natural;
+
   const wasHidden = useRef(hidden);
   useEffect(() => {
     const returned = wasHidden.current && !hidden;
@@ -109,7 +161,7 @@ export function Console({ padX }: { padX: number }) {
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [notes, focused?.lines.length, expanded]);
+  }, [notes, focused?.lines.length, expanded, height]);
 
   const remember = useCallback((line: string) => {
     setHistory((prev) => {
@@ -259,6 +311,7 @@ export function Console({ padX }: { padX: number }) {
 
   return (
     <Group
+      panelRef={panelRef}
       style={{
         flex: "none",
         // Inset rather than full-bleed, and by the pane's OWN horizontal
@@ -277,11 +330,37 @@ export function Console({ padX }: { padX: number }) {
         margin: `0 ${padX}px ${padX}px`,
         display: "flex",
         flexDirection: "column",
-        // Bounded: the console is a strip you type into, and the pane above is
-        // the app. Expanded it takes a third of the window, never more.
-        maxHeight: expanded ? "38vh" : undefined,
+        // Bounded at both ends, and by CSS rather than by a resize listener, so
+        // a window dragged smaller than a remembered height still leaves a view
+        // above the console. Unsized (`height === null`) the cap is the older,
+        // tighter one and the panel is as tall as its output.
+        height: expanded && height !== null ? height : undefined,
+        minHeight: expanded && height !== null ? CONSOLE_MIN : undefined,
+        maxHeight: expanded
+          ? height === null
+            ? "38vh"
+            : `calc(100vh - ${PANE_RESERVE}px)`
+          : undefined,
       }}
     >
+      {expanded ? (
+        <ResizeHandle
+          label="Console height"
+          value={Math.round(shown)}
+          min={CONSOLE_MIN}
+          max={tallest()}
+          onChange={setHeight}
+          onCommit={(h) => rememberUi("console.height", h)}
+          // Back to sizing itself, which is where it started. Clearing the
+          // stored value rather than writing a default is what makes the reset
+          // a real undo: relaunching does not resurrect a number.
+          onReset={() => {
+            setHeight(null);
+            forgetUi("console.height");
+          }}
+        />
+      ) : null}
+
       <Header run={focused} expanded={expanded} onToggle={() => runs.setConsoleOpen(!expanded)} />
 
       {expanded ? (
@@ -515,8 +594,10 @@ function Scrollback({ notes, run }: { notes: readonly Note[]; run: Run | undefin
       style={{
         margin: 0,
         fontFamily: FONT.mono,
-        fontSize: 11.5,
-        lineHeight: 1.55,
+        // 11.5/1.55 was a stylization that had stopped being readable -- this is
+        // a transcript people read back and copy out of, not a status strip.
+        fontSize: 12.5,
+        lineHeight: 1.62,
         whiteSpace: "pre-wrap",
         wordBreak: "break-word",
       }}

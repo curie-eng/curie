@@ -6,7 +6,7 @@
 // independently, and whose chrome never moves. Getting that right does more for
 // "this is not a browser tab" than any amount of restyling inside the panes.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { AppProvider, useApp } from "./bridge/app";
 import { ResourcesProvider } from "./bridge/resources";
@@ -25,6 +25,7 @@ import { Activity } from "./views/Activity";
 import { Settings } from "./views/Settings";
 import { RunSheetHost } from "./views/Actions";
 import { PANE_FADE } from "./tokens";
+import { readBool, write as remember } from "./lib/uiState";
 
 function View() {
   const { route } = useApp();
@@ -50,7 +51,7 @@ function View() {
 
 /** Global keys. Kept here so a shortcut behaves the same everywhere, and so a
  *  keystroke aimed at a text field is never stolen. */
-function Keys() {
+function Keys({ onToggleRail }: { onToggleRail(): void }) {
   const app = useApp();
   const runs = useRuns();
 
@@ -64,6 +65,10 @@ function Keys() {
       if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         return app.setPaletteOpen(true);
+      }
+      if (mod && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        return onToggleRail();
       }
       if (mod && e.key.toLowerCase() === "j") {
         e.preventDefault();
@@ -105,7 +110,7 @@ function Keys() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [app, runs]);
+  }, [app, runs, onToggleRail]);
 
   return null;
 }
@@ -129,6 +134,17 @@ function Frame() {
   // into two files that then drift.
   const padX = bleed ? 16 : 22;
 
+  // The rail, collapsed or not. A remembered UI position: the operator who
+  // wants the width back should not have to ask for it at every launch.
+  const [railCollapsed, setRailCollapsed] = useState(() => readBool("rail.collapsed", false));
+  const toggleRail = useCallback(() => setRailCollapsed((prev) => !prev), []);
+  // Written from an effect, not from inside the updater. A state updater has to
+  // be pure -- React invokes it more than once, and in development invokes it
+  // twice on purpose -- so a `localStorage.setItem` in there runs an unknown
+  // number of times against an unknown `prev`, and what ends up on disk can
+  // disagree with what is on screen. It did.
+  useEffect(() => remember("rail.collapsed", railCollapsed), [railCollapsed]);
+
   // Two halves of "start the new view at the top", each in the place it belongs.
   //
   // The toolbar's separator is state, so it is corrected during render: the new
@@ -148,7 +164,7 @@ function Frame() {
 
   return (
     <div style={{ display: "flex", height: "100vh", background: "transparent", overflow: "hidden" }}>
-      <Sidebar />
+      <Sidebar collapsed={railCollapsed} />
 
       {/* The content pane. Translucent, like the sidebar -- the window's vibrancy
           carries through it, so the desktop reads faintly behind the whole app
@@ -182,7 +198,11 @@ function Frame() {
           overflow: "hidden",
         }}
       >
-        <Toolbar scrolled={scrolled} />
+        <Toolbar
+          scrolled={scrolled}
+          railCollapsed={railCollapsed}
+          onToggleRail={toggleRail}
+        />
         <main
           ref={scroller}
           onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 4)}
@@ -231,7 +251,7 @@ function Frame() {
           the operator to the Commands list to find it again. */}
       <RunSheetHost />
       <Palette />
-      <Keys />
+      <Keys onToggleRail={toggleRail} />
     </div>
   );
 }
