@@ -304,6 +304,9 @@ function registerIpc(): void {
     workspace.pick(requireWindow(), opts),
   );
   ipcMain.handle(CH.wsAdd, (_e, path: string) => workspace.add(path));
+  ipcMain.handle(CH.wsCreate, (_e, opts: { parentDir: string; name: string; files: Record<string, string> }) =>
+    workspace.createAgent(opts),
+  );
   ipcMain.handle(CH.wsDelete, (_e, path: string) => workspace.remove(path));
   ipcMain.handle(CH.wsForget, (_e, path: string) => workspace.forget(path));
   ipcMain.handle(CH.wsFiles, (_e, root: string) => workspace.bundleFiles(root));

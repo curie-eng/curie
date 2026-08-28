@@ -13,7 +13,6 @@ import { AppProvider } from "../bridge/app";
 import { ResourcesProvider } from "../bridge/resources";
 import { RunsProvider } from "../bridge/runs";
 import { Build } from "./Build";
-import { surfacesById } from "../lib/surfaces";
 import type { CurieBridge, Workspace } from "../bridge/bridge";
 
 const WEATHER: Workspace = {
@@ -77,6 +76,7 @@ function stubShell(): CurieBridge {
       files: async () => [],
       readFile: async () => "",
       writeFile: async () => {},
+      createAgent: async () => ({ ok: false as const, error: "stub" }),
       revealInFileManager: async () => {},
     },
     api: {
@@ -185,18 +185,15 @@ describe("the agent list", () => {
     expect(detail()).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "First reply, no keys" })).toBeInTheDocument();
 
+    // Exactly one control that MAKES an agent, and it opens the gallery rather
+    // than the scaffolder. The command-shaped path still exists at the foot of
+    // the page -- that is the point of it being down there -- but it does not
+    // compete for the same words.
     const creates = screen
       .getAllByRole("button")
       .map((b) => b.textContent?.trim() ?? "")
-      .filter((t) => /new agent|scaffold|open a bundle/i.test(t));
+      .filter((t) => /^new agent/i.test(t));
     expect(creates).toEqual(["New agent…"]);
-
-    // And the label is the surface's, not a copy: the column button and the
-    // group at the foot of the page drifted to "New Agent…" and "New agent…"
-    // while both were hand-written, which reads as two different actions.
-    expect(surfacesById.get("build.author")!.actions.find((a) => a.id === "init")!.label).toBe(
-      "New agent…",
-    );
 
     // And exactly one way to bring in something that already exists.
     expect(screen.getAllByRole("button", { name: "Import…" })).toHaveLength(1);

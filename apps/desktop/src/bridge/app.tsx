@@ -107,6 +107,12 @@ interface AppValue {
   forgetWorkspace(path: string): Promise<void>;
   /** Delete the bundle directory. Resolves to the shell's verdict. */
   deleteWorkspace(path: string): Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Scaffold a new agent from a template and open it. */
+  createAgent(opts: {
+    parentDir: string;
+    name: string;
+    files: Record<string, string>;
+  }): Promise<{ ok: true } | { ok: false; error: string }>;
 
   readonly api: ApiConnection | null;
   connectApi(baseUrl: string, apiKey: string | null): Promise<void>;
@@ -303,6 +309,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [refreshWorkspaces],
   );
 
+  const createAgent = useCallback(
+    async (opts: { parentDir: string; name: string; files: Record<string, string> }) => {
+      const res = await bridge().workspace.createAgent(opts);
+      await refreshWorkspaces();
+      // Open what was just made. Creating an agent and then leaving the operator
+      // on the list they started from is the app asking "so where is it".
+      if (res.ok) setWorkspacePath(res.workspace.path);
+      return res.ok ? ({ ok: true } as const) : res;
+    },
+    [refreshWorkspaces],
+  );
+
   /** Delete the bundle from disk. The shell decides whether it may; this only
    *  refreshes the list and hands the refusal back for the caller to show. */
   const deleteWorkspace = useCallback(
@@ -409,6 +427,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       openWorkspace,
       forgetWorkspace,
       deleteWorkspace,
+      createAgent,
       api,
       connectApi,
       refreshApi,
@@ -438,6 +457,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       openWorkspace,
       forgetWorkspace,
       deleteWorkspace,
+      createAgent,
       api,
       connectApi,
       refreshApi,

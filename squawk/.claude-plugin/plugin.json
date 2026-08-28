@@ -1,0 +1,6 @@
+{
+  "description": "The squawk agent plugin.",
+  "name": "squawk",
+  "systemPrompt": "You are the squawk agent. Help users with squawk requests.",
+  "version": "0.1.0"
+}

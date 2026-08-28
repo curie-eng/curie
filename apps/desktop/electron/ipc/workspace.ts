@@ -20,6 +20,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
 import type { Workspace } from "../shared/contract.js";
 import { prefs, update } from "./store.js";
+import { runOnce } from "./cli.js";
 
 function readJson<T>(path: string): T | undefined {
   try {
@@ -131,6 +132,62 @@ export async function pick(
  *     ordinary, but a directory that is itself a repo root is somebody's whole
  *     project. Nothing in this app is worth that risk.
  */
+/**
+ * Create a new agent: the platform's scaffold, then the template's overlay.
+ *
+ * `curie init` writes the base, so what a bundle IS has exactly one definition
+ * and this app cannot drift from it. A template only replaces the files that
+ * make the result a particular agent rather than a generic one -- its
+ * instructions and its examples.
+ *
+ * It runs here rather than through the transcript because creating an agent is
+ * not something the operator asked to watch a command do. They asked for an
+ * agent. The failure still reaches them: the CLI's own stderr comes back as the
+ * error, because a scaffolder that refuses is usually refusing for a reason the
+ * operator can act on (a name that collides, a directory that is not writable).
+ */
+export async function createAgent(opts: {
+  parentDir: string;
+  name: string;
+  files: Record<string, string>;
+}): Promise<{ ok: true; workspace: Workspace } | { ok: false; error: string }> {
+  const parent = resolve(opts.parentDir);
+  const name = opts.name.trim();
+
+  // The CLI wants kebab-case; saying so here beats letting `init` refuse after
+  // the operator has already picked a template and a folder.
+  if (!/^[a-z][a-z0-9]*(-[a-z0-9]+)*$/.test(name)) {
+    return {
+      ok: false,
+      error: "Use lower-case letters, digits and single hyphens, starting with a letter.",
+    };
+  }
+  if (!existsSync(parent) || !statSync(parent).isDirectory()) {
+    return { ok: false, error: `${parent} is not a folder.` };
+  }
+  const dir = join(parent, name);
+  if (existsSync(dir)) {
+    return { ok: false, error: `${dir} already exists. Pick another name or another folder.` };
+  }
+
+  const res = await runOnce(["init", name], { cwd: parent, timeoutMs: 60_000 });
+  if (res.code !== 0) {
+    return { ok: false, error: (res.stderr || res.stdout || "could not create the agent").trim() };
+  }
+
+  for (const [rel, body] of Object.entries(opts.files)) {
+    // `within` is the same containment check the file editor uses: a template is
+    // app data today, but nothing here should be able to write outside the
+    // directory it just made.
+    const target = within(dir, rel);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, body);
+  }
+
+  const ws = add(dir);
+  return ws ? { ok: true, workspace: ws } : { ok: false, error: "created, but could not open it" };
+}
+
 export function remove(path: string): { ok: true } | { ok: false; error: string } {
   const abs = resolve(path);
 
