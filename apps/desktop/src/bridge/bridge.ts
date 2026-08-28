@@ -61,6 +61,7 @@ const detached: CurieBridge = {
     // Empty, not a guess: with no shell there is no working directory to report,
     // and the UI renders "not known yet" rather than inventing a path.
     defaultCwd: "",
+    homeDir: "/Users/test",
     appVersion: "0.0.0",
     electronVersion: "",
     chromeVersion: "",
