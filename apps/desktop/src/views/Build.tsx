@@ -23,7 +23,7 @@ import { ActionButton, Actions, RunButton } from "./Actions";
 import { resolve, surfacesById } from "../lib/surfaces";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
-import { bridge } from "../bridge/bridge";
+import { bridge, type Workspace } from "../bridge/bridge";
 import {
   GROUP_LABEL,
   classifyFile,
@@ -40,16 +40,19 @@ import {
   type PluginManifest,
   type SkillMeta,
 } from "../lib/bundle";
-import { ACCENT, F, FONT, LINE, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, FONT, LINE, R, S, STATUS, T, tint } from "../tokens";
 import {
   Badge,
   Button,
   EmptyState,
+  Field,
   Group,
+  Input,
   Mono,
   Notice,
   Row,
   SectionHeader,
+  Sheet,
   Well,
 } from "../primitives";
 
@@ -126,6 +129,7 @@ function AgentList() {
   const app = useApp();
   const active = app.workspace?.path ?? null;
   const newAgent = resolve(surfacesById.get("build.author")!).find((x) => x.action.id === "init");
+  const [pendingDelete, setPendingDelete] = useState<Workspace | null>(null);
 
   return (
     <section style={{ width: 196, flex: "none" }}>
@@ -221,6 +225,35 @@ function AgentList() {
                     {w.hasEvals ? " · evals" : ""}
                   </div>
                 </div>
+                {/* Revealed on row hover or focus, not standing there always: a
+                    delete control beside every row permanently is a mis-click
+                    waiting to happen on a list you point at to SWITCH agents far
+                    more often than to remove one. Opacity rather than display,
+                    so it stays in the tab order for anyone driving by keyboard;
+                    see `.row-delete` in styles.css. `stopPropagation` because
+                    the row itself selects. */}
+                <button
+                  className="row-delete"
+                  aria-label={`Delete ${w.plugin?.name ?? w.name}`}
+                  title={`Delete ${w.plugin?.name ?? w.name} from disk`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setPendingDelete(w);
+                  }}
+                  style={{
+                    flex: "none",
+                    border: "none",
+                    background: "transparent",
+                    padding: 3,
+                    marginRight: -3,
+                    borderRadius: R.control,
+                    color: "inherit",
+                    cursor: "default",
+                    display: "inline-flex",
+                  }}
+                >
+                  <Glyph d="M4.5 4.5l7 7M11.5 4.5l-7 7" />
+                </button>
               </Row>
             );
           })
@@ -272,7 +305,94 @@ function AgentList() {
         </Button>
         </div>
       </Group>
+
+      {pendingDelete ? (
+        <DeleteBundle bundle={pendingDelete} onClose={() => setPendingDelete(null)} />
+      ) : null}
     </section>
+  );
+}
+
+/**
+ * The delete confirmation.
+ *
+ * Typing the bundle's name, which is the gate every destructive command in this
+ * app already uses -- muscle memory must not be able to carry somebody through a
+ * deletion they did not mean. It is doing more work than usual here: a command
+ * can be re-run, and a directory cannot be un-deleted.
+ *
+ * No trash, on purpose. An app that deletes into a holding pen has to grow a way
+ * to see and empty that pen, and until it does the operator cannot tell whether
+ * the thing is actually gone.
+ *
+ * The path is shown in full. The name says which agent; the path is the only
+ * thing that says which COPY, and two checkouts of one bundle differ by nothing
+ * else.
+ */
+function DeleteBundle({ bundle, onClose }: { bundle: Workspace; onClose(): void }) {
+  const app = useApp();
+  const name = bundle.plugin?.name ?? bundle.name;
+  const [typed, setTyped] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const confirm = async () => {
+    setBusy(true);
+    const res = await app.deleteWorkspace(bundle.path);
+    setBusy(false);
+    if (res.ok) onClose();
+    else setError(res.error);
+  };
+
+  return (
+    <Sheet
+      title="Delete this agent"
+      onClose={onClose}
+      width={520}
+      footer={
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", width: "100%" }}>
+          <Button tone="plain" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button tone="danger" busy={busy} disabled={typed !== name} onClick={() => void confirm()}>
+            Delete permanently
+          </Button>
+        </div>
+      }
+    >
+      <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.6, marginBottom: 12 }}>
+        This removes the directory and everything in it. There is no undo, and it does not go to the
+        Trash.
+      </div>
+      <Well style={{ padding: "8px 10px", marginBottom: 14 }} mono>
+        {bundle.path}
+      </Well>
+      {error ? (
+        <div style={{ marginBottom: 12 }}>
+          <Notice tone="error" title="Not deleted">
+            {error}
+          </Notice>
+        </div>
+      ) : null}
+      <Field
+        label={
+          <>
+            Type <Mono style={{ color: T.primary }}>{name}</Mono> to confirm
+          </>
+        }
+      >
+        <Input
+          value={typed}
+          autoFocus
+          spellCheck={false}
+          autoComplete="off"
+          onChange={(e) => setTyped(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && typed === name) void confirm();
+          }}
+        />
+      </Field>
+    </Sheet>
   );
 }
 

@@ -355,6 +355,13 @@ export interface CurieBridge {
     open(): Promise<Workspace | null>;
     add(path: string): Promise<Workspace | null>;
     forget(path: string): Promise<void>;
+    /** Delete the bundle directory from disk, permanently, and forget it.
+     *
+     *  Guarded in the shell rather than trusted from the renderer: it refuses
+     *  anything the app is not already tracking, anything that is not a bundle,
+     *  and any directory that is itself a git repository. A stale list entry
+     *  must not be able to erase a checkout. */
+    delete(path: string): Promise<{ ok: true } | { ok: false; error: string }>;
     /** Paths, relative to the bundle root, of the files a human edits. The
      *  walker lives in the shell because it needs the filesystem; what counts as
      *  worth showing is decided in the renderer. */
@@ -412,6 +419,7 @@ export const CH = {
   wsOpen: "curie:ws:open",
   wsAdd: "curie:ws:add",
   wsForget: "curie:ws:forget",
+  wsDelete: "curie:ws:delete",
   wsFiles: "curie:ws:files",
   wsRead: "curie:ws:read",
   wsWrite: "curie:ws:write",

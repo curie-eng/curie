@@ -68,6 +68,12 @@ function stubShell(): CurieBridge {
       open: async () => null,
       add: async () => null,
       forget: async () => {},
+      delete: async (path: string) => {
+      if (refuse) return { ok: false as const, error: refuse };
+      deleted.push(path);
+      listed = listed.filter((w) => w.path !== path);
+      return { ok: true as const };
+    },
       files: async () => [],
       readFile: async () => "",
       writeFile: async () => {},
@@ -112,7 +118,12 @@ function detail(): HTMLElement {
   return list().parentElement!.lastElementChild as HTMLElement;
 }
 
+const deleted: string[] = [];
+let refuse: string | null = null;
+
 beforeEach(() => {
+  deleted.length = 0;
+  refuse = null;
   listed = [WEATHER, SRE];
   window.curie = stubShell();
 });
@@ -258,5 +269,51 @@ describe("the list is a bounded container", () => {
     listed = many;
     mount();
     await waitFor(() => expect(within(list()).getByText("24")).toBeInTheDocument());
+  });
+});
+
+describe("deleting an agent", () => {
+  it("does not delete on the first click, and needs the name typed", async () => {
+    // A directory cannot be un-deleted, so this gate does more work than the
+    // one on a destructive command -- a command can be re-run.
+    mount();
+    await waitFor(() => expect(within(list()).getByText("weather")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete weather" }));
+    await waitFor(() => expect(screen.getByText("Delete this agent")).toBeInTheDocument());
+
+    const confirm = screen.getByRole("button", { name: "Delete permanently" });
+    expect(confirm).toBeDisabled();
+    expect(deleted).toEqual([]);
+
+    // The confirm field has focus, so you can type without clicking first.
+    // `Sheet` used to focus its own panel unconditionally after mount, which
+    // stole focus back out of the field the sheet exists to have you fill in.
+    expect(screen.getByRole("textbox")).toHaveFocus();
+
+    // A near miss is still a miss.
+    await userEvent.type(screen.getByRole("textbox"), "weathe");
+    expect(confirm).toBeDisabled();
+
+    await userEvent.type(screen.getByRole("textbox"), "r");
+    expect(confirm).toBeEnabled();
+    await userEvent.click(confirm);
+    await waitFor(() => expect(deleted).toEqual(["/w/weather"]));
+  });
+
+  it("shows the shell's refusal instead of pretending it worked", async () => {
+    // The guards live in the shell because the argument is a path and the
+    // renderer is untrusted. What comes back is a reason, and it has to be
+    // readable -- silently leaving the row in place would look like a no-op.
+    refuse = "That directory is a git repository. Delete it with your own tools, not from here.";
+    mount();
+    await waitFor(() => expect(within(list()).getByText("weather")).toBeInTheDocument());
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete weather" }));
+    await userEvent.type(await screen.findByRole("textbox"), "weather");
+    await userEvent.click(screen.getByRole("button", { name: "Delete permanently" }));
+
+    await waitFor(() => expect(screen.getByText(/git repository/)).toBeInTheDocument());
+    expect(screen.getByText("Delete this agent")).toBeInTheDocument();
   });
 });

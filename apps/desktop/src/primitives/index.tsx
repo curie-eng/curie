@@ -156,6 +156,9 @@ export function Row({
   const [hover, setHover] = useState(false);
   return (
     <div
+      // A hook for CSS that needs the ROW's state, not the child's: a control
+      // revealed on row hover cannot express that from its own rules.
+      data-row=""
       onClick={onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
@@ -912,7 +915,13 @@ export function Sheet({
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
-    ref.current?.focus();
+    // Focus the panel ONLY if nothing inside it already took focus. It focuses
+    // itself so a sheet opened by mouse still has the keyboard, but an
+    // `autoFocus`ed field inside commits before this effect runs, so an
+    // unconditional call stole focus back out of the field the sheet exists to
+    // have you fill in -- you had to click the box before you could type.
+    const panel = ref.current;
+    if (panel && !panel.contains(document.activeElement)) panel.focus();
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
@@ -939,6 +948,12 @@ export function Sheet({
         aria-modal="true"
         aria-label={typeof title === "string" ? title : undefined}
         style={{
+          // No focus ring on the panel itself. `tabIndex={-1}` makes it a
+          // target for programmatic focus, not a control somebody tabbed to,
+          // and the app's global `:focus-visible` rule was drawing a 2px accent
+          // outline around the whole sheet as if it were one. The ring belongs
+          // on the field inside that actually has focus.
+          outline: "none",
           width,
           maxWidth: "100%",
           maxHeight: "84vh",

@@ -433,3 +433,24 @@ select {
     animation: none !important;
   }
 }
+
+/* A row's delete control: present in the DOM, invisible until the row is
+   hovered or something inside it has focus.
+
+   Not `display: none` until hover -- that would take it out of the tab order,
+   which puts it out of reach entirely for anyone driving by keyboard. Opacity
+   keeps it focusable, and `:focus-within` on the row is what makes tabbing to
+   it reveal it. A delete control standing beside every row permanently is a
+   mis-click waiting to happen on a list you point at to SWITCH agents far more
+   often than to remove one. */
+.row-delete {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+[data-row]:hover .row-delete,
+[data-row]:focus-within .row-delete {
+  opacity: 1;
+}
+.row-delete:hover {
+  color: var(--status-danger);
+}

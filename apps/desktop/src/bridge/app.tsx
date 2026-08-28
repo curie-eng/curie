@@ -105,6 +105,8 @@ interface AppValue {
   selectWorkspace(path: string | null): void;
   openWorkspace(): Promise<void>;
   forgetWorkspace(path: string): Promise<void>;
+  /** Delete the bundle directory. Resolves to the shell's verdict. */
+  deleteWorkspace(path: string): Promise<{ ok: true } | { ok: false; error: string }>;
 
   readonly api: ApiConnection | null;
   connectApi(baseUrl: string, apiKey: string | null): Promise<void>;
@@ -301,6 +303,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [refreshWorkspaces],
   );
 
+  /** Delete the bundle from disk. The shell decides whether it may; this only
+   *  refreshes the list and hands the refusal back for the caller to show. */
+  const deleteWorkspace = useCallback(
+    async (path: string) => {
+      const res = await bridge().workspace.delete(path);
+      await refreshWorkspaces();
+      return res;
+    },
+    [refreshWorkspaces],
+  );
+
   // Read the theme once, then follow the shell. The subscription matters only
   // while the preference is "system", which is the default, so most installs
   // depend on it.
@@ -395,6 +408,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       selectWorkspace: setWorkspacePath,
       openWorkspace,
       forgetWorkspace,
+      deleteWorkspace,
       api,
       connectApi,
       refreshApi,
@@ -423,6 +437,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       workspace,
       openWorkspace,
       forgetWorkspace,
+      deleteWorkspace,
       api,
       connectApi,
       refreshApi,

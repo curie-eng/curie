@@ -49,6 +49,7 @@ function stubShell(env: Partial<ShellEnvironment>): CurieBridge {
       open: async () => null,
       add: async () => null,
       forget: async () => {},
+      delete: async () => ({ ok: true as const }),
       files: async () => [],
       readFile: async () => "",
       writeFile: async () => {},
