@@ -5,12 +5,13 @@ allowed-tools:
   - mcp__curie-delegate__call_agent
 ---
 
-# Delegate to another agent (PROTOTYPE, Draft ADR-0115)
+# Delegate to another agent (ADR-0115)
 
-This bundle demonstrates the ADR-0115 prototype: one agent asking another
-agent to do something, over the platform's own first-party surface, with no
-third party in the path. See `docs/demo/ADR-0115-PROTOTYPE-NOTES.md` in the
-Curie repo for what this prototype cuts from the full ADR.
+One agent asking another agent to do something, over the platform's own
+first-party surface, with no third party in the path. This bundle declares
+its intent to call `bob` in `.claude-plugin/plugin.json`'s `delegatesTo`; an
+operator still has to arm the pair (`POST /delegate/grants`) before a call can
+succeed -- declaring is not the same as granting (ADR-0115 part 5).
 
 ## How to answer
 
