@@ -1107,6 +1107,15 @@ export function Sheet({
         justifyContent: "center",
         zIndex: 200,
         padding: 24,
+        // Centred on the CONTENT PANE, not the window. The scrim still covers
+        // everything -- a modal that leaves part of the window looking live is
+        // lying about what you can click -- but the sidebar is 218px of
+        // permanent chrome that never goes away, so the lit area is the frame
+        // the eye measures against. Centred on the window, a sheet sits ~109px
+        // left of where it looks like it should be, which reads as "not
+        // centred" and was reported as exactly that. Padding rather than
+        // `left`, so the scrim keeps its full width and only the CENTRING moves.
+        paddingLeft: M.sidebar + 24,
       }}
     >
       <div
@@ -1127,13 +1136,22 @@ export function Sheet({
           maxHeight: "84vh",
           display: "flex",
           flexDirection: "column",
-          // The same glass every card gets, so a sheet reads as this app's own
-          // surface rather than as a system dialog dropped on top of it. The
-          // blur is what keeps it legible: a translucent panel over a scrimmed
-          // page would be muddy without it.
-          background: S.cardFill,
-          backdropFilter: S.cardBackdrop,
-          WebkitBackdropFilter: S.cardBackdrop,
+          // Opaque, and this is the same call the row menu had to make. A CARD is
+          // glass because it sits on the pane and the window's vibrancy carrying
+          // through it is the point. A sheet floats over arbitrary content and
+          // has to be its own surface: on glass, the page underneath came
+          // through hard enough to compete with the sheet's own text -- "No
+          // agents yet" reading through the New agent title, a section header
+          // crossing a paragraph. A blur is not enough when what is behind is
+          // text at the same size, and it is a no-op here anyway now the fill is
+          // opaque, so it is gone with its compositing layer.
+          //
+          // A `--sheet-fill` was tried and reverted long before this, on the
+          // evidence of a screenshot -- captures do not composite native
+          // vibrancy, so they are the wrong instrument. This time it was
+          // reported from a real display, which is the only evidence that
+          // settles it.
+          background: S.raised,
           borderRadius: R.sheet,
           boxShadow: SHADOW.sheet,
           animation: "curie-sheet 200ms cubic-bezier(0.22,1,0.36,1)",

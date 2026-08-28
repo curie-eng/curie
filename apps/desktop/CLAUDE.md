@@ -435,6 +435,16 @@ React + TypeScript renderer. Full structure and rationale in
   - **Text uses the named roles in `F`** (`title`, `headline`, `body`, `callout`,
     `section`, `caption`, `footnote`) and the four emphasis levels in `T`. Do not
     pick a pixel size and a grey per component.
+  - **A modal centres on the CONTENT PANE, not the window.** The scrim still
+    spans everything -- a modal that leaves part of the window looking live is
+    lying about what you can click -- but the sidebar is 218px of permanent
+    chrome, so the lit area is the frame the eye measures against. Centred on the
+    window, a sheet sits half the sidebar's width left of where it looks like it
+    belongs; that was reported as "not centered", and it was. `paddingLeft:
+    M.sidebar + 24` on the overlay, so only the centring moves and the scrim
+    keeps its full width. `src/primitives/sheet.test.tsx` pins this and the
+    opacity, because both are one token in the source and glaring on screen.
+
   - **Controls are platform controls**: `Toggle` is a switch, not a checkbox;
     `Segmented` is a segmented control, not a row of buttons or a `<select>`;
     `Sheet` is a
@@ -443,13 +453,20 @@ React + TypeScript renderer. Full structure and rationale in
     visually attaches to just looked unfinished. It is a card like any other:
     `--card-fill`, the same blur, radius and shadow.
 
-    A `--sheet-fill` at a modal's opacity was tried and reverted. The evidence
-    for it was a screenshot in which the page's buttons looked legible through
-    the sheet -- and screenshots taken through the debugger do not composite the
-    window's native vibrancy, so `backdrop-filter` renders far weaker there than
-    on a real display. The blur does its job on screen. **Do not judge
+    **A sheet is opaque, and so is a menu.** A card is glass because it sits on
+    the pane and the window's vibrancy carrying through it is the point. Both of
+    those float over ARBITRARY content, so they have to be their own surface:
+    on glass the page underneath came through hard enough to compete with the
+    sheet's own text -- a page heading reading through the sheet's title. A blur
+    does not save it when what is behind is text at the same size, and it is a
+    no-op once the fill is opaque, so both dropped it and its compositing layer.
+
+    A `--sheet-fill` was tried and reverted long before that, on the evidence of
+    a screenshot -- and captures do not composite native vibrancy, so they are
+    the wrong instrument for this question in either direction. **Do not judge
     translucency from a captured image in this app**; that mistake has been made
-    on the cards, the seam, the pane and this sheet. A bare
+    on the cards, the seam, the pane, the sheet and the row menu. What settled it
+    was a report from a real display. A bare
     `<input type="checkbox">` is rendered by the engine and looks like a form
     control on a web page -- that is the tell to avoid.
   - **`tokens.ts` holds no colours, only references.** Every colour token is a
