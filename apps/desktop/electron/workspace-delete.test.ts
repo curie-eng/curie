@@ -10,6 +10,17 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// `workspace.ts` imports `electron` for its file dialogs, and importing that
+// package evaluates a shim that looks for the Electron BINARY and throws when it
+// is absent. CI installs the dependency but not the binary, so this test passed
+// on a developer machine and failed there -- the worst shape of environment
+// dependence, because it only shows up after review. Nothing here needs a real
+// dialog, so the module is replaced outright.
+vi.mock("electron", () => ({
+  dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+  shell: { showItemInFolder: () => {} },
+}));
+
 const store = { workspaces: [] as { path: string; lastOpened: number }[] };
 
 vi.mock("./ipc/store.js", () => ({

@@ -113,10 +113,14 @@ const STACK_CASES = (agent: string) =>
           note: "Anchored at both ends on purpose. The failure this catches is not a wrong word, it is a correct answer followed by 'Anything else I can help with?' -- the extra sentence is what makes a precise agent read as a chatbot.",
         },
         {
-          id: "handing-back-returns-the-newest-entry",
+          id: "handing-back-answers-in-one-of-the-two-valid-shapes",
           input: "",
-          grader: { kind: "regex", expected: "^\\s*Last thing:\\s+\\S", case_sensitive: true },
-          note: "An empty message hands one back. The grader cannot name the entry -- the list is shared and durable, so what comes back depends on what was said earlier, which is the point. It asserts the SHAPE: the marker, then a non-empty payload.",
+          grader: {
+            kind: "regex",
+            expected: "^\\s*(Last thing:\\s+\\S|Nothing saved\\.)",
+            case_sensitive: true,
+          },
+          note: "An empty message hands one back, and there are exactly two right answers: the entry, or that there is none. Both are accepted because the list is shared and durable, so what is on it depends on what was said earlier -- demanding an entry would fail a brand new agent, which is not a bug. What it rejects is a bare acknowledgement, which is well formed for saving and meaningless here.",
         },
         {
           id: "whitespace-counts-as-nothing",
@@ -126,13 +130,7 @@ const STACK_CASES = (agent: string) =>
             expected: "^\\s*(Last thing:\\s+\\S|Nothing saved\\.)",
             case_sensitive: true,
           },
-          note: "Trimming decides which branch runs, so three spaces must not be saved as an entry. Either outcome passes because the list's contents are not fixed; what is asserted is that whitespace did not get stored. The failure mode is testing `if message:` instead of `if message.strip():` and quietly collecting blank rows.",
-        },
-        {
-          id: "handing-back-actually-reads-the-list",
-          input: "",
-          grader: { kind: "tool_called", expected: "mcp__curie-state__get" },
-          note: "The case a text matcher cannot carry: a model can answer from the conversation it can already see instead of reading the stored list, and the reply looks identical either way. This grades the trajectory instead. RESIDUAL LIMIT: it proves the list was consulted, not that the entry returned is the one that was stored.",
+          note: "Trimming decides which branch runs, so three spaces must not be saved as an entry. Same two accepted shapes as above; what is asserted here is narrower, that whitespace did not get stored. The failure mode is testing `if message:` instead of `if message.strip():` and quietly collecting blank rows.",
         },
       ],
     },
@@ -143,17 +141,17 @@ const STACK_CASES = (agent: string) =>
 
 const OWN_CODE_PY = `"""Your agent's own code.
 
-Anything you write here that is wrapped in @tool becomes something the agent can
-call. Keep each one small and predictable: the point of putting work here rather
-than in the agent's instructions is that a program gives the same answer every
-time, and a model does not.
+Anything you write here that is wrapped in @mcp.tool becomes something the agent
+can call. Keep each one small and predictable: the point of putting work here
+rather than in the agent's instructions is that a program gives the same answer
+every time, and a model does not.
 
 Run it yourself while you are working on it:
 
     python tools/tools.py
 
-This talks to the agent over stdin and stdout, so it never listens on a port and
-nothing outside this computer can reach it.
+It talks to the agent over its input and output, so it never listens on a port
+and nothing outside this computer can reach it.
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -213,9 +211,9 @@ Say the number plainly, and say what it refers to.
 
 ## Making it yours
 
-The two tools above are examples. Open \`tools/tools.py\`, replace them with
-whatever your agent actually needs, and describe those here instead — this file
-is what tells the agent when to reach for them.
+The two above are examples. Open \`tools/tools.py\`, replace them with whatever
+your agent actually needs, and describe those here instead — this file is what
+tells the agent when to reach for them.
 `;
 
 export const TEMPLATES: readonly Template[] = [
