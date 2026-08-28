@@ -803,6 +803,23 @@ React + TypeScript renderer. Full structure and rationale in
   global `:focus-visible` rule was drawing a 2px accent ring around the whole
   sheet.
 
+- **"Ready to deploy" is about the FILES, and Build used to stop there.** That
+  badge means the bundle would load; it says nothing about whether anything is
+  running. It was the only badge on the screen, so an agent that had never been
+  deployed looked identical to one that had -- while Canvas and Resources showed
+  nothing, which reads as three views disagreeing when only one of them was
+  answering the question. `Deployment` compares the open bundle against
+  `app.agents`, which the app already had and nothing was consulting.
+
+  It is phrased as **"nothing is answering as `<name>`"**, not "not deployed".
+  Name is the only link there is -- a running agent carries no reference back to
+  the directory it came from -- and `deploy.yaml` can send one bundle out under a
+  different name per environment (`squawk-dev`, `squawk`), so a bundle really can
+  be running as something this cannot match. The narrower claim is the true one
+  and costs nothing. For the same reason the match is exact: `squawk-dev` and
+  `squawk` are different agents with separate identity, memory and approval
+  routing, so a prefix match would report a dev deployment as production.
+
 - **An agent is configured with fields, not by opening its files.**
   `AgentSettings` in the Build view edits what the agent should do, its
   description and the suggestions it offers. All three were already

@@ -21,6 +21,7 @@ import { useApp } from "../bridge/app";
 import { SlackPacks } from "./BuildPacks";
 import { NewAgent } from "./NewAgent";
 import { AgentSettings } from "./AgentSettings";
+import { Deployment, DeployedDot } from "./Deployment";
 import { Actions, RunButton } from "./Actions";
 import { surfacesById } from "../lib/surfaces";
 import { useResources } from "../bridge/resources";
@@ -218,9 +219,21 @@ function AgentList() {
                   >
                     {w.plugin?.name ?? w.name}
                   </div>
-                  <div style={{ ...F.footnote, color: T.quaternary, marginTop: 1 }}>
-                    {w.skills.length} skill{w.skills.length === 1 ? "" : "s"}
-                    {w.hasEvals ? " · evals" : ""}
+                  <div
+                    style={{
+                      ...F.footnote,
+                      color: T.quaternary,
+                      marginTop: 1,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                    }}
+                  >
+                    <span>
+                      {w.skills.length} skill{w.skills.length === 1 ? "" : "s"}
+                      {w.hasEvals ? " · evals" : ""}
+                    </span>
+                    <DeployedDot bundleName={w.plugin?.name ?? w.name} />
                   </div>
                 </div>
                 {/* The row's actions, behind the platform's overflow affordance
@@ -539,6 +552,11 @@ function Workbench() {
           first and repeatedly, and running it is what they do after. It edits
           the same files the list below does, through the same write functions,
           so the two surfaces cannot disagree about what a file means. */}
+      {/* Directly under the header, because "is this thing actually running"
+          is the question somebody arrives with after deploying once, and the
+          only answer Build gave was a readiness badge about the files. */}
+      <Deployment bundleName={plugin?.ok ? (plugin.value.name ?? ws.name) : ws.name} />
+
       <AgentSettings
         ws={ws}
         plugin={plugin?.ok ? plugin.value : undefined}
