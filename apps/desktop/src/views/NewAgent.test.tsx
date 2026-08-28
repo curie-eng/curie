@@ -36,7 +36,13 @@ describe("the new-agent wizard", () => {
       (d) => d.style.height !== "" && d.style.overflowY === "auto",
     );
     expect(body, "the wizard body should have an explicit height").toBeTruthy();
-    expect(body!.style.height).toMatch(/^\d+px$/);
+    // A `min()` of a fixed height and the room the sheet actually has: fixed so
+    // no step resizes the panel, capped so a short window shrinks and scrolls
+    // rather than clipping content with no scrollbar to say so.
+    // jsdom rewrites `calc(84vh - 168px)` as `-168px + 84vh`, so match the parts
+    // rather than the spelling.
+    expect(body!.style.height).toMatch(/^min\(\d+px, /);
+    expect(body!.style.height).toContain("84vh");
   });
 
   it("does not put the description inside the card it belongs to", async () => {

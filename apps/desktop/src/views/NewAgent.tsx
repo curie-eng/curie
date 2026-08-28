@@ -23,9 +23,21 @@ import { TEMPLATES, type Template } from "../lib/templates";
 import { ACCENT, F, LINE, R, S, T, tint } from "../tokens";
 import { Button, Field, Group, Input, Mono, Notice, Sheet } from "../primitives";
 
-/** Tall enough for the longest step without scrolling, and identical for all of
- *  them. See the note where it is used. */
-const BODY_HEIGHT = 452;
+/**
+ * Tall enough that NO step scrolls, and identical for all of them.
+ *
+ * Measured, not guessed: the tallest is the first step showing the shared-list
+ * template, at 468px of content. 480 leaves a little room for a font that
+ * renders slightly larger than the one measured on.
+ *
+ * The `min` is the short-window case. `Sheet` caps itself at 84vh, so on a small
+ * display a fixed 480 would be taller than the panel could ever be and the body
+ * would be clipped rather than scrolled -- content unreachable with no scrollbar
+ * to say so. 168 is the sheet's own header and footer, measured at 162 and
+ * rounded up; below that height the body shrinks and scrolls, which is the
+ * honest outcome when there is genuinely not enough room.
+ */
+const BODY_HEIGHT = "min(480px, calc(84vh - 168px))";
 
 type StepId = "start" | "name" | "review";
 
