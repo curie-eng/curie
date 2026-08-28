@@ -62,10 +62,20 @@ React + TypeScript renderer. Full structure and rationale in
   somebody from. Nothing is lost by dropping the token: the rendered preview
   under the form is the argv, exactly, and that is the mapping.
 
-  **A default belongs in the box, not in a footnote.** It was a chip beside the
-  label; it is the input's placeholder now, in the position the value will
-  occupy. The chip was reported as easy to miss, and it was -- an unnoticed
-  `curie-dev-key` is a 401 somebody then has to diagnose.
+  **A DEFAULT IS NOT A VALUE.** It is what the CLI does when the flag is absent,
+  so it is the input's PLACEHOLDER -- grey, in the position the value will
+  occupy -- and the box stays empty. It used to be seeded as real typed text,
+  which had two costs: the app restated every default explicitly, turning `curie
+  local deploy` into `curie local deploy --plugin-dir X --api-url Y --api-key
+  Z`, and it overrode the CLI's own resolution with a value the manifest could
+  only approximate. It was also, before that, a chip beside the label, which was
+  reported as easy to miss and was.
+
+  **Context IS a value.** The bundle the operator has open, what they typed last
+  time (`STICKY_FLAGS`), and what a contextual control seeded are answers to the
+  question rather than restatements of the fallback, so those are typed in and
+  visible in the preview. That is the line: manifest default -> placeholder,
+  everything the app actually knows -> value.
 
   **A path is chosen or dropped, not transcribed.** `file` and `path` kinds
   render `PathInput`: a box, a "Choose…" button on a native panel, and the field

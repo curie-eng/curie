@@ -95,16 +95,26 @@ function seedValues(
       flags[long] = fallback === "true";
       continue;
     }
-    // The bundle the operator is looking at beats the value they typed last
-    // time, which in turn beats the manifest's default.
+    // A DEFAULT IS NOT A VALUE. The manifest's default is what the CLI will do
+    // if the flag is absent, so typing it into the box makes the app restate it
+    // explicitly on every invocation -- `curie local deploy --api-url
+    // http://localhost:28000 --api-key curie-dev-key --plugin-dir /Users/...`
+    // for a command whose whole argv should have been `curie local deploy`. It
+    // also overrides the CLI's own resolution with a value this app guessed,
+    // which is wrong wherever that resolution is smarter than the manifest can
+    // express. Defaults are the placeholder now; see `ArgInput`.
+    //
+    // Context IS a value. The bundle the operator is looking at, what they
+    // typed last time, and what a contextual control seeded are answers to the
+    // question rather than a restatement of the fallback, so they are typed in
+    // and visible in the preview.
     const fromContext =
       long === "plugin-dir"
         ? (ctx.workspacePath ?? undefined)
         : STICKY_FLAGS.has(long)
           ? ctx.sticky[long]
           : undefined;
-    const seeded = fromContext || fallback;
-    if (seeded) flags[long] = seeded;
+    if (fromContext) flags[long] = fromContext;
   }
   // A contextual control's own values win over everything: the operator pressed
   // "Memory" on a particular agent's row, so that agent is the answer, not the
