@@ -90,3 +90,47 @@ export function titleize(id: string): string {
   const words = last.replace(/[-_]/g, " ").trim();
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
+
+/**
+ * A path short enough to sit in a field, the way the platform writes one.
+ *
+ * Two conventions, both of them what macOS itself does and neither invented
+ * here. The home directory becomes `~`, which is universal on this platform and
+ * on every shell the operator already uses. What is still too long is elided in
+ * the MIDDLE -- Finder's title bars and `NSPathControl` do exactly this --
+ * because the head says roughly where you are and the tail is the file you are
+ * identifying, while the segments between them are the least informative part.
+ *
+ * Truncating the end instead would drop the filename, which is the one piece
+ * nobody can reconstruct from the rest.
+ */
+export function shortPath(path: string, home?: string | null, max = 56): string {
+  if (!path) return path;
+  const sep = path.includes("\\") && !path.includes("/") ? "\\" : "/";
+
+  let out = path;
+  if (home && (path === home || path.startsWith(home + sep))) {
+    out = "~" + path.slice(home.length);
+  }
+  if (out.length <= max) return out;
+
+  const parts = out.split(sep).filter(Boolean);
+  const head = out.startsWith("~") ? "~" : out.startsWith(sep) ? "" : parts[0];
+  const body = out.startsWith("~") ? parts.slice(1) : out.startsWith(sep) ? parts : parts.slice(1);
+
+  // Keep as much of the TAIL as fits, head still attached. Greedy from the end
+  // rather than a fixed number of segments: the point is to spend the space
+  // available, and a rule that always keeps exactly one parent throws away room
+  // on a short path and still overflows on a long one.
+  for (let k = body.length - 1; k >= 1; k--) {
+    const candidate = `${head}${sep}…${sep}${body.slice(body.length - k).join(sep)}`;
+    if (candidate.length <= max) return candidate;
+  }
+  // No room for the head as well; keep the tail, which is the half that
+  // identifies the file.
+  for (let k = body.length - 1; k >= 1; k--) {
+    const candidate = `…${sep}${body.slice(body.length - k).join(sep)}`;
+    if (candidate.length <= max) return candidate;
+  }
+  return `…${sep}${body[body.length - 1]}`;
+}

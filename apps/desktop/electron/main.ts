@@ -280,6 +280,7 @@ function registerIpc(): void {
       helmAvailable: await which("helm"),
       platform: process.platform,
       defaultCwd: cli.defaultCwd(),
+      homeDir: app.getPath("home"),
       appVersion: app.getVersion(),
       electronVersion: process.versions.electron,
       chromeVersion: process.versions.chrome,
