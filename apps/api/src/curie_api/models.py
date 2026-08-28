@@ -361,22 +361,31 @@ class ApprovalAuditEntry(Base):
 
 
 class DelegationCallStatus(enum.StrEnum):
-    """Lifecycle of one agent-to-agent delegate call (ADR-0115 prototype)."""
+    """Lifecycle of one agent-to-agent delegate call (ADR-0115)."""
 
     pending = "pending"
     delivered = "delivered"
     dropped = "dropped"
+    # The API refused to mint the call at all -- an unarmed pair, a cycle, or
+    # a chain past `Settings.delegate_max_depth` (ADR-0115 part 6, "one
+    # recorded refusal"). Recorded so a refusal is queryable the same way a
+    # completed call is, rather than existing only in a log line.
+    refused = "refused"
 
 
 class DelegationCall(Base):
-    """PROTOTYPE (ADR-0115, Draft, not accepted -- see docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+    """One row per ``curie-delegate__call_agent`` invocation: the durable record
+    of "agent A asked agent B to do something", carrying everything the round
+    trip needs. ``caller_reply_*`` is the durable twin of the CALLER's
+    ``ReplyHandle`` at call time (mirrors ``Approval.reply_kind``/etc.),
+    snapshotted rather than re-resolved, so the eventual reply lands on the
+    same route even if the caller's binding changes in between.
 
-    One row per ``curie-delegate__call_agent`` invocation: the durable record of
-    "agent A asked agent B to do something", carrying everything the round trip
-    needs. ``caller_reply_*`` is the durable twin of the CALLER's ``ReplyHandle``
-    at call time (mirrors ``Approval.reply_kind``/etc.), snapshotted rather than
-    re-resolved, so the eventual reply lands on the same route even if the
-    caller's binding changes in between.
+    ``immediate_caller``/``accountable_principal``/``chain``/``depth`` mirror
+    ``aci_protocol.DelegationMeta`` verbatim (ADR-0115 part 4/6) -- this is the
+    durable twin of that wire payload, the same relationship
+    ``caller_reply_*`` has to ``ReplyHandle``. See that class's docstring for
+    why ``accountable_principal`` equals ``immediate_caller`` at v1.
     """
 
     __tablename__ = "delegation_calls"
@@ -396,17 +405,37 @@ class DelegationCall(Base):
     request_text: Mapped[str]
     result_text: Mapped[str | None] = mapped_column(default=None)
     status: Mapped[str] = mapped_column(server_default=DelegationCallStatus.pending)
+    # The calling agent's structured identity (ADR-0115 part 4). A string
+    # (`f"agent:{id}"`), not a foreign key: it is a provenance FACT snapshotted
+    # at call time, not a live relationship, and it must still read back after
+    # `caller_agent_id`'s row is gone (`ondelete="CASCADE"` above).
+    immediate_caller: Mapped[str]
+    # v1 identity is payload-level agent identity, not IdP-backed (#1049 open).
+    # Equals `immediate_caller` today because depth is capped at 1 -- see
+    # `Settings.delegate_max_depth`'s docstring for why raising it needs kernel
+    # work this migration does not do.
+    accountable_principal: Mapped[str]
+    # Agent ids already visited by this call's chain, oldest first, NOT
+    # including this call's own target. JSONB rather than a join table: the
+    # chain is written once at call time and never queried independently of
+    # its own row.
+    chain: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    depth: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(default=None)
 
 
 class DelegateGrant(Base):
-    """PROTOTYPE (ADR-0115). The operator-armed allowlist: caller may call target.
+    """The operator-armed allowlist: caller may call target.
 
     Default closed -- a call is refused unless a row here has ``armed=True``
-    (ADR-0115 part 5, "the bundle declares, the operator arms"). The prototype
-    skips the bundle-manifest declaration half and just lets an operator arm a
-    pair by name directly; see the prototype notes doc for why.
+    (ADR-0115 part 5, "the bundle declares, the operator arms"). The bundle
+    HALF of that split is ``PluginManifest.delegatesTo`` (declaration only,
+    validated at deploy by ``plugin_format.validate_bundle``); arming stays a
+    separate, explicit operator action recorded here, matching how this
+    codebase already treats ``Agent.approval_routes`` -- a bundle-declared name
+    an operator's own action binds, not something the bundle's declaration
+    alone can activate.
     """
 
     __tablename__ = "delegate_grants"

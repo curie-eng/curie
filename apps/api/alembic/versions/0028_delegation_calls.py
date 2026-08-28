@@ -1,16 +1,13 @@
-"""delegation_calls, delegate_grants: ADR-0115 prototype (agent-to-agent calls)
-
-PROTOTYPE tables for a demo of Draft ADR-0115 ("agents call each other with no
-third party in the path"). Not an implementation of the accepted ADR -- see
-docs/demo/ADR-0115-PROTOTYPE-NOTES.md for the documented deviations. This
-migration is expected to be dropped, not carried forward, once the demo branch
-is done with.
+"""delegation_calls, delegate_grants: ADR-0115 agent-to-agent delegate calls
 
 ``delegation_calls`` is the durable record of one agent-to-agent call, carrying
 the caller's reply route verbatim (mirrors ``approvals.reply_kind`` etc.) so the
 eventual answer can be routed back without re-resolving a binding that may have
-moved. ``delegate_grants`` is the operator-armed allowlist (default closed):
-a call is refused unless a row here has ``armed=true``.
+moved, plus the call's provenance (``immediate_caller``/``accountable_principal``/
+``chain``/``depth``, mirroring ``aci_protocol.DelegationMeta``). ``delegate_grants``
+is the operator-armed allowlist (default closed): a call is refused unless a row
+here has ``armed=true`` -- the bundle-declared half of that split
+(``PluginManifest.delegatesTo``) is validated at deploy, not persisted here.
 
 Revision ID: 0028
 Revises: 0027
@@ -21,7 +18,7 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 revision: str = "0028"
 down_revision: str | None = "0027"
@@ -55,6 +52,13 @@ def upgrade() -> None:
         sa.Column("request_text", sa.String(), nullable=False),
         sa.Column("result_text", sa.String(), nullable=True),
         sa.Column("status", sa.String(), nullable=False, server_default="pending"),
+        # Mirror ``aci_protocol.DelegationMeta`` (ADR-0115 part 4/6): the
+        # durable twin of the wire payload, same relationship the
+        # ``caller_reply_*`` columns above have to ``ReplyHandle``.
+        sa.Column("immediate_caller", sa.String(), nullable=False),
+        sa.Column("accountable_principal", sa.String(), nullable=False),
+        sa.Column("chain", JSONB(), nullable=False, server_default=sa.text("'[]'::jsonb")),
+        sa.Column("depth", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
         sa.Column("resolved_at", sa.DateTime(), nullable=True),
         schema=SCHEMA,

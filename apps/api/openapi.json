@@ -1239,21 +1239,40 @@
         "type": "object"
       },
       "DelegateCallDetailOut": {
-        "description": "A demo/ops convenience read: one call's full current record. Not part of\nthe ADR's design -- added so the round trip can be inspected without a\ndirect DB connection.",
+        "description": "An ops/audit read: one call's full current record, including its\nprovenance (mirrors ``aci_protocol.DelegationMeta``) -- not part of the\nADR's wire design, added so a call and any refusal are inspectable without\na direct DB connection.",
         "properties": {
+          "accountable_principal": {
+            "title": "Accountable Principal",
+            "type": "string"
+          },
           "caller_agent_id": {
             "format": "uuid",
             "title": "Caller Agent Id",
             "type": "string"
+          },
+          "chain": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Chain",
+            "type": "array"
           },
           "created_at": {
             "format": "date-time",
             "title": "Created At",
             "type": "string"
           },
+          "depth": {
+            "title": "Depth",
+            "type": "integer"
+          },
           "id": {
             "format": "uuid",
             "title": "Id",
+            "type": "string"
+          },
+          "immediate_caller": {
+            "title": "Immediate Caller",
             "type": "string"
           },
           "request_text": {
@@ -1300,6 +1319,10 @@
           "status",
           "request_text",
           "result_text",
+          "immediate_caller",
+          "accountable_principal",
+          "chain",
+          "depth",
           "created_at",
           "resolved_at"
         ],
@@ -3905,7 +3928,7 @@
         ]
       },
       "post": {
-        "description": "Mint a delegate call: caller ``agent_id`` asks ``body.target_agent`` to do\nsomething. Refuses (1) an unarmed pair -- default closed, ADR-0115 part 5 --\nand (2) a caller whose OWN conversation is already a delegate call, the\nprototype's stand-in for the real ADR's depth/cycle bound (part 6).",
+        "description": "Mint a delegate call: caller ``agent_id`` asks ``body.target_agent`` to do\nsomething. Refuses (1) an unarmed pair -- default closed, ADR-0115 part 5\n-- and (2) a call that would revisit an agent already in the chain, or\npush the chain past ``Settings.delegate_max_depth`` (ADR-0115 part 6),\nrecording that second kind of refusal as its own queryable call row.",
         "operationId": "create_call_agents__agent_id__delegate_calls_post",
         "parameters": [
           {
@@ -4043,7 +4066,7 @@
         ]
       },
       "patch": {
-        "description": "Buffer the target's latest streamed reply text. Last-write-wins, no\nhistory -- this prototype only needs the FINAL text at completion time.",
+        "description": "Buffer the target's latest streamed reply text. Last-write-wins, no\nhistory -- only the FINAL text at completion time is delivered.",
         "operationId": "progress_call_agents__agent_id__delegate_calls__call_id__patch",
         "parameters": [
           {
@@ -6342,7 +6365,7 @@
     },
     "/delegate/grants": {
       "post": {
-        "description": "Operator-only: arm (or disarm) ``caller_agent`` to call ``target_agent``.\n\nArming a target for the first time also binds its channel to\n``{kind: \"delegation\", address: <target agent id>}`` via the existing\n``update_agent_binding`` -- no new binding code, since ``AgentChannel``\nalready accepts any unregistered kind (ADR-0096's documented escape\nhatch). This REPLACES whatever channel the target held (an agent holds\nexactly one binding); the prototype's target agent is meant to be\nbackend-only for this reason -- see the prototype notes doc.",
+        "description": "Operator-only: arm (or disarm) ``caller_agent`` to call ``target_agent``.\n\nArming a target for the first time also binds its channel to\n``{kind: \"delegation\", address: <target agent id>}`` via the existing\n``update_agent_binding`` -- no new binding code, since ``AgentChannel``\nalready accepts any unregistered kind (ADR-0096's documented escape\nhatch). This REPLACES whatever channel the target held: an agent holds\nexactly one binding today (issue #1525, not yet built), so a delegate\ntarget gives up its previous channel the moment it is armed. A\ndelegate-callable agent is therefore backend-only for now, a real\nplatform constraint rather than something ADR-0115 chose.\n\nThis endpoint does not cross-check ``caller_agent``'s bundle-declared\n``PluginManifest.delegatesTo`` before arming -- matching this codebase's\nexisting precedent for ``Agent.approval_routes``, where an operator-set\nvalue is likewise not cross-validated against the bundle at write time\n(enforcement, where it exists at all, happens live at use time instead).\nDeclaration and arming are independent today: arming a pair the bundle\nnever declared succeeds. Tightening that is a follow-up, not a gap this\nchange silently papers over.",
         "operationId": "arm_grant_delegate_grants_post",
         "parameters": [
           {

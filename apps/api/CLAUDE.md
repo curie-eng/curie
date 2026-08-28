@@ -32,6 +32,15 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   the other. `POST /channels/token` (the mint) stays platform-key-only, and a
   `chn` token is refused on every other router, `/approvals/{id}/resolve`
   included. Extending it further still takes a new ADR.
+- **The `delegate` router is the THIRD such exception (ADR-0115).**
+  `require_delegate_access` (`routers/delegate.py`) accepts EITHER the platform
+  key OR a path-`agent_id`-bound `delegate` scoped token, minted by the worker
+  the same way `state`/`state.app` are (`sandbox_token.py`, a byte-identical
+  string on both sides is the whole contract) -- so a sandboxed agent can ask
+  another agent to do something without holding a resolve-capable platform-wide
+  key. `POST /delegate/grants` (the operator arm/disarm action) stays
+  platform-key-only, and a `delegate` token is refused on every other router.
+  Extending it further still takes a new ADR.
 - **The GitHub webhook is authenticated differently, on purpose.** `/github/webhook`
   verifies the HMAC signature GitHub sends (`x-hub-signature-256` against
   `settings.github_webhook_secret`), not the API key -- GitHub cannot send an

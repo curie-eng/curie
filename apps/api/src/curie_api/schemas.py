@@ -1530,7 +1530,7 @@ class ConsoleSessionOut(BaseModel):
     expires_at: datetime
 
 
-# --- delegation (ADR-0115 PROTOTYPE, Draft ADR, see docs/demo/ADR-0115-PROTOTYPE-NOTES.md) --
+# --- delegation (ADR-0115: agent-to-agent delegate calls) -------------------
 
 
 class DelegateCallIn(BaseModel):
@@ -1587,9 +1587,10 @@ class DelegateGrantOut(BaseModel):
 
 
 class DelegateCallDetailOut(BaseModel):
-    """A demo/ops convenience read: one call's full current record. Not part of
-    the ADR's design -- added so the round trip can be inspected without a
-    direct DB connection."""
+    """An ops/audit read: one call's full current record, including its
+    provenance (mirrors ``aci_protocol.DelegationMeta``) -- not part of the
+    ADR's wire design, added so a call and any refusal are inspectable without
+    a direct DB connection."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -1599,5 +1600,9 @@ class DelegateCallDetailOut(BaseModel):
     status: str
     request_text: str
     result_text: str | None
+    immediate_caller: str
+    accountable_principal: str
+    chain: list[str]
+    depth: int
     created_at: datetime
     resolved_at: datetime | None

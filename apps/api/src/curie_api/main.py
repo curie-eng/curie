@@ -276,7 +276,7 @@ def create_app() -> FastAPI:
     app.include_router(approvals.router)
     app.include_router(channels.router)
     app.include_router(hooks.router)
-    # PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+    # ADR-0115: agent-to-agent delegate calls.
     app.include_router(delegate.router)
     app.include_router(delegate.grants_router)
     return app

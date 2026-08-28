@@ -333,6 +333,17 @@ class Settings(BaseSettings):
     hook_backlog_window_s: int = 60
     channel_binding_backlog_limit: int = 64
     channel_binding_backlog_window_s: int = 60
+    # ADR-0115 part 6: the configured maximum a delegate-call chain may reach
+    # before the API refuses rather than mints. 1 for v1 -- a target may be
+    # CALLED, but may not itself delegate further -- because tracing an
+    # accountable principal ACROSS a hop needs the calling agent's own sandbox
+    # to see its own inbound turn's attribution, which needs a boot-env field
+    # only the single-owner kernel claim path can wire in
+    # (apps/worker/CLAUDE.md); this is not implemented, so depth stays at 1
+    # until it is. Raising this without that plumbing would silently start
+    # reporting `accountable_principal == immediate_caller` for a call it is
+    # no longer true for.
+    delegate_max_depth: int = 1
 
     def valkey_dsn(self) -> str:
         if self.valkey_url:

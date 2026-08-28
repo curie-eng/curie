@@ -1,29 +1,36 @@
-"""PROTOTYPE: agent-to-agent delegate calls (Draft ADR-0115, issue thread PR #1793).
-
-**This is a demo prototype, not an implementation of ADR-0115.** The ADR is
-Draft; per ADR-0085/ADR-0102 (`docs/adr/AGENTS.md`) a Draft authorizes no
-implementation until a maintainer accepts it. This router exists on a
-throw-away branch to produce a demo gif and deliberately cuts scope the real
-ADR would need -- see `docs/demo/ADR-0115-PROTOTYPE-NOTES.md` for the full
-list of documented deviations. Do not treat this as a template for the real
-implementation without re-reading the ADR's Decision section end to end.
+"""Agent-to-agent delegate calls (ADR-0115).
 
 **What this reuses, on purpose.** The scoped-token pattern is ADR-0033's: a
-new ``delegate`` scope, verified the same way ``routers/state.py`` verifies
-``state``/``state.app`` (a third narrow exception to `apps/api/CLAUDE.md`'s
+``delegate`` scope, verified the same way ``routers/state.py`` verifies
+``state``/``state.app`` -- a third narrow exception to `apps/api/CLAUDE.md`'s
 "every router keeps ``require_api_key``" rule, following the same precedent
-the ``channels`` router already set as the second exception). Turn minting and
+the ``channels`` router already set as the second exception. Turn minting and
 enqueue reuse ``delivery.py``'s claim/XADD helpers, the same machinery
 ``hooks.py``/``channels.py`` use -- this is not a new ingress mechanism, just a
 third caller of an existing one.
 
-**What this deliberately is NOT.** It does not add a message-lane
-``TurnSource`` value (reuses ``WEBHOOK``), does not suspend the caller's
-sandbox (the caller's turn ends normally; the reply arrives later as an
-ordinary new turn on the same conversation), and does not carry a
-bundle-declared allowlist or a call chain/depth on the wire (authorization is
-a flat ``delegate_grants`` table, and depth is capped at 1 by refusing a call
-whose OWN conversation id is already a delegate one).
+**The turn rides ``TurnSource.WEBHOOK``, deliberately, not a new value.**
+``hooks.py``'s own docstring states the reason plainly: "``source=WEBHOOK``...
+is what stops it steering a live conversation" (``source.is_job`` is the only
+thing that predicate drives, per ``aci_protocol.TurnSource``). That is exactly
+the safety property ADR-0115 part 2 needs -- a call must defer to an idle
+target, never interrupt a live one -- and the kernel already gives it for free
+to any job-lane turn via the existing bounded-retry reclaim (``kernel.py``'s
+``ThreadBusyError`` path), no kernel change required. What WEBHOOK does NOT
+give for free elsewhere -- a real caller identity, since ``hooks._mint_turn``
+pins ``author`` to the platform -- is not a problem here, because this router
+mints the turn directly and sets ``author``/``delegation.immediate_caller``
+itself; it never goes through the hook ingress. A dedicated message-lane
+source value (as ADR-0115's text originally sketched, pending ADR-0112) remains
+a legitimate future taxonomy cleanup, not a safety gap this implementation is
+missing.
+
+**Depth is capped at 1.** A target may be CALLED, but may not itself delegate
+further. See ``Settings.delegate_max_depth``'s docstring for why: tracing
+``accountable_principal`` truthfully across a second hop needs the calling
+agent's own sandbox to see its own inbound turn's attribution, which needs a
+boot-env field threaded through the single-owner kernel claim path
+(``apps/worker/CLAUDE.md``) that this change does not touch.
 """
 
 from __future__ import annotations
@@ -35,7 +42,13 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 import redis.asyncio as redis
-from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
+from aci_protocol import (
+    STREAM_PAYLOAD_FIELD,
+    DelegationMeta,
+    QueuedTurn,
+    ReplyHandle,
+    TurnSource,
+)
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -64,13 +77,36 @@ logger = logging.getLogger(__name__)
 # whole contract -- sandbox_token.py itself needs no change for a new scope.
 DELEGATE_SCOPE = "delegate"
 
-# The ReplyHandle.kind this prototype mints for a delegate-target turn. `kind`
-# is an open vocabulary under ADR-0096 (no protocol change needed for a new
-# value), and this is the one apps/worker/reply_sink.py's DelegationReplyAdapter
-# is registered against.
+# The ReplyHandle.kind minted for a delegate-target turn. `kind` is an open
+# vocabulary under ADR-0096 (no protocol change needed for a new value), and
+# this is the one apps/worker/reply_sink.py's DelegationReplyAdapter is
+# registered against.
 DELEGATION_KIND = "delegation"
 
 _CLAIM_PREFIX = "curie:delegate"
+
+# The conversation-id prefix this router mints for a target's own turn
+# (`delegate:<call id>`), also read by runner/delegate.py's
+# `is_delegate_target_boot` off CURIE_HISTORY_REF. Recognizing it here on an
+# INCOMING call's `caller_conversation_id` is how the depth/cycle check finds
+# the parent call to inherit chain/depth/accountable_principal from.
+_DELEGATE_CONVERSATION_PREFIX = "delegate:"
+
+
+def _parent_call_id(caller_conversation_id: str) -> uuid.UUID | None:
+    """The parent call this request's caller is itself the target of, if any.
+
+    ``None`` means an ordinary (non-nested) call: the caller's own conversation
+    was not minted by this router, so there is no chain to inherit.
+    """
+
+    if not caller_conversation_id.startswith(_DELEGATE_CONVERSATION_PREFIX):
+        return None
+    raw = caller_conversation_id.removeprefix(_DELEGATE_CONVERSATION_PREFIX)
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        return None
 
 
 async def _load_agent(session: SessionDep, agent_id: uuid.UUID) -> Agent | None:
@@ -115,9 +151,10 @@ async def create_call(
     session: SessionDep,
 ) -> DelegateCallOut:
     """Mint a delegate call: caller ``agent_id`` asks ``body.target_agent`` to do
-    something. Refuses (1) an unarmed pair -- default closed, ADR-0115 part 5 --
-    and (2) a caller whose OWN conversation is already a delegate call, the
-    prototype's stand-in for the real ADR's depth/cycle bound (part 6)."""
+    something. Refuses (1) an unarmed pair -- default closed, ADR-0115 part 5
+    -- and (2) a call that would revisit an agent already in the chain, or
+    push the chain past ``Settings.delegate_max_depth`` (ADR-0115 part 6),
+    recording that second kind of refusal as its own queryable call row."""
 
     caller = await _load_agent(session, agent_id)
     if caller is None:
@@ -137,28 +174,79 @@ async def create_call(
             "arm this pair first (default closed, ADR-0115 part 5)",
         )
 
-    if body.caller_conversation_id.startswith("delegate:"):
+    immediate_caller = f"agent:{caller.id}"
+    parent_chain: list[str] = []
+    parent_depth = 0
+    # v1 identity is payload-level agent identity (#1049 open): absent a
+    # parent call to inherit from, the caller IS the accountable principal.
+    accountable_principal = immediate_caller
+    parent_call_id = _parent_call_id(body.caller_conversation_id)
+    if parent_call_id is not None:
+        parent = await crud.get_delegation_call(session, parent_call_id)
+        if parent is not None:
+            parent_chain = list(parent.chain)
+            parent_depth = parent.depth
+            accountable_principal = parent.accountable_principal
+
+    chain = [*parent_chain, immediate_caller]
+    depth = parent_depth + 1
+    settings = get_settings()
+
+    if f"agent:{target.id}" in parent_chain or immediate_caller in parent_chain:
+        # A cycle: the target (or the caller itself, re-entering) already
+        # appears earlier in this chain.
+        await crud.create_delegation_call(
+            session,
+            caller=caller,
+            target=target,
+            data=body,
+            immediate_caller=immediate_caller,
+            accountable_principal=accountable_principal,
+            chain=chain,
+            depth=depth,
+            status=DelegationCallStatus.refused,
+        )
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "a delegated turn may not itself delegate further (prototype depth "
-            "cap of 1, standing in for ADR-0115 part 6's chain/depth bound)",
+            f"refused: {target.name} already appears in this call chain "
+            "(ADR-0115 part 6 cycle bound)",
+        )
+    if depth > settings.delegate_max_depth:
+        await crud.create_delegation_call(
+            session,
+            caller=caller,
+            target=target,
+            data=body,
+            immediate_caller=immediate_caller,
+            accountable_principal=accountable_principal,
+            chain=chain,
+            depth=depth,
+            status=DelegationCallStatus.refused,
+        )
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"refused: this call would reach depth {depth}, past the configured "
+            f"maximum of {settings.delegate_max_depth} (ADR-0115 part 6)",
         )
 
-    call = await crud.create_delegation_call(session, caller=caller, target=target, data=body)
+    call = await crud.create_delegation_call(
+        session,
+        caller=caller,
+        target=target,
+        data=body,
+        immediate_caller=immediate_caller,
+        accountable_principal=accountable_principal,
+        chain=chain,
+        depth=depth,
+    )
 
     turn = QueuedTurn(
         event_id=f"delegate-{call.id}",
         conversation_id=f"delegate:{call.id}",
-        # Not a person, and not the platform acting anonymously either: naming
-        # the calling agent here is the one attribution fact this prototype
-        # keeps (the ADR's fuller two-field caller/accountable-principal split
-        # is cut -- see the prototype notes doc).
-        author=f"agent:{caller.id}",
+        author=immediate_caller,
         text=body.message,
-        # Reuses the job lane (a documented deviation -- ADR-0115 wants a
-        # message-lane source, which needs a protocol codegen bump this
-        # prototype skips). The target still runs as an ordinary turn on its
-        # own conversation, credentials, and approval policy.
+        # Job lane on purpose, not a cut corner -- see the module docstring:
+        # `is_job` is what stops this from steering the target's live session.
         source=TurnSource.WEBHOOK,
         reply_handle=ReplyHandle(
             kind=DELEGATION_KIND,
@@ -168,9 +256,14 @@ async def create_call(
             adapter=None,
         ),
         received_at=datetime.now(UTC).isoformat(),
+        delegation=DelegationMeta(
+            immediate_caller=immediate_caller,
+            accountable_principal=accountable_principal,
+            chain=chain,
+            depth=depth,
+        ),
     )
 
-    settings = get_settings()
     key = f"{_CLAIM_PREFIX}:delivery:{call.id}"
     owner = f"pending:{pysecrets.token_hex(16)}"
     client: redis.Redis = request.app.state.valkey
@@ -239,7 +332,7 @@ async def progress_call(
     agent_id: uuid.UUID, call_id: uuid.UUID, body: DelegateProgressIn, session: SessionDep
 ) -> None:
     """Buffer the target's latest streamed reply text. Last-write-wins, no
-    history -- this prototype only needs the FINAL text at completion time."""
+    history -- only the FINAL text at completion time is delivered."""
 
     call = await crud.get_delegation_call(session, call_id)
     if call is None or call.target_agent_id != agent_id:
@@ -271,15 +364,24 @@ async def complete_call(
     if call.status != DelegationCallStatus.pending:
         return {"status": call.status}
 
+    # TurnCompleted.outcome (channel_protocol.reply) is one of "delivered",
+    # "dropped", "escalated", "awaiting-approval" -- NOT "completed".
+    # "awaiting-approval" is NOT terminal: it means the target's turn hit one
+    # of ITS OWN gated tools and suspended exactly as a user-started turn does
+    # (ADR-0115 part 4 -- a delegation never satisfies an approval gate, so the
+    # target's own policy runs unchanged). That turn resumes normally once a
+    # human decides, through the ordinary approval-resume path
+    # (`resumequeue.py`), and fires ANOTHER completion event when it truly
+    # finishes. Resolving the call here would drop that eventual answer on the
+    # floor, so this call is left `pending` and untouched.
+    if body.outcome == "awaiting-approval":
+        return {"status": call.status}
+
     target = await crud.get_agent(session, agent_id)
     target_name = target.name if target is not None else str(agent_id)
 
-    # TurnCompleted.outcome (channel_protocol.reply) is one of "delivered",
-    # "dropped", "escalated", "awaiting-approval" -- NOT "completed". Only
-    # "delivered" is treated as a real answer; "awaiting-approval" means the
-    # target itself suspended on an approval gate, which this prototype does
-    # not carry through (a documented cut -- see the prototype notes doc: the
-    # demo's target agent is expected to have no approval gates of its own).
+    # Only "delivered" is a real answer; "dropped" and "escalated" are
+    # terminal failures with nothing more coming.
     delivered = body.outcome == "delivered"
     call = await crud.resolve_delegation_call(
         session,
@@ -346,9 +448,20 @@ async def arm_grant(body: DelegateGrantIn, session: SessionDep) -> DelegateGrant
     ``{kind: "delegation", address: <target agent id>}`` via the existing
     ``update_agent_binding`` -- no new binding code, since ``AgentChannel``
     already accepts any unregistered kind (ADR-0096's documented escape
-    hatch). This REPLACES whatever channel the target held (an agent holds
-    exactly one binding); the prototype's target agent is meant to be
-    backend-only for this reason -- see the prototype notes doc.
+    hatch). This REPLACES whatever channel the target held: an agent holds
+    exactly one binding today (issue #1525, not yet built), so a delegate
+    target gives up its previous channel the moment it is armed. A
+    delegate-callable agent is therefore backend-only for now, a real
+    platform constraint rather than something ADR-0115 chose.
+
+    This endpoint does not cross-check ``caller_agent``'s bundle-declared
+    ``PluginManifest.delegatesTo`` before arming -- matching this codebase's
+    existing precedent for ``Agent.approval_routes``, where an operator-set
+    value is likewise not cross-validated against the bundle at write time
+    (enforcement, where it exists at all, happens live at use time instead).
+    Declaration and arming are independent today: arming a pair the bundle
+    never declared succeeds. Tightening that is a follow-up, not a gap this
+    change silently papers over.
     """
 
     caller = await crud.get_agent_by_name(session, body.caller_agent)

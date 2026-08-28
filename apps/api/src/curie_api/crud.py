@@ -20,6 +20,7 @@ from .models import (
     ConsoleSession,
     DelegateGrant,
     DelegationCall,
+    DelegationCallStatus,
     Deployment,
     Environment,
 )
@@ -476,7 +477,7 @@ async def get_approval_by_dedupe_key(session: AsyncSession, dedupe_key: str) -> 
     return result
 
 
-# -- delegation (ADR-0115 PROTOTYPE, see docs/demo/ADR-0115-PROTOTYPE-NOTES.md) --
+# -- delegation (ADR-0115: agent-to-agent delegate calls) --------------------
 
 
 async def create_delegation_call(
@@ -485,12 +486,22 @@ async def create_delegation_call(
     caller: Agent,
     target: Agent,
     data: DelegateCallIn,
+    immediate_caller: str,
+    accountable_principal: str,
+    chain: list[str],
+    depth: int,
+    status: str = DelegationCallStatus.pending,
 ) -> DelegationCall:
-    """Snapshot the caller's reply route and insert a pending call.
+    """Snapshot the caller's reply route and insert a call record.
 
     ``caller.channel`` fields are copied verbatim, the same reconstruction
     ``hooks._mint_turn`` performs for every hook-originated turn -- the
     durable-twin-of-ReplyHandle pattern ``Approval`` already uses.
+
+    ``status`` defaults to ``pending`` (a call the router is about to enqueue)
+    but a caller may pass ``refused`` directly: a cycle/depth refusal (ADR-0115
+    part 6) still gets a durable, queryable record -- "one recorded refusal" --
+    without ever being enqueued.
     """
 
     call = DelegationCall(
@@ -502,6 +513,11 @@ async def create_delegation_call(
         caller_reply_adapter=caller.channel.adapter,
         target_agent_id=target.id,
         request_text=data.message,
+        immediate_caller=immediate_caller,
+        accountable_principal=accountable_principal,
+        chain=chain,
+        depth=depth,
+        status=status,
     )
     session.add(call)
     await session.commit()
