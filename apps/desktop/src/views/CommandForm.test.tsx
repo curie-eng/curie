@@ -299,3 +299,33 @@ describe("the form is an abstraction over the CLI, not a rendering of it", () =>
     expect(screen.queryByText(/^default$/)).not.toBeInTheDocument();
   });
 });
+
+describe("controls stay where they are", () => {
+  it("does not move a toggle out of the disclosure when it is switched on", async () => {
+    // Which flags sit above "All options" used to be recomputed from the live
+    // values, so using a control promoted it: switching `Minimal` on made it
+    // "primary", it jumped out of the disclosure and up the form -- out from
+    // under the cursor that had just pressed it -- and everything below moved
+    // with it.
+    mount("local.up");
+    await waitFor(() => expect(screen.getByTestId("command-preview")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: /All options/ }));
+
+    const order = () =>
+      [...document.querySelectorAll("input, label")]
+        .map((e) => e.textContent?.trim())
+        .filter((t): t is string => !!t);
+
+    const before = order();
+    const minimal = screen
+      .getAllByRole("switch")
+      .find((sw) => sw.parentElement?.textContent?.includes("Minimal"));
+    expect(minimal, "the Minimal switch should be under the disclosure").toBeTruthy();
+    await userEvent.click(minimal!);
+
+    // The flag is now set -- the preview proves the click landed...
+    expect(screen.getByTestId("command-preview")).toHaveTextContent("--minimal");
+    // ...and nothing reordered.
+    expect(order()).toEqual(before);
+  });
+});

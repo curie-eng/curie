@@ -197,8 +197,23 @@ export function CommandForm({
     [cmd],
   );
 
-  const primary = bodyFlags.filter((f) => isPrimary(f, flags));
-  const secondary = bodyFlags.filter((f) => !isPrimary(f, flags));
+  // Decided ONCE, from the values the form opened with, and then fixed for its
+  // lifetime. It used to be recomputed from the live values on every render,
+  // which meant using a control moved it: switching `Minimal` on made it
+  // "primary", so it jumped out of the disclosure and up the form, out from
+  // under the cursor that had just pressed it -- and everything below it moved
+  // too. A control must not relocate because you used it.
+  //
+  // Seeding from the INITIAL values is still right, and is the whole point:
+  // a flag a contextual control prefilled, or one the operator typed last time,
+  // is something they have already chosen and belongs in view when the sheet
+  // opens. The form is keyed on `cmd.id` and never reseeds, so a lazy
+  // `useState` initialiser is exactly the lifetime wanted.
+  const [primaryLongs] = useState(
+    () => new Set(bodyFlags.filter((f) => isPrimary(f, flags)).map((f) => f.long!)),
+  );
+  const primary = bodyFlags.filter((f) => primaryLongs.has(f.long!));
+  const secondary = bodyFlags.filter((f) => !primaryLongs.has(f.long!));
 
   const missing = cmd.positionals
     .map((spec, i) => (spec.required && !positionals[i]?.trim() ? spec.id : null))
