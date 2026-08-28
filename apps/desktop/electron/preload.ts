@@ -64,6 +64,7 @@ const bridge: CurieBridge = {
     open: () => ipcRenderer.invoke(CH.wsOpen),
     add: (path: string) => ipcRenderer.invoke(CH.wsAdd, path),
     forget: (path: string) => ipcRenderer.invoke(CH.wsForget, path),
+    delete: (path: string) => ipcRenderer.invoke(CH.wsDelete, path),
     files: (root: string) => ipcRenderer.invoke(CH.wsFiles, root),
     readFile: (root: string, rel: string) => ipcRenderer.invoke(CH.wsRead, root, rel),
     writeFile: (root: string, rel: string, body: string) =>

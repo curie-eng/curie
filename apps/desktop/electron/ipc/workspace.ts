@@ -7,7 +7,15 @@
 // most tedious part of driving the CLI by hand.
 
 import { dialog, shell, type BrowserWindow } from "electron";
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  mkdirSync,
+} from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
 import type { Workspace } from "../shared/contract.js";
@@ -100,6 +108,57 @@ export async function pick(
         : ["openDirectory", "createDirectory"],
   });
   return res.canceled ? null : (res.filePaths[0] ?? null);
+}
+
+/**
+ * Delete a bundle directory from disk, permanently.
+ *
+ * There is no trash and that is deliberate -- an app that "deletes" into a
+ * holding pen has to grow a way to see and empty the pen, and until it does the
+ * operator has no idea whether the thing is gone. What it has instead is a set
+ * of refusals, checked HERE rather than in the renderer, because the renderer is
+ * untrusted and the argument is a path.
+ *
+ * Each refusal is a specific accident:
+ *   - not tracked: the only paths this may touch are ones the app is already
+ *     showing. A path arriving from anywhere else is not a bundle the operator
+ *     picked from a list.
+ *   - not a bundle: a list entry can outlive the directory it named, and the
+ *     name can be reused by something else entirely. `.claude-plugin/plugin.json`
+ *     is what makes a directory a bundle everywhere else in this app; it is what
+ *     makes one deletable here.
+ *   - a repository: `examples/squawk` sits INSIDE a checkout and deleting it is
+ *     ordinary, but a directory that is itself a repo root is somebody's whole
+ *     project. Nothing in this app is worth that risk.
+ */
+export function remove(path: string): { ok: true } | { ok: false; error: string } {
+  const abs = resolve(path);
+
+  if (!prefs().workspaces.some((w) => w.path === abs)) {
+    return { ok: false, error: "That bundle is not in this app's list." };
+  }
+  if (!existsSync(abs) || !statSync(abs).isDirectory()) {
+    // Already gone: drop the row rather than reporting a failure the operator
+    // can do nothing about and would have to clear by hand anyway.
+    forget(abs);
+    return { ok: true };
+  }
+  if (!existsSync(join(abs, ".claude-plugin", "plugin.json"))) {
+    return {
+      ok: false,
+      error: "That directory has no .claude-plugin/plugin.json, so it is not a bundle.",
+    };
+  }
+  if (existsSync(join(abs, ".git"))) {
+    return {
+      ok: false,
+      error: "That directory is a git repository. Delete it with your own tools, not from here.",
+    };
+  }
+
+  rmSync(abs, { recursive: true, force: true });
+  forget(abs);
+  return { ok: true };
 }
 
 export function forget(path: string): void {

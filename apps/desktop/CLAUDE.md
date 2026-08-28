@@ -661,6 +661,40 @@ React + TypeScript renderer. Full structure and rationale in
   "Scaffold a bundle, or find the ones already on this machine" over two buttons,
   neither of which scaffolds.
 
+- **A bundle can be deleted, and the guards are in the SHELL.** The Build
+  column had no way to remove a row at all -- `forgetWorkspace` existed on the
+  bridge and was called from nowhere -- so a test agent stayed in the list
+  forever. `workspace.remove` deletes the directory and forgets it, behind the
+  same type-the-name gate every destructive command uses. That gate is doing
+  more work here than usual: a command can be re-run, and a directory cannot be
+  un-deleted.
+
+  No trash, deliberately. An app that deletes into a holding pen has to grow a
+  way to see and empty that pen, and until it does the operator cannot tell
+  whether the thing is gone.
+
+  The refusals are checked in the main process because the argument is a path
+  and the renderer is untrusted, and each one is a specific accident: a path the
+  app is not already tracking (it did not come from an operator picking a row),
+  a directory with no `.claude-plugin/plugin.json` (a list entry outlives the
+  directory it named, and names get reused), and a directory that is itself a
+  git repository (a bundle inside a checkout is ordinary; a repo root is
+  somebody's whole project). A row whose directory is already gone is forgotten
+  rather than reported as a failure the operator can do nothing about.
+
+  Deployed agents were already covered -- `local delete` / `cluster delete` sit
+  on the `agent.control` surface and `riskOf`'s leaf heuristic classifies them
+  destructive.
+
+- **A `Sheet` focuses its panel only if nothing inside it has focus.** It
+  focuses itself so a sheet opened by mouse still has the keyboard for Escape,
+  but an `autoFocus`ed field commits before that effect runs, so the
+  unconditional call stole focus back out of the field the sheet exists to have
+  you fill in. The panel also sets `outline: none`: `tabIndex={-1}` makes it a
+  target for programmatic focus, not a control somebody tabbed to, and the
+  global `:focus-visible` rule was drawing a 2px accent ring around the whole
+  sheet.
+
 - **The agent is a surface, not a prefix.** Twenty-six commands are agent-scoped:
   thirteen verbs at the local and the cluster tier. They live in one sheet
   (`src/views/AgentSheet.tsx`), opened from the agent's own row, with the tier
