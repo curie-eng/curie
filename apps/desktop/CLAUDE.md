@@ -1056,13 +1056,35 @@ agent list (the toggle in the detail column's header). What holds them together:
   way back is not collapsed, it is lost. The same reason puts the rail's toggle
   in the toolbar.
 
-- **The two toggles must not look alike.** Both are on screen at once, and one
-  glyph in two places is a promise that it does the same thing in both -- which
-  it does not. `PanelToggle` takes a `variant`, and each draws the panel it
-  actually controls: `sidebar` is the platform's rail mark, a window frame with
-  its left column shaded, because the rail *narrows* and the frame stays put;
-  `list` is three bars with a chevron, because that panel *leaves*, so a
-  direction is honest there in a way it would not be for the rail.
+- **The toggles must not look alike.** Several are on screen at once, and one
+  glyph in two places is a promise that it does the same thing in both. So
+  `PanelToggle` takes a `variant` and each draws the panel it actually controls:
+  `sidebar` is the platform's rail mark, a window frame with its left column
+  shaded, because the rail *narrows* and the frame stays put; `bottom` is the
+  same frame with its bottom strip shaded, for the console; `list` is three bars
+  with a chevron, because that panel *leaves*, so a direction is honest there in
+  a way it would not be for the other two. The frame is what distinguishes them,
+  not three unrelated pictures.
+
+- **Hiding the console is not dismissing it, so it is not an ✕.** It comes
+  straight back from the toolbar, from Cmd+L, and on its own the moment anything
+  runs. It is the `bottom` variant of the same toggle. It also *reveals on
+  hover*: a permanent button offering to dismiss the panel you are reading, in
+  the corner of every screenful of output, is an invitation nobody asked for.
+  `data-reveal` on the control and `data-reveals` on its container (see
+  `styles.css`); opacity rather than `display: none`, so it stays in the tab
+  order and `:focus-within` brings it back for anyone driving by keyboard. A
+  `data-*` prop on a *component* is not an attribute -- it is a prop the
+  component never reads -- so the marker goes on a real element.
+
+- **A panel is as wide as its widest label, not a round number.** The rail was
+  218px for a list of seven short words and the agent column 196px; they are 186
+  and 168. The narrower column then wrapped the agent row's meta line, so the
+  `live` pill moved up to the name line and became `DeployedDot`'s actual dot:
+  in a 168px row a word costs about thirty-four pixels and takes them from the
+  agent's NAME, which is the one thing a switcher row exists to show. Presence
+  is the whole encoding for a mark like that -- it is there or it is not -- and
+  it survives being six pixels across in a way a word does not.
 
 - **Collapsed, an icon's accessible name is its only name.** A rail of
   unlabelled glyphs is unusable without sight, so `NavItem` carries an

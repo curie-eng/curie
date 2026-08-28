@@ -441,21 +441,29 @@ select {
   }
 }
 
-/* A row's delete control: present in the DOM, invisible until the row is
-   hovered or something inside it has focus.
+/* A control that should not stand in its container permanently: present in the
+   DOM, invisible until the container is hovered or something inside it has
+   focus. Mark the control `data-reveal` and the container `data-reveals` -- a
+   `[data-row]` is already one.
 
    Not `display: none` until hover -- that would take it out of the tab order,
    which puts it out of reach entirely for anyone driving by keyboard. Opacity
-   keeps it focusable, and `:focus-within` on the row is what makes tabbing to
-   it reveal it. A delete control standing beside every row permanently is a
-   mis-click waiting to happen on a list you point at to SWITCH agents far more
-   often than to remove one. */
-.row-delete {
+   keeps it focusable, and `:focus-within` on the container is what makes tabbing
+   to it reveal it.
+
+   Two controls use this, for the same reason in two shapes. A delete control
+   standing beside every row is a mis-click waiting to happen on a list you point
+   at to SWITCH agents far more often than to remove one. And the console's hide
+   button is a permanent invitation to dismiss the panel you are reading, sitting
+   in the corner of every screenful of output. */
+[data-reveal] {
   opacity: 0;
   transition: opacity 120ms ease;
 }
-[data-row]:hover .row-delete,
-[data-row]:focus-within .row-delete {
+[data-row]:hover [data-reveal],
+[data-row]:focus-within [data-reveal],
+[data-reveals]:hover [data-reveal],
+[data-reveals]:focus-within [data-reveal] {
   opacity: 1;
 }
 .row-delete:hover {

@@ -206,7 +206,10 @@ export const R = {
 /** Chrome metrics. */
 export const M = {
   titlebar: 52,
-  sidebar: 218,
+  // Sized to its widest label plus its icon, not to a round number. 218 was
+  // most of a Finder window's sidebar for a rail of seven short words, and the
+  // pane beside it is where the work is.
+  sidebar: 186,
   /** The rail, collapsed to icons.
    *
    *  Not narrower, and the number is not arbitrary: on macOS the OS draws the

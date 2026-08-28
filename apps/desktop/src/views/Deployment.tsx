@@ -13,7 +13,7 @@
 import { useApp } from "../bridge/app";
 import { deployedAs } from "../lib/deployment";
 import { RunButton } from "./Actions";
-import { ACCENT, F, LINE, R, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, R, STATUS, T } from "../tokens";
 import { Button, Group, LiveRing, SectionHeader } from "../primitives";
 
 export function Deployment({ bundleName }: { readonly bundleName: string }) {
@@ -102,7 +102,16 @@ export function Deployment({ bundleName }: { readonly bundleName: string }) {
 
 /** The same fact, small enough for an agent's row in the list. Absent when
  *  nothing is running, because a badge on every row saying "no" is noise on a
- *  list where most rows will say it. */
+ *  list where most rows will say it.
+ *
+ *  A dot, not the word. It was a `live` pill, which cost about thirty-four
+ *  pixels of a column a hundred and sixty-eight wide and took them from the
+ *  agent's NAME -- the one thing a row in a switcher exists to show. Presence is
+ *  the whole encoding here: there is a mark or there is not, which is a
+ *  distinction that survives being four pixels across in a way a word does not,
+ *  and the hue is confirmation rather than the signal. The title says it in
+ *  words for anyone who points at it, and the pane beside this list spells the
+ *  same fact out in full. */
 export function DeployedDot({ bundleName }: { readonly bundleName: string }) {
   const app = useApp();
   if (!app.api?.reachable || !deployedAs(app.agents, bundleName)) return null;
@@ -111,16 +120,11 @@ export function DeployedDot({ bundleName }: { readonly bundleName: string }) {
       title={`${bundleName} is running on the platform`}
       style={{
         flex: "none",
-        ...F.footnote,
-        color: ACCENT,
-        background: tint(ACCENT, 0.14),
+        width: 6,
+        height: 6,
         borderRadius: R.pill,
-        padding: "1px 7px",
-        border: `1px solid ${LINE.separator}`,
-        backgroundClip: "padding-box",
+        background: ACCENT,
       }}
-    >
-      live
-    </span>
+    />
   );
 }

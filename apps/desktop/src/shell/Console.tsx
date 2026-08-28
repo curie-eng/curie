@@ -35,7 +35,7 @@ import { complete, parseCommand } from "../lib/parseCommand";
 import { cwdFor } from "../lib/manifest";
 import { duration } from "../lib/format";
 import { ACCENT, F, FONT, LINE, R, STATUS, T, tint } from "../tokens";
-import { Button, CopyButton, Dot, Group, Kbd, Mono, ResizeHandle } from "../primitives";
+import { Button, CopyButton, Dot, Group, Kbd, Mono, PanelToggle, ResizeHandle } from "../primitives";
 import { forget as forgetUi, readNumber, write as rememberUi } from "../lib/uiState";
 
 /**
@@ -413,6 +413,7 @@ function Header({
     // controls are siblings now, so each is one thing you can click or tab to.
     <div
       className="no-drag"
+      data-reveals=""
       style={{
         display: "flex",
         alignItems: "center",
@@ -481,7 +482,7 @@ function Header({
 
       </button>
 
-      <span style={{ display: "flex", gap: 6 }}>
+      <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
         {running ? (
           <Button size="sm" tone="danger" onClick={() => runs.cancel(run!.id)}>
             Cancel
@@ -493,14 +494,30 @@ function Header({
             History
           </Button>
         ) : null}
-        <Button
-          size="sm"
-          tone="plain"
-          title="Hide the console — the ›_ button in the toolbar brings it back, and so does ⌘L or running anything"
-          onClick={() => runs.setConsoleHidden(true)}
-        >
-          ✕
-        </Button>
+        {/* Not an ✕, and not standing there permanently.
+
+            ✕ is the mark for dismissing a thing, and this dismisses nothing --
+            the console comes straight back from the toolbar, from Cmd+L, or on
+            its own the moment anything runs. Putting a panel away is what the
+            rail's and the agent list's controls do, so it draws the same window
+            frame with the strip it controls shaded: the bottom one.
+
+            And it reveals on hover (`data-reveal`, with `data-reveals` on the
+            header). A permanent button offering to dismiss the panel you are
+            reading, in the corner of every screenful of output, is an
+            invitation nobody asked for. Opacity rather than `display: none`, so
+            it stays in the tab order. The attribute goes on a wrapper because a
+            `data-*` prop on a component is not an attribute -- it is a prop the
+            component never reads, and it would have gone nowhere. */}
+        <span data-reveal style={{ display: "flex" }}>
+          <PanelToggle
+            collapsed={false}
+            onToggle={() => runs.setConsoleHidden(true)}
+            label="the console"
+            variant="bottom"
+            title="Hide the console — the ›_ button in the toolbar brings it back, and so does ⌘L or running anything"
+          />
+        </span>
       </span>
 
       <button
