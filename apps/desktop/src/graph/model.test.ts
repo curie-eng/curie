@@ -329,3 +329,49 @@ describe("the deploy edge", () => {
     expect(edges.map((e) => e.to)).toEqual(["agent:a1"]);
   });
 });
+
+describe("what the inspector can tell you about a piece of infrastructure", () => {
+  const node = (role: string, over: Partial<ResourceSample> = {}) =>
+    buildGraph(
+      { ...NO_SOURCES, samples: [container({ name: `curie-${role}-1`, role, ...over })] } as never,
+      EMPTY_DOC,
+    ).nodes.find((n) => n.id === `infra:${role}`)!;
+
+  it("leads with what the thing does, not with three spellings of its name", () => {
+    // Container / Image / State answered "which container is this", which is a
+    // different and much rarer question than "what is this".
+    const d = node("valkey").detail!;
+    expect(d.About).toMatch(/queue/i);
+    expect(Object.keys(d)[0]).toBe("About");
+  });
+
+  it("carries the live numbers the node badge only hints at", () => {
+    const d = node("api", { cpuPercent: 12.34, memBytes: 268435456, ports: [{ host: 28000, container: 8000, proto: "tcp" }] }).detail!;
+    expect(d.CPU).toBe("12.3%");
+    expect(d.Memory).toMatch(/256|268/);
+    expect(d.Ports).toBe("28000:8000");
+    // An unpublished port is not reachable; claiming it is would be worse than
+    // saying nothing.
+    expect(node("api", { ports: [{ host: null, container: 8000, proto: "tcp" }] }).detail!.Ports).toBeUndefined();
+  });
+
+  it("reports uptime from Docker's ISO start, and nothing at all when it cannot", () => {
+    const at = Date.parse("2026-08-28T12:00:00Z");
+    expect(node("worker", { startedAt: "2026-08-28T10:48:00Z", at }).detail!.Up).toBe("1h 12m");
+    expect(node("worker", { startedAt: "not a date", at }).detail!.Up).toBeUndefined();
+    expect(node("worker", { startedAt: null, at }).detail!.Up).toBeUndefined();
+  });
+
+  it("folds health into state when Docker reports one", () => {
+    expect(node("postgres", { state: "running", health: "healthy" }).detail!.State).toBe("running (healthy)");
+    expect(node("postgres", { state: "running", health: null }).detail!.State).toBe("running");
+  });
+
+  it("describes every role it will draw", () => {
+    // A node with no blurb is the bug this whole change is about, so the set of
+    // roles the canvas draws and the set it can explain must not drift apart.
+    for (const role of ["dispatcher", "valkey", "worker", "api", "postgres", "objectstore", "langfuse", "clickhouse", "otel"]) {
+      expect(node(role).detail!.About, `no blurb for ${role}`).toBeTruthy();
+    }
+  });
+});
