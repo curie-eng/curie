@@ -76,11 +76,12 @@ export const SURFACES: readonly Surface[] = [
   {
     id: "build.author",
     route: "build",
-    title: "Start something",
-    blurb: "Scaffold a bundle, or find the ones already on this machine.",
+    title: "The same thing, as commands",
+    blurb:
+      "New agent above does this for you. These are here for anyone who would rather run it, or wants the line to paste into a terminal.",
     where: "at the foot of the Build view, with or without a bundle open",
     actions: [
-      { id: "init", label: "New agent…", tone: "primary", hint: "Scaffold a Claude Code plugin bundle" },
+      { id: "init", label: "Scaffold an empty one", hint: "Writes the files and nothing else" },
       { id: "try", label: "First reply, no keys", hint: "Scaffold a keyless first reply to prove the loop works" },
       { id: "list-agents", label: "Find local bundles", quiet: true, hint: "List bundles under agents/ in a source checkout" },
     ],

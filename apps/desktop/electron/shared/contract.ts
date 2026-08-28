@@ -362,6 +362,13 @@ export interface CurieBridge {
      *  and any directory that is itself a git repository. A stale list entry
      *  must not be able to erase a checkout. */
     delete(path: string): Promise<{ ok: true } | { ok: false; error: string }>;
+    /** Scaffold a new agent from a template: the CLI writes the base, the
+     *  supplied files are written over it, and the result is opened. */
+    createAgent(opts: {
+      parentDir: string;
+      name: string;
+      files: Record<string, string>;
+    }): Promise<{ ok: true; workspace: Workspace } | { ok: false; error: string }>;
     /** Paths, relative to the bundle root, of the files a human edits. The
      *  walker lives in the shell because it needs the filesystem; what counts as
      *  worth showing is decided in the renderer. */
@@ -420,6 +427,7 @@ export const CH = {
   wsAdd: "curie:ws:add",
   wsForget: "curie:ws:forget",
   wsDelete: "curie:ws:delete",
+  wsCreate: "curie:ws:create",
   wsFiles: "curie:ws:files",
   wsRead: "curie:ws:read",
   wsWrite: "curie:ws:write",

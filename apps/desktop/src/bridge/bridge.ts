@@ -90,6 +90,7 @@ const detached: CurieBridge = {
     add: async () => null,
     forget: async () => {},
     delete: reject("delete a bundle"),
+    createAgent: reject("create an agent"),
     files: async () => [],
     readFile: reject("Reading a bundle file"),
     writeFile: reject("Writing a bundle file"),

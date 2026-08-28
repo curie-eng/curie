@@ -49,6 +49,7 @@ function stubShell(): CurieBridge {
       add: async () => null,
       forget: async () => {},
       delete: async () => ({ ok: true as const }),
+      createAgent: async () => ({ ok: false as const, error: "stub" }),
       files: async () => [],
       readFile: async () => "",
       writeFile: async () => {},
