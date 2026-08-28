@@ -289,6 +289,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
         .api.connection()
         .then((next) => {
           if (!cancelled) setApi(next);
+          // The agent list on the same tick. Refreshing it only after a run
+          // this app started covers your own actions and nothing else: an
+          // agent deployed or deleted from a terminal, or by a colleague
+          // against a shared API, left this window asserting the opposite
+          // indefinitely -- "Running now" for an agent that had been deleted
+          // half an hour ago. Two reads against the same endpoint the
+          // connection probe already talks to.
+          if (!cancelled && next.reachable) void refreshAgents();
         });
     };
     const t = setInterval(tick, 15_000);
@@ -296,7 +304,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       clearInterval(t);
     };
-  }, []);
+  }, [refreshAgents]);
 
   useEffect(() => {
     if (!api?.reachable) return;
