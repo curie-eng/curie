@@ -12,7 +12,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { LOCAL_API_URL } from "./ipc/store";
+import { LOCAL_API_URL } from "./shared/contract";
 
 /** `cli/src/observability.rs`, four levels up from `apps/desktop/electron`. */
 const OBSERVABILITY = join(__dirname, "..", "..", "..", "cli", "src", "observability.rs");

@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 import { useApp } from "../bridge/app";
+import { LOCAL_API_URL } from "../../electron/shared/contract";
 import { THEMES } from "../../electron/shared/themes";
 import { commands } from "../lib/manifest";
 import { surfacesById } from "../lib/surfaces";
@@ -24,6 +25,7 @@ import {
   Notice,
   Row,
   SectionHeader,
+  Segmented,
   Sheet,
 } from "../primitives";
 
@@ -51,18 +53,89 @@ function Panel({
   );
 }
 
+/**
+ * Settings, in tabs.
+ *
+ * Nine panels in one column was a scroll, not a screen: everything was equally
+ * far away and nothing said what belonged with what. Grouping them means the
+ * question you arrived with ("where do I put the API key", "why does it think
+ * curie is missing") lands on a tab rather than on a scrollbar.
+ *
+ * The control is `Segmented` and it sits INSIDE the view, not in the toolbar.
+ * The Commands pane switch lives in the toolbar for two reasons that do not
+ * apply here -- three things deep-link straight to History, and its two panes
+ * want different frame padding -- and neither is worth exporting a route per
+ * settings tab for. Horizontal, because a vertical rail beside a rail is two
+ * navigation systems answering the same question.
+ *
+ * Which tab you were on is a UI position, so it lives in `localStorage` beside
+ * the Build cursor and the agent-sheet tier, not in platform state.
+ */
+const TABS = [
+  { value: "connection", label: "Connection", title: "The platform API, and the secrets it uses" },
+  { value: "appearance", label: "Appearance", title: "Theme" },
+  { value: "machine", label: "Machine", title: "What this app can see on this machine" },
+  { value: "developer", label: "Developer", title: "Contributor scripts and things that print" },
+  { value: "about", label: "About", title: "What this shell is" },
+] as const;
+
+type Tab = (typeof TABS)[number]["value"];
+
+const TAB_KEY = "curie.settings.tab";
+
+function storedTab(): Tab {
+  try {
+    const raw = localStorage.getItem(TAB_KEY);
+    if (TABS.some((t) => t.value === raw)) return raw as Tab;
+  } catch {
+    // A disabled or full localStorage must not cost anyone the Settings screen.
+  }
+  return "connection";
+}
+
 export function Settings() {
+  const [tab, setTab] = useState<Tab>(storedTab);
+
+  const choose = (next: Tab) => {
+    setTab(next);
+    try {
+      localStorage.setItem(TAB_KEY, next);
+    } catch {
+      // Same as above: remembering the tab is a nicety, not a requirement.
+    }
+  };
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 760 }}>
-      <AppearancePanel />
-      <ApiPanel />
-      <CommandSurfacePanel />
-      <SecretsPanel />
-      <EnvironmentPanel />
-      <MaintenancePanel />
-      <ReferencePanel />
-      <DevPanel />
-      <AboutPanel />
+      <div>
+        <Segmented<Tab> options={TABS} value={tab} onChange={choose} />
+      </div>
+
+      {tab === "connection" ? (
+        <>
+          <ApiPanel />
+          <SecretsPanel />
+        </>
+      ) : null}
+
+      {tab === "appearance" ? <AppearancePanel /> : null}
+
+      {tab === "machine" ? (
+        <>
+          <EnvironmentPanel />
+          <CommandSurfacePanel />
+          <MaintenancePanel />
+        </>
+      ) : null}
+
+      {tab === "developer" ? (
+        <>
+          <DevPanel />
+          <ReferencePanel />
+        </>
+      ) : null}
+
+      {tab === "about" ? <AboutPanel /> : null}
     </div>
   );
 }
@@ -254,11 +327,11 @@ function ApiPanel() {
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-        <Field label="Base URL" hint="Local stack default is http://localhost:8000">
+        <Field label="Base URL" hint={`Local stack default is ${LOCAL_API_URL}`}>
           <Input
             value={baseUrl}
             spellCheck={false}
-            placeholder="http://localhost:8000"
+            placeholder={LOCAL_API_URL}
             onChange={(e) => setBaseUrl(e.target.value)}
             style={{ fontFamily: FONT.mono }}
           />
