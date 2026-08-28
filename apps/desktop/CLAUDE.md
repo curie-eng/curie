@@ -172,6 +172,20 @@ React + TypeScript renderer. Full structure and rationale in
   finished thing is finished is noise, so `up` drops it and moves the count into
   the line below.
 
+  **Taking the stack down is on the card that says it is up**, because that is
+  where somebody is standing when they decide they are done with it -- sending
+  them to Tiers to find the same command is the "go and look for it yourself"
+  answer this app exists to remove. Nothing about the placement makes it easier
+  to fire: `local.down` is destructive, so the control opens the same generated
+  form with the same review-and-run gate as everywhere else, in the same red it
+  wears on Tiers.
+
+  **The marker sits in a fixed 16px slot**, matching `Notice`'s glyph. Without
+  it the marker's own width set the text column, so a 9px ring started the stack
+  card's text 7px left of the notice stacked directly under it -- two cards on
+  one screen with two left margins. Centring inside the slot also puts the marker
+  on the first line's optical middle without a hand-tuned `marginTop` per state.
+
 - **A stack coming up is progress, not an error, and the progress is measured.**
   The API being unreachable is a red notice with "Start the stack" on it -- but
   only when nothing is being done about it. While the stack is starting, the
