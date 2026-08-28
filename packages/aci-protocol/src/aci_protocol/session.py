@@ -325,8 +325,7 @@ class BootEnv(_AciModel):
     state_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_STATE_TOKEN", "worker")
     )
-    # PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
-    # Mirrors state_url/state_token exactly: the auto-mounted curie-delegate MCP
+    # ADR-0115. Mirrors state_url/state_token exactly: the auto-mounted curie-delegate MCP
     # server's base URL and its scoped ADR-0033 "delegate" token, never the raw
     # platform key. Absent when the worker mints no delegate token (no api_key
     # configured), same as state_token today.

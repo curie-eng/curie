@@ -51,7 +51,7 @@ from .service_config import (
 )
 from .session import BootEnv, Budget, OtelConfig, SessionConfig
 from .session import Producer as EnvProducer
-from .turn import QueuedTurn, ReplyHandle, TurnSource
+from .turn import DelegationMeta, QueuedTurn, ReplyHandle, TurnSource
 from .version import PROTOCOL_VERSION, is_compatible
 from .wire import ApprovalRequest, EvalJob, EvalReport, GateKind
 
@@ -72,6 +72,7 @@ __all__ = [
     "QueuedTurn",
     "ReplyHandle",
     "TurnSource",
+    "DelegationMeta",
     # eval/approval queue payloads (the API <-> worker seam)
     "EvalJob",
     "EvalReport",

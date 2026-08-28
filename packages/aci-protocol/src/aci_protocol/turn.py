@@ -117,6 +117,40 @@ class ReplyHandle(_AciModel):
     adapter: str | None = None
 
 
+class DelegationMeta(_AciModel):
+    """Provenance of an agent-to-agent delegated turn (ADR-0115).
+
+    ``immediate_caller`` and ``accountable_principal`` are deliberately two
+    fields rather than one, even though v1 sets them equal: a cycle/depth
+    refusal always checks the immediate caller, and a later multi-hop trace
+    back to a human principal must not force a second wire change when it
+    lands. They are equal today because depth is capped at 1 (``chain`` is
+    always empty for a caller minting a fresh call) -- there is no deeper hop
+    to trace a principal *through* yet. Propagating a principal ACROSS a hop
+    would need the calling agent's own sandbox to see its own inbound turn's
+    attribution, which needs a new boot-env field threaded through the
+    single-owner kernel claim path (``apps/worker/CLAUDE.md``); this change
+    does not touch that file, so multi-hop accountable-principal tracing is a
+    documented follow-up, not something silently approximated here.
+
+    v1 identity is payload-level agent identity, not IdP-backed -- ADR-0115's
+    maintainer decision #2, discussion #1049 still open for the IdP-backed
+    story.
+
+    ``chain`` lists the agent ids already visited by this call chain, oldest
+    first, NOT including the target being asked now -- the API refuses a call
+    that would revisit one of them (a cycle) or push ``depth`` past the
+    configured maximum. ``depth`` is ``len(chain)`` at call time, carried
+    explicitly rather than re-derived, so a consumer that only cares about the
+    bound does not have to decode the whole chain to check it.
+    """
+
+    immediate_caller: str
+    accountable_principal: str
+    chain: list[str] = []
+    depth: int = 0
+
+
 class QueuedTurn(_AciModel):
     """A normalized inbound turn ready for the worker to route and run.
 
@@ -132,6 +166,11 @@ class QueuedTurn(_AciModel):
     site sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting
     to the non-job value is also the safe direction -- an unset ``source`` reads
     as a person's message, so a job can never be created by omission.
+
+    ``delegation`` is ``None`` for every turn except one minted by the
+    ADR-0115 delegate router, which is what makes it a PATCH: an older
+    consumer that has never heard of delegation ignores the field and keeps
+    working, exactly as a pre-upgrade producer keeps decoding ``source``.
     """
 
     event_id: str
@@ -141,3 +180,4 @@ class QueuedTurn(_AciModel):
     reply_handle: ReplyHandle
     received_at: str
     source: TurnSource = TurnSource.SLACK
+    delegation: DelegationMeta | None = None

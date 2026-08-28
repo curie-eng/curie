@@ -42,6 +42,7 @@ fn resume_turn(resume_event_id: &str, endpoint: &str) -> QueuedTurn {
         // A resume continues the turn a person started, matching what
         // `resumequeue._build_turn` mints on the Python side.
         source: TurnSource::Slack,
+        delegation: None,
     }
 }
 

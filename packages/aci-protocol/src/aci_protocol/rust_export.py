@@ -36,7 +36,7 @@ from .service_config import (
     WORKER_GROUP_DEFAULT,
 )
 from .session import BootEnv, Budget, OtelConfig, SessionConfig
-from .turn import QueuedTurn, ReplyHandle, TurnSource
+from .turn import DelegationMeta, QueuedTurn, ReplyHandle, TurnSource
 from .version import PROTOCOL_VERSION, WIRE_VERSION_FIELD
 from .wire import ApprovalRequest, EvalJob, EvalReport, GateKind
 
@@ -456,6 +456,7 @@ def render_rust() -> str:
         _struct(BootEnv),
         _env_keys_module(),
         _struct(ReplyHandle),
+        _struct(DelegationMeta),
         _struct(QueuedTurn),
         _struct(EvalJob),
         _struct(EvalReport),
