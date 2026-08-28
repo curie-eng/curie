@@ -529,6 +529,10 @@ mod tests {
             vec![
                 "author",
                 "conversation_id",
+                // ADR-0115: absent (null) for every turn the CLI mints -- the
+                // CLI never delegates -- but still present in the serialized
+                // shape, since the field has no `skip_serializing_if`.
+                "delegation",
                 "event_id",
                 "received_at",
                 "reply_handle",

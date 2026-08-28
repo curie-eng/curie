@@ -90,6 +90,9 @@ async fn xadd_lands_the_exact_seam_shape_on_real_valkey() {
         vec![
             "author",
             "conversation_id",
+            // ADR-0115: absent (null) for a turn the CLI mints -- the CLI
+            // never delegates -- but still present in the serialized shape.
+            "delegation",
             "event_id",
             "received_at",
             "reply_handle",
