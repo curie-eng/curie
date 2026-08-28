@@ -156,10 +156,24 @@ describe("the agent list", () => {
     expect(within(detail()).getByTitle("/w/weather")).toBeInTheDocument();
   });
 
-  it("says so plainly when there are none at all", async () => {
+  it("drops the split entirely on a first run, and offers ONE way to create", async () => {
+    // A master-detail with an empty 196px column beside an empty pane is two
+    // empty things arranged. Worse, the five ways to start were spread across
+    // all three regions -- the column's footer, the detail's empty state and the
+    // scaffolding group under it -- and three of them ran `init`. The count is
+    // the assertion: a first-timer must not have to choose between synonyms.
     listed = [];
     mount();
-    await waitFor(() => expect(within(list()).getByText("None yet.")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("No agents yet")).toBeInTheDocument());
+
+    const creates = screen
+      .getAllByRole("button")
+      .map((b) => b.textContent?.trim() ?? "")
+      .filter((t) => /new agent|scaffold|open a bundle/i.test(t));
+    expect(creates).toEqual(["New agent…"]);
+
+    // And exactly one way to bring in something that already exists.
+    expect(screen.getAllByRole("button", { name: "Import…" })).toHaveLength(1);
   });
 
   it("switches the detail pane when another agent is picked", async () => {

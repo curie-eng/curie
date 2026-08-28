@@ -29,6 +29,15 @@ interface Item {
   readonly icon: ReactNode;
 }
 
+/**
+ * The rail, in the order the work happens: look at what is running, author a
+ * bundle, see how it is wired, watch what it costs.
+ *
+ * Tiers is last on purpose. It is a reference for a concept -- the same verbs
+ * against a bigger deployment -- rather than somewhere you operate, and sitting
+ * third it read as a step in the flow that nobody could place. A row high in the
+ * rail is a claim that you should start there.
+ */
 const ITEMS: readonly Item[] = [
   {
     id: "overview",
@@ -43,11 +52,10 @@ const ITEMS: readonly Item[] = [
     icon: <Icon d="M3.4 12.6h9.2M5.4 10.2V5.6M8 10.2V3.4M10.6 10.2V7.2" />,
   },
   {
-    id: "tiers",
-    label: "Tiers",
-    hint: "Skill, local and cluster",
-    // Three rungs, ascending: the ladder itself.
-    icon: <Icon d="M3 12.6h3.2V9.4H3zM6.4 12.6h3.2V6.2H6.4zM9.8 12.6H13V3.4H9.8z" />,
+    id: "canvas",
+    label: "Canvas",
+    hint: "Agents, pipelines, infra",
+    icon: <Icon d="M3.2 3.6h3.4v3.2H3.2zM9.4 9.2h3.4v3.2H9.4zM6.6 5.2h2.2a2 2 0 0 1 2 2v2" />,
   },
   {
     id: "resources",
@@ -56,10 +64,11 @@ const ITEMS: readonly Item[] = [
     icon: <Icon d="M2.6 12.6V7.4M6.2 12.6V3.4M9.8 12.6V8.8M13.4 12.6V5.6" />,
   },
   {
-    id: "canvas",
-    label: "Canvas",
-    hint: "Agents, pipelines, infra",
-    icon: <Icon d="M3.2 3.6h3.4v3.2H3.2zM9.4 9.2h3.4v3.2H9.4zM6.6 5.2h2.2a2 2 0 0 1 2 2v2" />,
+    id: "tiers",
+    label: "Tiers",
+    hint: "Skill, local and cluster",
+    // Three rungs, ascending: the ladder itself.
+    icon: <Icon d="M3 12.6h3.2V9.4H3zM6.4 12.6h3.2V6.2H6.4zM9.8 12.6H13V3.4H9.8z" />,
   },
 ];
 

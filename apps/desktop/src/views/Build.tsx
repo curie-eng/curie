@@ -19,8 +19,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useApp } from "../bridge/app";
 import { SlackPacks } from "./BuildPacks";
-import { Actions, RunButton } from "./Actions";
-import { surfacesById } from "../lib/surfaces";
+import { ActionButtons, Actions, RunButton } from "./Actions";
+import { resolve, surfacesById } from "../lib/surfaces";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
 import { bridge } from "../bridge/bridge";
@@ -75,6 +75,14 @@ export function Build() {
   // list out there would sit outside the column every other view is measured
   // against. Inside the cap, list-then-detail is also the order these panes are
   // read in.
+  // Nothing authored yet. A master-detail with an empty 196px column beside an
+  // empty pane is two empty things arranged, and the five ways to start were
+  // spread across all three of its regions -- the column's footer, the detail's
+  // empty state, and the scaffolding group under it -- with three of them
+  // running the same command. On a first run there is one question, so there is
+  // one panel and one set of answers.
+  if (!app.workspaces.length && !ws) return <FirstAgent />;
+
   return (
     <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
       <AgentList />
@@ -259,28 +267,61 @@ function AgentList() {
   );
 }
 
+/**
+ * Agents exist, none is selected.
+ *
+ * No buttons. The column to the left already lists every agent and carries the
+ * two ways to get another one, so a pair of "open"/"new" buttons here was a
+ * second copy of a control three inches away -- and the duplicate made the real
+ * one harder to find, not easier. This says what a bundle is and where to pick
+ * one; the list is the control.
+ */
 function NoBundle() {
-  const app = useApp();
   return (
     <Group>
-      <EmptyState
-        title="No bundle open"
-        action={
-          <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
-            <Button tone="primary" onClick={() => void app.openWorkspace()}>
-              Open a bundle
-            </Button>
-            <RunButton id="init" size="md">
-              Scaffold a new one
-            </RunButton>
-          </div>
-        }
-      >
-        A bundle is a directory with <Mono>.claude-plugin/plugin.json</Mono> in it: skills, the MCP
-        servers they call, and the eval cases that make a change falsifiable. Open one to edit it, or
-        scaffold a new one with <Mono>curie init</Mono>.
+      <EmptyState title="Pick an agent">
+        Choose one from the list on the left, or start another with{" "}
+        <Mono>New Agent…</Mono> at the foot of it. A bundle is a directory with{" "}
+        <Mono>.claude-plugin/plugin.json</Mono> in it: skills, the MCP servers they call, and the
+        eval cases that make a change falsifiable.
       </EmptyState>
     </Group>
+  );
+}
+
+/**
+ * The first run: no agents anywhere.
+ *
+ * One panel, and the actions come from `build.author` rather than being written
+ * here, so there is exactly one place that decides what starting an agent means.
+ * Importing is the exception and is a shell action rather than a command -- it
+ * opens a directory chooser, which no CLI verb can do.
+ */
+function FirstAgent() {
+  const app = useApp();
+  const surface = surfacesById.get("build.author")!;
+  const items = resolve(surface);
+  return (
+    <div style={{ maxWidth: 720 }}>
+      <SectionHeader>Agents</SectionHeader>
+      <Group>
+        <EmptyState
+          title="No agents yet"
+          action={
+            <div style={{ display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+              <ActionButtons actions={items} size="md" />
+              <Button size="md" onClick={() => void app.openWorkspace()}>
+                Import…
+              </Button>
+            </div>
+          }
+        >
+          An agent is a directory with <Mono>.claude-plugin/plugin.json</Mono> in it: skills, the MCP
+          servers they call, and the eval cases that make a change falsifiable. Scaffold one here,
+          then run it, grade it, and deploy it onto the platform — all from this tab.
+        </EmptyState>
+      </Group>
+    </div>
   );
 }
 

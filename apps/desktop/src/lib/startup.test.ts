@@ -106,10 +106,11 @@ describe("stackPhase", () => {
     expect(stackPhase(up, { apiReachable: true, runActive: false })).toBe("up");
   });
 
-  it("is idle when there is no stack at all", () => {
-    // Nothing created is not a stack that is down, it is one nobody asked for.
-    expect(stackPhase(none, { apiReachable: false, runActive: false })).toBe("idle");
-    expect(stackPhase(none, { apiReachable: true, runActive: false })).toBe("idle");
+  it("is `absent` when there is no stack at all -- the first-run case", () => {
+    // Nothing created is not a stack that is down, it is one nobody has asked
+    // for yet, and that is the single moment the app has one obvious next move.
+    expect(stackPhase(none, { apiReachable: false, runActive: false })).toBe("absent");
+    expect(stackPhase(none, { apiReachable: true, runActive: false })).toBe("absent");
   });
 
   it("keeps showing the card during a run even when the API already answers", () => {
@@ -123,9 +124,10 @@ describe("stackPhase", () => {
 
   it("is starting with nothing created yet, but only while a run is in flight", () => {
     // Pulling images is the longest phase and emits no output; a blank screen
-    // through it is what makes the whole thing feel broken.
+    // through it is what makes the whole thing feel broken. With no run, the
+    // same nothing is a first run rather than a start in progress.
     expect(stackPhase(none, { apiReachable: false, runActive: true })).toBe("starting");
-    expect(stackPhase(none, { apiReachable: false, runActive: false })).toBe("idle");
+    expect(stackPhase(none, { apiReachable: false, runActive: false })).toBe("absent");
   });
 
   it("is starting when containers exist and some are not ready, with no run of ours", () => {

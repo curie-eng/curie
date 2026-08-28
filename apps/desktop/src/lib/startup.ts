@@ -118,7 +118,7 @@ export function stackProgress(samples: readonly ResourceSample[]): StackProgress
  * "something is wrong and the notice below says what". Those are the two cases
  * where a status card would have nothing true to say.
  */
-export type StackPhase = "idle" | "starting" | "settling" | "up";
+export type StackPhase = "absent" | "idle" | "starting" | "settling" | "up";
 
 /**
  * How long "everything is up, the API just has not answered yet" stays a
@@ -147,10 +147,11 @@ export function stackPhase(
   // depend on the same fact the errors beside it are about. The run ending is
   // what ends the run.
   if (runActive) return "starting";
-  // No containers at all is not a stack that is down, it is a stack that was
-  // never asked for. `LadderStrip` covers that; a status card would be reporting
-  // on nothing.
-  if (progress.total === 0) return "idle";
+  // No containers at all is not a stack that is down, it is a stack nobody has
+  // asked for yet -- a first run. That is the one moment the whole app has a
+  // single obvious next action, so it gets its own phase rather than being
+  // folded into "nothing to report".
+  if (progress.total === 0) return "absent";
   if (progress.ready < progress.total) return "starting";
   if (apiReachable) return "up";
   // Every container is up and only the API has yet to answer. Normal for a few
