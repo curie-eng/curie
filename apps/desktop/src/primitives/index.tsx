@@ -237,15 +237,20 @@ export function Stat({
   sub,
   accent,
   first,
+  title,
 }: {
   label: string;
   value: ReactNode;
   sub?: ReactNode;
   accent?: string;
   first?: boolean;
+  /** Where the number came from, or the caveat on it. The cell shows a figure
+   *  and a short caption; anything longer than a caption belongs here. */
+  title?: string;
 }) {
   return (
     <div
+      title={title}
       style={{
         flex: 1,
         minWidth: 0,

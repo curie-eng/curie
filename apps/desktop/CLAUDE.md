@@ -712,6 +712,22 @@ React + TypeScript renderer. Full structure and rationale in
   integration test asserting the daemon never returns two containers with the
   same name.
 
+- **A cost figure needs to know whether money moved.** Langfuse prices
+  observations from token counts and a price row for the model name, and it does
+  that whether or not a request ever left the machine. A stack pinned to
+  `CURIE_FAKE_MODEL` therefore reports real dollars for runs that cost nothing,
+  and the Overview showed $0.04 of spend that had not happened -- summed
+  faithfully from a source that was itself confidently wrong. `ResourceFrame`
+  carries `fakeModel`, read off the worker container's own environment and
+  cached like `daemonCapacity`; `null` means "no worker to ask" and must never
+  collapse into "real", or a failed lookup makes a priced figure look
+  trustworthy.
+
+  The caption was the other half of it. "$0.04 / from Langfuse" names the SOURCE
+  in the place a reader expects the payee, and somebody read it exactly that way
+  -- as Langfuse having charged them four cents. A caption under a currency
+  figure says what the figure covers; the source belongs in the tooltip.
+
 - **Every percentage needs its denominator.** `docker info` supplies the daemon's
   CPU count and memory total (cached for a minute -- it is a round trip and the
   answer never changes), and the UI shows usage over that ceiling. A bare summed
