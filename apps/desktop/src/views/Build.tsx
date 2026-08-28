@@ -99,8 +99,10 @@ export function Build() {
             group sits outside the workbench and is here either way. With
             nothing open it is the only thing to do; with something open it is
             how you start the next one. */}
-        <div style={{ marginTop: 16 }}>
+        <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 14 }}>
           <Actions surface={surfacesById.get("build.author")!} />
+          {/* Last on the page. See `NotHere`. */}
+          {ws ? <NotHere /> : null}
         </div>
       </div>
     </div>
@@ -650,13 +652,45 @@ function Ladder() {
         </div>
       </Actions>
 
-      {/* Two verbs the ladder has further up and this tier does not. They are
-          here rather than omitted because "why can I not do X here" is a real
-          question, and the CLI answers it -- these commands exist precisely to
-          print that answer. Hiding them would make the app the surface that
-          silently has less than the CLI. */}
-      <Actions surface={surfacesById.get("build.not-here")!} />
     </div>
+  );
+}
+
+/**
+ * The verbs the ladder has further up and this tier does not.
+ *
+ * They stay in the app because "why can I not do X here" is a real question and
+ * these commands exist precisely to print the answer -- hiding them would make
+ * this the surface that silently has less than the CLI. But they are five
+ * controls whose labels all begin "Why no", and sitting between "Ship it" and
+ * the file list they were an explanation of absences interrupting the path from
+ * authoring to deploying. Last on the page, and closed until asked: a question
+ * about something that is not here is not answered by putting it in the way.
+ */
+function NotHere() {
+  const [open, setOpen] = useState(false);
+  return (
+    <section>
+      <SectionHeader
+        right={
+          <Button size="sm" tone="plain" onClick={() => setOpen((v) => !v)}>
+            {open ? "Hide" : "Show"}
+          </Button>
+        }
+      >
+        Not at this tier
+      </SectionHeader>
+      {open ? (
+        <Actions surface={surfacesById.get("build.not-here")!} />
+      ) : (
+        <Group style={{ padding: "10px 12px" }}>
+          <div style={{ ...F.footnote, color: T.tertiary, lineHeight: 1.55 }}>
+            Versions, memory and run history need the platform, and the skill tier does not have
+            one. Each of those commands still exists here and will say so in its own words.
+          </div>
+        </Group>
+      )}
+    </section>
   );
 }
 

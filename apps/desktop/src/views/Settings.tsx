@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 import { useApp } from "../bridge/app";
-import { LOCAL_API_URL } from "../../electron/shared/contract";
+import { isLoopback, LOCAL_API_KEY, LOCAL_API_URL } from "../../electron/shared/contract";
 import { THEMES } from "../../electron/shared/themes";
 import { commands } from "../lib/manifest";
 import { surfacesById } from "../lib/surfaces";
@@ -338,7 +338,13 @@ function ApiPanel() {
         </Field>
         <Field
           label="API key"
-          hint={app.api?.hasKey ? "A key is stored. Leave blank to keep it." : "Sent as X-API-Key."}
+          hint={
+            app.api?.hasKey
+              ? "A key is stored. Leave blank to keep it."
+              : isLoopback(baseUrl)
+                ? `Sent as X-API-Key. Blank uses ${LOCAL_API_KEY}, the key the local dev stack ships with — the same default the CLI uses.`
+                : "Sent as X-API-Key. This host is not local, so a key is required."
+          }
         >
           <Input
             type="password"

@@ -8,7 +8,13 @@
 // surface for it. Second, the API key stays in the main process: the renderer
 // asks whether a key is held, never for the key.
 
-import type { ApiConnection, ApiRequest, ApiResponse } from "../shared/contract.js";
+import {
+  isLoopback,
+  LOCAL_API_KEY,
+  type ApiConnection,
+  type ApiRequest,
+  type ApiResponse,
+} from "../shared/contract.js";
 import { prefs, update } from "./store.js";
 
 function url(base: string, path: string, query?: ApiRequest["query"]): string {
@@ -22,7 +28,13 @@ function url(base: string, path: string, query?: ApiRequest["query"]): string {
 export async function request<T = unknown>(req: ApiRequest): Promise<ApiResponse<T>> {
   const { apiBaseUrl, apiKey } = prefs();
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (apiKey) headers["X-API-Key"] = apiKey;
+  // A stored key always wins. With none set, fall back to the key the local dev
+  // stack ships with -- the same default `curie local deploy` uses, which is why
+  // deploying from a terminal needs no setup. Loopback only: it is a well-known
+  // development credential, fine to assume against this machine and unacceptable
+  // to send anywhere else.
+  const key = apiKey || (isLoopback(apiBaseUrl) ? LOCAL_API_KEY : null);
+  if (key) headers["X-API-Key"] = key;
   if (req.body !== undefined) headers["Content-Type"] = "application/json";
 
   const controller = new AbortController();
