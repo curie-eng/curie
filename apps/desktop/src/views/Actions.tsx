@@ -158,6 +158,11 @@ export interface ActionsProps {
    *  map does not. */
   readonly children?: ReactNode;
   readonly right?: ReactNode;
+  /** Replaces the surface's own blurb. Only for a group rendered with `only`:
+   *  the surface's sentence describes the whole set, so filtering the controls
+   *  without filtering the sentence leaves a group promising a button it is no
+   *  longer showing. */
+  readonly blurb?: ReactNode;
 }
 
 /**
@@ -166,7 +171,7 @@ export interface ActionsProps {
  * `SectionHeader` outside a `Group`, per the app's grouping rule -- a header
  * inside the box is what makes a native list read as a card with a title bar.
  */
-export function Actions({ surface, prefill, only, children, right }: ActionsProps) {
+export function Actions({ surface, prefill, only, children, right, blurb }: ActionsProps) {
   const items = useMemo(
     () => resolve(surface).filter(({ action }) => (only ? only(action) : true)),
     [surface, only],
@@ -179,7 +184,7 @@ export function Actions({ surface, prefill, only, children, right }: ActionsProp
       <SectionHeader right={right}>{surface.title}</SectionHeader>
       <Group style={{ padding: 12 }}>
         <div style={{ ...F.callout, color: T.tertiary, marginBottom: 10, lineHeight: 1.5 }}>
-          {surface.blurb}
+          {blurb ?? surface.blurb}
         </div>
 
         <NeedNotice need={surface.needs} style={{ marginBottom: 10 }} />

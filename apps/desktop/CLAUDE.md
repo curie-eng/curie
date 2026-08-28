@@ -573,6 +573,22 @@ React + TypeScript renderer. Full structure and rationale in
   every blank was expected and the dash was noise, and the row label restated the
   button beside it. They stack inside their own column instead.
 
+- **De-duplicate controls; do not delete the interface they were in.** Build's
+  first run offered five ways to start, spread across the agent column's footer,
+  the detail pane's empty state and the scaffolding group, with three of them
+  running `init`. Cutting that to one was right. Replacing the whole master-detail
+  view with a single first-run panel also cut it to one, and removed Build --
+  which is not a trade anyone asked for, and the person who had been using the
+  other half said so. The layout stays in every state; what changed is that
+  `init` is declared once, rendered by the column from `build.author`, and
+  filtered out of the group at the foot with `only`.
+
+  A group rendered with `only` needs its `blurb` overridden too. The surface's
+  sentence describes the whole set, so filtering the buttons without filtering
+  the sentence leaves a panel promising a control it is no longer showing --
+  "Scaffold a bundle, or find the ones already on this machine" over two buttons,
+  neither of which scaffolds.
+
 - **The agent is a surface, not a prefix.** Twenty-six commands are agent-scoped:
   thirteen verbs at the local and the cluster tier. They live in one sheet
   (`src/views/AgentSheet.tsx`), opened from the agent's own row, with the tier
