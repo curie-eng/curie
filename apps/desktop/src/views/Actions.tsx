@@ -115,12 +115,14 @@ export function ActionButton({
   size = "sm",
   style,
   tone,
+  icon,
 }: {
   readonly action: Action;
   readonly cmd: { id: string; about: string };
   readonly prefill?: Prefill;
   readonly size?: "sm" | "md";
   readonly style?: CSSProperties;
+  readonly icon?: ReactNode;
   /** Overrides the tone the action asks for. The tiers matrix uses it: `quiet`
    *  means "unfilled" in a wrapping row of buttons, where the filled ones around
    *  it still say the row is controls -- but in a grid an unfilled cell beside a
@@ -138,6 +140,7 @@ export function ActionButton({
       title={`curie ${action.id.replace(/\./g, " ")} — ${action.hint ?? cmd.about}`}
       onClick={() => app.runCommand(action.id, prefill)}
       style={style}
+      icon={icon}
     >
       {action.label}
     </Button>

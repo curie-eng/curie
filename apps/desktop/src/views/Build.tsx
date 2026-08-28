@@ -19,7 +19,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useApp } from "../bridge/app";
 import { SlackPacks } from "./BuildPacks";
-import { ActionButtons, Actions, RunButton } from "./Actions";
+import { ActionButton, ActionButtons, Actions, RunButton } from "./Actions";
 import { resolve, surfacesById } from "../lib/surfaces";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
@@ -100,7 +100,13 @@ export function Build() {
             nothing open it is the only thing to do; with something open it is
             how you start the next one. */}
         <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 14 }}>
-          <Actions surface={surfacesById.get("build.author")!} />
+          {/* Everything in `build.author` EXCEPT scaffolding, which the agent
+              column owns and renders from this same surface. Two buttons for
+              one command on one screen is two buttons to choose between. */}
+          <Actions
+            surface={surfacesById.get("build.author")!}
+            only={(a) => a.id !== "init"}
+          />
           {/* Last on the page. See `NotHere`. */}
           {ws ? <NotHere /> : null}
         </div>
@@ -123,6 +129,7 @@ function Glyph({ d }: { d: string }) {
 function AgentList() {
   const app = useApp();
   const active = app.workspace?.path ?? null;
+  const newAgent = resolve(surfacesById.get("build.author")!).find((x) => x.action.id === "init");
 
   return (
     <section style={{ width: 196, flex: "none" }}>
@@ -244,16 +251,20 @@ function AgentList() {
             gap: 6,
           }}
         >
-        <Button
-          size="sm"
-          tone="primary"
-          icon={<Glyph d="M8 3.5v9M3.5 8h9" />}
-          onClick={() => app.runCommand("init")}
-          style={{ width: "100%" }}
-          title="Scaffold a new agent with curie init"
-        >
-          New Agent…
-        </Button>
+        {/* Rendered from the placement map, not written here. This button and
+            the one in the group at the foot of the page are the same command,
+            and while both were hand-written they drifted to "New Agent…" and
+            "New agent…" -- two spellings of one action, which reads as two
+            actions. One declaration, one label. */}
+        {newAgent ? (
+          <ActionButton
+            action={newAgent.action}
+            cmd={newAgent.cmd}
+            tone="primary"
+            icon={<Glyph d="M8 3.5v9M3.5 8h9" />}
+            style={{ width: "100%" }}
+          />
+        ) : null}
         <Button
           size="sm"
           icon={<Glyph d="M8 2.5v6.8M5.4 6.9 8 9.5l2.6-2.6M3 10.8v1.7a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-1.7" />}

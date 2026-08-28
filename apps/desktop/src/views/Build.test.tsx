@@ -13,6 +13,7 @@ import { AppProvider } from "../bridge/app";
 import { ResourcesProvider } from "../bridge/resources";
 import { RunsProvider } from "../bridge/runs";
 import { Build } from "./Build";
+import { surfacesById } from "../lib/surfaces";
 import type { CurieBridge, Workspace } from "../bridge/bridge";
 
 const WEATHER: Workspace = {
@@ -136,7 +137,7 @@ describe("the agent list", () => {
 
   it("offers a way to add one, and to import one that exists", async () => {
     mount();
-    await waitFor(() => expect(screen.getByRole("button", { name: "New Agent…" })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "New agent…" })).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "Import…" })).toBeInTheDocument();
   });
 
@@ -171,6 +172,13 @@ describe("the agent list", () => {
       .map((b) => b.textContent?.trim() ?? "")
       .filter((t) => /new agent|scaffold|open a bundle/i.test(t));
     expect(creates).toEqual(["New agent…"]);
+
+    // And the label is the surface's, not a copy: the column button and the
+    // group at the foot of the page drifted to "New Agent…" and "New agent…"
+    // while both were hand-written, which reads as two different actions.
+    expect(surfacesById.get("build.author")!.actions.find((a) => a.id === "init")!.label).toBe(
+      "New agent…",
+    );
 
     // And exactly one way to bring in something that already exists.
     expect(screen.getAllByRole("button", { name: "Import…" })).toHaveLength(1);
@@ -218,11 +226,11 @@ describe("the list is a bounded container", () => {
   it("keeps the actions reachable however long the list is", async () => {
     listed = many;
     mount();
-    await waitFor(() => expect(screen.getByRole("button", { name: "New Agent…" })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "New agent…" })).toBeInTheDocument());
     // Pinned in the footer, not pushed past the twenty-fourth row: they must be
     // outside the scrolling region but inside the container.
     const scroller = within(list()).getByText("agent-0").closest("div[style*='max-height']")!;
-    const newAgent = screen.getByRole("button", { name: "New Agent…" });
+    const newAgent = screen.getByRole("button", { name: "New agent…" });
     expect(scroller.contains(newAgent)).toBe(false);
     expect(list().contains(newAgent)).toBe(true);
   });
