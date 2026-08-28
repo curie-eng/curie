@@ -6,6 +6,10 @@ import { describe, expect, it } from "vitest";
 
 import type { Workspace } from "../../electron/shared/contract";
 import {
+  skillBody,
+  withSkillBody,
+  withPluginField,
+
   classifyFile,
   organise,
   parseEvalSuite,
@@ -372,5 +376,72 @@ describe("an eval case's input may be empty", () => {
     const parsed = parseEvalSuite(missing);
     expect(parsed.ok).toBe(false);
     if (!parsed.ok) expect(parsed.error).toMatch(/input/);
+  });
+});
+
+describe("editing a bundle through fields instead of a text editor", () => {
+  const SKILL = `---
+name: shift-notes
+description: Keeps a list.
+allowed-tools:
+  - mcp__curie-state__get
+---
+
+# shift-notes
+
+Say something to save it.
+`;
+
+  it("separates the prose from the frontmatter", () => {
+    expect(skillBody(SKILL)).toBe("# shift-notes\n\nSay something to save it.\n");
+  });
+
+  it("rewrites the prose and leaves the frontmatter exactly as it was", () => {
+    // The frontmatter carries `allowed-tools`, which decides what the agent may
+    // call. A body edit that reformatted or dropped it would change what the
+    // agent can DO, from a field that says it edits what the agent should do.
+    const out = withSkillBody(SKILL, "# shift-notes\n\nNew instructions.");
+    expect(out).toContain("allowed-tools:\n  - mcp__curie-state__get");
+    expect(out).toContain("New instructions.");
+    expect(out).not.toContain("Say something to save it.");
+    expect(parseSkill(out).allowedTools).toEqual(["mcp__curie-state__get"]);
+  });
+
+  it("does not invent a frontmatter block for a file that has none", () => {
+    // Writing one would put a `name` in the file the author never chose, and the
+    // readiness check already reports the absence.
+    const out = withSkillBody("just prose", "still prose");
+    expect(out).toBe("still prose\n");
+  });
+
+  it("sets a plugin.json field", () => {
+    const out = withPluginField('{"name":"x","version":"0.1.0"}', "description", " A thing ");
+    expect(out.ok).toBe(true);
+    if (out.ok) expect(JSON.parse(out.value)).toEqual({
+      name: "x",
+      version: "0.1.0",
+      description: "A thing",
+    });
+  });
+
+  it("REMOVES a field rather than writing it empty", () => {
+    // These fields are absent-or-present. An empty `description` is a
+    // description, and the platform will faithfully show it as blank.
+    const out = withPluginField('{"name":"x","description":"old"}', "description", "  ");
+    expect(out.ok).toBe(true);
+    if (out.ok) expect(JSON.parse(out.value)).toEqual({ name: "x" });
+  });
+
+  it("keeps fields it does not model", () => {
+    const out = withPluginField('{"name":"x","triggers":[{"type":"cron"}]}', "description", "hi");
+    expect(out.ok).toBe(true);
+    if (out.ok) expect(JSON.parse(out.value).triggers).toEqual([{ type: "cron" }]);
+  });
+
+  it("refuses to write over a file it cannot parse", () => {
+    // Overwriting a broken file with what the panel could salvage is how an
+    // author loses the half of it the panel does not model.
+    const out = withPluginField("{ not json", "description", "hi");
+    expect(out.ok).toBe(false);
   });
 });

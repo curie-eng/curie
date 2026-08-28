@@ -287,13 +287,14 @@ describe("deleting an agent", () => {
     // The confirm field has focus, so you can type without clicking first.
     // `Sheet` used to focus its own panel unconditionally after mount, which
     // stole focus back out of the field the sheet exists to have you fill in.
-    expect(screen.getByRole("textbox")).toHaveFocus();
+    expect(within(screen.getByRole("dialog")).getByRole("textbox")).toHaveFocus();
 
     // A near miss is still a miss.
-    await userEvent.type(screen.getByRole("textbox"), "weathe");
+    const confirmField = within(screen.getByRole("dialog")).getByRole("textbox");
+    await userEvent.type(confirmField, "weathe");
     expect(confirm).toBeDisabled();
 
-    await userEvent.type(screen.getByRole("textbox"), "r");
+    await userEvent.type(confirmField, "r");
     expect(confirm).toBeEnabled();
     await userEvent.click(confirm);
     await waitFor(() => expect(deleted).toEqual(["/w/weather"]));
@@ -309,7 +310,7 @@ describe("deleting an agent", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Actions for weather" }));
     await userEvent.click(await screen.findByRole("menuitem", { name: "Delete…" }));
-    await userEvent.type(await screen.findByRole("textbox"), "weather");
+    await userEvent.type(within(await screen.findByRole("dialog")).getByRole("textbox"), "weather");
     await userEvent.click(screen.getByRole("button", { name: "Delete permanently" }));
 
     await waitFor(() => expect(screen.getByText(/git repository/)).toBeInTheDocument());

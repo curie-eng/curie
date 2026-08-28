@@ -20,6 +20,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useApp } from "../bridge/app";
 import { SlackPacks } from "./BuildPacks";
 import { NewAgent } from "./NewAgent";
+import { AgentSettings } from "./AgentSettings";
 import { Actions, RunButton } from "./Actions";
 import { surfacesById } from "../lib/surfaces";
 import { useResources } from "../bridge/resources";
@@ -532,8 +533,19 @@ function Workbench() {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <Header checks={checks} plugin={plugin?.ok ? plugin.value : undefined} />
-      <Ladder />
       {checks.length ? <Checklist checks={checks} /> : null}
+
+      {/* Above the loop, because configuring the agent is what somebody does
+          first and repeatedly, and running it is what they do after. It edits
+          the same files the list below does, through the same write functions,
+          so the two surfaces cannot disagree about what a file means. */}
+      <AgentSettings
+        ws={ws}
+        plugin={plugin?.ok ? plugin.value : undefined}
+        onSaved={reload}
+      />
+
+      <Ladder />
 
       <section>
         <SectionHeader
