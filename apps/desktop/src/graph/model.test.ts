@@ -292,3 +292,40 @@ describe("an agent with a model override", () => {
     expect(new Set(nodes.map((n) => n.id)).size).toBe(nodes.length);
   });
 });
+
+describe("the deploy edge", () => {
+  const ws = {
+    path: "/w/shift-notes",
+    name: "shift-notes",
+    plugin: { name: "shift-notes", version: "0.1.0" },
+    skills: ["shift-notes"],
+    hasEvals: true,
+    hasMcp: false,
+    lastOpened: 1,
+  };
+  const agent = (name: string, id: string) => ({ id, name, model: null, thinking: null });
+  const deployEdges = (agents: ReturnType<typeof agent>[]) =>
+    buildGraph({ workspace: ws, agents, samples: PLATFORM } as never, EMPTY_DOC)
+      .edges.filter((e) => e.kind === "deploy");
+
+  it("connects the open bundle to the agent it is deployed as", () => {
+    const edges = deployEdges([agent("shift-notes", "a1")]);
+    expect(edges).toHaveLength(1);
+    expect(edges[0].from).toBe("bundle");
+    expect(edges[0].to).toBe("agent:a1");
+  });
+
+  it("does NOT connect it to an unrelated agent", () => {
+    // The bug this pins: the edge was drawn for EVERY agent the platform
+    // reported, so a machine running two unrelated agents showed the bundle you
+    // have open shipping as both. A derived diagram asserting a relationship
+    // that does not exist is worse than one that omits it.
+    const edges = deployEdges([agent("squawk", "a2")]);
+    expect(edges).toHaveLength(0);
+  });
+
+  it("picks out only its own agent when several are running", () => {
+    const edges = deployEdges([agent("squawk", "a2"), agent("shift-notes", "a1"), agent("weather", "a3")]);
+    expect(edges.map((e) => e.to)).toEqual(["agent:a1"]);
+  });
+});

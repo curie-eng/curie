@@ -16,6 +16,7 @@
 import type { AgentSummary } from "../bridge/app";
 import type { ResourceSample, Workspace } from "../bridge/bridge";
 import type { NodeKind } from "../tokens";
+import { isDeployedFrom } from "../lib/deployment";
 
 export interface GraphNode {
   readonly id: string;
@@ -259,6 +260,9 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
 
   // --- what you author ----------------------------------------------------
   const ws = sources.workspace;
+  // The same name Build and the deployment panel match on: the plugin's name
+  // when it declares one, the directory's otherwise.
+  const openBundleName = ws ? (ws.plugin?.name ?? ws.name) : "";
   if (ws) {
     add({
       id: "bundle",
@@ -330,7 +334,9 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
       ],
     }, COL.agent);
 
-    if (ws) link("bundle", id, "deploy", "deploy");
+    // Only to the agent this bundle is actually deployed as. Drawn to every
+    // agent, this edge told you the bundle you have open ships as each of them.
+    if (ws && isDeployedFrom(agent, openBundleName)) link("bundle", id, "deploy", "deploy");
 
     // Channel: the agent's front door.
     if (agent.channel?.channel_id) {
