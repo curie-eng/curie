@@ -1,0 +1,44 @@
+{
+  "name": "squawk",
+  "cases": [
+    {
+      "id": "push-acknowledges-and-says-nothing-else",
+      "input": "the deploy is blocked on the migration",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*Squawk!\\s*$",
+        "case_sensitive": true
+      },
+      "note": "A non-empty message is a push, and the whole reply is the acknowledgement. Anchored at both ends on purpose: the failure this catches is not a wrong word, it is a model that answers correctly and then adds 'I've added that to the stack. Anything else?'. That extra sentence is what makes a deterministic-looking bot read as a chatbot wearing its name."
+    },
+    {
+      "id": "pop-returns-the-newest-entry-verbatim",
+      "input": "",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*Squawk!\\s+\\S",
+        "case_sensitive": true
+      },
+      "note": "An empty message pops. The grader cannot name the entry -- the stack is agent-global and durable, so what comes back depends on what this agent was told earlier, which is the point of the bundle and not something a case may pin. It asserts the SHAPE: the marker, then a non-empty payload. An empty stack answers 'Squawk stack is empty.' and fails this pattern, which is correct: a case that accepted both would assert nothing."
+    },
+    {
+      "id": "whitespace-only-is-empty-and-pops",
+      "input": "   ",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*Squawk!(\\s+\\S|\\s+stack is empty\\.)",
+        "case_sensitive": true
+      },
+      "note": "Trimming decides push versus pop, so whitespace must take the pop branch. Either pop outcome passes here because the stack's contents are not fixed; what is being asserted is that three spaces did NOT get pushed as an entry. The failure mode is a bundle that tests `if message:` instead of `if message.strip():` and quietly accumulates blank rows."
+    },
+    {
+      "id": "a-pop-actually-reads-the-durable-stack",
+      "input": "",
+      "grader": {
+        "kind": "tool_called",
+        "expected": "mcp__curie-state__get"
+      },
+      "note": "The case a text matcher cannot carry. `Squawk!` with nothing after it is a well-formed PUSH acknowledgement and a meaningless pop, and no pattern can tell the two apart once the payload is optional -- so grading the answer text cannot catch a model that skips the store and answers from the conversation it can already see. This grades the trajectory instead: an empty message must have read `squawk/stack`. It is deterministic, which the graders here are required to be (an LLM judge is deferred to ADR-0042 precisely so eval results stay reproducible). RESIDUAL LIMIT: trajectory records the tool REQUEST, so this proves the pop consulted the stack, not that the entry it returned is the one that was stored."
+    }
+  ]
+}
