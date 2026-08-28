@@ -282,9 +282,18 @@ describe("the form is an abstraction over the CLI, not a rendering of it", () =>
 
     // Every input, not just the textboxes: the API key is a password field and
     // is exactly the case where a default nobody notices costs a 401.
-    const placeholders = [...document.querySelectorAll("input")].map((i) => i.placeholder);
-    expect(placeholders).toContain("curie-dev-key");
-    expect(placeholders).toContain(".");
+    const boxes = [...document.querySelectorAll("input")].filter((i) => i.type !== "checkbox");
+    expect(boxes.map((i) => i.placeholder)).toEqual(
+      expect.arrayContaining(["curie-dev-key", ".", "http://localhost:28000"]),
+    );
+
+    // And nothing TYPED. A default is what the CLI does when the flag is
+    // absent, so seeding it as a value made the app restate every default
+    // explicitly -- `curie local deploy --plugin-dir X --api-url Y --api-key Z`
+    // for a command whose argv should have been `curie local deploy` -- and
+    // overrode the CLI's own resolution with a value this app guessed.
+    expect(boxes.map((i) => i.value)).toEqual(boxes.map(() => ""));
+    expect(screen.getByTestId("command-preview")).toHaveTextContent("curie local deploy");
 
     // And no "default X" chip left behind saying the same thing twice.
     expect(screen.queryByText(/^default$/)).not.toBeInTheDocument();
