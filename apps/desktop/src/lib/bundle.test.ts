@@ -345,3 +345,32 @@ describe("save validation", () => {
     expect(validateForSave("connectors.yaml", ": : :")).toBeNull();
   });
 });
+
+describe("an eval case's input may be empty", () => {
+  // The frozen schema types `input` as a plain string with no `minLength`, and
+  // the eval driver has no emptiness check. Refusing `""` here made this app
+  // stricter than the platform it is a client of -- and it refused a real
+  // bundle: `examples/squawk` is a stack whose entire contract is that a
+  // non-empty message pushes and an EMPTY message pops, so the empty case is
+  // the only one that exercises half the behaviour.
+  const suite = (input: string) =>
+    JSON.stringify({
+      name: "s",
+      cases: [{ id: "pop", input, grader: { kind: "regex", expected: "^Squawk" } }],
+    });
+
+  it("accepts an empty input", () => {
+    const parsed = parseEvalSuite(suite(""));
+    expect(parsed.ok, parsed.ok ? "" : parsed.error).toBe(true);
+  });
+
+  it("still requires the field to be present and a string", () => {
+    const missing = JSON.stringify({
+      name: "s",
+      cases: [{ id: "pop", grader: { kind: "regex", expected: "x" } }],
+    });
+    const parsed = parseEvalSuite(missing);
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.error).toMatch(/input/);
+  });
+});

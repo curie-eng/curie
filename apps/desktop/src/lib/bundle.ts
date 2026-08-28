@@ -213,7 +213,15 @@ export function parseEvalSuite(text: string): Parsed<EvalSuite> {
     const g = c?.grader as Record<string, unknown> | undefined;
     const where = typeof c?.id === "string" ? `case "${c.id}"` : `case ${i + 1}`;
     if (typeof c?.id !== "string" || !c.id) return { ok: false, error: `${where}: missing \`id\`` };
-    if (typeof c.input !== "string" || !c.input) {
+    // Present, but not necessarily non-empty. The frozen schema
+    // (`apps/worker/schema/eval-cases.schema.json`) types `input` as a plain
+    // string with no `minLength`, and the eval driver has no emptiness check,
+    // so `""` is a valid case -- and for some agents it is the only interesting
+    // one. `examples/squawk` is a stack whose whole contract is that a non-empty
+    // message pushes and an EMPTY message pops; refusing that case here made
+    // this app stricter than the platform it is a client of, which is the rule
+    // this file exists to keep.
+    if (typeof c.input !== "string") {
       return { ok: false, error: `${where}: missing \`input\`` };
     }
     if (!g || typeof g.kind !== "string" || !GRADER_KINDS.includes(g.kind as GraderKind)) {
