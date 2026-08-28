@@ -23,6 +23,10 @@ import { TEMPLATES, type Template } from "../lib/templates";
 import { ACCENT, F, LINE, R, S, T, tint } from "../tokens";
 import { Button, Field, Group, Input, Mono, Notice, Sheet } from "../primitives";
 
+/** Tall enough for the longest step without scrolling, and identical for all of
+ *  them. See the note where it is used. */
+const BODY_HEIGHT = 452;
+
 type StepId = "start" | "name" | "review";
 
 const STEPS: readonly { id: StepId; label: string }[] = [
@@ -112,20 +116,30 @@ export function NewAgent({ onClose }: { readonly onClose: () => void }) {
     >
       <Steps current={index} />
 
-      {step === "start" ? (
-        <StartFrom picked={picked} onPick={setPicked} />
-      ) : step === "name" ? (
-        <NameIt
-          name={name}
-          onName={setName}
-          slugged={id}
-          where={where}
-          onWhere={setWhere}
-          onSubmit={() => !blocked && next()}
-        />
-      ) : (
-        <Review template={picked} name={id} where={where} />
-      )}
+      {/* A FIXED height, not a natural one. Every step and every template has a
+          different amount to say, so a body that sized itself made the sheet
+          jump each time somebody pressed a card or Next -- the controls moving
+          under the cursor that just used them, and the whole panel resizing
+          around a decision that had not been made yet. A wizard that changes
+          shape as you fill it in is asking you to re-find everything at every
+          step. Content taller than this scrolls inside; the sheet does not
+          move. */}
+      <div style={{ height: BODY_HEIGHT, overflowY: "auto", overflowX: "hidden" }}>
+        {step === "start" ? (
+          <StartFrom picked={picked} onPick={setPicked} />
+        ) : step === "name" ? (
+          <NameIt
+            name={name}
+            onName={setName}
+            slugged={id}
+            where={where}
+            onWhere={setWhere}
+            onSubmit={() => !blocked && next()}
+          />
+        ) : (
+          <Review template={picked} name={id} where={where} />
+        )}
+      </div>
 
       {error ? (
         <div style={{ marginTop: 14 }}>
@@ -188,6 +202,10 @@ function StartFrom({
 }) {
   return (
     <div style={{ display: "grid", gap: 16 }}>
+      {/* Every card the same height, whichever is selected. The description used
+          to appear inside the chosen one, so picking a card resized it and
+          shoved the two below it down the page -- selection is not supposed to
+          move the thing you are selecting between. */}
       <div style={{ display: "grid", gap: 8 }}>
         {TEMPLATES.map((t) => (
           <TemplateCard
@@ -199,29 +217,34 @@ function StartFrom({
         ))}
       </div>
 
-      {picked.example.length ? (
-        <div style={{ display: "grid", gap: 8 }}>
-          <div style={{ ...F.section, color: T.tertiary }}>What it looks like</div>
-          <Group style={{ padding: 12, display: "grid", gap: 6 }}>
-            {picked.example.map((line, i) => (
-              <div key={i} style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
-                <span
-                  style={{
-                    ...F.footnote,
-                    color: line.from === "you" ? T.quaternary : ACCENT,
-                    width: 44,
-                    flex: "none",
-                    textAlign: "right",
-                  }}
-                >
-                  {line.from}
-                </span>
-                <span style={{ ...F.body, color: T.secondary }}>{line.text}</span>
-              </div>
-            ))}
-          </Group>
+      <div style={{ display: "grid", gap: 8 }}>
+        <div style={{ ...F.section, color: T.tertiary }}>
+          {picked.example.length ? "What it looks like" : "About this one"}
         </div>
-      ) : null}
+        <Group style={{ padding: 12, display: "grid", gap: 8 }}>
+          <div style={{ ...F.footnote, color: T.tertiary, lineHeight: 1.55 }}>{picked.about}</div>
+          {picked.example.length ? (
+            <div style={{ display: "grid", gap: 6, marginTop: 2 }}>
+              {picked.example.map((line, i) => (
+                <div key={i} style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
+                  <span
+                    style={{
+                      ...F.footnote,
+                      color: line.from === "you" ? T.quaternary : ACCENT,
+                      width: 44,
+                      flex: "none",
+                      textAlign: "right",
+                    }}
+                  >
+                    {line.from}
+                  </span>
+                  <span style={{ ...F.body, color: T.secondary }}>{line.text}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </Group>
+      </div>
     </div>
   );
 }
@@ -284,6 +307,19 @@ function NameIt({
           </Button>
         </div>
       </Field>
+
+      {/* The answer to both fields at once, while they are still being typed.
+          The review step says it again, and that is not a duplicate: here it is
+          live feedback on what you are typing, there it is the last thing you
+          read before anything is written. */}
+      {slugged && where ? (
+        <Group style={{ padding: "10px 12px" }}>
+          <div style={{ ...F.footnote, color: T.tertiary }}>
+            This makes{" "}
+            <Mono style={{ fontSize: 11, color: T.primary }}>{`${where}/${slugged}`}</Mono>
+          </div>
+        </Group>
+      ) : null}
     </div>
   );
 }
@@ -391,11 +427,6 @@ function TemplateCard({
       <div style={{ ...F.callout, color: T.secondary, marginTop: 2, lineHeight: 1.5 }}>
         {template.tagline}
       </div>
-      {picked ? (
-        <div style={{ ...F.footnote, color: T.tertiary, marginTop: 6, lineHeight: 1.55 }}>
-          {template.about}
-        </div>
-      ) : null}
     </button>
   );
 }
