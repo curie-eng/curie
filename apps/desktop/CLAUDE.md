@@ -6,6 +6,27 @@ React + TypeScript renderer. Full structure and rationale in
 
 ## Load-bearing invariants
 
+- **The app does not speak in commands.** The point of a window over a CLI is
+  that you do not have to know the CLI, so the copy somebody reads while deciding
+  what to build must not be the CLI's own vocabulary: no bundle, runner,
+  container, tier, compose, manifest, MCP, binary or command name. Say what the
+  thing DOES. `src/lib/voice.test.ts` enforces it over every surface title and
+  blurb and every template, and it is not vacuous -- restoring one old blurb
+  fails it.
+
+  Command names are **moved, not hidden**, and every one is still one hover or
+  one tab away: each control's tooltip carries `curie local up — <what it does>`,
+  `build.author` and `settings.machine`/`dev`/`reference` are explicitly the
+  command-shaped path and are exempt by name in the test, the Commands tab is the
+  complete reference, and the console takes typed commands. Those are the places
+  somebody has gone looking for them. A NEW surface cannot join the exempt list
+  by accident -- it is a set of ids, not a pattern.
+
+  The tiers are named for who can reach the agent, because that is the actual
+  difference and "skill/local/cluster" is an implementation detail three levels
+  down: **Just you, right here** / **Everything, on this computer** / **Shared
+  with your team**. The rail says "Where it runs".
+
 - **The command surface is generated, never hand-written.** Every command in the
   Commands view, the palette, and the canvas inspector comes from
   `src/generated/commandManifest.ts`, regenerated from `cli/command-manifest.json`

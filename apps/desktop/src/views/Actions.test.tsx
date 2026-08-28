@@ -126,13 +126,13 @@ afterEach(() => {
 describe("a surface's controls", () => {
   it("renders one control per command, labelled the way the map says", () => {
     mount(<Actions surface={surfacesById.get("tiers.local")!} />);
-    expect(screen.getByRole("button", { name: "Bring up" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Stop the stack" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start it here" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Shut it all down" })).toBeInTheDocument();
   });
 
   it("names the command it will run, so a button never hides one", () => {
     mount(<Actions surface={surfacesById.get("tiers.local")!} />);
-    expect(screen.getByRole("button", { name: "Bring up" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "Start it here" })).toHaveAttribute(
       "title",
       expect.stringContaining("curie local up") as unknown as string,
     );
@@ -141,12 +141,12 @@ describe("a surface's controls", () => {
   it("opens the command form in place rather than navigating away", async () => {
     const user = userEvent.setup();
     mount(<Actions surface={surfacesById.get("tiers.local")!} />);
-    await user.click(screen.getByRole("button", { name: "Bring up" }));
+    await user.click(screen.getByRole("button", { name: "Start it here" }));
     await waitFor(() =>
       expect(screen.getByTestId("command-preview")).toHaveTextContent("curie local up"),
     );
     // Still on the same screen: the group that opened the sheet is behind it.
-    expect(screen.getByRole("button", { name: "Stop the stack" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Shut it all down" })).toBeInTheDocument();
   });
 });
 

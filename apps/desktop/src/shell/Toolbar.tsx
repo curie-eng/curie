@@ -15,13 +15,13 @@ import { PROMPT } from "../primitives/glyphs";
 
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "What is happening right now" },
-  build: { title: "Build", subtitle: "Author this bundle, then run it up the ladder" },
-  tiers: { title: "Tiers", subtitle: "The same agent, on a laptop or on a cluster" },
-  resources: { title: "Resources", subtitle: "What each agent is consuming" },
-  canvas: { title: "Canvas", subtitle: "Agents, integrations, and the infra under them" },
+  build: { title: "Build", subtitle: "Make an agent, try it, then put it to work" },
+  tiers: { title: "Where it runs", subtitle: "Just you, this computer, or your whole team" },
+  resources: { title: "Resources", subtitle: "What each agent is using up" },
+  canvas: { title: "Canvas", subtitle: "Your agents, what they connect to, and what runs them" },
   // Two panes of one tab, so they share a title and differ in the subtitle.
-  commands: { title: "Commands", subtitle: "Everything the CLI can do" },
-  activity: { title: "Commands", subtitle: "Every command this app has run" },
+  commands: { title: "Commands", subtitle: "Every command, for when you would rather type one" },
+  activity: { title: "Commands", subtitle: "Everything this app has run" },
   settings: { title: "Settings", subtitle: "Connection, secrets, and what this app is" },
 };
 

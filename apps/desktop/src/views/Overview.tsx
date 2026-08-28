@@ -115,12 +115,12 @@ export function Overview() {
           first
           label="Agents"
           value={app.agents.length}
-          sub={reachable ? "deployed identities" : "API unreachable"}
+          sub={reachable ? "put to work" : "cannot reach Curie"}
         />
         <Stat
-          label="Runners live"
+          label="Test copies"
           value={res.samples.filter((s) => s.role === "runner" && s.state === "running").length}
-          sub="sandboxes on this machine"
+          sub="running on this computer"
           accent={ACCENT}
         />
         {/* Two things this stat must not do, both of which it did.
@@ -223,8 +223,8 @@ export function Overview() {
                     nothing open this names what is missing and goes to Build. */}
                 <div style={{ ...F.callout, color: T.tertiary, textAlign: "center" }}>
                   {app.workspace
-                    ? "No runner sandboxes on this machine."
-                    : "No runner sandboxes, and no bundle open to boot one from."}
+                    ? "No test copies running on this computer."
+                    : "Nothing running, and no agent open to try."}
                 </div>
                 {app.workspace ? (
                   <RunButton id="skill.up" tone="primary">
@@ -524,13 +524,12 @@ function SetUp({ dockerAvailable }: { readonly dockerAvailable: boolean }) {
     <Group style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "14px 14px" }}>
       <div style={{ flex: 1, minWidth: 0, display: "grid", gap: 4 }}>
         <div style={{ ...F.headline }}>
-          {dockerAvailable ? "Set up Curie on this machine" : "Docker is not running"}
+          {dockerAvailable ? "Set up Curie on this computer" : "Docker is not running"}
         </div>
         <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.55, maxWidth: 640 }}>
           {dockerAvailable ? (
             <>
-              One button brings the whole platform up here — the API, the worker, the dispatcher and
-              the object store. That is what an agent gets deployed onto. Then{" "}
+              One button starts everything an agent needs to run here. Then{" "}
               <button
                 onClick={() => app.navigate("build")}
                 style={{
@@ -544,12 +543,12 @@ function SetUp({ dockerAvailable }: { readonly dockerAvailable: boolean }) {
               >
                 Build
               </button>{" "}
-              is where you author one and ship it.
+              is where you make one and put it to work.
             </>
           ) : (
             <>
-              Everything here runs in containers, so Docker has to be running before the platform
-              can start. Start Docker Desktop and this card will offer the button.
+              Curie runs its agents in containers, so Docker has to be running first. Start Docker
+              Desktop and this card will offer the button.
             </>
           )}
         </div>
@@ -599,23 +598,23 @@ function StackCard({
   const color = failed.length ? STATUS.warn : ACCENT;
 
   const title = failed.length
-    ? "Local stack is degraded"
+    ? "Something is wrong"
     : up
-      ? "Local stack is up"
-      : "Starting the local stack";
+      ? "Curie is running"
+      : "Starting Curie";
 
   const detail = failed.length
-    ? `${failed.join(", ")} ${failed.length === 1 ? "is" : "are"} not healthy — the console has the output`
+    ? `${failed.join(", ")} ${failed.length === 1 ? "is" : "are"} not healthy — the console below has the details`
     : up
-      ? `${total} ${total === 1 ? "service" : "services"} running · API answering${apiBaseUrl ? ` at ${apiBaseUrl}` : ""}`
+      ? `${total} ${total === 1 ? "piece" : "pieces"} running · ready for agents${apiBaseUrl ? ` at ${apiBaseUrl}` : ""}`
       : phase === "settling"
-        ? "All containers are up. Waiting for the API to answer."
+        ? "Everything has started. Waiting for it to answer."
         : waiting.length
-          ? `Waiting for ${waiting.slice(0, 3).join(", ")}${waiting.length > 3 ? ` and ${waiting.length - 3} more` : ""}`
+          ? `Still starting: ${waiting.slice(0, 3).join(", ")}${waiting.length > 3 ? ` and ${waiting.length - 3} more` : ""}`
           : // Compose has created nothing yet, which means it is still pulling
             // images. That is the longest phase and the one with no output at
             // all, so it needs naming rather than leaving blank.
-            "Pulling images. Nothing has been created yet.";
+            "Downloading what it needs. This is the slow part the first time.";
 
   return (
     <Group style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "10px 12px" }}>
@@ -661,7 +660,7 @@ function StackCard({
         )}
 
         <div style={{ ...F.footnote, color: T.tertiary }}>
-          {!up && total ? `${ready} of ${total} services ready · ` : ""}
+          {!up && total ? `${ready} of ${total} ready · ` : ""}
           {detail}
         </div>
       </div>
@@ -676,7 +675,7 @@ function StackCard({
       {total ? (
         <span style={{ flex: "none" }}>
           <RunButton id="local.down" tone="danger">
-            Stop the stack
+            Shut it down
           </RunButton>
         </span>
       ) : null}
