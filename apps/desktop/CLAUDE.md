@@ -95,7 +95,15 @@ React + TypeScript renderer. Full structure and rationale in
   cannot express what every button can.
 
   **Dismissing it leaves nothing behind in the pane, so the way back lives in
-  the toolbar.** The × means what it says -- a residual strip would be the
+  the toolbar, as a glyph.** A prompt is about as legible as an icon gets -- it
+  is what every terminal puts in its own corner -- so the word "Console" beside
+  it was a caption on a picture of itself; `aria-label` carries the name. Visible
+  means the GLYPH is strong, not that the button is a coloured badge: a filled
+  accent disc was tried and read as a status light, because the toolbar's other
+  controls are pills reporting state and a third round coloured thing joins that
+  set rather than standing out from it. Primary ink on no fill, fill on hover.
+  The glyph itself is `PROMPT` in `primitives`, shared with the sidebar's
+  Commands row rather than copied, so one path cannot drift from the other. The × means what it says -- a residual strip would be the
   button not having worked -- but that left the only routes back invisible: ⌘L,
   or something starting a run. A control you cannot see is not a way back. The
   toolbar's Console button appears exactly while the console is hidden and costs

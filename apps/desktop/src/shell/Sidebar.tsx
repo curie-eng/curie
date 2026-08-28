@@ -18,7 +18,7 @@ import { useApp, type Route } from "../bridge/app";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
 import { ACCENT, F, M, R, S, STATUS, T } from "../tokens";
-import { Spinner } from "../primitives";
+import { Glyph as Icon, PROMPT, Spinner } from "../primitives";
 import { bytes, percent } from "../lib/format";
 
 interface Item {
@@ -26,24 +26,6 @@ interface Item {
   readonly label: string;
   readonly hint: string;
   readonly icon: ReactNode;
-}
-
-/** Inline SVG rather than an icon font: nine glyphs do not justify a dependency,
- *  and these inherit `currentColor`, so the selected state is one rule. Drawn on
- *  a 16px grid with a 1.4 stroke to sit close to SF Symbols' weight. */
-function Icon({ d, filled }: { d: string; filled?: boolean }) {
-  return (
-    <svg width={16} height={16} viewBox="0 0 16 16" aria-hidden style={{ flex: "none" }}>
-      <path
-        d={d}
-        fill={filled ? "currentColor" : "none"}
-        stroke="currentColor"
-        strokeWidth={filled ? 0 : 1.4}
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
 }
 
 const ITEMS: readonly Item[] = [
@@ -140,7 +122,7 @@ export function Sidebar() {
             id: "commands",
             label: "Commands",
             hint: "Every curie command, where each one lives, and what has run",
-            icon: <Icon d="m3 4.6 3 3-3 3M8.4 11.4H13" />,
+            icon: <Icon d={PROMPT} />,
           }}
           // Active for either pane: History is not a separate destination.
           active={app.route === "commands" || app.route === "activity"}
