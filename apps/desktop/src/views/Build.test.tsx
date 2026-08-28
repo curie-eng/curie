@@ -157,15 +157,21 @@ describe("the agent list", () => {
     expect(within(detail()).getByTitle("/w/weather")).toBeInTheDocument();
   });
 
-  it("drops the split entirely on a first run, and offers ONE way to create", async () => {
-    // A master-detail with an empty 196px column beside an empty pane is two
-    // empty things arranged. Worse, the five ways to start were spread across
-    // all three regions -- the column's footer, the detail's empty state and the
-    // scaffolding group under it -- and three of them ran `init`. The count is
-    // the assertion: a first-timer must not have to choose between synonyms.
+  it("keeps the whole interface on a first run, and offers ONE way to create", async () => {
+    // Both halves matter and the first attempt at this traded one for the
+    // other. The five ways to start -- spread across the column's footer, the
+    // detail's empty state and the scaffolding group, three of them running
+    // `init` -- did need cutting to one. Replacing the entire Build interface
+    // with a single first-run panel also cut it to one, and removed Build.
     listed = [];
     mount();
     await waitFor(() => expect(screen.getByText("No agents yet")).toBeInTheDocument());
+
+    // The interface is still here: the agent column, the detail pane, and the
+    // scaffolding group at the foot.
+    expect(list()).toBeInTheDocument();
+    expect(detail()).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "First reply, no keys" })).toBeInTheDocument();
 
     const creates = screen
       .getAllByRole("button")

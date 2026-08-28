@@ -1,0 +1,22 @@
+# Where this bundle gets deployed. `curie cluster deploy --target prod` reads
+# this, so the routing is a reviewable diff in the repository instead of flags
+# scattered across whatever invokes the command.
+#
+# The BUNDLE is identical for every target -- only the binding differs, which
+# is what lets prod promote the exact artifact dev validated.
+#
+# Left empty, a push deploys to the single agent this repository binds.
+# Declare targets once the repository binds more than one.
+#
+# Uncomment and edit. Use Slack channel IDs (starting with C), not #names:
+#
+# targets:
+#   dev:
+#     agent: my-agent-dev
+#     env: dev
+#     slack_channel: C0EXAMPLE1
+#   prod:
+#     agent: my-agent
+#     env: prod
+#     slack_channel: C0EXAMPLE2
+targets: {}

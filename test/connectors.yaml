@@ -1,0 +1,30 @@
+# What this agent needs running. Curie derives the Deployment, Service,
+# container hardening, host allowlist, sandbox-to-connector NetworkPolicy,
+# secret wiring, and the URL the agent dials -- so none of that lives here.
+#
+# Uncomment and edit to declare one:
+#
+# connectors:
+#   grafana:
+#     image: grafana/mcp-grafana:0.17.2
+#     args:
+#       - -t
+#       - streamable-http
+#       # Curie names the Service, so Curie supplies every name the sandbox may
+#       # dial. Hardcoding these breaks the moment a second agent runs this
+#       # bundle -- the names are per-agent.
+#       - -allowed-hosts
+#       - ${CURIE_ALLOWED_HOSTS}
+#     env:
+#       GRAFANA_URL: https://grafana.example.com
+#     # NAMES only. Values resolve at deploy time from your environment or
+#     # `curie secrets set <NAME>`; they never belong in this file.
+#     secrets:
+#       - GRAFANA_SERVICE_ACCOUNT_TOKEN
+#     secret_files:
+#       GRAFANA_CLIENT_CERT: /etc/grafana/client.pem
+#
+#     # Where to reach it on a tier that cannot host it -- `skill` hosts
+#     # nothing, so this is how local development reaches your own copy.
+#     unhosted_url: ${GRAFANA_MCP_URL}
+connectors: {}
