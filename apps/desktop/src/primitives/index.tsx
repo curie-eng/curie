@@ -469,6 +469,53 @@ export function Spinner({ size = 13, color = T.tertiary }: { size?: number; colo
   );
 }
 
+/**
+ * A live marker for something that is up and staying up.
+ *
+ * The counterpart to `Spinner`, and they must not be swapped. A spinner is a
+ * promise that something will finish, so one left on screen after the work is
+ * done says the opposite of the truth -- the stack card wore a spinner while
+ * the stack was already running, which read as "still trying". This finishes
+ * nothing and is not trying to: the loop IS the message.
+ *
+ * It also satisfies the app's rule about status dots, which allows exactly one
+ * use -- a live marker whose animation is the information -- rather than a
+ * coloured dot standing in for a word.
+ */
+export function LiveRing({ color = ACCENT, size = 9 }: { color?: string; size?: number }) {
+  return (
+    <span
+      aria-hidden
+      style={{
+        position: "relative",
+        flex: "none",
+        display: "inline-flex",
+        width: size,
+        height: size,
+      }}
+    >
+      <span
+        style={{
+          position: "absolute",
+          inset: 0,
+          borderRadius: 999,
+          background: color,
+          animation: "curie-ping 2400ms cubic-bezier(0, 0, 0.2, 1) infinite",
+        }}
+      />
+      <span
+        style={{
+          position: "relative",
+          width: size,
+          height: size,
+          borderRadius: 999,
+          background: color,
+        }}
+      />
+    </span>
+  );
+}
+
 // --- buttons ---------------------------------------------------------------
 
 /** Inline SVG rather than an icon font: a dozen glyphs do not justify a

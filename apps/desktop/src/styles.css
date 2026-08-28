@@ -392,6 +392,26 @@ select {
   }
 }
 
+/* A radar ping: an expanding ring that fades, on a slow loop.
+   
+   This is what a running system gets INSTEAD of a spinner, and the distinction
+   is the whole point of having it. A spinner means "wait for me" -- it is a
+   promise that something will finish -- so leaving one on screen after the work
+   is done tells the operator the opposite of the truth. A ping finishes nothing
+   and is not trying to; it just keeps saying "still here", which is exactly what
+   a healthy stack has to communicate and cannot communicate by disappearing. */
+@keyframes curie-ping {
+  0% {
+    transform: scale(0.65);
+    opacity: 0.5;
+  }
+  70%,
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
 @keyframes curie-rise {
   from {
     opacity: 0;

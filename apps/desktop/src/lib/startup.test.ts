@@ -98,9 +98,18 @@ describe("stackProgress", () => {
 describe("stackPhase", () => {
   const none = { total: 0, ready: 0, waiting: [], failed: [] };
 
-  it("is idle once the API answers and nothing of ours is running", () => {
+  it("reports `up` rather than disappearing once everything is answering", () => {
+    // The card used to vanish here, which meant the only thing telling an
+    // operator it had worked was the absence of a warning -- success by
+    // removal, which only works if you were watching.
     const up = { total: 4, ready: 4, waiting: [], failed: [] };
-    expect(stackPhase(up, { apiReachable: true, runActive: false })).toBe("idle");
+    expect(stackPhase(up, { apiReachable: true, runActive: false })).toBe("up");
+  });
+
+  it("is idle when there is no stack at all", () => {
+    // Nothing created is not a stack that is down, it is one nobody asked for.
+    expect(stackPhase(none, { apiReachable: false, runActive: false })).toBe("idle");
+    expect(stackPhase(none, { apiReachable: true, runActive: false })).toBe("idle");
   });
 
   it("keeps showing the card during a run even when the API already answers", () => {
