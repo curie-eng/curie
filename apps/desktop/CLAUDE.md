@@ -453,13 +453,25 @@ React + TypeScript renderer. Full structure and rationale in
     visually attaches to just looked unfinished. It is a card like any other:
     `--card-fill`, the same blur, radius and shadow.
 
-    **A sheet is opaque, and so is a menu.** A card is glass because it sits on
-    the pane and the window's vibrancy carrying through it is the point. Both of
-    those float over ARBITRARY content, so they have to be their own surface:
-    on glass the page underneath came through hard enough to compete with the
-    sheet's own text -- a page heading reading through the sheet's title. A blur
-    does not save it when what is behind is text at the same size, and it is a
-    no-op once the fill is opaque, so both dropped it and its compositing layer.
+    **A sheet and a menu take `--sheet-fill`, which is neither.** A card is glass
+    because it sits on the pane and the window's vibrancy carrying through it is
+    the point. Both of those float over ARBITRARY content, and on glass the page
+    underneath came through hard enough to compete with the sheet's own text -- a
+    page heading reading through the sheet's title. Fully opaque fixed that and
+    overshot: it read as a system dialog dropped on the app rather than part of
+    it. `--sheet-fill` is a thin film at 0.93 with `--card-backdrop` under it,
+    and the blur is load bearing at that alpha rather than decorative. High
+    contrast still gets it fully opaque, like the card.
+
+    **A `Sheet` portals to the body.** `position: fixed` only escapes to the
+    viewport while no ancestor establishes a containing block or a stacking
+    context, and `main` carries the `CONTENT_FADE` mask -- a mask does exactly
+    that. So an in-place sheet was trapped in `main`'s stacking context and the
+    console, a SIBLING of `main`, painted straight over its scrim: opening a
+    sheet dimmed the whole window except the console, which read as the console
+    somehow still being live. A z-index on the console would have fixed that one
+    case and left the next masked or transformed ancestor to reintroduce it
+    somewhere else.
 
     A `--sheet-fill` was tried and reverted long before that, on the evidence of
     a screenshot -- and captures do not composite native vibrancy, so they are

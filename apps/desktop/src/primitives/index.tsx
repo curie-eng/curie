@@ -634,15 +634,14 @@ export function MenuButton({
                 minWidth: 168,
                 padding: 4,
                 borderRadius: R.group,
-                // `raised`, not `cardFill`, and no backdrop blur. A card is
-                // glass because it sits on the pane and the window's vibrancy
-                // carrying through it is the point. A menu floats over arbitrary
-                // content -- here, directly over the accent-green "New agent…"
-                // button -- so it has to be its own surface or the thing behind
-                // it competes with its labels. `raised` is opaque, which also
-                // makes a `backdrop-filter` a no-op that costs a compositing
-                // layer, so there is none.
-                background: S.raised,
+                // The same film a sheet gets, and for the same reason: a menu
+                // floats over arbitrary content -- here directly over the
+                // accent-green "New agent…" button -- so it has to be its own
+                // surface or what is behind competes with its labels. Not
+                // `cardFill`, which is glass because a card sits on the pane.
+                background: S.sheetFill,
+                backdropFilter: S.cardBackdrop,
+                WebkitBackdropFilter: S.cardBackdrop,
                 boxShadow: SHADOW.sheet,
                 border: `1px solid ${LINE.separator}`,
                 zIndex: 300,
@@ -1093,7 +1092,20 @@ export function Sheet({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  return (
+  // Portalled to the body, and that is not a detail. A sheet is declared
+  // wherever it is used -- inside a view, inside `main` -- and `position: fixed`
+  // only escapes to the viewport while no ancestor establishes a containing
+  // block or a stacking context. `main` carries a `mask-image` (the fade into
+  // the console), and a mask does exactly that: the overlay was trapped in
+  // `main`'s stacking context, so the console -- a SIBLING of `main` -- painted
+  // over the scrim. Opening a sheet dimmed the whole window except the console,
+  // which read as the console being somehow still live.
+  //
+  // Fixing the symptom would have meant a z-index on the console, and the next
+  // masked or transformed ancestor would have brought it back somewhere else. A
+  // modal belongs at the top of the document, not wherever it happens to be
+  // written.
+  return createPortal(
     <div
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
@@ -1136,22 +1148,22 @@ export function Sheet({
           maxHeight: "84vh",
           display: "flex",
           flexDirection: "column",
-          // Opaque, and this is the same call the row menu had to make. A CARD is
-          // glass because it sits on the pane and the window's vibrancy carrying
-          // through it is the point. A sheet floats over arbitrary content and
-          // has to be its own surface: on glass, the page underneath came
-          // through hard enough to compete with the sheet's own text -- "No
-          // agents yet" reading through the New agent title, a section header
-          // crossing a paragraph. A blur is not enough when what is behind is
-          // text at the same size, and it is a no-op here anyway now the fill is
-          // opaque, so it is gone with its compositing layer.
+          // `sheetFill`, not `cardFill` and not fully opaque. A CARD is glass
+          // because it sits on the pane and the window's vibrancy carrying
+          // through it is the point; on glass a SHEET let the page underneath
+          // compete with its own text -- "No agents yet" reading through the New
+          // agent title. Fully opaque fixed that and went too far the other way,
+          // reading as a system dialog dropped on the app rather than part of
+          // it. A thin film with the blur under it is the answer: the page is
+          // felt behind the panel without being read through it.
           //
-          // A `--sheet-fill` was tried and reverted long before this, on the
-          // evidence of a screenshot -- captures do not composite native
-          // vibrancy, so they are the wrong instrument. This time it was
-          // reported from a real display, which is the only evidence that
-          // settles it.
-          background: S.raised,
+          // The blur is load bearing at this alpha, which is why it is back. All
+          // of this was settled by somebody looking at a real display -- captures
+          // do not composite native vibrancy, so they are the wrong instrument
+          // in either direction.
+          background: S.sheetFill,
+          backdropFilter: S.cardBackdrop,
+          WebkitBackdropFilter: S.cardBackdrop,
           borderRadius: R.sheet,
           boxShadow: SHADOW.sheet,
           animation: "curie-sheet 200ms cubic-bezier(0.22,1,0.36,1)",
@@ -1187,6 +1199,7 @@ export function Sheet({
           </div>
         ) : null}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

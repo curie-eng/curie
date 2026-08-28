@@ -19,17 +19,28 @@ function open() {
 }
 
 describe("Sheet", () => {
-  it("is opaque, because it floats over arbitrary content", () => {
+  it("is nearly opaque, not glass and not a system dialog", () => {
     // A card is glass -- it sits on the pane and the window's vibrancy carrying
     // through it is the point. A sheet covers whatever happens to be behind it,
     // and on glass that content came through hard enough to compete with the
-    // sheet's own text: a page heading reading through the sheet's title, a
-    // section label crossing a paragraph. `--card-fill` here is the bug.
+    // sheet's own text. Fully opaque fixed that and went too far: it read as a
+    // dialog dropped on the app rather than part of it. `--sheet-fill` is the
+    // film between, and the blur under it is what keeps the film legible.
     const panel = open();
-    expect(panel.style.background).toBe("var(--s-raised)");
+    expect(panel.style.background).toBe("var(--sheet-fill)");
     expect(panel.style.background).not.toContain("card-fill");
-    // A blur over an opaque fill is a compositing layer that does nothing.
-    expect(panel.style.backdropFilter).toBe("");
+    expect(panel.style.backdropFilter).toBe("var(--card-backdrop)");
+  });
+
+  it("renders at the top of the document, not where it was declared", () => {
+    // `position: fixed` only escapes to the viewport while no ancestor makes a
+    // containing block or a stacking context. `main` carries a mask (the fade
+    // into the console) and a mask does exactly that, so an in-place sheet was
+    // trapped in `main` and the console painted over its scrim. A z-index on the
+    // console would have fixed that one case and left the next masked ancestor
+    // to bring it back somewhere else.
+    const overlay = open().parentElement!;
+    expect(overlay.parentElement).toBe(document.body);
   });
 
   it("centres on the content pane, not the window", () => {

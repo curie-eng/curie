@@ -102,6 +102,9 @@ export const S = {
   /** A grouped list or panel sitting on `content`. A plain colour, because the
    *  canvas uses it as an SVG fill. */
   raised: "var(--s-raised)",
+  /** A panel that floats over arbitrary content: a sheet, a row menu. Nearly
+   *  opaque, with `cardBackdrop` under it. See the note in `styles.css`. */
+  sheetFill: "var(--sheet-fill)",
   /** What a card actually paints: may be a gradient, and on light themes is one.
    *  Use this for a panel's background and `raised` only where a flat colour is
    *  required. */
