@@ -28,6 +28,7 @@ import {
   Group,
   Mono,
   Notice,
+  LiveRing,
   Row,
   SectionHeader,
   Spinner,
@@ -376,8 +377,8 @@ function Health({ onRefresh }: { onRefresh(): void }) {
   // says it that way -- with a spinner rather than a red glyph, because a
   // failure mark standing over a working process is the screen calling its own
   // work broken.
-  const starting = phase !== "idle";
-  if (app.api && !app.api.reachable && app.api.baseUrl && !starting) {
+  const showStack = phase !== "idle";
+  if (app.api && !app.api.reachable && app.api.baseUrl && !showStack) {
     issues.push({
       text: `The platform API at ${app.api.baseUrl} is not answering. Agents, versions, memory and traces are unavailable until it is.`,
       fix: "local.up",
@@ -398,14 +399,17 @@ function Health({ onRefresh }: { onRefresh(): void }) {
             // can list. All that is missing is THIS app's read access to the
             // agent list, so it must not be painted as the stack being broken.
             tone: "warn",
-            text: `The stack is up. This app has no API key for ${app.api.baseUrl}, so it cannot list agents, versions or memory here — agents themselves are unaffected.`,
+            // No "the stack is up" here: the card directly above says exactly
+            // that, and a notice repeating the line it sits under reads as two
+            // systems that have not been introduced.
+            text: `This app has no API key for ${app.api.baseUrl}, so it cannot list agents, versions or memory here. Agents themselves are unaffected — they do not need this app to have a key.`,
             label: "Add an API key",
             goto: "settings",
           }
         : { text: `Reached the API but could not list agents: ${app.agentsError}` },
     );
   }
-  if (!issues.length && !starting) return null;
+  if (!issues.length && !showStack) return null;
 
   return (
     // The progress card is FIRST and is rendered independently of the issues
@@ -414,7 +418,9 @@ function Health({ onRefresh }: { onRefresh(): void }) {
     // one suppress the other means the screen answers "what is happening" with
     // only half of it.
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      {starting ? <StackStarting phase={phase} progress={progress} /> : null}
+      {showStack ? (
+        <StackCard phase={phase} progress={progress} apiBaseUrl={app.api?.baseUrl} />
+      ) : null}
       {issues.map((issue, i) => (
         <Notice
           key={i}
@@ -441,61 +447,85 @@ function Health({ onRefresh }: { onRefresh(): void }) {
 }
 
 /**
- * The stack coming up, as progress rather than as an error.
+ * The local stack's state, as one card that stays put.
+ *
+ * It does not disappear when the stack comes up. That was the thing worth
+ * changing: the only signal that a start had worked was a warning going away,
+ * and a screen that reports success by removing something is asking you to have
+ * been watching it. The card stays and the MARKER changes -- a spinner while
+ * there is something to wait for, a slow ping once there is not. A spinner is a
+ * promise that something will finish, so leaving one up after the work is done
+ * says the opposite of the truth; a ping finishes nothing and is not trying to.
  *
  * Everything on it is measured. The bar is containers Docker reports ready over
  * containers compose has created, which is the same condition `compose up
- * --wait` is itself blocking on; the step line names the services actually
- * being waited for. Nothing here advances because time passed.
+ * --wait` is itself blocking on, and the step line names the services actually
+ * outstanding. Nothing advances because time passed.
  *
- * There is no error glyph. A red mark standing over a process that is working
- * is the screen calling its own work broken, and it is the thing that made this
- * card read as a failure for the whole minute the stack takes to start. The
- * spinner is the state.
+ * There is no error glyph in any of these states. A red mark standing over a
+ * process that is working is the screen calling its own work broken, and it is
+ * what made this read as a failure for the whole minute a start takes.
  */
-function StackStarting({
+function StackCard({
   phase,
   progress,
+  apiBaseUrl,
 }: {
-  readonly phase: "starting" | "settling";
+  readonly phase: "starting" | "settling" | "up";
   readonly progress: ReturnType<typeof stackProgress>;
+  readonly apiBaseUrl: string | undefined;
 }) {
   const { total, ready, waiting, failed } = progress;
+  const up = phase === "up";
+  const color = failed.length ? STATUS.warn : ACCENT;
 
-  const step = failed.length
+  const title = failed.length
+    ? "Local stack is degraded"
+    : up
+      ? "Local stack is up"
+      : "Starting the local stack";
+
+  const detail = failed.length
     ? `${failed.join(", ")} ${failed.length === 1 ? "is" : "are"} not healthy — the console has the output`
-    : phase === "settling"
-      ? "All containers are up. Waiting for the API to answer."
-      : waiting.length
-        ? `Waiting for ${waiting.slice(0, 3).join(", ")}${waiting.length > 3 ? ` and ${waiting.length - 3} more` : ""}`
-        : // Compose has created nothing yet, which means it is still pulling
-          // images. That is the longest phase and the one with no output at
-          // all, so it needs to be named rather than left blank.
-          "Pulling images. Nothing has been created yet.";
+    : up
+      ? `${total} ${total === 1 ? "service" : "services"} running · API answering${apiBaseUrl ? ` at ${apiBaseUrl}` : ""}`
+      : phase === "settling"
+        ? "All containers are up. Waiting for the API to answer."
+        : waiting.length
+          ? `Waiting for ${waiting.slice(0, 3).join(", ")}${waiting.length > 3 ? ` and ${waiting.length - 3} more` : ""}`
+          : // Compose has created nothing yet, which means it is still pulling
+            // images. That is the longest phase and the one with no output at
+            // all, so it needs naming rather than leaving blank.
+            "Pulling images. Nothing has been created yet.";
 
   return (
     <Group style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "10px 12px" }}>
-      <span style={{ flex: "none", marginTop: 2 }}>
-        <Spinner size={14} color={failed.length ? STATUS.warn : ACCENT} />
+      <span style={{ flex: "none", marginTop: up ? 5 : 2 }}>
+        {up ? <LiveRing color={color} /> : <Spinner size={14} color={color} />}
       </span>
       <div style={{ flex: 1, minWidth: 0, display: "grid", gap: 6 }}>
-        <div style={{ ...F.headline }}>Starting the local stack</div>
+        <div style={{ ...F.headline }}>{title}</div>
 
-        {/* `warnAt` is null on purpose: `total` is a target to reach, not a
-            ceiling to stay under, and amber at 85% would warn that the stack is
-            nearly up. */}
-        <UsageBar
-          value={total ? ready : null}
-          max={total || null}
-          height={4}
-          warnAt={null}
-          color={failed.length ? STATUS.warn : ACCENT}
-          title={total ? `${ready} of ${total} containers ready` : "Nothing created yet"}
-        />
+        {/* The bar belongs to the wait. Once there is nothing left to wait for
+            it is a full bar reporting that a finished thing is finished, so it
+            goes and the count moves into the line below. */}
+        {up ? null : (
+          // `warnAt` is null on purpose: `total` is a target to reach, not a
+          // ceiling to stay under, and amber at 85% would warn that the stack
+          // is nearly up.
+          <UsageBar
+            value={total ? ready : null}
+            max={total || null}
+            height={4}
+            warnAt={null}
+            color={color}
+            title={total ? `${ready} of ${total} containers ready` : "Nothing created yet"}
+          />
+        )}
 
         <div style={{ ...F.footnote, color: T.tertiary }}>
-          {total ? `${ready} of ${total} services ready · ` : ""}
-          {step}
+          {!up && total ? `${ready} of ${total} services ready · ` : ""}
+          {detail}
         </div>
       </div>
     </Group>

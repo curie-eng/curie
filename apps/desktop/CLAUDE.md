@@ -154,6 +154,24 @@ React + TypeScript renderer. Full structure and rationale in
   not tell you whether the app picked your bundle, your checkout, or a fallback,
   and those produce different results for the same command.
 
+- **A running stack says so; it does not report success by disappearing.**
+  `StackCard` stays on the Overview whenever the local stack has containers, and
+  the MARKER changes rather than the card going away. The card used to vanish the
+  moment the API answered, which left the absence of a warning as the only signal
+  that a start had worked -- a screen that reports success by removing something
+  is asking you to have been watching it.
+
+  `Spinner` and `LiveRing` are counterparts and must not be swapped. A spinner is
+  a promise that something will finish, so one left up after the work is done
+  says the opposite of the truth. `LiveRing` finishes nothing and is not trying
+  to: a slow ping whose loop IS the message. It is also the one status-dot use
+  the app's own rule allows -- a live marker whose animation is the information,
+  not a coloured dot standing in for a word.
+
+  The bar belongs to the wait and goes with it. A full bar reporting that a
+  finished thing is finished is noise, so `up` drops it and moves the count into
+  the line below.
+
 - **A stack coming up is progress, not an error, and the progress is measured.**
   The API being unreachable is a red notice with "Start the stack" on it -- but
   only when nothing is being done about it. While the stack is starting, the

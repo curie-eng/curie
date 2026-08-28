@@ -105,7 +105,20 @@ export function stackProgress(samples: readonly ResourceSample[]): StackProgress
  * the last healthcheck passing and the next API poll: nothing is wrong then,
  * and saying so would be the screen contradicting itself.
  */
-export type StackPhase = "idle" | "starting" | "settling";
+/**
+ * `up` is a state the card SHOWS, not one it disappears on.
+ *
+ * The card used to vanish the moment the stack came up, which meant the only
+ * thing that ever told an operator it had worked was the absence of a warning.
+ * A screen that reports success by removing something is asking you to have
+ * been watching. `up` keeps the card and swaps the spinner for a live marker,
+ * so the answer to "is it up" is on screen whether or not you saw it happen.
+ *
+ * `idle` is now only "there is no local stack here" -- nothing created -- or
+ * "something is wrong and the notice below says what". Those are the two cases
+ * where a status card would have nothing true to say.
+ */
+export type StackPhase = "idle" | "starting" | "settling" | "up";
 
 /**
  * How long "everything is up, the API just has not answered yet" stays a
@@ -134,10 +147,14 @@ export function stackPhase(
   // depend on the same fact the errors beside it are about. The run ending is
   // what ends the run.
   if (runActive) return "starting";
-  if (apiReachable) return "idle";
+  // No containers at all is not a stack that is down, it is a stack that was
+  // never asked for. `LadderStrip` covers that; a status card would be reporting
+  // on nothing.
   if (progress.total === 0) return "idle";
   if (progress.ready < progress.total) return "starting";
-  // Everything Docker knows about is up; only the API has yet to answer. That
-  // is normal for a few seconds and a problem after that.
+  if (apiReachable) return "up";
+  // Every container is up and only the API has yet to answer. Normal for a few
+  // seconds; past that it is a real problem, and the error notice -- which
+  // carries the fix -- takes over.
   return settlingForMs > SETTLE_GRACE_MS ? "idle" : "settling";
 }
