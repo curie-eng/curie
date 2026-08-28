@@ -48,25 +48,25 @@ const ITEMS: readonly Item[] = [
   {
     id: "build",
     label: "Build",
-    hint: "Author the open bundle",
+    hint: "Make an agent and put it to work",
     icon: <Icon d="M3.4 12.6h9.2M5.4 10.2V5.6M8 10.2V3.4M10.6 10.2V7.2" />,
   },
   {
     id: "canvas",
     label: "Canvas",
-    hint: "Agents, pipelines, infra",
+    hint: "How your agents are wired together",
     icon: <Icon d="M3.2 3.6h3.4v3.2H3.2zM9.4 9.2h3.4v3.2H9.4zM6.6 5.2h2.2a2 2 0 0 1 2 2v2" />,
   },
   {
     id: "resources",
     label: "Resources",
-    hint: "Live CPU, memory, I/O",
+    hint: "What is using CPU, memory and disk",
     icon: <Icon d="M2.6 12.6V7.4M6.2 12.6V3.4M9.8 12.6V8.8M13.4 12.6V5.6" />,
   },
   {
     id: "tiers",
-    label: "Tiers",
-    hint: "Skill, local and cluster",
+    label: "Where it runs",
+    hint: "Just you, this computer, or your team",
     // Three rungs, ascending: the ladder itself.
     icon: <Icon d="M3 12.6h3.2V9.4H3zM6.4 12.6h3.2V6.2H6.4zM9.8 12.6H13V3.4H9.8z" />,
   },
@@ -131,7 +131,7 @@ export function Sidebar() {
           item={{
             id: "commands",
             label: "Commands",
-            hint: "Every curie command, where each one lives, and what has run",
+            hint: "Every command, where each one lives in this app, and what has run",
             icon: <Icon d={PROMPT} />,
           }}
           // Active for either pane: History is not a separate destination.
@@ -291,7 +291,7 @@ function MachineStatus() {
       {drifted ? (
         <button
           onClick={() => app.navigate("settings")}
-          title="This app was generated from a different version of the CLI than the one installed."
+          title="This app was built against a different version of Curie than the one installed here. Open Settings to see what differs."
           style={{
             marginTop: 7,
             border: "none",
@@ -305,7 +305,7 @@ function MachineStatus() {
             gap: 4,
           }}
         >
-          command surface drifted
+          version mismatch
         </button>
       ) : null}
     </div>

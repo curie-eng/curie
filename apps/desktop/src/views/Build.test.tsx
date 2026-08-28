@@ -183,7 +183,7 @@ describe("the agent list", () => {
     // scaffolding group at the foot.
     expect(list()).toBeInTheDocument();
     expect(detail()).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "First reply, no keys" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "See one work, no setup" })).toBeInTheDocument();
 
     // Exactly one control that MAKES an agent, and it opens the gallery rather
     // than the scaffolder. The command-shaped path still exists at the foot of

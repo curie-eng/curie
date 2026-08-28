@@ -401,17 +401,15 @@ function NoBundle({ first }: { readonly first: boolean }) {
         {first ? (
           <>
             Start one with <Mono>New agent…</Mono> in the Agents column on the left, or{" "}
-            <Mono>Import…</Mono> one that already exists on disk. An agent is a directory with{" "}
-            <Mono>.claude-plugin/plugin.json</Mono> in it: skills, the MCP servers they call, and the
-            eval cases that make a change falsifiable. Once one is open, this pane is where you run
-            it, grade it and deploy it.
+            <Mono>Import…</Mono> one you already have. An agent is a folder holding what it should
+            do, the outside tools it may use, and the examples that prove a change works. Once one
+            is open, this is where you try it, score it and put it to work.
           </>
         ) : (
           <>
             Choose one from the list on the left, or start another with <Mono>New agent…</Mono> at
-            the foot of it. A bundle is a directory with <Mono>.claude-plugin/plugin.json</Mono> in
-            it: skills, the MCP servers they call, and the eval cases that make a change
-            falsifiable.
+            the foot of it. An agent is a folder holding what it should do, the outside tools it may
+            use, and the examples that prove a change works.
           </>
         )}
       </EmptyState>
@@ -662,32 +660,36 @@ function Header({ checks, plugin }: { checks: readonly Check[]; plugin?: PluginM
         </div>
       </div>
 
-      {/* What the bundle declares, which is otherwise only visible by reading
-          plugin.json by hand. */}
+      {/* What this agent is made of, which is otherwise only visible by opening
+          its files one at a time. */}
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginTop: 12 }}>
-        <Fact label="Skills" value={String(ws.skills.length)} detail={ws.skills.join(", ")} />
+        <Fact label="Things it can do" value={String(ws.skills.length)} detail={ws.skills.join(", ")} />
         <Fact
-          label="Eval cases"
-          value={ws.hasEvals ? "present" : "none"}
-          detail={ws.hasEvals ? "evals/cases.json" : "not falsifiable yet"}
+          label="Examples"
+          value={ws.hasEvals ? "yes" : "none"}
+          detail={ws.hasEvals ? "scored on every change" : "no way to prove a change works"}
         />
-        <Fact label="MCP" value={ws.hasMcp ? "declared" : "none"} detail=".mcp.json" />
+        <Fact
+          label="Outside tools"
+          value={ws.hasMcp ? "yes" : "none"}
+          detail={ws.hasMcp ? "declared by this agent" : "uses only what Curie provides"}
+        />
         {plugin?.secrets?.length ? (
           <Fact
-            label="Secrets"
+            label="Secrets it needs"
             value={String(plugin.secrets.length)}
             detail={plugin.secrets.join(", ")}
           />
         ) : null}
         {plugin?.approvalGates?.length ? (
           <Fact
-            label="Approval gates"
+            label="Needs approval"
             value={String(plugin.approvalGates.length)}
             detail={plugin.approvalGates.join(", ")}
           />
         ) : null}
         {plugin?.triggerCount ? (
-          <Fact label="Triggers" value={String(plugin.triggerCount)} detail="cron or webhook" />
+          <Fact label="Runs on its own" value={String(plugin.triggerCount)} detail="on a schedule, or when something happens" />
         ) : null}
       </div>
     </Group>
@@ -729,11 +731,10 @@ function Ladder() {
         }
       >
         <div style={{ ...F.footnote, color: T.quaternary, marginTop: 10, lineHeight: 1.55 }}>
-          A runner executes an immutable snapshot taken at <Mono style={{ fontSize: 10 }}>skill up</Mono>,
-          so a SKILL.md edit reaches it only after a restart. Grading without that restart grades
-          the pre-edit bundle with nothing to say it is stale.{" "}
-          <Mono style={{ fontSize: 10 }}>skill up --replace</Mono> is the restart.
-          {" "}evals/cases.json is read live from source, so the contract needs no restart.
+          A test copy is a snapshot taken when it started, so edits to what the agent should do
+          reach it only after you restart it — and scoring without restarting scores the old
+          version, with nothing on screen to say so. Starting a test copy again replaces it. Your
+          examples are read fresh every time, so those never need a restart.
         </div>
       </Actions>
 

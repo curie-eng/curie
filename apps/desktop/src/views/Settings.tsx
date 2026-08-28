@@ -10,7 +10,6 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useApp } from "../bridge/app";
 import { isLoopback, LOCAL_API_KEY, LOCAL_API_URL } from "../../electron/shared/contract";
 import { THEMES } from "../../electron/shared/themes";
-import { commands } from "../lib/manifest";
 import { surfacesById } from "../lib/surfaces";
 import { Actions, DrivenBy, RunButton } from "./Actions";
 import { bridge, hasShell } from "../bridge/bridge";
@@ -311,7 +310,7 @@ function ApiPanel() {
 
   return (
     <Panel
-      title="Platform API"
+      title="Where your agents live"
       right={
         app.api ? (
           <Badge color={app.api.reachable ? ACCENT : STATUS.danger} filled>
@@ -342,8 +341,8 @@ function ApiPanel() {
             app.api?.hasKey
               ? "A key is stored. Leave blank to keep it."
               : isLoopback(baseUrl)
-                ? `Sent as X-API-Key. Blank uses ${LOCAL_API_KEY}, the key the local dev stack ships with — the same default the CLI uses.`
-                : "Sent as X-API-Key. This host is not local, so a key is required."
+                ? `Leave blank and Curie uses ${LOCAL_API_KEY}, the key it ships with for this computer.`
+                : "This is not this computer, so it needs a key."
           }
         >
           <Input
@@ -430,10 +429,9 @@ function SecretsPanel() {
       }
     >
       <div style={{ fontSize: 12, color: T.tertiary, marginBottom: 12, lineHeight: 1.6 }}>
-        {surfacesById.get("settings.secrets")!.blurb} Stored by <Mono>curie secrets</Mono> in its own
-        private storage. A value you type here is handed to the CLI through the environment, never as
-        a command argument, so it does not appear in <Mono>ps</Mono> — which is why this panel does
-        the job natively rather than opening the generic form.
+        {surfacesById.get("settings.secrets")!.blurb} A value you type here is passed along in a
+        way that keeps it out of anything another program on this computer could read, which is why
+        this panel does the job itself instead of opening the usual form.
       </div>
 
       {error ? (
@@ -554,7 +552,7 @@ function CommandSurfacePanel() {
 
   return (
     <Panel
-      title="Command surface"
+      title="Version check"
       right={
           <Badge color={clean ? ACCENT : drift ? STATUS.warn : T.tertiary} filled={!!drift}>
             {clean ? "in sync" : drift ? "drifted" : "not checked"}
@@ -563,11 +561,11 @@ function CommandSurfacePanel() {
     >
 
       <div style={{ fontSize: 12, color: T.tertiary, marginBottom: 12, lineHeight: 1.6 }}>
-        Every command in this app is generated from the CLI&apos;s own manifest, then checked
-        against the binary on PATH at startup.{" "}
+        This app is built against one version of Curie and drives whichever one is installed. It
+        checks the two agree when it starts.{" "}
         {clean
-          ? `All ${commands.length} commands this app offers match ${drift?.cliVersion ?? "the installed CLI"}.`
-          : "Below is where the two disagree."}
+          ? `Everything this app offers matches ${drift?.cliVersion ?? "the installed version"}.`
+          : "Below is where they disagree. Updating Curie usually fixes it."}
       </div>
 
       {behind.length ? (
@@ -576,14 +574,14 @@ function CommandSurfacePanel() {
             tone="error"
             title={
               behind.length === 1
-                ? "This app offers a command the installed CLI does not have"
+                ? "This app offers something the installed Curie does not have"
                 : `This app offers ${behind.length} commands the installed CLI does not have`
             }
           >
             <Mono style={{ fontSize: 11 }}>{behind.join(", ")}</Mono>
             <div style={{ marginTop: 6 }}>
               Running {behind.length === 1 ? "it" : "them"} will fail. The app was built against a
-              different version of the CLI.
+              different version of Curie.
             </div>
           </Notice>
         </div>
@@ -594,7 +592,7 @@ function CommandSurfacePanel() {
           tone="warn"
           title={
             ahead.length === 1
-              ? "The installed CLI has a command this app does not offer"
+              ? "The installed Curie can do something this app does not offer"
               : `The installed CLI has ${ahead.length} commands this app does not offer`
           }
         >
@@ -627,7 +625,7 @@ function EnvironmentPanel() {
 
   return (
     <Panel
-      title="What this app can see"
+      title="What this app can find"
       right={
         <div style={{ display: "flex", gap: 6 }}>
           <RunButton id="doctor">Full diagnosis</RunButton>
@@ -660,7 +658,7 @@ function EnvironmentPanel() {
 
       {env && !env.cliPath ? (
         <div style={{ marginTop: 12 }}>
-          <Notice tone="error" title="curie is not on PATH">
+          <Notice tone="error" title="Curie is not installed here">
             A GUI launch does not inherit your login shell&apos;s PATH. This app also looks in{" "}
             <Mono>~/.cargo/bin</Mono>, <Mono>~/.local/bin</Mono>, <Mono>/opt/homebrew/bin</Mono> and{" "}
             <Mono>/usr/local/bin</Mono>. If yours lives somewhere else, set{" "}
@@ -727,7 +725,7 @@ function AboutPanel() {
   const app = useApp();
   const env = app.env;
   return (
-    <Panel title="About this shell">
+    <Panel title="About">
       <div style={{ fontSize: 12, color: T.secondary, lineHeight: 1.7 }}>
         Curie Desktop is Chromium with the browser removed. It keeps the renderer — one engine that
         draws identically on macOS, Windows and Linux — and drops tabs, history, extensions, profile
@@ -758,7 +756,7 @@ function AboutPanel() {
       ) : null}
       {!hasShell() ? (
         <div style={{ marginTop: 12 }}>
-          <Notice tone="warn" title="Running without the desktop shell">
+          <Notice tone="warn" title="Running without the app around it">
             This window is a plain web page, so anything needing the local machine is disabled. Start
             it with <Mono>pnpm dev</Mono> from <Mono>apps/desktop</Mono> to get the full app.
           </Notice>

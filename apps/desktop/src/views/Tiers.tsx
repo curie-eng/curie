@@ -36,7 +36,7 @@ import type { Command } from "../lib/manifest";
 import { resolve, surfacesById, type Action, type Surface } from "../lib/surfaces";
 import { ActionButton, Actions, NeedNotice } from "./Actions";
 import { ACCENT, F, HUE, LINE, R, S, STATUS, T, tint } from "../tokens";
-import { Badge, Group, Mono, SectionHeader } from "../primitives";
+import { Badge, Group, SectionHeader } from "../primitives";
 
 /** What each rung actually is, in one honest sentence about cost and reach. The
  *  manifest describes commands; nothing in it describes a *tier*. */
@@ -54,20 +54,20 @@ const RUNGS: readonly Rung[] = [
   {
     surfaceId: "tiers.skill",
     color: ACCENT,
-    cost: "One container, seconds to start",
-    reach: "This directory only — no agents, no versions, no memory",
+    cost: "Seconds to start",
+    reach: "Only you can reach it, and it forgets everything when it stops",
   },
   {
     surfaceId: "tiers.local",
     color: STATUS.info,
-    cost: "Eight or so containers, about a minute",
-    reach: "The whole platform on this machine, with real agents to deploy to",
+    cost: "About a minute to start",
+    reach: "Everything works for real, but only on this computer",
   },
   {
     surfaceId: "tiers.cluster",
     color: HUE.violet,
-    cost: "A Helm release on a real cluster",
-    reach: "The same platform, reachable by other people",
+    cost: "Needs a server",
+    reach: "Stays up, and anyone who needs it can reach it",
   },
 ];
 
@@ -87,19 +87,19 @@ function verbOf(id: string): string {
  *  deliberately differ per rung, because "Boot runner", "Bring up" and "Install
  *  or upgrade" are honestly different acts that happen to be the same verb. */
 const VERB_LABEL: Record<string, string> = {
-  up: "Start",
-  status: "Check",
+  up: "Start it",
+  status: "Check it",
   message: "Talk to it",
-  eval: "Grade",
-  down: "Stop",
+  eval: "Score it",
+  down: "Stop it",
   comms: "Slack",
-  check: "MCP servers",
-  rebuild: "One service",
+  check: "Its tools",
+  rebuild: "One piece",
   "github-app": "GitHub identity",
-  "migrate-store": "Object store",
-  "observability.runs": "Recent runs",
-  "observability.run": "One run",
-  "observability.metrics": "Metrics",
+  "migrate-store": "Stored files",
+  "observability.runs": "Recent activity",
+  "observability.run": "One conversation",
+  "observability.metrics": "Usage",
 };
 
 /** A verb nobody has named still gets a readable row rather than being dropped:
@@ -177,9 +177,9 @@ const ONLY: readonly (readonly NonNullable<Cell>[])[] = RUNGS.map((_, col) =>
 /** What a band of rows means. Keyed by how many rungs offer the verb, which is
  *  the fact the band is grouping on. */
 const BAND: Record<number, string> = {
-  3: "At every rung",
-  2: "Once there is a platform",
-  1: "Only at this rung",
+  3: "Everywhere",
+  2: "Once it has a home",
+  1: "Only here",
 };
 
 /** The label column is bounded rather than `auto` so the three rung columns stay
@@ -278,9 +278,8 @@ export function Tiers() {
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18, alignItems: "start" }}>
         <Actions surface={surfacesById.get("tiers.declarative")!}>
           <div style={{ ...F.footnote, color: T.quaternary, marginTop: 10, lineHeight: 1.55 }}>
-            A <Mono style={{ fontSize: 10 }}>curie.yaml</Mono> describes the release you want;{" "}
-            <Mono style={{ fontSize: 10 }}>apply</Mono> converges the cluster to it. Read the diff
-            first — it is the only one of the three that changes nothing.
+            One file describes the setup you want, and applying it changes the server to match.
+            Check what would change first — it is the only one of the three that changes nothing.
           </div>
         </Actions>
 
@@ -383,13 +382,11 @@ function Explainer() {
         padding: "12px 14px",
       }}
     >
-      <div style={{ ...F.headline, marginBottom: 4 }}>The same agent, three deployments</div>
+      <div style={{ ...F.headline, marginBottom: 4 }}>One agent, three places to put it</div>
       <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.6, maxWidth: 820 }}>
-        A bundle runs unchanged at every rung. Going up costs more to start and reaches further, and
-        the verbs keep their names — <Mono style={{ fontSize: 11 }}>message</Mono>,{" "}
-        <Mono style={{ fontSize: 11 }}>eval</Mono>, <Mono style={{ fontSize: 11 }}>deploy</Mono>,{" "}
-        <Mono style={{ fontSize: 11 }}>kill</Mono> — so what you learn on one rung is what you know
-        on the next.
+        The same agent works in all three without being changed. Moving right costs more to set up
+        and lets more people reach it — and you do the same things to it wherever it is, so nothing
+        you learn here has to be learned again there.
       </div>
     </div>
   );
@@ -406,20 +403,20 @@ export function LadderStrip() {
   const cluster = !!app.api?.reachable && !app.api.baseUrl.includes("localhost");
 
   const rungs: [string, boolean, string][] = [
-    ["Skill", runners, ACCENT],
-    ["Local", stack, STATUS.info],
-    ["Cluster", cluster, HUE.violet],
+    ["Just you", runners, ACCENT],
+    ["This computer", stack, STATUS.info],
+    ["Your team", cluster, HUE.violet],
   ];
 
   return (
     <section>
-      <SectionHeader>Where things are running</SectionHeader>
+      <SectionHeader>Where your agents can run</SectionHeader>
       {/* Slim: three pills and a link do not need a card's worth of padding,
           and the band of empty space between them was reading as a mistake. */}
       <Group style={{ padding: "7px 12px" }}>
         <button
           onClick={() => app.navigate("tiers")}
-          title="Open the tiers view"
+          title="See where an agent can run"
           style={{
             display: "flex",
             alignItems: "center",
@@ -462,7 +459,7 @@ export function LadderStrip() {
             </span>
           ))}
           <span style={{ flex: 1 }} />
-          <span style={{ ...F.footnote, color: T.tertiary }}>Open tiers ›</span>
+          <span style={{ ...F.footnote, color: T.tertiary }}>Where it runs ›</span>
         </button>
       </Group>
     </section>

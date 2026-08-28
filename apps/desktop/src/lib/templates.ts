@@ -140,6 +140,84 @@ const STACK_CASES = (agent: string) =>
     2,
   ) + "\n";
 
+
+const OWN_CODE_PY = `"""Your agent's own code.
+
+Anything you write here that is wrapped in @tool becomes something the agent can
+call. Keep each one small and predictable: the point of putting work here rather
+than in the agent's instructions is that a program gives the same answer every
+time, and a model does not.
+
+Run it yourself while you are working on it:
+
+    python tools/tools.py
+
+This talks to the agent over stdin and stdout, so it never listens on a port and
+nothing outside this computer can reach it.
+"""
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("tools")
+
+
+@mcp.tool()
+def word_count(text: str) -> int:
+    """Count the words in a piece of text."""
+    return len(text.split())
+
+
+@mcp.tool()
+def reading_time_minutes(text: str) -> float:
+    """Roughly how many minutes it takes to read a piece of text."""
+    return round(len(text.split()) / 200, 1)
+
+
+if __name__ == "__main__":
+    mcp.run()
+`;
+
+const OWN_CODE_MCP = `{
+  "mcpServers": {
+    "tools": {
+      "command": "python",
+      "args": ["tools/tools.py"]
+    }
+  }
+}
+`;
+
+const OWN_CODE_SKILL = (agent: string) => `---
+name: ${agent}
+description: Answer questions about a piece of text by measuring it, using this agent's own code rather than estimating.
+allowed-tools:
+  - tools
+---
+
+# ${agent}
+
+## When to use this
+
+Somebody asks how long a piece of text is, how many words it has, or how long it
+takes to read.
+
+## How to answer
+
+Call the tool, do not estimate. That is the whole reason the code is here: a
+program gives the same answer every time and a guess does not.
+
+- \`word_count\` for a number of words.
+- \`reading_time_minutes\` for how long it takes to read.
+
+Say the number plainly, and say what it refers to.
+
+## Making it yours
+
+The two tools above are examples. Open \`tools/tools.py\`, replace them with
+whatever your agent actually needs, and describe those here instead — this file
+is what tells the agent when to reach for them.
+`;
+
 export const TEMPLATES: readonly Template[] = [
   {
     id: "stack",
@@ -158,6 +236,23 @@ export const TEMPLATES: readonly Template[] = [
     files: (agent) => ({
       [`skills/${agent}/SKILL.md`]: STACK_SKILL(agent),
       "evals/cases.json": STACK_CASES(agent),
+    }),
+  },
+  {
+    id: "own-code",
+    name: "Your own code",
+    tagline:
+      "You write a small program; the agent calls it. For anything a set of instructions cannot do on its own.",
+    about:
+      "Some work is arithmetic, or a lookup, or a call to a system you already run — things a model should not be improvising. This starts you with a small program the agent can call like any other tool, plus the wiring already done. Written in Python, kept inside the agent's own folder, and running on your computer rather than anywhere else.",
+    example: [
+      { from: "you", text: "how long is this document?" },
+      { from: "agent", text: "1,284 words — about 6 minutes to read." },
+    ],
+    files: (agent) => ({
+      "tools/tools.py": OWN_CODE_PY,
+      ".mcp.json": OWN_CODE_MCP,
+      [`skills/${agent}/SKILL.md`]: OWN_CODE_SKILL(agent),
     }),
   },
   {
