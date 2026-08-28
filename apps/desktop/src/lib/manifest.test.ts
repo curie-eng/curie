@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 
 import { resolve as resolveArgv } from "../../electron/ipc/manifest";
-import { humanArg,
+import { runtimeDefault, humanArg,
   commands,
   commandsById,
   fieldKind,
@@ -386,5 +386,26 @@ describe("humanArg", () => {
     expect(humanArg("run_id")).toBe("Run ID");
     expect(humanArg("github-app")).toBe("GitHub app");
     expect(humanArg("plugin-dir")).toBe("Plugin Directory");
+  });
+});
+
+describe("runtimeDefault", () => {
+  const file = { id: "file", long: "file", positional: false, required: false, help: "" };
+
+  it("names the compose file a dev build uses, when there is a checkout", () => {
+    // The manifest says `null` for this flag because clap never sees the
+    // default -- the CLI resolves it at runtime. Without this the box showed a
+    // shape hint and left the answer in a two-line help string.
+    expect(runtimeDefault(file as never, { repoRoot: "/repo" })).toBe("compose.dev.yaml");
+  });
+
+  it("names the pinned release file when there is no checkout", () => {
+    expect(runtimeDefault(file as never, { repoRoot: null })).toContain("compose.release.yaml");
+    expect(runtimeDefault(file as never, null)).toContain("compose.release.yaml");
+  });
+
+  it("has nothing to say about other flags", () => {
+    const other = { id: "agent", long: "agent", positional: false, required: false, help: "" };
+    expect(runtimeDefault(other as never, { repoRoot: "/repo" })).toBeNull();
   });
 });

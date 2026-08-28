@@ -71,6 +71,12 @@ React + TypeScript renderer. Full structure and rationale in
   only approximate. It was also, before that, a chip beside the label, which was
   reported as easy to miss and was.
 
+  Some defaults are not in the manifest at all, because clap never sees them:
+  `--file` resolves at runtime to the local `compose.dev.yaml` on a dev build and
+  a pinned `compose.release.yaml` from the remote on a release one. `manifest.ts`
+  supplies those as `runtimeDefault`, keyed off `repoRoot`, rather than leaving
+  the box with a shape hint and the answer buried in a two-line help string.
+
   **Context IS a value.** The bundle the operator has open, what they typed last
   time (`STICKY_FLAGS`), and what a contextual control seeded are answers to the
   question rather than restatements of the fallback, so those are typed in and

@@ -227,6 +227,27 @@ export function defaultValue(arg: ManifestArg): string {
   return arg.default_values?.[0] ?? "";
 }
 
+/**
+ * Placeholders for flags whose default the CLI computes at runtime.
+ *
+ * Some defaults are not in the manifest because clap never sees them -- `--file`
+ * resolves to the local `compose.dev.yaml` on a dev build and a version-pinned
+ * `compose.release.yaml` from the remote on a release one. The manifest says
+ * `null`, so without this the box showed a shape hint and the operator had to
+ * read a two-line help string to learn what leaving it blank does.
+ *
+ * Here rather than in the view, per the rule about per-command special cases
+ * being data. `repoRoot` is the switch because a checkout is exactly the case
+ * where the dev file exists and is the one that gets used.
+ */
+export function runtimeDefault(
+  arg: ManifestArg,
+  env: { repoRoot?: string | null } | null | undefined,
+): string | null {
+  if (arg.long !== "file") return null;
+  return env?.repoRoot ? "compose.dev.yaml" : "compose.release.yaml (pinned, from the remote)";
+}
+
 /** Search over id, name, and help text. Ranked so an exact command name beats a
  *  help-text mention, which is what makes the palette feel like it read your
  *  mind on `curie local up`. */

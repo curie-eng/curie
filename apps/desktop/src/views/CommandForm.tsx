@@ -25,6 +25,7 @@ import {
   cwdReason,
   fieldKind,
   humanArg,
+  runtimeDefault,
   defaultValue,
   renderCommand,
   NEEDS_TERMINAL,
@@ -596,6 +597,7 @@ function PathInput({
   value: string;
   onChange(next: string): void;
 }) {
+  const app = useApp();
   const [over, setOver] = useState(false);
 
   const choose = async () => {
@@ -639,12 +641,11 @@ function PathInput({
         // The default in the box. Where there is none, say what shape of thing
         // belongs here rather than leaving it blank.
         placeholder={
-          arg.default_values?.[0] ??
-          (over
+          over
             ? "Drop it here"
-            : kind === "file"
-              ? "Choose a file, or drop one here"
-              : "Choose a directory, or drop one here")
+            : (arg.default_values?.[0] ??
+              runtimeDefault(arg, app.env) ??
+              (kind === "file" ? "Choose a file, or drop one here" : "Choose a directory"))
         }
         onChange={(e) => onChange(e.target.value)}
         style={{ fontFamily: FONT.mono, flex: 1, minWidth: 0 }}
