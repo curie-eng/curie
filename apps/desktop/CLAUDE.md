@@ -803,6 +803,32 @@ React + TypeScript renderer. Full structure and rationale in
   global `:focus-visible` rule was drawing a 2px accent ring around the whole
   sheet.
 
+- **An agent is configured with fields, not by opening its files.**
+  `AgentSettings` in the Build view edits what the agent should do, its
+  description and the suggestions it offers. All three were already
+  configurable; it just meant knowing that the description lives in
+  `plugin.json`, that the instructions are the prose under a YAML frontmatter
+  block in `skills/<name>/SKILL.md`, and that the suggestions are a JSON array
+  called `starterPrompts`. That is the CLI's filing system, and knowing it is the
+  price this window exists to remove.
+
+  It goes through the pure write functions in `bundle.ts` -- `withSkillBody`,
+  `withPluginField` -- so the panel and the file editor below it cannot disagree
+  about what a file means, and each has a test. Two rules there:
+  **an empty value REMOVES the field** rather than writing `""`, because these
+  are absent-or-present and a blank description is a description the platform
+  will faithfully show; and **a file that does not parse is not written at all**,
+  because replacing it with what the panel could model is how an author loses the
+  half of it the panel does not.
+
+  Save state is **per field**, on blur. One failing write must not make every
+  other field look unsaved.
+
+  The dials that only exist once an agent is RUNNING -- model, thinking, where it
+  answers, what it may spend -- are genuinely elsewhere, on the agent's row on the
+  Overview. The panel says so rather than leaving somebody to hunt for them and
+  conclude they do not exist.
+
 - **The agent is a surface, not a prefix.** Twenty-six commands are agent-scoped:
   thirteen verbs at the local and the cluster tier. They live in one sheet
   (`src/views/AgentSheet.tsx`), opened from the agent's own row, with the tier

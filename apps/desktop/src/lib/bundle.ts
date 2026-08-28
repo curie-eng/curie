@@ -475,3 +475,70 @@ export function validateForSave(path: string, text: string): string | null {
   // than letting the CLI be the judge.
   return null;
 }
+
+// --- editing, for the controls that stand in for a text editor ---------------
+//
+// The Build view lets somebody configure an agent with fields rather than by
+// opening its files, so these are the writes behind those fields. Each one is a
+// pure text-to-text function with a test, because "the app corrupted my agent"
+// is the one outcome a settings panel must never produce, and a round trip
+// through a form is exactly where that happens.
+
+/**
+ * The prose under a skill's frontmatter: what the agent should actually do.
+ *
+ * Returned separately from the frontmatter because it is the thing an author
+ * writes and rewrites, while the frontmatter is three fields that change rarely.
+ */
+export function skillBody(text: string): string {
+  const match = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(text.trimStart());
+  return match ? text.trimStart().slice(match[0].length).replace(/^\r?\n/, "") : text;
+}
+
+/**
+ * Replace that prose, leaving the frontmatter untouched.
+ *
+ * A file with no frontmatter is returned with the new body and nothing else --
+ * inventing a frontmatter block here would put a `name` in the file that the
+ * author never chose, and the readiness check already reports its absence.
+ */
+export function withSkillBody(text: string, body: string): string {
+  const trimmed = text.trimStart();
+  const match = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(trimmed);
+  if (!match) return body.endsWith("\n") ? body : `${body}\n`;
+  const head = trimmed.slice(0, match[0].length).replace(/\r?\n*$/, "\n");
+  return `${head}\n${body.replace(/\s*$/, "")}\n`;
+}
+
+/**
+ * Set one top-level field in `plugin.json`, or remove it when the value is empty.
+ *
+ * Removing rather than writing `""` or `[]` matters: the manifest's optional
+ * fields are absent-or-present, and an empty string in `description` is a
+ * description the platform will faithfully show as blank.
+ *
+ * Refuses to write anything if the file does not parse. A settings panel that
+ * "fixes" a broken file by overwriting it with what it could salvage is how an
+ * author loses the half of the file the panel does not model.
+ */
+export function withPluginField(
+  text: string,
+  key: string,
+  value: string | readonly string[] | undefined,
+): Parsed<string> {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(text);
+  } catch (err) {
+    return { ok: false, error: `plugin.json does not parse: ${(err as Error).message}` };
+  }
+  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
+    return { ok: false, error: "plugin.json is not a JSON object" };
+  }
+  const next = { ...(doc as Record<string, unknown>) };
+  const empty =
+    value === undefined || (typeof value === "string" ? !value.trim() : value.length === 0);
+  if (empty) delete next[key];
+  else next[key] = typeof value === "string" ? value.trim() : [...value];
+  return { ok: true, value: `${JSON.stringify(next, null, 2)}\n` };
+}
