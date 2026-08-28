@@ -95,30 +95,29 @@ def approval_turn(summary: str, route: str | None = None) -> list[Any]:
     ]
 
 
-# PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
-# The offline fake never runs a real model, so it cannot "decide" to call
-# curie-delegate the way a live model reading its tool description would.
+# ADR-0115. The offline fake never runs a real model, so it cannot "decide" to
+# call curie-delegate the way a live model reading its tool description would.
 # Mirrors APPROVAL_MARKER exactly: a marker in the query text stands in for
-# that decision so the demo (`curie local` with no model credential) can
-# exercise the REAL delegate router/MCP-server/reply-sink code path end to
-# end, offline. Everything after the marker on the same line is the message
-# sent to the target agent.
+# that decision so an offline caller (no model credential, e.g. CI or
+# `curie local --fake-model`) can exercise the REAL delegate
+# router/MCP-server/reply-sink code path end to end. Everything after the
+# marker on the same line is the message sent to the target agent.
 DELEGATE_MARKER = "[fake:delegate:<target-agent>]"
 _DELEGATE_MARKER_RE = re.compile(r"\[fake:delegate:([A-Za-z0-9_-]+)\]")
 DELEGATE_TOOL_NAME = f"mcp__{DELEGATE_SERVER_NAME}__call_agent"
 
 
-# The delegate TARGET's side of the prototype demo. The fake model cannot
-# reason, so a delegated question would otherwise come back as the canned
-# "all done" -- a visible non-answer that makes the demo look like the delivery
-# path worked while the answer did not. This is a deterministic responder, not a
-# model: it solves a two-operand integer expression by regex and arithmetic, and
-# says "idk" for anything else. No model call and no network, so the
+# The delegate TARGET's side of the fake model. The fake model cannot reason,
+# so a delegated question would otherwise come back as the canned "all done"
+# -- a visible non-answer that makes it look like the delivery path worked
+# while the answer did not. This is a deterministic responder, not a model: it
+# solves a two-operand integer expression by regex and arithmetic, and says
+# "idk" for anything else. No model call and no network, so the
 # CURIE_FAKE_MODEL offline guarantee (ADR-0055, runner/CLAUDE.md) still holds.
 #
 # `eval` is deliberately NOT used: the input is an inbound message from another
 # agent, and handing that to the interpreter would be arbitrary code execution
-# in the sandbox for a demo fixture's convenience.
+# in the sandbox for an offline fixture's convenience.
 _ARITH_RE = re.compile(r"(-?\d+)\s*([-+*/])\s*(-?\d+)")
 
 
@@ -156,7 +155,7 @@ def arithmetic_turn(question: str) -> list[Any]:
 
 
 def delegate_turn(target_agent: str, message: str) -> list[Any]:
-    """A turn that calls the (prototype) curie-delegate tool, then ends."""
+    """A turn that calls the curie-delegate tool, then ends."""
 
     text = f"Asking {target_agent} about that."
     return [
@@ -211,15 +210,14 @@ class FakeModelSession:
         # the fake tier omits the sole-route auto-bind / unknown-route refusal and
         # silently widens the card -- the exact real-path regression #544 closed.
         self._approval_gate = approval_gate
-        # PROTOTYPE (Draft ADR-0115): when set, a scripted DELEGATE_TOOL_NAME
-        # block makes a REAL call through it (an actual HTTP POST to the
-        # prototype delegate route), the same "fake decision, real side effect"
-        # shape as request_approval above.
+        # ADR-0115: when set, a scripted DELEGATE_TOOL_NAME block makes a REAL
+        # call through it (an actual HTTP POST to the delegate route), the same
+        # "fake decision, real side effect" shape as request_approval above.
         self._delegate_client = delegate_client
-        # PROTOTYPE (Draft ADR-0115): set only for a turn the delegate router
-        # minted (its conversation id is `delegate:<call id>`), so this responder
-        # answers a DELEGATED question and nothing else. Every other fake boot,
-        # and every existing test, keeps `default_turn()` verbatim.
+        # ADR-0115: set only for a turn the delegate router minted (its
+        # conversation id is `delegate:<call id>`), so this responder answers a
+        # DELEGATED question and nothing else. Every other fake boot, and every
+        # existing test, keeps `default_turn()` verbatim.
         self._answer_arithmetic = answer_arithmetic
         self.connected = False
         self.queries: list[str] = []

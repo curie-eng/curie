@@ -1,11 +1,9 @@
-"""PROTOTYPE: the worker's write client for delegate calls (Draft ADR-0115).
+"""The worker's write client for delegate calls (ADR-0115).
 
 Mirrors ``approvals.ApprovalClient``: the worker never writes to Postgres or
 XADDs onto ``curie:runs`` directly for this feature -- it calls back into the
 API over HTTP with the platform key, the same pattern every other durable
-write the worker makes already uses. See
-``docs/demo/ADR-0115-PROTOTYPE-NOTES.md`` for what this prototype cuts from
-the full ADR.
+write the worker makes already uses.
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ class DelegateBackendError(Exception):
 
 
 class DelegateClient:
-    """HTTP implementation against the platform API's (prototype) delegate routes."""
+    """HTTP implementation against the platform API's delegate routes."""
 
     def __init__(self, *, api_base_url: str, api_key: str, client: httpx.AsyncClient) -> None:
         self._base = api_base_url.rstrip("/")

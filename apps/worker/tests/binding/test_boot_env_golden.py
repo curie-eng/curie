@@ -42,8 +42,7 @@ _MINTED = (
     "CURIE_MEMORY_TOKEN",
     "CURIE_HISTORY_TOKEN",
     "CURIE_STATE_TOKEN",
-    # PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
-    "CURIE_DELEGATE_TOKEN",
+    "CURIE_DELEGATE_TOKEN",  # ADR-0115
 )
 
 _MEMORY_REF = f"http://localhost:8000/agents/{_AGENT}/state/memory"

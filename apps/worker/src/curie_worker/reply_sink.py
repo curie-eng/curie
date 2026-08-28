@@ -43,7 +43,7 @@ ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 
 SLACK_KIND = "slack"
 
-# PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
+# ADR-0115: the ReplyHandle.kind a delegate target's turn carries.
 DELEGATION_KIND = "delegation"
 
 # The most acknowledgement body the worker will read off an adapter. The ack
@@ -277,10 +277,10 @@ def _ref_from(payload: bytes) -> str | None:
 
 
 class DelegationReplyAdapter:
-    """PROTOTYPE (Draft ADR-0115, not accepted): routes a delegate target's
-    replies back to the calling agent, over HTTP to the (prototype) API delegate
-    routes -- never a real outbound egress adapter, since ``kind="delegation"``
-    is a platform-internal route, not an operator-configured one.
+    """Routes a delegate target's replies back to the calling agent, over HTTP
+    to the API's delegate routes -- never a real outbound egress adapter, since
+    ``kind="delegation"`` is a platform-internal route, not an
+    operator-configured one.
 
     ``event.target.address`` is the target agent's own id (the binding this
     turn's ``ReplyHandle.channel`` was bound to when the operator armed it);
@@ -353,12 +353,11 @@ def build_reply_sink(
 ) -> ReplySinkRouter:
     """The worker's sink: Slack below its own origin, everything else over HTTP.
 
-    ``http_client``: PROTOTYPE (Draft ADR-0115). When supplied, wires the
-    ``delegation`` kind to ``DelegationReplyAdapter``, reusing the caller's
-    shared ``httpx.AsyncClient`` (the same one the approval writer and eval-lane
-    reporters already share in ``run.py``) rather than opening a new one.
-    Omitted callers (existing tests) get the pre-prototype adapter set
-    unchanged.
+    ``http_client``: ADR-0115. When supplied, wires the ``delegation`` kind to
+    ``DelegationReplyAdapter``, reusing the caller's shared ``httpx.AsyncClient``
+    (the same one the approval writer and eval-lane reporters already share in
+    ``run.py``) rather than opening a new one. Omitted callers (existing tests)
+    get the adapter set from before delegation existed, unchanged.
     """
     adapters: dict[str, ReplySink] = {
         SLACK_KIND: SlackReplyAdapter(

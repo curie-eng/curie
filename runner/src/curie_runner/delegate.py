@@ -1,11 +1,8 @@
-"""PROTOTYPE: the ``curie-delegate`` MCP server (Draft ADR-0115, not accepted).
+"""The ``curie-delegate`` MCP server (ADR-0115).
 
-**This is a demo prototype, not the ADR-0115 implementation.** See
-``docs/demo/ADR-0115-PROTOTYPE-NOTES.md`` for the documented deviations
-(reused job-lane ``TurnSource``, no formal suspend/resume, no bundle-declared
-allowlist or on-wire call chain/depth). Modeled directly on
-``runner/src/curie_runner/state.py`` -- the auto-mounted-MCP-server pattern
-ADR-0073 established and this prototype reuses rather than inventing a new one.
+Modeled directly on ``runner/src/curie_runner/state.py`` -- the
+auto-mounted-MCP-server pattern ADR-0073 established and this reuses rather
+than inventing a new one.
 
 ``CURIE_DELEGATE_URL`` / ``CURIE_DELEGATE_TOKEN`` are the boot-env pair
 (mirrors ``CURIE_STATE_URL``/``CURIE_STATE_TOKEN``): the URL is this agent's
@@ -42,7 +39,7 @@ HISTORY_REF_ENV = BootEnv.env_key("history_ref")
 
 _TIMEOUT_SECONDS = 15
 
-# The conversation-id prefix the (prototype) delegate router mints for a target's
+# The conversation-id prefix the delegate router mints for a target's
 # turn (`delegate:<call id>`), mirrored here so the runner can tell a delegated
 # turn from an ordinary one without a new boot-env field.
 DELEGATE_CONVERSATION_PREFIX = "delegate:"
@@ -68,7 +65,7 @@ def _conversation_id_from_history_ref(history_ref: str | None) -> str | None:
 
 
 class DelegateApiClient:
-    """Thin async client over the (prototype) delegate-calls route.
+    """Thin async client over the delegate-calls route.
 
     ``base_url`` is the fully composed ``.../agents/<id>/delegate/calls``
     endpoint. The scoped ``delegate`` token (ADR-0033) rides ``X-API-Key``,
@@ -141,8 +138,7 @@ async def op_call_agent(client: DelegateApiClient, args: dict[str, Any]) -> dict
             "note": (
                 f"Asked {target_agent!r}. This is asynchronous: the reply, if any, "
                 "will arrive later as a new message in this conversation, not as "
-                "this tool call's return value. (Prototype note: no formal "
-                "suspend -- it is safe to end your turn now.)"
+                "this tool call's return value. It is safe to end your turn now."
             ),
         }
     )

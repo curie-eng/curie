@@ -632,11 +632,10 @@ class BindingResolver:
         # and none is set -- preserving the pre-#410 no-key path.
         state_token: str | None = None
         app_state_token: str | None = None
-        # PROTOTYPE (Draft ADR-0115, not accepted -- docs/demo/ADR-0115-PROTOTYPE-NOTES.md).
-        # A third scoped-token scope, minted the same way as state/state.app: the
-        # sandbox presents this to the API's new (prototype) delegate router,
-        # never the raw platform key. Absent on the no-key fake/local path, same
-        # as the state tokens above.
+        # ADR-0115: a third scoped-token scope, minted the same way as
+        # state/state.app: the sandbox presents this to the API's delegate
+        # router, never the raw platform key. Absent on the no-key fake/local
+        # path, same as the state tokens above.
         delegate_token: str | None = None
         if self._config.api_key:
             exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
@@ -708,10 +707,10 @@ class BindingResolver:
             # (and the URL still emitted) on the no-key fake/local path.
             state_url=state_url,
             state_token=app_state_token,
-            # PROTOTYPE (Draft ADR-0115): mirrors state_url/state_token exactly.
-            # Omitted (both None) on the no-key fake/local path since there is
-            # nothing to sign a delegate token with; the runner simply mounts
-            # no curie-delegate server in that case.
+            # ADR-0115: mirrors state_url/state_token exactly. Omitted (both
+            # None) on the no-key fake/local path since there is nothing to
+            # sign a delegate token with; the runner simply mounts no
+            # curie-delegate server in that case.
             delegate_url=delegate_url if delegate_token else None,
             delegate_token=delegate_token,
         )
