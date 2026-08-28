@@ -279,7 +279,8 @@ describe("deleting an agent", () => {
     mount();
     await waitFor(() => expect(within(list()).getByText("weather")).toBeInTheDocument());
 
-    await userEvent.click(screen.getByRole("button", { name: "Delete weather" }));
+    await userEvent.click(screen.getByRole("button", { name: "Actions for weather" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Delete…" }));
     await waitFor(() => expect(screen.getByText("Delete this agent")).toBeInTheDocument());
 
     const confirm = screen.getByRole("button", { name: "Delete permanently" });
@@ -309,7 +310,8 @@ describe("deleting an agent", () => {
     mount();
     await waitFor(() => expect(within(list()).getByText("weather")).toBeInTheDocument());
 
-    await userEvent.click(screen.getByRole("button", { name: "Delete weather" }));
+    await userEvent.click(screen.getByRole("button", { name: "Actions for weather" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Delete…" }));
     await userEvent.type(await screen.findByRole("textbox"), "weather");
     await userEvent.click(screen.getByRole("button", { name: "Delete permanently" }));
 

@@ -661,6 +661,31 @@ React + TypeScript renderer. Full structure and rationale in
   "Scaffold a bundle, or find the ones already on this machine" over two buttons,
   neither of which scaffolds.
 
+- **A row's actions go behind `MenuButton`, not a bare glyph.** A single-purpose
+  control only works while there is exactly one purpose; the kebab is the
+  platform's answer to "this row has actions" and takes a second one without
+  being redesigned. It is revealed on row hover or focus (`.row-delete`), with
+  opacity rather than `display` so it stays in the tab order -- hover-only would
+  put it out of reach for anyone driving by keyboard.
+
+  It renders through a **portal**. Every list here lives inside a `Group`, which
+  sets `overflow: hidden` to keep children inside its rounded corners, so a
+  popover positioned inside the row is clipped by its own container. It closes on
+  outside press, Escape, scroll and resize -- the last two because it is
+  positioned once from a measured rect, and left open through a scroll it would
+  hang in the wrong place pointing at a row that has moved.
+
+  **A menu is not a card.** `Group` is glass because it sits on the pane and the
+  vibrancy carrying through is the point; a menu floats over arbitrary content
+  and has to be its own surface, so it takes opaque `S.raised`. That also makes a
+  `backdrop-filter` a no-op costing a compositing layer, so it has none.
+
+  Its opacity cannot be judged from a CDP capture -- the card *underneath* it is
+  backdrop-filtered, and the capture composites that wrongly, so the menu looks
+  see-through in a screenshot while hit-testing at its centre returns its own
+  button. That is the same trap this file already warns about for cards, the
+  seam, the pane and the sheet. Measure the computed background and the hit test.
+
 - **A bundle can be deleted, and the guards are in the SHELL.** The Build
   column had no way to remove a row at all -- `forgetWorkspace` existed on the
   bridge and was called from nowhere -- so a test agent stayed in the list

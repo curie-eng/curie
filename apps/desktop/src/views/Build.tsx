@@ -40,7 +40,7 @@ import {
   type PluginManifest,
   type SkillMeta,
 } from "../lib/bundle";
-import { ACCENT, F, FONT, LINE, R, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, FONT, LINE, S, STATUS, T, tint } from "../tokens";
 import {
   Badge,
   Button,
@@ -48,6 +48,7 @@ import {
   Field,
   Group,
   Input,
+  MenuButton,
   Mono,
   Notice,
   Row,
@@ -225,35 +226,26 @@ function AgentList() {
                     {w.hasEvals ? " · evals" : ""}
                   </div>
                 </div>
-                {/* Revealed on row hover or focus, not standing there always: a
-                    delete control beside every row permanently is a mis-click
-                    waiting to happen on a list you point at to SWITCH agents far
-                    more often than to remove one. Opacity rather than display,
-                    so it stays in the tab order for anyone driving by keyboard;
-                    see `.row-delete` in styles.css. `stopPropagation` because
-                    the row itself selects. */}
-                <button
+                {/* The row's actions, behind the platform's overflow affordance
+                    rather than a bare glyph doing one thing -- a single-purpose
+                    control only works while there is exactly one purpose, and
+                    this list will grow more than one. Revealed on row hover or
+                    focus, because a control standing beside every row is a
+                    mis-click waiting to happen on a list you point at to SWITCH
+                    agents far more often than to act on one. Opacity rather than
+                    display, so it stays in the tab order; see `.row-delete` in
+                    styles.css. */}
+                <MenuButton
                   className="row-delete"
-                  aria-label={`Delete ${w.plugin?.name ?? w.name}`}
-                  title={`Delete ${w.plugin?.name ?? w.name} from disk`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setPendingDelete(w);
-                  }}
-                  style={{
-                    flex: "none",
-                    border: "none",
-                    background: "transparent",
-                    padding: 3,
-                    marginRight: -3,
-                    borderRadius: R.control,
-                    color: "inherit",
-                    cursor: "default",
-                    display: "inline-flex",
-                  }}
-                >
-                  <Glyph d="M4.5 4.5l7 7M11.5 4.5l-7 7" />
-                </button>
+                  label={`Actions for ${w.plugin?.name ?? w.name}`}
+                  items={[
+                    {
+                      label: "Delete…",
+                      tone: "danger",
+                      onSelect: () => setPendingDelete(w),
+                    },
+                  ]}
+                />
               </Row>
             );
           })

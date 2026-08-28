@@ -17,6 +17,7 @@ import {
   type SelectHTMLAttributes,
   type TextareaHTMLAttributes,
 } from "react";
+import { createPortal } from "react-dom";
 
 import { ACCENT, ACCENT_HOVER, F, FONT, KNOB, LINE, M, ON_ACCENT, R, S, SHADOW, STATUS, T, readable, tint } from "../tokens";
 
@@ -521,6 +522,173 @@ export function LiveRing({ color = ACCENT, size = 9 }: { color?: string; size?: 
         }}
       />
     </span>
+  );
+}
+
+/** One row of a `MenuButton`'s popover. `tone: "danger"` is the destructive
+ *  ink; the confirmation still belongs to whatever the item opens. */
+export interface MenuItem {
+  readonly label: string;
+  readonly onSelect: () => void;
+  readonly tone?: "danger";
+  readonly disabled?: boolean;
+}
+
+/**
+ * The overflow menu on a row: three dots, and a popover.
+ *
+ * A row action used to be a bare glyph doing one thing, which only works while
+ * there is exactly one thing. The kebab is the platform's answer to "this row
+ * has actions" and it does not have to be redesigned to hold a second one --
+ * pass another item.
+ *
+ * It renders through a PORTAL. Every list in this app lives inside a `Group`,
+ * and `Group` sets `overflow: hidden` to keep its children inside its rounded
+ * corners, so a popover positioned inside the row is clipped by its own
+ * container. Portalling to the body and positioning from the trigger's measured
+ * rect is what lets the menu escape the card it belongs to.
+ *
+ * It closes on outside press, Escape, scroll and resize. The last two matter
+ * because the menu is positioned once from a rect: left open through a scroll it
+ * would hang in the wrong place, pointing at a row that has moved.
+ */
+export function MenuButton({
+  label,
+  items,
+  className,
+}: {
+  /** Names the button for assistive tech; there is no visible text. */
+  readonly label: string;
+  readonly items: readonly MenuItem[];
+  readonly className?: string;
+}) {
+  const [at, setAt] = useState<{ top: number; right: number } | null>(null);
+  const ref = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!at) return;
+    const close = () => setAt(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    // `mousedown`, not `click`: closing on click would fire after the item's own
+    // click and could dismiss before the selection is handled.
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [at]);
+
+  const open = () => {
+    const r = ref.current?.getBoundingClientRect();
+    if (r) setAt({ top: Math.round(r.bottom + 4), right: Math.round(window.innerWidth - r.right) });
+  };
+
+  return (
+    <>
+      <button
+        ref={ref}
+        className={className}
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={!!at}
+        title={label}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (at) setAt(null);
+          else open();
+        }}
+        style={{
+          flex: "none",
+          border: "none",
+          background: at ? S.control : "transparent",
+          padding: 3,
+          borderRadius: R.control,
+          color: "inherit",
+          cursor: "default",
+          display: "inline-flex",
+        }}
+      >
+        <svg width={16} height={16} viewBox="0 0 16 16" aria-hidden style={{ flex: "none" }}>
+          <circle cx="8" cy="3.5" r="1.35" fill="currentColor" />
+          <circle cx="8" cy="8" r="1.35" fill="currentColor" />
+          <circle cx="8" cy="12.5" r="1.35" fill="currentColor" />
+        </svg>
+      </button>
+
+      {at
+        ? createPortal(
+            <div
+              role="menu"
+              onMouseDown={(e) => e.stopPropagation()}
+              style={{
+                position: "fixed",
+                top: at.top,
+                right: at.right,
+                minWidth: 168,
+                padding: 4,
+                borderRadius: R.group,
+                // `raised`, not `cardFill`, and no backdrop blur. A card is
+                // glass because it sits on the pane and the window's vibrancy
+                // carrying through it is the point. A menu floats over arbitrary
+                // content -- here, directly over the accent-green "New agent…"
+                // button -- so it has to be its own surface or the thing behind
+                // it competes with its labels. `raised` is opaque, which also
+                // makes a `backdrop-filter` a no-op that costs a compositing
+                // layer, so there is none.
+                background: S.raised,
+                boxShadow: SHADOW.sheet,
+                border: `1px solid ${LINE.separator}`,
+                zIndex: 300,
+                animation: "curie-rise 90ms ease-out",
+              }}
+            >
+              {items.map((item) => (
+                <MenuRow key={item.label} item={item} onDone={() => setAt(null)} />
+              ))}
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
+  );
+}
+
+function MenuRow({ item, onDone }: { readonly item: MenuItem; readonly onDone: () => void }) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      role="menuitem"
+      disabled={item.disabled}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onClick={(e) => {
+        e.stopPropagation();
+        onDone();
+        item.onSelect();
+      }}
+      style={{
+        display: "block",
+        width: "100%",
+        textAlign: "left",
+        border: "none",
+        background: hover && !item.disabled ? S.control : "transparent",
+        borderRadius: R.control,
+        padding: "5px 9px",
+        ...F.body,
+        color: item.tone === "danger" ? STATUS.danger : T.primary,
+        opacity: item.disabled ? 0.4 : 1,
+        cursor: "default",
+      }}
+    >
+      {item.label}
+    </button>
   );
 }
 
