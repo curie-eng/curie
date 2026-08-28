@@ -110,6 +110,7 @@ export function Build() {
               collapsed={collapsed}
               onToggle={toggle}
               label="the agent list"
+              variant="list"
               style={{ width: 20, height: 16, marginLeft: -4 }}
             />
             {ws ? "Agent" : "No agent"}
