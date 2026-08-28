@@ -1386,22 +1386,36 @@ export function ResizeHandle({
  * Show or hide a panel that sits beside the content: the window's rail, the
  * Build tab's agent column.
  *
- * One glyph for both states rather than a chevron that flips. A chevron says
- * "there is more this way" and has to be read for direction; the platform's
- * sidebar mark is a picture of the layout, and shading the panel it controls
- * says which of the two states you are looking at without any direction to
- * decode. `aria-pressed` carries the same fact to a screen reader.
+ * Two marks, not one, because the app has two of these on screen at once and a
+ * control that looks identical in two places is a promise that it does the same
+ * thing in both. It does not -- one is window chrome that narrows the whole
+ * window, the other is a list inside a single view -- so each draws the thing it
+ * actually controls:
+ *
+ *   - `sidebar` is the platform's rail mark: a window with its left column
+ *     shaded while the rail is showing. It narrows to icons rather than leaving,
+ *     which is why the frame stays put in both states and only the fill moves.
+ *   - `list` is the list itself, three bars, with a chevron for the direction it
+ *     goes. Direction is honest here in a way it would not be for the rail: this
+ *     panel LEAVES, so "away to the left" and "back from the left" is exactly
+ *     what the two states are.
+ *
+ * `aria-pressed` carries the state to a screen reader either way, so nothing
+ * depends on telling the two glyphs apart.
  */
 export function PanelToggle({
   collapsed,
   onToggle,
   label,
+  variant = "sidebar",
   style,
 }: {
   collapsed: boolean;
   onToggle(): void;
   /** What the panel is, e.g. "agents". Used to build the title both ways. */
   label: string;
+  /** Which panel this is. See the note above -- the two must not look alike. */
+  variant?: "sidebar" | "list";
   style?: CSSProperties;
 }) {
   const [hover, setHover] = useState(false);
@@ -1429,20 +1443,39 @@ export function PanelToggle({
         ...style,
       }}
     >
-      <svg width={15} height={15} viewBox="0 0 16 16" aria-hidden>
-        <rect
-          x={2.2}
-          y={3.4}
-          width={11.6}
-          height={9.2}
-          rx={1.8}
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.4}
-        />
-        <path d="M6.4 3.4v9.2" stroke="currentColor" strokeWidth={1.4} />
-        {/* The panel itself, shaded while it is showing. */}
-        {collapsed ? null : <path d="M4 3.6h2.2v8.8H4z" fill="currentColor" opacity={0.55} />}
+      <svg
+        width={15}
+        height={15}
+        viewBox="0 0 16 16"
+        aria-hidden
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.4}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        {variant === "sidebar" ? (
+          <>
+            <rect x={2.2} y={3.4} width={11.6} height={9.2} rx={1.8} />
+            {/* Stops at the frame's inner edges: the round cap this glyph now
+                shares with the rest of the icon set adds half a stroke at each
+                end, and a divider drawn corner to corner overshot into them. */}
+            <path d="M6.4 4.1v7.8" />
+            {/* The rail itself, shaded while it is showing. */}
+            {collapsed ? null : (
+              // Inset evenly inside the frame and stopping at the divider. Drawn
+              // flush to the frame it overshot the rounded corners, which at a
+              // 15px glyph reads as a smudge rather than as a shaded panel.
+              <rect x={3.4} y={4.4} width={3} height={7.2} fill="currentColor" stroke="none" opacity={0.55} />
+            )}
+          </>
+        ) : (
+          <>
+            <path d="M6.8 4.6h6.6M6.8 8h6.6M6.8 11.4h6.6" />
+            {/* Away to the left, or back from it. */}
+            <path d={collapsed ? "M2.4 5.8 4.6 8l-2.2 2.2" : "M4.6 5.8 2.4 8l2.2 2.2"} />
+          </>
+        )}
       </svg>
     </button>
   );

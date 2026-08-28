@@ -1056,6 +1056,14 @@ agent list (the toggle in the detail column's header). What holds them together:
   way back is not collapsed, it is lost. The same reason puts the rail's toggle
   in the toolbar.
 
+- **The two toggles must not look alike.** Both are on screen at once, and one
+  glyph in two places is a promise that it does the same thing in both -- which
+  it does not. `PanelToggle` takes a `variant`, and each draws the panel it
+  actually controls: `sidebar` is the platform's rail mark, a window frame with
+  its left column shaded, because the rail *narrows* and the frame stays put;
+  `list` is three bars with a chevron, because that panel *leaves*, so a
+  direction is honest there in a way it would not be for the rail.
+
 - **Collapsed, an icon's accessible name is its only name.** A rail of
   unlabelled glyphs is unusable without sight, so `NavItem` carries an
   `aria-label` regardless of state and folds the hint into the tooltip. What
