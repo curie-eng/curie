@@ -18,7 +18,6 @@ import { useCallback, useMemo, useState } from "react";
 import { useApp, type Prefill } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
 import { bridge } from "../bridge/bridge";
-import { shortPath } from "../lib/format";
 import { ACCENT, F, FONT, HUE, LINE, R, S, STATUS, T } from "../tokens";
 import { Badge, Button, CopyButton, Field, Input, Mono, Notice, Select, Sheet, Textarea, Toggle } from "../primitives";
 import {
@@ -645,12 +644,7 @@ function PathInput({
           over
             ? "Drop it here"
             : (arg.default_values?.[0] ??
-              // Shortened the way the platform writes a path: `~` for home, and
-              // the middle elided so the filename -- the part nobody can
-              // reconstruct from the rest -- always survives.
-              (runtimeDefault(arg, app.env)
-                ? shortPath(runtimeDefault(arg, app.env)!, app.env?.homeDir)
-                : null) ??
+              runtimeDefault(arg, app.env) ??
               (kind === "file" ? "Choose a file, or drop one here" : "Choose a directory"))
         }
         onChange={(e) => onChange(e.target.value)}

@@ -243,11 +243,6 @@ export interface ShellEnvironment {
    *  (`CURIE_WORKSPACE` or the home directory), because the renderer cannot see
    *  either and must not print a directory it guessed. */
   readonly defaultCwd: string;
-  /** The user's home directory, so the renderer can abbreviate a path to `~/...`
-   *  the way every other app on the platform does. It cannot work this out on
-   *  its own -- there is no `os` in the renderer, and `defaultCwd` is not it
-   *  whenever `CURIE_WORKSPACE` is set. */
-  readonly homeDir: string;
   readonly appVersion: string;
   readonly electronVersion: string;
   readonly chromeVersion: string;

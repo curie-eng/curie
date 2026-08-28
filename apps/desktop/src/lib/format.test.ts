@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { shortPath, DASH, ago, bytes, count, duration, percent, stripAnsi, titleize, usd } from "./format";
+import { DASH, ago, bytes, count, duration, percent, stripAnsi, titleize, usd } from "./format";
 
 const ESC = String.fromCharCode(27);
 const BEL = String.fromCharCode(7);
@@ -90,51 +90,5 @@ describe("titleize", () => {
   it("turns a command id into a heading", () => {
     expect(titleize("local.reset-thread")).toBe("Reset thread");
     expect(titleize("up")).toBe("Up");
-  });
-});
-
-describe("shortPath", () => {
-  const home = "/Users/alexrao";
-
-  it("abbreviates the home directory the way every shell does", () => {
-    expect(shortPath("/Users/alexrao/code/x.yaml", home)).toBe("~/code/x.yaml");
-  });
-
-  it("leaves a path outside home alone", () => {
-    expect(shortPath("/etc/hosts", home)).toBe("/etc/hosts");
-  });
-
-  it("elides the MIDDLE, keeping the filename and its directory", () => {
-    // Truncating the end would drop the filename, which is the one piece
-    // nobody can reconstruct from the rest.
-    const long =
-      "/Users/alexrao/curietech/agentos/.claude/worktrees/commands-tab-ui-ux-5b3aeb/compose.dev.yaml";
-    const out = shortPath(long, home);
-    expect(out.length).toBeLessThanOrEqual(56);
-    expect(out).toContain("…");
-    expect(out.endsWith("commands-tab-ui-ux-5b3aeb/compose.dev.yaml")).toBe(true);
-    expect(out.startsWith("~")).toBe(true);
-  });
-
-  it("spends the space it has rather than keeping a fixed number of segments", () => {
-    // A rule that always keeps exactly one parent throws away room on a short
-    // path and still overflows on a long one.
-    const out = shortPath("/Users/alexrao/a/b/c/d/e/f/g/h/i/file.yaml", home, 56);
-    expect(out.length).toBeLessThanOrEqual(56);
-    expect(out.endsWith("file.yaml")).toBe(true);
-    expect(out.split("/").length).toBeGreaterThan(3);
-  });
-
-  it("falls back to the filename when even one parent will not fit", () => {
-    // The leading separator survives: "/…/c.yaml" still says the path is
-    // absolute, which "…/c.yaml" does not.
-    const out = shortPath("/a/" + "b".repeat(60) + "/c.yaml", null, 20);
-    expect(out).toBe("/…/c.yaml");
-  });
-
-  it("keeps Windows separators", () => {
-    expect(shortPath("C:\\src\\curie\\compose.dev.yaml", null, 44)).toBe(
-      "C:\\src\\curie\\compose.dev.yaml",
-    );
   });
 });
