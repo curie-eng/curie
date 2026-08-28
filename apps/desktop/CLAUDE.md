@@ -36,10 +36,20 @@ React + TypeScript renderer. Full structure and rationale in
   The body of that sheet is a FIXED height rather than a natural one, for the
   same reason one level up: three steps and three templates all have different
   amounts to say, so a self-sizing body made the whole sheet jump on every press
-  -- the buttons moving under the cursor that had just used them. Anything taller
-  scrolls inside. Measured across every template and every step: one height, one
-  position. `src/views/NewAgent.test.tsx` pins the two decisions, since jsdom
-  cannot measure the pixels.
+  -- the buttons moving under the cursor that had just used them.
+
+  That height is **measured, and big enough that no step scrolls**. A fixed body
+  that still scrolled would have traded one annoyance for another. It is a
+  `min()` against the room the sheet actually has, because `Sheet` caps itself at
+  84vh and a flat 480 on a short display would be taller than the panel could
+  ever be -- the body clipped rather than scrolled, content unreachable with no
+  scrollbar to say so. `src/views/NewAgent.test.tsx` pins the decisions, since
+  jsdom cannot measure the pixels.
+
+  **A `Sheet` clips to its own radius.** Its body and footer are square, and with
+  `overflow: visible` their corners painted over the panel's rounded ones -- a
+  rounded container whose children are not clipped only looks rounded while
+  nothing reaches the edge.
 
 - **The command surface is generated, never hand-written.** Every command in the
   Commands view, the palette, and the canvas inspector comes from

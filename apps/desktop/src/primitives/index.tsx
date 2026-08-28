@@ -1165,6 +1165,12 @@ export function Sheet({
           backdropFilter: S.cardBackdrop,
           WebkitBackdropFilter: S.cardBackdrop,
           borderRadius: R.sheet,
+          // Clip to the radius. The body and the footer are square, and with
+          // this visible their corners painted straight over the panel's own
+          // rounded ones -- a card scrolled to the bottom of the body squared
+          // off the sheet's bottom-left. A rounded container whose children are
+          // not clipped only looks rounded while nothing reaches the edge.
+          overflow: "hidden",
           boxShadow: SHADOW.sheet,
           animation: "curie-sheet 200ms cubic-bezier(0.22,1,0.36,1)",
         }}
