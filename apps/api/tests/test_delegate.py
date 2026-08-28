@@ -119,12 +119,6 @@ def _queued(valkey: redis.Redis, stream: str) -> list[QueuedTurn]:
     return [QueuedTurn.model_validate_json(fields["payload"]) for _, fields in entries]
 
 
-def _call_detail(client: TestClient, headers: dict[str, str], *, agent_id: str, call_id: str) -> Any:
-    resp = client.get(f"/agents/{agent_id}/delegate/calls/{call_id}", headers=headers)
-    assert resp.status_code == 200, resp.text
-    return resp.json()
-
-
 # --- auth -----------------------------------------------------------------
 
 
