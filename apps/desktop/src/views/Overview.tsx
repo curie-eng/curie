@@ -13,7 +13,7 @@ import { useApp, type AgentSummary } from "../bridge/app";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
 import { bridge } from "../bridge/bridge";
-import { ago, bytes, count, duration, percent, usd } from "../lib/format";
+import { ago, bytes, count, DASH, duration, percent, usd } from "../lib/format";
 import { ACCENT, F, STATUS, T } from "../tokens";
 import { stackPhase, stackProgress } from "../lib/startup";
 import { FitWidth, RankedBars, Sparkline, UsageBar } from "../primitives/charts";
@@ -57,6 +57,10 @@ export function Overview() {
   const app = useApp();
   const res = useResources();
   const runs = useRuns();
+
+  // `null` (no worker to ask) is deliberately NOT falsy-collapsed into "real":
+  // a lookup that failed must not make a priced figure look trustworthy.
+  const fakeModel = res.frame?.fakeModel === true;
 
   const [metrics, setMetrics] = useState<MetricsSummary | null>(null);
   const [approvals, setApprovals] = useState<readonly ApprovalOut[]>([]);
@@ -119,10 +123,45 @@ export function Overview() {
           sub="sandboxes on this machine"
           accent={ACCENT}
         />
+        {/* Two things this stat must not do, both of which it did.
+            
+            It must not report a number as money when no money moved. Langfuse
+            prices observations from token counts and a price row for the model
+            name, and it does that whether or not a request ever left the
+            machine -- so a stack pinned to the offline fake model reported
+            $0.04 of spend that had not happened. `fakeModel` comes off the
+            worker's own environment, and `null` (no worker to ask) is treated
+            as "cannot say", never as "real".
+
+            And its caption must not name the SOURCE where a reader expects the
+            payee. "$0.04 / from Langfuse" reads as Langfuse having charged you
+            four cents; somebody read it exactly that way. The caption says what
+            the figure covers now, and the source moved into the tooltip. */}
         <Stat
           label="Spend"
-          value={metrics ? (metrics.cost_known ? usd(metrics.cost_usd) : "unknown") : "—"}
-          sub={metrics && !metrics.cost_known ? "no price row for this model" : "from Langfuse"}
+          value={
+            fakeModel
+              ? "none"
+              : metrics
+                ? metrics.cost_known
+                  ? usd(metrics.cost_usd)
+                  : "unknown"
+                : DASH
+          }
+          sub={
+            fakeModel
+              ? "fake model — nothing billed"
+              : metrics
+                ? metrics.cost_known
+                  ? "model usage, last 7 days"
+                  : "no price row for this model"
+                : "unavailable"
+          }
+          title={
+            fakeModel
+              ? `The worker is pinned to the offline fake model, so no request reaches a provider. Langfuse still prices the token counts, which is where the ${metrics ? usd(metrics.cost_usd) : "figure"} it reports comes from.`
+              : "Summed from Langfuse observations over the last 7 days."
+          }
         />
         <Stat
           label="p95 latency"

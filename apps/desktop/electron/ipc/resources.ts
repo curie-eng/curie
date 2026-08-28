@@ -362,9 +362,56 @@ export async function sampleDocker(): Promise<{ samples: ResourceSample[]; error
   }
 }
 
+/**
+ * Whether the local stack's worker is pinned to the offline fake model.
+ *
+ * Cached like `daemonCapacity`, and for the same reason: `docker inspect` is a
+ * heavier call than `ps` and the answer only changes when the stack is
+ * recreated. `null` means "no worker to ask", which is not the same as "no" and
+ * must not render as a priced figure.
+ *
+ * The value matters far out of proportion to its size. Langfuse prices
+ * observations from token counts and a price row for the model name, and does
+ * so whether or not a request ever left the machine -- so a stack on the fake
+ * model reports real dollars for runs that cost nothing.
+ */
+/** The compose service that runs agents, and therefore the one whose model mode
+ *  decides whether a cost figure means anything. */
+const WORKER_CONTAINER = "curie-curie-worker-1";
+
+let fakeModelCache: { at: number; value: boolean | null } | null = null;
+
+async function workerFakeModel(): Promise<boolean | null> {
+  if (fakeModelCache && Date.now() - fakeModelCache.at < 60_000) return fakeModelCache.value;
+  let value: boolean | null;
+  try {
+    const { stdout } = await execFileAsync(
+      "docker",
+      ["inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", WORKER_CONTAINER],
+      { timeout: 6000, maxBuffer: 1 << 20 },
+    );
+    // Absent, empty, `0` and `false` all mean live; anything else means pinned
+    // on. Matching the CLI, which treats the variable as set-or-not rather than
+    // parsing it strictly.
+    const line = stdout.split("\n").find((l) => l.startsWith("CURIE_FAKE_MODEL="));
+    const raw = line?.slice("CURIE_FAKE_MODEL=".length).trim() ?? "";
+    value = raw !== "" && raw !== "0" && raw.toLowerCase() !== "false";
+  } catch {
+    // No such container, or no daemon. `null`, not `false`: the UI must not say
+    // a cost is real because a lookup failed.
+    value = null;
+  }
+  fakeModelCache = { at: Date.now(), value };
+  return value;
+}
+
 export async function collect(): Promise<ResourceFrame> {
-  const [{ samples, error }, capacity] = await Promise.all([sampleDocker(), daemonCapacity()]);
-  return { at: Date.now(), samples, capacity, error };
+  const [{ samples, error }, capacity, fakeModel] = await Promise.all([
+    sampleDocker(),
+    daemonCapacity(),
+    workerFakeModel(),
+  ]);
+  return { at: Date.now(), samples, capacity, error, fakeModel };
 }
 
 export function startFeed(win: BrowserWindow, intervalMs: number): void {

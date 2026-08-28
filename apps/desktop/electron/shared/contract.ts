@@ -200,6 +200,15 @@ export interface ResourceFrame {
   /** Present when the source could not be reached; the UI degrades honestly
    *  rather than showing a frozen last-good frame as if it were live. */
   readonly error?: string;
+  /** Whether the local stack's worker is pinned to the OFFLINE FAKE MODEL
+   *  (`CURIE_FAKE_MODEL`). `null` when there is no worker to ask.
+   *
+   *  It is carried because a cost figure means nothing without it. Langfuse
+   *  prices observations from token counts and a price row for the model name,
+   *  and it does that whether or not a request was ever made -- so a stack on
+   *  the fake model reports real dollars for runs that cost nothing. The
+   *  Overview showed $0.04 of spend that had not happened. */
+  readonly fakeModel: boolean | null;
 }
 
 /** The host OS. Spelled out rather than reusing `NodeJS.Platform`, because this
