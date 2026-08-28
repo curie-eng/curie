@@ -789,6 +789,16 @@ and neither may own it -- the main process as the stored default, Settings as th
 hint under the field. Those were two hardcoded copies, and the one in Settings
 went on telling people the wrong port after the default was fixed.
 
+**The local dev key is assumed on loopback.** `curie local deploy` and friends
+default `--api-key` to `curie-dev-key` (`cli/src/main.rs`), which is why
+deploying from a terminal needs no setup at all. This app sent no key, so it
+401'd against the very stack it had just started -- an app that starts a
+platform and then cannot read it is not one anybody would call easy. `api.ts`
+falls back to that key when none is stored AND the base URL is loopback. A
+stored key always wins, and `isLoopback` parses the URL rather than matching a
+prefix, because `http://localhost.evil.com` is not localhost and a `startsWith`
+check would post a credential to it.
+
 A 401 from a reachable API is a **missing credential, and a WARNING, not an
 error**. The platform is up and agents run whether or not this window holds a
 key -- a bot answering in Slack does not care what this app can list -- so all

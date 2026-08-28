@@ -112,6 +112,34 @@ export interface DaemonCapacity {
  */
 export const LOCAL_API_URL = "http://localhost:28000";
 
+/**
+ * The key the local dev stack ships with, and the CLI's own default.
+ *
+ * `curie local deploy` and friends default `--api-key` to this
+ * (`cli/src/main.rs`), which is why deploying from a terminal works with no
+ * setup at all. This app sent no key, so it 401'd against the very stack it had
+ * just started -- an app that starts a platform and then cannot read it is not
+ * an app anybody would call easy.
+ *
+ * `localOnly` is the whole safety story and is enforced in `api.ts`: this is a
+ * well-known development credential, so it is fine to assume against a loopback
+ * address and unacceptable to send anywhere else. A stored key always wins --
+ * this only fills the gap where none was ever set.
+ */
+export const LOCAL_API_KEY = "curie-dev-key";
+
+/** Whether a base URL points at this machine, and so whether the dev key may be
+ *  assumed. Parsed rather than string-matched: `http://localhost.evil.com` is
+ *  not localhost and a `startsWith` check would send the key to it. */
+export function isLoopback(baseUrl: string): boolean {
+  try {
+    const h = new URL(baseUrl).hostname.toLowerCase();
+    return h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
 /** One row of the resource monitor. Shaped after `docker stats` because that is
  *  the mental model operators already have, but sourced from whichever tier is
  *  live: Docker for `skill`/`local`, the platform API's runner pods for
