@@ -4,6 +4,8 @@
 
 import { describe, expect, it } from "vitest";
 
+import { deployedAs } from "./deployment";
+
 import type { Workspace } from "../../electron/shared/contract";
 import {
   skillBody,
@@ -443,5 +445,26 @@ Say something to save it.
     // author loses the half of it the panel does not model.
     const out = withPluginField("{ not json", "description", "hi");
     expect(out.ok).toBe(false);
+  });
+});
+
+describe("matching a bundle to a running agent", () => {
+  const agents = [{ name: "squawk" }, { name: "weather" }];
+
+  it("finds the one deployed under this bundle's name", () => {
+    expect(deployedAs(agents, "squawk")).toEqual({ name: "squawk" });
+  });
+
+  it("finds nothing when the platform is running nothing by that name", () => {
+    expect(deployedAs(agents, "shift-notes")).toBeUndefined();
+    expect(deployedAs([], "squawk")).toBeUndefined();
+  });
+
+  it("does not match a name that merely contains it", () => {
+    // `deploy.yaml` sends a bundle out as `squawk-dev` in one environment and
+    // `squawk` in another. Those are DIFFERENT agents with separate identity,
+    // memory and approval routing, and treating one as the other would report a
+    // dev deployment as production being live.
+    expect(deployedAs([{ name: "squawk-dev" }], "squawk")).toBeUndefined();
   });
 });
