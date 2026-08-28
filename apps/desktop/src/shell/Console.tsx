@@ -416,7 +416,7 @@ function Header({
         <Button
           size="sm"
           tone="plain"
-          title="Hide the console — ⌘L brings it back, and so does running anything"
+          title="Hide the console — the ›_ button in the toolbar brings it back, and so does ⌘L or running anything"
           onClick={() => runs.setConsoleHidden(true)}
         >
           ✕

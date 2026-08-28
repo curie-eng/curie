@@ -5,10 +5,12 @@
 // carries that view's title and its actions, and lets content scroll underneath
 // it. It is also the window's drag region, since the window has no OS chrome.
 
+import { useState } from "react";
+
 import { useApp, type Route } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
 import { F, LINE, M, PANE_FADE, R, S, STATUS, T } from "../tokens";
-import { Mono, Segmented, Spinner } from "../primitives";
+import { Glyph, PROMPT, Segmented, Spinner } from "../primitives";
 
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "What is happening right now" },
@@ -108,9 +110,21 @@ export function Toolbar({ scrolled }: { scrolled: boolean }) {
  * It is deliberately not permanent. The console is normally on screen, and a
  * button offering to show you the thing you are looking at is the kind of
  * always-there chrome this toolbar exists to avoid.
+ *
+ * The glyph carries it alone. A prompt is about as legible as an icon gets --
+ * it is what every terminal in the world puts in its own corner -- and the word
+ * "Console" beside it was a caption on a picture of itself. `aria-label` carries
+ * the name the label used to.
+ *
+ * Visible means the GLYPH is strong, not that the button is a coloured badge. A
+ * filled accent disc was tried and it read as a status light: the toolbar's
+ * other two controls are pills reporting state, and a third round coloured thing
+ * joins that set rather than standing out from it. Primary ink on no fill, with
+ * the fill arriving on hover, is what the platform's own toolbar buttons do.
  */
 function ConsoleButton() {
   const runs = useRuns();
+  const [hover, setHover] = useState(false);
   if (!runs.consoleHidden) return null;
   return (
     <button
@@ -122,22 +136,25 @@ function ConsoleButton() {
         // back, because this button unmounts on the same commit and whatever
         // focus it set would be dropped.
       }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      aria-label="Show the console"
       title="Show the console and put the cursor in it (⌘L)"
       style={{
         display: "inline-flex",
         alignItems: "center",
-        gap: 6,
+        justifyContent: "center",
+        width: 27,
+        height: 27,
         border: "none",
-        background: S.control,
-        borderRadius: R.pill,
-        padding: "4px 11px",
-        ...F.caption,
-        color: T.secondary,
+        background: hover ? S.control : "transparent",
+        borderRadius: R.control,
+        padding: 0,
+        color: T.primary,
         cursor: "default",
       }}
     >
-      <Mono style={{ fontSize: 11, color: T.tertiary }}>›_</Mono>
-      Console
+      <Glyph d={PROMPT} size={16} />
     </button>
   );
 }

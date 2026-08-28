@@ -465,6 +465,38 @@ export function Spinner({ size = 13, color = T.tertiary }: { size?: number; colo
 
 // --- buttons ---------------------------------------------------------------
 
+/** Inline SVG rather than an icon font: a dozen glyphs do not justify a
+ *  dependency, and these inherit `currentColor`, so a selected or accented state
+ *  is one rule. Drawn on a 16px grid with a 1.4 stroke to sit close to SF
+ *  Symbols' weight. */
+export function Glyph({
+  d,
+  filled,
+  size = 16,
+}: {
+  readonly d: string;
+  readonly filled?: boolean;
+  readonly size?: number;
+}) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" aria-hidden style={{ flex: "none" }}>
+      <path
+        d={d}
+        fill={filled ? "currentColor" : "none"}
+        stroke="currentColor"
+        strokeWidth={filled ? 0 : 1.4}
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+/** A shell prompt: chevron and cursor rule. Shared rather than copied, because
+ *  the sidebar's Commands row and the toolbar's console button are the same
+ *  glyph and a second copy of the path is a second copy to keep in step. */
+export const PROMPT = "m3 4.6 3 3-3 3M8.4 11.4H13";
+
 export type ButtonTone = "default" | "primary" | "danger" | "plain";
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
