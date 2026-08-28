@@ -300,6 +300,9 @@ function registerIpc(): void {
 
   ipcMain.handle(CH.wsList, () => workspace.list());
   ipcMain.handle(CH.wsOpen, () => workspace.open(requireWindow()));
+  ipcMain.handle(CH.dialogPick, (_e, opts: { kind: "file" | "directory"; title?: string }) =>
+    workspace.pick(requireWindow(), opts),
+  );
   ipcMain.handle(CH.wsAdd, (_e, path: string) => workspace.add(path));
   ipcMain.handle(CH.wsForget, (_e, path: string) => workspace.forget(path));
   ipcMain.handle(CH.wsFiles, (_e, root: string) => workspace.bundleFiles(root));

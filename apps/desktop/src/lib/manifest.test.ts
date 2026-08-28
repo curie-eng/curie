@@ -369,12 +369,22 @@ describe("humanArg", () => {
   // wrong signal above the field you are meant to type into.
   it("turns an argument id into words", () => {
     expect(humanArg("name")).toBe("Name");
-    expect(humanArg("run_id")).toBe("Run id");
-    expect(humanArg("github-app")).toBe("Github app");
+    expect(humanArg("run_id")).toBe("Run ID");
   });
 
   it("is sentence case, not title case", () => {
     // Title Case on a form label is a heading pretending to be one.
     expect(humanArg("object_store_bucket")).toBe("Object store bucket");
+  });
+
+  it("keeps acronyms as acronyms", () => {
+    // "Api url" is worse than `--api-url`, not better: it reads as a typo, and
+    // the whole point of dropping the flag token was to make the label easier
+    // to read than the flag.
+    expect(humanArg("api_url")).toBe("API URL");
+    expect(humanArg("api-key")).toBe("API key");
+    expect(humanArg("run_id")).toBe("Run ID");
+    expect(humanArg("github-app")).toBe("GitHub app");
+    expect(humanArg("plugin-dir")).toBe("Plugin Directory");
   });
 });

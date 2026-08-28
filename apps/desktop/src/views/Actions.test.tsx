@@ -56,6 +56,7 @@ function stubShell(): CurieBridge {
       onFrame: () => () => {},
       logs: async () => "",
     },
+    dialog: { pick: async () => null, pathForFile: () => null },
     workspace: {
       list: async () => [],
       open: async () => null,

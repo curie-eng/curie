@@ -368,7 +368,45 @@ export const STICKY_FLAGS = new Set([
  * dropping it, because the rendered preview under the form is the whole truth
  * about what will run.
  */
+const ACRONYMS: Record<string, string> = {
+  api: "API",
+  url: "URL",
+  urls: "URLs",
+  id: "ID",
+  ids: "IDs",
+  json: "JSON",
+  yaml: "YAML",
+  yml: "YAML",
+  mcp: "MCP",
+  cpu: "CPU",
+  ui: "UI",
+  sdk: "SDK",
+  ttl: "TTL",
+  k8s: "K8s",
+  github: "GitHub",
+  gitlab: "GitLab",
+  slack: "Slack",
+  otel: "OTel",
+  ns: "Namespace",
+  env: "Environment",
+  dir: "Directory",
+  repo: "Repository",
+};
+
 export function humanArg(id: string): string {
-  const words = id.replace(/[_-]+/g, " ").trim();
-  return words.charAt(0).toUpperCase() + words.slice(1);
+  const words = id
+    .replace(/[_-]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!words.length) return id;
+  return words
+    .map((w, i) => {
+      const known = ACRONYMS[w.toLowerCase()];
+      if (known) return known;
+      // Only the first word is capitalised: sentence case, so a label reads as
+      // a label and not as a heading.
+      return i === 0 ? w.charAt(0).toUpperCase() + w.slice(1) : w;
+    })
+    .join(" ");
 }
