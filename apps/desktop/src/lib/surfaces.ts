@@ -80,7 +80,7 @@ export const SURFACES: readonly Surface[] = [
     blurb: "Scaffold a bundle, or find the ones already on this machine.",
     where: "at the foot of the Build view, with or without a bundle open",
     actions: [
-      { id: "init", label: "New agent bundle", tone: "primary", hint: "Scaffold a Claude Code plugin bundle" },
+      { id: "init", label: "New agent…", tone: "primary", hint: "Scaffold a Claude Code plugin bundle" },
       { id: "try", label: "First reply, no keys", hint: "Scaffold a keyless first reply to prove the loop works" },
       { id: "list-agents", label: "Find local bundles", quiet: true, hint: "List bundles under agents/ in a source checkout" },
     ],

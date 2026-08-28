@@ -377,8 +377,8 @@ function Health({ onRefresh }: { onRefresh(): void }) {
   // says it that way -- with a spinner rather than a red glyph, because a
   // failure mark standing over a working process is the screen calling its own
   // work broken.
-  const showStack = phase !== "idle";
-  if (app.api && !app.api.reachable && app.api.baseUrl && !showStack) {
+  const showStack = phase !== "idle" && phase !== "absent";
+  if (app.api && !app.api.reachable && app.api.baseUrl && !showStack && phase !== "absent") {
     issues.push({
       text: `The platform API at ${app.api.baseUrl} is not answering. Agents, versions, memory and traces are unavailable until it is.`,
       fix: "local.up",
@@ -409,7 +409,7 @@ function Health({ onRefresh }: { onRefresh(): void }) {
         : { text: `Reached the API but could not list agents: ${app.agentsError}` },
     );
   }
-  if (!issues.length && !showStack) return null;
+  if (!issues.length && !showStack && phase !== "absent") return null;
 
   return (
     // The progress card is FIRST and is rendered independently of the issues
@@ -418,6 +418,7 @@ function Health({ onRefresh }: { onRefresh(): void }) {
     // one suppress the other means the screen answers "what is happening" with
     // only half of it.
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {phase === "absent" ? <SetUp dockerAvailable={env.dockerAvailable} /> : null}
       {showStack ? (
         <StackCard phase={phase} progress={progress} apiBaseUrl={app.api?.baseUrl} />
       ) : null}
@@ -443,6 +444,72 @@ function Health({ onRefresh }: { onRefresh(): void }) {
         </Notice>
       ))}
     </div>
+  );
+}
+
+/**
+ * First run: one button, and nothing else competing with it.
+ *
+ * Nothing is running, so every other panel on this page has an em dash in it
+ * and none of them can be acted on. The only useful thing the app can say is
+ * "press this", and saying it as one primary control -- rather than as a red
+ * warning about an API that was never started -- is the difference between a
+ * screen that reads as broken and one that reads as new.
+ *
+ * `local.up` is the whole setup: compose brings up the API, the worker, the
+ * dispatcher, the object store and the rest, which is what a bundle gets
+ * deployed onto. It goes through the same generated form as every other
+ * command, so the flags are all still there for anyone who wants them -- the
+ * button is a shortcut past the list, not a second way to run things.
+ *
+ * Docker is the one precondition this app cannot press a button about, so when
+ * it is missing the card says that instead of offering an action that would
+ * fail ten seconds later.
+ */
+function SetUp({ dockerAvailable }: { readonly dockerAvailable: boolean }) {
+  const app = useApp();
+  return (
+    <Group style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "14px 14px" }}>
+      <div style={{ flex: 1, minWidth: 0, display: "grid", gap: 4 }}>
+        <div style={{ ...F.headline }}>
+          {dockerAvailable ? "Set up Curie on this machine" : "Docker is not running"}
+        </div>
+        <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.55, maxWidth: 640 }}>
+          {dockerAvailable ? (
+            <>
+              One button brings the whole platform up here — the API, the worker, the dispatcher and
+              the object store. That is what an agent gets deployed onto. Then{" "}
+              <button
+                onClick={() => app.navigate("build")}
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  padding: 0,
+                  font: "inherit",
+                  color: ACCENT,
+                  cursor: "default",
+                }}
+              >
+                Build
+              </button>{" "}
+              is where you author one and ship it.
+            </>
+          ) : (
+            <>
+              Everything here runs in containers, so Docker has to be running before the platform
+              can start. Start Docker Desktop and this card will offer the button.
+            </>
+          )}
+        </div>
+      </div>
+      {dockerAvailable ? (
+        <span style={{ flex: "none" }}>
+          <RunButton id="local.up" tone="primary" size="md">
+            Set up Curie
+          </RunButton>
+        </span>
+      ) : null}
+    </Group>
   );
 }
 

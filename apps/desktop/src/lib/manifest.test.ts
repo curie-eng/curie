@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 
 import { resolve as resolveArgv } from "../../electron/ipc/manifest";
-import {
+import { humanArg,
   commands,
   commandsById,
   fieldKind,
@@ -360,5 +360,21 @@ describe("search", () => {
 
   it("returns nothing for a term in no command", () => {
     expect(search("zzzznotacommand")).toEqual([]);
+  });
+});
+
+describe("humanArg", () => {
+  // The form used to label positionals with the CLI's usage token. `<NAME>`
+  // over an empty box is the shape of a thing that is missing, which is the
+  // wrong signal above the field you are meant to type into.
+  it("turns an argument id into words", () => {
+    expect(humanArg("name")).toBe("Name");
+    expect(humanArg("run_id")).toBe("Run id");
+    expect(humanArg("github-app")).toBe("Github app");
+  });
+
+  it("is sentence case, not title case", () => {
+    // Title Case on a form label is a heading pretending to be one.
+    expect(humanArg("object_store_bucket")).toBe("Object store bucket");
   });
 });

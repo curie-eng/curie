@@ -92,9 +92,9 @@ function Keys() {
         const routes = [
           "overview",
           "build",
-          "tiers",
-          "resources",
           "canvas",
+          "resources",
+          "tiers",
           "commands",
         ] as const;
         return app.navigate(routes[Number(e.key) - 1]);

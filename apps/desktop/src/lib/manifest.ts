@@ -356,3 +356,19 @@ export const STICKY_FLAGS = new Set([
   "agent",
   "target",
 ]);
+
+/**
+ * An argument's name in words: `run_id` -> "Run id".
+ *
+ * Sentence case, not Title Case -- this is a field label, and Title Case on a
+ * form is a heading pretending to be one. It exists because the form used to
+ * label positionals with the CLI's own usage token (`<NAME>`), and that shape
+ * over an empty box reads as a placeholder somebody forgot to fill in: the exact
+ * wrong signal above the field you are meant to type into. Nothing is lost by
+ * dropping it, because the rendered preview under the form is the whole truth
+ * about what will run.
+ */
+export function humanArg(id: string): string {
+  const words = id.replace(/[_-]+/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}

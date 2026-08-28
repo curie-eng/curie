@@ -23,6 +23,7 @@ import {
   cwdFor,
   cwdReason,
   fieldKind,
+  humanArg,
   defaultValue,
   renderCommand,
   NEEDS_TERMINAL,
@@ -263,7 +264,13 @@ export function CommandForm({
       {cmd.positionals.map((spec, i) => (
         <Field
           key={spec.id}
-          label={<Mono>{`<${spec.id.toUpperCase()}>`}</Mono>}
+          // The argument's name in words, not the CLI's usage token. `<NAME>`
+          // over an empty box reads as a placeholder somebody forgot to fill in
+          // -- it is the shape of a thing that is missing, which is the exact
+          // wrong signal above the field you are meant to type into. The
+          // mapping back to argv is not lost: it is the rendered preview under
+          // the form, which is the whole truth about what will run.
+          label={humanArg(spec.id)}
           hint={spec.help}
           required={spec.required}
         >
