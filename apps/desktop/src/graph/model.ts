@@ -17,6 +17,7 @@ import type { AgentSummary } from "../bridge/app";
 import type { ResourceSample, Workspace } from "../bridge/bridge";
 import type { NodeKind } from "../tokens";
 import { isDeployedFrom } from "../lib/deployment";
+import { bytes } from "../lib/format";
 
 export interface GraphNode {
   readonly id: string;
@@ -241,6 +242,55 @@ function materialise(placed: readonly Placed[]): { nodes: GraphNode[]; lanes: La
   return { nodes, lanes };
 }
 
+/**
+ * What each piece of the platform is for, in one line.
+ *
+ * The inspector used to answer "what is this valkey node" with the container's
+ * name, its image tag and the word `running` -- three restatements of the label
+ * you already clicked. None of them say what the thing DOES, which is the only
+ * question a diagram of an architecture you did not write can be asked.
+ *
+ * These follow `ARCHITECTURE.md`'s own component map rather than being invented
+ * here, so the canvas and the doc describe the same system. The canvas already
+ * draws the message path from that doc; this is the same source for the nouns.
+ */
+const ROLE_ABOUT: Readonly<Record<string, string>> = {
+  dispatcher: "Takes messages in from Slack, drops duplicates, and puts the survivors on the queue.",
+  valkey: "The queue. Work waits here between arriving and being picked up, and thread locks live here so one conversation only ever has one live session.",
+  worker: "Pulls work off the queue and runs one session per thread, in a sandbox.",
+  api: "Deploys bundles, keeps the record of agents and versions, and answers reads. This app talks to it.",
+  postgres: "The record: agents, their versions, and what is deployed where.",
+  objectstore: "Where skill bundles are kept once uploaded, addressed by digest.",
+  langfuse: "Traces and cost. Every model call an agent makes is recorded here.",
+  clickhouse: "The column store Langfuse keeps its traces in.",
+  otel: "Collects traces from everything else and forwards them to Langfuse.",
+  runner: "A sandbox running Claude Code plus one skill \u2014 this is where an agent's turn actually happens.",
+  model: "The model an agent's turns are sent to.",
+};
+
+/** `28000:8000`, the way the Resources table spells the same thing. Only the
+ *  published ones: an unpublished container port is not reachable and saying it
+ *  is would be worse than saying nothing. */
+function publishedPorts(ports: ResourceSample["ports"]): string | undefined {
+  const published = ports.filter((p) => p.host !== null);
+  if (!published.length) return undefined;
+  return published.map((p) => `${p.host}:${p.container}`).join(", ");
+}
+
+/** `1h 12m`, `4m`, `38s` -- how long the container has been up. Docker reports
+ *  the start as an ISO string; an unparseable one yields nothing rather than
+ *  `NaNs`. */
+function uptime(startedAt: string | null, now: number): string | undefined {
+  if (!startedAt) return undefined;
+  const began = Date.parse(startedAt);
+  if (!Number.isFinite(began)) return undefined;
+  const secs = Math.max(0, Math.round((now - began) / 1000));
+  if (secs < 90) return `${secs}s`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m`;
+  return `${Math.floor(mins / 60)}h ${mins % 60}m`;
+}
+
 export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
   const placed: Placed[] = [];
   const edges: GraphEdge[] = [];
@@ -432,7 +482,18 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
       sub: sample.state === "running" ? "live" : sample.state,
       status: sample.state === "running" ? "live" : "known",
       metric: { cpu: sample.cpuPercent, mem: sample.memBytes },
-      detail: { Container: sample.name, Image: sample.image ?? undefined, State: sample.state },
+      detail: {
+        // What it does comes first. The identifiers are the answer to "which
+        // container is this", which is a different and much rarer question.
+        About: ROLE_ABOUT[sample.role],
+        State: sample.health ? `${sample.state} (${sample.health})` : sample.state,
+        Up: uptime(sample.startedAt, sample.at),
+        CPU: sample.cpuPercent === null ? undefined : `${sample.cpuPercent.toFixed(1)}%`,
+        Memory: sample.memBytes === null ? undefined : bytes(sample.memBytes),
+        Ports: publishedPorts(sample.ports),
+        Container: sample.name,
+        Image: sample.image ?? undefined,
+      },
       actions: ["local.status", "local.rebuild", "local.observability"],
     }, COL.infra + (FLOW_DEPTH[sample.role] ?? 0));
   }

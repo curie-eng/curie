@@ -221,6 +221,28 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  /**
+   * A command finished, so what the platform says may have changed.
+   *
+   * Without this the agent list only refetched when the API's *reachability*
+   * flipped, which for a stack that stays up means never: deploying an agent
+   * left every view that reads `agents` -- the Build panel's "Running now", the
+   * list's live dot, the Overview count, the Canvas -- showing the state from
+   * before the deploy. It looked like a thirty-second lag and was really "not
+   * until something else happened to refetch".
+   *
+   * Any successful run, not an allowlist of the ones that mutate the platform.
+   * That list would be a second copy of the command surface, ninety-three
+   * entries and growing, and it would be wrong the first time somebody added a
+   * command without remembering it existed. One GET against localhost after a
+   * command the operator sat and watched is not worth the bookkeeping.
+   */
+  useEffect(() => {
+    return bridge().cli.onResult((result) => {
+      if (result.state === "ok") void refreshAgents();
+    });
+  }, [refreshAgents]);
+
   // One awaited pass at mount rather than three fire-and-forget calls: the
   // `cancelled` guard means a window closed mid-probe cannot land state on an
   // unmounted tree, and awaiting keeps the setStates out of the effect body.
