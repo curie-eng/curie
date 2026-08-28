@@ -46,6 +46,15 @@ React + TypeScript renderer. Full structure and rationale in
   scrollbar to say so. `src/views/NewAgent.test.tsx` pins the decisions, since
   jsdom cannot measure the pixels.
 
+  **One scrolling box per sheet, and it is the sheet's own.** A caller that wants
+  a fixed body passes `bodyHeight`; wrapping the children in a second
+  `overflow: auto` clips at THAT box's padding edge, which was zero, so every
+  card inside had its shadow cut off at the left, right and bottom. The sheet's
+  own body already carries the 18px inset those shadows need. Note the height
+  includes that inset (`box-sizing: border-box` is global), so it has to be
+  larger than the content by exactly that much -- getting this wrong is a body
+  that scrolls by ten pixels, which is worse than one that scrolls properly.
+
   **A `Sheet` clips to its own radius.** Its body and footer are square, and with
   `overflow: visible` their corners painted over the panel's rounded ones -- a
   rounded container whose children are not clipped only looks rounded while

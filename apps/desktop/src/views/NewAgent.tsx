@@ -27,8 +27,10 @@ import { Button, Field, Group, Input, Mono, Notice, Sheet } from "../primitives"
  * Tall enough that NO step scrolls, and identical for all of them.
  *
  * Measured, not guessed: the tallest is the first step showing the shared-list
- * template, at 468px of content. 480 leaves a little room for a font that
- * renders slightly larger than the one measured on.
+ * template, at 468px of content. This box carries the sheet's own 18px bottom
+ * inset inside its height (`box-sizing: border-box` is global), so it has to be
+ * that much larger again; 532 leaves a little over for a font that renders
+ * slightly bigger than the one measured on.
  *
  * The `min` is the short-window case. `Sheet` caps itself at 84vh, so on a small
  * display a fixed 480 would be taller than the panel could ever be and the body
@@ -37,7 +39,7 @@ import { Button, Field, Group, Input, Mono, Notice, Sheet } from "../primitives"
  * rounded up; below that height the body shrinks and scrolls, which is the
  * honest outcome when there is genuinely not enough room.
  */
-const BODY_HEIGHT = "min(480px, calc(84vh - 168px))";
+const BODY_HEIGHT = "min(532px, calc(84vh - 168px))";
 
 type StepId = "start" | "name" | "review";
 
@@ -102,6 +104,10 @@ export function NewAgent({ onClose }: { readonly onClose: () => void }) {
       title="New agent"
       onClose={onClose}
       width={720}
+      // Fixed, so no step resizes the panel. Passed to the sheet rather than
+      // applied to a wrapper here: a second scrolling box would clip at its own
+      // padding edge and cut the shadow off every card inside it.
+      bodyHeight={BODY_HEIGHT}
       footer={
         <div style={{ display: "flex", alignItems: "center", gap: 10, width: "100%" }}>
           <span style={{ ...F.footnote, color: T.quaternary }}>
@@ -128,30 +134,20 @@ export function NewAgent({ onClose }: { readonly onClose: () => void }) {
     >
       <Steps current={index} />
 
-      {/* A FIXED height, not a natural one. Every step and every template has a
-          different amount to say, so a body that sized itself made the sheet
-          jump each time somebody pressed a card or Next -- the controls moving
-          under the cursor that just used them, and the whole panel resizing
-          around a decision that had not been made yet. A wizard that changes
-          shape as you fill it in is asking you to re-find everything at every
-          step. Content taller than this scrolls inside; the sheet does not
-          move. */}
-      <div style={{ height: BODY_HEIGHT, overflowY: "auto", overflowX: "hidden" }}>
-        {step === "start" ? (
-          <StartFrom picked={picked} onPick={setPicked} />
-        ) : step === "name" ? (
-          <NameIt
-            name={name}
-            onName={setName}
-            slugged={id}
-            where={where}
-            onWhere={setWhere}
-            onSubmit={() => !blocked && next()}
-          />
-        ) : (
-          <Review template={picked} name={id} where={where} />
-        )}
-      </div>
+      {step === "start" ? (
+        <StartFrom picked={picked} onPick={setPicked} />
+      ) : step === "name" ? (
+        <NameIt
+          name={name}
+          onName={setName}
+          slugged={id}
+          where={where}
+          onWhere={setWhere}
+          onSubmit={() => !blocked && next()}
+        />
+      ) : (
+        <Review template={picked} name={id} where={where} />
+      )}
 
       {error ? (
         <div style={{ marginTop: 14 }}>
