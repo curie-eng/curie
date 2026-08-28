@@ -18,7 +18,8 @@ import { useApp, type Route } from "../bridge/app";
 import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
 import { ACCENT, F, M, R, S, STATUS, T } from "../tokens";
-import { Glyph as Icon, PROMPT, Spinner } from "../primitives";
+import { Glyph as Icon, Spinner } from "../primitives";
+import { PROMPT } from "../primitives/glyphs";
 import { bytes, percent } from "../lib/format";
 
 interface Item {

@@ -154,6 +154,50 @@ React + TypeScript renderer. Full structure and rationale in
   not tell you whether the app picked your bundle, your checkout, or a fallback,
   and those produce different results for the same command.
 
+- **A stack coming up is progress, not an error, and the progress is measured.**
+  The API being unreachable is a red notice with "Start the stack" on it -- but
+  only when nothing is being done about it. While the stack is starting, the
+  same fact is `StackStarting` in `Overview.tsx`: a spinner, a bar, and the step
+  it is on. A failure mark standing over a process that is working is the screen
+  calling its own work broken, and it stood there for the whole minute a start
+  takes.
+
+  The numbers come from **Docker, not from the CLI's output**, and that is not a
+  shortcut. `curie local up` runs `docker compose up -d --wait`, and with no TTY
+  the CLI's checklist writes nothing until the whole step resolves -- so between
+  the click and forty seconds later there is not one line to render. A bar
+  driven by that stream would have to invent its steps. Docker is both honest
+  and the *same* source `--wait` is blocking on, so `src/lib/startup.ts` counts
+  ready containers over created ones and names the services still outstanding.
+
+  Three rules there each fix a specific on-screen lie, and each has a test:
+  - **No healthcheck means no opinion, not "starting".** Most compose services
+    declare none; treating a missing verdict as pending leaves a stack that is
+    genuinely up sitting at "8 of 10" forever.
+  - **A one-shot that exited 0 is done, not broken.** `curie-migrate`,
+    `rustfs-init` and the two `*-perms` containers run once and exit; reading
+    "stopped" as "failed" reported four failures on a perfectly healthy stack.
+    That needs the exit code, which is why `ResourceSample` carries one --
+    without it "stopped" and "failed" are the same value.
+  - **Settling is bounded** (`SETTLE_GRACE_MS`). Every container healthy and
+    still no API means something IS wrong, and a spinner that never resolves
+    hides that forever behind a message saying it is fine. Past the grace period
+    the error comes back with the command that fixes it.
+
+  The grace period's clock is the resource frame's own `at`, not `Date.now()`:
+  the poll is what re-renders the card, so the deadline can only be noticed on a
+  frame boundary anyway -- and an impure call in render is a hook-lint error.
+
+- **A module that exports a non-component opts out of Fast Refresh.** One
+  `export const` in `src/primitives/index.tsx` -- the module every screen imports
+  -- silently stopped every primitive edit from reaching an open window, with the
+  source saying one thing and the running app another and nothing to explain the
+  gap. Icon paths live in `src/primitives/glyphs.ts` for that reason, and
+  `react-refresh/only-export-components` is **on**, so the next one is a lint
+  error rather than an afternoon. The deliberate exceptions are listed in
+  `eslint.config.js`: a context provider exported beside its own `use*` hook,
+  where a full reload is the honest outcome anyway.
+
 - **No demo mode, no fixtures** -- the same rule as `apps/ui` (#542). Every view
   is backed by the live CLI, the live Docker daemon, or the live API. An
   unmeasurable value renders as an em dash (`DASH` in `src/lib/format.ts`), never

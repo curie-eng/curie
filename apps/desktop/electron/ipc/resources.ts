@@ -81,6 +81,34 @@ interface DockerPsRow {
 }
 
 /**
+ * The healthcheck verdict inside `docker ps`'s `Status` string.
+ *
+ * Docker has no dedicated health column in `ps`; it appends the verdict in
+ * parentheses -- `Up 2 minutes (healthy)`, `Up 3 seconds (health: starting)`,
+ * `Up 5 minutes (unhealthy)` -- and appends nothing at all when the image
+ * declares no healthcheck. That last case is the one worth being careful about:
+ * it must read as "no opinion", not as "starting", or a stack made partly of
+ * unchecked services would never finish coming up on screen.
+ */
+export function parseHealth(status: string | undefined): "healthy" | "unhealthy" | "starting" | null {
+  if (!status) return null;
+  if (/\(health:\s*starting\)/i.test(status)) return "starting";
+  if (/\(unhealthy\)/i.test(status)) return "unhealthy";
+  if (/\(healthy\)/i.test(status)) return "healthy";
+  return null;
+}
+
+/**
+ * The exit status inside a stopped container's `Status` (`Exited (0) 8 minutes
+ * ago`). Null while it is running -- there is no code yet, and zero would be a
+ * lie in the one direction that matters.
+ */
+export function parseExitCode(status: string | undefined): number | null {
+  const m = /^Exited\s*\((\d+)\)/i.exec(status ?? "");
+  return m ? Number(m[1]) : null;
+}
+
+/**
  * Parse Docker's port summary.
  *
  * The raw form is a comma-separated list that lists each binding once per
@@ -309,6 +337,8 @@ export async function sampleDocker(): Promise<{ samples: ResourceSample[]; error
         service: service ?? null,
         role,
         state: row.State ?? "unknown",
+        health: parseHealth(row.Status),
+        exitCode: parseExitCode(row.Status),
         // A stopped container has no stats row at all; null (rendered as a dash)
         // is the honest answer, not 0.
         cpuPercent: stat ? parsePercent(stat.CPUPerc) : null,

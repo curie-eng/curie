@@ -112,6 +112,24 @@ export interface ResourceSample {
   /** `runner`, `api`, `worker`, `postgres`, ... -- drives grouping and color. */
   readonly role: string;
   readonly state: string;
+  /** The container's healthcheck verdict, parsed out of `docker ps`'s `Status`
+   *  (`Up 2 minutes (healthy)`). `null` when the image declares no healthcheck,
+   *  which is a real and common answer -- not a failure and not "starting".
+   *
+   *  It is carried because it is the only honest measure of a stack coming up:
+   *  `docker compose up --wait` waits on exactly this, so "ready" during a
+   *  start is `running` plus a health verdict that is not `starting`. `state`
+   *  alone flips to `running` the instant the process spawns and would draw a
+   *  stack as up while every service was still booting. */
+  readonly health: "healthy" | "unhealthy" | "starting" | null;
+  /** Exit status of a container that has stopped, from `Exited (0) 8 minutes
+   *  ago`. `null` while it is still running.
+   *
+   *  A compose stack is not all long-lived services: `curie-migrate`,
+   *  `rustfs-init` and the two `*-perms` containers run once and exit 0, and
+   *  that IS them succeeding. Without the code, "stopped" and "failed" are the
+   *  same value and a healthy stack reports four broken services. */
+  readonly exitCode: number | null;
   readonly cpuPercent: number | null;
   readonly memBytes: number | null;
   readonly memLimitBytes: number | null;

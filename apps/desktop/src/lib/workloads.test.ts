@@ -17,6 +17,8 @@ function sample(over: Partial<ResourceSample> & { name: string }): ResourceSampl
     service: null,
     role: "other",
     state: "running",
+    health: null,
+    exitCode: null,
     cpuPercent: 1,
     memBytes: 1024,
     memLimitBytes: null,

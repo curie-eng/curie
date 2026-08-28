@@ -10,7 +10,8 @@ import { useState } from "react";
 import { useApp, type Route } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
 import { F, LINE, M, PANE_FADE, R, S, STATUS, T } from "../tokens";
-import { Glyph, PROMPT, Segmented, Spinner } from "../primitives";
+import { Glyph, Segmented, Spinner } from "../primitives";
+import { PROMPT } from "../primitives/glyphs";
 
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "What is happening right now" },
