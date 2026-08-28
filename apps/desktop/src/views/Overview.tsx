@@ -216,12 +216,25 @@ export function Overview() {
                   gap: 10,
                 }}
               >
+                {/* `skill up` snapshots the directory it is invoked in, so with
+                    no bundle open it would boot a runner over the fallback
+                    directory and produce a container with nothing in it. The
+                    empty state's own action must not be a dead end: with
+                    nothing open this names what is missing and goes to Build. */}
                 <div style={{ ...F.callout, color: T.tertiary, textAlign: "center" }}>
-                  No runner sandboxes on this machine.
+                  {app.workspace
+                    ? "No runner sandboxes on this machine."
+                    : "No runner sandboxes, and no bundle open to boot one from."}
                 </div>
-                <RunButton id="skill.up" tone="primary">
-                  Boot a runner
-                </RunButton>
+                {app.workspace ? (
+                  <RunButton id="skill.up" tone="primary">
+                    Boot a runner
+                  </RunButton>
+                ) : (
+                  <Button size="sm" onClick={() => app.navigate("build")}>
+                    Open a bundle
+                  </Button>
+                )}
               </div>
             )}
             <div
@@ -679,18 +692,29 @@ function Agents() {
   const sheet = useAgentSheet();
 
   if (!app.api?.reachable) {
+    // With no containers at all, the setup card at the top of this page already
+    // owns starting the stack, and offering the same command again here made
+    // three green buttons compete on a screen whose whole point is that there
+    // is one thing to do. Pointing at a different API stays either way -- that
+    // is a genuinely different action, and it is the only one left when the
+    // stack is not the problem.
+    const firstRun = stackProgress(res.samples).total === 0;
     return (
       <section>
         <SectionHeader>Agents</SectionHeader>
         <Group style={{ padding: 14 }}>
           <div style={{ ...F.callout, color: T.tertiary, marginBottom: 10 }}>
-            Agents live in the platform API, and this app is not pointed at one that answers.
+            {firstRun
+              ? "Agents live in the platform API. Start it with the button at the top of this page, or point this app at one that is already running."
+              : "Agents live in the platform API, and this app is not pointed at one that answers."}
           </div>
           {/* Both ways out, rather than prose naming them. */}
           <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
-            <RunButton id="local.up" tone="primary">
-              Bring the local stack up
-            </RunButton>
+            {firstRun ? null : (
+              <RunButton id="local.up" tone="primary">
+                Bring the local stack up
+              </RunButton>
+            )}
             <Button size="sm" onClick={() => app.navigate("settings")}>
               Point at an API
             </Button>
