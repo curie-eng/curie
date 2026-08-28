@@ -73,6 +73,14 @@ class PluginManifest(BaseModel):
     # below carry the shape the validator enforces.
     triggers: list[Any] | None = None
     approvalPolicy: dict[str, Any] | None = None
+    # Curie authoring extension (ADR-0115): the OTHER agents this bundle
+    # intends to call by name. Declaration of intent only -- it names what the
+    # bundle author WANTS to reach, never a grant. An operator must still arm
+    # each declared pair before a call can succeed (ADR-0115 part 5, "the
+    # bundle declares, the operator arms"); a declared-but-unarmed pair is
+    # refused exactly like an undeclared one. Validated non-empty-string and
+    # deduplicated by ``validate.py``.
+    delegatesTo: list[str] | None = None
 
 
 # Trigger types the manifest may declare beyond inbound chat (epic #29). The

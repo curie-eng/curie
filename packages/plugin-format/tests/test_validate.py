@@ -227,6 +227,34 @@ def test_malformed_secrets_shape_is_rejected(tmp_path: Path) -> None:
     assert not validate_bundle(bundle).valid
 
 
+def test_valid_delegates_to_passes(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, '{"name": "alice", "delegatesTo": ["bob", "carol"]}')
+    assert validate_bundle(bundle).valid
+
+
+def test_malformed_delegates_to_shape_is_rejected(tmp_path: Path) -> None:
+    # A non-list delegatesTo value is rejected (matches test_malformed_secrets_shape_is_rejected:
+    # the field's own `list[str] | None` type rejects it at the manifest level before
+    # `_validate_delegates_to` runs, same as `secrets`).
+    bundle = _bundle(tmp_path, '{"name": "demo", "delegatesTo": "bob"}')
+    assert not validate_bundle(bundle).valid
+
+
+def test_empty_delegates_to_entry_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, '{"name": "demo", "delegatesTo": [""]}')
+    assert "delegatesTo.name_invalid" in _codes(bundle)
+
+
+def test_self_referential_delegates_to_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, '{"name": "alice", "delegatesTo": ["alice"]}')
+    assert "delegatesTo.self_reference" in _codes(bundle)
+
+
+def test_duplicate_delegates_to_entry_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, '{"name": "alice", "delegatesTo": ["bob", "bob"]}')
+    assert "delegatesTo.duplicate" in _codes(bundle)
+
+
 def test_valid_approval_policy_passes(tmp_path: Path) -> None:
     bundle = _bundle(
         tmp_path,

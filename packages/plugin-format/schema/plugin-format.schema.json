@@ -305,6 +305,21 @@
           "default": null,
           "title": "Commands"
         },
+        "delegatesTo": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delegatesto"
+        },
         "description": {
           "anyOf": [
             {

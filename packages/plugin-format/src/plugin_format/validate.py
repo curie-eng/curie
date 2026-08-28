@@ -89,6 +89,7 @@ def validate_bundle(path: str | Path) -> ValidationResult:
         _validate_triggers(manifest, c)
         _validate_approval_policy(manifest, mcp_servers, connector_server_names(root), c)
         _validate_secrets(manifest, c)
+        _validate_delegates_to(manifest, c)
         _validate_scripts(root, c)
         _validate_connectors(root, c)
         _validate_deploy_targets(root, c)
@@ -638,6 +639,46 @@ def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
                 "used for a connector secret",
                 loc,
             )
+
+
+def _validate_delegates_to(manifest: PluginManifest, c: _Collector) -> None:
+    """Validate the manifest ``delegatesTo`` declaration (ADR-0115).
+
+    A list of the OTHER agents this bundle intends to call, by name. This is
+    declaration only -- it never grants anything by itself, an operator still
+    has to arm each pair -- so validation is narrow: each entry is a non-empty
+    string, no entry names this same bundle (a bundle cannot declare intent to
+    call itself; that is a trivial cycle refused for free at deploy rather
+    than left for the depth/cycle check at call time), and there are no
+    duplicate entries.
+    """
+
+    declared = manifest.delegatesTo
+    if declared is None:
+        return
+    if not isinstance(declared, list):
+        c.error("delegatesTo.invalid", "delegatesTo must be a list of agent names", "plugin.json")
+        return
+
+    seen: set[str] = set()
+    for i, name in enumerate(declared):
+        loc = f"plugin.json (delegatesTo[{i}])"
+        if not isinstance(name, str) or not name.strip():
+            c.error(
+                "delegatesTo.name_invalid",
+                f"delegatesTo entry {name!r} must be a non-empty agent name",
+                loc,
+            )
+            continue
+        if name == manifest.name:
+            c.error(
+                "delegatesTo.self_reference",
+                f"delegatesTo cannot name this bundle's own agent {name!r}",
+                loc,
+            )
+        elif name in seen:
+            c.error("delegatesTo.duplicate", f"delegatesTo lists {name!r} more than once", loc)
+        seen.add(name)
 
 
 def _validate_scripts(root: Path, c: _Collector) -> None:
