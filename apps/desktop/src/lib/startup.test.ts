@@ -98,8 +98,18 @@ describe("stackProgress", () => {
 describe("stackPhase", () => {
   const none = { total: 0, ready: 0, waiting: [], failed: [] };
 
-  it("is idle once the API answers, whatever Docker says", () => {
-    expect(stackPhase(none, { apiReachable: true, runActive: true })).toBe("idle");
+  it("is idle once the API answers and nothing of ours is running", () => {
+    const up = { total: 4, ready: 4, waiting: [], failed: [] };
+    expect(stackPhase(up, { apiReachable: true, runActive: false })).toBe("idle");
+  });
+
+  it("keeps showing the card during a run even when the API already answers", () => {
+    // `local rebuild`, or `up` run a second time, both act on a stack that is
+    // already answering. Keying the card off the API meant it vanished for
+    // exactly those -- and made the card's existence depend on the same fact
+    // the errors beside it are about.
+    const up = { total: 4, ready: 4, waiting: [], failed: [] };
+    expect(stackPhase(up, { apiReachable: true, runActive: true })).toBe("starting");
   });
 
   it("is starting with nothing created yet, but only while a run is in flight", () => {

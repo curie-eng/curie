@@ -564,6 +564,20 @@ React + TypeScript renderer. Full structure and rationale in
   you operate, and the row's badge is the running-command count -- the one signal
   Activity used to contribute to the rail.
 
+- **Settings is tabbed, horizontally, inside the view.** Nine panels in one
+  column was a scroll rather than a screen: everything equally far away and
+  nothing saying what belonged with what. They group into Connection,
+  Appearance, Machine, Developer and About.
+
+  The `Segmented` sits INSIDE the view, unlike the Commands pane switch which
+  lives in the toolbar. That one is in the toolbar for two reasons that do not
+  apply here -- three things deep-link straight to History, and its two panes
+  want different frame padding -- and neither is worth exporting a route per
+  settings tab for. Horizontal, because a vertical rail beside the sidebar is
+  two navigation systems answering the same question. The selected tab is a UI
+  position, so it lives in `localStorage` beside the Build cursor and the
+  agent-sheet tier.
+
 - **Views do not render their own title.** The toolbar owns it (`shell/Toolbar.tsx`,
   keyed off the route). A pane that repeats its own name under the window's title
   bar is a web header.
@@ -738,9 +752,26 @@ the app already had the wrong URL written to disk -- `prefs()` rewrites that one
 value, and only when it is exactly the old default, since it is a port nothing
 has ever served rather than a preference somebody chose.
 
-A 401 from a reachable API is a **missing credential, not a fault to recheck**.
-The Overview says so and opens Settings; offering "Recheck" for it sent the
-operator round a loop that could not terminate.
+The constant lives in `electron/shared/contract.ts` because BOTH sides need it
+and neither may own it -- the main process as the stored default, Settings as the
+hint under the field. Those were two hardcoded copies, and the one in Settings
+went on telling people the wrong port after the default was fixed.
+
+A 401 from a reachable API is a **missing credential, and a WARNING, not an
+error**. The platform is up and agents run whether or not this window holds a
+key -- a bot answering in Slack does not care what this app can list -- so all
+that is actually missing is this app's own read access. Painting that red says
+the stack is broken when it is not. It opens Settings; offering "Recheck" for it
+sent the operator round a loop that could not terminate.
+
+**A start in flight is a start in flight, whatever else is true.** `stackPhase`
+used to check `apiReachable` first, which meant the progress card vanished for
+every start against a stack that was already answering (`local rebuild`, or `up`
+run twice) and, worse, made the card's existence depend on the same fact the
+errors beside it are about. The card renders first and independently of the
+issue list: a start in progress and a problem worth naming are both true at once
+more often than not -- that is what a start IS -- and letting either suppress the
+other answers "what is happening" with half of it.
 
 ## Drift between this app and the installed CLI
 

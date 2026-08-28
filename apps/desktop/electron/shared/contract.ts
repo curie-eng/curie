@@ -93,6 +93,25 @@ export interface DaemonCapacity {
   readonly hostMemBytes: number | null;
 }
 
+/**
+ * Where `curie local up` publishes the platform API on the host.
+ *
+ * The container listens on 8000 and `compose.dev.yaml` maps it to **28000**,
+ * because a dev stack that squats on the obvious ports collides with everything
+ * else on a developer's machine. This app defaulted to `localhost:8000`, which
+ * nothing serves, so the app that starts the stack could not then talk to it:
+ * every API-backed screen sat empty behind "not answering" while the stack was
+ * completely healthy.
+ *
+ * It lives in the contract because BOTH sides need it and neither may own it.
+ * The main process uses it as the stored default; Settings shows it as the hint
+ * under the field. Those were two hardcoded copies, and the copy in Settings
+ * went on telling people the wrong port after the default was fixed. The CLI's
+ * `LOCAL_API_URL` (`cli/src/observability.rs`) is the source, and
+ * `electron/store.test.ts` reads that file so the three cannot drift.
+ */
+export const LOCAL_API_URL = "http://localhost:28000";
+
 /** One row of the resource monitor. Shaped after `docker stats` because that is
  *  the mental model operators already have, but sourced from whichever tier is
  *  live: Docker for `skill`/`local`, the platform API's runner pods for

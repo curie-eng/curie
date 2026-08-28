@@ -355,7 +355,16 @@ function Health({ onRefresh }: { onRefresh(): void }) {
 
   if (!env) return null;
 
-  const issues: { text: string; fix?: string; label?: string; goto?: "settings" }[] = [];
+  const issues: {
+    text: string;
+    fix?: string;
+    label?: string;
+    goto?: "settings";
+    /** Defaults to `error`. A thing that narrows what the app can show is not
+     *  the same as a thing that stops it working, and painting both red makes
+     *  the difference invisible at the moment it matters most. */
+    tone?: "error" | "warn";
+  }[] = [];
   if (!env.cliPath) {
     issues.push({ text: "The curie binary is not on PATH, so this app cannot run anything." });
   }
@@ -383,7 +392,13 @@ function Health({ onRefresh }: { onRefresh(): void }) {
     issues.push(
       unauthorized
         ? {
-            text: `The API at ${app.api.baseUrl} answered, but rejected this app's credentials (${app.agentsError}). Agents, versions and memory need an API key.`,
+            // A warning, not an error, and the wording matters as much as the
+            // colour. The platform is up and agents run without this app having
+            // a key -- a bot answering in Slack does not care what this window
+            // can list. All that is missing is THIS app's read access to the
+            // agent list, so it must not be painted as the stack being broken.
+            tone: "warn",
+            text: `The stack is up. This app has no API key for ${app.api.baseUrl}, so it cannot list agents, versions or memory here — agents themselves are unaffected.`,
             label: "Add an API key",
             goto: "settings",
           }
@@ -393,12 +408,17 @@ function Health({ onRefresh }: { onRefresh(): void }) {
   if (!issues.length && !starting) return null;
 
   return (
+    // The progress card is FIRST and is rendered independently of the issues
+    // below it. A start in flight and a problem worth naming are both true at
+    // once more often than not -- that is what a start is -- and letting either
+    // one suppress the other means the screen answers "what is happening" with
+    // only half of it.
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {starting ? <StackStarting phase={phase} progress={progress} /> : null}
       {issues.map((issue, i) => (
         <Notice
           key={i}
-          tone="error"
+          tone={issue.tone ?? "error"}
           action={
             issue.fix ? (
               <RunButton id={issue.fix}>{issue.label ?? "Fix"}</RunButton>

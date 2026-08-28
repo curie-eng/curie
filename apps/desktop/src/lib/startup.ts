@@ -127,8 +127,15 @@ export function stackPhase(
     settlingForMs = 0,
   }: { apiReachable: boolean; runActive: boolean; settlingForMs?: number },
 ): StackPhase {
+  // A start in flight is a start in flight, whatever else is true. This used to
+  // check `apiReachable` first and return `idle` on it, which meant the card
+  // vanished for every start against a stack that was already answering --
+  // `local rebuild`, or `up` run twice -- and, worse, made the card's existence
+  // depend on the same fact the errors beside it are about. The run ending is
+  // what ends the run.
+  if (runActive) return "starting";
   if (apiReachable) return "idle";
-  if (progress.total === 0) return runActive ? "starting" : "idle";
+  if (progress.total === 0) return "idle";
   if (progress.ready < progress.total) return "starting";
   // Everything Docker knows about is up; only the API has yet to answer. That
   // is normal for a few seconds and a problem after that.
