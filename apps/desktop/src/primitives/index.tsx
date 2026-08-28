@@ -314,7 +314,14 @@ export function Notice({
   const color = TONE[tone];
   const glyph = tone === "success" ? "✓" : tone === "info" ? "i" : "!";
   return (
-    <div
+    // A `Group`, so a notice is a card like everything else on the screen: the
+    // same radius, the same hairline, the same lift. It used to be a flat
+    // tinted band, which on a pane full of cards read as a stripe painted onto
+    // the background rather than as a thing sitting on it. The tint replaces
+    // the card's own fill rather than layering over it -- the tone IS this
+    // card's surface -- and `Group`'s backdrop blur still carries the window's
+    // vibrancy through it.
+    <Group
       style={{
         display: "flex",
         gap: 10,
@@ -326,8 +333,7 @@ export function Notice({
         // margin. One line centres.
         alignItems: title ? "flex-start" : "center",
         padding: "10px 12px",
-        borderRadius: R.group,
-        background: tint(color, 0.1),
+        background: tint(color, 0.12),
       }}
     >
       <span
@@ -356,7 +362,7 @@ export function Notice({
         {children ? <div style={{ ...F.callout, color: T.secondary }}>{children}</div> : null}
       </div>
       {action ? <div style={{ flex: "none" }}>{action}</div> : null}
-    </div>
+    </Group>
   );
 }
 
@@ -491,11 +497,6 @@ export function Glyph({
     </svg>
   );
 }
-
-/** A shell prompt: chevron and cursor rule. Shared rather than copied, because
- *  the sidebar's Commands row and the toolbar's console button are the same
- *  glyph and a second copy of the path is a second copy to keep in step. */
-export const PROMPT = "m3 4.6 3 3-3 3M8.4 11.4H13";
 
 export type ButtonTone = "default" | "primary" | "danger" | "plain";
 

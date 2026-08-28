@@ -15,7 +15,8 @@ import { useRuns } from "../bridge/runs";
 import { bridge } from "../bridge/bridge";
 import { ago, bytes, count, duration, percent, usd } from "../lib/format";
 import { ACCENT, F, STATUS, T } from "../tokens";
-import { FitWidth, RankedBars, Sparkline } from "../primitives/charts";
+import { stackPhase, stackProgress } from "../lib/startup";
+import { FitWidth, RankedBars, Sparkline, UsageBar } from "../primitives/charts";
 import { RunButton } from "./Actions";
 import { useAgentSheet } from "./AgentSheet";
 import { LadderStrip } from "./Tiers";
@@ -29,6 +30,7 @@ import {
   Notice,
   Row,
   SectionHeader,
+  Spinner,
   Stat,
   Stats,
 } from "../primitives";
@@ -324,7 +326,33 @@ function Blockers({ approvals }: { approvals: readonly ApprovalOut[] }) {
 /** What is broken on this machine, with the command that fixes it. */
 function Health({ onRefresh }: { onRefresh(): void }) {
   const app = useApp();
+  const res = useResources();
+  const runs = useRuns();
   const env = app.env;
+
+  const progress = stackProgress(res.samples);
+
+  // When everything went ready, so the settling grace period can be bounded.
+  //
+  // The clock is the resource FRAME's own timestamp, not `Date.now()`. Two
+  // reasons, and the second is the real one: `Date.now()` in render is impure
+  // and the hook lint rejects it, but more importantly the frame's `at` is the
+  // clock this measurement actually runs on -- the poll is what re-renders this
+  // component, so the deadline can only ever be noticed on a frame boundary
+  // anyway. Adjusted during render rather than in an effect, per the app's
+  // rule; an effect would show one frame of the wrong answer first.
+  const now = res.frame?.at ?? 0;
+  const allReady = progress.total > 0 && progress.ready === progress.total;
+  const [readyAt, setReadyAt] = useState<number | null>(null);
+  if (allReady && readyAt === null) setReadyAt(now);
+  if (!allReady && readyAt !== null) setReadyAt(null);
+
+  const phase = stackPhase(progress, {
+    apiReachable: !!app.api?.reachable,
+    runActive: runs.active.some((r) => r.action === "local.up" || r.action === "local.rebuild"),
+    settlingForMs: readyAt === null ? 0 : Math.max(0, now - readyAt),
+  });
+
   if (!env) return null;
 
   const issues: { text: string; fix?: string; label?: string }[] = [];
@@ -334,7 +362,13 @@ function Health({ onRefresh }: { onRefresh(): void }) {
   if (!env.dockerAvailable) {
     issues.push({ text: "Docker is not reachable: the skill and local tiers cannot start." });
   }
-  if (app.api && !app.api.reachable && app.api.baseUrl) {
+  // The API being down is only an ERROR when nothing is being done about it.
+  // While the stack is coming up the same fact is progress, and `StackStarting`
+  // says it that way -- with a spinner rather than a red glyph, because a
+  // failure mark standing over a working process is the screen calling its own
+  // work broken.
+  const starting = phase !== "idle";
+  if (app.api && !app.api.reachable && app.api.baseUrl && !starting) {
     issues.push({
       text: `The platform API at ${app.api.baseUrl} is not answering. Agents, versions, memory and traces are unavailable until it is.`,
       fix: "local.up",
@@ -344,10 +378,11 @@ function Health({ onRefresh }: { onRefresh(): void }) {
   if (app.agentsError && app.api?.reachable) {
     issues.push({ text: `Reached the API but could not list agents: ${app.agentsError}` });
   }
-  if (!issues.length) return null;
+  if (!issues.length && !starting) return null;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {starting ? <StackStarting phase={phase} progress={progress} /> : null}
       {issues.map((issue, i) => (
         <Notice
           key={i}
@@ -366,6 +401,68 @@ function Health({ onRefresh }: { onRefresh(): void }) {
         </Notice>
       ))}
     </div>
+  );
+}
+
+/**
+ * The stack coming up, as progress rather than as an error.
+ *
+ * Everything on it is measured. The bar is containers Docker reports ready over
+ * containers compose has created, which is the same condition `compose up
+ * --wait` is itself blocking on; the step line names the services actually
+ * being waited for. Nothing here advances because time passed.
+ *
+ * There is no error glyph. A red mark standing over a process that is working
+ * is the screen calling its own work broken, and it is the thing that made this
+ * card read as a failure for the whole minute the stack takes to start. The
+ * spinner is the state.
+ */
+function StackStarting({
+  phase,
+  progress,
+}: {
+  readonly phase: "starting" | "settling";
+  readonly progress: ReturnType<typeof stackProgress>;
+}) {
+  const { total, ready, waiting, failed } = progress;
+
+  const step = failed.length
+    ? `${failed.join(", ")} ${failed.length === 1 ? "is" : "are"} not healthy — the console has the output`
+    : phase === "settling"
+      ? "All containers are up. Waiting for the API to answer."
+      : waiting.length
+        ? `Waiting for ${waiting.slice(0, 3).join(", ")}${waiting.length > 3 ? ` and ${waiting.length - 3} more` : ""}`
+        : // Compose has created nothing yet, which means it is still pulling
+          // images. That is the longest phase and the one with no output at
+          // all, so it needs to be named rather than left blank.
+          "Pulling images. Nothing has been created yet.";
+
+  return (
+    <Group style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "10px 12px" }}>
+      <span style={{ flex: "none", marginTop: 2 }}>
+        <Spinner size={14} color={failed.length ? STATUS.warn : ACCENT} />
+      </span>
+      <div style={{ flex: 1, minWidth: 0, display: "grid", gap: 6 }}>
+        <div style={{ ...F.headline }}>Starting the local stack</div>
+
+        {/* `warnAt` is null on purpose: `total` is a target to reach, not a
+            ceiling to stay under, and amber at 85% would warn that the stack is
+            nearly up. */}
+        <UsageBar
+          value={total ? ready : null}
+          max={total || null}
+          height={4}
+          warnAt={null}
+          color={failed.length ? STATUS.warn : ACCENT}
+          title={total ? `${ready} of ${total} containers ready` : "Nothing created yet"}
+        />
+
+        <div style={{ ...F.footnote, color: T.tertiary }}>
+          {total ? `${ready} of ${total} services ready · ` : ""}
+          {step}
+        </div>
+      </div>
+    </Group>
   );
 }
 

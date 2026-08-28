@@ -16,6 +16,8 @@ function container(over: Partial<ResourceSample> & { name: string; role: string 
     project: "curie",
     service: over.role,
     state: "running",
+    health: null,
+    exitCode: null,
     cpuPercent: 1,
     memBytes: 1024,
     memLimitBytes: null,

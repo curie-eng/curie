@@ -42,8 +42,27 @@ export default [
       // The manifest gives every flag a `long`, checked by the parity test, so
       // the assertions that rely on it are load-bearing rather than sloppy.
       "@typescript-eslint/no-non-null-assertion": "off",
-      "react-refresh/only-export-components": "off",
+      // On, and load bearing for the dev loop rather than for style. A module
+      // that exports a non-component opts itself out of Fast Refresh, and with
+      // this off a single constant in `primitives/index.tsx` silently stopped
+      // every primitive edit from reaching an open window -- the source said one
+      // thing and the running app another, with nothing to say why.
+      "react-refresh/only-export-components": ["error", { allowConstantExport: true }],
     },
+  },
+  {
+    // The deliberate exceptions: a context provider exported beside its own
+    // `use*` hook. Splitting those would buy nothing -- editing a provider
+    // remounts the tree anyway, so a full reload is the honest outcome there --
+    // whereas in a leaf component module the same export silently costs every
+    // consumer its hot updates. That asymmetry is the whole reason the rule is
+    // scoped rather than blanket-disabled.
+    files: [
+      "src/bridge/**/*.tsx",
+      "src/primitives/charts.tsx",
+      "src/views/AgentSheet.tsx",
+    ],
+    rules: { "react-refresh/only-export-components": "off" },
   },
   {
     files: ["electron/**/*.ts", "scripts/**/*.mjs", "*.config.ts"],
