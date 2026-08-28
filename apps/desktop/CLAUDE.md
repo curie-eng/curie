@@ -27,6 +27,20 @@ React + TypeScript renderer. Full structure and rationale in
   down: **Just you, right here** / **Everything, on this computer** / **Shared
   with your team**. The rail says "Where it runs".
 
+- **A control must not resize the thing it is inside.** The new-agent wizard put
+  each template's description inside the card you had selected, so choosing one
+  grew it and shoved the cards below it down the page -- selection moving the
+  set you are selecting between. The description lives in a detail area that is
+  always present, and the cards are all one height.
+
+  The body of that sheet is a FIXED height rather than a natural one, for the
+  same reason one level up: three steps and three templates all have different
+  amounts to say, so a self-sizing body made the whole sheet jump on every press
+  -- the buttons moving under the cursor that had just used them. Anything taller
+  scrolls inside. Measured across every template and every step: one height, one
+  position. `src/views/NewAgent.test.tsx` pins the two decisions, since jsdom
+  cannot measure the pixels.
+
 - **The command surface is generated, never hand-written.** Every command in the
   Commands view, the palette, and the canvas inspector comes from
   `src/generated/commandManifest.ts`, regenerated from `cli/command-manifest.json`
