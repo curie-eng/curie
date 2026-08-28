@@ -40,6 +40,12 @@
      light theme before a dark one. */
   --s-content-fill: rgba(32, 32, 34, 0.6);
   --s-raised: #2c2c2e;
+  /* A sheet and a row menu float over arbitrary content, so they cannot be as
+     translucent as a card -- but fully opaque reads as a system dialog dropped
+     on the app rather than as part of it. A thin film over `raised`, with the
+     card blur under it: enough that the page is felt behind the panel, not
+     enough that its text competes with the panel's own. */
+  --sheet-fill: rgba(44, 44, 46, 0.93);
   --s-hover: #333336;
   --s-selected: #3a3a3d;
   --s-well: #1a1a1c;
@@ -163,6 +169,7 @@
   --s-content: #eaecf1;
   --s-content-fill: rgba(222, 226, 235, 0.62);
   --s-raised: #ffffff;
+  --sheet-fill: rgba(255, 255, 255, 0.93);
   --s-hover: #f1f3f7;
   --s-selected: #e0e5ee;
   /* Recessed, and clearly below the card it sits on rather than beside it. */

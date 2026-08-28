@@ -221,6 +221,8 @@ function derive(theme) {
       // Same colour, vibrancy allowed through. See the note in styles.css.
       "--s-content-fill": alpha(mix(bg, "#000000", 0.08), 0.6),
       "--s-raised": mix(bg, fg, 0.1),
+      // A sheet/menu floats over arbitrary content: nearly opaque, not glass.
+      "--sheet-fill": alpha(mix(bg, fg, 0.1), 0.93),
       "--s-hover": mix(bg, fg, 0.15),
       "--s-selected": mix(bg, fg, 0.21),
       "--s-well": mix(bg, "#000000", 0.35),
@@ -251,6 +253,7 @@ function derive(theme) {
       "--s-content": mix(bg, "#000000", 0.045),
       "--s-content-fill": alpha(mix(bg, "#000000", 0.09), 0.62),
       "--s-raised": bg,
+      "--sheet-fill": alpha(bg, 0.93),
       "--s-hover": mix(bg, "#000000", 0.045),
       "--s-selected": mix(bg, accent, 0.14),
       "--s-well": mix(bg, "#000000", 0.075),
@@ -307,6 +310,9 @@ function derive(theme) {
     // A high-contrast theme exists to remove ambiguity between surfaces, so it
     // gets an opaque card and a hard edge rather than something to see through.
     vars["--card-fill"] = vars["--s-raised"];
+    // A high-contrast theme removes ambiguity between surfaces, so a panel that
+    // floats over content is opaque there too.
+    vars["--sheet-fill"] = vars["--s-raised"];
     vars["--card-backdrop"] = "none";
     vars["--shadow-card"] = `0 0 0 1px ${alpha(lineBase, 0.7)}`;
     vars["--shadow-overlay"] = `0 0 0 1px ${alpha(lineBase, 0.7)}`;
