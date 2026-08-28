@@ -1395,27 +1395,35 @@ export function ResizeHandle({
  *   - `sidebar` is the platform's rail mark: a window with its left column
  *     shaded while the rail is showing. It narrows to icons rather than leaving,
  *     which is why the frame stays put in both states and only the fill moves.
+ *   - `bottom` is the same window with its bottom strip shaded, for the console.
+ *     Same family on purpose: these two put a panel away without it leaving the
+ *     window, and the shaded edge is which panel. The frame does the
+ *     distinguishing rather than two unrelated glyphs.
  *   - `list` is the list itself, three bars, with a chevron for the direction it
  *     goes. Direction is honest here in a way it would not be for the rail: this
  *     panel LEAVES, so "away to the left" and "back from the left" is exactly
  *     what the two states are.
  *
- * `aria-pressed` carries the state to a screen reader either way, so nothing
- * depends on telling the two glyphs apart.
+ * `aria-pressed` carries the state to a screen reader in every case, so nothing
+ * depends on telling the glyphs apart.
  */
 export function PanelToggle({
   collapsed,
   onToggle,
   label,
   variant = "sidebar",
+  title,
   style,
 }: {
   collapsed: boolean;
   onToggle(): void;
   /** What the panel is, e.g. "agents". Used to build the title both ways. */
   label: string;
-  /** Which panel this is. See the note above -- the two must not look alike. */
-  variant?: "sidebar" | "list";
+  /** Which panel this is. See the note above -- these must not look alike. */
+  variant?: "sidebar" | "bottom" | "list";
+  /** Overrides the generated `Hide the x` / `Show the x`, for a control with
+   *  more to say -- where the panel went, and what brings it back. */
+  title?: string;
   style?: CSSProperties;
 }) {
   const [hover, setHover] = useState(false);
@@ -1424,7 +1432,7 @@ export function PanelToggle({
       className="no-drag"
       onClick={onToggle}
       aria-pressed={!collapsed}
-      title={collapsed ? `Show ${label}` : `Hide ${label}`}
+      title={title ?? (collapsed ? `Show ${label}` : `Hide ${label}`)}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
@@ -1454,18 +1462,22 @@ export function PanelToggle({
         strokeLinecap="round"
         strokeLinejoin="round"
       >
-        {variant === "sidebar" ? (
+        {variant !== "list" ? (
           <>
             <rect x={2.2} y={3.4} width={11.6} height={9.2} rx={1.8} />
             {/* Stops at the frame's inner edges: the round cap this glyph now
                 shares with the rest of the icon set adds half a stroke at each
                 end, and a divider drawn corner to corner overshot into them. */}
-            <path d="M6.4 4.1v7.8" />
-            {/* The rail itself, shaded while it is showing. */}
-            {collapsed ? null : (
-              // Inset evenly inside the frame and stopping at the divider. Drawn
-              // flush to the frame it overshot the rounded corners, which at a
-              // 15px glyph reads as a smudge rather than as a shaded panel.
+            <path d={variant === "bottom" ? "M2.9 9.6h10.2" : "M6.4 4.1v7.8"} />
+            {/* The panel itself, shaded while it is showing. Inset evenly inside
+                the frame and stopping at the divider: drawn flush to the frame it
+                overshot the rounded corners, which at a 15px glyph reads as a
+                smudge rather than as a shaded panel. */}
+            {collapsed ? null : variant === "bottom" ? (
+              // Inset past where the frame's 1.8 corner radius is still
+              // curving, or the strip's square ends sit outside the curve.
+              <rect x={4.1} y={10.3} width={7.8} height={1.4} fill="currentColor" stroke="none" opacity={0.55} />
+            ) : (
               <rect x={3.4} y={4.4} width={3} height={7.2} fill="currentColor" stroke="none" opacity={0.55} />
             )}
           </>

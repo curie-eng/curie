@@ -164,7 +164,7 @@ function AgentList() {
   const [creating, setCreating] = useState(false);
 
   return (
-    <section style={{ width: 196, flex: "none" }}>
+    <section style={{ width: 168, flex: "none" }}>
       {/* The count says this is a collection with a size, not a fixed pair of
           labels. */}
       <SectionHeader
@@ -241,32 +241,44 @@ function AgentList() {
                   {(w.plugin?.name ?? w.name).slice(0, 1).toUpperCase()}
                 </span>
                 <div style={{ flex: 1, minWidth: 0 }} title={w.path}>
-                  <div
-                    style={{
-                      ...F.body,
-                      color: on ? T.primary : T.secondary,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {w.plugin?.name ?? w.name}
+                  {/* Identity and state on the first line, facts on the second.
+                      The `live` pill used to sit beside the facts, which in a
+                      168px column left "1 skill · evals" about seventy pixels
+                      and clipped the half of it that is not the word "skill".
+                      Up here it costs nothing: a name is short and already
+                      ellipsises, and "squawk · live" is the pair somebody scans
+                      this list for anyway. */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span
+                      style={{
+                        ...F.body,
+                        color: on ? T.primary : T.secondary,
+                        minWidth: 0,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {w.plugin?.name ?? w.name}
+                    </span>
+                    <DeployedDot bundleName={w.plugin?.name ?? w.name} />
                   </div>
+                  {/* One line, clipped rather than wrapped. Wrapping doubled the
+                      row's height for one agent and not the next, and a list
+                      whose rows differ in height for a reason nobody can see
+                      reads as broken rather than as informative. */}
                   <div
                     style={{
                       ...F.footnote,
                       color: T.quaternary,
                       marginTop: 1,
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
                     }}
                   >
-                    <span>
-                      {w.skills.length} skill{w.skills.length === 1 ? "" : "s"}
-                      {w.hasEvals ? " · evals" : ""}
-                    </span>
-                    <DeployedDot bundleName={w.plugin?.name ?? w.name} />
+                    {w.skills.length} skill{w.skills.length === 1 ? "" : "s"}
+                    {w.hasEvals ? " · evals" : ""}
                   </div>
                 </div>
                 {/* The row's actions, behind the platform's overflow affordance
@@ -280,6 +292,7 @@ function AgentList() {
                     styles.css. */}
                 <MenuButton
                   className="row-delete"
+                  data-reveal
                   label={`Actions for ${w.plugin?.name ?? w.name}`}
                   items={[
                     {
