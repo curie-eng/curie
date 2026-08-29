@@ -1006,6 +1006,53 @@ React + TypeScript renderer. Full structure and rationale in
   `FitWidth` (`primitives/charts.tsx`). A hardcoded chart width in a resizable
   window is a bug.
 
+## The measure, and the fade
+
+- **The content column is centred, not left-aligned.** It was capped at 1320 and
+  pinned to the sidebar, so every pixel of extra window width went to a dead band
+  on the right and the app read as shoved into a corner. `CONTENT_MAX` is 1440
+  with `margin-inline: auto`: a window wider than the cap grows both margins
+  evenly. The cap still exists -- a table at arm's length is its own problem --
+  but it is a measure, not an alignment.
+
+- **`CONTENT_FADE` applies only while the console is on screen.** The ramp exists
+  to stop a part-scrolled card being guillotined against the console's rounded
+  top edge. Dismiss the console and there is nothing at that edge to collide
+  with, so the mask was softening the last line of the page for no reason. Canvas
+  still opts out entirely -- a node fading for a layout reason reads as state the
+  node does not have.
+
+## Where the command names may and may not show
+
+The de-unixified surface had one leak: the generated form's sheet was titled
+`curie local deploy`. Every button that opens it says something like "Put it to
+work", so the panel announcing a command line undid the whole point at the moment
+somebody acted. `commandTitle()` in `lib/surfaces.ts` names a command by its
+placement label instead, and the confirm sheet uses it too.
+
+The command line has not gone anywhere: the form still shows it above the Run
+button, copyable, which is where somebody who wants it looks. That is the rule --
+**the exact invocation is available, never the heading.**
+
+## Getting a deployed agent into Slack
+
+"Running now" was true and useless on its own: a deployed agent answers nothing
+until a Slack app exists and the dispatcher holds its two tokens. The operator
+had finished the part the app could see and had four undocumented steps left.
+
+`SlackInstall` (in `views/Deployment.tsx`) shows those steps under a deployed
+agent, collapsed. The manifest it hands out is **generated** from
+`apps/dispatcher/slack-app-manifest.yaml` by `pnpm gen:slack`, never retyped: a
+scope added there and not regenerated here would have the app installing a Slack
+app the dispatcher cannot use, and a missing scope does not fail at install -- it
+fails at an API call hours later. CI regenerates and diffs, the same mechanism
+that guards the command manifest. `slackManifest.test.ts` covers what a diff
+cannot judge: that the string is still usable as a manifest at all.
+
+The source file's leading comment block is stripped, because it is instructions
+to a human reading the repo. What the copy button gives you is what Slack expects
+and nothing else.
+
 ## Furniture the operator moves
 
 Three panels can be resized or put away: the console (drag its top edge), the

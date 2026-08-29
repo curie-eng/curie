@@ -708,6 +708,16 @@ jobs:
           pnpm gen:manifest
           git diff --exit-code src/generated/commandManifest.ts src/generated/commandManifest.json \
             || (echo "commandManifest is stale; run 'pnpm gen:manifest' in this job's working directory and commit." && exit 1)
+      - name: Slack app manifest is current
+        # The desktop app hands operators the Slack app manifest to paste at
+        # api.slack.com. It is generated from apps/dispatcher/slack-app-manifest.yaml
+        # so the scopes cannot drift from the ones the dispatcher needs -- a
+        # missing scope fails at an API call hours after a successful install,
+        # which is the worst way to find out.
+        run: |
+          pnpm gen:slack
+          git diff --exit-code src/generated/slackManifest.ts \
+            || (echo "slackManifest.ts is stale; run 'pnpm gen:slack' in this job's working directory and commit." && exit 1)
       - name: Typecheck
         run: pnpm typecheck
       - name: Lint
