@@ -67,19 +67,24 @@ is a judgement call, not something derivable from the tree.
    (`apps/api/src/curie_api/models.py::Deployment`), which materializes as a `CREATE TYPE` in the `curie` schema.
 3. **`JSONB` column type** — `apps/api/src/curie_api/models.py::JSONB` is imported from
    `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **fifteen** columns:
-   `behavior_packs`, `approval_required_tools`, `approval_routes` and `secrets` on
-   `apps/api/src/curie_api/models.py::Agent`, `changed_paths` on
-   `apps/api/src/curie_api/models.py::Publication`, `evidence` on
-   `apps/api/src/curie_api/models.py::ApprovalAuditEntry`, `value` on
-   `apps/api/src/curie_api/models.py::WorkflowStateEntry`, `arguments`, `result`,
-   `prior_state`, `post_state` and `target` on
-   `apps/api/src/curie_api/models.py::AgentAction`,
-   `evidence` on `apps/api/src/curie_api/models.py::ActionAuditEntry`, and `params`
-   and `result` on `apps/api/src/curie_api/models.py::ControlProposal`. Two of them are
-   load-bearing rather than incidental: the workflow-state store exists precisely because
-   Postgres JSONB meant no new datastore was needed (see that class's docstring), and the
-   action ledger's `prior_state` holds a snapshot whose shape belongs to whatever resource
-   a connector wrote to, which no column type can know in advance (ADR-0117).
+   `behavior_packs`, `approval_required_tools`, `approval_routes`, `secrets`,
+   `changed_paths`, `evidence`, `arguments`, `result`, `prior_state`, `target`,
+   `post_state`, `value`, and `params`. The last one is
+   `apps/api/src/curie_api/models.py::ControlProposal.params`; by owning class,
+   `behavior_packs`/`approval_required_tools`/`approval_routes`/`secrets` are on
+   `apps/api/src/curie_api/models.py::Agent`, `changed_paths` is on
+   `apps/api/src/curie_api/models.py::Publication`, `arguments`/`result`
+   (first occurrence)/`prior_state`/`target`/`post_state` are on
+   `apps/api/src/curie_api/models.py::AgentAction`, `evidence` is used by both
+   `apps/api/src/curie_api/models.py::ApprovalAuditEntry` and
+   `apps/api/src/curie_api/models.py::ActionAuditEntry`, `value` is on
+   `apps/api/src/curie_api/models.py::WorkflowStateEntry`, and `params`/`result`
+   (second occurrence) are on `apps/api/src/curie_api/models.py::ControlProposal`.
+   Two of them are load-bearing rather than incidental: the workflow-state store
+   exists precisely because Postgres JSONB meant no new datastore was needed (see
+   that class's docstring), and the action ledger's `prior_state` holds a snapshot
+   whose shape belongs to whatever resource a connector wrote to, which no column
+   type can know in advance (ADR-0117).
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
    is written by hand in `apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL` (executed
    through `text(...)` in `apps/api/src/curie_api/commitpoller.py::CommitPoller.poll_once`)
