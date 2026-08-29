@@ -213,3 +213,43 @@ describe("classify canonicalises the role", () => {
     });
   });
 });
+
+describe("classify attributes the platform's own sandboxes", () => {
+  // A turn runs in `curie-thread-<hash>-<hash>`, whose name carries a thread
+  // hash and nothing else. Before the label was read these fell through to role
+  // "other" with no agent -- the one container on the machine that IS an agent
+  // doing work was the one the Resources tab could not attribute.
+  const LABELS = {
+    "curietech.ai/agent": "shift-notes",
+    "curietech.ai/managed-by": "curie-sandbox-substrate",
+    "curietech.ai/thread-hash": "670393b761",
+  };
+
+  it("names the agent a sandbox is running for", () => {
+    expect(classify("curie-thread-670393b761-c62e9b", LABELS)).toEqual({
+      role: "runner",
+      agent: "shift-notes",
+    });
+  });
+
+  it("prefers the label over anything the name suggests", () => {
+    expect(classify("curie-runner-something-else", LABELS)).toEqual({
+      role: "runner",
+      agent: "shift-notes",
+    });
+  });
+
+  it("still calls an unlabelled sandbox a runner rather than 'other'", () => {
+    expect(classify("curie-thread-abc-def", {})).toEqual({ role: "runner" });
+    expect(classify("x", { "curietech.ai/managed-by": "curie-sandbox-substrate" })).toEqual({
+      role: "runner",
+    });
+  });
+
+  it("leaves compose services alone", () => {
+    expect(classify("curie-valkey-1", { "com.docker.compose.service": "valkey" })).toEqual({
+      role: "valkey",
+      service: "valkey",
+    });
+  });
+});
