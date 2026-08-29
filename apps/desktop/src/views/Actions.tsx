@@ -15,7 +15,7 @@ import { useMemo, type CSSProperties, type ReactNode } from "react";
 
 import { useApp, type Prefill } from "../bridge/app";
 import { commandsById } from "../lib/manifest";
-import { resolve, type Action, type Need, type Surface } from "../lib/surfaces";
+import { commandTitle, resolve, type Action, type Need, type Surface } from "../lib/surfaces";
 import { CommandForm } from "./CommandForm";
 import { F, LINE, S, STATUS, T } from "../tokens";
 import { Button, Group, Mono, SectionHeader, Sheet, type ButtonTone } from "../primitives";
@@ -262,11 +262,9 @@ export function RunSheetHost() {
 
   return (
     <Sheet
-      title={
-        <span style={{ display: "inline-flex", alignItems: "baseline", gap: 8 }}>
-          <Mono style={{ fontSize: 13, color: T.primary }}>curie {cmd.path.join(" ")}</Mono>
-        </span>
-      }
+      // Named for what you pressed, not for the command it will run. See
+      // `commandTitle`.
+      title={commandTitle(cmd.id, cmd.path)}
       onClose={app.closeRun}
       width={640}
       footer={

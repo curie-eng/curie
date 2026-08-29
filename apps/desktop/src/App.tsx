@@ -121,8 +121,13 @@ function Keys({ onToggleRail }: { onToggleRail(): void }) {
 const CONTENT_FADE =
   "linear-gradient(to bottom, #000 calc(100% - 28px), rgba(0,0,0,0.85) calc(100% - 20px), rgba(0,0,0,0.5) calc(100% - 11px), rgba(0,0,0,0.15) calc(100% - 4px), transparent 100%)";
 
+/** The measure. Wide enough that a large window is used rather than framed by a
+ *  dead band, narrow enough that a table never runs to arm's length. */
+const CONTENT_MAX = 1440;
+
 function Frame() {
   const { route } = useApp();
+  const runs = useRuns();
   const [scrolled, setScrolled] = useState(false);
   const scroller = useRef<HTMLElement>(null);
 
@@ -133,6 +138,9 @@ function Frame() {
   // up with the content above it by construction rather than by a number copied
   // into two files that then drift.
   const padX = bleed ? 16 : 22;
+  // See the mask below: the ramp is only worth having when the console is there
+  // to be faded into.
+  const fade = route !== "canvas" && !runs.consoleHidden;
 
   // The rail, collapsed or not. A remembered UI position: the operator who
   // wants the width back should not have to ask for it at every launch.
@@ -233,13 +241,30 @@ function Frame() {
             // -- it is not a document meeting an edge, it is a graph, and a node
             // fading out for a reason that is really about layout would read as
             // state the node does not have.
-            maskImage: route === "canvas" ? undefined : CONTENT_FADE,
-            WebkitMaskImage: route === "canvas" ? undefined : CONTENT_FADE,
+            //
+            // And only while there is a console to meet. The fade exists to stop
+            // content being guillotined against the console's rounded top edge;
+            // with the console dismissed the pane runs to the bottom of the
+            // window and there is nothing there to collide with, so the ramp was
+            // just softening the last line of the page for no reason.
+            maskImage: fade ? CONTENT_FADE : undefined,
+            WebkitMaskImage: fade ? CONTENT_FADE : undefined,
           }}
         >
-          {/* Wide enough that a large window is used rather than framed by a dead
-            band, still capped so prose never runs to a 2000px measure. */}
-        <div style={{ maxWidth: bleed ? "none" : 1320, height: bleed ? "100%" : undefined }}>
+          {/* Centred, and capped so prose never runs to a 2000px measure.
+              Left-aligned it read as the whole app being shoved against the
+              sidebar with a dead band on the right -- the wider the window, the
+              worse, because every pixel of extra width went to the gap. Centred,
+              a window wider than the cap grows the margins evenly and the
+              content stays where the eye already is. */}
+          <div
+            style={{
+              maxWidth: bleed ? "none" : CONTENT_MAX,
+              marginInline: bleed ? undefined : "auto",
+              width: "100%",
+              height: bleed ? "100%" : undefined,
+            }}
+          >
             <View />
           </div>
         </main>

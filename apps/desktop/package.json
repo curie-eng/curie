@@ -7,9 +7,10 @@
   "main": "dist-electron/main.cjs",
   "scripts": {
     "gen:manifest": "node scripts/gen-command-manifest.mjs",
-    "pretypecheck": "pnpm gen:manifest && pnpm gen:themes",
-    "predev": "pnpm gen:manifest && pnpm gen:themes",
-    "prebuild": "pnpm gen:manifest && pnpm gen:themes",
+    "gen:slack": "node scripts/gen-slack-manifest.mjs",
+    "pretypecheck": "pnpm gen:manifest && pnpm gen:slack && pnpm gen:themes",
+    "predev": "pnpm gen:manifest && pnpm gen:slack && pnpm gen:themes",
+    "prebuild": "pnpm gen:manifest && pnpm gen:slack && pnpm gen:themes",
     "dev": "concurrently -k -n vite,electron -c cyan,magenta \"vite\" \"pnpm dev:electron\"",
     "dev:electron": "node scripts/dev-electron.mjs",
     "build:renderer": "vite build",

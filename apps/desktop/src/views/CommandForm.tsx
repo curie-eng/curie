@@ -17,6 +17,7 @@ import { useCallback, useMemo, useState } from "react";
 
 import { useApp, type Prefill } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
+import { commandTitle } from "../lib/surfaces";
 import { bridge } from "../bridge/bridge";
 import { ACCENT, F, FONT, HUE, LINE, R, S, STATUS, T } from "../tokens";
 import { Badge, Button, CopyButton, Field, Input, Mono, Notice, Select, Sheet, Textarea, Toggle } from "../primitives";
@@ -689,7 +690,7 @@ function ConfirmDestructive({
   const word = cmd.name;
   return (
     <Sheet
-      title={`Run curie ${cmd.path.join(" ")}?`}
+      title={`${commandTitle(cmd.id, cmd.path)}?`}
       onClose={onCancel}
       footer={
         <>

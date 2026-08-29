@@ -399,6 +399,25 @@ export function homeOf(commandId: string): Placement | undefined {
   return placementsOf(commandId)[0];
 }
 
+/**
+ * What to call a command in a heading, in this app's own words.
+ *
+ * The generated form's sheet was titled `curie local deploy`, which is the one
+ * place the whole de-unixified surface leaked: every button that opens it says
+ * something like "Put it to work", and then the panel that opens announces a
+ * command line. The placement label is what the operator pressed, so it is what
+ * the heading should say. The command line has not gone anywhere -- the form
+ * still shows it, copyable, above the Run button, which is where somebody who
+ * wants it will look.
+ *
+ * Falls back to the command's own path for anything not placed on a surface;
+ * that is a heading nobody should see, because `surfaces.test.ts` requires every
+ * runnable command to be placed.
+ */
+export function commandTitle(commandId: string, fallbackPath: readonly string[]): string {
+  return homeOf(commandId)?.action.label ?? `curie ${fallbackPath.join(" ")}`;
+}
+
 /** The commands a surface offers, resolved against the manifest. An id with no
  *  command is dropped rather than rendered as a dead control -- the test is what
  *  stops that happening silently. */
