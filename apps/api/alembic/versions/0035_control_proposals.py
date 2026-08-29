@@ -9,8 +9,8 @@ The row stores an API-rendered ``summary`` rather than proposer text, because th
 human's click is the authorization and the model must not author the sentence
 that click is based on.
 
-Revision ID: 0034
-Revises: 0033
+Revision ID: 0035
+Revises: 0034
 Create Date: 2026-08-22
 """
 
@@ -20,8 +20,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0034"
-down_revision: str | None = "0033"
+revision: str = "0035"
+down_revision: str | None = "0034"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
