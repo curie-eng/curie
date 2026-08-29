@@ -210,11 +210,28 @@ export function classify(
 ): { role: string; agent?: string; service?: string } {
   const service = labels["com.docker.compose.service"];
 
+  // The platform's own sandboxes say who they are for, on a label.
+  //
+  // These are `curie-thread-<hash>-<hash>` -- the name carries a thread hash and
+  // nothing else -- so before this they matched no pattern and fell through to
+  // role `other`, project `standalone`, agent unknown. The one container on the
+  // machine that IS an agent doing work was the one the Resources tab could not
+  // attribute, under a heading that says "what each agent is using up". The
+  // label is authoritative and needs no name parsing, so it is checked first and
+  // covers `skill up` runners too if they ever grow one.
+  const labelled = labels["curietech.ai/agent"];
+  if (labelled) return { role: "runner", agent: labelled };
+
   // A `skill up` runner is not a compose service; its name also carries the
   // agent it was booted for.
   if (name.startsWith("curie-runner")) {
     const suffix = name.replace(/^curie-runner-?/, "");
     return { role: "runner", agent: suffix && suffix !== "local" ? suffix : undefined };
+  }
+
+  // A sandbox with no agent label is still a sandbox, not an "other".
+  if (labels["curietech.ai/managed-by"] || name.startsWith("curie-thread-")) {
+    return { role: "runner" };
   }
 
   const haystack = `${service ?? ""} ${name}`.toLowerCase();
