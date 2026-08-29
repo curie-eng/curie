@@ -12,11 +12,12 @@ import argparse
 import json
 import urllib.request
 
+# Channel ids below are demo fixtures, not real Slack conversations.
 FLEET = [
-    ("sre-bot", "C0DEMO001", [("v1", None), ("v2", None), ("v3", None)], "v3"),
-    ("support-bot", "C0DEMO002", [("v7", None)], "v7"),
-    ("release-notes", "C0DEMO003", [("v2", None)], "v2"),
-    ("oncall-digest", "C0DEMO004", [], None),
+    ("sre-bot", "C0DEMO001", [("v1", None), ("v2", None), ("v3", None)], "v3"),  # gitleaks:allow
+    ("support-bot", "C0DEMO002", [("v7", None)], "v7"),  # gitleaks:allow
+    ("release-notes", "C0DEMO003", [("v2", None)], "v2"),  # gitleaks:allow
+    ("oncall-digest", "C0DEMO004", [], None),  # gitleaks:allow
 ]
 
 

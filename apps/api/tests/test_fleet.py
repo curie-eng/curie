@@ -67,9 +67,11 @@ def _create_agent(client: Any, headers: dict[str, str], name: str, channel: str)
 def fleet(client: Any, auth_headers: dict[str, str], clean_db: None) -> dict[str, str]:
     """A control agent and one ordinary agent to act on."""
 
+    control_channel = "C0FLEETCTL"  # gitleaks:allow -- fixture channel id, not real
+    target_channel = "C0FLEETTGT"  # gitleaks:allow -- fixture channel id, not real
     return {
-        "control": _create_agent(client, auth_headers, CONTROL_AGENT_NAME, "C0FLEETCTL"),
-        "target": _create_agent(client, auth_headers, "sre-bot", "C0FLEETTGT"),
+        "control": _create_agent(client, auth_headers, CONTROL_AGENT_NAME, control_channel),
+        "target": _create_agent(client, auth_headers, "sre-bot", target_channel),
     }
 
 

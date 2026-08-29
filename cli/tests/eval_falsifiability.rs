@@ -113,9 +113,43 @@ fn done_turn(text: &str) -> Vec<OutboundEvent> {
     }]
 }
 
+/// A known-good exemplar (Control C). Most cases grade the answer TEXT, so a
+/// bare JSON string suffices -- `done_turn` mirrors what the runner path
+/// actually judges. A `tool_called` grader instead judges the trajectory
+/// (`curie::evals::trajectory`, built from `ToolNote` frames), which a
+/// text-only turn never carries; `ToolCall` names the tool a real answering
+/// turn would have invoked first, so its exemplar carries a trajectory to
+/// judge, not just an answer to display. `#[serde(untagged)]` tries `Text`
+/// first, so every existing bare-string fixture keeps decoding unchanged.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Exemplar {
+    Text(String),
+    ToolCall { tool: String, text: String },
+}
+
+/// The turn `Exemplar` describes: the tool-call trajectory (if any) followed
+/// by the `done_turn` final frame carrying its answer text.
+fn exemplar_turn(exemplar: &Exemplar) -> Vec<OutboundEvent> {
+    let (tool, text) = match exemplar {
+        Exemplar::Text(text) => (None, text.as_str()),
+        Exemplar::ToolCall { tool, text } => (Some(tool.as_str()), text.as_str()),
+    };
+    let mut events = Vec::new();
+    if let Some(tool) = tool {
+        events.push(OutboundEvent::ToolNote {
+            version: PROTOCOL_VERSION.into(),
+            text: format!("calling {tool}"),
+            tool: Some(tool.into()),
+        });
+    }
+    events.extend(done_turn(text));
+    events
+}
+
 #[derive(Debug, Deserialize)]
 struct Fixtures {
-    exemplars: BTreeMap<String, String>,
+    exemplars: BTreeMap<String, Exemplar>,
     input_satisfiable_baseline: BTreeSet<String>,
 }
 
@@ -216,8 +250,9 @@ fn every_grader_greens_on_its_known_good_exemplar() {
                 continue; // missing-exemplar completeness is asserted below
             };
             // Grade the exemplar through the same pass condition the runner path
-            // uses (a completed `done` turn whose final text is the exemplar).
-            if !turn_passes(case, &done_turn(exemplar)) {
+            // uses (a completed `done` turn whose trajectory/final text is the
+            // exemplar's).
+            if !turn_passes(case, &exemplar_turn(exemplar)) {
                 red.push(format!(
                     "{key} -> exemplar {exemplar:?} does NOT satisfy its grader"
                 ));

@@ -531,7 +531,7 @@ def test_unbinding_one_of_several_works(
 ) -> None:
     added = client.post(
         f"/agents/{fleet['target']}/channels",
-        json={"kind": "slack", "address": "C0SCRXTRA"},
+        json={"kind": "slack", "address": "C0SCRXTRA"},  # gitleaks:allow
         headers=auth_headers,
     )
     assert added.status_code in (200, 201), added.text
@@ -543,11 +543,11 @@ def test_unbinding_one_of_several_works(
         client,
         auth_headers,
         "surfaces",
-        "unbind-slack-C0SCRXTRA",
+        "unbind-slack-C0SCRXTRA",  # gitleaks:allow
         params={"agent_id": fleet["target"]},
     )
     assert response.status_code == 200, response.text
-    assert response.json()["result"]["unbound"] == "slack:C0SCRXTRA"
+    assert response.json()["result"]["unbound"] == "slack:C0SCRXTRA"  # gitleaks:allow
     after = _screen(client, auth_headers, "surfaces", agent_id=fleet["target"])
     assert [r["address"] for r in after["blocks"][0]["rows"]] == ["C0SCRTGT"]
 
