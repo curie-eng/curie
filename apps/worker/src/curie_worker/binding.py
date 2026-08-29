@@ -697,7 +697,7 @@ class BindingResolver:
                 scope="state.app",
                 exp=exp,
             )
-        # The fleet control token (ADR-0125). Minted for ONE agent and no other:
+        # The fleet control token (ADR-0133). Minted for ONE agent and no other:
         # the operator names it in CURIE_CONTROL_AGENT, and the comparison is
         # against the RESOLVED agent name, which the platform assigned at deploy
         # -- not against anything the bundle says about itself, so a bundle

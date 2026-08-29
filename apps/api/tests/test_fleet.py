@@ -1,6 +1,6 @@
 """The fleet control plane's trust boundary, against real Postgres and Valkey.
 
-ADR-0125. These tests are the security claim, so they are written as attacks
+ADR-0133. These tests are the security claim, so they are written as attacks
 rather than as feature coverage: each one is a way an agent that is not the
 control agent might reach the plane, or a way the control agent might reach past
 proposing. Feature behavior (a proposal executes and the fleet changes) is

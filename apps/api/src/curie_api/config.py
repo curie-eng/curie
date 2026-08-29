@@ -54,7 +54,7 @@ class Settings(BaseSettings):
         ),
     )
 
-    # The one agent allowed to reach the fleet control plane (ADR-0125), by name.
+    # The one agent allowed to reach the fleet control plane (ADR-0133), by name.
     #
     # Empty is the default and means the control plane authenticates NOBODY but
     # the platform key: no scoped token verifies, whatever it claims. So the
@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     # which agent is privileged.
     control_agent: str = ""
 
-    # Who may press a button on a control screen (ADR-0125), as a comma-separated
+    # Who may press a button on a control screen (ADR-0133), as a comma-separated
     # list of channel user ids.
     #
     # Deliberately provider-neutral opaque ids, not Slack-shaped ones: the same

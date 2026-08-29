@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """In-bundle stdio MCP server: the control agent's window onto the fleet.
 
-ADR-0125. Seven tools. Six read. One writes a proposal. **None execute**, and
+ADR-0133. Seven tools. Six read. One writes a proposal. **None execute**, and
 the absence is the design, not an omission to be filled in later.
 
 Two of the reads return SCREENS -- a titled page of blocks and buttons the

@@ -72,4 +72,4 @@ your description for the platform's on the one text that matters.
 The tools run as an in-bundle stdio MCP server (`mcp/fleet_server.py`, declared
 in `.mcp.json`). It authenticates with a scoped `control` token the platform
 mints only for this agent; running this bundle as any other agent yields no
-credential and every tool says so. See `README.md` and ADR-0125.
+credential and every tool says so. See `README.md` and ADR-0133.

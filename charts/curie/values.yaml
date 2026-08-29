@@ -745,7 +745,7 @@ api:
   # Human-readable org/workspace name the UI reads from the open /config endpoint.
   # Override to white-label the app for a deployment.
   orgName: Curie
-  # The one agent allowed to reach the fleet control plane (ADR-0125), by name.
+  # The one agent allowed to reach the fleet control plane (ADR-0133), by name.
   #
   # Empty -- the default -- means the plane authenticates nobody but the platform
   # key, whatever token a sandbox presents. Naming an agent here is half of
@@ -1131,7 +1131,7 @@ mailAdapter:
       type: RuntimeDefault
 
 worker:
-  # The one agent this worker mints a fleet-control token for (ADR-0125).
+  # The one agent this worker mints a fleet-control token for (ADR-0133).
   # Must match `api.controlAgent`; see the note there. Empty mints none, which
   # is the default and the closed state.
   controlAgent: ""

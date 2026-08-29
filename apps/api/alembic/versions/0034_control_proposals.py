@@ -1,6 +1,6 @@
 """control_proposals: fleet actions the control agent proposes and a human runs
 
-ADR-0125. The control agent reads the fleet with a scoped ``control`` token and
+ADR-0133. The control agent reads the fleet with a scoped ``control`` token and
 writes rows here. It has no execute path: the execute route accepts the platform
 key only, so this table is the boundary between what the model may compute and
 what a human may run.

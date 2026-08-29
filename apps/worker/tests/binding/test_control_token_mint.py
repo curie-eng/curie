@@ -1,6 +1,6 @@
 """Who the worker mints a fleet-control token for -- and who it never does.
 
-ADR-0125. The API refuses a control token that names the wrong agent, so this
+ADR-0133. The API refuses a control token that names the wrong agent, so this
 is the second, independent half of the same guarantee: no other sandbox is
 handed one in the first place. Both halves are asserted because each is a
 different failure. If only the API checked, every sandbox would carry a

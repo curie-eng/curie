@@ -1,4 +1,4 @@
-# VHS tape for the control agent (ADR-0125).
+# VHS tape for the control agent (ADR-0133).
 # Regenerate with: vhs docs/demo/curie-control.tape
 #
 # What is real and what is staged, stated up front because a demo GIF is a

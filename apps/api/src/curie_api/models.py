@@ -763,7 +763,7 @@ class ProposalStatus(enum.StrEnum):
 class ControlProposal(Base):
     """A fleet action the control agent has PROPOSED and a human has not yet run.
 
-    The control agent (ADR-0125) reads the fleet and writes rows here. It cannot
+    The control agent (ADR-0133) reads the fleet and writes rows here. It cannot
     execute one: ``POST /fleet/proposals/{id}/execute`` refuses every caller but
     the platform key, so the model's authority ends at this table. A row is a
     request for a human to act, not an action.

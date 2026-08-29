@@ -164,7 +164,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # The Slack shimmer caption. Read from the WORKER's env since #1312 moved
         # the whole shimmer to this side; it reaches Slack, never a sandbox.
         "CURIE_STATUS_TEXT",
-        # Which agent this worker mints a fleet-control token FOR (ADR-0125),
+        # Which agent this worker mints a fleet-control token FOR (ADR-0133),
         # read from the WORKER's env by WorkerConfig. Emphatically not a boot
         # key: a sandbox that could read the name could learn whether it is
         # privileged, and a sandbox that could SET it would name itself. The

@@ -160,4 +160,4 @@ and under this design there is always one.
 Proposals expire after 30 minutes. A stale proposal describes a fleet that has
 moved, and executing it applies a decision made about a different system.
 
-See [ADR-0125](../../docs/adr/0125-the-control-agent-renders-screens-a-human-presses.md).
+See [ADR-0133](../../docs/adr/0133-the-control-agent-renders-screens-a-human-presses.md).

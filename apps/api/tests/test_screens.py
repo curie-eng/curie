@@ -1,4 +1,4 @@
-"""Screens and buttons against real Postgres and Valkey (ADR-0125).
+"""Screens and buttons against real Postgres and Valkey (ADR-0133).
 
 Same posture as ``test_fleet.py``: the interesting tests are the ones that try
 to get a mutation through a path that should not allow it. The rendering tests

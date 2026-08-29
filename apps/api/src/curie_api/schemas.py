@@ -1923,7 +1923,7 @@ class ConsoleSessionOut(BaseModel):
     expires_at: datetime
 
 
-# -- fleet control plane (ADR-0125) --------------------------------------------
+# -- fleet control plane (ADR-0133) --------------------------------------------
 
 
 class FleetAgentSummary(BaseModel):
@@ -2016,7 +2016,7 @@ class ProposalActionInfo(BaseModel):
     description: str
 
 
-# -- control screens (ADR-0125) ------------------------------------------------
+# -- control screens (ADR-0133) ------------------------------------------------
 
 
 class ScreenBlockOut(BaseModel):

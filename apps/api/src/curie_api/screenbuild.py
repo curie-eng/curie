@@ -1,4 +1,4 @@
-"""Building each screen from the store (ADR-0125).
+"""Building each screen from the store (ADR-0133).
 
 Kept apart from ``screens.py`` on purpose: that module is the vocabulary (what a
 screen and a button ARE, and which CLI command each screen answers), this one is

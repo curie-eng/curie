@@ -1,4 +1,4 @@
-"""Does the control agent actually reach every CLI feature? (ADR-0125)
+"""Does the control agent actually reach every CLI feature? (ADR-0133)
 
 The claim "every feature of the CLI is available in some screen" is worth
 nothing as prose, because the CLI grows and prose does not. So it is a test over

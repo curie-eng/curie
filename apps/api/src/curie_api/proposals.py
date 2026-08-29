@@ -1,4 +1,4 @@
-"""The closed vocabulary of fleet actions a control proposal may name (ADR-0125).
+"""The closed vocabulary of fleet actions a control proposal may name (ADR-0133).
 
 Three things live here, deliberately in one file, because they are three views of
 the same decision and splitting them is how they drift:

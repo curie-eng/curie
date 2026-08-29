@@ -1,6 +1,6 @@
 """The fleet control plane: what the control agent may read, and may only ask for.
 
-ADR-0125. Every other router is platform-key-only (``require_api_key``) or
+ADR-0133. Every other router is platform-key-only (``require_api_key``) or
 agent-self-scoped (``require_state_access``, ADR-0033). This one is the first
 surface a *sandboxed agent* may call about agents other than itself, so the
 whole file is organized around one question: what stops any other agent from
@@ -451,7 +451,7 @@ async def reject_proposal(
     return _out(proposal)
 
 
-# -- Screens: the surface a human taps (ADR-0125) ------------------------------
+# -- Screens: the surface a human taps (ADR-0133) ------------------------------
 #
 # Reads are open to the same two callers as everything above -- the control
 # agent renders screens into a channel, so it must be able to fetch them.

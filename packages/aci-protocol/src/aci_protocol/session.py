@@ -325,7 +325,7 @@ class BootEnv(_AciModel):
     state_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_STATE_TOKEN", "worker")
     )
-    # The fleet control plane (ADR-0125), delivered to exactly ONE agent: the
+    # The fleet control plane (ADR-0133), delivered to exactly ONE agent: the
     # operator-named control agent. control_url is the API's ``/fleet`` base and
     # control_token is a scoped sandbox token (ADR-0033) carrying scope
     # ``control`` -- a sibling of the state pair above in shape, and its

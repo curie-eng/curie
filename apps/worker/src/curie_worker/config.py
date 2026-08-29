@@ -852,7 +852,7 @@ class WorkerConfig(BaseSettings):
     # runner-reachable.
     runner_api_base_url: str = Field(default="", validation_alias="CURIE_RUNNER_API_URL")
     api_key: str = Field(default="curie-dev-key", validation_alias=API_KEY_ENV)
-    # The one agent this worker mints a fleet-control token for (ADR-0125), by
+    # The one agent this worker mints a fleet-control token for (ADR-0133), by
     # name. Empty -- the default -- means it mints none, ever, so no sandbox on
     # this worker can reach the control plane.
     #

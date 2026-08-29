@@ -1,6 +1,6 @@
 """Screens: the channel-neutral UI the control agent puts in front of a human.
 
-ADR-0125. A screen is a titled page of blocks plus a row of buttons. It is
+ADR-0133. A screen is a titled page of blocks plus a row of buttons. It is
 **semantic, not rendered**: nothing here knows Slack's Block Kit or Discord's
 component JSON, because ADR-0020 makes rendering the channel adapter's job and
 this is the port's side of that line. A screen that carried Slack JSON would
