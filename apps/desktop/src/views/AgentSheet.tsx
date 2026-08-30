@@ -14,6 +14,7 @@
 // every button below re-points at the chosen tier.
 
 import { useState } from "react";
+import { channelLabel } from "../lib/channels";
 
 import { useApp, type AgentSummary } from "../bridge/app";
 import { surfacesById } from "../lib/surfaces";
@@ -148,9 +149,9 @@ function Identity({ agent }: { agent: AgentSummary }) {
 
       <span style={{ color: T.tertiary }}>surface</span>
       <span>
-        {agent.channel?.channel_id ? (
+        {channelLabel(agent) ? (
           <Badge color={STATUS.warn} filled>
-            {agent.channel.kind ?? "channel"} · {agent.channel.channel_id}
+            {channelLabel(agent)}
           </Badge>
         ) : (
           <span style={{ color: T.quaternary }}>no channel bound</span>

@@ -14,6 +14,7 @@
 // command that does it.
 
 import type { AgentSummary } from "../bridge/app";
+import { channelsOf } from "../lib/channels";
 import type { ResourceSample, Workspace } from "../bridge/bridge";
 import type { NodeKind } from "../tokens";
 import { isDeployedFrom } from "../lib/deployment";
@@ -389,18 +390,20 @@ export function buildGraph(sources: Sources, doc: GraphDoc): Graph {
     if (ws && isDeployedFrom(agent, openBundleName)) link("bundle", id, "deploy", "deploy");
 
     // Channel: the agent's front door.
-    if (agent.channel?.channel_id) {
-      const chId = `channel:${agent.id}`;
+    // One node per binding: an agent answering in two channels has two front
+    // doors, and drawing one of them was the diagram asserting the other did
+    // not exist.
+    for (const channel of channelsOf(agent)) {
+      const chId = `channel:${agent.id}:${channel.address}`;
       add({
         id: chId,
         kind: "channel",
-        label: agent.channel.kind === "slack" ? "Slack" : (agent.channel.kind ?? "channel"),
-        sub: agent.channel.channel_id,
+        label: channel.kind === "slack" ? "Slack" : (channel.kind ?? "channel"),
+        sub: channel.address,
         status: "known",
         detail: {
-          Kind: agent.channel.kind,
-          Channel: agent.channel.channel_id,
-          Workspace: agent.channel.workspace_id,
+          Kind: channel.kind,
+          Channel: channel.address,
         },
         actions: ["local.comms", "cluster.comms", "local.message"],
       }, COL.external);

@@ -11,6 +11,7 @@
 // running. Nothing was comparing the two.
 
 import { useState, type CSSProperties } from "react";
+import { channelLabel } from "../lib/channels";
 
 import { useApp } from "../bridge/app";
 import { bridge } from "../bridge/bridge";
@@ -70,7 +71,7 @@ export function Deployment({ bundleName }: { readonly bundleName: string }) {
               <>
                 Answering as <strong style={{ color: T.secondary }}>{live.name}</strong>
                 {live.model ? ` on ${live.model}` : ""}
-                {live.channel?.kind ? ` · ${live.channel.kind}` : ""}. Sending it again replaces it
+                {channelLabel(live) ? ` · ${channelLabel(live)}` : ""}. Sending it again replaces it
                 with what is on disk now.
               </>
             ) : (

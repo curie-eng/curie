@@ -98,7 +98,7 @@ const AGENT: AgentSummary = {
   name: "deal-desk",
   model: "claude-sonnet-4",
   approval_required_tools: ["Bash"],
-  channel: { kind: "slack", channel_id: "C123" },
+  channels: [{ kind: "slack", address: "C123" }],
 };
 
 /** The sheet host has to be mounted too: a control's whole job is to open it. */
