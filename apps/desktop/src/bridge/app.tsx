@@ -19,6 +19,7 @@ import {
 } from "react";
 
 import { bridge } from "./bridge";
+import type { AgentChannel } from "../lib/channels";
 import type {
   ApiConnection,
   ShellEnvironment,
@@ -76,7 +77,9 @@ export interface AgentSummary {
   repo_full_name?: string | null;
   secrets?: string[] | null;
   approval_required_tools?: string[] | null;
-  channel?: { kind?: string; channel_id?: string; workspace_id?: string } | null;
+  /** ADR-0118: an agent holds SEVERAL bindings. Read these through
+   *  `lib/channels.ts` rather than indexing them at each call site. */
+  channels?: readonly AgentChannel[] | null;
   created_at?: string;
 }
 

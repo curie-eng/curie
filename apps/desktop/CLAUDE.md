@@ -1034,6 +1034,34 @@ The command line has not gone anywhere: the form still shows it above the Run
 button, copyable, which is where somebody who wants it looks. That is the rule --
 **the exact invocation is available, never the heading.**
 
+## An agent's bindings are plural
+
+The platform moved to one agent holding several bindings (ADR-0118) and the API
+says so: `channels: [{ kind, address }]`. This app was still reading
+`channel: { kind, channel_id }`, a shape the API had not sent for some time.
+Nothing failed. Every read was `undefined`, so every view that asked said the
+same wrong thing -- **"no channel bound" under an agent that had been answering
+in Slack for days** -- on the Overview row, the agent sheet, the pack list, the
+deployment panel, and the canvas, which drew no front door at all.
+
+Read them through `lib/channels.ts` (`channelsOf`, `primaryChannel`,
+`channelLabel`) rather than indexing the array at each call site, so the next
+shape change is one file. The canvas draws one node per binding: an agent
+answering in two channels has two front doors, and drawing one of them asserted
+the other did not exist.
+
+That bug is the reason to distrust a field the API "should" have. A typecheck
+cannot see it -- the type was a fiction we wrote down -- and the UI states the
+negative confidently. When a view says something is absent, check the payload.
+
+## `local message` is not `local memory`
+
+Next to each other on the Overview row, and they take different positionals:
+`local memory` takes an **agent**, `local message` takes the **message text**.
+Both were prefilled with the agent's name, so the Message button offered to send
+an agent its own name as a message. An agent is targeted by one of its channels
+(`--channel`), never by a positional.
+
 ## Getting a deployed agent into Slack
 
 "Running now" was true and useless on its own: a deployed agent answers nothing

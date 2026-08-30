@@ -26,6 +26,7 @@
 // over the same corpus and fails when they disagree.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { channelLabel, primaryChannel } from "../lib/channels";
 
 import { useApp, type AgentSummary } from "../bridge/app";
 import { bridge } from "../bridge/bridge";
@@ -251,7 +252,7 @@ function AgentRow({
 }) {
   const on = packs ? enabledPacks(packs) : null;
   const dead = packs ? inertPacks(packs) : [];
-  const kind = agent.channel?.kind;
+  const where = channelLabel(agent);
 
   return (
     <Row first={first} onClick={onOpen}>
@@ -259,12 +260,12 @@ function AgentRow({
         <div style={{ ...F.body, color: T.primary }}>{agent.name}</div>
         <div style={{ ...F.footnote, color: T.tertiary, marginTop: 1 }}>
           {agent.model ?? "platform default model"}
-          {kind ? ` · ${kind}${agent.channel?.channel_id ? ` ${agent.channel.channel_id}` : ""}` : ""}
+          {where ? ` · ${where}` : ""}
         </div>
       </div>
 
       <div style={{ display: "flex", gap: 6, alignItems: "center", flex: "none" }}>
-        {!kind ? (
+        {!where ? (
           <Badge color={STATUS.warn} title="Nothing renders a pack until a surface is bound.">
             no surface
           </Badge>
@@ -482,7 +483,7 @@ function Scope() {
 /** Packs are a Slack layer, so an agent bound to something else is worth naming
  *  rather than letting the author configure a caption nothing will render. */
 function Binding({ agent }: { agent: AgentSummary }) {
-  const kind = agent.channel?.kind;
+  const kind = primaryChannel(agent)?.kind;
   if (!kind)
     return (
       <Row>

@@ -8,6 +8,7 @@
 // repeats its own name under the window's title bar is a web habit.
 
 import { useCallback, useEffect, useState } from "react";
+import { channelLabel, primaryChannel } from "../lib/channels";
 
 import { useApp, type AgentSummary } from "../bridge/app";
 import { useResources } from "../bridge/resources";
@@ -807,9 +808,9 @@ function AgentRow({
       </div>
 
       <div style={{ width: 200 }}>
-        {agent.channel?.channel_id ? (
+        {channelLabel(agent) ? (
           <Badge color={STATUS.warn} filled>
-            {agent.channel.kind ?? "channel"} · {agent.channel.channel_id}
+            {channelLabel(agent)}
           </Badge>
         ) : (
           <span style={{ ...F.footnote, color: T.quaternary }}>no channel bound</span>
@@ -829,7 +830,18 @@ function AgentRow({
       {/* The two most common verbs inline, already pointed at this agent; the
           rest are one click away in the sheet the row opens. */}
       <div style={{ display: "flex", gap: 6 }} onClick={(e) => e.stopPropagation()}>
-        <RunButton id="local.message" prefill={{ positionals: [agent.name] }}>
+        {/* `local message` takes the MESSAGE as its positional, not an agent --
+            unlike `local memory` next to it, which does. Passing the agent name
+            here put it in the message body, so the button offered to send an
+            agent its own name. An agent is targeted by one of its channels. */}
+        <RunButton
+          id="local.message"
+          prefill={
+            primaryChannel(agent)?.address
+              ? { flags: { channel: primaryChannel(agent)!.address! } }
+              : undefined
+          }
+        >
           Message
         </RunButton>
         <RunButton id="local.memory" tone="plain" prefill={{ positionals: [agent.name] }}>
