@@ -15,21 +15,27 @@ on the server that owns the record, never inside the sandbox.
 
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from curie_telemetry import operation_span, record_metric
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from opentelemetry.trace import SpanKind
 from sqlalchemy.exc import IntegrityError
 
-from .. import crud
+from .. import approval_principal, crud
 from ..auth import require_api_key
 from ..authorizer import authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep
 from ..models import Approval, ApprovalStatus
 from ..resumequeue import build_expiry_resume_turn, build_resume_turn
-from ..schemas import ApprovalAuditOut, ApprovalOut, ApprovalResolve
+from ..schemas import (
+    ApprovalAuditOut,
+    ApprovalOut,
+    ApprovalPrincipalMint,
+    ApprovalPrincipalOut,
+    ApprovalResolve,
+)
 from ..wirebody import ApprovalRequestBody
 
 logger = logging.getLogger(__name__)
@@ -37,6 +43,40 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/approvals", tags=["approvals"], dependencies=[Depends(require_api_key)]
 )
+
+
+@router.post(
+    "/principals/operator",
+    response_model=ApprovalPrincipalOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def mint_operator_principal(
+    data: ApprovalPrincipalMint, response: Response
+) -> ApprovalPrincipalOut:
+    """Mint an operator credential; the platform key authorizes issuance only.
+
+    The token is returned once and marked non-cacheable.  Resolution will
+    authenticate the subject from this credential rather than accepting a
+    caller-supplied actor string.
+    """
+
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(
+        seconds=approval_principal.OPERATOR_TOKEN_TTL_SECONDS
+    )
+    token = approval_principal.mint(
+        get_settings().api_key,
+        subject=data.subject,
+        kind="operator",
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=int(expires_at.timestamp()),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return ApprovalPrincipalOut(
+        token=token,
+        subject=data.subject,
+        expires_at=expires_at,
+    )
 
 
 def _expired(approval: Approval) -> bool:
