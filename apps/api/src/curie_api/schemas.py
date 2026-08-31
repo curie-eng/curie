@@ -1520,6 +1520,28 @@ class ApprovalResolve(BaseModel):
     actor_channel: str | None = None
 
 
+class ApprovalPrincipalMint(BaseModel):
+    """Administrative request to mint one operator approval credential."""
+
+    subject: str = Field(min_length=1)
+
+    @field_validator("subject")
+    @classmethod
+    def _nonblank_subject(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("subject must not be blank")
+        return value
+
+
+class ApprovalPrincipalOut(BaseModel):
+    """One-time delivery of a short-lived operator approval credential."""
+
+    token: str
+    subject: str
+    kind: Literal["operator"] = "operator"
+    expires_at: datetime
+
+
 class ApprovalOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

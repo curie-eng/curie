@@ -174,6 +174,7 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/versions/{version_id}/connectors",
     "/agents/{agent_id}/versions/{version_id}/files",
     "/approvals",
+    "/approvals/principals/operator",
     "/approvals/{approval_id}",
     "/approvals/{approval_id}/audit",
     "/approvals/{approval_id}/resolve",
