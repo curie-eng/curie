@@ -5416,6 +5416,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -5467,6 +5483,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -5537,6 +5569,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -5596,6 +5644,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -5660,6 +5724,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -5731,6 +5811,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "requestBody": {
@@ -5790,6 +5886,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -5840,6 +5952,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -5910,6 +6038,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -5959,6 +6103,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -6016,6 +6176,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -6086,6 +6262,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -6142,6 +6334,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -6212,6 +6420,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -6268,6 +6492,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -6357,6 +6597,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -6442,6 +6698,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "requestBody": {
@@ -6509,6 +6781,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -6611,6 +6899,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -6670,6 +6974,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -6726,6 +7046,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -6786,6 +7122,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -6848,6 +7200,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -6939,6 +7307,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -6998,6 +7382,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -7078,6 +7478,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -7136,6 +7552,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -8218,6 +8650,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -8285,6 +8733,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -8343,6 +8807,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -8404,6 +8884,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -8484,6 +8980,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -8548,6 +9060,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -8656,6 +9184,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -8724,6 +9268,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -8833,6 +9393,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -8884,6 +9460,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -9014,6 +9606,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -9073,6 +9681,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -9154,6 +9778,22 @@
               ],
               "title": "Curie Console Session"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "requestBody": {
@@ -9213,6 +9853,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -9414,6 +10070,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "requestBody": {
@@ -9564,6 +10236,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "requestBody": {
@@ -9623,6 +10311,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -9700,6 +10404,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -9750,6 +10470,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -9820,6 +10556,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -9869,6 +10621,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -9954,6 +10722,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -10002,6 +10786,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -10062,6 +10862,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "requestBody": {
@@ -10121,6 +10937,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -10418,6 +11250,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -10481,6 +11329,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -10539,6 +11403,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -10672,6 +11552,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -10785,6 +11681,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -10849,6 +11761,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -10959,6 +11887,22 @@
               ],
               "title": "X-Api-Key"
             }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
           }
         ],
         "responses": {
@@ -11017,6 +11961,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
@@ -11080,6 +12040,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
             }
           }
         ],
