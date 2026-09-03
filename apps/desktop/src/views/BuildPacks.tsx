@@ -54,7 +54,7 @@ import {
   type PackKind,
   type Setting,
 } from "../lib/packs";
-import { ACCENT, F, FONT, KNOB, LINE, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, FONT, KNOB, LINE, M, S, STATUS, T, tint } from "../tokens";
 import {
   Badge,
   Button,
@@ -471,7 +471,7 @@ function AgentPacks({
  *  will otherwise assume these are more files. */
 function Scope() {
   return (
-    <div style={{ ...F.footnote, color: T.tertiary, padding: "0 4px 8px", maxWidth: 760 }}>
+    <div style={{ ...F.footnote, color: T.tertiary, padding: "0 4px 8px", maxWidth: M.prose }}>
       Opt-in Slack touches applied around a turn: a load caption, a tip, canned replies to a bare
       greeting or help request, a hub button. They are stored on the agent, not in the bundle, so
       they are saved to a deployed agent and take effect on its next message. The CLI has no verb

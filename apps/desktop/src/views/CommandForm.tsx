@@ -19,7 +19,7 @@ import { useApp, type Prefill } from "../bridge/app";
 import { useRuns } from "../bridge/runs";
 import { commandTitle } from "../lib/surfaces";
 import { bridge } from "../bridge/bridge";
-import { ACCENT, F, FONT, HUE, LINE, R, S, STATUS, T } from "../tokens";
+import { ACCENT, F, FONT, HUE, LINE, M, R, S, STATUS, T } from "../tokens";
 import { Badge, Button, CopyButton, Field, Input, Mono, Notice, Select, Sheet, Textarea, Toggle } from "../primitives";
 import {
   cwdFor,
@@ -281,7 +281,7 @@ export function CommandForm({
               </Badge>
             ) : null}
           </div>
-          <div style={{ fontSize: 12, color: T.secondary, lineHeight: 1.55, maxWidth: 720 }}>
+          <div style={{ fontSize: 12, color: T.secondary, lineHeight: 1.55, maxWidth: M.prose }}>
             {cmd.about}
           </div>
         </div>

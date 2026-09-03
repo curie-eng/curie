@@ -35,7 +35,7 @@ import { DASH } from "../lib/format";
 import type { Command } from "../lib/manifest";
 import { resolve, surfacesById, type Action, type Surface } from "../lib/surfaces";
 import { ActionButton, Actions, NeedNotice } from "./Actions";
-import { ACCENT, F, HUE, LINE, R, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, HUE, LINE, M, R, S, STATUS, T, tint } from "../tokens";
 import { Badge, Group, SectionHeader } from "../primitives";
 
 /** What each rung actually is, in one honest sentence about cost and reach. The
@@ -383,7 +383,7 @@ function Explainer() {
       }}
     >
       <div style={{ ...F.headline, marginBottom: 4 }}>One agent, three places to put it</div>
-      <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.6, maxWidth: 820 }}>
+      <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.6, maxWidth: M.prose }}>
         The same agent works in all three without being changed. Moving right costs more to set up
         and lets more people reach it — and you do the same things to it wherever it is, so nothing
         you learn here has to be learned again there.

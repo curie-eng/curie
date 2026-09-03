@@ -206,6 +206,18 @@ export const R = {
 /** Chrome metrics. */
 export const M = {
   titlebar: 52,
+  /**
+   * The comfortable measure for a paragraph, and the ONLY width a view may cap.
+   *
+   * A long line of prose is genuinely hard to read, so text gets a ceiling. A
+   * panel does not: capping one leaves dead space to its right that grows with
+   * the window, which is what the Settings page did at 760 -- a third of a wide
+   * window empty beside a form that could have used it.
+   *
+   * So the rule is: cap the measure of TEXT, let panels fill. `layout.test.ts`
+   * enforces it by rejecting any other large `maxWidth` in a view.
+   */
+  prose: 720,
   // Sized to its widest label plus its icon, not to a round number. 218 was
   // most of a Finder window's sidebar for a rail of seven short words, and the
   // pane beside it is where the work is.

@@ -105,7 +105,7 @@ export function Settings() {
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 760 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       <div>
         <Segmented<Tab> options={TABS} value={tab} onChange={choose} />
       </div>
