@@ -331,7 +331,12 @@ const blocks = THEMES.map((t) => {
   const body = order
     .map((k) => `  ${k}: ${vars[k]};`)
     .join("\n");
-  return `:root[data-theme="${t.id}"] {\n  color-scheme: ${t.appearance};\n${body}\n}`;
+  // Two selectors, one variable set. The root form is how a theme is worn; the
+  // `[data-theme-preview]` form scopes the same palette to any subtree, which
+  // is what lets the settings page show a theme without the window putting it
+  // on. Emitting both here rather than duplicating the block keeps them from
+  // ever disagreeing.
+  return `:root[data-theme="${t.id}"],\n[data-theme-preview="${t.id}"] {\n  color-scheme: ${t.appearance};\n${body}\n}`;
 });
 
 mkdirSync(join(root, "src", "generated"), { recursive: true });

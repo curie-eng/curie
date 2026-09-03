@@ -14,6 +14,7 @@ import { surfacesById } from "../lib/surfaces";
 import { Actions, DrivenBy, RunButton } from "./Actions";
 import { bridge, hasShell } from "../bridge/bridge";
 import { ACCENT, F, FONT, LINE, R, S, STATUS, T, tint } from "../tokens";
+import { ThemePreview } from "./ThemePreview";
 import {
   Badge,
   Button,
@@ -143,6 +144,16 @@ function AppearancePanel() {
   const app = useApp();
   const theme = app.theme;
   const preference = theme?.preference ?? "system";
+  const [preview, setPreview] = useState<string | null>(null);
+
+  // Hovering shows that theme; otherwise the preview shows what is on. "System"
+  // has no palette of its own, so it previews whichever the OS currently
+  // resolves to -- which is the honest answer to "what will I get".
+  const chosen = preference === "system" ? (theme?.effective ?? "dark") : preference;
+  const shownTheme = preview ?? chosen;
+  const shownLabel =
+    THEMES.find((t) => t.id === shownTheme)?.label ??
+    (shownTheme === "dark" ? "Curie Dark" : "Curie Light");
 
   return (
     <Panel
@@ -158,6 +169,19 @@ function AppearancePanel() {
           label="Theme"
           hint="System follows the OS, including when it switches at sunset. Anything else is absolute."
         >
+          {/* Two columns where there is room for two. The list used to sit in a
+              narrow band with the rest of the pane empty, and a swatch cannot
+              answer the question you actually have, which is what the theme
+              looks like applied. Hovering previews; the preview otherwise shows
+              what you are wearing. */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "minmax(320px, 1fr) minmax(0, 1fr)",
+              gap: 16,
+              alignItems: "start",
+            }}
+          >
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             <ThemeChoice
               id="system"
@@ -166,6 +190,7 @@ function AppearancePanel() {
               active={preference === "system"}
               note={theme?.preference === "system" ? `currently ${theme.effective}` : undefined}
               onPick={() => app.setTheme("system")}
+              onPreview={setPreview}
             />
             {/* A grid rather than a list: seventeen themes read as a palette to
                 scan, and each one is recognisable from its own colours without
@@ -185,9 +210,13 @@ function AppearancePanel() {
                   swatch={t.swatch}
                   active={preference === t.id}
                   onPick={() => app.setTheme(t.id)}
+                  onPreview={setPreview}
                 />
               ))}
             </div>
+          </div>
+
+          <ThemePreview theme={shownTheme} label={shownLabel} />
           </div>
         </Field>
       </Row>
@@ -197,6 +226,7 @@ function AppearancePanel() {
 
 /** One theme, drawn in its own colours. */
 function ThemeChoice({
+  onPreview,
   id,
   label,
   swatch,
@@ -210,12 +240,19 @@ function ThemeChoice({
   active: boolean;
   note?: string;
   onPick(): void;
+  /** Hovering or focusing shows this theme in the preview beside the list, so
+   *  the answer arrives before you commit to wearing it. */
+  onPreview(theme: string | null): void;
 }) {
   return (
     <button
       onClick={onPick}
       title={id}
       aria-pressed={active}
+      onMouseEnter={() => onPreview(id === "system" ? null : id)}
+      onMouseLeave={() => onPreview(null)}
+      onFocus={() => onPreview(id === "system" ? null : id)}
+      onBlur={() => onPreview(null)}
       style={{
         display: "flex",
         alignItems: "center",

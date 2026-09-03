@@ -6,7 +6,8 @@
  * for anything it forgot.
  */
 
-:root[data-theme="dark"] {
+:root[data-theme="dark"],
+[data-theme-preview="dark"] {
   color-scheme: dark;
   --accent: #3ecf8e;
   --accent-deep: #2bb377;
@@ -64,7 +65,8 @@
   --hue-grey-dim: #8e8e93;
 }
 
-:root[data-theme="light"] {
+:root[data-theme="light"],
+[data-theme-preview="light"] {
   color-scheme: light;
   --accent: #0f8f62;
   --accent-deep: #0b6f4c;
@@ -122,7 +124,8 @@
   --hue-grey-dim: #b4b4bb;
 }
 
-:root[data-theme="dark-plus"] {
+:root[data-theme="dark-plus"],
+[data-theme-preview="dark-plus"] {
   color-scheme: dark;
   --accent: #007acc;
   --accent-deep: #005c99;
@@ -180,7 +183,8 @@
   --hue-grey-dim: #8e8e93;
 }
 
-:root[data-theme="light-plus"] {
+:root[data-theme="light-plus"],
+[data-theme-preview="light-plus"] {
   color-scheme: light;
   --accent: #007acc;
   --accent-deep: #005c99;
@@ -238,7 +242,8 @@
   --hue-grey-dim: #b4b4bb;
 }
 
-:root[data-theme="dark-modern"] {
+:root[data-theme="dark-modern"],
+[data-theme-preview="dark-modern"] {
   color-scheme: dark;
   --accent: #0078d4;
   --accent-deep: #005a9f;
@@ -296,7 +301,8 @@
   --hue-grey-dim: #8e8e93;
 }
 
-:root[data-theme="light-modern"] {
+:root[data-theme="light-modern"],
+[data-theme-preview="light-modern"] {
   color-scheme: light;
   --accent: #005fb8;
   --accent-deep: #00478a;
@@ -354,7 +360,8 @@
   --hue-grey-dim: #b4b4bb;
 }
 
-:root[data-theme="hc-dark"] {
+:root[data-theme="hc-dark"],
+[data-theme-preview="hc-dark"] {
   color-scheme: dark;
   --accent: #f38518;
   --accent-deep: #b66412;
@@ -412,7 +419,8 @@
   --hue-grey-dim: #8e8e93;
 }
 
-:root[data-theme="hc-light"] {
+:root[data-theme="hc-light"],
+[data-theme-preview="hc-light"] {
   color-scheme: light;
   --accent: #0f4a85;
   --accent-deep: #0b3864;
@@ -470,7 +478,8 @@
   --hue-grey-dim: #b4b4bb;
 }
 
-:root[data-theme="abyss"] {
+:root[data-theme="abyss"],
+[data-theme-preview="abyss"] {
   color-scheme: dark;
   --accent: #2277ff;
   --accent-deep: #1a59bf;
@@ -528,7 +537,8 @@
   --hue-grey-dim: #8e8e93;
 }
 
-:root[data-theme="kimbie-dark"] {
+:root[data-theme="kimbie-dark"],
+[data-theme-preview="kimbie-dark"] {
   color-scheme: dark;
   --accent: #a57a4c;
   --accent-deep: #7c5c39;
@@ -586,7 +596,8 @@
   --hue-grey-dim: #8e8e93;
 }
 
-:root[data-theme="monokai"] {
+:root[data-theme="monokai"],
+[data-theme-preview="monokai"] {
   color-scheme: dark;
   --accent: #a6e22e;
   --accent-deep: #7daa23;
@@ -644,7 +655,8 @@
   --hue-grey-dim: #75715e;
 }
 
-:root[data-theme="monokai-dimmed"] {
+:root[data-theme="monokai-dimmed"],
+[data-theme-preview="monokai-dimmed"] {
   color-scheme: dark;
   --accent: #6a9fb5;
   --accent-deep: #507788;
@@ -702,7 +714,8 @@
   --hue-grey-dim: #8e8e93;
 }
 
-:root[data-theme="quiet-light"] {
+:root[data-theme="quiet-light"],
+[data-theme-preview="quiet-light"] {
   color-scheme: light;
   --accent: #705697;
   --accent-deep: #544171;
@@ -760,7 +773,8 @@
   --hue-grey-dim: #b4b4bb;
 }
 
-:root[data-theme="red"] {
+:root[data-theme="red"],
+[data-theme-preview="red"] {
   color-scheme: dark;
   --accent: #e35353;
   --accent-deep: #aa3e3e;
@@ -818,7 +832,8 @@
   --hue-grey-dim: #8e8e93;
 }
 
-:root[data-theme="solarized-dark"] {
+:root[data-theme="solarized-dark"],
+[data-theme-preview="solarized-dark"] {
   color-scheme: dark;
   --accent: #268bd2;
   --accent-deep: #1d689e;
@@ -876,7 +891,8 @@
   --hue-grey-dim: #657b83;
 }
 
-:root[data-theme="solarized-light"] {
+:root[data-theme="solarized-light"],
+[data-theme-preview="solarized-light"] {
   color-scheme: light;
   --accent: #268bd2;
   --accent-deep: #1d689e;
@@ -934,7 +950,8 @@
   --hue-grey-dim: #839496;
 }
 
-:root[data-theme="tomorrow-night-blue"] {
+:root[data-theme="tomorrow-night-blue"],
+[data-theme-preview="tomorrow-night-blue"] {
   color-scheme: dark;
   --accent: #bbdaff;
   --accent-deep: #8ca4bf;
