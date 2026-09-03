@@ -107,7 +107,12 @@ function VersionsTable({ agentId }: { agentId: string }) {
       <div style={{ display: "flex", alignItems: "center", marginBottom: 12 }}>
         <span style={{ fontSize: 13, fontWeight: 500, color: C.text }}>Versions</span>
         <div style={{ marginLeft: "auto" }}>
-          <CliHint command={cliCommand(state.env === "prod" ? "cluster.status" : "local.status")} />
+          {/* Both halves of the same fact: the string for a browser to copy,
+              the structure for the desktop shell to run. */}
+          <CliHint
+            command={cliCommand(state.env === "prod" ? "cluster.status" : "local.status")}
+            invocation={{ action: state.env === "prod" ? "cluster.status" : "local.status" }}
+          />
         </div>
       </div>
       <div
