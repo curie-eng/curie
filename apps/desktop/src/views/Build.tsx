@@ -44,7 +44,7 @@ import {
   type PluginManifest,
   type SkillMeta,
 } from "../lib/bundle";
-import { ACCENT, F, FONT, LINE, S, STATUS, T, tint } from "../tokens";
+import { ACCENT, F, FONT, LINE, M, S, STATUS, T, tint } from "../tokens";
 import {
   Badge,
   Button,
@@ -723,7 +723,7 @@ function Header({ checks, plugin }: { checks: readonly Check[]; plugin?: PluginM
             </Badge>
           </div>
           {plugin?.description ? (
-            <div style={{ ...F.callout, color: T.secondary, marginTop: 6, maxWidth: 720 }}>
+            <div style={{ ...F.callout, color: T.secondary, marginTop: 6, maxWidth: M.prose }}>
               {plugin.description}
             </div>
           ) : null}

@@ -15,7 +15,7 @@ import { useResources } from "../bridge/resources";
 import { useRuns } from "../bridge/runs";
 import { bridge } from "../bridge/bridge";
 import { ago, bytes, count, DASH, duration, percent, usd } from "../lib/format";
-import { ACCENT, F, STATUS, T } from "../tokens";
+import { ACCENT, F, M, STATUS, T } from "../tokens";
 import { stackPhase, stackProgress } from "../lib/startup";
 import { FitWidth, RankedBars, Sparkline, UsageBar } from "../primitives/charts";
 import { RunButton } from "./Actions";
@@ -527,7 +527,7 @@ function SetUp({ dockerAvailable }: { readonly dockerAvailable: boolean }) {
         <div style={{ ...F.headline }}>
           {dockerAvailable ? "Set up Curie on this computer" : "Docker is not running"}
         </div>
-        <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.55, maxWidth: 640 }}>
+        <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.55, maxWidth: M.prose }}>
           {dockerAvailable ? (
             <>
               One button starts everything an agent needs to run here. Then{" "}
