@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { C } from "../tokens";
 import { useStore } from "../state/store";
+import { desktopBridge, type Invocation } from "../lib/desktopBridge";
 import type { WiredActionId } from "./parity";
 
 // CliHint: a resting `>_` glyph that morphs in place into a copy button on
@@ -30,22 +31,36 @@ type CliHintProps =
       label?: string;
       noCliEquivalent?: never;
       actionIds?: never;
+      /** The same command as a structure. Supplied, and running in the desktop
+       *  shell, this control RUNS rather than copies. The string is still what
+       *  the tooltip shows and what a browser copies, so a caller that provides
+       *  both gets the right behaviour in either host. */
+      invocation?: Invocation;
     }
   | {
       command?: never;
       label?: string;
       noCliEquivalent: string;
       actionIds: readonly WiredActionId[];
+      // An action with no CLI verb has nothing to run either.
+      invocation?: never;
     };
 
 export function CliHint({
   command,
   label,
   noCliEquivalent,
+  invocation,
 }: CliHintProps) {
   const { dispatch } = useStore();
   const [active, setActive] = useState(false); // hover or keyboard focus
   const [copied, setCopied] = useState(false);
+  const [running, setRunning] = useState(false);
+
+  // The one place the web console and the desktop app differ. Same component,
+  // same call sites: in a browser there is nothing that can run a command, so
+  // it copies; in the shell there is, so it runs.
+  const shell = invocation ? desktopBridge() : null;
 
   // Amber "no CLI equivalent yet" affordance: link out to the tracking issue
   // rather than copy. Kept a real <button> for keyboard parity with the copy
@@ -86,6 +101,18 @@ export function CliHint({
 
   const cmd = command ?? "";
 
+  function run() {
+    if (!shell || !invocation) return;
+    setRunning(true);
+    void shell.cli
+      .run(invocation)
+      .then(() => dispatch({ type: "toast", message: `Running ${invocation.action.replace(/\./g, " ")}` }))
+      .catch((e: unknown) =>
+        dispatch({ type: "toast", message: `Could not start: ${String(e)}` }),
+      )
+      .finally(() => setRunning(false));
+  }
+
   function copy() {
     if (navigator.clipboard) {
       void navigator.clipboard.writeText(cmd).catch(() => {});
@@ -96,19 +123,21 @@ export function CliHint({
   }
 
   // Resting `>_`; morphs to `⧉` on hover/focus; flips to `✓` right after copy.
-  const glyph = copied ? "✓" : active ? "⧉" : ">_";
+  // In the shell it morphs to `▶` instead, because the click does something
+  // different and the glyph is the only warning of that.
+  const glyph = copied ? "✓" : running ? "…" : active ? (shell ? "▶" : "⧉") : ">_";
   const glyphColor = copied ? C.brand : active ? C.link : C.muted;
 
   return (
     <button
       type="button"
-      onClick={copy}
+      onClick={shell ? run : copy}
       onMouseEnter={() => setActive(true)}
       onMouseLeave={() => setActive(false)}
       onFocus={() => setActive(true)}
       onBlur={() => setActive(false)}
-      title={`$ ${cmd}`}
-      aria-label={`Copy command: ${cmd}`}
+      title={shell ? `Run: ${cmd}` : `$ ${cmd}`}
+      aria-label={shell ? `Run command: ${cmd}` : `Copy command: ${cmd}`}
       data-copied={copied ? "true" : "false"}
       style={{
         background: "transparent",
