@@ -20,8 +20,7 @@
     "noUncheckedSideEffectImports": true,
 
     "paths": {
-      "@aci/*": ["../../packages/aci-protocol/generated/ts/*"],
-      "@bridge": ["../../packages/desktop-bridge/bridge.ts"]
+      "@aci/*": ["../../packages/aci-protocol/generated/ts/*"]
     }
   },
   "include": ["src"]

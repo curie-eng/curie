@@ -9,9 +9,6 @@ export default defineConfig({
       "@aci": fileURLToPath(
         new URL("../../packages/aci-protocol/generated/ts", import.meta.url),
       ),
-      "@bridge": fileURLToPath(
-        new URL("../../packages/desktop-bridge/bridge.ts", import.meta.url),
-      ),
     },
   },
   test: {
