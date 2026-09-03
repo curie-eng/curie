@@ -19,7 +19,10 @@ const BASE = readFileSync(resolve(HERE, "..", "src", "styles.css"), "utf8");
 
 function blocks(css: string): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
-  const re = /:root\[data-theme="([^"]+)"\]\s*\{([^}]*)\}/g;
+  // Each block is a selector LIST: the root form a theme is worn with, and the
+  // `[data-theme-preview]` form that scopes the same palette to a subtree so
+  // settings can show a theme without the window putting it on.
+  const re = /:root\[data-theme="([^"]+)"\],\s*\[data-theme-preview="[^"]+"\]\s*\{([^}]*)\}/g;
   for (let m = re.exec(css); m; m = re.exec(css)) {
     const vars = new Set<string>();
     for (const line of m[2].split("\n")) {
@@ -50,6 +53,15 @@ describe("the generated themes", () => {
   it("ships a non-trivial set", () => {
     expect(THEMES.length).toBeGreaterThanOrEqual(15);
     expect(expected.size).toBeGreaterThanOrEqual(40);
+  });
+
+  it("gives every theme a preview selector as well as a root one", () => {
+    // The preview panel scopes a palette to a subtree. If the generator ever
+    // emitted only the root selector again, the preview would silently inherit
+    // the window's theme and show every option looking identical.
+    for (const t of THEMES) {
+      expect(CSS, `no preview selector for ${t.id}`).toContain(`[data-theme-preview="${t.id}"]`);
+    }
   });
 
   it("has a stylesheet block for every registered theme", () => {
