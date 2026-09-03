@@ -774,6 +774,18 @@ pub fn is_agent_lookup_not_found(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<AgentLookupNotFound>().is_some())
 }
 
+/// A minted console login code and when it stops being redeemable.
+///
+/// Short-lived and single-use by construction: it exists only to be copied out
+/// of a terminal into a browser once. The API stores only its hash, so this
+/// plaintext exists in the CLI's memory and the operator's clipboard and
+/// nowhere else.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConsoleLoginCode {
+    pub code: String,
+    pub expires_at: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Bundle {
     pub bundle_ref: String,
@@ -2072,6 +2084,28 @@ impl ApiClient {
             .json()
             .await
             .context("decoding created version")
+    }
+
+    /// Mint a single-use console login code (ADR-0083).
+    ///
+    /// The operator copies a CODE, never the platform key: that is the whole
+    /// point of the exchange. This call is the only place the key is used, it
+    /// happens here in the CLI, and the value never reaches a browser on any
+    /// path.
+    pub async fn create_console_login_code(&self) -> Result<ConsoleLoginCode> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!("{}/console/login-codes", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "POST console login code",
+            )
+            .await?;
+        Self::expect_ok(resp, "minting a console login code")
+            .await?
+            .json()
+            .await
+            .context("decoding the login code")
     }
 
     pub async fn upload_bundle(

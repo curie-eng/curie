@@ -1554,6 +1554,62 @@ export const commandManifest = {
           "name": "deploy"
         },
         {
+          "about": "Sign in to the local web console",
+          "hidden": false,
+          "name": "console",
+          "subcommands": [
+            {
+              "about": "Mint a single-use login code for the web console (ADR-0083)",
+              "args": [
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Where the console is served, for the printed instruction",
+                  "id": "console_url",
+                  "long": "console-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "long_about": "Mint a single-use login code for the web console (ADR-0083).\n\nThe console authenticates with a revocable session cookie, not the platform key. This command is the only place the key is handled, it happens here rather than in a browser, and what you carry away is a short-lived code that authorizes one browser and nothing else.",
+              "name": "login"
+            }
+          ]
+        },
+        {
           "about": "List an agent's immutable versions (`GET /agents/{id}/versions`)",
           "args": [
             {
@@ -4488,6 +4544,81 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "reset-thread"
+        },
+        {
+          "about": "Sign in to the cluster's web console",
+          "hidden": false,
+          "long_about": "Sign in to the cluster's web console.\n\nThe key is read from the release Secret and flows straight into the request header, never through your shell or your screen; what you copy is the code.",
+          "name": "console",
+          "subcommands": [
+            {
+              "about": "Mint a single-use login code for the cluster's web console (ADR-0083)",
+              "args": [
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Where the console is served, for the printed instruction",
+                  "id": "console_url",
+                  "long": "console-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "login"
+            }
+          ]
         },
         {
           "about": "Delete an agent via the platform API (`DELETE /agents/{id}`)",

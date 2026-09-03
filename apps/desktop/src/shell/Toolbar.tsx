@@ -12,6 +12,7 @@ import { useRuns } from "../bridge/runs";
 import { F, LINE, M, PANE_FADE, R, S, STATUS, T } from "../tokens";
 import { Glyph, PanelToggle, Segmented, Spinner } from "../primitives";
 import { PROMPT } from "../primitives/glyphs";
+import { SignIn } from "../views/SignIn";
 
 const TITLES: Record<Route, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "What is happening right now" },
@@ -216,6 +217,7 @@ function PaneSwitch() {
 function ApiPill() {
   const app = useApp();
   const api = app.api;
+  const [signingIn, setSigningIn] = useState(false);
   // Reachable and authorized are different facts, and this pill used to collapse
   // them. In a browser tab the API answers every call with 401 until a console
   // session exists (ADR-0083), so "reachable" was true and the pill said
@@ -241,9 +243,14 @@ function ApiPill() {
           : "No API";
 
   return (
+    <>
+    {signingIn ? <SignIn onClose={() => setSigningIn(false)} /> : null}
     <button
       className="no-drag"
-      onClick={() => app.navigate("settings")}
+      // The pill is the only place that reports this state, so it should also be
+      // the way out of it: unauthorized opens the exchange, everything else goes
+      // to the connection settings.
+      onClick={() => (state === "unauthorized" ? setSigningIn(true) : app.navigate("settings"))}
       title={
         state === "ok"
           ? `Connected to ${api?.baseUrl}`
@@ -279,5 +286,6 @@ function ApiPill() {
     >
       {label}
     </button>
+    </>
   );
 }
