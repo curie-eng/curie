@@ -13,6 +13,47 @@ import { bridge } from "../bridge/bridge";
 import { F, T } from "../tokens";
 import { Button, Field, Input, Notice, Sheet } from "../primitives";
 
+/**
+ * Ask the shell to mint a code for us.
+ *
+ * The rule ADR-0083 sets is that the BROWSER must never hold the platform key.
+ * The desktop shell is not a browser: it already holds the key and already runs
+ * `curie` as you, exactly like the terminal does. So where the shell is present
+ * there is no reason to make somebody go and copy a code by hand -- the app can
+ * mint one and spend it immediately, and the browser rule is untouched.
+ *
+ * Runs with `--json` so the code is read from a parsed field rather than
+ * scraped out of human-readable output.
+ */
+async function mintThroughShell(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let runId: string | null = null;
+    const off = bridge().cli.onResult((r) => {
+      if (runId !== null && r.runId !== runId) return;
+      off();
+      if (r.state !== "ok") {
+        reject(new Error("The sign-in command did not succeed."));
+        return;
+      }
+      const code = (r.result as { code?: unknown } | undefined)?.code;
+      if (typeof code !== "string" || !code) {
+        reject(new Error("The sign-in command returned no code."));
+        return;
+      }
+      resolve(code);
+    });
+    bridge()
+      .cli.run({ action: "local.console.login", json: true })
+      .then((handle) => {
+        runId = handle.runId;
+      })
+      .catch((e: unknown) => {
+        off();
+        reject(e instanceof Error ? e : new Error(String(e)));
+      });
+  });
+}
+
 /** The exchange is one unauthenticated POST; the cookie comes back on it. */
 async function exchange(code: string): Promise<string | null> {
   const res = await bridge().api.request<{ detail?: string }>({
@@ -32,6 +73,30 @@ export function SignIn({ onClose }: { readonly onClose: () => void }) {
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Can this window run commands itself? In the desktop app, yes, and then
+  // signing in needs no terminal at all.
+  const canMint = !!app.env?.cliPath;
+
+  async function signInHere() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const minted = await mintThroughShell();
+      const failure = await exchange(minted);
+      if (failure) {
+        setError(failure);
+        return;
+      }
+      app.refreshApi();
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function submit() {
     if (!code.trim() || busy) return;
@@ -66,9 +131,23 @@ export function SignIn({ onClose }: { readonly onClose: () => void }) {
         </div>
       }
     >
+      {canMint ? (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.6, marginBottom: 10 }}>
+            This app can sign itself in. It already runs Curie commands as you, so it can
+            get a code and use it without you copying anything.
+          </div>
+          <Button tone="primary" busy={busy} onClick={() => void signInHere()}>
+            Sign me in
+          </Button>
+        </div>
+      ) : null}
+
       <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.6, marginBottom: 14 }}>
-        Run <strong>curie local console login</strong> in a terminal and paste the code it prints.
-        The code works once and only signs in this browser.
+        {canMint ? "Or paste a code: run " : "Run "}
+        <strong>curie local console login</strong>
+        {canMint ? " anywhere and paste what it prints." : " in a terminal and paste the code it prints."}
+        {" "}A code works once and only signs in this window.
       </div>
 
       <Field label="Login code">
