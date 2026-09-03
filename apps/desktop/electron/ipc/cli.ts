@@ -25,6 +25,7 @@ import type {
 } from "../shared/contract.js";
 import { CH } from "../shared/contract.js";
 import { resolve as resolveInvocation } from "./manifest.js";
+import { findRepoRoot } from "./repo.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -85,6 +86,33 @@ export function defaultCwd(): string {
   return process.env.CURIE_WORKSPACE ?? homedir();
 }
 
+/**
+ * Where a command runs, decided here rather than by whoever is asking.
+ *
+ * The renderer used to compute this and pass it down, which meant the policy
+ * lived in one client and any second client got it wrong -- and one did: the
+ * browser console has no notion of a working directory, so every command it ran
+ * landed in the home directory and `local status` could not find a compose file.
+ *
+ * Most of what an operator runs is repository-scoped: the dev stack's compose
+ * file, the chart, the contract fixtures. So the checkout wins when there is
+ * one, and a caller with a genuine reason to run somewhere else (a bundle
+ * directory) still passes `cwd` explicitly and is honoured.
+ */
+export function cwdFor(explicit?: string | null): string {
+  if (explicit) return explicit;
+  // A configured workspace beats wherever the binary happened to be launched
+  // from: one is a stated intent, the other is an accident of packaging. In dev
+  // `process.cwd()` is the checkout, and in a packaged app it is not a
+  // repository at all, so it is the last guess rather than the first.
+  const configured = process.env.CURIE_WORKSPACE;
+  return (
+    (configured ? findRepoRoot(configured) : null) ??
+    findRepoRoot(process.cwd()) ??
+    defaultCwd()
+  );
+}
+
 /** One-shot run collected into a string. Used for the shell's own probes
  *  (`curie --version`, `secrets list`), never for anything long-running. */
 export async function runOnce(
@@ -111,7 +139,7 @@ export function startRun(win: BrowserWindow, inv: CliInvocation): RunHandle {
   const cli = findCli();
   if (!cli) throw new Error("curie is not on PATH. Install it, then reopen this window.");
 
-  const command = resolveInvocation(inv, inv.cwd || defaultCwd());
+  const command = resolveInvocation(inv, cwdFor(inv.cwd));
   const runId = randomUUID();
   const startedAt = Date.now();
 

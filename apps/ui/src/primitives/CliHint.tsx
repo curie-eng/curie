@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { C } from "../tokens";
 import { useStore } from "../state/store";
-import { desktopBridge, type Invocation } from "../lib/desktopBridge";
+import { desktopBridge, type Invocation } from "@bridge";
 import type { WiredActionId } from "./parity";
 
 // CliHint: a resting `>_` glyph that morphs in place into a copy button on
