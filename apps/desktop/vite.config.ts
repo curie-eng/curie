@@ -98,7 +98,22 @@ function watchCodegen(): Plugin {
 export default defineConfig({
   base: "./",
   plugins: [react(), devCsp(), watchCodegen()],
-  server: { port: 5273, strictPort: true },
+  // Same-origin `/api`, because this UI is also the browser console now and the
+  // platform API carries no CORS middleware on purpose. In production the
+  // origin serving these files proxies the same path; in dev that is this rule.
+  // `CURIE_API_TARGET` matches `apps/ui`'s spelling so one env var configures
+  // either host.
+  server: {
+    port: 5273,
+    strictPort: true,
+    proxy: {
+      "/api": {
+        target: process.env.CURIE_API_TARGET ?? "http://localhost:28000",
+        changeOrigin: true,
+        rewrite: (p: string) => p.replace(/^\/api/, ""),
+      },
+    },
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,

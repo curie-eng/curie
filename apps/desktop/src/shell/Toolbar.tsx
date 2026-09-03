@@ -216,10 +216,29 @@ function PaneSwitch() {
 function ApiPill() {
   const app = useApp();
   const api = app.api;
-  const state = !api ? "unknown" : api.reachable ? "ok" : api.baseUrl ? "down" : "unset";
+  // Reachable and authorized are different facts, and this pill used to collapse
+  // them. In a browser tab the API answers every call with 401 until a console
+  // session exists (ADR-0083), so "reachable" was true and the pill said
+  // "Connected" over a screen with nothing on it. A green light above an empty
+  // table is worse than a red one.
+  const state = !api
+    ? "unknown"
+    : api.reachable && api.hasKey
+      ? "ok"
+      : api.reachable
+        ? "unauthorized"
+        : api.baseUrl
+          ? "down"
+          : "unset";
 
   const label =
-    state === "ok" ? (api?.orgName ?? "Connected") : state === "down" ? "API offline" : "No API";
+    state === "ok"
+      ? (api?.orgName ?? "Connected")
+      : state === "unauthorized"
+        ? "Sign in"
+        : state === "down"
+          ? "API offline"
+          : "No API";
 
   return (
     <button
@@ -228,9 +247,11 @@ function ApiPill() {
       title={
         state === "ok"
           ? `Connected to ${api?.baseUrl}`
-          : state === "down"
-            ? `Cannot reach ${api?.baseUrl}`
-            : "No platform API configured"
+          : state === "unauthorized"
+            ? `${api?.baseUrl} is reachable but this console is not signed in`
+            : state === "down"
+              ? `Cannot reach ${api?.baseUrl}`
+              : "No platform API configured"
       }
       style={{
         display: "inline-flex",
@@ -245,7 +266,14 @@ function ApiPill() {
         // name), so a coloured dot beside it only repeats the word. Colour the
         // word instead: a connected org reads as calm secondary text, and a
         // failure is the only thing that takes a warning colour.
-        color: state === "down" ? STATUS.danger : state === "unset" ? T.quaternary : T.secondary,
+        color:
+          state === "down"
+            ? STATUS.danger
+            : state === "unauthorized"
+              ? STATUS.warn
+              : state === "unset"
+                ? T.quaternary
+                : T.secondary,
         cursor: "default",
       }}
     >
