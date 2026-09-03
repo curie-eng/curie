@@ -8,7 +8,8 @@
 // real states -- "curie is not reachable from here" -- instead of blank panels,
 // and tests get a seam to stub.
 
-import type { ApiResponse, CurieBridge } from "../../electron/shared/contract";
+import type { CurieBridge } from "../../electron/shared/contract";
+import { webConnection, webRequest } from "./webApi";
 
 export type {
   ApiConnection,
@@ -96,18 +97,17 @@ const detached: CurieBridge = {
     writeFile: reject("Writing a bundle file"),
     revealInFileManager: async () => {},
   },
+  // The one part of the detached shell that is not a refusal. Without a main
+  // process the API is still reachable, same-origin, the way `apps/ui` reaches
+  // it -- so a browser tab is a working console rather than a demo of one. See
+  // `webApi.ts`; credentials are cookies, never a key.
   api: {
-    connection: async () => ({
-      baseUrl: "",
-      hasKey: false,
-      reachable: false,
-      checkedAt: Date.now(),
-    }),
-    connect: reject("Connecting to the platform API"),
-    // The generic is the caller's expectation, not a promise about the body: a
-    // failed call has no body, and every caller must check `ok` first anyway.
-    request: async <T>() =>
-      ({ status: 0, ok: false, body: undefined as T, error: "no desktop shell" }) as ApiResponse<T>,
+    connection: webConnection,
+    // Pointing a browser tab at a different API is not this app's job: the
+    // origin serving the page decides, via its own proxy. In the shell this is
+    // a real setting.
+    connect: reject("Choosing a different platform API"),
+    request: webRequest,
   },
   secrets: {
     list: async () => [],
