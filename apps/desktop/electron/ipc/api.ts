@@ -78,7 +78,13 @@ export async function connection(): Promise<ApiConnection> {
   const res = await request<{ org_name?: string }>({ method: "GET", path: "/config" });
   return {
     baseUrl: apiBaseUrl,
-    hasKey: !!apiKey,
+    // "Can this console make authorized calls", not "is a key stored". A
+    // loopback API takes the dev key without one being configured, and `request`
+    // below already applies it -- so reporting "no key" there made the shell
+    // claim it was signed out while its own requests were succeeding. Both hosts
+    // now answer the same question with this field, which is what lets one
+    // screen gate on it.
+    hasKey: !!(apiKey || (isLoopback(apiBaseUrl) ? LOCAL_API_KEY : null)),
     reachable: res.ok,
     orgName: res.ok ? res.body?.org_name : undefined,
     checkedAt: Date.now(),

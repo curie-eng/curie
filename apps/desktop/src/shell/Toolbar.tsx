@@ -18,6 +18,10 @@ const TITLES: Record<Route, { title: string; subtitle: string }> = {
   overview: { title: "Overview", subtitle: "What is happening right now" },
   build: { title: "Build", subtitle: "Make an agent, try it, then put it to work" },
   tiers: { title: "Where it runs", subtitle: "Just you, this computer, or your whole team" },
+  observability: {
+    title: "Activity",
+    subtitle: "What your agents have done, and what it cost",
+  },
   resources: { title: "Resources", subtitle: "What each agent is using up" },
   canvas: { title: "Canvas", subtitle: "Your agents, what they connect to, and what runs them" },
   // Two panes of one tab, so they share a title and differ in the subtitle.

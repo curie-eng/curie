@@ -19,6 +19,7 @@ import { Overview } from "./views/Overview";
 import { Build } from "./views/Build";
 import { Tiers } from "./views/Tiers";
 import { Resources } from "./views/Resources";
+import { Observability } from "./views/Observability";
 import { Canvas } from "./views/Canvas";
 import { Commands } from "./views/Commands";
 import { Activity } from "./views/Activity";
@@ -34,6 +35,8 @@ function View() {
       return <Build />;
     case "tiers":
       return <Tiers />;
+    case "observability":
+      return <Observability />;
     case "resources":
       return <Resources />;
     case "canvas":
@@ -99,6 +102,7 @@ function Keys({ onToggleRail }: { onToggleRail(): void }) {
           "build",
           "canvas",
           "resources",
+          "observability",
           "tiers",
           "commands",
         ] as const;

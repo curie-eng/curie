@@ -33,6 +33,7 @@ export type Route =
   | "build"
   | "tiers"
   | "resources"
+  | "observability"
   | "canvas"
   | "commands"
   | "activity"
