@@ -23,38 +23,6 @@ import { ACCENT, F, FONT, HUE, LINE, ON_ACCENT, R, S, STATUS, T } from "../token
  * about the component below: anything listed must be visible, and anything
  * shown should be listed.
  */
-export const PREVIEW_VARS = [
-  "--s-window",
-  "--s-sidebar-fallback",
-  "--s-content",
-  "--card-fill",
-  "--s-well",
-  "--s-field",
-  "--s-selected",
-  "--s-control",
-  "--s-subtle",
-  "--accent",
-  "--on-accent",
-  "--t-primary",
-  "--t-secondary",
-  "--t-tertiary",
-  "--t-quaternary",
-  "--line-separator",
-  "--line-border",
-  "--status-ok",
-  "--status-warn",
-  "--status-danger",
-  "--status-info",
-  "--hue-blue",
-  "--hue-purple",
-  "--hue-orange",
-  "--hue-cyan",
-  "--hue-teal",
-  "--hue-yellow",
-  "--hue-red",
-  "--hue-grey",
-] as const;
-
 const NODE_HUES: readonly [string, string][] = [
   ["blue", HUE.blue],
   ["purple", HUE.purple],

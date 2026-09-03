@@ -37,8 +37,8 @@ export const THEMES: readonly ThemeInfo[] = [
     "label": "Curie Dark",
     "appearance": "dark",
     "swatch": [
+      "#1f1f21",
       "#242426",
-      "#2c2c2e",
       "#3ecf8e"
     ]
   },
@@ -47,8 +47,8 @@ export const THEMES: readonly ThemeInfo[] = [
     "label": "Curie Light",
     "appearance": "light",
     "swatch": [
+      "#e4e6eb",
       "#eaecf1",
-      "#ffffff",
       "#0f8f62"
     ]
   },
@@ -57,8 +57,8 @@ export const THEMES: readonly ThemeInfo[] = [
     "label": "Dark+",
     "appearance": "dark",
     "swatch": [
+      "#333333",
       "#272727",
-      "#303030",
       "#007acc"
     ]
   },
@@ -67,8 +67,8 @@ export const THEMES: readonly ThemeInfo[] = [
     "label": "Light+",
     "appearance": "light",
     "swatch": [
+      "#f3f3f3",
       "#f4f4f4",
-      "#ffffff",
       "#007acc"
     ]
   },
@@ -77,8 +77,8 @@ export const THEMES: readonly ThemeInfo[] = [
     "label": "Dark Modern",
     "appearance": "dark",
     "swatch": [
+      "#181818",
       "#282828",
-      "#303030",
       "#0078d4"
     ]
   },
@@ -87,8 +87,8 @@ export const THEMES: readonly ThemeInfo[] = [
     "label": "Light Modern",
     "appearance": "light",
     "swatch": [
+      "#f8f8f8",
       "#f4f4f4",
-      "#ffffff",
       "#005fb8"
     ]
   },
@@ -98,7 +98,7 @@ export const THEMES: readonly ThemeInfo[] = [
     "appearance": "dark",
     "swatch": [
       "#0d0d0d",
-      "#1a1a1a",
+      "#0d0d0d",
       "#f38518"
     ]
   },
@@ -107,8 +107,8 @@ export const THEMES: readonly ThemeInfo[] = [
     "label": "Light High Contrast",
     "appearance": "light",
     "swatch": [
+      "#f0f0f0",
       "#f4f4f4",
-      "#ffffff",
       "#0f4a85"
     ]
   },
@@ -118,7 +118,7 @@ export const THEMES: readonly ThemeInfo[] = [
     "appearance": "dark",
     "swatch": [
       "#051221",
-      "#0a182a",
+      "#051221",
       "#2277ff"
     ]
   },
@@ -128,7 +128,7 @@ export const THEMES: readonly ThemeInfo[] = [
     "appearance": "dark",
     "swatch": [
       "#2b2115",
-      "#34291b",
+      "#2b2115",
       "#a57a4c"
     ]
   },
@@ -138,7 +138,7 @@ export const THEMES: readonly ThemeInfo[] = [
     "appearance": "dark",
     "swatch": [
       "#31322c",
-      "#3c3d37",
+      "#31322c",
       "#a6e22e"
     ]
   },
@@ -147,8 +147,8 @@ export const THEMES: readonly ThemeInfo[] = [
     "label": "Monokai Dimmed",
     "appearance": "dark",
     "swatch": [
+      "#353535",
       "#262726",
-      "#2f2f2f",
       "#6a9fb5"
     ]
   },
@@ -157,8 +157,8 @@ export const THEMES: readonly ThemeInfo[] = [
     "label": "Quiet Light",
     "appearance": "light",
     "swatch": [
+      "#e6e6e6",
       "#eaeaea",
-      "#f5f5f5",
       "#705697"
     ]
   },
@@ -168,7 +168,7 @@ export const THEMES: readonly ThemeInfo[] = [
     "appearance": "dark",
     "swatch": [
       "#430c0c",
-      "#4c1919",
+      "#430c0c",
       "#e35353"
     ]
   },
@@ -178,7 +178,7 @@ export const THEMES: readonly ThemeInfo[] = [
     "appearance": "dark",
     "swatch": [
       "#07313b",
-      "#0f3741",
+      "#07313b",
       "#268bd2"
     ]
   },
@@ -187,8 +187,8 @@ export const THEMES: readonly ThemeInfo[] = [
     "label": "Solarized Light",
     "appearance": "light",
     "swatch": [
+      "#eee7d5",
       "#f2ebd9",
-      "#fdf6e3",
       "#268bd2"
     ]
   },
@@ -198,7 +198,7 @@ export const THEMES: readonly ThemeInfo[] = [
     "appearance": "dark",
     "swatch": [
       "#0d2f5a",
-      "#1a3a62",
+      "#0d2f5a",
       "#bbdaff"
     ]
   }
