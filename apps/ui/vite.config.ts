@@ -22,6 +22,11 @@ export default defineConfig({
       "@aci": fileURLToPath(
         new URL("../../packages/aci-protocol/generated/ts", import.meta.url),
       ),
+      // The desktop shell's contract, declared once in packages/ and imported
+      // by both builds. See packages/desktop-bridge/README.md.
+      "@bridge": fileURLToPath(
+        new URL("../../packages/desktop-bridge/bridge.ts", import.meta.url),
+      ),
     },
   },
   // allowedHosts lets the dev/preview server be reached over the tailnet
