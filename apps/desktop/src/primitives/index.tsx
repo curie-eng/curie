@@ -1039,7 +1039,12 @@ export function Field({
   right?: ReactNode;
 }) {
   return (
-    <div style={{ marginBottom: 14 }}>
+    // Fills the width it is given. A `Field` is a labelled control, and inside a
+    // flex row it was sizing to its content instead: on the theme picker that
+    // left the field 858px wide in a 1222px row, with the difference dead. In a
+    // block context these two properties do nothing, so this is safe wherever a
+    // Field already looked right.
+    <div style={{ marginBottom: 14, flex: 1, minWidth: 0 }}>
       <div
         style={{
           display: "flex",
