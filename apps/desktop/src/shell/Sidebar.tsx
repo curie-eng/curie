@@ -58,6 +58,12 @@ const ITEMS: readonly Item[] = [
     icon: <Icon d="M3.2 3.6h3.4v3.2H3.2zM9.4 9.2h3.4v3.2H9.4zM6.6 5.2h2.2a2 2 0 0 1 2 2v2" />,
   },
   {
+    id: "observability",
+    label: "Activity",
+    hint: "What your agents have done, and what it cost",
+    icon: <Icon d="M2.4 11.6 6 6.8l2.8 2.6L13.6 4" />,
+  },
+  {
     id: "resources",
     label: "Resources",
     hint: "What is using CPU, memory and disk",
