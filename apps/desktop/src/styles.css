@@ -469,3 +469,27 @@ select {
 .row-delete:hover {
   color: var(--status-danger);
 }
+
+/* The theme preview eases between themes instead of cutting.
+
+   Changing a theme changes every colour in the panel at once, and switching them
+   instantly reads as a flash even when it is the theme you asked for. Easing the
+   colours across turns it into one movement. Only colour is animated, so nothing
+   moves or reflows.
+
+   Gradients cannot be transitioned by `background-color`, so the card fill still
+   swaps outright. That is one element among many and it does not read as a flash
+   on its own.
+
+   Anybody who has asked their system to reduce motion gets the cut, which is
+   what that setting means here: no animation rather than a gentler one. */
+@media (prefers-reduced-motion: no-preference) {
+  [data-theme-preview],
+  [data-theme-preview] * {
+    transition:
+      background-color 140ms ease,
+      border-color 140ms ease,
+      color 140ms ease,
+      fill 140ms ease;
+  }
+}

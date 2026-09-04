@@ -5,7 +5,7 @@
 // read back, because a desktop app that could show you a secret is a second
 // place secrets live.
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { useApp } from "../bridge/app";
 import { isLoopback, LOCAL_API_KEY, LOCAL_API_URL } from "../../electron/shared/contract";
@@ -140,11 +140,51 @@ export function Settings() {
   );
 }
 
+/** A hovered theme has to be settled on before it is drawn.
+ *
+ *  Each row swaps the whole preview -- every surface, every colour -- so moving
+ *  the pointer across the grid repainted it once per row it crossed. Seventeen
+ *  themes deep that is a strobe, not a preview.
+ *
+ *  Leaving is held back for the same reason, and it is the bigger half. A row
+ *  clears the preview as the pointer goes and the next row sets it as the
+ *  pointer arrives, so a sweep did not run theme to theme: it bounced through
+ *  the current theme between every pair, twice the flashing for the same
+ *  distance travelled. Holding the clear lets the next row cancel it, so
+ *  crossing the grid changes nothing until the pointer stops, and stopping
+ *  outside it still returns to what you are wearing. */
+function useSettledPreview(delay: number): [string | null, (id: string | null) => void] {
+  const [preview, setPreview] = useState<string | null>(null);
+  const pending = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(
+    () => () => {
+      if (pending.current !== undefined) clearTimeout(pending.current);
+    },
+    [],
+  );
+
+  const show = useCallback(
+    (id: string | null) => {
+      if (pending.current !== undefined) clearTimeout(pending.current);
+      pending.current = setTimeout(() => {
+        pending.current = undefined;
+        setPreview(id);
+      }, delay);
+    },
+    [delay],
+  );
+
+  return [preview, show];
+}
+
 function AppearancePanel() {
   const app = useApp();
   const theme = app.theme;
   const preference = theme?.preference ?? "system";
-  const [preview, setPreview] = useState<string | null>(null);
+  // Long enough that crossing a row does not count as choosing it, short enough
+  // that stopping on one still feels answered rather than loaded.
+  const [preview, setPreview] = useSettledPreview(140);
 
   // Hovering shows that theme; otherwise the preview shows what is on. "System"
   // has no palette of its own, so it previews whichever the OS currently
