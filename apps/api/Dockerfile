@@ -12,7 +12,7 @@
 # `curie-api` member (and only its deps) as non-editable wheels into /app/.venv;
 # the runtime carries just that venv plus the Alembic migration tree so the chart
 # can run `alembic upgrade head` from the same image.
-FROM python:3.13.15-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS builder
+FROM python:3.14.7-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS builder
 RUN pip install --no-cache-dir uv==0.10.7
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 \
@@ -21,7 +21,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 COPY . .
 RUN uv sync --frozen --no-dev --no-editable --package curie-api
 
-FROM python:3.13.15-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
+FROM python:3.14.7-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
 # git is a RUNTIME dependency: the git-flow engine (gitflow.py) shells out to
 # `git clone --mirror` / `git archive` to build a bundle from a pushed sha. The
 # slim base does not ship it, so without this a push webhook fails
