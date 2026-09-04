@@ -298,21 +298,25 @@ function ThemeChoice({
           }}
         />
       )}
-      <span style={{ minWidth: 0, flex: 1 }}>
-        <span
-          style={{
-            ...F.body,
-            display: "block",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            color: active ? T.primary : T.secondary,
-          }}
-        >
-          {label}
-        </span>
-        {note ? <span style={{ ...F.footnote, color: T.tertiary }}>{note}</span> : null}
+      <span
+        style={{
+          ...F.body,
+          minWidth: 0,
+          flex: 1,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          color: active ? T.primary : T.secondary,
+        }}
+      >
+        {label}
       </span>
+      {/* Beside the label, not beneath it. Stacked, the note gave this one row
+          a second line, so System stood taller than every other theme and the
+          list reflowed as the note came and went. */}
+      {note ? (
+        <span style={{ ...F.footnote, flex: "none", color: T.tertiary }}>{note}</span>
+      ) : null}
     </button>
   );
 }
