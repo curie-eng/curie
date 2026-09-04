@@ -1,0 +1,27 @@
+# The smallest bundle-owned connector: built from source, pinned by digest,
+# credential held by reference, reach undeclared because the schema has no
+# field for it (measured: a `reaches:` key is refused by the validator).
+connectors:
+  stubfin:
+    build:
+      context: connector
+      platforms: [linux/amd64]
+    env:
+      # The stand-in third-party API. On a real deployment this is the
+      # provider's public host, which the connector pod reaches because it is
+      # rendered an Ingress policy and NO Egress policy.
+      FIN_API_BASE: http://stubfin-api:8080
+      # Names, not values: which Secret holds the refresh token and under which
+      # key, so a reissued token is written back to the place it came from.
+      FIN_TOKEN_SECRET: stubfin-credentials
+      FIN_TOKEN_SECRET_KEY: FIN_REFRESH_TOKEN
+    secrets:
+      - name: FIN_CLIENT_ID
+        from_secret: stubfin-credentials
+        key: FIN_CLIENT_ID
+      - name: FIN_CLIENT_SECRET
+        from_secret: stubfin-credentials
+        key: FIN_CLIENT_SECRET
+      - name: FIN_REFRESH_TOKEN
+        from_secret: stubfin-credentials
+        key: FIN_REFRESH_TOKEN
