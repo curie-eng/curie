@@ -9,7 +9,7 @@
 // and tests get a seam to stub.
 
 import type { CurieBridge } from "../../electron/shared/contract";
-import { webConnection, webRequest } from "./webApi";
+import { webConnection, webRequest, webSignOut } from "./webApi";
 
 export type {
   ApiConnection,
@@ -107,6 +107,7 @@ const detached: CurieBridge = {
     // origin serving the page decides, via its own proxy. In the shell this is
     // a real setting.
     connect: reject("Choosing a different platform API"),
+    signOut: webSignOut,
     request: webRequest,
   },
   secrets: {

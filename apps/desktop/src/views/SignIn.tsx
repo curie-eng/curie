@@ -90,6 +90,7 @@ export function SignIn({ onClose }: { readonly onClose: () => void }) {
         return;
       }
       app.refreshApi();
+      app.refreshAgents();
       onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -112,6 +113,12 @@ export function SignIn({ onClose }: { readonly onClose: () => void }) {
     // learns about it at once, rather than each discovering it on its own next
     // request.
     app.refreshApi();
+    // And reload what the refusals emptied. Re-probing only fixes the pill: the
+    // agent list is still whatever the signed-out window managed to fetch,
+    // which is nothing, so signing in landed on "no agents yet" plus a stale
+    // error until something else happened to refresh. Signing in should show
+    // you what you just got access to.
+    app.refreshAgents();
     onClose();
   }
 

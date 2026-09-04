@@ -75,6 +75,7 @@ function stubShell(): CurieBridge {
     api: {
       connection,
       connect: connection,
+      signOut: connection,
       request: async (req: ApiRequest) => {
         calls.push({ method: req.method, path: req.path, body: req.body });
         if (req.path === "/agents") return { status: 200, ok: true, body: agents as never };

@@ -14,6 +14,7 @@ import { surfacesById } from "../lib/surfaces";
 import { Actions, DrivenBy, RunButton } from "./Actions";
 import { bridge, hasShell } from "../bridge/bridge";
 import { ACCENT, F, FONT, LINE, R, S, STATUS, T, tint } from "../tokens";
+import { SignIn } from "./SignIn";
 import { ThemePreview } from "./ThemePreview";
 import {
   Badge,
@@ -113,6 +114,7 @@ export function Settings() {
 
       {tab === "connection" ? (
         <>
+          <AccessPanel />
           <ApiPanel />
           <SecretsPanel />
         </>
@@ -358,6 +360,99 @@ function ThemeChoice({
         <span style={{ ...F.footnote, flex: "none", color: T.tertiary }}>{note}</span>
       ) : null}
     </button>
+  );
+}
+
+/** What is authorizing this console, said out loud, with the way out of it.
+ *
+ *  The state existed and was invisible. Both hosts authorize every call, and
+ *  nothing on any screen said so or offered a way to stop: the shell holds the
+ *  platform key, a browser tab holds a session (ADR-0083), and the only hint
+ *  either way was a pill that read "Connected". `revoke_console_session` was
+ *  written months ago and reachable from nowhere, so a console could be signed
+ *  in and never out. */
+function AccessPanel() {
+  const app = useApp();
+  const api = app.api;
+  const [signingIn, setSigningIn] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const signOut = async () => {
+    setBusy(true);
+    try {
+      await app.signOutApi();
+      app.refreshAgents();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Four states, and the difference between the middle two is the whole reason
+  // this panel exists: an API that refuses this console looks identical to one
+  // that is not there unless something says which.
+  const state = !api ? "unknown" : api.via ? "in" : api.reachable ? "out" : "unreachable";
+
+  return (
+    <Panel
+      title="Access"
+      right={
+        state === "in" ? (
+          <Badge color={ACCENT} filled>
+            signed in
+          </Badge>
+        ) : state === "out" ? (
+          <Badge color={STATUS.warn} filled>
+            signed out
+          </Badge>
+        ) : null
+      }
+    >
+      {signingIn ? <SignIn onClose={() => setSigningIn(false)} /> : null}
+
+      <div style={{ fontSize: 12, color: T.tertiary, marginBottom: 12, lineHeight: 1.6 }}>
+        {state === "in" && api?.via === "key" ? (
+          <>
+            Authorized by the platform key, which the desktop shell holds and the page never
+            receives. Signing out forgets it here; it does not revoke anything, because a key is
+            not a session. On this computer the local stack still answers afterwards, using the
+            key Curie ships with.
+          </>
+        ) : state === "in" ? (
+          <>
+            Signed in with a console session: a cookie this page cannot read, which expires on its
+            own and can be revoked. Signing out revokes it at the API rather than only dropping it
+            here, so a copy of the cookie stops working too.
+          </>
+        ) : state === "out" ? (
+          <>
+            The API is answering and refusing this console. Nothing on these screens will load
+            until it has a session.
+          </>
+        ) : state === "unreachable" ? (
+          <>Nothing is answering at {api?.baseUrl || "that address"}, so there is nothing to sign in to yet.</>
+        ) : (
+          <>Still checking.</>
+        )}
+      </div>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        {state === "in" ? (
+          <Button tone="plain" busy={busy} onClick={() => void signOut()}>
+            Sign out
+          </Button>
+        ) : null}
+        {state === "out" ? (
+          <Button tone="primary" onClick={() => setSigningIn(true)}>
+            Sign in
+          </Button>
+        ) : null}
+        <div style={{ flex: 1 }} />
+        <span style={{ ...F.footnote, color: T.quaternary }}>
+          One console, not one person: there are no per-user accounts yet, so this says how this
+          window is authorized, not who you are.
+        </span>
+      </div>
+    </Panel>
   );
 }
 

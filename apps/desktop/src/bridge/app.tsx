@@ -120,6 +120,7 @@ interface AppValue {
 
   readonly api: ApiConnection | null;
   connectApi(baseUrl: string, apiKey: string | null): Promise<void>;
+  signOutApi(): Promise<void>;
   refreshApi(): void;
 
   readonly agents: readonly AgentSummary[];
@@ -403,6 +404,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setApi(await bridge().api.connect(baseUrl, apiKey));
   }, []);
 
+  const signOutApi = useCallback(async () => {
+    setApi(await bridge().api.signOut());
+  }, []);
+
   const remember = useCallback((flag: string, value: string) => {
     setSticky((prev) => {
       if (prev[flag] === value) return prev;
@@ -464,6 +469,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       createAgent,
       api,
       connectApi,
+      signOutApi,
       refreshApi,
       agents,
       agentsError,
@@ -494,6 +500,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       createAgent,
       api,
       connectApi,
+      signOutApi,
       refreshApi,
       agents,
       agentsError,

@@ -72,6 +72,7 @@ function stubShell(): CurieBridge {
     api: {
       connection: async () => ({ baseUrl: "", hasKey: false, reachable: false, checkedAt: 0 }),
       connect: async () => ({ baseUrl: "", hasKey: false, reachable: false, checkedAt: 0 }),
+      signOut: async () => ({ baseUrl: "", hasKey: false, reachable: false, checkedAt: 0 }),
       request: async () => ({ status: 0, ok: false, body: undefined as never }),
     },
     secrets: { list: async () => [], set: async () => {}, unset: async () => {} },

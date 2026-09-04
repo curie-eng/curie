@@ -129,3 +129,36 @@ async def current_session(
         subject=subject,
         expires_at=expires_at,
     )
+
+
+@router.delete("/session", status_code=status.HTTP_204_NO_CONTENT)
+async def sign_out(
+    response: Response,
+    session: SessionDep,
+    console_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+) -> None:
+    """Revoke this console's session and clear its cookie.
+
+    Not gated on `require_api_key`. The credential being destroyed is the one
+    doing the authorizing, so demanding it be valid first would mean an expired
+    or already-revoked session could never clear its own cookie, which is the
+    state most in need of clearing.
+
+    Idempotent, and silent about what it found. No cookie, an unknown token and
+    a session revoked a week ago all return the same 204, for the same reason
+    the exchange returns one 401 for every kind of bad code: the answer must not
+    say whether a token is real.
+
+    The cookie is `samesite="strict"`, so a request from another origin does not
+    carry it and cannot reach a session to revoke. That is what makes an
+    unauthenticated destructive route safe here.
+    """
+    if console_session is not None:
+        row = await crud.live_console_session(session, console_session)
+        if row is not None:
+            await crud.revoke_console_session(session, row)
+
+    # Cleared whatever happened above, so a browser holding a token the server
+    # has never heard of still ends up signed out rather than retrying with it.
+    # The attributes must match the ones it was set with or the browser keeps it.
+    response.delete_cookie(SESSION_COOKIE, httponly=True, secure=True, samesite="strict", path="/")
