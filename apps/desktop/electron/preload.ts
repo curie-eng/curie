@@ -77,6 +77,7 @@ const bridge: CurieBridge = {
     connection: () => ipcRenderer.invoke(CH.apiConnection),
     connect: (baseUrl: string, apiKey: string | null) =>
       ipcRenderer.invoke(CH.apiConnect, baseUrl, apiKey),
+    signOut: () => ipcRenderer.invoke(CH.apiSignOut),
     request: (req: ApiRequest) => ipcRenderer.invoke(CH.apiRequest, req),
   },
 

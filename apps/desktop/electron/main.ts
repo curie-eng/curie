@@ -318,6 +318,7 @@ function registerIpc(): void {
 
   ipcMain.handle(CH.apiConnection, () => api.connection());
   ipcMain.handle(CH.apiConnect, (_e, base: string, key: string | null) => api.connect(base, key));
+  ipcMain.handle(CH.apiSignOut, () => api.signOut());
   ipcMain.handle(CH.apiRequest, (_e, req: ApiRequest) => api.request(req));
 
   ipcMain.handle(CH.secList, () => secrets.list());

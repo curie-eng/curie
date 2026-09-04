@@ -309,6 +309,12 @@ export interface ApiConnection {
   /** Never the key itself -- only whether one is held, so the renderer can show
    *  connection state without the material ever entering the page. */
   readonly hasKey: boolean;
+  /** WHAT is authorizing this console, which the two hosts answer differently
+   *  and the UI has to be able to say out loud. In the shell it is the platform
+   *  key the main process holds; in a browser tab it is a session cookie the
+   *  page cannot read (ADR-0083). Undefined when nothing is authorizing it,
+   *  which is not the same as unreachable. */
+  readonly via?: "key" | "session";
   readonly reachable: boolean;
   readonly orgName?: string;
   readonly checkedAt: number;
@@ -381,6 +387,13 @@ export interface CurieBridge {
   api: {
     connection(): Promise<ApiConnection>;
     connect(baseUrl: string, apiKey: string | null): Promise<ApiConnection>;
+    /** End this console's authorization and report what is left.
+     *
+     *  One verb, two meanings, because the hosts hold different credentials:
+     *  the shell forgets the stored platform key, a browser tab revokes its
+     *  session at the server so the cookie cannot be replayed. Both leave the
+     *  console reachable and unauthorized, which is the state sign-in expects. */
+    signOut(): Promise<ApiConnection>;
     request<T = unknown>(req: ApiRequest): Promise<ApiResponse<T>>;
   };
 
@@ -434,6 +447,7 @@ export const CH = {
   wsReveal: "curie:ws:reveal",
   apiConnection: "curie:api:connection",
   apiConnect: "curie:api:connect",
+  apiSignOut: "curie:api:sign-out",
   apiRequest: "curie:api:request",
   secList: "curie:sec:list",
   secSet: "curie:sec:set",

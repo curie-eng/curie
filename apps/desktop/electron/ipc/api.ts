@@ -75,6 +75,7 @@ export async function request<T = unknown>(req: ApiRequest): Promise<ApiResponse
  *  wrong" -- two problems with completely different fixes. */
 export async function connection(): Promise<ApiConnection> {
   const { apiBaseUrl, apiKey } = prefs();
+  const held = !!(apiKey || (isLoopback(apiBaseUrl) ? LOCAL_API_KEY : null));
   const res = await request<{ org_name?: string }>({ method: "GET", path: "/config" });
   return {
     baseUrl: apiBaseUrl,
@@ -84,7 +85,11 @@ export async function connection(): Promise<ApiConnection> {
     // claim it was signed out while its own requests were succeeding. Both hosts
     // now answer the same question with this field, which is what lets one
     // screen gate on it.
-    hasKey: !!(apiKey || (isLoopback(apiBaseUrl) ? LOCAL_API_KEY : null)),
+    hasKey: held,
+    // The shell's credential is always the platform key: it never holds a
+    // console session, because the session exists so a BROWSER can be
+    // authorized without one.
+    ...(held ? { via: "key" as const } : {}),
     reachable: res.ok,
     orgName: res.ok ? res.body?.org_name : undefined,
     checkedAt: Date.now(),
@@ -97,5 +102,21 @@ export async function connect(baseUrl: string, apiKey: string | null): Promise<A
     apiBaseUrl: baseUrl.trim() || prefs().apiBaseUrl,
     ...(apiKey === null ? {} : { apiKey: apiKey === "" ? null : apiKey }),
   });
+  return connection();
+}
+
+
+/** Forget the stored platform key, leaving the API address alone.
+ *
+ *  What "signing out" means for this host. There is no session to revoke: the
+ *  shell authorizes with the key, so dropping it is the whole of it. The
+ *  address stays so the console still knows where to sign back in to.
+ *
+ *  A loopback API still answers afterwards, because `request` falls back to the
+ *  dev key for localhost. That is deliberate and `connection()` reports it
+ *  honestly rather than claiming a signed-out state the next call would
+ *  contradict. */
+export async function signOut(): Promise<ApiConnection> {
+  update({ apiKey: null });
   return connection();
 }

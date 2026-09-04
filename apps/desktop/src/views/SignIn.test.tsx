@@ -65,6 +65,7 @@ function stub(cliPath: string | null): CurieBridge {
     api: {
       connection: async () => ({ baseUrl: "http://localhost:28000", hasKey: false, reachable: true, checkedAt: 0 }),
       connect: async () => ({ baseUrl: "", hasKey: false, reachable: false, checkedAt: 0 }),
+      signOut: async () => ({ baseUrl: "", hasKey: false, reachable: false, checkedAt: 0 }),
       request: async (req: { path: string; body?: unknown }) => {
         if (req.path === "/console/session") posted.push(req.body);
         return { status: exchangeOk ? 200 : 401, ok: exchangeOk, body: undefined as never };

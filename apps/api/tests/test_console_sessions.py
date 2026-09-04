@@ -300,3 +300,49 @@ def test_the_platform_key_needs_no_database_session(clean_db: None) -> None:
         # missing store.
         bare.cookies.set(SESSION_COOKIE, "whatever")
         assert bare.get("/probe").status_code == 401
+
+
+def test_signing_out_revokes_the_session_and_clears_the_cookie(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The half of the lifecycle that was missing: `revoke_console_session` was
+    # written and reachable from nowhere, so a console could be signed in but
+    # never out.
+    _sign_in(client, auth_headers)
+    assert client.get("/agents").status_code == 200
+
+    out = client.delete("/console/session")
+    assert out.status_code == 204, out.text
+    # Cleared at the browser as well as revoked at the server, so a client that
+    # kept the value cannot keep presenting it.
+    assert SESSION_COOKIE in out.headers.get("set-cookie", "")
+
+    # The token is dead even for a client that held on to it.
+    assert client.get("/agents").status_code == 401
+
+
+def test_signing_out_is_idempotent_and_says_nothing_about_the_token(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # Never having been signed in, holding a token the server has never seen,
+    # and signing out twice all answer the same. A different answer for a real
+    # token would make this route an oracle for whether one is valid.
+    assert client.delete("/console/session").status_code == 204
+
+    client.cookies.set(SESSION_COOKIE, "not-a-real-token")
+    assert client.delete("/console/session").status_code == 204
+    client.cookies.delete(SESSION_COOKIE)
+
+    _sign_in(client, auth_headers)
+    assert client.delete("/console/session").status_code == 204
+    assert client.delete("/console/session").status_code == 204
+
+
+def test_signing_out_does_not_disturb_the_platform_key(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # Machine callers carry no cookie and must be untouched by a console signing
+    # itself out. ADR-0083's ordering exists so the two paths cannot interfere.
+    _sign_in(client, auth_headers)
+    assert client.delete("/console/session").status_code == 204
+    assert client.get("/agents", headers=auth_headers).status_code == 200

@@ -72,6 +72,9 @@ export async function webConnection(): Promise<ApiConnection> {
     // the UI can honestly report is whether the API accepted an authorized
     // call, which is the fact the toolbar is really claiming.
     hasKey: res.ok,
+    // A browser tab has exactly one way to be authorized, so there is no
+    // guessing here: if the call was accepted, a session cookie did it.
+    ...(res.ok ? { via: "session" as const } : {}),
     reachable: res.status !== 0,
     checkedAt: Date.now(),
   };
@@ -81,4 +84,21 @@ export async function webConnection(): Promise<ApiConnection> {
  *  state from "no API here" and gets a different prompt. */
 export function needsSignIn(res: { status: number }): boolean {
   return res.status === 401 || res.status === 403;
+}
+
+
+/** Revoke this console's session at the server, then re-probe.
+ *
+ *  Server-side, not just a cookie drop, because the cookie is `HttpOnly` and
+ *  this page could not delete it anyway. Revoking is also the stronger promise:
+ *  a token copied out of a proxy log stops working, rather than only stopping
+ *  being sent. The response clears the cookie as well, so the browser does not
+ *  keep presenting something already dead.
+ *
+ *  The re-probe is what the caller renders. Signing out leaves the API perfectly
+ *  reachable and simply unauthorized, and that is the state the sign-in prompt
+ *  keys off. */
+export async function webSignOut(): Promise<ApiConnection> {
+  await webRequest({ method: "DELETE", path: "/console/session" });
+  return webConnection();
 }
