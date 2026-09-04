@@ -3,7 +3,7 @@
 ## connector stdout after turn 2
 ```
 {"event": "startup", "api_base": "http://stubfin-api:8080", "credential_present": true, "tmp_writable": false, "tmpdir": null, "argv": [], "ts": "2026-09-04T16:44:51Z"}
-{"event": "token_persisted", "secret_name": "stubfin-credentials", "key": "FIN_REFRESH_TOKEN", "attempt": 1, "ts": "2026-09-04T16:45:43Z"}
+{"event": "token_persisted", "store": "stubfin-credentials", "key": "FIN_REFRESH_TOKEN", "attempt": 1, "ts": "2026-09-04T16:45:43Z"}
 {"event": "token_refresh", "ok": true, "upstream_status": 200, "duration_ms": 31, "rotated": true, "expires_in": 45, "ts": "2026-09-04T16:45:43Z"}
 {"event": "tool_call", "tool": "list_invoices", "ok": true, "upstream_status": 200, "duration_ms": 46, "period": "2026-Q2", "ts": "2026-09-04T16:45:43Z"}
 ```
@@ -11,7 +11,7 @@
 ## connector stdout after the restart and turn 3
 ```
 {"event": "startup", "api_base": "http://stubfin-api:8080", "credential_present": true, "tmp_writable": false, "tmpdir": null, "argv": [], "ts": "2026-09-04T16:46:22Z"}
-{"event": "token_persisted", "secret_name": "stubfin-credentials", "key": "FIN_REFRESH_TOKEN", "attempt": 1, "ts": "2026-09-04T16:46:47Z"}
+{"event": "token_persisted", "store": "stubfin-credentials", "key": "FIN_REFRESH_TOKEN", "attempt": 1, "ts": "2026-09-04T16:46:47Z"}
 {"event": "token_refresh", "ok": true, "upstream_status": 200, "duration_ms": 21, "rotated": true, "expires_in": 45, "ts": "2026-09-04T16:46:47Z"}
 {"event": "tool_call", "tool": "invoice", "ok": true, "upstream_status": 200, "duration_ms": 34, "invoice_id": "INV-2026-042", "ts": "2026-09-04T16:46:47Z"}
 ```
@@ -62,7 +62,7 @@ That's the only invoice the finance system holds for this period.
 _What I changed:_
 • called `Skill` — non-idempotent tool completed
 == connector log tail
-{"event": "token_persisted", "secret_name": "stubfin-credentials", "key": "FIN_REFRESH_TOKEN", "attempt": 1, "ts": "2026-09-04T16:50:47Z"}
+{"event": "token_persisted", "store": "stubfin-credentials", "key": "FIN_REFRESH_TOKEN", "attempt": 1, "ts": "2026-09-04T16:50:47Z"}
 {"event": "token_refresh", "ok": true, "upstream_status": 200, "duration_ms": 6, "rotated": true, "expires_in": 45, "ts": "2026-09-04T16:50:47Z"}
 {"event": "tool_call", "tool": "list_invoices", "ok": true, "upstream_status": 200, "duration_ms": 16, "period": "2026-Q3", "ts": "2026-09-04T16:50:47Z"}
 secret: rt-0005

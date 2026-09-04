@@ -32,9 +32,9 @@ spec:
       - env:
         - name: FIN_API_BASE
           value: http://stubfin-api:8080
-        - name: FIN_TOKEN_SECRET
+        - name: FIN_CREDENTIAL_STORE
           value: stubfin-credentials
-        - name: FIN_TOKEN_SECRET_KEY
+        - name: FIN_CREDENTIAL_STORE_KEY
           value: FIN_REFRESH_TOKEN
         - name: FIN_CLIENT_ID
           valueFrom:

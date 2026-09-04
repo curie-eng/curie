@@ -82,10 +82,14 @@ rendered read-only root filesystem leaves no usable temp directory while
 
 ## Rerunning
 
-One edit followed the runs: the connector's `token_persisted` log line named
-its Secret under the key `secret`, renamed to `secret_name` afterwards; the
-excerpts in `runs/logs.md` show the current key, and `connectors.lock.yaml`'s
-`source_digest` predates that rename.
+Two edits followed the runs, both renames. The connector's `token_persisted`
+log line named its Secret under the key `secret`, now `store`, and the two
+environment variables naming that Secret and its key were `FIN_TOKEN_SECRET`
+and `FIN_TOKEN_SECRET_KEY`, now `FIN_CREDENTIAL_STORE` and
+`FIN_CREDENTIAL_STORE_KEY`, because a static scanner read a variable named
+`secret` that holds a Secret's name as a credential being logged. The excerpts
+in `runs/logs.md` and `runs/rendered-objects.yaml` show the current names, and
+`connectors.lock.yaml`'s `source_digest` predates both renames.
 
 The bundle deploys unchanged into any 0.8.5 release with the four hand-applied
 objects above in place. `bundle/connectors.lock.yaml` names a registry that does

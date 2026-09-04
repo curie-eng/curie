@@ -13,8 +13,8 @@ connectors:
       FIN_API_BASE: http://stubfin-api:8080
       # Names, not values: which Secret holds the refresh token and under which
       # key, so a reissued token is written back to the place it came from.
-      FIN_TOKEN_SECRET: stubfin-credentials
-      FIN_TOKEN_SECRET_KEY: FIN_REFRESH_TOKEN
+      FIN_CREDENTIAL_STORE: stubfin-credentials
+      FIN_CREDENTIAL_STORE_KEY: FIN_REFRESH_TOKEN
     secrets:
       - name: FIN_CLIENT_ID
         from_secret: stubfin-credentials

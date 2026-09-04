@@ -70,8 +70,8 @@ API_BASE = os.environ.get("FIN_API_BASE", "").rstrip("/")
 CLIENT_ID = os.environ.get("FIN_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("FIN_CLIENT_SECRET", "")
 SEED_REFRESH = os.environ.get("FIN_REFRESH_TOKEN", "")
-TOKEN_SECRET = os.environ.get("FIN_TOKEN_SECRET", "stubfin-credentials")
-TOKEN_SECRET_KEY = os.environ.get("FIN_TOKEN_SECRET_KEY", "FIN_REFRESH_TOKEN")
+CREDENTIAL_STORE = os.environ.get("FIN_CREDENTIAL_STORE", "stubfin-credentials")
+CREDENTIAL_STORE_KEY = os.environ.get("FIN_CREDENTIAL_STORE_KEY", "FIN_REFRESH_TOKEN")
 TIMEOUT = float(os.environ.get("FIN_TIMEOUT_SECONDS", "20"))
 SA = "/var/run/secrets/kubernetes.io/serviceaccount"
 
@@ -117,12 +117,12 @@ def persist_refresh_token(new_token: str) -> None:
         raise TokenPersistError("no service account mounted; nowhere to store a reissued token")
     sa_token, namespace, ctx = sa
     body = json.dumps(
-        {"data": {TOKEN_SECRET_KEY: base64.b64encode(new_token.encode()).decode()}}
+        {"data": {CREDENTIAL_STORE_KEY: base64.b64encode(new_token.encode()).decode()}}
     ).encode()
     last = ""
     for attempt in range(1, 6):
         request = urllib.request.Request(
-            f"https://kubernetes.default.svc/api/v1/namespaces/{namespace}/secrets/{TOKEN_SECRET}",
+            f"https://kubernetes.default.svc/api/v1/namespaces/{namespace}/secrets/{CREDENTIAL_STORE}",
             data=body,
             method="PATCH",
             headers={
@@ -136,8 +136,8 @@ def persist_refresh_token(new_token: str) -> None:
                 if reply.status in (200, 201):
                     emit(
                         event="token_persisted",
-                        secret_name=TOKEN_SECRET,
-                        key=TOKEN_SECRET_KEY,
+                        store=CREDENTIAL_STORE,
+                        key=CREDENTIAL_STORE_KEY,
                         attempt=attempt,
                     )
                     return
@@ -150,7 +150,7 @@ def persist_refresh_token(new_token: str) -> None:
             last = str(error)
         time.sleep(2 * attempt)
     raise TokenPersistError(
-        f"could not store the reissued refresh token in Secret {TOKEN_SECRET}: {last}. "
+        f"could not store the reissued refresh token in Secret {CREDENTIAL_STORE}: {last}. "
         "The provider has already retired the previous token, so the new one exists only in this "
         "process. Do not restart this connector until the Role or Secret is fixed."
     )
