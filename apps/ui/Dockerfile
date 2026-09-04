@@ -11,7 +11,7 @@
 # apps/ui/Dockerfile.dockerignore (BuildKit honors <dockerfile>.dockerignore over
 # the context-root one) trims the root context to the UI plus that one
 # cross-package tree.
-FROM node:22.23.2-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS build
+FROM node:26.8.1-slim@sha256:c0753125a3789977aefe869cbebccf70e3cfd7ea84ca48547458f02e4f1d7146 AS build
 WORKDIR /app
 # Pin pnpm explicitly: package.json has no packageManager field, so corepack
 # would otherwise pull whatever pnpm is latest. pnpm 10+ turns a dependency with
@@ -32,7 +32,7 @@ COPY apps/ui ./apps/ui
 WORKDIR /app/apps/ui
 RUN pnpm build
 
-FROM nginxinc/nginx-unprivileged:1.27.5-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0
+FROM nginxinc/nginx-unprivileged:1.31.5-alpine@sha256:aa8c9087d36d93e9d650c5365f883b421e8214aedbad24ade52b844c583358f1
 # Only CURIE_API_TARGET is substituted; nginx's own $vars are left intact.
 ENV CURIE_API_TARGET=http://curie-api:8000 \
     NGINX_ENVSUBST_FILTER=CURIE_API_TARGET
