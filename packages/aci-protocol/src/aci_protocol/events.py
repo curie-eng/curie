@@ -14,7 +14,7 @@ outbound event carries a ``version`` equal to PROTOCOL_VERSION.
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
@@ -108,6 +108,30 @@ def _malformed_adoption_credential() -> ValueError:
     return ValueError("malformed adoption credential")
 
 
+def admit_bounded_credential(
+    value: Any, *, max_chars: int, error: Callable[[], ValueError]
+) -> str | None:
+    """Admit an optional opaque credential, or raise ``error()`` without echoing it.
+
+    The one admission rule every credential-bearing ACI field shares
+    (``Event.adoption_credential``, ``BootEnv.runner_bootstrap_token``):
+    ``None`` is "not presented"; any other well-formed value is a non-empty
+    string no longer than ``max_chars`` that is not whitespace-only. The
+    presented material is never copied onto the raised error, so a caller that
+    interpolates the exception into an HTTP body or a log line cannot leak it
+    from here. Control characters are deliberately not policed at this layer;
+    a realizing consumer compares the value and fails closed on a mismatch.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise error()
+    if not value or value.strip() == "" or len(value) > max_chars:
+        raise error()
+    return value
+
+
 def parse_adoption_credential(value: Any) -> str | None:
     """Admit an optional adoption credential, or raise without echoing it.
 
@@ -118,58 +142,65 @@ def parse_adoption_credential(value: Any) -> str | None:
     an HTTP body therefore cannot leak it from this helper.
     """
 
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise _malformed_adoption_credential()
-    if not value or value.strip() == "" or len(value) > ADOPTION_CREDENTIAL_MAX_CHARS:
-        raise _malformed_adoption_credential()
-    return value
+    return admit_bounded_credential(
+        value, max_chars=ADOPTION_CREDENTIAL_MAX_CHARS, error=_malformed_adoption_credential
+    )
 
 
-def _malformed_event_error() -> ValidationError:
-    """A credential-free ValidationError for a bad adoption_credential."""
+def _malformed_credential_error(title: str, field: str, message: str) -> ValidationError:
+    """A material-free ValidationError naming only the field and a fixed message."""
 
     return ValidationError.from_exception_data(
-        "Event",
+        title,
         [
             {
                 "type": "value_error",
-                "loc": ("adoption_credential",),
+                "loc": (field,),
                 "input": None,
-                "ctx": {"error": "malformed adoption credential"},
+                "ctx": {"error": message},
             }
         ],
     )
 
 
-def _scrub_credential_input(value: Any) -> Any:
+def _malformed_event_error() -> ValidationError:
+    """A credential-free ValidationError for a bad adoption_credential."""
+
+    return _malformed_credential_error(
+        "Event", "adoption_credential", "malformed adoption credential"
+    )
+
+
+def _scrub_credential_input(value: Any, field: str) -> Any:
     if isinstance(value, dict):
         return {
-            key: None if key == "adoption_credential" else _scrub_credential_input(item)
+            key: None if key == field else _scrub_credential_input(item, field)
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_scrub_credential_input(item) for item in value]
+        return [_scrub_credential_input(item, field) for item in value]
     if isinstance(value, (bytes, bytearray)):
         try:
             text = bytes(value).decode("utf-8")
         except UnicodeDecodeError:
             return "<redacted>"
-        return "<redacted>" if "adoption_credential" in text else value
-    if isinstance(value, str) and "adoption_credential" in value:
+        return "<redacted>" if field in text else value
+    if isinstance(value, str) and field in value:
         return "<redacted>"
     return value
 
 
-def redact_adoption_credential_error(exc: ValidationError) -> ValidationError:
-    """Return a ValidationError whose inputs cannot contain credential material.
+def redact_credential_error(
+    exc: ValidationError, *, title: str, field: str, message: str
+) -> ValidationError:
+    """Return a ValidationError whose inputs cannot contain ``field``'s material.
 
-    Errors whose loc is the credential field stay a closed malformed-credential
-    failure. Unrelated failures (a missing ``text``, for example) keep their
-    diagnosis; only the credential material is scrubbed from their inputs. A
-    ``json_invalid`` error keeps its parser diagnosis but loses its input
-    entirely, because unparsed raw JSON cannot be scrubbed by field name.
+    Errors whose loc is the credential field collapse to a closed
+    malformed-credential failure (``title``/``field``/``message``). Unrelated
+    failures (a missing ``text``, for example) keep their diagnosis; only the
+    credential material is scrubbed from their inputs. A ``json_invalid`` error
+    keeps its parser diagnosis but loses its input entirely, because unparsed
+    raw JSON cannot be scrubbed by field name.
     """
 
     errors = exc.errors()
@@ -178,11 +209,11 @@ def redact_adoption_credential_error(exc: ValidationError) -> ValidationError:
         loc = err.get("loc", ())
         loc_text = ".".join(str(part) for part in loc) if isinstance(loc, tuple) else ""
         msg = str(err.get("msg", ""))
-        if "adoption_credential" in loc_text or msg == "malformed adoption credential":
+        if field in loc_text or msg == message:
             credential_failed = True
             break
     if credential_failed:
-        return _malformed_event_error()
+        return _malformed_credential_error(title, field, message)
     scrubbed: list[Any] = []
     for err in errors:
         input_value = err.get("input")
@@ -196,14 +227,25 @@ def redact_adoption_credential_error(exc: ValidationError) -> ValidationError:
             item["input"] = "<redacted>"
             scrubbed.append(item)
             continue
-        if isinstance(input_value, str) and "adoption_credential" in input_value:
-            return _malformed_event_error()
-        item["input"] = _scrub_credential_input(input_value)
+        if isinstance(input_value, str) and field in input_value:
+            return _malformed_credential_error(title, field, message)
+        item["input"] = _scrub_credential_input(input_value, field)
         scrubbed.append(item)
     try:
         return ValidationError.from_exception_data(exc.title, scrubbed)
     except (TypeError, ValueError):
-        return _malformed_event_error()
+        return _malformed_credential_error(title, field, message)
+
+
+def redact_adoption_credential_error(exc: ValidationError) -> ValidationError:
+    """``redact_credential_error`` bound to ``Event.adoption_credential``."""
+
+    return redact_credential_error(
+        exc,
+        title="Event",
+        field="adoption_credential",
+        message="malformed adoption credential",
+    )
 
 
 class Event(_AciModel):
@@ -253,12 +295,16 @@ class Event(_AciModel):
         json_data: str | bytes | bytearray,
         **kwargs: Any,
     ) -> "Event":
+        # Raise outside the handler: ``from None`` hides traceback display but
+        # leaves the original raw-input error reachable through ``__context__``.
+        redacted: ValidationError | None = None
         try:
             return super().model_validate_json(json_data, **kwargs)
         except ValidationError as exc:
-            raise redact_adoption_credential_error(exc) from None
+            redacted = redact_adoption_credential_error(exc)
         except json.JSONDecodeError:
-            raise _malformed_event_error() from None
+            redacted = _malformed_event_error()
+        raise redacted
 
     @model_validator(mode="wrap")
     @classmethod

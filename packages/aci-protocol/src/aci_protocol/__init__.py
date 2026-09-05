@@ -51,7 +51,14 @@ from .service_config import (
     WORKER_GROUP_DEFAULT,
     derive_dead_letter_stream_name,
 )
-from .session import BootEnv, Budget, OtelConfig, SessionConfig
+from .session import (
+    RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS,
+    BootEnv,
+    Budget,
+    OtelConfig,
+    SessionConfig,
+    parse_runner_bootstrap_token,
+)
 from .session import Producer as EnvProducer
 from .turn import QueuedTurn, ReplyHandle, TurnSource
 from .version import PROTOCOL_VERSION, is_compatible
@@ -95,6 +102,8 @@ __all__ = [
     "InboundMessage",
     "ADOPTION_CREDENTIAL_MAX_CHARS",
     "parse_adoption_credential",
+    "RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS",
+    "parse_runner_bootstrap_token",
     # outbound
     "TextDelta",
     "ToolNote",

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.4.5";
+pub const PROTOCOL_VERSION: &str = "0.4.6";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -71,20 +71,50 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+fn deserialize_bounded_credential<'de, D>(
+    deserializer: D,
+    what: &'static str,
+    max_chars: usize,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s))
+            if !s.trim().is_empty() && s.chars().count() <= max_chars =>
+        {
+            Ok(Some(s))
+        }
+        Some(_) => Err(serde::de::Error::custom(format!("malformed {what}"))),
+    }
+}
+
 fn deserialize_adoption_credential<'de, D>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value = Option::<String>::deserialize(deserializer)?;
-    match &value {
-        None => Ok(None),
-        Some(s) if s.trim().is_empty() || s.chars().count() > 4096 => {
-            Err(serde::de::Error::custom("malformed adoption credential"))
-        }
-        Some(_) => Ok(value),
-    }
+    deserialize_bounded_credential(
+        deserializer,
+        "adoption credential",
+        4096,
+    )
+}
+
+fn deserialize_runner_bootstrap_token<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_credential(
+        deserializer,
+        "runner bootstrap token",
+        4096,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -161,7 +191,7 @@ pub struct SessionConfig {
     pub otel: OtelConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct BootEnv {
     pub session: SessionConfig,
     #[serde(default)]
@@ -170,6 +200,8 @@ pub struct BootEnv {
     pub bundle_version: Option<String>,
     #[serde(default)]
     pub runner_token: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_runner_bootstrap_token")]
+    pub runner_bootstrap_token: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -218,6 +250,44 @@ pub struct BootEnv {
     pub history_max_bytes: Option<i64>,
 }
 
+impl std::fmt::Debug for BootEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootEnv")
+            .field("session", &self.session)
+            .field("bundle_ref", &self.bundle_ref)
+            .field("bundle_version", &self.bundle_version)
+            .field("runner_token", &self.runner_token)
+            .field(
+                "runner_bootstrap_token",
+                &self.runner_bootstrap_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("model", &self.model)
+            .field("fake_model", &self.fake_model)
+            .field("history_ref", &self.history_ref)
+            .field("history_token", &self.history_token)
+            .field("memory_token", &self.memory_token)
+            .field("state_url", &self.state_url)
+            .field("state_token", &self.state_token)
+            .field("approval_required_tools", &self.approval_required_tools)
+            .field("approval_grant_tool", &self.approval_grant_tool)
+            .field("approval_resumed_kind", &self.approval_resumed_kind)
+            .field("approval_decision", &self.approval_decision)
+            .field("connector_secret_keys", &self.connector_secret_keys)
+            .field("connector_release", &self.connector_release)
+            .field("connector_agent", &self.connector_agent)
+            .field("connector_namespace", &self.connector_namespace)
+            .field("port", &self.port)
+            .field("base_url", &self.base_url)
+            .field("api_backend", &self.api_backend)
+            .field("thinking", &self.thinking)
+            .field("model_env_key", &self.model_env_key)
+            .field("max_turns", &self.max_turns)
+            .field("history_max_turns", &self.history_max_turns)
+            .field("history_max_bytes", &self.history_max_bytes)
+            .finish()
+    }
+}
+
 /// Boot-env variable names, generated from aci_protocol.session.BootEnv.
 /// The env key is the contract; the Rust CLI and the chart render-assert
 /// pin against these instead of retyping the literals.
@@ -247,6 +317,7 @@ pub mod env_keys {
     pub const CURIE_MODEL_API_BACKEND: &str = "CURIE_MODEL_API_BACKEND";
     pub const CURIE_MODEL_ENV_KEY: &str = "CURIE_MODEL_ENV_KEY";
     pub const CURIE_PLUGIN_DIR: &str = "CURIE_PLUGIN_DIR";
+    pub const CURIE_RUNNER_BOOTSTRAP_TOKEN: &str = "CURIE_RUNNER_BOOTSTRAP_TOKEN";
     pub const CURIE_RUNNER_PORT: &str = "CURIE_RUNNER_PORT";
     pub const CURIE_RUNNER_TOKEN: &str = "CURIE_RUNNER_TOKEN";
     pub const CURIE_SANDBOX_ID: &str = "CURIE_SANDBOX_ID";
@@ -548,6 +619,95 @@ mod tests {
         assert!(!error.to_string().contains("adoption-credential-fixture-PLACEHOLDER"));
     }
 
+    const BOOT_ENV_MINIMAL: &str = concat!(
+        r#"{"session":{"plugin_dir":"/plugins/bundle","session_id":"sess-abc","#,
+        r#""sandbox_id":"curie-sandbox-abc123","#,
+        r#""budget":{"max_output_tokens_per_run":4096,"max_usd_per_day":5.0}}"#
+    );
+
+    #[test]
+    fn boot_env_omitted_bootstrap_token_is_none() {
+        let raw = format!("{BOOT_ENV_MINIMAL}}}");
+        let decoded: BootEnv = serde_json::from_str(&raw).unwrap();
+        assert_eq!(decoded.runner_bootstrap_token, None);
+        assert_eq!(decoded.runner_token, None);
+    }
+
+    #[test]
+    fn boot_env_bootstrap_token_roundtrips() {
+        let boot = BootEnv {
+            runner_bootstrap_token: Some("runner-bootstrap-token-fixture-PLACEHOLDER".to_string()),
+            ..BootEnv::default()
+        };
+        let encoded = serde_json::to_string(&boot).unwrap();
+        let decoded: BootEnv = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(boot, decoded);
+    }
+
+    #[test]
+    fn boot_env_debug_redacts_bootstrap_token() {
+        let boot = BootEnv {
+            runner_bootstrap_token: Some("runner-bootstrap-token-fixture-PLACEHOLDER".to_string()),
+            ..BootEnv::default()
+        };
+        let rendered = format!("{boot:?}");
+        assert!(!rendered.contains("runner-bootstrap-token-fixture-PLACEHOLDER"));
+        assert!(rendered.contains("runner_bootstrap_token: Some(\"<redacted>\")"));
+        let unset = format!("{:?}", BootEnv::default());
+        assert!(unset.contains("runner_bootstrap_token: None"));
+    }
+
+    #[test]
+    fn boot_env_rejects_blank_bootstrap_token() {
+        let raw = format!("{BOOT_ENV_MINIMAL},\"runner_bootstrap_token\":\"   \"}}");
+        let error = serde_json::from_str::<BootEnv>(&raw).unwrap_err();
+        assert!(error.to_string().contains("malformed runner bootstrap token"));
+    }
+
+    #[test]
+    fn boot_env_rejects_non_string_bootstrap_token_without_echo() {
+        let specimens = [
+            "4711",
+            "true",
+            r#"["runner-bootstrap-token-fixture-PLACEHOLDER"]"#,
+            r#"{"v":"runner-bootstrap-token-fixture-PLACEHOLDER"}"#,
+        ];
+        for specimen in specimens {
+            let raw = format!("{BOOT_ENV_MINIMAL},\"runner_bootstrap_token\":{specimen}}}");
+            let rendered = serde_json::from_str::<BootEnv>(&raw).unwrap_err().to_string();
+            assert!(rendered.contains("malformed runner bootstrap token"), "{rendered}");
+            assert!(!rendered.contains("4711"), "{rendered}");
+            assert!(!rendered.contains("runner-bootstrap-token-fixture-PLACEHOLDER"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn boot_env_explicit_null_bootstrap_token_is_none() {
+        let raw = format!("{BOOT_ENV_MINIMAL},\"runner_bootstrap_token\":null}}");
+        let decoded: BootEnv = serde_json::from_str(&raw).unwrap();
+        assert_eq!(decoded.runner_bootstrap_token, None);
+    }
+
+    #[test]
+    fn inbound_event_rejects_non_string_adoption_credential_without_echo() {
+        let raw = concat!(
+            r#"{"kind":"event","type":"message","text":"hi","user":"U1","ts":"1.0","#,
+            r#""adoption_credential":4711}"#
+        );
+        let rendered = serde_json::from_str::<InboundMessage>(raw).unwrap_err().to_string();
+        assert!(rendered.contains("malformed adoption credential"), "{rendered}");
+        assert!(!rendered.contains("4711"), "{rendered}");
+    }
+
+    #[test]
+    fn boot_env_rejects_oversize_bootstrap_token_without_echo() {
+        let material = format!("runner-bootstrap-token-fixture-PLACEHOLDER{}", "x".repeat(4096));
+        let raw = format!("{BOOT_ENV_MINIMAL},\"runner_bootstrap_token\":\"{material}\"}}");
+        let error = serde_json::from_str::<BootEnv>(&raw).unwrap_err();
+        assert!(error.to_string().contains("malformed runner bootstrap token"));
+        assert!(!error.to_string().contains("runner-bootstrap-token-fixture-PLACEHOLDER"));
+    }
+
     #[test]
     fn reply_handle_accepts_explicit_null_placeholder() {
         let raw = r#"{"kind":"email","channel":"agent@example.test","placeholder":null,"endpoint":"https://adapter.example/hook","adapter":"agentmail_sandbox"}"#;
@@ -580,13 +740,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.4.6","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.4.7","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.4.5","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.4.6","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

@@ -167,6 +167,7 @@ def _full_boot_env() -> BootEnv:
         bundle_ref="bundles/demo/abc123.tar.gz",
         bundle_version="abc123def456",
         runner_token="rt-full-token",
+        runner_bootstrap_token="rt-bootstrap-full-token",
         model="claude-opus-4-6",
         fake_model=True,
         history_ref=_HISTORY_REF,
@@ -769,6 +770,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_BUNDLE_REF",
         "CURIE_BUNDLE_VERSION",
         "CURIE_RUNNER_TOKEN",
+        "CURIE_RUNNER_BOOTSTRAP_TOKEN",
         "CURIE_MODEL",
         "CURIE_FAKE_MODEL",
         "CURIE_HISTORY_REF",
@@ -882,6 +884,13 @@ def test_the_substrate_writes_identity_otel_and_the_warm_pool_defaults() -> None
         "CURIE_PLUGIN_DIR",  # agent-sandbox.yaml:416
         "CURIE_SESSION_ID",  # agent-sandbox.yaml:420 ("warm-unbound")
         "CURIE_BUDGET",  # agent-sandbox.yaml:428
+        # Substrate-only by contract (#1492, ADR-0122): a per-pool bootstrap
+        # credential arrives via secretKeyRef on the pool template. Declared
+        # here as the PRODUCER TAG; the chart does not render it yet, so unlike
+        # the keys above it has no agent-sandbox.yaml citation. The worker's
+        # per-claim render never writes it; a worker write would turn a bound
+        # pod back into one that admits the pool's shared bootstrap.
+        "CURIE_RUNNER_BOOTSTRAP_TOKEN",
     }
 
 

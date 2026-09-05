@@ -221,7 +221,11 @@ def test_unrelated_missing_field_is_not_reported_as_malformed_credential() -> No
 
 
 def test_protocol_version_is_the_compatible_patch() -> None:
-    assert PROTOCOL_VERSION == "0.4.5"
+    # 0.4.5 introduced this contract; later optional-field patches on the same
+    # 0.4 line stay wire compatible with it.
+    from aci_protocol import is_compatible
+
+    assert is_compatible("0.4.5", PROTOCOL_VERSION)
 
 
 def test_malformed_json_errors_do_not_echo_secret_material() -> None:
@@ -263,7 +267,28 @@ def _malformed_json_specimens() -> list[tuple[str, str | bytes | bytearray]]:
         ("escaped-bytearray", bytearray(escaped.encode())),
         ("keyless-str", keyless),
         ("keyless-bytes", keyless.encode()),
+        ("keyless-bytearray", bytearray(keyless.encode())),
     ]
+
+
+def _assert_no_credential_in_exception_chain(error: BaseException) -> None:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        surfaces = [str(current), repr(current)]
+        if isinstance(current, ValidationError):
+            surfaces.extend((json.dumps(current.errors(), default=str), current.json()))
+        assert all(_CREDENTIAL not in surface for surface in surfaces)
+        # Follow both links even when traceback display suppresses the context.
+        pending.extend(
+            linked for linked in (current.__cause__, current.__context__) if linked is not None
+        )
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 @pytest.mark.parametrize(
@@ -292,6 +317,22 @@ def test_invalid_json_errors_redact_the_whole_raw_input(
     types = {err["type"] for err in error.errors()}
     assert types == {"json_invalid"}, types
     assert all(err["input"] == "<redacted>" for err in error.errors())
+    _assert_no_credential_in_exception_chain(error)
+
+
+@pytest.mark.parametrize("encoding", (str, bytes, bytearray))
+def test_json_unrelated_error_keeps_diagnosis_without_credential_chain(
+    encoding: type[str] | type[bytes] | type[bytearray],
+) -> None:
+    body = _payload(adoption_credential=_CREDENTIAL)
+    del body["text"]
+    raw = json.dumps(body)
+    encoded = raw if encoding is str else encoding(raw.encode())
+    with pytest.raises(ValidationError) as exc:
+        Event.model_validate_json(encoded)
+    assert [(err["type"], err["loc"]) for err in exc.value.errors()] == [("missing", ("text",))]
+    assert "malformed adoption credential" not in str(exc.value)
+    _assert_no_credential_in_exception_chain(exc.value)
 
 
 def test_mapping_inputs_cannot_bypass_malformed_admission() -> None:

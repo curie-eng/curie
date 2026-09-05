@@ -24,9 +24,9 @@ string rather than a `const`. Artifact sync is enforced by the
 schema-compat gate (`tests/test_schema_compat.py`); an unbumped wire change is
 caught by the wire-lock gate (`tests/test_wire_lock.py`).
 
-## Contract surface (v0.4.5)
+## Contract surface (v0.4.6)
 
-`PROTOCOL_VERSION = "0.4.5"` is embedded in the schema and in every outbound
+`PROTOCOL_VERSION = "0.4.6"` is embedded in the schema and in every outbound
 event.
 
 **Session setup** (`SessionConfig`, with `to_env()` / `from_env()`):
@@ -42,6 +42,37 @@ event.
 | `otel` | `OTEL_EXPORTER_OTLP_ENDPOINT` / `_HEADERS` / `_PROTOCOL` | optional |
 
 `Budget` = `{max_output_tokens_per_run: int, task_budget_hint: int | None, max_usd_per_day: float}`.
+
+**Boot env** (`BootEnv`, ADR-0049) composes `SessionConfig` with the platform
+boot keys; the full key list with its producers is the generated block in the
+repo's `.env.example`. As of 0.4.6 it carries two runner credential keys with
+different authority, so an unbound warm runner can tell them apart at boot
+(#1492, ADR-0116 decision 2, ADR-0122):
+
+| Field | Env var | Producer | Authority |
+|---|---|---|---|
+| `runner_token` | `CURIE_RUNNER_TOKEN` | worker, per claim | bound per-conversation credential, enforced on every gated ACI route |
+| `runner_bootstrap_token` | `CURIE_RUNNER_BOOTSTRAP_TOKEN` | substrate, per-pool `Secret` | may authorize one atomic adoption (an `Event` carrying `adoption_credential`), then is retired for that pod |
+
+Consumer authority policy, realized by the runner and not by this package:
+`runner_token` present wins and the bootstrap is never admitted (the cold path
+is unchanged); only `runner_bootstrap_token` present is bootstrap mode, where
+any gated request other than the adopting event is refused before a model turn
+starts; neither present is today's tokenless legacy boot, unchanged.
+
+`runner_bootstrap_token` is handled as secret material: omitted from
+`repr`/`str`, never echoed by a validation error, and redacted by the generated
+Rust `Debug`. A present value that is empty, blank, oversize or not a string
+fails the boot parse closed. Unlike every other optional boot var, a
+declared-but-empty `CURIE_RUNNER_BOOTSTRAP_TOKEN` is not "unset": its only
+producer is a pool `Secret`, so an empty value is a mis-render, and only an
+absent key is the compatible legacy case. `runner_token` keeps its current
+handling, which predates this patch and is not changed by it: a
+declared-but-empty `CURIE_RUNNER_TOKEN` is unset, a blank value passes through
+verbatim with no size cap, and the value still appears in `repr` and in the
+Rust `Debug` output. Extending the redaction to it and the other token fields
+is a separate change. Declaring the key is not bootstrap mode, adoption,
+retirement, or a pool.
 
 **Inbound channel messages** (discriminated union on `kind`):
 

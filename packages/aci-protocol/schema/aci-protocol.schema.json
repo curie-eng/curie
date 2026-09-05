@@ -519,6 +519,25 @@
           ],
           "title": "Port"
         },
+        "runner_bootstrap_token": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "pattern": ".*\\S.*",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_RUNNER_BOOTSTRAP_TOKEN",
+          "producer": [
+            "substrate"
+          ],
+          "title": "Runner Bootstrap Token"
+        },
         "runner_token": {
           "anyOf": [
             {
@@ -1471,6 +1490,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.4.5",
-  "title": "ACI Protocol v0.4.5"
+  "protocolVersion": "0.4.6",
+  "title": "ACI Protocol v0.4.6"
 }
