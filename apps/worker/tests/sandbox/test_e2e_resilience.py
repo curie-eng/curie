@@ -1,100 +1,35 @@
-"""Sandbox-substrate resilience E2E against a standing Curie cluster.
+"""Sandbox-substrate resilience E2E on a disposable, task-owned cluster.
 
-The scenario drives the worker's ``SandboxSubstrate`` plus Valkey plus
-``kubectl`` directly, mirroring ``apps/worker/tests/sandbox/test_e2e_k8scratch.py``.
-There is no REST thread or message API to drive: a turn is a ``kubectl
-port-forward`` to the sandbox pod followed by ``POST /v1/event`` (NDJSON frames
-ending in a ``final``).
+The scenario drives the production SandboxSubstrate, real Valkey and runner ACI.
+Run three repetitions with ``CURIE_SANDBOX_E2E=1 CURIE_SANDBOX_E2E_RUNS=3 uv run
+pytest apps/worker/tests/sandbox/test_e2e_resilience.py -q``. The ordinary
+collector excludes this file unless the gate is enabled. Namespace, pool and
+capacity are selected by the CURIE_SANDBOX_E2E environment family; provision at
+least concurrency + batch ready replicas. Never target the permanent mail soak.
 
-It is opt-in: the sandbox collector excludes this module unless
-``CURIE_SANDBOX_E2E=1`` and the module retains the same guard for direct
-collection. The offline helpers in ``test_resilience_harness_unit.py`` remain in
-the normal ``apps/worker/tests`` collection and need neither a cluster nor a dev
-stack. To run the scenario three consecutive times against a standing cluster
-and dev-stack Valkey:
+Phases A/B assert distinct sandboxes, conversation affinity and a concurrent
+burst. Phase C replaces an idle sandbox and proves one surviving claim. Phase D
+asserts cold suspend/resume environment and a successful authenticated turn.
+Every ACI turn must end successfully: an HTTP 200 stream or a failed final does
+not pass. Set CURIE_SANDBOX_E2E_LIVE=1 (or CURIE_E2E_LIVE=1) to require a live
+pool, content isolation, durable recall and cache evidence. Credentials may live
+only in the pool's Secret; missing prerequisites fail the live run, never skip it.
+The whole scenario preflights its phase-D fixture before creating any claims:
+CURIE_SANDBOX_E2E_HISTORY_REF must name a task-owned real state API transcript,
+CURIE_SANDBOX_E2E_HISTORY_TOKEN supplies its scoped credential and
+CURIE_SANDBOX_E2E_HISTORY_MARKER for the synthetic token seeded in that transcript.
 
-``CURIE_SANDBOX_E2E=1 CURIE_SANDBOX_E2E_RUNS=3 uv run pytest
-apps/worker/tests/sandbox/test_e2e_resilience.py -q``
+These phases do not claim a worker process kill, a mid-tool pod kill, actual
+side-effect idempotency, eval-stream delivery or cache reuse merely from pod
+identity. The companion test_delivery_resilience.py counts durable subprocess
+receipts across fresh kernel/runner instances and real PEL reclaim, with fake
+Kubernetes and provider seams. Actual pod/worker crash and eval-fanout acceptance
+still needs separate disposable-cluster execution.
 
-Size the warm pool to at least ``CURIE_SANDBOX_E2E_CONCURRENCY +
-CURIE_SANDBOX_E2E_BATCH`` ready replicas. ``pool_ready`` blocks until the pool
-reports that capacity, so the concurrent claims and batch burst do not starve.
-``CURIE_SANDBOX_E2E_NAMESPACE`` and ``CURIE_SANDBOX_E2E_POOL`` select the
-standing-cluster resources; the namespace/pool and Valkey defaults match the
-sandbox E2E template. With a live Claude credential, reply-content isolation
-assertions and the cache-token probe are also enabled. Without one, the
-fake-model runner still proves every structural property but does not echo
-markers, so content-level cross-talk assertions do not run.
-
-Four phases share the module-scoped substrate and a set of held claims:
-
-- Phase A: concurrent threads are isolated (distinct sandboxes) and affined
-  (re-claim returns the same sandbox); with live creds, no content cross-talk.
-- Phase B: a mid-thread batch burst runs while Phase-A threads are held, and
-  leaves them undisturbed (same pod UIDs).
-- Phase C: a sandbox is killed mid-run (unclean pod delete); the thread
-  re-claims a fresh sandbox and exactly one live claim survives (no orphan or
-  duplicate side effect at the substrate level).
-- Phase D: one thread is suspended and resumed under sustained load on the
-  others; the resumed pod carries the injected history ref and the loaded
-  threads keep their pods.
-
-A cache-warmth proxy asserts pod-UID affinity across consecutive turns (the
-ADR-0003 "same pod across turns" property that enables prompt-cache reuse); see
-the documented assumptions below for why the direct
-``cache_read_input_tokens`` signal is not cluster-observable today.
-
-Documented assumptions and gaps:
-
-1. **"Batch job" is interpreted as a concurrent burst under sustained load.**
-   The batch phase launches ``CURIE_SANDBOX_E2E_BATCH`` additional threads while
-   the Phase-A threads are still held claimed, and asserts the batch turns
-   complete without disturbing the held threads. An alternative reading of
-   "batch job" is an eval fan-out (an ``XADD`` to the ``curie:evals`` stream
-   consumed by a separate consumer group). That path is not part of the sandbox
-   substrate this scenario drives, so it is noted here as an alternative rather
-   than exercised.
-
-2. **"No duplicate side effects" is asserted at the substrate level (one live
-   claim survives a kill), not as end-to-end side-effect idempotency.** The
-   semantic invariant, a failed run that emitted a side effect escalates to a
-   human instead of auto-retrying, is the kernel's fourth rule in
-   ``apps/worker/CLAUDE.md`` and already has a provoking integration test in
-   ``apps/worker/tests/kernel``. This scenario drives the ``SandboxSubstrate``
-   seam directly, mirroring ``test_e2e_k8scratch.py``, and therefore asserts the
-   observable substrate-level proxy: after an unclean kill and re-claim, exactly
-   one live ``SandboxClaim`` remains for the thread hash (no orphaned or
-   duplicated claim). Re-driving turns through the kernel path (a Valkey
-   ``curie:runs`` producer plus a fake Slack sink plus the in-cluster consumer)
-   to count actual side-effect executions is deliberately outside this
-   footprint: it would duplicate the kernel suite's existing coverage and pull
-   this scenario away from the substrate seam it is meant to stress.
-
-3. **``cache_read_input_tokens`` is not observable at the cluster level, so the
-   scenario asserts pod-UID affinity as the cache-warmth proxy.** The runner's
-   OTel export (``runner/src/curie_runner/otel.py``,
-   ``_GenerationSpan.record_usage``) exports only
-   ``gen_ai.usage.input_tokens`` and ``output_tokens`` and drops the cache-token
-   fields, so Langfuse never records ``cache_read_input_tokens``. It is asserted
-   only at the SDK layer in ``runner/tests/test_live.py``. The scenario therefore
-   asserts the cluster-observable property that enables cache reuse: the same
-   pod (same pod UID) serves consecutive turns on a thread (ADR-0003 "same pod
-   across turns"). The single ``xfail`` probe, ``test_cache_read_tokens_probe``,
-   reads per-trace usage from Langfuse and would turn green if the OTel export is
-   later extended.
-
-Follow-ups outside this footprint:
-
-- Extend ``runner/src/curie_runner/otel.py`` to export
-  ``cache_read_input_tokens`` and ``cache_creation_input_tokens``; the ``xfail``
-  probe becomes a real assertion then.
-- Add an end-to-end side-effect-idempotency resilience scenario that drives
-  turns through the kernel path (a Valkey ``curie:runs`` producer plus a fake
-  Slack sink plus the in-cluster consumer), kills a sandbox after a
-  side-effecting tool call fires, re-drives, and asserts the effect executed
-  exactly once.
-- If an eval-fanout batch interpretation is wanted, add a phase that drives the
-  ``curie:evals`` stream and its consumer group.
+The live cache probe drives two successful turns and queries their explicit
+trace identity in Langfuse. A missing endpoint, missing usage or unrelated cached
+observation cannot qualify. The runner already exports cache-token OTel fields;
+a stale xfail on that export would mask a regression.
 """
 
 from __future__ import annotations
@@ -103,8 +38,7 @@ import os
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
+import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -121,6 +55,7 @@ from resilience_fixtures import (  # noqa: E402, F401
 )
 from resilience_harness import (  # noqa: E402
     ResilienceConfig,
+    assert_exact_recall,
     collected_text,
     detect_cross_talk,
     final_frame,
@@ -131,7 +66,10 @@ from resilience_harness import (  # noqa: E402
     pod_uid,
     port_forward,
     post_event,
+    release_claims,
+    required_history_fixture,
     thread_hash,
+    trace_cache_reads,
     unique_marker,
 )
 
@@ -156,12 +94,22 @@ def _drive_turn(
     *,
     user: str,
     ts: str,
+    token: str = "",
+    trace_id: str | None = None,
 ) -> list[dict[str, object]]:
     """Port-forward to a sandbox, assert health, post one ACI turn, return frames."""
 
+    if cfg.live_model:
+        # Read only the model-mode bit. Never dump the pod's credential env.
+        mode = kubectl(
+            cfg, "exec", sandbox_name, "-c", "runner", "--", "python", "-c",
+            "import os; print('fake' if os.environ.get('CURIE_FAKE_MODEL','').lower() "
+            "in {'1','true','yes'} else 'live')",
+        ).strip()
+        assert mode == "live", "required live run reached a fake-model or unverified pod"
     with port_forward(cfg, sandbox_name, port) as base:
         assert get_json(base, "/healthz") == {"ok": True}
-        return post_event(base, text, user=user, ts=ts)
+        return post_event(base, text, user=user, ts=ts, token=token, trace_id=trace_id)
 
 
 def _assert_final(frames: Sequence[dict[str, object]]) -> None:
@@ -185,13 +133,18 @@ def _wait_pod_gone(cfg: ResilienceConfig, sandbox_name: str, timeout: float = 90
 def test_e2e_resilience(
     run: int, substrate: object, cfg: ResilienceConfig, pool_ready: None
 ) -> None:
+    from aci_protocol import BootEnv
     from curie_worker.sandbox import HISTORY_ENV, SandboxHandle, SandboxSubstrate
 
     assert isinstance(substrate, SandboxSubstrate)
+    # The operator prepares an isolated transcript through the real state API.
+    # An arbitrary marker is not a valid history ref: runner boot rejects it.
+    history_ref, history_token, history_marker = required_history_fixture(os.environ)
     print(f"\nEVIDENCE resilience_run={run} concurrency={cfg.concurrency} batch={cfg.batch}")
 
-    a_keys = [f"soak-a-{run}-{i}" for i in range(cfg.concurrency)]
-    batch_keys = [f"soak-batch-{run}-{j}" for j in range(cfg.batch)]
+    scope = uuid.uuid4().hex
+    a_keys = [f"resilience-{scope}-a-{run}-{i}" for i in range(cfg.concurrency)]
+    batch_keys = [f"resilience-{scope}-batch-{run}-{j}" for j in range(cfg.batch)]
     claimed: dict[str, SandboxHandle] = {}
     markers: dict[str, str] = {}
     uids: dict[str, str] = {}
@@ -214,7 +167,10 @@ def test_e2e_resilience(
         def _turn(key: str) -> tuple[str, list[dict[str, object]]]:
             handle = claimed[key]
             text = f"Please remember this token exactly: {markers[key]}"
-            frames = _drive_turn(cfg, handle.sandbox_name, handle.port, text, user=key, ts="1.0")
+            frames = _drive_turn(
+                cfg, handle.sandbox_name, handle.port, text,
+                user=key, ts="1.0", token=handle.token,
+            )
             return key, frames
 
         replies: dict[str, list[dict[str, object]]] = {}
@@ -231,7 +187,7 @@ def test_e2e_resilience(
         print("EVIDENCE phase_a_affinity_stable=true")
 
         # Content-level no-cross-talk only when a real model is behind the runner.
-        if cfg.live_creds:
+        if cfg.live_model:
             all_markers = list(markers.values())
             for key in a_keys:
                 text = collected_text(replies[key])
@@ -250,7 +206,8 @@ def test_e2e_resilience(
             handle = substrate.claim(key)
             claimed[key] = handle
             frames = _drive_turn(
-                cfg, handle.sandbox_name, handle.port, "batch turn under load", user=key, ts="1.0"
+                cfg, handle.sandbox_name, handle.port, "batch turn under load",
+                user=key, ts="1.0", token=handle.token,
             )
             return key, frames
 
@@ -270,10 +227,9 @@ def test_e2e_resilience(
         assert pod_uid(pod_of_sandbox(cfg, claimed[probe].sandbox_name)) == uids[probe]
         print("EVIDENCE phase_b_phase_a_undisturbed=true")
 
-        # -- Phase C: sandbox killed mid-run ---------------------------------
-        # The kernel's no-auto-retry-after-side-effects escalation is unit-tested
-        # in apps/worker/tests/kernel; here we assert the substrate-level proxy
-        # for "no duplicate side effect": exactly one live claim survives a kill.
+        # -- Phase C: idle sandbox replacement -------------------------------
+        # One live claim proves substrate cleanup only. It does not count tool
+        # side effects or claim to interrupt an active turn.
         victim = a_keys[-1]
         victim_hash = thread_hash(victim)
         victim_sandbox = claimed[victim].sandbox_name
@@ -287,7 +243,8 @@ def test_e2e_resilience(
         new_uid = pod_uid(pod_of_sandbox(cfg, fresh.sandbox_name))
         assert new_uid != old_uid, "re-claim returned the killed pod UID"
         frames = _drive_turn(
-            cfg, fresh.sandbox_name, fresh.port, "back after a kill", user=victim, ts="2.0"
+            cfg, fresh.sandbox_name, fresh.port, "back after a kill",
+            user=victim, ts="2.0", token=fresh.token,
         )
         _assert_final(frames)
         uids[victim] = new_uid
@@ -308,12 +265,12 @@ def test_e2e_resilience(
         loaded = [k for k in a_keys if k != victim][: max(cfg.concurrency - 1, 1)]
         target = loaded[0]
         others = loaded[1:]
-        target_marker = markers[target]
 
         def _sustained(key: str) -> str:
             handle = claimed[key]
             frames = _drive_turn(
-                cfg, handle.sandbox_name, handle.port, "sustained follow-up", user=key, ts="3.0"
+                cfg, handle.sandbox_name, handle.port, "sustained follow-up",
+                user=key, ts="3.0", token=handle.token,
             )
             _assert_final(frames)
             return key
@@ -321,9 +278,11 @@ def test_e2e_resilience(
         original_claim = claimed[target].claim_name
         with ThreadPoolExecutor(max_workers=max(len(others), 1)) as pool:
             load = pool.map(_sustained, others) if others else iter(())
-            substrate.suspend(target, history_ref=target_marker)
+            substrate.suspend(target, history_ref=history_ref)
             _wait_pod_gone(cfg, claimed[target].sandbox_name)
-            resumed = substrate.resume(target)
+            resumed = substrate.resume(
+                target, env={BootEnv.env_key("history_token"): history_token},
+            )
             claimed[target] = resumed
             list(load)
 
@@ -336,28 +295,38 @@ def test_e2e_resilience(
             for c in containers
             for e in c.get("env", [])
         }
-        assert env.get(HISTORY_ENV) == target_marker, "resumed pod missing injected history ref"
+        actual_history_ref = env.get(HISTORY_ENV)
+        history_token_matches = env.get(BootEnv.env_key("history_token")) == history_token
+        del env, containers, resumed_pod, history_token
+        assert actual_history_ref == history_ref, "resumed pod missing injected history ref"
+        assert history_token_matches, "resumed pod missing matching scoped history credential"
         frames = _drive_turn(
-            cfg, resumed.sandbox_name, resumed.port, "resumed and rehydrated", user=target, ts="4.0"
+            cfg, resumed.sandbox_name, resumed.port,
+            "What exact verification token was recorded in the durable transcript? "
+            "Reply only that token.",
+            user=target, ts="4.0", token=resumed.token,
         )
         _assert_final(frames)
+        if cfg.live_model:
+            assert_exact_recall(frames, history_marker)
         for key in others:
             assert pod_uid(pod_of_sandbox(cfg, claimed[key].sandbox_name)) == uids[key], (
                 f"suspend/resume disturbed concurrently loaded thread {key}"
             )
-        print(f"EVIDENCE phase_d_resume_injected_history_ref pod={resumed.sandbox_name}")
+        proof = "authenticated_runner_recall" if cfg.live_model else "UNPROVED_environment_only"
+        print(f"EVIDENCE phase_d_history={proof}")
 
         # -- Cache-warmth proxy: same pod across consecutive turns ------------
         stable = loaded[-1] if len(loaded) > 1 else target
         first_uid = pod_uid(pod_of_sandbox(cfg, claimed[stable].sandbox_name))
         frames = _drive_turn(
             cfg, claimed[stable].sandbox_name, claimed[stable].port, "warmth turn one",
-            user=stable, ts="5.0",
+            user=stable, ts="5.0", token=claimed[stable].token,
         )
         _assert_final(frames)
         frames = _drive_turn(
             cfg, claimed[stable].sandbox_name, claimed[stable].port, "warmth turn two",
-            user=stable, ts="6.0",
+            user=stable, ts="6.0", token=claimed[stable].token,
         )
         _assert_final(frames)
         second_uid = pod_uid(pod_of_sandbox(cfg, claimed[stable].sandbox_name))
@@ -365,57 +334,49 @@ def test_e2e_resilience(
         print(f"EVIDENCE same_pod_across_turns uid={first_uid}")
 
     finally:
-        for key in list(claimed):
-            try:
-                substrate.release(key)
-            except Exception:
-                pass
+        release_claims(substrate.release, list(claimed))
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "otel.py does not export cache_read_input_tokens; "
-        "see runner/src/curie_runner/otel.py -- tracked follow-up"
-    ),
-)
 @pytest.mark.skipif(
-    not (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")),
-    reason="cache-token probe needs live creds so a real model reports usage",
+    not ResilienceConfig.from_env().live_model,
+    reason="cache is outside the fake tier; select CURIE_SANDBOX_E2E_LIVE=1 for the live probe",
 )
-def test_cache_read_tokens_probe(cfg: ResilienceConfig) -> None:
-    """Probe: assert a per-trace ``cache_read_input_tokens`` is observable.
+def test_cache_read_tokens_probe(
+    substrate: object, cfg: ResilienceConfig, pool_ready: None,
+) -> None:
+    """Attribute cache reads to an actual follow-up, with an absent-trace control."""
 
-    This lights up green only if the runner's OTel export is later extended to
-    carry the cache-token fields (today ``_GenerationSpan.record_usage`` drops
-    them, so Langfuse never sees them). Reading is via the Langfuse public API
-    using the dev-stack keys; if Langfuse is not reachable the probe skips.
-    """
+    from curie_worker.sandbox import SandboxSubstrate
 
-    host = os.environ.get("LANGFUSE_HOST", "http://localhost:23000")
-    public_key = os.environ.get("LANGFUSE_PUBLIC_KEY", "pk-lf-curie-dev")
-    secret_key = os.environ.get("LANGFUSE_SECRET_KEY", "sk-lf-curie-dev")
-
-    import base64
-
-    token = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
-    request = urllib.request.Request(
-        f"{host}/api/public/observations?limit=50",
-        headers={"Authorization": f"Basic {token}"},
-    )
+    assert isinstance(substrate, SandboxSubstrate)
+    key = f"cache-{uuid.uuid4().hex}"
+    handle = substrate.claim(key)
     try:
-        with urllib.request.urlopen(request, timeout=10) as resp:
-            import json
-
-            payload = json.loads(resp.read())
-    except (urllib.error.URLError, TimeoutError) as exc:
-        pytest.skip(f"Langfuse not reachable for the cache-token probe: {exc}")
-
-    observations = payload.get("data", [])
-    cache_reads = [
-        (o.get("usage") or {}).get("cache_read_input_tokens", 0) for o in observations
-    ]
-    assert any((count or 0) > 0 for count in cache_reads), (
-        "no observation reported cache_read_input_tokens > 0 "
-        "(otel.py drops the cache-token fields today)"
-    )
+        # A unique, substantial prompt makes the continuation useful for a
+        # real cache probe. Two tiny replies alone may never reach a provider's
+        # minimum cacheable prefix size.
+        values = [unique_marker(key, i) for i in range(500)]
+        context = "\n".join(f"Record {i}: {value}" for i, value in enumerate(values))
+        _drive_turn(
+            cfg, handle.sandbox_name, handle.port,
+            f"Remember these records for the next turn. Reply only READY.\n{context}",
+            user=key, ts="1.0", token=handle.token,
+        )
+        trace_id = uuid.uuid4().hex
+        followup = _drive_turn(
+            cfg, handle.sandbox_name, handle.port,
+            "What is the exact value in Record 17? Reply only that value.",
+            user=key, ts="2.0", token=handle.token, trace_id=trace_id,
+        )
+        assert_exact_recall(followup, values[17])
+        deadline = time.monotonic() + 120
+        while True:
+            reads = trace_cache_reads(trace_id)
+            if reads > 0:
+                break
+            assert time.monotonic() < deadline, "follow-up trace has no observed cache reads"
+            time.sleep(2)
+        assert trace_cache_reads(uuid.uuid4().hex) == 0, "unobserved trace reported cached tokens"
+        print(f"EVIDENCE cache_followup_trace={trace_id} cache_read_input_tokens={reads}")
+    finally:
+        release_claims(substrate.release, [key])

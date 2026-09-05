@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -52,7 +53,7 @@ def resilience_substrate(cfg: ResilienceConfig) -> Iterator[object]:
         password=cfg.valkey_password,
     )
     client.ping()
-    prefix = "soak:curie:sandbox"
+    prefix = f"test:resilience:curie:sandbox:{uuid.uuid4().hex}"
     config = SubstrateConfig(
         namespace=cfg.namespace,
         warm_pool=cfg.pool,
