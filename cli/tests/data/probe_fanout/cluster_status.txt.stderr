@@ -1,0 +1,3 @@
+! warn  no pods running
+Error: target release has not converged: convergence could not be verified: Helm release has no verifiable revision
+Fix: inspect the unhealthy rollout reasons, correct the target configuration and rerun `curie cluster up`

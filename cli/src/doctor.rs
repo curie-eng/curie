@@ -2892,8 +2892,11 @@ esac
     /// Deleting either half of that assignment, or switching the read back to
     /// `fetch_release_values` (the operator-supplied values, where a chart
     /// default nobody set is invisible -- the #1950 defect), must fail this
-    /// test. The shell-model test above cannot catch any of that: it returns
-    /// early at the kubectl context probe, before a single helm read.
+    /// test. The shell-model test above cannot catch any of that: the helm
+    /// version and helm list probes are issued concurrently with the kubectl
+    /// context probe and their answers are discarded on that test's early
+    /// return, so only the computed and operator-supplied values reads are
+    /// skipped.
     #[tokio::test]
     async fn gather_reads_the_release_default_model_from_computed_helm_values() {
         let _lock = crate::PROCESS_ENV_LOCK.lock().await;
@@ -4269,8 +4272,23 @@ fn is_plain_https(entry: &serde_json::Value) -> bool {
 /// Gather the facts. Every probe is read-only and failure-tolerant: a missing
 /// tool or an unreachable cluster is a fact to report, never an error to raise.
 pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -> Facts {
+    // Four independent probes, issued as ONE stage: none reads another's
+    // output, and every one of them is a subprocess plus a round trip that
+    // doctor used to pay for in series. The RESULTS are consumed below in
+    // exactly the order they were awaited in before -- docker here, the kube
+    // context at its early return, the two helm answers at
+    // `classify_release_probe` -- so a run where the context is empty simply
+    // drops the helm answers on the floor rather than reordering any decision.
+    let helm_list_args = ["list", "-n", namespace, "-o", "json"];
+    let (docker_ok, context_probe, helm_present, release_listing) = tokio::join!(
+        probe_ok("docker", &["info"]),
+        capture("kubectl", &["config", "current-context"]),
+        probe_ok("helm", &["version", "--short"]),
+        capture("helm", &helm_list_args),
+    );
+
     let mut f = Facts {
-        docker_ok: probe_ok("docker", &["info"]).await,
+        docker_ok,
         bundle_name: bundle_name(),
         // What this run was pointed at, so every fix -- the model-pin `--set`
         // and the four cluster commands alike -- names the release this run
@@ -4337,18 +4355,19 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
         }
     }
 
-    let (ok, ctx, _) = capture("kubectl", &["config", "current-context"]).await;
+    let (ok, ctx, _) = context_probe;
     if !ok || ctx.trim().is_empty() {
         return f;
     }
     f.kube_context = Some(ctx.trim().to_string());
 
-    // The probe runs here rather than through `ops::fetch_release_chart`, which
-    // collapses every nonzero exit to `Ok(None)` -- the collapse that made a
-    // missing helm, a cluster that could not answer and an empty namespace
-    // report identically. `fetch_release_chart` is left alone; installation.rs
-    // still calls it.
-    let helm_present = probe_ok("helm", &["version", "--short"]).await;
+    // Both helm answers were issued alongside the context probe above and are
+    // consumed here. `helm version --short` runs rather than
+    // `ops::fetch_release_chart`, which collapses every nonzero exit to
+    // `Ok(None)` -- the collapse that made a missing helm, a cluster that could
+    // not answer and an empty namespace report identically.
+    // `fetch_release_chart` is left alone; installation.rs still calls it.
+    //
     // helm's stderr is bound to `_` and never read, and that is the security
     // property rather than an oversight: it is an arbitrary external line that
     // can carry an `Authorization` header, an exec-plugin's argv, or a
@@ -4357,7 +4376,7 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     // a check's `detail` or `fix` -- the chart, context and NodePort values a
     // check does render are bounded, structured fields, not diagnostic text
     // (#1348).
-    let (listed, stdout, _) = capture("helm", &["list", "-n", namespace, "-o", "json"]).await;
+    let (listed, stdout, _) = release_listing;
     f.release = classify_release_probe(helm_present, listed, &stdout, release);
     if !matches!(f.release, ReleaseProbe::Installed { .. }) {
         return f;
@@ -4535,25 +4554,35 @@ impl crate::ui::CliOutput for DoctorOutput {
 /// sibling cluster verbs use. Discovery errors are discarded: gather is
 /// failure-tolerant, and an unreachable API narrows the report to
 /// `agents: None` rather than failing the whole run (#1367).
+///
+/// The two legs are independent -- the URL comes off the release's Services and
+/// the key off its chart Secret -- so they are issued concurrently rather than
+/// the key waiting on the URL. One behavioral consequence, deliberate: when the
+/// URL turns out not to be discoverable, the key discovery has still RUN and
+/// its result is discarded. It is a read-only Secret lookup either way, and the
+/// report is identical; what changes is that doctor no longer pays for the two
+/// round trips back to back.
 pub async fn resolve_api(
     namespace: &str,
     release: &str,
     api_url: Option<&str>,
     api_key: Option<&str>,
 ) -> Option<(String, String)> {
-    let url = match nonempty(api_url) {
-        Some(url) => url.to_string(),
-        None => crate::ops::discover_api_url(namespace, release)
-            .await
-            .ok()?,
-    };
-    let key = match nonempty(api_key) {
-        Some(key) => key.to_string(),
-        None => crate::ops::discover_api_key(namespace, release)
-            .await
-            .ok()?,
-    };
-    Some((url, key))
+    let (url, key) = tokio::join!(
+        async {
+            match nonempty(api_url) {
+                Some(url) => Some(url.to_string()),
+                None => crate::ops::discover_api_url(namespace, release).await.ok(),
+            }
+        },
+        async {
+            match nonempty(api_key) {
+                Some(key) => Some(key.to_string()),
+                None => crate::ops::discover_api_key(namespace, release).await.ok(),
+            }
+        },
+    );
+    Some((url?, key?))
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {

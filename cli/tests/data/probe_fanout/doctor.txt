@@ -1,0 +1,17 @@
+MISS  Model credential           none found
+      → export CURIE_CREDENTIALS=sk-ant-...   (or `curie secrets set CURIE_CREDENTIALS`; `curie skill up --fake-model` needs none)
+--    Model pin                  no model determined: per-agent overrides could not be read because the platform API was not reached, no release default agentSandbox.runner.model or inference.model, and no CURIE_MODEL
+ok    Docker                     running
+MISS  Bundle in this directory   no .claude-plugin/plugin.json
+      → curie init my-agent && cd my-agent
+ok    Cluster                    doctor-stub-context (reached)
+ok    Curie release              curie (curie-0.8.2)
+MISS  Slack                      no tokens recorded
+      → curie cluster comms --slack --namespace curie --release curie --app-token xapp-... --bot-token xoxb-...
+MISS  Clone credential           none — a private repo cannot be cloned, so git-push deploys will fail
+      → curie cluster github-app --namespace curie --release curie --app-id <id> --private-key ./key.pem
+ok    Webhook exposure           NodePort 30800
+--    Repo binding               platform API not reached — could not discover it from the release; pass --api-url/--api-key to include this
+
+No bundle here. Start with `curie init my-agent`.
+4 things to set up. Run `curie` with no arguments for a guided walkthrough, or fix them one at a time with the commands above.
