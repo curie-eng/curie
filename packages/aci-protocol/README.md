@@ -24,9 +24,9 @@ string rather than a `const`. Artifact sync is enforced by the
 schema-compat gate (`tests/test_schema_compat.py`); an unbumped wire change is
 caught by the wire-lock gate (`tests/test_wire_lock.py`).
 
-## Contract surface (v0.4.4)
+## Contract surface (v0.4.5)
 
-`PROTOCOL_VERSION = "0.4.4"` is embedded in the schema and in every outbound
+`PROTOCOL_VERSION = "0.4.5"` is embedded in the schema and in every outbound
 event.
 
 **Session setup** (`SessionConfig`, with `to_env()` / `from_env()`):
@@ -45,19 +45,45 @@ event.
 
 **Inbound channel messages** (discriminated union on `kind`):
 
-- `Event` = `{kind: "event", type: message|job|eval_case, text, user, ts, session_id?, history_ref?}`.
+- `Event` = `{kind: "event", type: message|job|eval_case, text, user, ts, session_id?, history_ref?, adoption_credential?}`.
   `session_id` and `history_ref` are nullable strings carrying conversation-scoped
   identity after a sandbox is bound; older producers may omit either field.
+  `adoption_credential` is a nullable string carrying a per-conversation runner
+  credential on the existing authenticated event (ADR-0122). Omitted or JSON
+  `null` is the legacy cold path (no adoption requested). A malformed value is
+  a hard decode error with no partial Event. The field is secret material: it
+  is omitted from `repr`/`str` and must not appear in errors, model prompts, or
+  evidence. It is not a substitute for `text`, `user`, `ts`, or `history_ref`.
 - `Interrupt` = `{kind: "interrupt", reason}`
 
 **Outbound NDJSON response events** (discriminated union on `type`, each carries
 `version`):
 
-- `text_delta` = `{version, text}`
-- `tool_note` = `{version, text, tool?}`
-- `final` = `{version, text, status}` where `status` is `SessionStatus`
-- `error` = `{version, message, classification?}`
-- `side_effect_flag` = `{version, tool?, detail?}`
+- `text_delta` = `{version, text, adoption_applied?}`
+- `tool_note` = `{version, text, tool?, adoption_applied?}`
+- `final` = `{version, text, status, adoption_applied?}` where `status` is `SessionStatus`
+- `error` = `{version, message, classification?, adoption_applied?}`
+- `side_effect_flag` = `{version, tool?, detail?, adoption_applied?}`
+
+`adoption_applied` is the optional ack that the consumer applied
+`adoption_credential` for that turn. `null`/omitted is the pre-ack shape. `true`
+means the credential was installed. A producer that sent a credential must
+require `true`; a successful turn without that ack is not adoption, because a
+tolerant 0.4.4 consumer ignores the inbound field.
+
+These fields define delivery and admission on the frozen Event. They do not
+retire a bootstrap token, recover a route, or enable warm-pool replicas. That
+realizing work stays in a later runner/worker change.
+
+**Producer/consumer rollout.** Inbound `Event` has no `version`, so an old
+tolerant consumer can ignore `adoption_credential` and still emit a `final`.
+Order: (1) land this contract; (2) ship a consumer that validates, applies only
+after a well-formed value, fails malformed frames atomically, redacts the
+secret, and emits `adoption_applied=true` when it applied; (3) only then may a
+producer send `adoption_credential`, and only on authenticated `POST /v1/event`.
+A steer that carries a credential must be rejected by the realizing server
+rather than swapping mid-turn. Do not treat HTTP 200 or a `final` as
+retirement.
 
 **Session status** (`SessionStatus`): `done`, `idle-awaiting-input`,
 `classified-failure`.

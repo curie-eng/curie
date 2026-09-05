@@ -13,12 +13,21 @@ describingly. Outbound events are a discriminated union on ``type``; every
 outbound event carries a ``version`` equal to PROTOCOL_VERSION.
 """
 
+import json
 from collections.abc import Mapping
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from .version import PROTOCOL_VERSION, SEMVER_PATTERN
 
@@ -87,12 +96,140 @@ class SessionStatus(StrEnum):
 # --- Inbound channel messages -------------------------------------------------
 
 
+# Opaque per-conversation runner credential. Character cap, not a product
+# secret format: long enough for a typical bearer, short enough to reject a
+# dump. Realizing servers must not echo this value in errors, traces, or prompts.
+ADOPTION_CREDENTIAL_MAX_CHARS = 4096
+
+
+def _malformed_adoption_credential() -> ValueError:
+    """Reject without attaching the presented material to the exception."""
+
+    return ValueError("malformed adoption credential")
+
+
+def parse_adoption_credential(value: Any) -> str | None:
+    """Admit an optional adoption credential, or raise without echoing it.
+
+    ``None`` is the legacy cold path (omit or JSON null). Any other well-formed
+    value is a non-empty string no longer than ``ADOPTION_CREDENTIAL_MAX_CHARS``
+    that is not whitespace-only. The presented material is never copied onto
+    the raised error; a realizing server that interpolates the exception into
+    an HTTP body therefore cannot leak it from this helper.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _malformed_adoption_credential()
+    if not value or value.strip() == "" or len(value) > ADOPTION_CREDENTIAL_MAX_CHARS:
+        raise _malformed_adoption_credential()
+    return value
+
+
+def _malformed_event_error() -> ValidationError:
+    """A credential-free ValidationError for a bad adoption_credential."""
+
+    return ValidationError.from_exception_data(
+        "Event",
+        [
+            {
+                "type": "value_error",
+                "loc": ("adoption_credential",),
+                "input": None,
+                "ctx": {"error": "malformed adoption credential"},
+            }
+        ],
+    )
+
+
+def _scrub_credential_input(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: None if key == "adoption_credential" else _scrub_credential_input(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_scrub_credential_input(item) for item in value]
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            text = bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            return "<redacted>"
+        return "<redacted>" if "adoption_credential" in text else value
+    if isinstance(value, str) and "adoption_credential" in value:
+        return "<redacted>"
+    return value
+
+
+def redact_adoption_credential_error(exc: ValidationError) -> ValidationError:
+    """Return a ValidationError whose inputs cannot contain credential material.
+
+    Errors whose loc is the credential field stay a closed malformed-credential
+    failure. Unrelated failures (a missing ``text``, for example) keep their
+    diagnosis; only the credential material is scrubbed from their inputs. A
+    ``json_invalid`` error keeps its parser diagnosis but loses its input
+    entirely, because unparsed raw JSON cannot be scrubbed by field name.
+    """
+
+    errors = exc.errors()
+    credential_failed = False
+    for err in errors:
+        loc = err.get("loc", ())
+        loc_text = ".".join(str(part) for part in loc) if isinstance(loc, tuple) else ""
+        msg = str(err.get("msg", ""))
+        if "adoption_credential" in loc_text or msg == "malformed adoption credential":
+            credential_failed = True
+            break
+    if credential_failed:
+        return _malformed_event_error()
+    scrubbed: list[Any] = []
+    for err in errors:
+        input_value = err.get("input")
+        item = dict(err)
+        if err.get("type") == "json_invalid":
+            # Raw JSON that never parsed: pydantic attaches the WHOLE input, and
+            # no field-name match can locate a credential inside it (an escaped
+            # key such as ``"adoption_credenti\u0061l"`` defeats a literal
+            # scrub). Drop the raw input outright; the parser's position-only
+            # message keeps the invalid-JSON diagnosis truthful.
+            item["input"] = "<redacted>"
+            scrubbed.append(item)
+            continue
+        if isinstance(input_value, str) and "adoption_credential" in input_value:
+            return _malformed_event_error()
+        item["input"] = _scrub_credential_input(input_value)
+        scrubbed.append(item)
+    try:
+        return ValidationError.from_exception_data(exc.title, scrubbed)
+    except (TypeError, ValueError):
+        return _malformed_event_error()
+
+
 class Event(_AciModel):
     """An inbound event delivered into a live session (initial or follow-up).
 
     ``session_id`` and ``history_ref`` carry conversation-scoped identity to a
     runner after its sandbox is bound. Both remain optional so older producers
     can omit them and tolerant consumers can adopt the additive wire shape.
+
+    ``adoption_credential`` is the optional per-conversation runner credential
+    ADR-0122 delivers on this same authenticated ``Event`` (never a new
+    lifecycle route, and never by overloading ``text`` / ``user`` / ``ts`` /
+    ``history_ref``). Omitted or JSON ``null`` is the legacy cold path: no
+    adoption is requested and a current credential must stay in force. A
+    malformed value is a hard decode error; the model is not constructed, so
+    there is no partial adoption at the wire layer. The field is secret
+    material: it is omitted from ``repr`` / ``str``, and decode errors must
+    not echo it.
+
+    This field does not retire a bootstrap token, persist a route, or enable a
+    warm pool. Those are realizing-runner/worker behaviors. Because inbound
+    ``Event`` carries no ``version`` and a tolerant consumer ignores unknown
+    keys, a successful turn is not proof of adoption. A consumer that applies
+    the credential MUST set ``adoption_applied=True`` on the outbound frames of
+    that turn; a producer that sent a credential MUST treat a missing or
+    non-true ack as "not adopted".
     """
 
     kind: Literal["event"] = "event"
@@ -102,6 +239,45 @@ class Event(_AciModel):
     ts: str
     session_id: str | None = None
     history_ref: str | None = None
+    adoption_credential: str | None = Field(
+        default=None,
+        repr=False,
+        min_length=1,
+        max_length=ADOPTION_CREDENTIAL_MAX_CHARS,
+        pattern=r".*\S.*",
+    )
+
+    @classmethod
+    def model_validate_json(
+        cls,
+        json_data: str | bytes | bytearray,
+        **kwargs: Any,
+    ) -> "Event":
+        try:
+            return super().model_validate_json(json_data, **kwargs)
+        except ValidationError as exc:
+            raise redact_adoption_credential_error(exc) from None
+        except json.JSONDecodeError:
+            raise _malformed_event_error() from None
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _admit_adoption_credential(cls, data: Any, handler: Any) -> Any:
+        # Validate and (on failure) drop the presented value before pydantic
+        # records ``input_value``. The wrap path is what keeps HTTP 400 bodies
+        # that interpolate ``ValidationError`` from echoing the credential.
+        if isinstance(data, Mapping) and "adoption_credential" in data:
+            incoming = dict(data)
+            raw = incoming.pop("adoption_credential")
+            try:
+                incoming["adoption_credential"] = parse_adoption_credential(raw)
+            except ValueError:
+                raise _malformed_event_error() from None
+            data = incoming
+        try:
+            return handler(data)
+        except ValidationError as exc:
+            raise redact_adoption_credential_error(exc) from None
 
 
 class Interrupt(_AciModel):
@@ -123,6 +299,25 @@ class _OutboundBase(_AciModel):
     # compatibility range. The NDJSON decoder enforces compatibility; the pattern
     # here rejects a structurally malformed value on construction.
     version: str = Field(default=PROTOCOL_VERSION, pattern=SEMVER_PATTERN)
+    # Ack that the consumer applied ``Event.adoption_credential`` for this turn.
+    # ``None`` (omitted or JSON null) is the pre-ack shape: either the consumer
+    # predates the field, or no adoption was requested. ``True`` means the
+    # credential was installed and the bootstrap must no longer be accepted
+    # against that pod. ``False`` means the consumer understood the field and
+    # did not apply it. A producer that sent a credential must require
+    # ``True``; a missing ack is not successful adoption.
+    adoption_applied: bool | None = None
+
+    @field_validator("adoption_applied", mode="before")
+    @classmethod
+    def _strict_adoption_applied(cls, value: Any) -> bool | None:
+        # JSON true/false only. Coercing "true"/1 to True would let a malformed
+        # ack look like successful adoption.
+        if value is None:
+            return None
+        if value is True or value is False:
+            return value
+        raise ValueError("adoption_applied must be a JSON boolean")
 
 
 class TextDelta(_OutboundBase):

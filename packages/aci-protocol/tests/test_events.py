@@ -87,7 +87,7 @@ def test_event_rejects_unknown_fields_on_direct_construction() -> None:
         )
 
 
-@pytest.mark.parametrize("field", ("session_id", "history_ref"))
+@pytest.mark.parametrize("field", ("session_id", "history_ref", "adoption_credential"))
 def test_interrupt_rejects_event_session_context_fields(field: str) -> None:
     with pytest.raises(ValidationError):
         Interrupt.model_validate({"reason": "stop", field: "context-example"})

@@ -110,6 +110,7 @@ fn done_turn(text: &str) -> Vec<OutboundEvent> {
         approval_granted_tool: None,
         input_tokens: None,
         output_tokens: None,
+        adoption_applied: None,
     }]
 }
 

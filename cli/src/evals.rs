@@ -755,6 +755,7 @@ mod tests {
         OutboundEvent::TextDelta {
             version: PROTOCOL_VERSION.into(),
             text: text.into(),
+            adoption_applied: None,
         }
     }
 
@@ -769,6 +770,7 @@ mod tests {
             approval_granted_tool: None,
             input_tokens: None,
             output_tokens: None,
+            adoption_applied: None,
         }
     }
 
@@ -777,6 +779,7 @@ mod tests {
             version: PROTOCOL_VERSION.into(),
             text: format!("calling {tool}"),
             tool: Some(tool.into()),
+            adoption_applied: None,
         }
     }
 

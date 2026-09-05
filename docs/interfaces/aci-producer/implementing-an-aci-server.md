@@ -46,9 +46,13 @@ that has not opted into shared history. The reference implementation is
 Startup configuration remains **environment-only**. Read it once with
 `SessionConfig.from_env()` (the `CURIE_*` mapping: `plugin_dir`, `session_id`,
 `sandbox_id`, `budget`, optional `memory_ref`, `credentials_ref`, `otel`). The
-inbound `Event` separately has optional `session_id` and `history_ref` fields for
-conversation-scoped identity after a sandbox is bound. They are wire metadata,
-not a replacement for `SessionConfig`, and older producers may omit either one.
+inbound `Event` separately has optional `session_id`, `history_ref`, and
+`adoption_credential` fields. The first two are conversation-scoped identity
+after a sandbox is bound. `adoption_credential` is the optional per-conversation
+runner credential delivered on this same authenticated event (ADR-0122); omitted
+or null means no adoption. They are wire metadata, not a replacement for
+`SessionConfig`, and older producers may omit any of them. A schema field is
+not bootstrap retirement or warm-pool activation.
 
 ## The wire contract in one screen
 
@@ -57,24 +61,28 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
 **Inbound** — a discriminated union on `kind` (`parse_inbound` decodes it):
 
 - `Event` = `{kind: "event", type: "message"|"job"|"eval_case", text, user, ts,
-  session_id?, history_ref?}`. The optional fields are nullable strings; either
-  may be omitted independently.
+  session_id?, history_ref?, adoption_credential?}`. The optional fields are
+  nullable strings and may be omitted independently. `adoption_credential` is
+  secret material: omit/null is the legacy cold path, a malformed value is a
+  hard decode error, and the value must not appear in `repr`, errors, model
+  prompts, or evidence.
 - `Interrupt` = `{kind: "interrupt", reason}`
 
 **Outbound** — a discriminated union on `type`, each carrying `version`
 (`to_ndjson_line` encodes, `parse_ndjson_line` decodes one line):
 
-- `TextDelta` → `text_delta` `{version, text}`
-- `ToolNote` → `tool_note` `{version, text, tool?}`
-- `Final` → `final` `{version, text, status}` where `status ∈ {done,
+- `TextDelta` → `text_delta` `{version, text, adoption_applied?}`
+- `ToolNote` → `tool_note` `{version, text, tool?, adoption_applied?}`
+- `Final` → `final` `{version, text, status, adoption_applied?}` where `status ∈ {done,
   idle-awaiting-input, classified-failure}`
-- `ErrorEvent` → `error` `{version, message, classification?}`
+- `ErrorEvent` → `error` `{version, message, classification?, adoption_applied?}`
 - `SideEffectFlag` → `side_effect_flag` `{version, tool?, detail?, call_id?,
-  arguments?, result?, failed?}`, emitted once when a side-effecting call is
-  made and once when its result arrives, joined on `call_id` (ADR-0117)
+  arguments?, result?, failed?, adoption_applied?}`, emitted once when a
+  side-effecting call is made and once when its result arrives, joined on
+  `call_id` (ADR-0117)
 
 **Version gate (strict producer, tolerant consumer).** Your producer emits its
-**exact build `PROTOCOL_VERSION`** (currently `0.4.4`) on every outbound event and
+**exact build `PROTOCOL_VERSION`** (currently `0.4.5`) on every outbound event and
 constructs strictly -- an unknown field is an error at construction, catching your
 mistakes at the source. A **consumer** decoding the wire is tolerant the other way:
 it accepts any version compatible with its own build (`major.minor` match under

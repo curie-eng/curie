@@ -20,7 +20,7 @@ import json
 from collections.abc import Iterable, Iterator
 from typing import Any
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from .events import (
     READER_CONTEXT,
@@ -31,6 +31,7 @@ from .events import (
     SideEffectFlag,
     TextDelta,
     ToolNote,
+    redact_adoption_credential_error,
 )
 from .turn import QueuedTurn
 from .version import PROTOCOL_VERSION, is_compatible
@@ -96,8 +97,14 @@ def iter_ndjson(text: str) -> Iterator[OutboundEventModel]:
 def parse_inbound(raw: str | dict[str, Any]) -> Any:
     """Decode an inbound channel message (event or interrupt) from JSON."""
 
-    data = json.loads(raw) if isinstance(raw, str) else raw
-    return _INBOUND_ADAPTER.validate_python(data, context=READER_CONTEXT)
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError as exc:
+        raise json.JSONDecodeError("malformed inbound JSON", "<redacted>", exc.pos) from None
+    try:
+        return _INBOUND_ADAPTER.validate_python(data, context=READER_CONTEXT)
+    except ValidationError as exc:
+        raise redact_adoption_credential_error(exc) from None
 
 
 def to_inbound_json(message: Any) -> str:

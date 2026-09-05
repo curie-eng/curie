@@ -627,6 +627,18 @@
     "ErrorEvent": {
       "description": "A classified failure surfaced to the platform.",
       "properties": {
+        "adoption_applied": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Adoption Applied"
+        },
         "classification": {
           "anyOf": [
             {
@@ -776,8 +788,23 @@
       "type": "object"
     },
     "Event": {
-      "description": "An inbound event delivered into a live session (initial or follow-up).\n\n``session_id`` and ``history_ref`` carry conversation-scoped identity to a\nrunner after its sandbox is bound. Both remain optional so older producers\ncan omit them and tolerant consumers can adopt the additive wire shape.",
+      "description": "An inbound event delivered into a live session (initial or follow-up).\n\n``session_id`` and ``history_ref`` carry conversation-scoped identity to a\nrunner after its sandbox is bound. Both remain optional so older producers\ncan omit them and tolerant consumers can adopt the additive wire shape.\n\n``adoption_credential`` is the optional per-conversation runner credential\nADR-0122 delivers on this same authenticated ``Event`` (never a new\nlifecycle route, and never by overloading ``text`` / ``user`` / ``ts`` /\n``history_ref``). Omitted or JSON ``null`` is the legacy cold path: no\nadoption is requested and a current credential must stay in force. A\nmalformed value is a hard decode error; the model is not constructed, so\nthere is no partial adoption at the wire layer. The field is secret\nmaterial: it is omitted from ``repr`` / ``str``, and decode errors must\nnot echo it.\n\nThis field does not retire a bootstrap token, persist a route, or enable a\nwarm pool. Those are realizing-runner/worker behaviors. Because inbound\n``Event`` carries no ``version`` and a tolerant consumer ignores unknown\nkeys, a successful turn is not proof of adoption. A consumer that applies\nthe credential MUST set ``adoption_applied=True`` on the outbound frames of\nthat turn; a producer that sent a credential MUST treat a missing or\nnon-true ack as \"not adopted\".",
       "properties": {
+        "adoption_credential": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "pattern": ".*\\S.*",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Adoption Credential"
+        },
         "history_ref": {
           "anyOf": [
             {
@@ -842,6 +869,18 @@
     "Final": {
       "description": "The terminal response event, carrying the session status.\n\n``approval_summary`` accompanies an ``awaiting-approval`` status (ADR-0010):\nthe human-readable statement of what needs approval, captured from the\nrun's approval request so the platform can persist it on the durable\n``Approval`` record and show it to the approver. ``approval_route`` names\nthe approval route the request targets (#247): declared in the bundle\nmanifest's ``approvalPolicy`` (versioned with the agent), bound to a\nworkspace channel per deployment by the worker. Both ``None`` on every\nother status; ``approval_route`` also ``None`` when the request named no\nroute (the platform falls back to the requesting channel).\n\n``approval_gate_kind`` records which gate produced the request (#544):\n``'permission'`` when the runner's tool-permission gate denied a real tool\ncall, ``'policy'`` when the model asked for a business-decision approval.\nIt is the durable provenance the worker branches on instead of sniffing the\nsummary prefix. ``approval_granted_tool`` carries the tool name the\npermission gate denied -- the trusted ``can_use_tool`` value the resume-turn\ngrant is bound to -- and is only ever set for ``approval_gate_kind =\n'permission'``; a policy gate never authorizes a tool, so it stays ``None``.\nBoth ``None`` on every other status, and ``None`` from an older runner that\npredates these fields (the worker falls back to the prefix parse then).\n\n``input_tokens``/``output_tokens`` carry the turn's model token usage when\nthe harness reported it (#390): the runner stamps them from the SDK result's\n``usage`` so a consumer can attribute a dollar cost to the turn (model\npricing lives with the consumer, not on the wire). Both ``None`` when usage\nwas unavailable -- the fake-model path, a provider that reports no usage, or\nan older runner that predates these fields -- so a consumer computing cost\nleaves it unknown rather than counting the turn as free. Additive optional\nscalars: a tolerant consumer decoding an older producer's ``final`` simply\nsees them absent.",
       "properties": {
+        "adoption_applied": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Adoption Applied"
+        },
         "approval_gate_kind": {
           "anyOf": [
             {
@@ -1227,6 +1266,18 @@
     "SideEffectFlag": {
       "description": "Marks that a non-idempotent tool call executed during the run.\n\nIts presence gates the no-retry-after-side-effects rule (section 2b): a\nfailed run carrying this flag escalates to a human instead of retrying.\n\nIt also reports WHAT the call did (ADR-0117). The information was already in\nhand where the frame is built and was being replaced by a constant ``detail``\nstring, so a consumer could know that something mutated and never what. Every\nfield below is optional with a ``None`` default, which is why carrying them\nis a patch under ADR-0036: a reader that predates them decodes the frame\nunchanged.\n\nOne CALL produces two frames -- an opening one when the call is made, so the\nno-retry rule latches even if the turn dies mid-call, and a closing one\ncarrying what came back. ``call_id`` is what joins them into one record; a\nturn that calls the same tool twice is otherwise indistinguishable from one\nthat called it once.",
       "properties": {
+        "adoption_applied": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Adoption Applied"
+        },
         "arguments": {
           "anyOf": [
             {
@@ -1322,6 +1373,18 @@
     "TextDelta": {
       "description": "A streamed chunk of assistant text.",
       "properties": {
+        "adoption_applied": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Adoption Applied"
+        },
         "text": {
           "title": "Text",
           "type": "string"
@@ -1348,6 +1411,18 @@
     "ToolNote": {
       "description": "A human readable note about a tool call the harness is making.",
       "properties": {
+        "adoption_applied": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Adoption Applied"
+        },
         "text": {
           "title": "Text",
           "type": "string"
@@ -1396,6 +1471,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.4.4",
-  "title": "ACI Protocol v0.4.4"
+  "protocolVersion": "0.4.5",
+  "title": "ACI Protocol v0.4.5"
 }

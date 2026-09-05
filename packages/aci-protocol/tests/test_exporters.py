@@ -10,7 +10,7 @@ the private helpers, because the rendered artifact is the real contract.
 
 import re
 
-from aci_protocol import BootEnv
+from aci_protocol import ADOPTION_CREDENTIAL_MAX_CHARS, BootEnv
 from aci_protocol.rust_export import render_rust
 from aci_protocol.schema_export import build_schema
 
@@ -30,6 +30,26 @@ def test_event_session_context_fields_are_optional_nullable_strings() -> None:
         prop = event["properties"][field]
         assert "anyOf" in prop
         assert {variant["type"] for variant in prop["anyOf"]} == {"string", "null"}
+
+
+def test_event_adoption_credential_is_optional_nullable_string() -> None:
+    event = build_schema()["$defs"]["Event"]
+    assert "adoption_credential" not in event["required"]
+    prop = event["properties"]["adoption_credential"]
+    assert "anyOf" in prop
+    assert {variant["type"] for variant in prop["anyOf"]} == {"string", "null"}
+    string_variant = next(variant for variant in prop["anyOf"] if variant["type"] == "string")
+    assert string_variant["minLength"] == 1
+    assert string_variant["maxLength"] == ADOPTION_CREDENTIAL_MAX_CHARS
+    assert string_variant["pattern"] == r".*\S.*"
+
+
+def test_outbound_adoption_applied_is_optional_nullable_bool() -> None:
+    final = build_schema()["$defs"]["Final"]
+    assert "adoption_applied" not in final["required"]
+    prop = final["properties"]["adoption_applied"]
+    assert "anyOf" in prop
+    assert {variant["type"] for variant in prop["anyOf"]} == {"boolean", "null"}
 
 
 def test_generated_rust_guards_the_version() -> None:

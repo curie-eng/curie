@@ -13,6 +13,7 @@ class and regenerates the committed schema and types.
 
 from .conformance import ConformanceReport, Producer, run_conformance
 from .events import (
+    ADOPTION_CREDENTIAL_MAX_CHARS,
     OUTBOUND_EVENT_TYPES,
     READER_CONTEXT,
     ErrorEvent,
@@ -25,6 +26,7 @@ from .events import (
     SideEffectFlag,
     TextDelta,
     ToolNote,
+    parse_adoption_credential,
 )
 from .ndjson import (
     ProtocolVersionError,
@@ -91,6 +93,8 @@ __all__ = [
     "Event",
     "Interrupt",
     "InboundMessage",
+    "ADOPTION_CREDENTIAL_MAX_CHARS",
+    "parse_adoption_credential",
     # outbound
     "TextDelta",
     "ToolNote",

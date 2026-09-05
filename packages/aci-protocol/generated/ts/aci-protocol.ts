@@ -20,7 +20,7 @@ export type ExpiresInSeconds = number | null;
  * authority-bearing per #544/ADR-0046, so the value domain is a named, exported
  * part of the contract rather than an inline annotation.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "GateKind".
  */
 export type GateKind = "permission" | "policy";
@@ -69,6 +69,7 @@ export type SessionId = string;
 export type StateToken = string | null;
 export type StateUrl = string | null;
 export type Thinking = string | null;
+export type AdoptionApplied = boolean | null;
 export type Classification = string | null;
 export type Message = string;
 export type Type = "error";
@@ -86,6 +87,7 @@ export type RepoFullName = string;
 export type Sha1 = string;
 export type TargetUrl1 = string | null;
 export type Total = number;
+export type AdoptionCredential = string | null;
 export type HistoryRef1 = string | null;
 export type Kind = "event";
 export type SessionId1 = string | null;
@@ -93,6 +95,7 @@ export type Text = string;
 export type Ts = string;
 export type Type1 = "message" | "job" | "eval_case";
 export type User = string;
+export type AdoptionApplied1 = boolean | null;
 export type ApprovalGateKind = string | null;
 export type ApprovalGrantedTool = string | null;
 export type ApprovalRoute = string | null;
@@ -110,24 +113,27 @@ export type Text1 = string;
 export type Type2 = "final";
 export type Version1 = string;
 /**
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "InboundMessage".
  */
 export type InboundMessage = Event | Interrupt;
 export type Kind1 = "interrupt";
 export type Reason = string;
 /**
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "OutboundEvent".
  */
 export type OutboundEvent = TextDelta | ToolNote | Final | ErrorEvent | SideEffectFlag;
+export type AdoptionApplied2 = boolean | null;
 export type Text2 = string;
 export type Type3 = "text_delta";
 export type Version2 = string;
+export type AdoptionApplied3 = boolean | null;
 export type Text3 = string;
 export type Tool = string | null;
 export type Type4 = "tool_note";
 export type Version3 = string;
+export type AdoptionApplied4 = boolean | null;
 export type Arguments = {
   [k: string]: unknown;
 } | null;
@@ -181,7 +187,7 @@ export type Text4 = string;
  * Wire tokens follow the section 0 spelling; ``classified failure`` in prose
  * becomes the token ``classified-failure`` on the wire.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "SessionStatus".
  */
 export type SessionStatus1 = "done" | "idle-awaiting-input" | "classified-failure" | "awaiting-approval";
@@ -209,12 +215,12 @@ export type SessionStatus1 = "done" | "idle-awaiting-input" | "classified-failur
  * ENUM VALUE -- breaking under this package's rules, so it is a deliberate,
  * separately-decided bump rather than something this change assumes.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "TurnSource".
  */
 export type TurnSource1 = "slack" | "webhook" | "cron";
 
-export interface ACIProtocolV044 {
+export interface ACIProtocolV045 {
   [k: string]: unknown;
 }
 /**
@@ -238,7 +244,7 @@ export interface ACIProtocolV044 {
  * nullable because ``slack`` legitimately has no adapter -- its route is the
  * worker's configured Slack origin.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "ApprovalRequest".
  */
 export interface ApprovalRequest {
@@ -285,7 +291,7 @@ export interface ApprovalRequest {
  * baked template default, the worker's value is per-agent model routing. Do not
  * collapse either producer list to a single value.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "BootEnv".
  */
 export interface BootEnv {
@@ -325,7 +331,7 @@ export interface BootEnv {
  * section 0 describes these as per-tool secrets via K8s Secret refs, so the
  * contract carries the reference, not the secret material itself.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "SessionConfig".
  */
 export interface SessionConfig {
@@ -344,7 +350,7 @@ export interface SessionConfig {
  * ``task_budget_hint`` is the optional hint passed through to the model so it
  * self paces (section 6b); it is not a hard ceiling.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "Budget".
  */
 export interface Budget {
@@ -360,7 +366,7 @@ export interface Budget {
  * fields the prototype used (endpoint, headers, protocol); any others pass
  * through as raw env vars untouched and are out of scope for this typed view.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "OtelConfig".
  */
 export interface OtelConfig {
@@ -372,10 +378,11 @@ export interface OtelConfig {
 /**
  * A classified failure surfaced to the platform.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "ErrorEvent".
  */
 export interface ErrorEvent {
+  adoption_applied?: AdoptionApplied;
   classification?: Classification;
   message: Message;
   type: Type;
@@ -389,7 +396,7 @@ export interface ErrorEvent {
  * worker consumes off it (formerly the API's ``EvalJobRequest`` and the
  * worker's ``EvalWorkItem``, which had drifted on ``bundle_ref``).
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "EvalJob".
  */
 export interface EvalJob {
@@ -409,7 +416,7 @@ export interface EvalJob {
  * Byte-identical across both lanes before this promotion, so it carries no
  * semantic decisions.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "EvalReport".
  */
 export interface EvalReport {
@@ -427,10 +434,29 @@ export interface EvalReport {
  * runner after its sandbox is bound. Both remain optional so older producers
  * can omit them and tolerant consumers can adopt the additive wire shape.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * ``adoption_credential`` is the optional per-conversation runner credential
+ * ADR-0122 delivers on this same authenticated ``Event`` (never a new
+ * lifecycle route, and never by overloading ``text`` / ``user`` / ``ts`` /
+ * ``history_ref``). Omitted or JSON ``null`` is the legacy cold path: no
+ * adoption is requested and a current credential must stay in force. A
+ * malformed value is a hard decode error; the model is not constructed, so
+ * there is no partial adoption at the wire layer. The field is secret
+ * material: it is omitted from ``repr`` / ``str``, and decode errors must
+ * not echo it.
+ *
+ * This field does not retire a bootstrap token, persist a route, or enable a
+ * warm pool. Those are realizing-runner/worker behaviors. Because inbound
+ * ``Event`` carries no ``version`` and a tolerant consumer ignores unknown
+ * keys, a successful turn is not proof of adoption. A consumer that applies
+ * the credential MUST set ``adoption_applied=True`` on the outbound frames of
+ * that turn; a producer that sent a credential MUST treat a missing or
+ * non-true ack as "not adopted".
+ *
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "Event".
  */
 export interface Event {
+  adoption_credential?: AdoptionCredential;
   history_ref?: HistoryRef1;
   kind: Kind;
   session_id?: SessionId1;
@@ -474,10 +500,11 @@ export interface Event {
  * scalars: a tolerant consumer decoding an older producer's ``final`` simply
  * sees them absent.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "Final".
  */
 export interface Final {
+  adoption_applied?: AdoptionApplied1;
   approval_gate_kind?: ApprovalGateKind;
   approval_granted_tool?: ApprovalGrantedTool;
   approval_route?: ApprovalRoute;
@@ -493,7 +520,7 @@ export interface Final {
 /**
  * A hard stop delivered on the control channel, distinct from a steer.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "Interrupt".
  */
 export interface Interrupt {
@@ -504,10 +531,11 @@ export interface Interrupt {
 /**
  * A streamed chunk of assistant text.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "TextDelta".
  */
 export interface TextDelta {
+  adoption_applied?: AdoptionApplied2;
   text: Text2;
   type: Type3;
   version: Version2;
@@ -516,10 +544,11 @@ export interface TextDelta {
 /**
  * A human readable note about a tool call the harness is making.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "ToolNote".
  */
 export interface ToolNote {
+  adoption_applied?: AdoptionApplied3;
   text: Text3;
   tool?: Tool;
   type: Type4;
@@ -545,10 +574,11 @@ export interface ToolNote {
  * turn that calls the same tool twice is otherwise indistinguishable from one
  * that called it once.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "SideEffectFlag".
  */
 export interface SideEffectFlag {
+  adoption_applied?: AdoptionApplied4;
   arguments?: Arguments;
   call_id?: CallId;
   detail?: Detail;
@@ -575,7 +605,7 @@ export interface SideEffectFlag {
  * to the non-job value is also the safe direction -- an unset ``source`` reads
  * as a person's message, so a job can never be created by omission.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "QueuedTurn".
  */
 export interface QueuedTurn {
@@ -624,7 +654,7 @@ export interface QueuedTurn {
  * third-party or pre-upgrade producer is not rejected outright, but every
  * first-party mint site sets it explicitly.
  *
- * This interface was referenced by `ACIProtocolV044`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV045`'s JSON-Schema
  * via the `definition` "ReplyHandle".
  */
 export interface ReplyHandle {

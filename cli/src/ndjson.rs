@@ -86,6 +86,7 @@ mod tests {
                 approval_granted_tool: None,
                 input_tokens: None,
                 output_tokens: None,
+                adoption_applied: None,
             }
         );
     }

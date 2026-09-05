@@ -290,6 +290,7 @@ fn final_event(text: &str, status: SessionStatus) -> OutboundEvent {
         approval_granted_tool: None,
         input_tokens: None,
         output_tokens: None,
+        adoption_applied: None,
     }
 }
 
@@ -343,6 +344,7 @@ fn a_fake_turn_that_did_not_complete_is_still_a_fail() {
     let unfinished: Vec<OutboundEvent> = vec![OutboundEvent::TextDelta {
         version: PROTOCOL_VERSION.into(),
         text: "all done".into(),
+        adoption_applied: None,
     }];
     assert_eq!(
         turn_outcome(&case, &unfinished, true),

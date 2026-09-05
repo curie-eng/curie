@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.4.4";
+pub const PROTOCOL_VERSION: &str = "0.4.5";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -69,6 +69,22 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer)
+}
+
+fn deserialize_adoption_credential<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match &value {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() || s.chars().count() > 4096 => {
+            Err(serde::de::Error::custom("malformed adoption credential"))
+        }
+        Some(_) => Ok(value),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -320,7 +336,7 @@ pub struct ApprovalRequest {
     pub expires_in_seconds: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum InboundMessage {
     #[serde(rename = "event")]
@@ -333,11 +349,44 @@ pub enum InboundMessage {
         session_id: Option<String>,
         #[serde(default)]
         history_ref: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_adoption_credential")]
+        adoption_credential: Option<String>,
     },
     #[serde(rename = "interrupt")]
     Interrupt {
         reason: String,
     },
+}
+
+impl std::fmt::Debug for InboundMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Event {
+                r#type,
+                text,
+                user,
+                ts,
+                session_id,
+                history_ref,
+                adoption_credential,
+            } => f
+                .debug_struct("Event")
+                .field("type", r#type)
+                .field("text", text)
+                .field("user", user)
+                .field("ts", ts)
+                .field("session_id", session_id)
+                .field("history_ref", history_ref)
+                .field(
+                    "adoption_credential",
+                    &adoption_credential.as_ref().map(|_| "<redacted>"),
+                )
+                .finish(),
+            Self::Interrupt { reason } => {
+                f.debug_struct("Interrupt").field("reason", reason).finish()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -347,12 +396,16 @@ pub enum OutboundEvent {
     TextDelta {
         #[serde(deserialize_with = "require_compatible_protocol_version")]
         version: String,
+        #[serde(default)]
+        adoption_applied: Option<bool>,
         text: String,
     },
     #[serde(rename = "tool_note")]
     ToolNote {
         #[serde(deserialize_with = "require_compatible_protocol_version")]
         version: String,
+        #[serde(default)]
+        adoption_applied: Option<bool>,
         text: String,
         #[serde(default)]
         tool: Option<String>,
@@ -361,6 +414,8 @@ pub enum OutboundEvent {
     Final {
         #[serde(deserialize_with = "require_compatible_protocol_version")]
         version: String,
+        #[serde(default)]
+        adoption_applied: Option<bool>,
         text: String,
         #[serde(default)]
         status: SessionStatus,
@@ -381,6 +436,8 @@ pub enum OutboundEvent {
     ErrorEvent {
         #[serde(deserialize_with = "require_compatible_protocol_version")]
         version: String,
+        #[serde(default)]
+        adoption_applied: Option<bool>,
         message: String,
         #[serde(default)]
         classification: Option<String>,
@@ -389,6 +446,8 @@ pub enum OutboundEvent {
     SideEffectFlag {
         #[serde(deserialize_with = "require_compatible_protocol_version")]
         version: String,
+        #[serde(default)]
+        adoption_applied: Option<bool>,
         #[serde(default)]
         tool: Option<String>,
         #[serde(default)]
@@ -420,6 +479,7 @@ mod tests {
             approval_granted_tool: None,
             input_tokens: None,
             output_tokens: None,
+            adoption_applied: None,
         };
         let encoded = serde_json::to_string(&event).unwrap();
         let decoded: OutboundEvent = serde_json::from_str(&encoded).unwrap();
@@ -438,6 +498,7 @@ mod tests {
             approval_granted_tool: None,
             input_tokens: None,
             output_tokens: None,
+            adoption_applied: None,
         };
         let encoded = serde_json::to_string(&event).unwrap();
         let decoded: OutboundEvent = serde_json::from_str(&encoded).unwrap();
@@ -453,10 +514,38 @@ mod tests {
             ts: "1.0".to_string(),
             session_id: None,
             history_ref: None,
+            adoption_credential: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn inbound_event_debug_redacts_adoption_credential() {
+        let message = InboundMessage::Event {
+            r#type: EventType::Message,
+            text: "hello".to_string(),
+            user: "U1".to_string(),
+            ts: "1.0".to_string(),
+            session_id: None,
+            history_ref: None,
+            adoption_credential: Some("adoption-credential-fixture-PLACEHOLDER".to_string()),
+        };
+        let rendered = format!("{message:?}");
+        assert!(!rendered.contains("adoption-credential-fixture-PLACEHOLDER"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn inbound_event_rejects_empty_adoption_credential() {
+        let raw = concat!(
+            r#"{"kind":"event","type":"message","text":"hi","user":"U1","ts":"1.0","#,
+            r#""adoption_credential":""}"#
+        );
+        let error = serde_json::from_str::<InboundMessage>(raw).unwrap_err();
+        assert!(error.to_string().contains("malformed adoption credential"));
+        assert!(!error.to_string().contains("adoption-credential-fixture-PLACEHOLDER"));
     }
 
     #[test]
@@ -491,13 +580,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.4.5","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.4.6","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.4.4","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.4.5","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

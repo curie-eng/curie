@@ -31,10 +31,14 @@ The reply is a stream of NDJSON events defined in
 - `error`
 
 An inbound `event` frame carries `{kind, type, text, user, ts}` plus optional,
-nullable `session_id` and `history_ref` strings for conversation-scoped identity.
-Older producers may omit either field independently. Startup configuration is a
-separate, environment-only `SessionConfig`; the per-event fields do not replace
-it.
+nullable `session_id`, `history_ref`, and `adoption_credential` strings.
+`session_id` and `history_ref` are conversation-scoped identity.
+`adoption_credential` is the optional per-conversation runner credential on this
+same authenticated event; omitted or null is the legacy cold path. Older
+producers may omit any of these independently. A successful turn without
+`adoption_applied: true` on the outbound stream is not adoption. Startup
+configuration is a separate, environment-only `SessionConfig`; the per-event
+fields do not replace it.
 
 ## Inside the box
 
@@ -113,7 +117,7 @@ regenerated and committed together it **always goes green**. It pins artifact
 *sync*; it never pinned *compatibility*. Three things carry the contract
 instead:
 
-- **Semver, not a freeze.** `PROTOCOL_VERSION` is `0.4.4`
+- **Semver, not a freeze.** `PROTOCOL_VERSION` is `0.4.5`
   ([`packages/aci-protocol/src/aci_protocol/version.py`](../../packages/aci-protocol/src/aci_protocol/version.py)),
   versioned independently of the Curie release. Under 0.x a consumer accepts
   the same `major.minor`; only a new optional field is compatible (patch), and
