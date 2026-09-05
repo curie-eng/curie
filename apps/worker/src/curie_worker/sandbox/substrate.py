@@ -26,6 +26,7 @@ import logging
 import secrets
 import time
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 from aci_protocol import BootEnv
@@ -92,6 +93,33 @@ logger = logging.getLogger(__name__)
 # sandbox, and the next claim() takes the existing _evict_stale path, which
 # drops the stale route and rebinds. Slow turn, not corruption.
 REAP_GRACE_MARGIN_SECONDS = 30.0
+
+
+def _poll_sleeps(config: SubstrateConfig) -> Iterator[float]:
+    """Yield the successive sleep lengths for ONE substrate wait loop.
+
+    The first ``poll_fast_polls`` sleeps are the configured interval, so the
+    warm-pool fast path polls exactly as often as the old fixed loop did; after
+    that each sleep grows by ``poll_backoff_factor`` up to the cap. The result
+    is that a cold boot costs tens of ``get_claim``/``get_sandbox`` calls rather
+    than hundreds, without making a warm bind any slower to notice.
+
+    Each wait loop takes its own generator, so the serviceFQDN phase restarts at
+    the fast interval: it begins the moment the claim binds, which is exactly
+    when the sandbox address is about to appear, and inheriting the bind phase's
+    backed-off interval would add half a second to every cold claim.
+
+    The generator is deliberately clock-free. Bounding a sleep by the shared
+    deadline is the caller's job, because only the caller knows the deadline.
+    """
+
+    interval = config.poll_interval_seconds
+    cap = max(config.poll_interval_max_seconds, config.poll_interval_seconds)
+    for _ in range(max(0, config.poll_fast_polls)):
+        yield interval
+    while True:
+        interval = min(interval * config.poll_backoff_factor, cap)
+        yield interval
 
 
 def _sandbox_attributes(operation: str, outcome: str) -> dict[str, str]:
@@ -604,6 +632,7 @@ class SandboxSubstrate:
         last_quota_rejection = None
         last_ready_condition: tuple[str | None, str | None] | None = None
         consecutive_quota = 0
+        sleeps = _poll_sleeps(self._config)
         while time.monotonic() < deadline:
             claim = self._k8s.get_claim(claim_name)
             if claim is not None:
@@ -622,7 +651,10 @@ class SandboxSubstrate:
                     last_ready_condition = (claim.ready_reason, claim.ready_message)
                 if claim.ready and claim.sandbox_name:
                     return claim.sandbox_name
-            time.sleep(self._config.poll_interval_seconds)
+            # Clamped to the time left in the shared budget: an unclamped
+            # backed-off sleep would overshoot the deadline by up to the cap and
+            # steal that much from the serviceFQDN phase downstream.
+            time.sleep(max(0.0, min(next(sleeps), deadline - time.monotonic())))
         if last_quota_rejection is not None:
             raise CapacityExhaustedError(last_quota_rejection)
         condition_detail = "no Ready condition was observed"
@@ -635,11 +667,12 @@ class SandboxSubstrate:
         )
 
     def _await_service_fqdn(self, sandbox_name: str, deadline: float) -> SandboxView:
+        sleeps = _poll_sleeps(self._config)
         while time.monotonic() < deadline:
             sandbox = self._k8s.get_sandbox(sandbox_name)
             if sandbox is not None and sandbox.service_fqdn:
                 return sandbox
-            time.sleep(self._config.poll_interval_seconds)
+            time.sleep(max(0.0, min(next(sleeps), deadline - time.monotonic())))
         raise ClaimTimeoutError(
             f"sandbox {sandbox_name} has no serviceFQDN within "
             f"{self._config.claim_timeout_seconds}s (is spec.service true in the template?)"

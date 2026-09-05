@@ -836,3 +836,259 @@ def test_resume_merges_caller_boot_env(
     assert env[HISTORY_ENV] == "h-42"
     # The caller's mapping is not mutated.
     assert SESSION_ENV not in boot_env
+
+
+# --- Bind/serviceFQDN poll backoff -------------------------------------------
+# These run on a SIMULATED clock: the substrate's ``time`` module is swapped for
+# a fake whose ``sleep`` advances a virtual counter instead of waiting, so a 10s
+# cold boot is asserted exactly and instantly. Wall clock would make the cadence
+# assertions jitter-dependent and the suite ten seconds slower per case. The
+# reaper tests above swap ``substrate.datetime`` the same way.
+
+
+class _VirtualClock:
+    """A monotonic clock whose ``sleep`` advances time rather than passing it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _production_poll_config(key_prefix: str) -> SubstrateConfig:
+    """The SHIPPED poll defaults, on a per-test Valkey prefix.
+
+    The ``config`` fixture runs a 5ms interval and a 2s budget to keep the other
+    tests fast; asserting the cadence against that would prove nothing about
+    what operators actually run.
+    """
+
+    return SubstrateConfig(
+        namespace="test-ns",
+        warm_pool="test-pool",
+        key_prefix=key_prefix,
+        claim_timeout_seconds=90.0,
+    )
+
+
+class _VirtualBindClient(FakeSandboxClient):
+    """Binds its claim once the VIRTUAL clock passes ``bind_after_seconds``.
+
+    Every ``get_claim`` records the virtual instant it was made, which is the
+    poll cadence the backoff exists to shape.
+    """
+
+    def __init__(self, clock: _VirtualClock, bind_after_seconds: float) -> None:
+        super().__init__()
+        self.clock = clock
+        self.bind_after_seconds = bind_after_seconds
+        self.poll_times: list[float] = []
+
+    def get_claim(self, name: str) -> ClaimView | None:
+        claim = self.claims.get(name)
+        if claim is None:
+            return None
+        self.poll_times.append(self.clock.now)
+        ready = self.clock.now >= self.bind_after_seconds
+        return ClaimView(
+            name=claim.name,
+            ready=ready,
+            sandbox_name=claim.sandbox_name if ready else None,
+            created_at=claim.created_at,
+            quota_rejection=None,
+            ready_reason=None,
+            ready_message=None,
+        )
+
+
+class _VirtualFqdnClient(FakeSandboxClient):
+    """Binds immediately, but publishes no serviceFQDN until the virtual clock
+    passes ``fqdn_after_seconds`` -- the phase-2 shape of a cold boot."""
+
+    def __init__(self, clock: _VirtualClock, fqdn_after_seconds: float) -> None:
+        super().__init__()
+        self.clock = clock
+        self.fqdn_after_seconds = fqdn_after_seconds
+        self.sandbox_polls: list[float] = []
+
+    def get_sandbox(self, name: str) -> SandboxView | None:
+        view = super().get_sandbox(name)
+        if view is None:
+            return None
+        self.sandbox_polls.append(self.clock.now)
+        if self.clock.now >= self.fqdn_after_seconds:
+            return view
+        return SandboxView(
+            name=view.name,
+            ready=view.ready,
+            service_fqdn="",
+            operating_mode=view.operating_mode,
+            port=view.port,
+        )
+
+
+def test_bind_polling_backs_off_over_a_cold_boot(
+    affinity: AffinityStore, key_prefix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A cold create (pod scheduling, init containers, runner boot) takes ~10s.
+    # The old fixed 50ms loop asks the apiserver about the claim ~200 times over
+    # that window, per claim; the backoff must bring that down to tens while
+    # still actually polling.
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _VirtualBindClient(clock, bind_after_seconds=10.0)
+    substrate = SandboxSubstrate(fake_k8s, affinity, _production_poll_config(key_prefix))
+
+    handle = substrate.claim("T1")
+
+    assert handle.sandbox_name in fake_k8s.sandboxes
+    assert len(fake_k8s.poll_times) <= 40
+    # The lower bound keeps the upper one honest: a loop that stopped polling
+    # altogether would also satisfy "at most 40".
+    assert len(fake_k8s.poll_times) >= 10
+
+
+def test_warm_bind_polls_at_the_unchanged_fast_interval(
+    affinity: AffinityStore, key_prefix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The warm-pool path is the one the backoff must not tax. A bind at 200ms is
+    # inside the fast window, so the poll instants are exactly the ones the old
+    # fixed loop produced and the claim binds on the very same poll.
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _VirtualBindClient(clock, bind_after_seconds=0.2)
+    substrate = SandboxSubstrate(fake_k8s, affinity, _production_poll_config(key_prefix))
+
+    handle = substrate.claim("T1")
+
+    assert fake_k8s.poll_times == pytest.approx([0.0, 0.05, 0.10, 0.15, 0.20])
+    assert handle.sandbox_name in fake_k8s.sandboxes
+
+
+def test_service_fqdn_polling_backs_off_over_a_cold_boot(
+    affinity: AffinityStore, key_prefix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Phase 2 has its own wait loop and therefore its own call volume: a bound
+    # sandbox whose address takes 10s to publish must not cost ~200 get_sandbox
+    # calls either.
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _VirtualFqdnClient(clock, fqdn_after_seconds=10.0)
+    substrate = SandboxSubstrate(fake_k8s, affinity, _production_poll_config(key_prefix))
+
+    handle = substrate.claim("T1")
+
+    assert handle.service_fqdn.endswith(".svc.cluster.local")
+    assert len(fake_k8s.sandbox_polls) <= 40
+    assert len(fake_k8s.sandbox_polls) >= 10
+
+
+def test_backoff_is_capped_and_never_overshoots_the_claim_budget(
+    affinity: AffinityStore, key_prefix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two bounds that together stop the backoff from turning into a stall: no
+    # single sleep exceeds the cap, and the last sleep is clamped to whatever is
+    # left of the shared deadline, so a claim that never binds still times out
+    # at claim_timeout_seconds rather than a cap-length overshoot past it.
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    # 90.0s lands the backoff grid (6 x 0.05, then 0.1 + 0.2 + 0.4, then 0.5
+    # steps) exactly on the deadline, so the clamp would never fire and the
+    # test would pass even with the ``min(..., deadline - now)`` clamp
+    # deleted. 90.3 leaves a 0.3s remainder, smaller than
+    # poll_interval_max_seconds, so only the clamp can produce the final sleep.
+    config = replace(_production_poll_config(key_prefix), claim_timeout_seconds=90.3)
+    fake_k8s = _VirtualBindClient(clock, bind_after_seconds=float("inf"))
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    with pytest.raises(ClaimTimeoutError):
+        substrate.claim("T1")
+
+    assert max(clock.sleeps) <= config.poll_interval_max_seconds
+    # The clamp is what produced this final sleep: an unclamped backoff would
+    # have kept it at the cap instead of shortening it.
+    assert clock.sleeps[-1] < config.poll_interval_max_seconds
+    assert clock.now == pytest.approx(config.claim_timeout_seconds)
+    # The claim that never bound is still cleaned up.
+    assert fake_k8s.deleted == fake_k8s.created
+
+
+class _VirtualBindThenFqdnClient(FakeSandboxClient):
+    """Binds its claim at ``bind_after_seconds`` and only then starts
+    publishing serviceFQDN, from ``fqdn_after_seconds``.
+
+    Records both poll streams (``poll_times`` for get_claim, ``sandbox_polls``
+    for get_sandbox, matching ``_VirtualBindClient`` and ``_VirtualFqdnClient``
+    above) so a test can check the FQDN loop's own cadence rather than only
+    the combined outcome. A standalone subclass rather than multiple
+    inheritance from those two: both override ``__init__`` with a zero-arg
+    ``super().__init__()``, and combining them would route that call into the
+    sibling's ``__init__``, which needs its own positional args.
+    """
+
+    def __init__(
+        self, clock: _VirtualClock, bind_after_seconds: float, fqdn_after_seconds: float
+    ) -> None:
+        super().__init__()
+        self.clock = clock
+        self.bind_after_seconds = bind_after_seconds
+        self.fqdn_after_seconds = fqdn_after_seconds
+        self.poll_times: list[float] = []
+        self.sandbox_polls: list[float] = []
+
+    def get_claim(self, name: str) -> ClaimView | None:
+        claim = self.claims.get(name)
+        if claim is None:
+            return None
+        self.poll_times.append(self.clock.now)
+        ready = self.clock.now >= self.bind_after_seconds
+        return ClaimView(
+            name=claim.name,
+            ready=ready,
+            sandbox_name=claim.sandbox_name if ready else None,
+            created_at=claim.created_at,
+            quota_rejection=None,
+            ready_reason=None,
+            ready_message=None,
+        )
+
+    def get_sandbox(self, name: str) -> SandboxView | None:
+        view = super().get_sandbox(name)
+        if view is None:
+            return None
+        self.sandbox_polls.append(self.clock.now)
+        if self.clock.now >= self.fqdn_after_seconds:
+            return view
+        return SandboxView(
+            name=view.name,
+            ready=view.ready,
+            service_fqdn="",
+            operating_mode=view.operating_mode,
+            port=view.port,
+        )
+
+
+def test_service_fqdn_polling_restarts_fast_after_a_cold_bind(
+    affinity: AffinityStore, key_prefix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The bind phase backs off all the way to the 500ms cap over its 10s cold
+    # boot. The FQDN phase must not inherit that backed-off interval: its own
+    # generator starts fresh, so its first sleep is the fast 50ms interval, not
+    # a leftover 500ms from phase 1.
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _VirtualBindThenFqdnClient(
+        clock, bind_after_seconds=10.0, fqdn_after_seconds=10.05
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, _production_poll_config(key_prefix))
+
+    handle = substrate.claim("T1")
+
+    assert fake_k8s.sandbox_polls == pytest.approx([10.0, 10.05])
+    assert handle.service_fqdn.endswith(".svc.cluster.local")
