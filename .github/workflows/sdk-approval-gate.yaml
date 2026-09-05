@@ -1,29 +1,9 @@
 name: SDK approval-gate live proof
 
-# The approval gate has escaped to production three times (#245, #453, #1852).
-# Every automated proof in the tree -- runner/tests/test_approval_gate_enforcement.py,
-# runner/tests/test_gate_shadowing.py, and (as of #2094) the live ladder case
-# case_live_approval_gate_denies -- sits behind FakeModelSession or, for the
-# live case, behind the nightly's cron trigger. None of them re-run on the
-# event that actually produces the regression class #1852 fixed: a bump of
-# `claude-agent-sdk`, the third-party dependency that owns how the real Claude
-# Agent SDK dispatches permission rules against a real model. FakeModelSession
-# cannot exhibit either failure mode (the prose-only-deny hang, or the
-# executed-anyway race) because both are properties of the real SDK's
-# scheduling against a real model, not of anything this repo's code decides.
-#
-# `runner/pyproject.toml` declares `claude-agent-sdk>=0.2.135` -- a floor, not
-# a pin -- and Dependabot groups every Python bump into one weekly PR whose
-# only gate is the offline fake suite above. So today, a `claude-agent-sdk`
-# bump that reintroduces #1852 merges on green CI and is only caught by the
-# next 08:00 UTC nightly, or by a human noticing in production.
-#
-# This workflow closes that gap without paying live-model cost on every PR:
-# `detect` (job below) is a cheap, no-build TOML diff that fires only when the
-# `claude-agent-sdk` entry in `uv.lock` actually changed (tools/sdk-lock-gate);
-# the live job runs the SAME skill-tier ladder case the nightly runs, live,
-# but only when `detect` says so. See the plan at
-# .projects/plans/task-2094-live-approval-gate.md for the full design record.
+# Real SDK scheduling can regress when the SDK lock entry or Curie's named
+# approval/catalog enforcement paths change (#2094, #2308). Keep detection cheap
+# and exact; unrelated runner work and unrelated dependency bumps cost no model
+# run. This workflow is path-triggered, never a globally required PR check.
 
 on:
   pull_request:
@@ -31,20 +11,38 @@ on:
     paths:
       - "uv.lock"
       - ".github/workflows/sdk-approval-gate.yaml"
-      - "tools/sdk-lock-gate/**"
+      - "tools/sdk-lock-gate/detect.py"
+      - "tools/sdk-lock-gate/run-proof.py"
+      - "tools/sdk-lock-gate/tests/test_approval_paths.py"
+      - "tools/sdk-lock-gate/tests/test_live_proof_consumer.py"
+      - "tools/sdk-lock-gate/tests/test_sdk_lock_gate.py"
+      - "runner/src/curie_runner/__main__.py"
+      - "runner/src/curie_runner/adapter.py"
+      - "runner/src/curie_runner/approval.py"
+      - "runner/src/curie_runner/config.py"
+      - "runner/src/curie_runner/connectors.py"
+      - "runner/src/curie_runner/hooks.py"
+      - "runner/src/curie_runner/session.py"
+      - "runner/tests/fixtures/mcp_tool_capability_server.py"
+      - "runner/tests/test_approval.py"
+      - "runner/tests/test_approval_gate_enforcement.py"
+      - "runner/tests/test_connectors.py"
+      - "runner/tests/test_gate_e2e.py"
+      - "runner/tests/test_gate_shadowing.py"
+      - "runner/tests/test_hooks.py"
+      - "runner/tests/test_hosted_mcp_approval_catalog.py"
+      - "runner/tests/test_ladder_approval_gate_case.py"
+      - "runner/tests/test_live.py"
+      - "runner/tests/test_mcp_tool_capability.py"
 
 permissions:
   contents: read
 
 jobs:
-  # Cheap and cacheless: no build, no Docker, no credential. Materializes the
-  # base and head uv.lock and asks the pure detector in tools/sdk-lock-gate
-  # whether the resolved claude-agent-sdk entry (or any other line naming it)
-  # actually changed. Fails open (reports changed=true) on anything it cannot
-  # parse -- a missing base file, malformed TOML -- because this gate must
-  # never silently go dark; over-triggering only costs one live run.
+  # The lock fingerprint preserves #2094. Malformed locks demand a live proof;
+  # unreadable git/path detection fails the cheap job and cannot emit a skip.
   detect:
-    name: Detect a claude-agent-sdk lock change
+    name: Detect SDK or approval policy changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -54,35 +52,36 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      # fetch-depth: 0 pulls this PR's own ref history; the base branch tip
-      # is not guaranteed to be present locally until fetched explicitly.
-      - name: Fetch the base ref
-        run: git fetch origin "${{ github.base_ref }}"
-      # git show can fail legitimately (uv.lock did not exist on the base --
-      # e.g. it was just added). Do not let that fail the step: leave old.lock
-      # absent and let the detector's own fail-open rule (old_text is None ->
-      # changed=true) decide, per tools/sdk-lock-gate's contract.
-      - name: Materialize the base and head uv.lock
+      - name: Materialize the exact PR change and lock inputs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          if git show "origin/${{ github.base_ref }}:uv.lock" > old.lock 2>/dev/null; then
-            echo "base uv.lock materialized"
-          else
-            rm -f old.lock
-            echo "uv.lock is absent on the base ref; the detector treats this as a change (fail-open)"
-          fi
+          git cat-file -e "$BASE_SHA^{commit}"
+          git cat-file -e "$HEAD_SHA^{commit}"
+          git diff --name-only --no-renames -z "$BASE_SHA...$HEAD_SHA" > changed-paths
+          # Absent locks retain #2094's conservative run-proof decision.
+          for side in old new; do
+            if [[ "$side" == old ]]; then ref="$BASE_SHA"; else ref="$HEAD_SHA"; fi
+            if git cat-file -e "$ref:uv.lock" 2>/dev/null; then
+              git show "$ref:uv.lock" > "$side.lock"
+            else
+              rm -f "$side.lock"
+            fi
+          done
       - id: detect
-        name: Compare the claude-agent-sdk lock entry
-        run: python3 tools/sdk-lock-gate/detect.py --old-file old.lock --new-file uv.lock
+        name: Compare the SDK entry and named enforcement paths
+        run: python3 tools/sdk-lock-gate/detect.py --old-file old.lock --new-file new.lock --changed-paths-file changed-paths
 
   # Runs the SAME skill-tier live case the nightly runs
   # (case_live_approval_gate_denies in cli/scripts/e2e-ladder.sh, #2094), on
-  # demand, only when detect says the claude-agent-sdk entry actually moved.
+  # demand, only when detect says the SDK entry or a named enforcement path moved.
   # Gated on BOTH `needs: [detect]` and the `if:` below -- needs alone still
   # runs this job (skipped or not) on every uv.lock touch; the if: alone,
   # without needs, would evaluate before detect's output exists.
   live-approval-gate:
-    name: Live approval-gate proof (claude-agent-sdk changed)
+    name: Live approval-gate proof (SDK or approval policy changed)
     needs: [detect]
     if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
@@ -130,7 +129,7 @@ jobs:
             {
               echo "### SDK approval-gate live proof DID NOT RUN -- this check is red on purpose"
               echo ""
-              echo "This PR changes the \`claude-agent-sdk\` entry in \`uv.lock\`. That dependency owns how the real Claude Agent SDK dispatches permission rules against a real model, so it is the one change that can reintroduce the approval-gate escapes of #245, #453 and #1852 -- and no offline fake-model test in this repo can detect either failure mode."
+              echo "This PR changes the SDK lock entry or a named approval/catalog enforcement path. Those changes can regress real SDK permission dispatch; offline fake-model tests cannot establish the live proof."
               echo ""
               echo "The live approval-gate proof could not run: **no model credential was available to this run**. \`OPENROUTER_API_KEY\` is empty here, which happens for a fork PR (a \`pull_request\` run from a fork is never issued repository secrets) and for a Dependabot PR (those runs read the separate Dependabot secret store). Re-running this same workflow will not change that."
               echo ""
@@ -195,4 +194,4 @@ jobs:
           CURIE_E2E_LIVE: "1"
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: z-ai/glm-5.2
-        run: bash cli/scripts/e2e-ladder.sh
+        run: python3 tools/sdk-lock-gate/run-proof.py

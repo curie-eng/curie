@@ -17,6 +17,10 @@ mean different bytes execute the permission dispatch, and all of them return ``T
 For the same reason the detector fails **open**: a missing side or a lock that is not valid
 TOML returns ``True``. A corrupt lock is somebody else's CI failure and must never silently
 disarm this gate.
+
+The workflow also supplies git changed paths (#2308). Named approval and MCP
+enforcement paths force the proof with an unchanged lock; unrelated paths do not.
+Malformed path input fails detection, never a successful changed=false skip.
 """
 
 from __future__ import annotations
@@ -30,6 +34,58 @@ from typing import Any
 
 SDK_NAME = "claude-agent-sdk"
 PACKAGE_HEADER = "[[package]]"
+
+# Exact enforcement and catalog observation paths, not all runner changes (#2308).
+# The workflow's outer paths mirror these; consumer tests pin both boundaries.
+APPROVAL_PATHS = frozenset(
+    {
+        "runner/src/curie_runner/approval.py",
+        "runner/src/curie_runner/adapter.py",
+        "runner/src/curie_runner/__main__.py",
+        "runner/src/curie_runner/connectors.py",
+        "runner/src/curie_runner/hooks.py",
+        "runner/src/curie_runner/config.py",
+        "runner/src/curie_runner/session.py",
+        "runner/tests/test_approval.py",
+        "runner/tests/test_approval_gate_enforcement.py",
+        "runner/tests/test_gate_shadowing.py",
+        "runner/tests/test_gate_e2e.py",
+        "runner/tests/test_hooks.py",
+        "runner/tests/test_connectors.py",
+        "runner/tests/test_mcp_tool_capability.py",
+        "runner/tests/test_hosted_mcp_approval_catalog.py",
+        "runner/tests/test_live.py",
+        "runner/tests/test_ladder_approval_gate_case.py",
+        "runner/tests/fixtures/mcp_tool_capability_server.py",
+        ".github/workflows/sdk-approval-gate.yaml",
+        "tools/sdk-lock-gate/detect.py",
+        "tools/sdk-lock-gate/run-proof.py",
+        "tools/sdk-lock-gate/tests/test_approval_paths.py",
+        "tools/sdk-lock-gate/tests/test_live_proof_consumer.py",
+        "tools/sdk-lock-gate/tests/test_sdk_lock_gate.py",
+    }
+)
+
+
+def approval_paths_changed(path: Path) -> bool:
+    """Consume git's NUL terminated path stream, including deleted/renamed paths.
+
+    Invalid or unreadable input raises, making detect fail instead of emitting a
+    successful skip. Empty is git's valid representation of no changed files.
+    """
+    raw = path.read_bytes()
+    if raw and not raw.endswith(b"\0"):
+        raise ValueError("changed paths must be NUL terminated")
+    paths = raw[:-1].decode("utf-8").split("\0") if raw else []
+    for name in paths:
+        if (
+            not name
+            or name.startswith("/")
+            or any(part in {".", "..", ""} for part in name.split("/"))
+        ):
+            raise ValueError("changed paths contain an invalid repository path")
+    return any(name in APPROVAL_PATHS for name in paths)
+
 
 # (parsed SDK tables, sorted other lines naming the SDK). Comparable, not hashable:
 # the tables stay nested dicts and are compared with ``==``, never hashed.
@@ -144,12 +200,17 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--old-file", required=True, type=Path)
     parser.add_argument("--new-file", required=True, type=Path)
+    parser.add_argument("--changed-paths-file", type=Path)
     return parser
 
 
 def _run() -> None:
     args = _parser().parse_args()
     changed = sdk_entry_changed(_read(args.old_file), _read(args.new_file))
+    if args.changed_paths_file is not None:
+        # Always parse even if the SDK moved: malformed detect input is a failure.
+        policy_changed = approval_paths_changed(args.changed_paths_file)
+        changed = changed or policy_changed
 
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
@@ -159,7 +220,7 @@ def _run() -> None:
 
 
 def main() -> int:
-    """Write the verdict and always exit 0; the workflow reads the output, not the code."""
+    """Write the verdict; unreadable detection input fails the workflow job."""
     _run()
     return 0
 
