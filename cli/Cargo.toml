@@ -75,7 +75,7 @@ rpassword = "7.5.4"
 # `PluginManifest` field in Rust. Default features pull reqwest + a second TLS
 # stack for remote `$ref` resolution neither use case needs; the committed
 # schemas are self-contained, so keep it lean.
-jsonschema = { version = "0.51", default-features = false }
+jsonschema = { version = "0.52", default-features = false }
 serde_norway = "0.9.42"
 crypto_box = { version = "0.9.1", features = ["seal", "std"] }
 base64 = "0.23.1"
