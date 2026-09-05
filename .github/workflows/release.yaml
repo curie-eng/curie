@@ -618,7 +618,7 @@ jobs:
       # a binary scan would need. Scanning the cli/ tree instead would also drag in
       # cli/target/, which the build step above has just filled with rlibs (#629).
       - name: Generate the CLI SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           file: cli/Cargo.lock
           format: spdx-json
@@ -664,7 +664,7 @@ jobs:
       # today -- that is #62, still open. Do not read this as coverage existing
       # elsewhere; it does not yet.
       - name: Generate the chart SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           file: dist/curie-${{ steps.ver.outputs.v }}.tgz
           format: spdx-json
@@ -672,7 +672,7 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
       - name: Generate the compose SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           file: dist/compose.release.yaml
           format: spdx-json
@@ -799,7 +799,7 @@ jobs:
       # after would mean an unverifiable release is already installed by the time
       # the workflow goes red (#629).
       - name: Create draft release with generated notes
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           # Everything staged in dist is published: assets, their SBOMs, the
           # checksum manifest, and its signature.
