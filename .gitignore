@@ -99,3 +99,14 @@ apps/ui/src/generated/
 
 # Cross-build output for the linux/arm64 CLI (docker buildx / rust image).
 cli/target-linux-*/
+
+# Agent bundles scaffolded at the REPO ROOT by `curie init` while trying the app
+# out. Somebody's scratch copy of an agent, not part of this repo; two of them
+# reached a commit by accident during a demo recording.
+#
+# Both rules are root-anchored, which is the point: `examples/squawk` is a real
+# committed example and the eval falsifiability gate reads its cases. Only a
+# bundle left loose at the root is scratch.
+/squawk/
+/test/
+
