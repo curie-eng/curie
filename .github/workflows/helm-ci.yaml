@@ -316,6 +316,21 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/langfuse-worker-probe-assertions.sh
 
+      # Prove the probe-window invariant across the WHOLE render, not a named
+      # list: for every container carrying both probes, the liveness failure
+      # cutoff -- initialDelaySeconds + (failureThreshold - 1) * periodSeconds,
+      # kubelet defaults applied to omitted keys -- must be strictly LATER than
+      # the readiness one, or the kubelet restarts a container that is still
+      # inside the boot window readiness was sized to tolerate. postgres (WAL
+      # replay), langfuse-web and langfuse-worker (Prisma/ClickHouse boot
+      # migrations) and api all inverted the two probes. Also requires an
+      # explicit livenessProbe timeoutSeconds everywhere, since the kubelet's
+      # invisible 1s default is the silent half of the postgres case.
+      - name: helm render assertions (probe windows)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/probe-window-assertions.sh
+
       # Prove the controller NetworkPolicy RBAC split (issue #350): exactly one
       # read-only cluster grant (get/list/watch) so the informer syncs, no
       # cluster-wide mutate anywhere (#66 guarded), namespaced mutate intact, and

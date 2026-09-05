@@ -32,8 +32,8 @@
 #     couples the worker's LIFE to Postgres and Valkey. The worker is
 #     `replicas: 1` with `strategy: Recreate` and runs Prisma/ClickHouse boot
 #     migrations at container start, and init containers do NOT re-run on a
-#     liveness restart. So a store blip of roughly two minutes
-#     (`failureThreshold: 6` x `periodSeconds: 20`) would kill the only replica
+#     liveness restart. So a store blip of roughly five minutes
+#     (`failureThreshold: 15` x `periodSeconds: 20`) would kill the only replica
 #     and restart it straight into boot migrations against a sick Postgres --
 #     reproducing the exact Prisma `P1001` / `BackOff` class this ticket exists
 #     to stop, with the readiness gate powerless to help. Chart precedent is
@@ -49,9 +49,15 @@
 #   is liveness's only job here, deliberately.
 #
 # `timeoutSeconds` is asserted BY NAME on both probes: the kubelet default is
-# 1s, and `langfuse-web`'s block (the obvious thing to copy) omits the key. A
-# 1s timeout against an endpoint that runs a Prisma query plus a Redis ping is
-# a restart loop waiting to happen.
+# 1s, and a 1s timeout against an endpoint that runs a Prisma query plus a Redis
+# ping is a restart loop waiting to happen.
+#
+# The cadence numbers below are the chart DEFAULTS, which now come from
+# `langfuse.worker.readinessProbe.*` / `.livenessProbe.*` in values.yaml rather
+# than from literals in the template. This script pins those defaults by value.
+# The invariant that survives an operator OVERRIDE -- every container's liveness
+# failure cutoff strictly outlasting its readiness cutoff -- is pinned separately
+# by ci/probe-window-assertions.sh.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -137,7 +143,7 @@ if "httpGet" in liveness:
         f"/api/ready run a Prisma SELECT 1 and a Redis ping, so an HTTP liveness probe couples the "
         f"worker's LIFE to Postgres and Valkey. The worker is replicas:1 + Recreate and runs boot "
         f"migrations at container start, and init containers do NOT re-run on a liveness restart -- "
-        f"so a ~2 minute store blip would restart the single replica straight into boot migrations "
+        f"so a ~5 minute store blip would restart the single replica straight into boot migrations "
         f"against a sick Postgres, which is the exact P1001/BackOff class #2330 exists to stop. Use "
         f"tcpSocket:3030"
     )
@@ -165,7 +171,7 @@ EXPECTED = {
         "initialDelaySeconds": 90,
         "periodSeconds": 20,
         "timeoutSeconds": 5,
-        "failureThreshold": 6,
+        "failureThreshold": 15,
     }),
 }
 for probe_name, (probe, expected) in EXPECTED.items():
@@ -174,9 +180,8 @@ for probe_name, (probe, expected) in EXPECTED.items():
             reason = ""
             if field == "timeoutSeconds":
                 reason = (
-                    " -- the kubelet default is 1s, and langfuse-web's block (the obvious thing to "
-                    "copy) omits the key; 1s against an endpoint running a Prisma query plus a Redis "
-                    "ping is a restart loop"
+                    " -- the kubelet default is 1s, an omitted key is invisible in the manifest, and "
+                    "1s against an endpoint running a Prisma query plus a Redis ping is a restart loop"
                 )
             raise SystemExit(
                 f"{probe_name} does not declare {field} explicitly{reason}"
@@ -185,7 +190,7 @@ for probe_name, (probe, expected) in EXPECTED.items():
             raise SystemExit(
                 f"{probe_name}.{field} is {probe[field]!r}, expected {value!r}"
             )
-print("  ok: readiness cadence 20/10/5/30 and liveness cadence 90/20/5/6, both with an explicit timeoutSeconds")
+print("  ok: readiness cadence 20/10/5/30 and liveness cadence 90/20/5/15, both with an explicit timeoutSeconds")
 PY
 
 python3 "$TMP/assert.py" "$TMP/default.yaml"
@@ -219,7 +224,7 @@ elif mutation == "liveness-http-health":
         "initialDelaySeconds": 90,
         "periodSeconds": 20,
         "timeoutSeconds": 5,
-        "failureThreshold": 6,
+        "failureThreshold": 15,
     }
 elif mutation == "readiness-health":
     worker.setdefault("readinessProbe", {}).setdefault("httpGet", {})["path"] = "/api/health"

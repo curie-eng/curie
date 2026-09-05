@@ -42,34 +42,37 @@ component and rail detail in `charts/curie/README.md`.
     strategy values key**. Pinned by `ci/langfuse-recreate-assertions.sh`.
     Horizontal scale for Langfuse needs an Accepted out-of-band migrator; when
     that lands, this exception is removed rather than extended.
-  - **Third named exception: `langfuse-worker`'s probe cadences, also in
-    `templates/langfuse.yaml`.** Its `readinessProbe`/`livenessProbe` cadence
-    numbers (#2330) -- `initialDelaySeconds`, `periodSeconds`,
-    `timeoutSeconds`, `failureThreshold` -- are hardcoded to match
-    `langfuse-web`'s, three blocks above in the same file, instead of reading
-    from new `langfuse.worker.readinessProbe.*` / `.livenessProbe.*` values
-    keys. The probe types and endpoints deliberately differ from web's
-    (worker readiness is `httpGet /api/ready`, liveness is `tcpSocket`; web
-    uses `httpGet /api/public/health` for both -- see the liveness rationale
-    below) -- only the cadence numbers follow web. This is a knowing
-    deviation, not a claim that the invariant does not apply: this ticket
-    exists *because* `langfuse-web` and `langfuse-worker` had diverged (web
-    alone had the Postgres readiness gate), and adding values-driven probe
-    keys for the worker while `langfuse-web`'s probes stay hardcoded in the
-    same file would create a new asymmetry in the very file the ticket is
-    about. It is also not a new hole in the chart: every other long-running
-    Deployment already
-    hardcodes its probe numbers -- `api.yaml`, `ui.yaml`, `postgres.yaml`,
-    `clickhouse.yaml`, `valkey.yaml`, `rustfs.yaml`, `otel-collector.yaml`,
-    `mail-adapter.yaml`, `inference.yaml`, and the `curie.heartbeatProbes`
-    helper (used by `worker.yaml` and `dispatcher.yaml`) -- so `langfuse-web`
-    itself was already inside this exception before #2330. The only K8s Probes
-    genuinely driven by values in this chart are
-    `agentSandbox.runner.readinessProbe`, because its cadence couples to the
-    worker's claim-timeout budget, and `dispatcher.startupProbe`; nothing here
-    couples the same way. The correct end state is lifting `langfuse-web` and
-    `langfuse-worker` onto values-driven probes together, tracked as a separate
-    follow-up -- not extended piecemeal from this ticket.
+  - **Probe handlers stay in the template; probe cadences live in values.**
+    The probe *handler* -- `exec` / `httpGet` path / `tcpSocket` port -- is a
+    correctness choice about the image, not an environment knob, so it is
+    hardcoded in `templates/` on purpose (`langfuse-worker`'s `tcpSocket`
+    liveness is load-bearing, #2330; see the liveness invariant below). The
+    *cadence* keys -- `initialDelaySeconds`, `periodSeconds`, `timeoutSeconds`,
+    `failureThreshold` -- are sizing, so they read from values:
+    `postgres.readinessProbe`/`.livenessProbe`,
+    `langfuse.web.readinessProbe`/`.livenessProbe`,
+    `langfuse.worker.readinessProbe`/`.livenessProbe`, and
+    `api.readinessProbe`/`.livenessProbe`, alongside the pre-existing
+    `agentSandbox.runner.readinessProbe` and `dispatcher.startupProbe`. On top of
+    that: **on every container carrying both probes, the liveness failure cutoff
+    must strictly exceed the readiness one**, where
+    `cutoff = initialDelaySeconds + (failureThreshold - 1) * periodSeconds` and
+    omitted keys take the kubelet defaults (`periodSeconds: 10`,
+    `failureThreshold: 3`, `timeoutSeconds: 1`). A liveness probe that gives up
+    before readiness has stopped tolerating a slow boot restarts a container that
+    is still legitimately booting -- postgres replaying WAL, Langfuse running its
+    Prisma/ClickHouse boot migrations, the API warming up -- and the restart
+    re-enters the same boot path. Every `livenessProbe` must also declare
+    `timeoutSeconds` explicitly; the kubelet's 1s default is invisible in the
+    manifest and each timed-out probe counts as a failure. Both rules are pinned
+    for *every* rendered container, with no allowlist, by
+    `ci/probe-window-assertions.sh`. The remaining hardcoded probe blocks
+    (`ui.yaml`, `clickhouse.yaml`, `valkey.yaml`, `rustfs.yaml`,
+    `otel-collector.yaml`, `mail-adapter.yaml`, `inference.yaml`, and the
+    `curie.heartbeatProbes` helper used by `worker.yaml` and `dispatcher.yaml`)
+    all satisfy the ordering invariant today; lifting their numbers onto values
+    is a follow-up, and the assertion pins their ordering wherever the numbers
+    live.
 - **The instrumented set is exactly the workloads whose container `env` block
   includes the `curie.env.otel` helper.** That include *is* the boundary -- it
   is not a count and not a list kept in prose, and this rule exists because a

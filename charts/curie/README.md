@@ -133,6 +133,49 @@ helm upgrade curie charts/curie -n curie --reuse-values \
 | `dispatcher.startupProbe.periodSeconds` | `10` | Interval between dispatcher startup probes. |
 | `dispatcher.startupProbe.timeoutSeconds` | `5` | Timeout for each dispatcher startup probe. |
 | `dispatcher.startupProbe.failureThreshold` | `27` | Consecutive failures allowed. With the other defaults, the earliest failure cutoff is 260 seconds. |
+`postgres`, `langfuse.web`, `langfuse.worker`, and `api` each declare a paired
+`readinessProbe`/`livenessProbe`. Every failure cutoff below is
+`initialDelaySeconds + (failureThreshold - 1) * periodSeconds`, and on every one
+of these containers the liveness cutoff must strictly exceed the readiness
+cutoff -- otherwise a container still legitimately booting (WAL recovery,
+Prisma/ClickHouse boot migrations, API warm-up) gets killed and restarted back
+into the same boot path instead of being given time to finish it.
+`ci/probe-window-assertions.sh` enforces this ordering render-wide.
+
+| Value | Default | Meaning |
+| --- | --- | --- |
+| `postgres.readinessProbe.initialDelaySeconds` | `5` | Delay before the first probe. |
+| `postgres.readinessProbe.periodSeconds` | `5` | Probe interval. |
+| `postgres.readinessProbe.timeoutSeconds` | `5` | Per-probe timeout (explicit, never the kubelet 1-second default). |
+| `postgres.readinessProbe.failureThreshold` | `12` | Failures before the container is marked unready; earliest cutoff 60 seconds. |
+| `postgres.livenessProbe.initialDelaySeconds` | `20` | Delay before the first probe. |
+| `postgres.livenessProbe.periodSeconds` | `10` | Probe interval. |
+| `postgres.livenessProbe.timeoutSeconds` | `5` | Per-probe timeout (explicit, never the kubelet 1-second default). |
+| `postgres.livenessProbe.failureThreshold` | `30` | Failures before the container is restarted; earliest cutoff 310 seconds. |
+| `langfuse.web.readinessProbe.initialDelaySeconds` | `20` | Delay before the first probe. |
+| `langfuse.web.readinessProbe.periodSeconds` | `10` | Probe interval. |
+| `langfuse.web.readinessProbe.timeoutSeconds` | `5` | Per-probe timeout (explicit, never the kubelet 1-second default). |
+| `langfuse.web.readinessProbe.failureThreshold` | `30` | Failures before the container is marked unready; earliest cutoff 310 seconds. |
+| `langfuse.web.livenessProbe.initialDelaySeconds` | `90` | Delay before the first probe. |
+| `langfuse.web.livenessProbe.periodSeconds` | `20` | Probe interval. |
+| `langfuse.web.livenessProbe.timeoutSeconds` | `5` | Per-probe timeout (explicit, never the kubelet 1-second default). |
+| `langfuse.web.livenessProbe.failureThreshold` | `15` | Failures before the container is restarted; earliest cutoff 370 seconds. |
+| `langfuse.worker.readinessProbe.initialDelaySeconds` | `20` | Delay before the first probe. |
+| `langfuse.worker.readinessProbe.periodSeconds` | `10` | Probe interval. |
+| `langfuse.worker.readinessProbe.timeoutSeconds` | `5` | Per-probe timeout (explicit, never the kubelet 1-second default). |
+| `langfuse.worker.readinessProbe.failureThreshold` | `30` | Failures before the container is marked unready; earliest cutoff 310 seconds. |
+| `langfuse.worker.livenessProbe.initialDelaySeconds` | `90` | Delay before the first probe. |
+| `langfuse.worker.livenessProbe.periodSeconds` | `20` | Probe interval. |
+| `langfuse.worker.livenessProbe.timeoutSeconds` | `5` | Per-probe timeout (explicit, never the kubelet 1-second default). |
+| `langfuse.worker.livenessProbe.failureThreshold` | `15` | Failures before the container is restarted; earliest cutoff 370 seconds. Deliberately equal to `langfuse.web`'s: same boot migrations, same single-replica constraint. |
+| `api.readinessProbe.initialDelaySeconds` | `5` | Delay before the first probe. |
+| `api.readinessProbe.periodSeconds` | `5` | Probe interval. |
+| `api.readinessProbe.timeoutSeconds` | `3` | Per-probe timeout (explicit, never the kubelet 1-second default). |
+| `api.readinessProbe.failureThreshold` | `24` | Failures before the container is marked unready; earliest cutoff 120 seconds. |
+| `api.livenessProbe.initialDelaySeconds` | `30` | Delay before the first probe. |
+| `api.livenessProbe.periodSeconds` | `15` | Probe interval. |
+| `api.livenessProbe.timeoutSeconds` | `5` | Per-probe timeout (explicit, never the kubelet 1-second default). |
+| `api.livenessProbe.failureThreshold` | `12` | Failures before the container is restarted; earliest cutoff 195 seconds. |
 
 The dispatcher starts its heartbeat only after every boot preflight succeeds.
 Until then, the startup probe gates readiness and liveness so Kubernetes does
@@ -583,6 +626,17 @@ the operators who customized the gate. Move any `--set`s or overlay files from
 `langfuse.web.postgresReadiness.*` to `langfuse.postgresReadiness.*`; the
 alias is removed in a future minor. `helm install`/`upgrade` prints a NOTES.txt
 reminder whenever the deprecated key is still set.
+
+Both Langfuse Deployments read their probe cadences from values
+(`langfuse.web.readinessProbe`/`.livenessProbe` and
+`langfuse.worker.readinessProbe`/`.livenessProbe`); only the probe handlers stay
+in the template, because the handler is a correctness choice about the image
+rather than a sizing knob. On each container the liveness failure cutoff
+(`initialDelaySeconds + (failureThreshold - 1) * periodSeconds`) outlasts the
+readiness cutoff by design -- 370 seconds against 310 -- so the kubelet cannot
+restart a container that is still inside the boot window readiness was sized to
+tolerate. `charts/curie/ci/probe-window-assertions.sh` pins that ordering for
+every container in the rendered chart.
 
 `langfuse-worker` also carries its own `readinessProbe` (`httpGet /api/ready`)
 and `livenessProbe` (`tcpSocket` on the same port 3030) once the container is

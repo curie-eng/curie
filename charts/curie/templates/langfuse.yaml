@@ -143,17 +143,12 @@ spec:
             httpGet:
               path: /api/public/health
               port: 3000
-            initialDelaySeconds: 20
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 30
+            {{- toYaml .Values.langfuse.web.readinessProbe | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /api/public/health
               port: 3000
-            initialDelaySeconds: 90
-            periodSeconds: 20
-            failureThreshold: 6
+            {{- toYaml .Values.langfuse.web.livenessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.langfuse.web.resources | nindent 12 }}
 ---
@@ -230,23 +225,22 @@ spec:
           # liveness restart, so a store blip would restart the only replica
           # straight into those boot migrations against a sick Postgres -- the
           # exact P1001/BackOff class the wait-for-postgres gate exists to stop
-          # (#71, #2330). timeoutSeconds is explicit on both: the kubelet
-          # default is 1s, which langfuse-web's block above silently takes.
+          # (#71, #2330). Cadences for both probes come from
+          # `langfuse.worker.readinessProbe` / `.livenessProbe` in values, as
+          # langfuse-web's block above now does from `langfuse.web.*`: both
+          # Deployments declare `timeoutSeconds` explicitly rather than taking
+          # the kubelet's invisible 1s default, and on each container the
+          # liveness failure cutoff must outlive the readiness one, pinned by
+          # ci/probe-window-assertions.sh.
           readinessProbe:
             httpGet:
               path: /api/ready
               port: 3030
-            initialDelaySeconds: 20
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 30
+            {{- toYaml .Values.langfuse.worker.readinessProbe | nindent 12 }}
           livenessProbe:
             tcpSocket:
               port: 3030
-            initialDelaySeconds: 90
-            periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 6
+            {{- toYaml .Values.langfuse.worker.livenessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.langfuse.worker.resources | nindent 12 }}
 {{- end }}

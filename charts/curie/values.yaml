@@ -260,6 +260,20 @@ langfuse:
     # cap (~512Mi) OOM-crashes under a tight container limit; raise it in step
     # with the memory limit. Empty = leave the image default.
     nodeOptions: "--max-old-space-size=1024"
+    # Probe cadences. Liveness must outlast readiness: this replicas:1 +
+    # Recreate Deployment runs Prisma/ClickHouse boot migrations at container
+    # start, and init containers do NOT re-run on a liveness restart. Cutoffs:
+    # readiness 310s, liveness 370s. Formula/rationale: ci/probe-window-assertions.sh header.
+    readinessProbe:
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 30
+    livenessProbe:
+      initialDelaySeconds: 90
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 15
     # DEPRECATED: langfuse.web.postgresReadiness moved to langfuse.postgresReadiness
     # (#2330), which gates BOTH Langfuse Deployments. Values supplied at the old
     # path are still honoured and are applied to BOTH; the chart no longer sets
@@ -291,6 +305,20 @@ langfuse:
         type: RuntimeDefault
   worker:
     nodeOptions: "--max-old-space-size=640"
+    # Probe cadences, deliberately equal to langfuse.web's above: same boot
+    # migrations, same replicas:1 + Recreate constraint, cadence kept equal to
+    # web's. Cutoffs: readiness 310s, liveness 370s. Formula/rationale:
+    # ci/probe-window-assertions.sh header.
+    readinessProbe:
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 30
+    livenessProbe:
+      initialDelaySeconds: 90
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 15
     resources:
       requests: { cpu: 150m, memory: 384Mi }
       limits: { cpu: "1", memory: 1Gi }
@@ -336,6 +364,20 @@ postgres:
   # this Alpine image (#2319). Parameterized for BYO images with a different gid.
   podSecurityContext:
     fsGroup: 70
+  # Probe cadences. Liveness MUST outlast readiness here because `pg_isready`
+  # returns non-zero for the whole of WAL recovery after an unclean stop, and a
+  # restart re-enters the same recovery. Cutoffs: readiness 60s, liveness 310s.
+  # Formula/rationale: ci/probe-window-assertions.sh header.
+  readinessProbe:
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 5
+    failureThreshold: 12
+  livenessProbe:
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 30
   persistence:
     enabled: true
     size: 2Gi
@@ -991,6 +1033,20 @@ api:
   # approval evidence. A sealed install generates and persists this value
   # independently; values-dev.yaml keeps the published deterministic default.
   approvalChatAttesterSecret: curie-dev-approval-chat-attester
+  # Probe cadences. Liveness must outlast readiness so a cold API still warming
+  # up before /health answers is kept out of the Service rather than restarted
+  # back into the same warm-up. Cutoffs: readiness 120s, liveness 195s.
+  # Formula/rationale: ci/probe-window-assertions.sh header.
+  readinessProbe:
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 24
+  livenessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 12
   # Human-readable org/workspace name the UI reads from the open /config endpoint.
   # Override to white-label the app for a deployment.
   orgName: Curie
