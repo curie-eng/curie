@@ -1585,6 +1585,14 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
+                  "help": "Who the session is for. Bound to the code at mint time (ADR-0106), so the console session it becomes carries an identity rather than being anonymous",
+                  "id": "subject",
+                  "long": "subject",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
                   "help": "Where the console is served, for the printed instruction",
                   "id": "console_url",
                   "long": "console-url",
@@ -4594,6 +4602,14 @@ export const commandManifest = {
                   "long": "release",
                   "positional": false,
                   "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Who the session is for. Bound to the code at mint time (ADR-0106)",
+                  "id": "subject",
+                  "long": "subject",
+                  "positional": false,
+                  "required": true
                 },
                 {
                   "global": false,

@@ -5945,16 +5945,22 @@ impl crate::ui::CliOutput for VersionsOutput {
 pub async fn console_login(
     api_url: String,
     api_key: String,
+    subject: String,
     console_url: String,
     dry_run: bool,
 ) -> Result<ConsoleLoginOutput> {
     if dry_run {
         return Ok(ConsoleLoginOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![format!("POST {api_url}/console/login-codes")],
+            lines: vec![format!(
+                "POST {api_url}/console/login-codes  (subject {subject})"
+            )],
         }));
     }
     let client = ApiClient::new(&api_url, &api_key)?;
-    let minted = client.create_console_login_code().await?;
+    // The subject-bound mint, which is the only one the API still accepts: a
+    // code now carries who it is for, so the session it becomes is an identity
+    // rather than an anonymous grant.
+    let minted = client.mint_console_login_code(&subject).await?;
     Ok(ConsoleLoginOutput::Minted {
         code: minted.code,
         expires_at: minted.expires_at,

@@ -291,11 +291,6 @@
       "struct": "RoutingCheck",
       "schema": "RoutingCheck",
       "omissions": []
-    },
-    {
-      "struct": "ConsoleLoginCode",
-      "schema": "ConsoleLoginCodeOut",
-      "omissions": []
     }
   ],
   "non_mirrors": [

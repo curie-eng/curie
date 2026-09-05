@@ -15,7 +15,8 @@ import { AppProvider } from "../bridge/app";
 import type { CurieBridge } from "../bridge/bridge";
 import { SignIn } from "./SignIn";
 
-const ran: { action: string; json?: boolean }[] = [];
+type Ran = { action: string; flags?: Record<string, unknown>; json?: boolean };
+const ran: Ran[] = [];
 const posted: unknown[] = [];
 let mintedCode = "CODE-FROM-SHELL";
 let exchangeOk = true;
@@ -39,8 +40,10 @@ function stub(cliPath: string | null): CurieBridge {
       drift: null,
     }),
     cli: {
-      run: async (inv: { action: string; json?: boolean }) => {
-        ran.push({ action: inv.action, json: inv.json });
+      run: async (inv: { action: string; flags?: Record<string, unknown>; json?: boolean }) => {
+        // Record the flags too: what the subject is bound to is the point of the
+        // call, and a stub that drops it lets an unattributed mint pass.
+        ran.push({ action: inv.action, flags: inv.flags, json: inv.json });
         // The shell answers asynchronously, like the real one.
         queueMicrotask(() =>
           onResultCb?.({ runId: "r1", state: "ok", exitCode: 0, durationMs: 1, result: { code: mintedCode } }),
@@ -114,13 +117,26 @@ describe("signing in", () => {
     expect(screen.queryByRole("button", { name: "Sign me in" })).not.toBeInTheDocument();
   });
 
+  it("will not mint until told who the session is for", async () => {
+    // Minting binds the subject to the code, so there is no anonymous version of
+    // this to fall back on: without one the button cannot do anything.
+    window.curie = stub("/usr/local/bin/curie");
+    mount();
+    expect(await screen.findByRole("button", { name: "Sign me in" })).toBeDisabled();
+    expect(ran).toHaveLength(0);
+  });
+
   it("mints through the shell and spends the code, with no copying", async () => {
     window.curie = stub("/usr/local/bin/curie");
     mount();
+    await userEvent.type(await screen.findByPlaceholderText(/Slack member id/i), "U0EXAMPLE1");
     await userEvent.click(await screen.findByRole("button", { name: "Sign me in" }));
     await waitFor(() => expect(posted).toHaveLength(1));
-    // Asked the CLI for a machine-readable answer rather than scraping text.
-    expect(ran).toEqual([{ action: "local.console.login", json: true }]);
+    // Asked the CLI for a machine-readable answer rather than scraping text, and
+    // carried the subject through rather than minting an unattributed code.
+    expect(ran).toEqual([
+      { action: "local.console.login", flags: { subject: "U0EXAMPLE1" }, json: true },
+    ]);
     expect(posted[0]).toEqual({ code: "CODE-FROM-SHELL" });
   });
 
@@ -128,6 +144,7 @@ describe("signing in", () => {
     window.curie = stub("/usr/local/bin/curie");
     mintedCode = "";
     mount();
+    await userEvent.type(await screen.findByPlaceholderText(/Slack member id/i), "U0EXAMPLE1");
     await userEvent.click(await screen.findByRole("button", { name: "Sign me in" }));
     expect(await screen.findByText(/returned no code/i)).toBeInTheDocument();
     expect(posted).toHaveLength(0);

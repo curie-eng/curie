@@ -25,7 +25,7 @@ import { Button, Field, Input, Notice, Sheet } from "../primitives";
  * Runs with `--json` so the code is read from a parsed field rather than
  * scraped out of human-readable output.
  */
-async function mintThroughShell(): Promise<string> {
+async function mintThroughShell(subject: string): Promise<string> {
   return new Promise((resolve, reject) => {
     let runId: string | null = null;
     const off = bridge().cli.onResult((r) => {
@@ -43,7 +43,7 @@ async function mintThroughShell(): Promise<string> {
       resolve(code);
     });
     bridge()
-      .cli.run({ action: "local.console.login", json: true })
+      .cli.run({ action: "local.console.login", flags: { subject }, json: true })
       .then((handle) => {
         runId = handle.runId;
       })
@@ -71,6 +71,11 @@ async function exchange(code: string): Promise<string | null> {
 export function SignIn({ onClose }: { readonly onClose: () => void }) {
   const app = useApp();
   const [code, setCode] = useState("");
+  // Who the session is for. Minting binds it to the code (ADR-0106), and this
+  // app has no idea who you are: it holds the platform key, which says what it
+  // may do and nothing about whose hands are on it. So it asks rather than
+  // inventing an identity and attributing your approvals to it.
+  const [subject, setSubject] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -79,11 +84,11 @@ export function SignIn({ onClose }: { readonly onClose: () => void }) {
   const canMint = !!app.env?.cliPath;
 
   async function signInHere() {
-    if (busy) return;
+    if (busy || !subject.trim()) return;
     setBusy(true);
     setError(null);
     try {
-      const minted = await mintThroughShell();
+      const minted = await mintThroughShell(subject.trim());
       const failure = await exchange(minted);
       if (failure) {
         setError(failure);
@@ -142,9 +147,26 @@ export function SignIn({ onClose }: { readonly onClose: () => void }) {
         <div style={{ marginBottom: 16 }}>
           <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.6, marginBottom: 10 }}>
             This app can sign itself in. It already runs Curie commands as you, so it can
-            get a code and use it without you copying anything.
+            get a code and use it without you copying anything. Say who the session is
+            for and it is recorded against everything that session approves.
           </div>
-          <Button tone="primary" busy={busy} onClick={() => void signInHere()}>
+          <Field label="Who this session is for">
+            <Input
+              value={subject}
+              onChange={(e) => setSubject(e.currentTarget.value)}
+              placeholder="a Slack member id, e.g. U0EXAMPLE1"
+              spellCheck={false}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void signInHere();
+              }}
+            />
+          </Field>
+          <Button
+            tone="primary"
+            busy={busy}
+            disabled={!subject.trim()}
+            onClick={() => void signInHere()}
+          >
             Sign me in
           </Button>
         </div>
@@ -152,7 +174,7 @@ export function SignIn({ onClose }: { readonly onClose: () => void }) {
 
       <div style={{ ...F.callout, color: T.secondary, lineHeight: 1.6, marginBottom: 14 }}>
         {canMint ? "Or paste a code: run " : "Run "}
-        <strong>curie local console login</strong>
+        <strong>curie local console login --subject you</strong>
         {canMint ? " anywhere and paste what it prints." : " in a terminal and paste the code it prints."}
         {" "}A code works once and only signs in this window.
       </div>
