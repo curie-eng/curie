@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import replace
+from collections.abc import Mapping, MutableMapping
+from dataclasses import dataclass, replace
 from pathlib import Path
+from urllib.parse import unquote
 
 import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from curie_telemetry import bootstrap_service_telemetry
+from yarl import URL
 
 from . import __version__
 from .adapter import (
@@ -52,6 +55,7 @@ from .history import (
     DEFAULT_REPLAY_MAX_TURNS,
     ConversationReplay,
     HistoryError,
+    HistoryRecord,
     StructuredReplayUnsupported,
     TranscriptStore,
     build_conversation_replay,
@@ -64,10 +68,15 @@ from .otel import RunTracer, build_tracer_provider
 from .plugin import load_bundle_web_search_enabled
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
-from .server import bind_status_attestation, create_app
-from .session import SessionRunner
+from .server import Snapshotter, bind_status_attestation, create_app
+from .session import ConversationBinder, SessionRunner
 from .side_effects import SideEffectClassifier
-from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
+from .state import (
+    STATE_SERVER_NAME,
+    STATE_URL_ENV,
+    build_state_server,
+    resolve_state_client,
+)
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
 
 logger = logging.getLogger("curie_runner")
@@ -148,6 +157,119 @@ def _merge_pre_tool_use_hooks(
     return merged or None
 
 
+def _replay_window(config: RunnerConfig) -> tuple[int, int]:
+    """The structured-replay bounds: operator knobs, else the loader defaults."""
+
+    max_turns = (
+        config.history_max_turns
+        if config.history_max_turns is not None
+        else DEFAULT_REPLAY_MAX_TURNS
+    )
+    max_bytes = (
+        config.history_max_bytes
+        if config.history_max_bytes is not None
+        else DEFAULT_REPLAY_MAX_BYTES
+    )
+    return max_turns, max_bytes
+
+
+def adoptable_history_ref(history_ref: str | None, env: Mapping[str, str]) -> str | None:
+    """Admit a caller-chosen ``history_ref`` only inside this pod's state authority.
+
+    The adopting Event names the transcript to load, and the runner fetches it
+    with the pod's agent-scoped ``CURIE_HISTORY_TOKEN``. Unlike the boot ref,
+    which the worker set in the same env as the token, this ref arrives from
+    whoever holds the bootstrap credential, so it is bound to the state
+    namespace the pod was booted for: it must sit under ``CURIE_STATE_URL``
+    (``.../agents/<id>/state``). A pod booted with no state authority admits
+    no ref at all. An absent ref is the history-less adoption and passes.
+
+    The comparison is on PARSED URLs, not on the string: the scheme, host
+    and port must match exactly; userinfo, a query, or a fragment is refused;
+    and every path segment below the base is checked for the dot forms
+    (``.``, ``..``, and their percent-encodings) that would walk out of the
+    namespace once a server normalizes them. The ref is parsed in its encoded
+    form so the worker's percent-encoded thread key (``binding.py`` quotes the
+    key with ``safe=""``, so a Slack ``:`` arrives as ``%3A``) is compared as
+    sent rather than requoted, and any ref the parser would rewrite is
+    refused outright rather than "helpfully" normalized.
+    """
+
+    if not history_ref:
+        return None
+    raw_base = (env.get(STATE_URL_ENV) or "").rstrip("/")
+    if not raw_base:
+        raise HistoryError(
+            "adoption named a history_ref but this runner has no configured state authority"
+        )
+    outside = HistoryError("adoption history_ref is outside this runner's state authority")
+    try:
+        base = URL(raw_base, encoded=True)
+        ref = URL(history_ref, encoded=True)
+    except ValueError as exc:
+        raise outside from exc
+    if str(ref) != history_ref or ref.user is not None or ref.query_string or ref.fragment:
+        raise outside
+    if (ref.scheme, ref.host, ref.port) != (base.scheme, base.host, base.port):
+        raise outside
+    prefix = base.raw_path.rstrip("/") + "/"
+    if not ref.raw_path.startswith(prefix):
+        raise outside
+    for segment in ref.raw_path[len(prefix) :].split("/"):
+        if unquote(segment) in ("", ".", ".."):
+            raise outside
+    return history_ref
+
+
+def retire_bootstrap_from_process_env(environ: MutableMapping[str, str]) -> bool:
+    """Drop the pool bootstrap credential from the process environment.
+
+    The runner keeps the bootstrap in ``CredentialAuthority`` (private memory)
+    and nowhere else. It must not be inheritable by any child: the harness
+    SDK builds its subprocess environment from ``os.environ`` and the MCP tool
+    capability probe merges ``os.environ`` too, so leaving the key in place
+    would hand a credential that can adopt EVERY unbound pod of the pool to
+    prompt-driven code. Called once, immediately after ``RunnerConfig`` has
+    read it and before any spawn. Returns whether a value was present.
+    """
+
+    return environ.pop(BootEnv.env_key("runner_bootstrap_token"), None) is not None
+
+
+def build_app_for(
+    config: RunnerConfig, runner: SessionRunner, snapshotter: Snapshotter | None
+) -> web.Application:
+    """The one boot-time app construction: per-claim, bootstrap, or open.
+
+    ``CredentialAuthority`` decides the mode from the two BootEnv credentials
+    exactly as the contract documents: a present ``runner_token`` wins and the
+    bootstrap is never admitted; only a bootstrap present means bootstrap mode;
+    neither means the tokenless legacy boot.
+    """
+
+    return create_app(
+        runner,
+        token=config.runner_token,
+        bootstrap_token=config.runner_bootstrap_token,
+        snapshotter=snapshotter,
+    )
+
+
+@dataclass
+class _BoundIdentity:
+    """The conversation the session factory currently builds sessions for.
+
+    Fixed at boot for a per-claim runner. A bootstrap-mode runner boots on the
+    template's placeholder identity and is repointed here at adoption
+    (ADR-0116 decision 2), so the replacement model session, and every later
+    reset generation, carries the adopted conversation's replay and id.
+    """
+
+    session_id: str
+    replay: ConversationReplay
+    options: ClaudeAgentOptions | None
+
+
 def build_runner(
     config: RunnerConfig,
     *,
@@ -177,6 +299,9 @@ def build_runner(
     # compiles into session inputs, replacing the direct module imports these
     # used to be. Defaults to the built-in Claude harness.
     harness = harness or _resolve_harness()
+    # A non-optional alias for the nested binder below: mypy does not carry the
+    # narrowing above into a closure.
+    active_harness: HarnessContribution = harness
     conversation_replay = conversation_replay or ConversationReplay()
     if conversation_replay.present and not harness.supports_structured_replay and not fake_model:
         raise StructuredReplayUnsupported(
@@ -383,6 +508,11 @@ def build_runner(
         )
 
     sdk_generation = 0
+    identity = _BoundIdentity(
+        session_id=config.session.session_id,
+        replay=conversation_replay,
+        options=real_options,
+    )
 
     def factory() -> ModelSession:
         if fake_model:
@@ -399,9 +529,9 @@ def build_runner(
                 # Share the same gate so a scripted request_approval resolves its
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
-                replay_messages=conversation_replay.messages,
+                replay_messages=identity.replay.messages,
             )
-        assert real_options is not None
+        assert identity.options is not None
         nonlocal sdk_generation
         generation = sdk_generation
         sdk_generation += 1
@@ -413,22 +543,86 @@ def build_runner(
         # (#2221). Native checkpoint entries carry the previous id, so later
         # generations rematerialize portable messages only.
         if generation == 0:
-            return ClaudeAgentSession(real_options)
+            return ClaudeAgentSession(identity.options)
         envelope = build_structured_resume(
-            conversation_replay.messages,
-            curie_session_id=f"{config.session.session_id}:reset:{generation}",
+            identity.replay.messages,
+            curie_session_id=f"{identity.session_id}:reset:{generation}",
             cwd=workspace_cwd,
             harness_replay=None,
         )
         return ClaudeAgentSession(
             replace(
-                real_options,
+                identity.options,
                 resume=envelope.resume,
                 session_id=envelope.session_id if envelope.resume is None else None,
                 session_store=envelope.session_store,
                 session_store_flush="eager" if envelope.session_store is not None else "batched",
             )
         )
+
+    class _Binder:
+        """Adoption binder (ADR-0116 d2): load the conversation, repoint the factory."""
+
+        async def load(
+            self, session_id: str, history_ref: str | None
+        ) -> tuple[TranscriptStore, ConversationReplay, HistoryRecord | None]:
+            # Same loader, same window, same fail-closed posture as the boot
+            # path (_load_history): a configured ref that cannot be loaded is
+            # continuity-critical and refuses rather than answering blind. The
+            # ref itself is caller-chosen here, so it is first bound to the
+            # pod's own state authority.
+            store = resolve_history(adoptable_history_ref(history_ref, os.environ), os.environ)
+            max_turns, max_bytes = _replay_window(config)
+            records = await store.load()
+            replay, summary = build_conversation_replay(
+                records, max_turns=max_turns, max_bytes=max_bytes
+            )
+            if (
+                replay.present
+                and not active_harness.supports_structured_replay
+                and not fake_model
+            ):
+                raise StructuredReplayUnsupported(
+                    f"harness {active_harness.name!r} declares structured replay absent; "
+                    "refusing recovered history instead of rendering a prompt preamble"
+                )
+            logger.info(
+                "history loaded at adoption session=%s records=%d messages=%d compacted=%s",
+                session_id,
+                len(records),
+                len(replay.messages),
+                summary is not None,
+            )
+            # The summary is handed back, not appended: the runner writes it
+            # only once the binding is applied.
+            return store, replay, summary
+
+        def rebind(self, session_id: str, replay: ConversationReplay) -> None:
+            nonlocal sdk_generation
+            if not fake_model:
+                assert real_options is not None
+                structured = build_structured_resume(
+                    replay.messages,
+                    curie_session_id=session_id,
+                    cwd=workspace_cwd,
+                    harness_replay=replay.harness_replay,
+                )
+                identity.options = replace(
+                    real_options,
+                    resume=structured.resume,
+                    session_id=structured.session_id if structured.resume is None else None,
+                    session_store=structured.session_store,
+                    session_store_flush=(
+                        "eager" if structured.session_store is not None else "batched"
+                    ),
+                )
+            identity.session_id = session_id
+            identity.replay = replay
+            # The bound conversation's first SDK session is its generation 0;
+            # later resets mint ids under the bound session id.
+            sdk_generation = 0
+
+    binder: ConversationBinder = _Binder()
 
     provider = build_tracer_provider(
         config.session.otel,
@@ -458,6 +652,8 @@ def build_runner(
             approval_decision=config.approval_decision,
             false_completion_check=config.false_completion_check,
             history_resumed=conversation_replay.present,
+            conversation_binder=binder,
+            boot_replay=conversation_replay,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,
@@ -507,16 +703,7 @@ def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, ConversationRe
     """
 
     store = resolve_history(config.history_ref, os.environ)
-    max_turns = (
-        config.history_max_turns
-        if config.history_max_turns is not None
-        else DEFAULT_REPLAY_MAX_TURNS
-    )
-    max_bytes = (
-        config.history_max_bytes
-        if config.history_max_bytes is not None
-        else DEFAULT_REPLAY_MAX_BYTES
-    )
+    max_turns, max_bytes = _replay_window(config)
 
     async def _load() -> tuple[ConversationReplay, int, bool]:
         records = await store.load()
@@ -560,6 +747,10 @@ def _serve() -> None:
     )
     logger.info("runner starting fake_model=%s", fake_model)
     config = RunnerConfig.from_env(os.environ)
+    # First thing after the parse and before ANY child can be spawned: the
+    # bootstrap lives in the authority only, never in a child's environment.
+    if retire_bootstrap_from_process_env(os.environ):
+        logger.info("pool bootstrap credential read and removed from the process environment")
     logger.info(
         "runner configured session=%s model=%s port=%d harness=%s",
         config.session.session_id,
@@ -619,7 +810,7 @@ def _serve() -> None:
 
     snapshot_callback = capture_mounted_workspace if workspace_path is not None else None
 
-    app = create_app(runner, token=config.runner_token, snapshotter=snapshot_callback)
+    app = build_app_for(config, runner, snapshot_callback)
 
     async def _startup(_app: web.Application) -> None:
         try:

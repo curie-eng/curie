@@ -15,7 +15,7 @@ their default. Each var keeps the behavior it has.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from aci_protocol import BootEnv, SessionConfig
@@ -83,6 +83,11 @@ class RunnerConfig:
     false_completion_check: bool
     port: int
     runner_token: str | None
+    # Pool bootstrap credential (ADR-0122), delivered by the substrate's pool
+    # template only; ``None`` when absent. ``CredentialAuthority`` gives a
+    # present ``runner_token`` precedence, so a pod bound at boot never enters
+    # bootstrap mode. Never repr'd: it is secret material.
+    runner_bootstrap_token: str | None = field(repr=False)
     # Operator bounds on the rehydrated structured history, reachable through
     # the chart's runner.extraEnv. None hands the consumer its own default, so
     # the defaults live at the call site rather than here.
@@ -148,6 +153,7 @@ class RunnerConfig:
             false_completion_check=false_completion_check,
             port=boot.port if boot.port is not None else 8080,
             runner_token=boot.runner_token,
+            runner_bootstrap_token=boot.runner_bootstrap_token,
             history_max_turns=boot.history_max_turns,
             history_max_bytes=boot.history_max_bytes,
         )
