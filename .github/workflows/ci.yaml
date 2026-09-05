@@ -463,6 +463,75 @@ jobs:
       - name: E2E (Playwright, stackless)
         run: pnpm exec playwright test
 
+  desktop:
+    name: Desktop (lint + vitest + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 9
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      # The app mirrors curie_worker.behaviorpacks in TypeScript so the Build
+      # view can preview what a Slack behavior pack will actually do.
+      # packs-parity.test.ts runs both implementations over one corpus and skips
+      # itself without uv, so without this the parity guarantee would hold only
+      # on machines that happen to have it. The module needs pydantic and the
+      # standard library, nothing more, so the test runs --no-project and this
+      # adds no dependency sync.
+      - name: Install uv (for the behavior-pack parity test)
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        # Electron downloads a ~100MB Chromium in postinstall and the packaged
+        # app is not built here, so skip it: this job type checks, lints, tests
+        # and bundles, none of which need the runtime binary.
+        run: pnpm install --frozen-lockfile
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      - name: Command manifest is current
+        # The desktop app's entire command surface is generated from
+        # cli/command-manifest.json. A stale committed manifest means the app
+        # describes a CLI that no longer exists, so drift is a hard failure.
+        run: |
+          pnpm gen:manifest
+          git diff --exit-code src/generated/commandManifest.ts src/generated/commandManifest.json \
+            || (echo "commandManifest is stale; run 'pnpm gen:manifest' in this job's working directory and commit." && exit 1)
+      - name: Slack app manifest is current
+        # The desktop app hands operators the Slack app manifest to paste at
+        # api.slack.com. It is generated from apps/dispatcher/slack-app-manifest.yaml
+        # so the scopes cannot drift from the ones the dispatcher needs -- a
+        # missing scope fails at an API call hours after a successful install,
+        # which is the worst way to find out.
+        run: |
+          pnpm gen:slack
+          git diff --exit-code src/generated/slackManifest.ts \
+            || (echo "slackManifest.ts is stale; run 'pnpm gen:slack' in this job's working directory and commit." && exit 1)
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+      - name: Unit tests (vitest)
+        # The CLI and Docker integration suites skip themselves when neither is
+        # present, which is the case on a clean runner. The behavior-pack parity
+        # suite does NOT skip here: uv is installed above so it compares against
+        # the real worker.
+        run: pnpm test
+      - name: Build renderer and shell bundles
+        run: pnpm build
+
   compose:
     name: Compose (release stack validates)
     runs-on: ubuntu-latest

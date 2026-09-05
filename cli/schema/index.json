@@ -94,6 +94,12 @@
       "version": "1.0"
     },
     {
+      "result": "ConsoleLoginOutput",
+      "kind": "CliOutput",
+      "schema": "console-login.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "DeleteOutput",
       "kind": "CliOutput",
       "schema": "delete.schema.json",

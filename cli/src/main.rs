@@ -1373,6 +1373,61 @@ enum SkillAction {
     },
 }
 
+/// Subcommands of `curie <tier> console`.
+///
+/// Generic over the tier so `local` and `cluster` share one surface and one
+/// handler, the way `AgentTarget` does: the connection flags live on the leaf
+/// verb, because `curie local console login --dry-run` is what an operator will
+/// type and clap only accepts parent flags BEFORE the subcommand.
+#[derive(Subcommand)]
+enum ConsoleAction<T: TierDefaults + Clone + Send + Sync + 'static> {
+    /// Mint a single-use login code for the web console (ADR-0083).
+    ///
+    /// The console authenticates with a revocable session cookie, not the
+    /// platform key. This command is the only place the key is handled, it
+    /// happens here rather than in a browser, and what you carry away is a
+    /// short-lived code that authorizes one browser and nothing else.
+    Login {
+        #[arg(long, default_value = T::API_URL, env = "CURIE_API_URL")]
+        api_url: String,
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Who the session is for. Bound to the code at mint time (ADR-0106),
+        /// so the console session it becomes carries an identity rather than
+        /// being anonymous.
+        #[arg(long, value_name = "SUBJECT")]
+        subject: String,
+        /// Where the console is served, for the printed instruction.
+        #[arg(long, value_name = "URL")]
+        console_url: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        /// The tier only supplies the default API URL above; nothing reads it.
+        #[arg(skip)]
+        _tier: std::marker::PhantomData<T>,
+    },
+}
+
+/// `curie cluster console`. Separate from the local surface because the cluster
+/// connection self-plumbs a tunnel and discovers its key, which is a different
+/// set of flags rather than different defaults for the same ones.
+#[derive(Subcommand)]
+enum ClusterConsoleAction {
+    /// Mint a single-use login code for the cluster's web console (ADR-0083).
+    Login {
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Who the session is for. Bound to the code at mint time (ADR-0106).
+        #[arg(long, value_name = "SUBJECT")]
+        subject: String,
+        /// Where the console is served, for the printed instruction.
+        #[arg(long, value_name = "URL")]
+        console_url: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 /// Subcommands of `curie local`.
 #[derive(Subcommand)]
 enum LocalAction {
@@ -1734,6 +1789,11 @@ enum LocalAction {
         /// MCP server. The value never appears in argv. Repeatable.
         #[arg(long = "secret", value_name = "NAME")]
         secret: Vec<String>,
+    },
+    /// Sign in to the local web console.
+    Console {
+        #[command(subcommand)]
+        action: ConsoleAction<LocalTier>,
     },
     /// List an agent's immutable versions (`GET /agents/{id}/versions`).
     Versions {
@@ -2673,6 +2733,15 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Sign in to the cluster's web console.
+    ///
+    /// The key is read from the release Secret and flows straight into the
+    /// request header, never through your shell or your screen; what you copy
+    /// is the code.
+    Console {
+        #[command(subcommand)]
+        action: ClusterConsoleAction,
+    },
     /// Delete an agent via the platform API (`DELETE /agents/{id}`).
     Delete {
         /// Agent name or id to delete.
@@ -3493,6 +3562,27 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await;
                 emit(local::with_deploy_unreachable_hint(result, &local_api_url).await?)
             }
+            LocalAction::Console { action } => match action {
+                ConsoleAction::Login {
+                    api_url,
+                    api_key,
+                    subject,
+                    console_url,
+                    dry_run,
+                    ..
+                } => emit(
+                    commands::console_login(
+                        api_url,
+                        api_key,
+                        subject,
+                        // The console is served beside the API in the dev stack;
+                        // an explicit --console-url wins for anything else.
+                        console_url.unwrap_or_else(|| "http://localhost:28080".to_string()),
+                        dry_run,
+                    )
+                    .await?,
+                ),
+            },
             LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
             LocalAction::Memory { target, add } => match add {
                 None => emit(commands::memory(target.into()).await?),
@@ -4668,6 +4758,21 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
+            ClusterAction::Console { action } => match action {
+                ClusterConsoleAction::Login {
+                    conn,
+                    subject,
+                    console_url,
+                    dry_run,
+                } => {
+                    let (api_url, api_key, _pf) = resolve_cluster_conn(conn, dry_run).await?;
+                    let where_console = console_url.unwrap_or_else(|| api_url.clone());
+                    emit(
+                        commands::console_login(api_url, api_key, subject, where_console, dry_run)
+                            .await?,
+                    )
+                }
+            },
             ClusterAction::Versions { target } => {
                 let ClusterAgentTarget {
                     agent,

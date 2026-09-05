@@ -5690,6 +5690,57 @@ pub async fn delete(opts: AgentActionOpts, yes: bool) -> Result<DeleteOutput> {
 /// version list. Owns its data (agent name + cloned versions) so `to_json` /
 /// `render` outlive the `ApiClient`. The json-vs-human choice is made once, in
 /// `Ui::emit` (issue #456).
+/// A minted console login code, and how to use it.
+///
+/// ADR-0083: the operator copies a CODE into the console, never the platform
+/// key. Under `--json` the code is a field like any other; the human render
+/// spells out the exchange, because a bare token with no instruction is how
+/// people end up pasting the wrong thing into the wrong box.
+#[derive(Debug)]
+pub enum ConsoleLoginOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Minted {
+        code: String,
+        expires_at: String,
+        console_url: String,
+    },
+}
+
+impl crate::ui::CliOutput for ConsoleLoginOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::DryRun(plan) => plan.to_json(),
+            Self::Minted {
+                code,
+                expires_at,
+                console_url,
+            } => serde_json::json!({
+                "code": code,
+                "expires_at": expires_at,
+                "console_url": console_url,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            Self::DryRun(plan) => plan.render(ui),
+            Self::Minted {
+                code,
+                expires_at,
+                console_url,
+            } => {
+                ui.kv("login code", code);
+                ui.kv("expires", expires_at);
+                ui.payload(&format!(
+                    "Open {console_url} and paste the code to sign in."
+                ));
+                ui.note("Single use, and not the platform key: it authorizes this browser only.");
+            }
+        }
+    }
+}
+
 pub enum VersionsOutput {
     DryRun(crate::ui::DryRunPlan),
     Empty {
@@ -5762,6 +5813,37 @@ impl crate::ui::CliOutput for VersionsOutput {
 }
 
 /// `<tier> versions <agent>`: list the agent's immutable versions (newest first).
+/// Mint a console login code (ADR-0083).
+///
+/// The key is used HERE, by the CLI, and the operator carries away a code. That
+/// asymmetry is the decision: a browser that never receives the platform key
+/// cannot leak it through history, a referrer, or a screenshot.
+pub async fn console_login(
+    api_url: String,
+    api_key: String,
+    subject: String,
+    console_url: String,
+    dry_run: bool,
+) -> Result<ConsoleLoginOutput> {
+    if dry_run {
+        return Ok(ConsoleLoginOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!(
+                "POST {api_url}/console/login-codes  (subject {subject})"
+            )],
+        }));
+    }
+    let client = ApiClient::new(&api_url, &api_key)?;
+    // The subject-bound mint, which is the only one the API still accepts: a
+    // code now carries who it is for, so the session it becomes is an identity
+    // rather than an anonymous grant.
+    let minted = client.mint_console_login_code(&subject).await?;
+    Ok(ConsoleLoginOutput::Minted {
+        code: minted.code,
+        expires_at: minted.expires_at,
+        console_url,
+    })
+}
+
 pub async fn versions(opts: AgentActionOpts) -> Result<VersionsOutput> {
     if opts.dry_run {
         return Ok(VersionsOutput::DryRun(crate::ui::DryRunPlan {

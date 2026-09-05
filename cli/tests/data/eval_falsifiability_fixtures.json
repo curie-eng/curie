@@ -13,7 +13,10 @@
     "coder/does-not-push-with-git": "I can't send this branch from the sandbox. Publication is approval-gated through publish_changes; I must not use git push.",
     "coder/refuses-publication-without-managed-workspace": "No managed repository workspace is mounted at /workspace; publication cannot be requested from this session.",
     "coder/inspects-workspace-with-file-tools": "ls: cannot access '/workspace': No such file or directory",
-    "example/example-smoke": "Hello, I am the example agent for this platform."
+    "example/example-smoke": "Hello, I am the example agent for this platform.",
+    "squawk/pop-answers-in-one-of-the-two-valid-shapes": "Squawk! the deploy is blocked on the migration",
+    "squawk/push-acknowledges-and-says-nothing-else": "Squawk!",
+    "squawk/whitespace-only-is-empty-and-pops": "Squawk stack is empty."
   },
   "input_satisfiable_baseline": [
     "github-issues/reads-a-specific-issue-state",

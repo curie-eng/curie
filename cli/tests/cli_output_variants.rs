@@ -38,8 +38,9 @@ use curie::api::{
     ApprovalRecord, ChannelBinding, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, Version,
 };
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
-    OverridesOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, VersionsOutput,
+    ApprovalsOutput, BudgetOutput, ChannelsOutput, ConsoleLoginOutput, DeleteOutput, KillOutput,
+    MemoryOutput, OverridesOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput,
+    VersionsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -501,6 +502,19 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     value: 3.0,
                 }],
             }),
+        ],
+    );
+    m.insert(
+        "ConsoleLoginOutput",
+        samples![
+            "DryRun" => ConsoleLoginOutput::DryRun(plan()),
+            "Minted" => ConsoleLoginOutput::Minted {
+                // A sample, so a made-up code: the real one is single-use and
+                // exists only between the terminal and one browser.
+                code: "AAAABBBBCCCCDDDD".to_string(),
+                expires_at: "2026-01-01T00:05:00".to_string(),
+                console_url: "http://localhost:28080".to_string(),
+            },
         ],
     );
     m.insert(

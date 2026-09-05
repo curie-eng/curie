@@ -10,11 +10,18 @@ from typing import Annotated, Literal
 from fastapi import Cookie, Depends, Header, HTTPException, status
 
 from . import approval_principal, crud
+from .auth import SESSION_COOKIE
 from .config import get_settings
 from .deps import SessionDep
 
 APPROVAL_PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
-CONSOLE_SESSION_COOKIE = "curie_console_session"
+#: One definition, not two. Two branches independently spelled this literal --
+#: here for the approval principal, and in `auth` for the dependency that reads
+#: the cookie -- and they agree only by luck. `auth` is the one that verifies it
+#: and imports nothing but `config`, so pointing this at it costs no import
+#: cycle; the reverse would pull `crud` in eagerly and undo the lazy import
+#: `require_api_key` relies on.
+CONSOLE_SESSION_COOKIE = SESSION_COOKIE
 
 AuthenticatedPrincipalKind = Literal["chat", "console", "operator"]
 

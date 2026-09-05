@@ -1,0 +1,105 @@
+{
+  "name": "@curie/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Curie Desktop: a native operator console for the curie CLI and platform API",
+  "main": "dist-electron/main.cjs",
+  "scripts": {
+    "gen:manifest": "node scripts/gen-command-manifest.mjs",
+    "gen:slack": "node scripts/gen-slack-manifest.mjs",
+    "pretypecheck": "pnpm gen:manifest && pnpm gen:slack && pnpm gen:themes",
+    "predev": "pnpm gen:manifest && pnpm gen:slack && pnpm gen:themes",
+    "prebuild": "pnpm gen:manifest && pnpm gen:slack && pnpm gen:themes",
+    "dev": "concurrently -k -n vite,electron -c cyan,magenta \"vite\" \"pnpm dev:electron\"",
+    "dev:electron": "node scripts/dev-electron.mjs",
+    "build:renderer": "vite build",
+    "build:electron": "node scripts/build-electron.mjs",
+    "build": "tsc -b --noEmit && pnpm build:renderer && pnpm build:electron",
+    "start": "electron .",
+    "lint": "eslint . --max-warnings 0",
+    "typecheck": "tsc -b --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "package": "pnpm build && electron-builder --dir",
+    "package:dmg": "pnpm build && electron-builder",
+    "app": "open -n release/Curie.app || open release/Curie.app",
+    "gen:themes": "node scripts/gen-themes.mjs"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.101.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.1.0",
+    "@testing-library/user-event": "^14.6.3",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@typescript-eslint/eslint-plugin": "^8.67.0",
+    "@typescript-eslint/parser": "^8.67.0",
+    "@vitejs/plugin-react": "^6.0.5",
+    "concurrently": "^9.1.2",
+    "electron": "^34.2.0",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.25.0",
+    "eslint": "^10.8.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.4",
+    "globals": "^17.9.0",
+    "jsdom": "^30.0.1",
+    "typescript": "^5.9.2",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.10"
+  },
+  "build": {
+    "appId": "net.curietech.curie.desktop",
+    "productName": "Curie",
+    "directories": {
+      "output": "release",
+      "buildResources": "assets"
+    },
+    "files": [
+      "dist/**",
+      "dist-electron/**"
+    ],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.png",
+      "identity": null,
+      "darkModeSupport": true
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Development",
+      "icon": "assets/icon.png"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.png"
+    }
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild"
+    ]
+  }
+}

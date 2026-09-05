@@ -1,0 +1,10 @@
+{
+  "name": "squawk",
+  "description": "An agent-global LIFO stack. Say something to push it; say nothing to pop the newest entry.",
+  "version": "0.1.0",
+  "starterPrompts": [
+    "remember the deploy is blocked on the migration",
+    "What is on the stack right now?",
+    "Pop the newest thing off the stack."
+  ]
+}
