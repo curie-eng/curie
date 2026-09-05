@@ -1,5 +1,6 @@
 """SessionRunner: turn streaming, interrupt reclassification, rehydrate options."""
 
+import asyncio
 import logging
 
 import anyio
@@ -7,6 +8,7 @@ import pytest
 from aci_protocol import ErrorEvent, Event, Interrupt, SessionStatus, parse_ndjson
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 from curie_runner import RunTracer, SideEffectClassifier, build_options
+from curie_runner import session as session_module
 from curie_runner.fake import FakeModelSession, default_turn
 from curie_runner.session import SessionRunner
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
@@ -310,6 +312,627 @@ def test_interrupt_precedes_iterator_exception_and_preserves_cancelled_terminal(
         assert "internal-interrupt-error-call-PLACEHOLDER" not in repr(
             tools[0].attributes
         )
+
+
+def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing at a suspended yield must not let abandonment store first."""
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    fake = FakeModelSession()
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+    )
+    metrics: list[tuple[str, dict[str, str]]] = []
+
+    def capture_metric(
+        name: str,
+        _value: float = 1,
+        *,
+        attributes: dict[str, str],
+    ) -> None:
+        metrics.append((name, dict(attributes)))
+
+    monkeypatch.setattr(session_module, "record_metric", capture_metric)
+    epoch = "A" * 43
+
+    async def go() -> None:
+        await runner.start()
+        turn = runner.run_turn(
+            Event(type="message", text="go", user="U0EXAMPLE1", ts="1"),
+            turn_epoch=epoch,
+        )
+        await anext(turn)
+        assert await runner.timeout(epoch) is True
+        # No further yield is requested. GeneratorExit reaches run_turn's
+        # no-yield finally, which must store timeout before RunTracer can infer
+        # generic abandonment.
+        await turn.aclose()
+        await runner.close()
+
+    anyio.run(go)
+    spans = list(exporter.get_finished_spans())
+    root = _span_named(spans, "agent.run")[0]
+    assert root.attributes["curie.terminal.cause"] == "runner_timeout"
+    assert root.attributes["curie.terminal.status"] == "failed"
+    assert root.status.status_code is StatusCode.ERROR
+    completed = [
+        attributes
+        for name, attributes in metrics
+        if name == "curie.turn.completed"
+    ]
+    assert completed == [
+        {
+            "service.name": "curie-runner",
+            "source": "runner",
+            "outcome": "classified_failure",
+        }
+    ]
+
+
+def test_timeout_epoch_is_isolated_from_stale_spoofed_and_replayed_turns() -> None:
+    runner, fake = _runner()
+    first_epoch = "B" * 43
+    second_epoch = "C" * 43
+    spoofed_epoch = "D" * 43
+
+    async def go() -> None:
+        await runner.start()
+        first = runner.run_turn(
+            Event(type="message", text="first", user="U0EXAMPLE1", ts="1"),
+            turn_epoch=first_epoch,
+        )
+        async for _ in first:
+            pass
+
+        interrupts_after_first = fake.interrupts
+        assert await runner.timeout(first_epoch) is False
+        assert fake.interrupts == interrupts_after_first
+
+        second = runner.run_turn(
+            Event(type="message", text="second", user="U0EXAMPLE1", ts="2"),
+            turn_epoch=second_epoch,
+        )
+        await anext(second)
+        assert await runner.timeout(first_epoch) is False
+        assert await runner.timeout(spoofed_epoch) is False
+        assert fake.interrupts == interrupts_after_first
+
+        assert await runner.timeout(second_epoch) is True
+        async for _ in second:
+            pass
+        interrupts_after_timeout = fake.interrupts
+        assert await runner.timeout(second_epoch) is False
+        assert fake.interrupts == interrupts_after_timeout
+        await runner.close()
+
+    anyio.run(go)
+
+
+def test_timeout_during_abandonment_cleanup_cannot_own_next_turn_stop() -> None:
+    class CleanupRaceSession:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+            self.interrupt_lock = anyio.Lock()
+            self.interrupt_roles: list[str] = []
+            self.first_interrupt_entered = anyio.Event()
+            self.release_first_interrupt = anyio.Event()
+            self.second_interrupt_entered = anyio.Event()
+            self.release_second_interrupt = anyio.Event()
+            self.turn_b_cleanup_started = False
+
+        async def connect(self) -> None: ...
+
+        async def query(self, text: str) -> None:
+            self.queries.append(text)
+
+        async def receive_turn(self):
+            yield AssistantMessage(
+                content=[TextBlock(text=f"working-{len(self.queries)}")],
+                model="fake-model",
+            )
+
+        async def interrupt(self) -> None:
+            async with self.interrupt_lock:
+                self.interrupt_roles.append(
+                    "turn_b_cleanup"
+                    if self.turn_b_cleanup_started
+                    else "before_turn_b_cleanup"
+                )
+                attempt = len(self.interrupt_roles)
+                if attempt == 1:
+                    self.first_interrupt_entered.set()
+                    await self.release_first_interrupt.wait()
+                elif attempt == 2:
+                    self.second_interrupt_entered.set()
+                    await self.release_second_interrupt.wait()
+
+        async def close(self) -> None:
+            self.release_first_interrupt.set()
+            self.release_second_interrupt.set()
+
+    session = CleanupRaceSession()
+    runner = SessionRunner(
+        session_factory=lambda: session,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+    )
+    first_epoch = "J" * 43
+    second_epoch = "K" * 43
+
+    async def go() -> None:
+        first_close_done = anyio.Event()
+        timeout_started = anyio.Event()
+        timeout_done = anyio.Event()
+        timeout_accepted: list[bool] = []
+
+        async def close_first() -> None:
+            await first.aclose()
+            first_close_done.set()
+
+        async def request_late_timeout() -> None:
+            timeout_started.set()
+            timeout_accepted.append(await runner.timeout(first_epoch))
+            timeout_done.set()
+
+        await runner.start()
+        first = runner.run_turn(
+            Event(type="message", text="first", user="U0EXAMPLE1", ts="1"),
+            turn_epoch=first_epoch,
+        )
+        await anext(first)
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(close_first)
+            await session.first_interrupt_entered.wait()
+            tasks.start_soon(request_late_timeout)
+            await timeout_started.wait()
+            # Let the control request either reject the retired epoch or queue
+            # behind turn A's cleanup stop. No wall-clock timing is involved.
+            await anyio.lowlevel.checkpoint()
+            await anyio.lowlevel.checkpoint()
+            session.release_first_interrupt.set()
+            await first_close_done.wait()
+
+            second = runner.run_turn(
+                Event(type="message", text="second", user="U0EXAMPLE1", ts="2"),
+                turn_epoch=second_epoch,
+            )
+            await anext(second)
+
+            if not timeout_done.is_set():
+                # Current buggy behavior reaches here: the timeout stop was
+                # accepted for A but its acknowledgement lands during B.
+                await session.second_interrupt_entered.wait()
+                session.release_second_interrupt.set()
+                await timeout_done.wait()
+
+            session.turn_b_cleanup_started = True
+            second_close_done = anyio.Event()
+
+            async def close_second() -> None:
+                await second.aclose()
+                second_close_done.set()
+
+            tasks.start_soon(close_second)
+            if not second_close_done.is_set():
+                await session.second_interrupt_entered.wait()
+                session.release_second_interrupt.set()
+            await second_close_done.wait()
+
+        assert timeout_accepted == [False]
+        assert session.interrupt_roles == [
+            "before_turn_b_cleanup",
+            "turn_b_cleanup",
+        ]
+        await runner.close()
+
+    anyio.run(go)
+
+
+def test_next_turn_waits_for_timeout_interrupt_to_settle() -> None:
+    class SlowTimeoutInterruptSession:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+            self.interrupts = 0
+            self.first_receive_entered = anyio.Event()
+            self.end_first_receive = anyio.Event()
+            self.interrupt_entered = anyio.Event()
+            self.release_interrupt = anyio.Event()
+            self.interrupt_settled = anyio.Event()
+            self.second_query_started = anyio.Event()
+            self.second_query_started_early = False
+
+        async def connect(self) -> None: ...
+
+        async def query(self, text: str) -> None:
+            self.queries.append(text)
+            if len(self.queries) == 2:
+                self.second_query_started_early = not self.interrupt_settled.is_set()
+                self.second_query_started.set()
+
+        async def receive_turn(self):
+            if len(self.queries) == 1:
+                self.first_receive_entered.set()
+                await self.end_first_receive.wait()
+                return
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="sdk-session-PLACEHOLDER",
+                result="healthy",
+            )
+
+        async def interrupt(self) -> None:
+            self.interrupts += 1
+            self.end_first_receive.set()
+            self.interrupt_entered.set()
+            await self.release_interrupt.wait()
+            self.interrupt_settled.set()
+
+        async def close(self) -> None: ...
+
+    session = SlowTimeoutInterruptSession()
+    runner = SessionRunner(
+        session_factory=lambda: session,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+    )
+    first_epoch = "F" * 43
+    second_epoch = "G" * 43
+    first_lines: list[str] = []
+    second_lines: list[str] = []
+
+    async def go() -> None:
+        first_done = anyio.Event()
+        second_attempted = anyio.Event()
+        second_done = anyio.Event()
+        timeout_done = anyio.Event()
+        timeout_accepted: list[bool] = []
+
+        async def consume_first() -> None:
+            async for line in runner.run_turn(
+                Event(type="message", text="first", user="U0EXAMPLE1", ts="1"),
+                turn_epoch=first_epoch,
+            ):
+                first_lines.append(line)
+            first_done.set()
+
+        async def request_timeout() -> None:
+            timeout_accepted.append(await runner.timeout(first_epoch))
+            timeout_done.set()
+
+        async def consume_second() -> None:
+            second_attempted.set()
+            async for line in runner.run_turn(
+                Event(type="message", text="second", user="U0EXAMPLE1", ts="2"),
+                turn_epoch=second_epoch,
+            ):
+                second_lines.append(line)
+            second_done.set()
+
+        await runner.start()
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(consume_first)
+            await session.first_receive_entered.wait()
+            tasks.start_soon(request_timeout)
+            await session.interrupt_entered.wait()
+            tasks.start_soon(consume_second)
+            await second_attempted.wait()
+            # Let the timeout, first consumer, and already-queued second
+            # consumer advance to their ownership barriers. No clock delay is
+            # involved: checkpoints only give each runnable task a turn.
+            await anyio.lowlevel.checkpoint()
+            await anyio.lowlevel.checkpoint()
+
+            assert not first_done.is_set()
+            assert not session.second_query_started.is_set()
+            assert not timeout_done.is_set()
+
+            session.release_interrupt.set()
+            await timeout_done.wait()
+            await first_done.wait()
+            await session.second_query_started.wait()
+            await second_done.wait()
+
+        assert timeout_accepted == [True]
+        await runner.close()
+
+    anyio.run(go)
+
+    first_events = parse_ndjson("".join(first_lines))
+    second_events = parse_ndjson("".join(second_lines))
+    assert first_events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    assert second_events[-1].status is SessionStatus.DONE
+    assert session.queries == ["first", "second"]
+    assert session.interrupts == 1
+    assert session.interrupt_settled.is_set()
+    assert not session.second_query_started_early
+
+
+class _OrderedTimeoutWireSession:
+    """Event-gated SDK double exposing stop/query order without clock sleeps."""
+
+    def __init__(self, failure: str) -> None:
+        self.failure = failure
+        self.wire: list[tuple[str, str | int]] = []
+        self.queries = 0
+        self.interrupts = 0
+        self.first_receive_entered = anyio.Event()
+        self.end_first_receive = anyio.Event()
+        self.first_interrupt_entered = anyio.Event()
+        self.cleanup_interrupt_written = anyio.Event()
+        self.release_ack = anyio.Event()
+        self.second_query_started = anyio.Event()
+
+    async def connect(self) -> None: ...
+
+    async def query(self, text: str) -> None:
+        self.queries += 1
+        self.wire.append(("query", text))
+        if self.queries == 2:
+            self.second_query_started.set()
+
+    async def receive_turn(self):
+        if self.queries == 1:
+            self.first_receive_entered.set()
+            await self.end_first_receive.wait()
+            return
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sdk-session-PLACEHOLDER",
+            result="healthy",
+        )
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+        attempt = self.interrupts
+        self.first_interrupt_entered.set()
+        if self.failure == "cancel-before-write" and attempt == 1:
+            await self.release_ack.wait()
+            return
+        self.wire.append(("interrupt", attempt))
+        if attempt > 1:
+            self.cleanup_interrupt_written.set()
+        if self.failure == "ack-failure" and attempt == 1:
+            self.end_first_receive.set()
+            raise RuntimeError("Control request timeout: interrupt")
+        await self.release_ack.wait()
+        self.end_first_receive.set()
+
+    async def close(self) -> None:
+        self.release_ack.set()
+        self.end_first_receive.set()
+
+
+def _exercise_timeout_interrupt_failure(
+    failure: str,
+) -> tuple[
+    _OrderedTimeoutWireSession,
+    list[str],
+    list[str],
+    list[BaseException],
+    list[ReadableSpan],
+]:
+    session = _OrderedTimeoutWireSession(failure)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    runner = SessionRunner(
+        session_factory=lambda: session,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+    )
+    first_epoch = "H" * 43
+    second_epoch = "I" * 43
+    first_lines: list[str] = []
+    second_lines: list[str] = []
+    timeout_errors: list[BaseException] = []
+
+    async def go() -> None:
+        first_done = anyio.Event()
+        second_done = anyio.Event()
+        timeout_done = anyio.Event()
+        first_scope = anyio.CancelScope()
+        timeout_scope = anyio.CancelScope()
+
+        async def consume_first() -> None:
+            with first_scope:
+                try:
+                    async for line in runner.run_turn(
+                        Event(
+                            type="message",
+                            text="first",
+                            user="U0EXAMPLE1",
+                            ts="1",
+                        ),
+                        turn_epoch=first_epoch,
+                    ):
+                        first_lines.append(line)
+                except anyio.get_cancelled_exc_class():
+                    pass
+            first_done.set()
+
+        async def request_timeout() -> None:
+            with timeout_scope:
+                try:
+                    await runner.timeout(first_epoch)
+                except BaseException as exc:
+                    timeout_errors.append(exc)
+            timeout_done.set()
+
+        async def consume_second() -> None:
+            async for line in runner.run_turn(
+                Event(type="message", text="second", user="U0EXAMPLE1", ts="2"),
+                turn_epoch=second_epoch,
+            ):
+                second_lines.append(line)
+            second_done.set()
+
+        await runner.start()
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(consume_first)
+            await session.first_receive_entered.wait()
+            tasks.start_soon(request_timeout)
+            await session.first_interrupt_entered.wait()
+
+            if failure.startswith("cancel-"):
+                timeout_scope.cancel()
+                await timeout_done.wait()
+                # Abandon the blocked consumer. Its run_turn finalizer must see
+                # the still-open turn and send the safety-net stop; ending the
+                # fake iterator normally would set _turn_open=False first and
+                # would not exercise this cancellation shape.
+                first_scope.cancel()
+                await session.cleanup_interrupt_written.wait()
+                session.release_ack.set()
+                await first_done.wait()
+                tasks.start_soon(consume_second)
+            else:
+                await timeout_done.wait()
+                tasks.start_soon(consume_second)
+
+            await first_done.wait()
+            await session.second_query_started.wait()
+            await second_done.wait()
+
+        await runner.close()
+
+    anyio.run(go)
+    return session, first_lines, second_lines, timeout_errors, list(
+        exporter.get_finished_spans()
+    )
+
+
+def _assert_timeout_then_healthy(
+    first_lines: list[str],
+    second_lines: list[str],
+    spans: list[ReadableSpan],
+    *,
+    first_was_abandoned: bool = False,
+) -> None:
+    second_events = parse_ndjson("".join(second_lines))
+    if first_was_abandoned:
+        assert not first_lines
+    else:
+        first_events = parse_ndjson("".join(first_lines))
+        assert first_events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    assert second_events[-1].status is SessionStatus.DONE
+    first_root = _span_named(spans, "agent.run")[0]
+    assert first_root.attributes["curie.terminal.cause"] == "runner_timeout"
+    assert first_root.attributes["curie.terminal.status"] == "failed"
+    assert first_root.status.status_code is StatusCode.ERROR
+
+
+def test_timeout_cancelled_after_stop_write_cleans_up_before_next_query() -> None:
+    session, first, second, errors, spans = _exercise_timeout_interrupt_failure(
+        "cancel-after-write"
+    )
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert session.wire == [
+        ("query", "first"),
+        ("interrupt", 1),
+        ("interrupt", 2),
+        ("query", "second"),
+    ]
+    _assert_timeout_then_healthy(first, second, spans, first_was_abandoned=True)
+
+
+def test_timeout_ack_failure_releases_only_after_recorded_stop() -> None:
+    session, first, second, errors, spans = _exercise_timeout_interrupt_failure(
+        "ack-failure"
+    )
+    assert [type(error) for error in errors] == [RuntimeError]
+    assert session.wire == [
+        ("query", "first"),
+        ("interrupt", 1),
+        ("query", "second"),
+    ]
+    _assert_timeout_then_healthy(first, second, spans)
+
+
+def test_timeout_cancelled_before_stop_write_uses_cleanup_before_next_query() -> None:
+    session, first, second, errors, spans = _exercise_timeout_interrupt_failure(
+        "cancel-before-write"
+    )
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert session.wire == [
+        ("query", "first"),
+        ("interrupt", 2),
+        ("query", "second"),
+    ]
+    _assert_timeout_then_healthy(first, second, spans, first_was_abandoned=True)
+
+
+def test_timeout_precedes_an_operator_interrupt_on_the_same_turn() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    script = [
+        AssistantMessage(content=[TextBlock(text="working")], model="fake-model"),
+        ResultMessage(
+            subtype="error_during_execution",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="sdk-session-PLACEHOLDER",
+            result="stopped",
+        ),
+    ]
+    fake = FakeModelSession(lambda: script, truncate_on_interrupt=False)
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+    )
+    epoch = "E" * 43
+    lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        turn = runner.run_turn(
+            Event(type="message", text="go", user="U0EXAMPLE1", ts="1"),
+            turn_epoch=epoch,
+        )
+        lines.append(await anext(turn))
+        await runner.interrupt("operator stop")
+        assert await runner.timeout(epoch) is True
+        async for line in turn:
+            lines.append(line)
+        await runner.close()
+
+    anyio.run(go)
+    events = parse_ndjson("".join(lines))
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    root = _span_named(list(exporter.get_finished_spans()), "agent.run")[0]
+    assert root.attributes["curie.terminal.cause"] == "runner_timeout"
+    assert root.attributes["curie.terminal.status"] == "failed"
+    assert root.status.status_code is StatusCode.ERROR
 
 
 @pytest.mark.parametrize(

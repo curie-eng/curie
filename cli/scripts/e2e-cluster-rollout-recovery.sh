@@ -575,6 +575,10 @@ PY
 )" >/dev/null
 DEPLOYMENT_PATCHED=1
 kubectl -n "$NAMESPACE" rollout status "deployment/$WORKER_DEPLOYMENT" --timeout=300s
+# A completed rollout can still have a terminating predecessor. Settle that
+# setup transition before choosing the consumer and freezing the full identity
+# invariant for the first message; keep every pod in the later comparisons.
+assert_release_healthy
 OLD_POD="$(ready_worker)"
 [[ -n "$OLD_POD" ]] || { echo "error: no Ready baseline worker" >&2; exit 1; }
 OLD_CONSUMER="$(wait_consumer_for_pod "$OLD_POD" 60)"

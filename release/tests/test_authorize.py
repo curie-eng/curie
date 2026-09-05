@@ -1339,10 +1339,9 @@ class TestHelmCiWorkflowTriggers:
         # web-identity gate executes those repository files against each
         # rendered workload, so a PR touching only them (a revert of the
         # credential fix) must still match this filter or the gate never runs.
-        # The same holds for compose.dev.yaml: the Langfuse image-pin
-        # assertion this job runs renders it as the second shipping surface
-        # for the pinned Langfuse version, so a PR that floats the tag only
-        # in Compose must still match this filter or that gate never runs.
+        # compose.dev.yaml is here for the same reason: two chart gates (the
+        # unpinned-image gate, #2319, and the Langfuse image-pin gate, #2190)
+        # read it, so a compose-only unpin must still trigger this workflow.
         assert triggers["pull_request"]["paths"] == [
             "charts/curie/**",
             "examples/sre-bot/observability/**",
@@ -1600,6 +1599,7 @@ class TestLegitimateSkips:
             "cluster=true",
             "released_upgrade=true",
             "skill_local_tiers=skill,local",
+            "pytest=true",
         ], (
             "ci.yaml's push selection no longer emits the complete tier contract: "
             f"{github_output.read_text()!r}"

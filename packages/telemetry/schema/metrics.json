@@ -54,10 +54,11 @@
           "classified_failure",
           "side_effect_halted",
           "idle",
-          "interrupted"
+          "interrupted",
+          "deadline_halted"
         ]
       },
-      "cardinality_bound": 168
+      "cardinality_bound": 192
     },
     "curie.turn.duration": {
       "type": "histogram",
@@ -86,10 +87,11 @@
           "classified_failure",
           "side_effect_halted",
           "idle",
-          "interrupted"
+          "interrupted",
+          "deadline_halted"
         ]
       },
-      "cardinality_bound": 168
+      "cardinality_bound": 192
     },
     "curie.history.resume.cache_read": {
       "type": "histogram",
@@ -690,7 +692,8 @@
           "steer",
           "interrupt",
           "reset",
-          "status"
+          "status",
+          "timeout"
         ],
         "role": [
           "client"
@@ -702,7 +705,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 20
+      "cardinality_bound": 24
     },
     "curie.runner.rpc.result": {
       "type": "counter",
@@ -718,7 +721,8 @@
           "steer",
           "interrupt",
           "reset",
-          "status"
+          "status",
+          "timeout"
         ],
         "role": [
           "client"
@@ -730,7 +734,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 20
+      "cardinality_bound": 24
     },
     "curie.approval.lifecycle": {
       "type": "counter",

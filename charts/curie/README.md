@@ -3,13 +3,14 @@
 The umbrella Helm chart that installs the whole Curie (Relay) stack on a
 single node. It installs the backing-store stack (Langfuse + Postgres + Valkey +
 ClickHouse + RustFS + OTel Collector, dev profile, BYO (bring-your-own)
-toggles, the two preflights) plus the security rails as chart defaults.
+toggles, the three preflights) plus the security rails as chart defaults.
 
 The chart is a direct port of the proven `compose.dev.yaml` dev stack: same
 images and the same headless-bootstrapped Langfuse dev project. The chart
-ClickHouse default is `:25.12` (AVX required, coupled to `langfuse.image.tag`)
-while compose stays on `:24.8` so an SSE4.2-only developer host can still boot
-the local stack. Rather than vendoring the upstream Langfuse chart and its
+ClickHouse default is `:25.12.11.4` (AVX required, coupled to
+`langfuse.image.tag`) while compose stays on `:24.8.14.39` so an SSE4.2-only
+developer host can still boot the local stack; both sides name a patch build
+rather than a moving `25.12` / `24.8` alias (#2319). Rather than vendoring the upstream Langfuse chart and its
 Bitnami subcharts, each component is a first-class template here -- this keeps
 the single-node footprint controllable and avoids the Bitnami-catalog
 (`bitnamilegacy/*`) instability. It still follows the Langfuse chart *idiom*:
@@ -126,6 +127,7 @@ helm upgrade curie charts/curie -n curie --reuse-values \
 | Value | Default | Meaning |
 | --- | --- | --- |
 | `dispatcher.apiBaseUrl` | `""` | Empty derives the in-chart API Service. A set value is used verbatim (BYO), and is **required** when `api.deploy: false`, where no in-chart Service exists to derive from. |
+| `ui.apiBaseUrl` | `""` | Empty derives the in-chart API Service for the UI's `CURIE_API_TARGET` nginx upstream. A set value is used verbatim (BYO). **Required** when `api.deploy: false` and `ui.deploy` is true: the UI's probes hit nginx `/` rather than the upstream, so an empty override fails the render closed instead of shipping a Ready UI that fails every `/api/` request. |
 | `dispatcher.apiPreflightTimeoutSeconds` | `120` | Bounded time for API `/health`, followed by a fresh same-size discovery-and-Slack budget. The bare dispatcher default remains 30 seconds. |
 | `dispatcher.startupProbe.initialDelaySeconds` | `0` | Delay before Kubernetes begins the dispatcher heartbeat startup probe. |
 | `dispatcher.startupProbe.periodSeconds` | `10` | Interval between dispatcher startup probes. |
@@ -152,6 +154,19 @@ dead-end at click time) and the fix is to set `dispatcher.apiBaseUrl`. And
 because the API's `/health` is unauthenticated, that first preflight proves only
 reachability. The following authenticated `/agents` discovery refuses startup
 when a BYO API expects a different key. Match `apiKey` to the API you point at.
+
+`api.deploy: false` also moves the runner sandbox's memory, history and state
+calls onto that external host, and the sandbox is under Rail 1's default-deny
+egress. The in-chart `runner-allow-api` policy selects this release's API pods,
+so it does not render, and NetworkPolicy has no hostname peer to derive from
+`dispatcher.apiBaseUrl`. Set `api.egress` to the endpoint's CIDRs (`{cidr,
+ports}` entries, same shape as the allowlist); the chart requires it at render
+whenever `dispatcher.apiBaseUrl` names an external API, because the failure it
+prevents is silent — agents boot with no
+prior memory and no thread transcript, `remember` writes never persist, and the
+only symptom is a warning line inside the sandbox.
+`mailAdapter.apiEgress.httpsCidrs` above is the same idea for the mail adapter
+pod: one BYO peer, declared explicitly, per pod that has an egress policy.
 
 **Cluster variants:**
 
@@ -341,12 +356,12 @@ pipeline and environment are applied on `helm upgrade`.
 | Component | Image | Notes |
 |---|---|---|
 | Langfuse web + worker | `langfuse/langfuse:3.225.5`, `langfuse/langfuse-worker:3.225.5` | Observability + eval backbone. Headless-bootstrapped dev org/project. Web and worker stay on one reviewed migration set; do not replace the version with floating `:3`. Both Deployments use Recreate, so a Langfuse image change is a brief outage while boot migrations run. |
-| Postgres | `postgres:16-alpine` | Langfuse transactional store + app state. StatefulSet. |
-| Valkey | `valkey/valkey:8-alpine` | Langfuse cache/queue + dispatcher Streams queue. |
-| ClickHouse | `clickhouse/clickhouse-server:25.12` | Langfuse OLAP store. Coupled to `langfuse.image.tag` 3.225.5; chart default requires AVX (see preflight). |
+| Postgres | `postgres:16.15-alpine@sha256:cf78e766...` | Langfuse transactional store + app state. StatefulSet. Digest-pinned: PostgreSQL's version is two components, and `postgres.podSecurityContext.fsGroup` (70) is the `postgres` gid read out of those exact bytes. |
+| Valkey | `valkey/valkey:8.1.10-alpine` | Langfuse cache/queue + dispatcher Streams queue. Same pin as `compose.dev.yaml` and the CI rust job's Valkey service. |
+| ClickHouse | `clickhouse/clickhouse-server:25.12.11.4` | Langfuse OLAP store. Coupled to `langfuse.image.tag` 3.225.5; chart default requires AVX (see preflight). `compose.dev.yaml` deliberately stays on the SSE4.2-safe `24.8.14.39`. |
 | RustFS | `rustfs/rustfs:1.0.0-beta.12` plus `amazon/aws-cli:2.32.6` init | Langfuse object storage; BYO real S3 in prod. |
 | OTel Collector | `otel/opentelemetry-collector-contrib:0.119.0` | Bounded OTLP gateway (gRPC+HTTP), durable queue by default; traces -> Langfuse over HTTP, logs/metrics -> configured exporters. |
-| Mail adapter | `ghcr.io/curie-eng/curie-mail-adapter` | Off by default. One `Recreate` replica with durable SQLite on single-writer storage; no platform key/database credential or ServiceAccount token. |
+| Mail adapter | `ghcr.io/curie-eng/curie-mail-adapter` | Off by default. One `Recreate` replica with durable SQLite on single-writer storage; no platform key/database credential or ServiceAccount token. The only first-party workload with its own egress NetworkPolicy, so its OTLP export needs an explicit peer (see below). |
 
 The mail adapter's `mailAdapter.persistence` block renders a 1 GiB RWO PVC by
 default or mounts a named same-namespace single-writer Filesystem `existingClaim`
@@ -354,11 +369,25 @@ with exactly one `ReadWriteOnce` or `ReadWriteOncePod` access mode. Its
 root filesystem remains read-only; only the state mount and an `emptyDir` at
 `/tmp` are writable. Enabling it also requires an explicit
 `mailAdapter.agentmail.httpsCidrs` list. One egress-only NetworkPolicy then
-allows DNS, this release's API pods, and those provider/proxy CIDRs on TCP 443.
-When `api.deploy=false`, the in-chart API selector is replaced by the required
-`mailAdapter.apiEgress.httpsCidrs` peers on `mailAdapter.apiEgress.port`; the
-chart does not infer IPs from `apiBaseUrl`. The policy has no Kubernetes API
-carve-out and never selects runner sandboxes. See
+allows DNS, this release's API pods, those provider/proxy CIDRs on TCP 443, and
+-- while `otelCollector.deploy=true` -- this release's OTel Collector on its
+gRPC and HTTP ports, so the adapter's OTLP export is not dropped by its own
+rail. When `api.deploy=false`, the in-chart API selector is replaced by the
+required `mailAdapter.apiEgress.httpsCidrs` peers on
+`mailAdapter.apiEgress.port`; the chart does not infer IPs from `apiBaseUrl`.
+The policy has no Kubernetes API carve-out and never selects runner sandboxes.
+
+The adapter is the only first-party workload with an egress-restricting
+NetworkPolicy, which makes one telemetry configuration asymmetric. With
+`otelCollector.deploy=false` and an external `otelCollector.endpoint`, api,
+dispatcher and worker export normally because nothing restricts their egress,
+while the adapter's exports are dropped: its policy has no peer for an address
+the chart cannot know, and the chart deliberately invents no broad allow for
+one. Because NetworkPolicies union rather than intersect, the fix needs no chart
+change -- apply an additional egress policy in the release namespace selecting
+the adapter's labels (`app.kubernetes.io/component: mail-adapter` plus the
+release's instance label) with a `to:` for the external collector. Everything
+else about the rail, including the AgentMail CIDRs, keeps working unchanged. See
 [`docs/operations.md`](../../docs/operations.md#connecting-email) for the
 mode-0600 credential workflow, retention, erase, and recovery procedure.
 
@@ -459,10 +488,33 @@ Flipping any to `false` removes its resources from the render; consumers
 fields on the same block (`host`/`port` for stores, `otelCollector.endpoint`
 for an external collector).
 
+BYO ClickHouse picks its URL scheme the same way: `clickhouse.scheme` governs
+`CLICKHOUSE_URL` for both Langfuse deployments and their readiness gate, derived
+as `https` when `clickhouse.deploy: false` and `httpPort` is 8443 and `http`
+otherwise, with an explicit `http`/`https` winning. `https` additionally enables
+TLS for the Langfuse migration connection on `nativePort`. A TLS ClickHouse
+needs both ports set -- `httpPort: 8443` and `nativePort: 9440` (the migration
+DSN uses `nativePort` and only the flag changes, not the port) -- or an
+explicit `scheme: https` plus both ports.
+
+A BYO Valkey that only accepts TLS -- in-transit-encrypted ElastiCache, Azure
+Cache for Redis, Redis Cloud, Upstash -- also needs `valkey.tls: true` alongside
+`valkey.deploy: false` and `valkey.host`. It reaches every consumer of that
+store at once: the api, worker and dispatcher, both `worker-upgrade-drain` hook
+Jobs, and both Langfuse Deployments. It requires `valkey.deploy: false` --
+`valkey.tls: true` against the in-chart Valkey fails the render, because that
+StatefulSet serves no TLS listener. Verification uses the system CA bundle, so a
+store fronted by a private CA (or one requiring mutual TLS) is not supported by
+this knob; that needs CA material distributed to all seven containers, which is
+a separate decision.
+
 BYO Langfuse requires a bare external hostname in `langfuse.host`. Consumers
 compose its URL as
-`http://<langfuse.host>:<langfuse.web.service.port>`; do not include a scheme,
-port, or path in `langfuse.host`. With `langfuse.deploy: false`, the chart omits
+`<scheme>://<langfuse.host>:<langfuse.web.service.port>`, where the scheme is
+`langfuse.scheme` when set (`http` or `https` only) and otherwise derived --
+`https` when the port is 443, `http` otherwise. Set `langfuse.scheme: https`
+for a TLS endpoint on any other port. Do not include a scheme, port, or path in
+`langfuse.host`. With `langfuse.deploy: false`, the chart omits
 the Langfuse Service, web and worker Deployments, and model-pricing Job. Helm
 rendering fails with an error naming `langfuse.host` when that value is missing
 or empty, instead of emitting the hostname of a Service the chart did not
@@ -489,10 +541,12 @@ complete `otlpAuthHeader` value. As an alternative for collector
 authentication, set `otelCollector.otlpAuthHeader` explicitly; see the
 credential details below.
 
-This BYO path currently composes HTTP only and has no HTTPS/TLS selector.
-Deploy it only across a trusted private transport or through a proxy that
-provides the required protection: an on-path observer can recover the full
-project credential because the Basic header is encoded, not encrypted.
+The URL scheme is selected by `langfuse.scheme`: derived as `https` when the
+port is 443 and `http` otherwise, with an explicit value winning. On the
+cleartext path (`http`), the Basic header warning still applies -- deploy a
+cleartext BYO Langfuse only across a trusted private transport or behind a
+proxy that provides TLS: an on-path observer can recover the full project
+credential because the Basic header is encoded, not encrypted.
 
 ### Langfuse Postgres startup readiness
 
@@ -513,14 +567,15 @@ authentication and migrations: bad credentials and permanent migration failures
 are terminal there and are not retried by this gate.
 
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
-`helm install` (the default) generates strong random values for all eleven
+`helm install` (the default) generates strong random values for all thirteen
 chart owned credentials: the backing store passwords, Langfuse
-salt/encryptionKey/nextauthSecret, the two Langfuse init credentials, and the
-api/webhook keys. Set `security.allowDevDefaults: true` (values-dev.yaml, i.e.
-`curie cluster up --dev`) to keep the deterministic published defaults for
-dev/CI.
+salt/encryptionKey/nextauthSecret, the two Langfuse init credentials, the
+api/webhook keys, `worker.internalWorkerToken`, and
+`api.approvalChatAttesterSecret`. Set `security.allowDevDefaults: true`
+(values-dev.yaml, i.e. `curie cluster up --dev`) to keep the deterministic
+published defaults for dev/CI.
 
-The nine non init credentials persist through `lookup`, so `helm upgrade`
+The eleven non init credentials persist through `lookup`, so `helm upgrade`
 re-uses them. Their explicit `--set` overrides and per store `existingSecret`
 values take precedence for rotation or recovery. The Langfuse init project
 secret and user password are first boot inputs. A fresh install generates them,
@@ -544,6 +599,18 @@ this path must add that key (or set `otelCollector.otlpAuthHeader`) before
 upgrading. Without it the collector pod fails to start with
 `CreateContainerConfigError`, which is the deliberate replacement for a silent
 401 on every trace export.
+
+Upgrade note for `langfuse.existingSecret` (#2327): the chart now actually reads
+`langfuseSalt` and `langfuseEncryptionKey` from that Secret. `values.yaml`
+already listed both as required keys, but the template ignored them -- an
+install already on this path was salting and encrypting with the chart-managed
+Secret's values instead, because those two keys ignored `existingSecret` while
+`NEXTAUTH_SECRET` and the `LANGFUSE_INIT_*` keys already honored it. Both
+Deployments now read the BYO Secret for real: a missing key fails loud with
+`CreateContainerConfigError`, a differing one fails silently and stops
+decrypting columns already written. Before upgrading, copy the live values out
+of the chart-managed `<release>-secrets` Secret into your BYO Secret, unless no
+encrypted data is worth preserving.
 
 Caveat: generation relies on Helm `lookup`, which is empty under client-side
 rendering. Driving this chart via `helm template | kubectl apply` or ArgoCD's
@@ -709,22 +776,26 @@ that is in place, static keys in a Secret remain the supported choice, and they
 are the safer of the two available options rather than a limitation to route
 around.
 
-## The two preflights
+## The three preflights
 
-(a) is a blocking `pre-install,pre-upgrade` hook. (b) is a `helm test` that
-must be run explicitly; it never runs during `helm install`. A green
+The chart ships three default-on preflights under `preflights.*`, plus a
+conditional gVisor RuntimeClass preflight under `security.gvisor` (described
+under the security rails; it is not in this block and does not run on the
+fake-model default). (a) is a blocking `pre-install,pre-upgrade` hook. (b) is
+a `helm test` that must be run explicitly; it never runs during
+`helm install`. (c) is a blocking `post-install,post-upgrade` hook. A green
 `helm install` does not prove NetworkPolicy is enforced, so run
 `helm test <release> -n <ns>` before treating the security rails as live.
-Both are re-runnable via that same `helm test` command.
+All three are re-runnable via that same `helm test` command.
 
 **(a) CPU-AVX / ClickHouse-pin check** (`preflights.avxCheck`). A pre-install /
 pre-upgrade hook Job.
 
 - ClickHouse >= 25.x is compiled for AVX and SIGILLs with exit 132 on
   SSE4.2-only CPUs -- a crash-looping pod is a confusing way to learn that.
-- Chart defaults require AVX: `clickhouse.image.tag` is `25.12` because
+- Chart defaults require AVX: `clickhouse.image.tag` is `25.12.11.4` because
   `langfuse.image.tag` 3.225.5's migration set from 39 onward cannot apply on
-  24.8, and 25.12 is not in `clickhouse.sse42SafeTags`.
+  24.8, and the 25.12 line is not in `clickhouse.sse42SafeTags`.
 - The Job reads the node's `/proc/cpuinfo`; if the node lacks AVX it FAILS
   the install unless the operator pins a tag in `clickhouse.sse42SafeTags`
   (`24.8`, `24.3`, `23.8`). That override cannot apply the current Langfuse
@@ -741,6 +812,26 @@ does a before/after egress check -- reach an external target with no policy
 private ranges stay allowed so the control path survives; the public target is
 denied), retry (expect blocked). It reports `enforcement=true` only if the after
 egress is actually blocked, and `enforcement=false` (fails loudly) otherwise.
+
+**(c) Controller-ready gate** (`preflights.controllerReady`). A post-install /
+post-upgrade hook Job, also re-runnable via `helm test`. Default `enabled:
+true`, gated also on `agentSandbox.controller.deploy` (also default true).
+
+- The vendored agent-sandbox controller runs a cluster-scope NetworkPolicy
+  informer. If its RBAC cannot satisfy that cluster LIST, the manager
+  crash-loops and no SandboxClaim ever binds. The Deployment has no
+  readiness probe, so `rollout status` can pass while the manager still
+  blocks on cache sync. The load-bearing signal is the "Starting workers"
+  log line.
+- The Job fails the Helm operation unless the controller becomes Available
+  and logs "Starting workers" within
+  `preflights.controllerReady.timeoutSeconds` (default 180).
+- An upgrade over a crash-looping controller may need a manual pod delete
+  plus `helm test`, because the hook waits for a healthy controller that
+  never arrives.
+- Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
+  `preflights.controllerReady.enabled: false`.
+- Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
 
 ## Single-node footprint (measured on a disposable single-node k3s cluster, 4 GB / 4 core)
 
@@ -837,10 +928,15 @@ sandbox and renders whenever an in-chart store is deployed.
 **Fail-closed egress.** `security.networkPolicy.allowedEgress` is EMPTY by
 default: a fresh install denies all egress except DNS until the operator declares
 where the model API and MCP endpoints live (`{cidr, ports}` entries). An unset
-allowlist never means allow-all. A BYO object store is not on that list: set
+allowlist never means allow-all. The BYO in-chart peers are not on that list
+either, because each names one endpoint rather than a class of destinations: set
 `rustfs.egress` (and `rustfs.stsEgress` on the key-free path) so the sandbox
-bundle-fetch can reach S3 and STS without opening the model allowlist. See
-**Key-free object store auth** above.
+bundle-fetch can reach S3 and STS, `otelCollector.egress` when
+`otelCollector.deploy: false` points the runner at an external collector, and
+`api.egress` when `api.deploy: false` points it at an external API. Each is
+required at render on its BYO path, so the install fails loudly instead of
+shipping a sandbox holding an address it can never reach. See **Key-free object
+store auth** above.
 
 **The controller does not get a second vote on egress (#765, ADR-0067).**
 NetworkPolicy allows are additive across objects selecting the same pods -- Rail
@@ -908,12 +1004,16 @@ a reachability boundary (namespace-per-tenant compute); the `ResourceQuota` and
 `LimitRange` complete it with a bound on consumption, since nodes are shared
 beneath the namespace and one tenant's sandboxes can otherwise exhaust node
 capacity another tenant's sandboxes depend on. The `ResourceQuota` is scoped
-via `scopeSelector` to the sandbox `PriorityClass` name
-(`resourceQuota.sandboxPriorityClassName`, default `curie-sandbox` -- the
-name ADR-0059 decision 5's `PriorityClass` is expected to define), so it binds
-only sandbox pods and not the control plane or data tier that, in the N=1
-self-host topology, share this same release namespace. The `LimitRange` has no
-scope (Kubernetes does not support one on `LimitRange`) and so applies
+via `scopeSelector` to the sandbox `PriorityClass` name. That name derives
+from `priorityClasses.sandbox.name` when
+`resourceQuota.sandboxPriorityClassName` is empty (the default -- empty
+means derive). Set the override only for a PriorityClass managed outside
+this chart whose name differs from `priorityClasses.sandbox.name`; pinning
+it is what lets a later rename leave the quota scoped to a class nothing
+carries. The quota then binds only sandbox pods and not the control plane
+or data tier that, in the N=1 self-host topology, share this same release
+namespace. The `LimitRange` has no scope (Kubernetes does not support one
+on `LimitRange`) and so applies
 namespace-wide, but ships `default`/`defaultRequest` only -- never `min`/`max`
 -- so it only ever fills a resource dimension a container leaves undeclared
 (today, `ephemeral-storage` everywhere in the chart) and can never reject an
@@ -1044,7 +1144,11 @@ to install only the control plane + backing stores without the runner substrate.
 - Traces flow to `<release>-otel-collector:4318` (HTTP) when the chart collector
   is deployed, or to `otelCollector.endpoint` when that BYO field is set. The
   env block is omitted only for explicit `telemetryDisabled` or local/offline
-  no-endpoint mode.
+  no-endpoint mode. The runner is under Rail 1, so on the BYO path the endpoint
+  alone gets it nowhere: `otelCollector.egress` must name the collector's CIDRs
+  or the default-deny drops every sandbox span while api, dispatcher and worker
+  keep exporting normally. The chart requires it at render rather than letting
+  that asymmetry ship silently.
 
 ## Deploying without inbound access
 
@@ -1283,7 +1387,9 @@ curie cluster github-app --app-id 1234567 --existing-secret my-github-app
 
 `--existing-secret-key` defaults to `privateKey`, the same default as the
 chart — pass it explicitly if your Secret uses a different key, since the CLI
-always sets this field. The command also rolls the API deployment onto the
+always sets this field. The command signs a JWT and calls GitHub `GET /app`
+before the helm upgrade; a 401 or App-id mismatch leaves the last known-good
+credential in place. The command also rolls the API deployment onto the
 referenced Secret, so there is nothing further to restart.
 
 **Quick trial — let the chart hold it.** `curie cluster github-app --app-id …
@@ -1327,7 +1433,7 @@ restarts.
 
 The GitHub App key was the first of twelve credential keys read straight from
 `.Values` with no in-chart generation (`charts/curie/templates/secrets.yaml`
-calls these direct passthrough, as opposed to the eleven keys
+calls these direct passthrough, as opposed to the thirteen keys
 `curie.managedSecret` generates and persists). Issue #1759 gave the other
 eleven the same `existingSecret` / `existingSecretKey` escape, one pair per
 key, all winning over their plain value when set:

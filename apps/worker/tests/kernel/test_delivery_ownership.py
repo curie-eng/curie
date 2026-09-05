@@ -38,6 +38,7 @@ from typing import Any
 
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
 from curie_dispatcher.queue import to_stream_fields
+from curie_worker import kernel as kernel_module
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
 
@@ -671,5 +672,115 @@ def test_a_transferred_delivery_inherits_the_remaining_budget_not_a_fresh_one(
             )
             assert fresh.generation == 1
             assert fresh.budget.deadline_ms > lease_1.budget.deadline_ms
+
+    asyncio.run(go())
+
+
+def test_an_already_expired_delivery_escalates_once_records_deadline_halted_and_acks(
+    make_harness,
+    monkeypatch,
+) -> None:
+    """#2278: recovering an already-expired delivery must escalate once, emit
+    one terminal completion, record both turn metrics through the REAL shared
+    ``record_metric`` validator, and ACK so the entry does not remain pending.
+
+    Red on omitting ``deadline_halted`` from ``_TURN_OUTCOMES``: ``record_metric``
+    raises after settlement, the consumer leaves the entry pending, and a turn
+    that already completed stays visibly stuck.
+
+    The sibling entry is the failure-negative: a first delivery with a live
+    budget still completes as ``done`` and ACKs, so the halt is the expired
+    deadline and not a consumer that stopped settling.
+    """
+
+    recorded: list[tuple[str, dict[str, str]]] = []
+    real_record_metric = kernel_module.record_metric
+
+    def spy(
+        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
+    ) -> None:
+        recorded.append((name, dict(attributes or {})))
+        real_record_metric(name, value, attributes=attributes)
+
+    monkeypatch.setattr(kernel_module, "record_metric", spy)
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+            h.runner.default_script = [Final(text="should-not-run", status=DONE)]
+
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(
+                    _qevent("expired", thread="deadline-1", event_id="deadline-1")
+                ),
+            )
+            entry_id, fields = await _read_one(h, h.config.consumer_name)
+            seconds, microseconds = await h.async_redis.time()
+            now_ms = int(seconds) * 1000 + int(microseconds) // 1000
+            await h.async_redis.hset(
+                h.config.delivery_state_key(
+                    h.config.stream, h.config.consumer_group, entry_id
+                ),
+                mapping={"deadline_ms": str(now_ms - 1000)},
+            )
+
+            await consumer._dispatch(entry_id, fields)
+            await _settle(consumer)
+
+            assert h.runner.opened == [], (
+                "an already-expired delivery must not start a runner attempt"
+            )
+            assert h.sink.last_text is not None
+            assert "delivery deadline" in h.sink.last_text.lower()
+            assert "human" in h.sink.last_text.lower()
+            assert [event.event for event, _route, _best in h.sink.events].count(
+                "turn.completed"
+            ) == 1
+            assert [completion.outcome for completion in h.sink.completions] == [
+                "escalated"
+            ]
+            assert await h.async_redis.exists(h.config.done_key("deadline-1"))
+            assert entry_id not in await _pending_rows(h), (
+                "an expired delivery that already completed was left pending"
+            )
+
+            completed = [
+                attrs
+                for name, attrs in recorded
+                if name == "curie.turn.completed"
+            ]
+            durations = [
+                attrs for name, attrs in recorded if name == "curie.turn.duration"
+            ]
+            assert [attrs["outcome"] for attrs in completed] == ["deadline_halted"]
+            assert [attrs["outcome"] for attrs in durations] == ["deadline_halted"]
+
+            recorded.clear()
+            h.runner.default_script = [Final(text="fresh-ok", status=DONE)]
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(
+                    _qevent("fresh", thread="deadline-2", event_id="deadline-2")
+                ),
+            )
+            fresh_id, fresh_fields = await _read_one(h, h.config.consumer_name)
+            await consumer._dispatch(fresh_id, fresh_fields)
+            await _settle(consumer)
+
+            assert h.sink.last_text == "fresh-ok"
+            assert [completion.outcome for completion in h.sink.completions][-1] == (
+                "delivered"
+            )
+            assert fresh_id not in await _pending_rows(h)
+            assert [
+                attrs["outcome"]
+                for name, attrs in recorded
+                if name == "curie.turn.completed"
+            ] == ["done"]
 
     asyncio.run(go())

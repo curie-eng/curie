@@ -416,6 +416,7 @@ class _GenerationSpan:
         self._root_context = set_span_in_context(root)
         self._configured_model = model
         self._active_generation: Any | None = None
+        self._deferred_generation_end_ns: int | None = None
         self._generation_started_ns = 0
         self._generation_model_recorded = False
         self._generation_ttft_recorded = False
@@ -496,12 +497,15 @@ class _GenerationSpan:
         *,
         interrupt_requested: bool,
         classified_failure: bool,
+        timeout_requested: bool = False,
         approval_paused: bool = False,
         completed_without_result: bool = False,
     ) -> None:
         """Apply the closed terminal mapping after the ACI final is decided."""
 
-        if interrupt_requested:
+        if timeout_requested:
+            self._finish("runner_timeout", "failed", failed=True)
+        elif interrupt_requested:
             self._finish("interrupt_requested", "cancelled", failed=False)
         elif approval_paused:
             self._finish("approval_required", "paused", failed=False)
@@ -530,6 +534,7 @@ class _GenerationSpan:
         self._result_observed = True
         if terminal_reason in self._ABORT_CAUSES:
             self._result_abort_cause = terminal_reason
+        self._close_deferred_generation()
         self._close_generation(
             "result_observed",
             failed=failed and not approval_paused,
@@ -559,16 +564,61 @@ class _GenerationSpan:
     def tool_use(self, call_id: str, tool_name: str) -> None:
         """Close provider wait and begin an inferred SDK tool interval."""
 
-        if self._terminal or call_id in self._active_tools:
+        if self._terminal:
+            return
+        self._close_deferred_generation()
+        if call_id in self._active_tools:
             return
         self._close_generation("tool_use_observed", failed=False)
-        self._tool_call_index += 1
-        tool = self._tracer.start_span(
-            "execute_tool",
-            context=self._root_context,
-            record_exception=False,
-            set_status_on_exception=False,
+        self._open_tool(call_id, tool_name)
+
+    def streamed_tool_use(
+        self,
+        call_id: str,
+        tool_name: str,
+        *,
+        observed_time_ns: int,
+    ) -> None:
+        """Begin a streamed tool interval while deferring generation closure."""
+
+        if self._terminal or call_id in self._active_tools:
+            return
+        if self._active_generation is not None:
+            pending_end = self._deferred_generation_end_ns
+            self._deferred_generation_end_ns = (
+                observed_time_ns
+                if pending_end is None
+                else min(pending_end, observed_time_ns)
+            )
+        self._open_tool(
+            call_id,
+            tool_name,
+            start_time_ns=observed_time_ns,
         )
+
+    def _open_tool(
+        self,
+        call_id: str,
+        tool_name: str,
+        *,
+        start_time_ns: int | None = None,
+    ) -> None:
+        self._tool_call_index += 1
+        if start_time_ns is None:
+            tool = self._tracer.start_span(
+                "execute_tool",
+                context=self._root_context,
+                record_exception=False,
+                set_status_on_exception=False,
+            )
+        else:
+            tool = self._tracer.start_span(
+                "execute_tool",
+                context=self._root_context,
+                start_time=start_time_ns,
+                record_exception=False,
+                set_status_on_exception=False,
+            )
         _set(tool, SpanAttributeKey.PHASE, "tool_wait")
         _set(tool, SpanAttributeKey.PHASE_START_KIND, "tool_use_inferred")
         _set(tool, SpanAttributeKey.TOOL_CALL_INDEX, self._tool_call_index)
@@ -582,6 +632,7 @@ class _GenerationSpan:
     def tool_result(self, call_id: str, *, failed: bool) -> None:
         """End a matching tool interval, then infer the next provider wait."""
 
+        self._close_deferred_generation()
         pending = self._active_tools.pop(call_id, None)
         if pending is None:
             return
@@ -663,13 +714,33 @@ class _GenerationSpan:
             self._generation_usage[usage_field] = total
             _set(self._active_generation, attribute_key, total)
 
-    def _close_generation(self, end_kind: str, *, failed: bool) -> None:
+    def _close_deferred_generation(self) -> None:
+        end_time_ns = self._deferred_generation_end_ns
+        if end_time_ns is None:
+            return
+        self._close_generation(
+            "tool_use_observed",
+            failed=False,
+            end_time_ns=end_time_ns,
+        )
+
+    def _close_generation(
+        self,
+        end_kind: str,
+        *,
+        failed: bool,
+        end_time_ns: int | None = None,
+    ) -> None:
         span = self._active_generation
+        self._deferred_generation_end_ns = None
         if span is None:
             return
         _set(span, SpanAttributeKey.PHASE_END_KIND, end_kind)
         span.set_status(StatusCode.ERROR if failed else StatusCode.OK)
-        span.end()
+        if end_time_ns is None:
+            span.end()
+        else:
+            span.end(end_time=end_time_ns)
         self._active_generation = None
 
     def _end_tool(
@@ -688,6 +759,7 @@ class _GenerationSpan:
     def _finish(self, cause: str, status: str, *, failed: bool) -> None:
         if self._terminal:
             return
+        self._close_deferred_generation()
         self._close_generation("terminal_inferred", failed=failed)
         for call_id, (tool, _index) in sorted(
             self._active_tools.items(), key=lambda item: item[1][1]

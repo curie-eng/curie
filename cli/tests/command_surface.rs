@@ -63,7 +63,22 @@ fn cluster_status_plan(env_namespace: &str, flag_namespace: Option<&str>) -> Vec
 }
 
 fn assert_status_plan_namespace(plan: &[String], namespace: &str) {
-    let namespaced: Vec<_> = plan.iter().filter(|line| line.contains(" -n ")).collect();
+    // Convergence previews one explicitly non-executable namespace template:
+    // live manifests may name another namespace. Concrete command arguments
+    // must still honor --namespace over CURIE_NAMESPACE without exception.
+    let template = "kubectl get deployments,statefulsets,daemonsets,pods,jobs -n '<manifest-namespace>' -o json";
+    assert_eq!(
+        plan.iter().filter(|line| line.as_str() == template).count(),
+        1
+    );
+    assert!(plan
+        .iter()
+        .any(|line| line.starts_with("# Convergence plan only:")
+            && line.contains("resolved at runtime")));
+    let namespaced: Vec<_> = plan
+        .iter()
+        .filter(|line| line.contains(" -n ") && line.as_str() != template)
+        .collect();
     assert!(
         !namespaced.is_empty(),
         "status plan must include namespace aware commands: {plan:?}"

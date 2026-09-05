@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 #
-# Render-assertion test for the dispatcher's platform-API wiring (#442). Proves,
-# with `helm template` alone (no cluster), that the dispatcher Deployment is told
-# where the API is and how to authenticate to it. Unwired, the dispatcher falls
-# back to its code default http://localhost:8000, which inside its own pod is the
-# dispatcher itself, and every Slack Approve click dead-ends with only a warning.
+# Render-assertion test for the dispatcher's platform-API wiring (#442) and the
+# UI's API upstream (#2316). Proves, with `helm template` alone (no cluster),
+# that the dispatcher Deployment is told where the API is and how to authenticate
+# to it, and that the UI's nginx CURIE_API_TARGET uses the same helper. Unwired,
+# the dispatcher falls back to its code default http://localhost:8000, which
+# inside its own pod is the dispatcher itself, and every Slack Approve click
+# dead-ends with only a warning. The UI's probes hit nginx `/` rather than the
+# upstream, so an unwired BYO install stays Ready while every /api/ request
+# fails at the proxy -- that path must fail the render closed.
 #
 #   1. Default install renders CURIE_API_URL as the in-chart API Service
 #      (http://<fullname>-api:<api.service.port>), asserted as a VALUE.
@@ -20,6 +24,12 @@
 #      The existing readiness/liveness probes remain unchanged, including on the
 #      worker, which must not receive a startup probe.
 #   7. A token-less install still renders no dispatcher at all (unchanged gate).
+#   8. Default install renders the UI's CURIE_API_TARGET as the in-chart API
+#      Service; the port tracks .Values.api.service.port.
+#   9. ui.apiBaseUrl overrides CURIE_API_TARGET verbatim when api.deploy=false
+#      (the BYO path). An empty override with api.deploy=false fails the render
+#      and names ui.apiBaseUrl. ui.deploy=false still renders the rest of the
+#      chart without that override.
 #
 # NOTE ON `--output-dir`: the sibling scripts in this directory capture
 # `helm template` through command substitution. Do NOT copy that here, and do not
@@ -60,6 +70,19 @@ render_dispatcher() {
   helm template curie "$CHART" --output-dir "$out" "$@" >/dev/null
   local manifest="$out/curie/templates/dispatcher.yaml"
   [ -f "$manifest" ] || fail "$name: dispatcher.yaml did not render at all"
+  echo "$manifest"
+}
+
+# Same --output-dir convention for the UI Deployment. Do not capture helm
+# template through a pipe; see the header note.
+render_ui() {
+  local name="$1"
+  shift
+  local out="$TMP/$name"
+  mkdir -p "$out"
+  helm template curie "$CHART" --output-dir "$out" "$@" >/dev/null
+  local manifest="$out/curie/templates/ui.yaml"
+  [ -f "$manifest" ] || fail "$name: ui.yaml did not render at all"
   echo "$manifest"
 }
 
@@ -357,4 +380,51 @@ if [ -f "$out/curie/templates/dispatcher.yaml" ]; then
   fail "a token-less default install rendered a dispatcher Deployment; the curie.dispatcher.enabled gate regressed"
 fi
 
-echo "OK: dispatcher platform-API wiring and delayed-readiness render assertions passed"
+# 8: default install renders the UI's CURIE_API_TARGET as the in-chart API
+# Service, and the port comes from .Values.api.service.port. Reuses assertion
+# 1's default render -- the arguments are identical.
+default_ui_manifest="$TMP/default/curie/templates/ui.yaml"
+[ -f "$default_ui_manifest" ] \
+  || fail "default install: ui.yaml did not render"
+actual="$(env_value "$default_ui_manifest" CURIE_API_TARGET)"
+[ -n "$actual" ] \
+  || fail "default install: UI has no CURIE_API_TARGET env value; nginx will proxy /api/ to the image default"
+[ "$actual" = "http://curie-api:8000" ] \
+  || fail "default install: UI CURIE_API_TARGET is '$actual', expected 'http://curie-api:8000' (the in-chart API Service)"
+
+ui_port_manifest="$(render_ui ui-port --set api.service.port=9999)"
+actual="$(env_value "$ui_port_manifest" CURIE_API_TARGET)"
+[ "$actual" = "http://curie-api:9999" ] \
+  || fail "api.service.port=9999: UI CURIE_API_TARGET is '$actual', expected 'http://curie-api:9999' (the port is hardcoded in the template instead of read from .Values.api.service.port)"
+
+# 9: BYO override renders verbatim on the api.deploy=false path, and an empty
+# override fails the render closed naming ui.apiBaseUrl. ui.deploy=false is the
+# gated-off sibling: the rest of the chart still renders without the override.
+ui_byo_manifest="$(render_ui byo-ui \
+  --set api.deploy=false \
+  --set ui.apiBaseUrl=http://byo-api.example:8080)"
+actual="$(env_value "$ui_byo_manifest" CURIE_API_TARGET)"
+[ "$actual" = "http://byo-api.example:8080" ] \
+  || fail "ui.apiBaseUrl override: CURIE_API_TARGET is '$actual', expected the verbatim override 'http://byo-api.example:8080'"
+
+byo_ui_missing="$TMP/byo-ui-missing"
+mkdir -p "$byo_ui_missing"
+if helm template curie "$CHART" --output-dir "$byo_ui_missing" \
+  --set api.deploy=false \
+  >"$TMP/byo-ui-missing.stdout" 2>"$TMP/byo-ui-missing.stderr"; then
+  fail "api.deploy=false with empty ui.apiBaseUrl rendered; the chart must fail closed naming ui.apiBaseUrl"
+fi
+byo_ui_missing_stderr="$(<"$TMP/byo-ui-missing.stderr")"
+[[ "$byo_ui_missing_stderr" == *"ui.apiBaseUrl"* ]] \
+  || fail "api.deploy=false empty-override render failure did not name ui.apiBaseUrl: $byo_ui_missing_stderr"
+
+ui_off="$TMP/ui-off"
+mkdir -p "$ui_off"
+helm template curie "$CHART" --output-dir "$ui_off" \
+  --set api.deploy=false \
+  --set ui.deploy=false >/dev/null
+if [ -f "$ui_off/curie/templates/ui.yaml" ]; then
+  fail "ui.deploy=false still rendered ui.yaml"
+fi
+
+echo "OK: dispatcher platform-API wiring, delayed-readiness, and UI API-target render assertions passed"

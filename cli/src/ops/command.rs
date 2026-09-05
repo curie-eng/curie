@@ -44,6 +44,7 @@ pub enum CmdArg {
     HelmSetExpression(String),
     SecretSet { key: String, value: String },
     SecretValuesFile(Vec<(String, String)>),
+    PrivateJsonValuesFile(PrivateHelmValues),
 }
 
 impl CmdArg {
@@ -57,7 +58,7 @@ impl CmdArg {
             CmdArg::Plain(s) => vec![s.clone()],
             CmdArg::HelmSetExpression(expression) => vec![expression.clone()],
             CmdArg::SecretSet { key, value } => vec![format!("{key}={value}")],
-            CmdArg::SecretValuesFile(_) => {
+            CmdArg::SecretValuesFile(_) | CmdArg::PrivateJsonValuesFile(_) => {
                 debug_assert!(
                     false,
                     "SecretValuesFile must be materialized before argv(); \
@@ -78,6 +79,13 @@ impl CmdArg {
                 vec![mask_helm_set_expression(expression)]
             }
             CmdArg::SecretSet { key, value } => vec![format!("{key}={}", mask_secret(value))],
+            CmdArg::PrivateJsonValuesFile(values) => vec![
+                "-f".to_string(),
+                format!(
+                    "<private retained mail values: {}>",
+                    values.keys().join(", ")
+                ),
+            ],
             CmdArg::SecretValuesFile(pairs) => {
                 let masked: Vec<String> = pairs
                     .iter()
@@ -160,6 +168,12 @@ impl OpsCommand {
             match a {
                 CmdArg::SecretValuesFile(pairs) => {
                     let guard = SecretValuesFileGuard::write(pairs)?;
+                    new_args.push(plain("-f"));
+                    new_args.push(plain(guard.path.to_string_lossy().into_owned()));
+                    guards.push(guard);
+                }
+                CmdArg::PrivateJsonValuesFile(values) => {
+                    let guard = SecretValuesFileGuard::write_document(&values.0)?;
                     new_args.push(plain("-f"));
                     new_args.push(plain(guard.path.to_string_lossy().into_owned()));
                     guards.push(guard);
@@ -307,10 +321,12 @@ impl SecretValuesFileGuard {
     /// with restrictive permissions atomically so the secret is never briefly
     /// world-readable.
     fn write(pairs: &[(String, String)]) -> Result<Self> {
-        ensure_secret_signal_cleanup()?;
+        Self::write_document(&nest_dotted_keys(pairs))
+    }
 
-        let doc = nest_dotted_keys(pairs);
-        let body = serde_json::to_vec(&doc).context("serializing secret helm values")?;
+    fn write_document(doc: &serde_json::Value) -> Result<Self> {
+        ensure_secret_signal_cleanup()?;
+        let body = serde_json::to_vec(doc).context("serializing secret helm values")?;
 
         let mut path = std::env::temp_dir();
         path.push(format!("curie-helm-values-{}.yaml", uuid::Uuid::new_v4()));

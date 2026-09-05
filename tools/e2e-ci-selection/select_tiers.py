@@ -100,6 +100,37 @@ def _matches_prefix(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}/")
 
 
+# Fail-closed pytest set. ignored_prefixes may skip compose+pytest, but never
+# for these Python or runtime paths even when a more-specific ignore exists
+# (packages/test-support, apps/dispatcher, apps/ui).
+MUST_RUN_PYTEST_EXACT = frozenset({"uv.lock", "pyproject.toml"})
+MUST_RUN_PYTEST_PREFIXES = (
+    "packages",
+    "apps",
+    "runner",
+    "examples/tests",
+    "cli",
+)
+
+
+def _is_must_run_pytest(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    if path in MUST_RUN_PYTEST_EXACT or name in MUST_RUN_PYTEST_EXACT:
+        return True
+    return any(_matches_prefix(path, prefix) for prefix in MUST_RUN_PYTEST_PREFIXES)
+
+
+def _needs_pytest(registry: Registry, paths: list[str]) -> bool:
+    if not paths:
+        return True
+    for path in paths:
+        if _is_must_run_pytest(path):
+            return True
+        if not any(_matches_prefix(path, prefix) for prefix in registry.ignored_prefixes):
+            return True
+    return False
+
+
 def _load_registry(path: Path) -> Registry:
     with path.open(encoding="utf-8") as stream:
         document = yaml.load(stream, Loader=UniqueKeyLoader)
@@ -127,12 +158,11 @@ def _load_registry(path: Path) -> Registry:
         ignored_prefixes.append(ignored)
 
     for ignored in ignored_prefixes:
+        # Reject only when this ignore would hide a selected exact path or prefix.
+        # A more-specific ignored child of a selected prefix is a hole, not an overlap.
         if any(_matches_prefix(path, ignored) for path in exact):
             raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
-        if any(
-            _matches_prefix(prefix, ignored) or _matches_prefix(ignored, prefix)
-            for prefix in prefixes
-        ):
+        if any(_matches_prefix(prefix, ignored) for prefix in prefixes):
             raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
 
     return Registry(fallback, exact, prefixes, tuple(ignored_prefixes))
@@ -164,13 +194,11 @@ def _changed_paths(base: str, head: str) -> list[str]:
     return [line for line in completed.stdout.splitlines() if line]
 
 
-def _render(selected: set[str]) -> str:
-    lines = [
-        f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}"
-        for tier in TIERS
-    ]
+def _render(selected: set[str], pytest_needed: bool) -> str:
+    lines = [f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}" for tier in TIERS]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
     lines.append(f"skill_local_tiers={skill_local}")
+    lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     return "\n".join(lines) + "\n"
 
 
@@ -192,6 +220,7 @@ def _run() -> None:
         if args.path or args.base or args.head:
             raise RegistryError("push cannot be combined with paths or revisions")
         selected = set(TIERS)
+        pytest_needed = True
     else:
         if args.path and (args.base or args.head):
             raise RegistryError("paths cannot be combined with revisions")
@@ -202,12 +231,13 @@ def _run() -> None:
         else:
             raise RegistryError("provide paths, push, or both base and head revisions")
         selected = set().union(*(_select_path(registry, path) for path in paths))
+        pytest_needed = _needs_pytest(registry, paths)
 
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
         raise RegistryError("GITHUB_OUTPUT is required")
     with Path(output_path).open("a", encoding="utf-8") as stream:
-        stream.write(_render(selected))
+        stream.write(_render(selected, pytest_needed))
 
 
 def main() -> int:

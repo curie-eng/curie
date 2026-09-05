@@ -41,6 +41,19 @@ fn repo_root() -> PathBuf {
 }
 
 fn write_exec(dir: &Path, name: &str, body: &str) {
+    let reads = include_str!("data/converged-installation-read.sh");
+    let body = if name == "helm" {
+        // Preserve this installer's existing Grafana status/migration replies.
+        let marker = "if [ \"$1\" = \"repo\" ]; then";
+        body.replacen(marker, &format!("{reads}\n{marker}"), 1)
+    } else if name == "kubectl" {
+        format!(
+            "#!/bin/sh\n{reads}\n{}",
+            body.strip_prefix("#!/bin/sh\n").unwrap_or(body)
+        )
+    } else {
+        body.to_string()
+    };
     let path = dir.join(name);
     fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
     let mut permissions = fs::metadata(&path)

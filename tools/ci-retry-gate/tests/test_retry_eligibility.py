@@ -172,6 +172,16 @@ RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
         # The raw CDN is eventually consistent after publication. This poll
         # never reruns repository code or the Pages publication mutation.
         ("chart-index.yaml", "publish-index", "Verify the public Helm consumer path"),
+        # Both are readiness polls for an external process starting up, not
+        # retries. The first waits for the stub upstream container to begin
+        # serving; the second waits for nginx to begin serving, and the two
+        # cannot be collapsed into one because nginx resolves its `proxy_pass`
+        # upstream at startup, so the UI must be started only once the upstream
+        # is already reachable. Neither re invokes repository code, and neither
+        # retries a mutation whose failure would be a defect: if either never
+        # becomes ready the step fails the job rather than papering over it.
+        ("ci.yaml", "ui-image-smoke", "Start the stub API upstream"),
+        ("ci.yaml", "ui-image-smoke", "Start the UI container"),
     }
 )
 

@@ -33,11 +33,14 @@ redefine them.
 ## Current contract
 
 A second implementation is an **ACI server**, an HTTP process serving
-the five POST endpoints (`runner/src/curie_runner/server.py`): `POST /v1/event` opens a
+the six POST endpoints (`runner/src/curie_runner/server.py`): `POST /v1/event` opens a
 turn, `POST /v1/steer` injects into the live turn (409 if none running),
 `POST /v1/interrupt` hard-stops it, `POST /v1/reset` discards the conversation so the
-next turn starts fresh (409 while a turn is active), and `POST /v1/snapshot` captures a
-bounded managed-workspace snapshot for publication. Two GETs sit alongside them and stay
+next turn starts fresh (409 while a turn is active), `POST /v1/snapshot` captures a
+bounded managed-workspace snapshot for publication, and `POST /v1/timeout` stops the
+exact open turn named by the event response epoch. The timeout is a runner-private,
+authenticated control route; a server that omits the epoch response header is simply
+not notified, and worker timeout classification remains unaffected. Two GETs sit alongside them and stay
 unauthenticated, `GET /healthz` and `GET /status`, because the chart's readiness probe
 sends no auth header. `/v1/reset` carries no ACI wire frame (it is a runner control route,
 like the GETs, and takes no body), but it is not optional: it is the per-case isolation

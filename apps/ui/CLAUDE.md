@@ -63,6 +63,19 @@ structure and wiring detail in `apps/ui/README.md`.
   runs when `PW_INTEGRATION=1`). Default `pnpm e2e` runs stackless only, so
   CI stays green without a backend.
 
+## The served response headers are pinned in CI, not in Playwright
+
+The nginx config that serves the console in production lives as a heredoc
+inside `apps/ui/Dockerfile`, not as a checked in config file. It sets gzip
+for the build assets and a one year immutable `Cache-Control` on
+`/assets/`, while `index.html` is `no-cache` so a redeploy is picked up.
+`location /api/` sets `gzip off` so proxied API responses stay
+byte-identical. Playwright cannot cover any of this, because its suite
+previews the Vite build on `4273` and never runs nginx. The pin is the
+`ui-image-smoke` job in `.github/workflows/ci.yaml`, which builds the real
+image, boots it against a stub API upstream, and asserts those headers.
+Change the nginx template and you update that job, not a Playwright spec.
+
 ## Verify
 
 ```bash

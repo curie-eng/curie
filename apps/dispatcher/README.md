@@ -124,6 +124,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `VALKEY_PORT` | `6379` | Valkey port (compose maps it to `26379` on the host) |
 | `VALKEY_PASSWORD` | "" | Valkey password (compose dev: `valkeypass`) |
 | `VALKEY_DB` | `0` | Valkey db index |
+| `VALKEY_TLS` | `false` | when `true`, the client connects over TLS and verifies against the system CA bundle; the chart sets this from `valkey.tls` |
 | `CURIE_STREAM` | `curie:runs` | Stream the jobs land on |
 | `CURIE_DEDUPE_PREFIX` | `curie:dedupe:` | dedupe key prefix |
 | `CURIE_DEDUPE_TTL_SECONDS` | `3600` | dedupe guard TTL |

@@ -11,6 +11,21 @@ trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# The readiness init defaults to postgres.image (langfuse.web.postgresReadiness
+# .image is empty by default), so read the pin out of values.yaml instead of
+# repeating it here -- a literal would silently drift from the #2319 pin.
+POSTGRES_IMAGE="$(python3 -c '
+import sys
+
+import yaml
+
+values = yaml.safe_load(open(sys.argv[1])) or {}
+image = ((values.get("postgres") or {}).get("image") or "").strip()
+if not image:
+    raise SystemExit("values.yaml postgres.image is empty")
+print(image)
+' "$CHART/values.yaml")"
+
 render() {
   local name="$1"
   shift
@@ -128,10 +143,10 @@ for needle in ("pg_isready", 'while [ "$attempt" -le "$POSTGRES_READINESS_ATTEMP
 print(f"  ok: {mode} web init is first, credential-free, hardened, image={expected_image}, tuning={attempts}/{interval}/{timeout}")
 PY
 
-python3 "$TMP/assert.py" "$TMP/default.yaml" default postgres:16-alpine 60 2 2
+python3 "$TMP/assert.py" "$TMP/default.yaml" default "$POSTGRES_IMAGE" 60 2 2
 python3 "$TMP/assert.py" "$TMP/tuned.yaml" tuned registry.example.com/postgres-readiness:test 7 3 4
-python3 "$TMP/assert.py" "$TMP/blank-security.yaml" blank-security postgres:16-alpine 60 2 2
-python3 "$TMP/assert.py" "$TMP/root-web-security.yaml" root-web-security postgres:16-alpine 60 2 2
+python3 "$TMP/assert.py" "$TMP/blank-security.yaml" blank-security "$POSTGRES_IMAGE" 60 2 2
+python3 "$TMP/assert.py" "$TMP/root-web-security.yaml" root-web-security "$POSTGRES_IMAGE" 60 2 2
 python3 "$TMP/assert.py" "$TMP/disabled.yaml" disabled ignored 0 0 0
 
 assert_refused() {
@@ -175,7 +190,7 @@ with open(target, "w") as output:
 PY
 
 set +e
-negative_output="$(python3 "$TMP/assert.py" "$TMP/missing-init.yaml" negative postgres:16-alpine 60 2 2 2>&1)"
+negative_output="$(python3 "$TMP/assert.py" "$TMP/missing-init.yaml" negative "$POSTGRES_IMAGE" 60 2 2 2>&1)"
 negative_rc=$?
 set -e
 [[ "$negative_rc" -ne 0 ]] || fail "negative control passed after wait-for-postgres was removed"
@@ -203,7 +218,7 @@ with open(target, "w") as output:
 PY
 
 set +e
-negative_output="$(python3 "$TMP/assert.py" "$TMP/unbounded-init.yaml" negative postgres:16-alpine 60 2 2 2>&1)"
+negative_output="$(python3 "$TMP/assert.py" "$TMP/unbounded-init.yaml" negative "$POSTGRES_IMAGE" 60 2 2 2>&1)"
 negative_rc=$?
 set -e
 [[ "$negative_rc" -ne 0 ]] || fail "negative control passed after the readiness loop was made unbounded"

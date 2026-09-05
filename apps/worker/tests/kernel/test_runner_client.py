@@ -6,21 +6,32 @@ is what TurnStream.close (called from __aexit__) invokes."""
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import contextlib
 import inspect
 import logging
+import textwrap
 import tracemalloc
 from typing import Any
 
 import pytest
-from aci_protocol import Event, Final, SessionStatus, TextDelta
+from aci_protocol import Event, Final, SessionStatus, SideEffectFlag, TextDelta
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 from curie_runner import RunTracer, SideEffectClassifier, create_app
 from curie_runner import server as runner_server
+from curie_runner import session as runner_session_module
 from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
+from curie_telemetry.tracing import configure_tracer_provider
+from curie_worker import runner_client as runner_client_module
 from curie_worker.runner_client import RunnerClient, RunnerError, RunnerStreamTimeout
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 DONE = SessionStatus.DONE
 
@@ -814,6 +825,31 @@ def test_interrupt_takes_no_remaining_budget_while_the_other_rpcs_do() -> None:
         "control path and keeps its own independent timeout"
     )
 
+    source = textwrap.dedent(inspect.getsource(RunnerClient))
+    tree = ast.parse(source)
+    timeout_posts = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        call_source = ast.get_source_segment(source, node) or ""
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "post"
+            and "/v1/timeout" in call_source
+        ):
+            timeout_posts.append(node)
+
+    assert len(timeout_posts) == 1, "RunnerClient must own one /v1/timeout POST"
+    timeout_keywords = {
+        keyword.arg: ast.unparse(keyword.value)
+        for keyword in timeout_posts[0].keywords
+        if keyword.arg is not None
+    }
+    assert timeout_keywords.get("timeout") == "self._interrupt_timeout", (
+        "/v1/timeout must use the independent control-plane cap, never the "
+        "expired stream/delivery budget"
+    )
+
 
 def test_interrupt_keeps_its_own_timeout_under_a_huge_streaming_budget() -> None:
     """The behavioral half of the guard above. With a 30s session budget and a
@@ -897,5 +933,438 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
             finally:
                 hold.set()
                 await client.close()
+
+    asyncio.run(go())
+
+
+_PRIVATE_EVENT_TEXT = "private-timeout-event-body-PLACEHOLDER"
+_PRIVATE_TOOL_CALL = "private-timeout-tool-call-PLACEHOLDER"
+_PRIVATE_TOOL_ARGUMENT = "private-timeout-tool-argument-PLACEHOLDER"
+_PRIVATE_POST_TIMEOUT_TEXT = "private-post-timeout-body-PLACEHOLDER"
+_RUNNER_TOKEN = "runner-token-PLACEHOLDER"
+_TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
+
+
+class _TimeoutBoundaryFake(FakeModelSession):
+    """Stall after a side-effect prefix, with two real interrupt shapes."""
+
+    def __init__(self, *, release_on_interrupt: bool) -> None:
+        script = [
+            AssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id=_PRIVATE_TOOL_CALL,
+                        name="Bash",
+                        input={"command": _PRIVATE_TOOL_ARGUMENT},
+                    )
+                ],
+                model="fake-model",
+            ),
+            AssistantMessage(
+                content=[TextBlock(text=_PRIVATE_POST_TIMEOUT_TEXT)],
+                model="fake-model",
+            ),
+        ]
+        super().__init__(
+            lambda: script,
+            truncate_on_interrupt=release_on_interrupt,
+        )
+        self._release_on_interrupt = release_on_interrupt
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.notified = asyncio.Event()
+        self.post_timeout_emitted = asyncio.Event()
+
+    async def receive_turn(self):
+        index = 0
+        async for message in super().receive_turn():
+            if index:
+                self.post_timeout_emitted.set()
+            yield message
+            if index == 0:
+                self.entered.set()
+                await self.release.wait()
+            index += 1
+
+    async def interrupt(self) -> None:
+        await super().interrupt()
+        self.notified.set()
+        if self._release_on_interrupt:
+            self.release.set()
+
+    async def close(self) -> None:
+        self.release.set()
+        await super().close()
+
+
+def _span_material(spans: list[ReadableSpan]) -> str:
+    return repr(
+        [
+            (
+                span.name,
+                dict(span.attributes or {}),
+                [(event.name, dict(event.attributes or {})) for event in span.events],
+                span.status,
+            )
+            for span in spans
+        ]
+    )
+
+
+async def _assert_real_timeout_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    release_on_interrupt: bool,
+) -> list[tuple[str, dict[str, str]]]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    fake = _TimeoutBoundaryFake(release_on_interrupt=release_on_interrupt)
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="fake-model",
+    )
+    metrics: list[tuple[str, dict[str, str]]] = []
+
+    def capture_metric(
+        name: str,
+        _value: float = 1,
+        *,
+        attributes: dict[str, str],
+    ) -> None:
+        metrics.append((name, dict(attributes)))
+
+    monkeypatch.setattr(runner_session_module, "record_metric", capture_metric)
+    worker_record_metric = runner_client_module.record_metric
+
+    def capture_worker_metric(
+        name: str,
+        value: float = 1,
+        *,
+        attributes: dict[str, str],
+    ) -> None:
+        # Keep the real catalog validator in the path. A capture-only double
+        # would hide the exact closed-domain failure this boundary regressed.
+        worker_record_metric(name, value, attributes=attributes)
+        metrics.append((name, dict(attributes)))
+
+    monkeypatch.setattr(runner_client_module, "record_metric", capture_worker_metric)
+    original_event = runner_server._event
+    handler_done = asyncio.Event()
+    handler_errors: list[BaseException] = []
+
+    async def wrapped_event(request: web.Request) -> web.StreamResponse:
+        try:
+            return await original_event(request)
+        except BaseException as exc:
+            handler_errors.append(exc)
+            raise
+        finally:
+            handler_done.set()
+
+    monkeypatch.setattr(runner_server, "_event", wrapped_event)
+    await runner.start()
+    server = TestServer(create_app(runner, token=_RUNNER_TOKEN))
+    await server.start_server()
+    client = RunnerClient(total_timeout_s=0.25, interrupt_timeout_s=2.0)
+    frames: list[Any] = []
+    epoch = ""
+    parent_trace_id = 0
+    configure_tracer_provider(provider)
+    try:
+        tracer = provider.get_tracer("timeout-boundary-test")
+        with tracer.start_as_current_span("worker.timeout.parent") as parent:
+            parent_trace_id = parent.get_span_context().trace_id
+            turn = await client.start_turn(
+                f"http://127.0.0.1:{server.port}",
+                Event(
+                    type="message",
+                    text=_PRIVATE_EVENT_TEXT,
+                    user="U0EXAMPLE1",
+                    ts="1",
+                ),
+                token=_RUNNER_TOKEN,
+                remaining_s=0.25,
+            )
+            epoch = turn._response.headers[_TURN_EPOCH_HEADER]
+            with pytest.raises(RunnerStreamTimeout):
+                async with turn:
+                    async for frame in turn:
+                        frames.append(frame)
+
+        await asyncio.wait_for(fake.notified.wait(), timeout=2.0)
+        if not release_on_interrupt:
+            # The control response has returned and TurnStream has released the
+            # body. Only now let the SDK emit a non-terminal line: response.write
+            # must fail and aclosing must inject GeneratorExit (or cancellation)
+            # while run_turn is suspended at its yield.
+            fake.release.set()
+            await asyncio.wait_for(fake.post_timeout_emitted.wait(), timeout=2.0)
+        await asyncio.wait_for(handler_done.wait(), timeout=2.0)
+    finally:
+        fake.release.set()
+        await client.close()
+        await server.close()
+        configure_tracer_provider(None)
+
+    assert any(isinstance(frame, SideEffectFlag) for frame in frames)
+    spans = list(exporter.get_finished_spans())
+    roots = [span for span in spans if span.name == "agent.run"]
+    assert len(roots) == 1
+    root = roots[0]
+    assert root.attributes["curie.terminal.cause"] == "runner_timeout"
+    assert root.attributes["curie.terminal.status"] == "failed"
+    assert root.status.status_code is StatusCode.ERROR
+    assert root.context is not None and root.context.trace_id == parent_trace_id
+    assert root.parent is not None
+    parent_rpc = next(
+        span
+        for span in spans
+        if span.context is not None and span.context.span_id == root.parent.span_id
+    )
+    assert parent_rpc.name == "curie.runner.rpc"
+    assert parent_rpc.attributes["curie.operation"] == "event"
+    for phase in (
+        span
+        for span in spans
+        if span.name in {"llm.generation", "execute_tool"}
+    ):
+        assert phase.end_time is not None
+        assert "curie.phase.end_kind" in phase.attributes
+    tool = next(span for span in spans if span.name == "execute_tool")
+    assert tool.attributes["curie.phase.end_kind"] == "terminal_inferred"
+    assert tool.attributes["curie.tool.outcome"] == "cancelled"
+    assert tool.status.status_code is StatusCode.ERROR
+
+    completed = [
+        attributes
+        for name, attributes in metrics
+        if name == "curie.turn.completed"
+    ]
+    assert completed == [
+        {
+            "service.name": "curie-runner",
+            "source": "runner",
+            "outcome": "classified_failure",
+        }
+    ]
+    material = _span_material(spans)
+    for private_value in (
+        epoch,
+        _RUNNER_TOKEN,
+        _PRIVATE_EVENT_TEXT,
+        _PRIVATE_TOOL_CALL,
+        _PRIVATE_TOOL_ARGUMENT,
+        _PRIVATE_POST_TIMEOUT_TEXT,
+    ):
+        assert private_value not in material
+    if not release_on_interrupt:
+        assert handler_errors, "released-body post-timeout write must fail"
+    assert fake.interrupts == 1, "an ACKed timeout stop must not be sent twice"
+    return metrics
+
+
+def test_real_http_timeout_unblocks_live_consumer_with_first_failure_terminal(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    metrics = asyncio.run(
+        _assert_real_timeout_boundary(monkeypatch, release_on_interrupt=True)
+    )
+    timeout_rpc_attributes = {
+        "service.name": "curie-worker",
+        "operation": "timeout",
+        "role": "client",
+        "outcome": "success",
+    }
+    assert (
+        "curie.runner.rpc.request.duration",
+        timeout_rpc_attributes,
+    ) in metrics
+    assert ("curie.runner.rpc.result", timeout_rpc_attributes) in metrics
+    assert not any(
+        "runner timeout terminal notification failed" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_real_http_timeout_terminalizes_before_released_body_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(
+        _assert_real_timeout_boundary(monkeypatch, release_on_interrupt=False)
+    )
+
+
+class _ProductionTimeoutPostureSession:
+    """Ordered wire double for aiohttp's production non-cancelling posture."""
+
+    def __init__(self) -> None:
+        self.wire: list[tuple[str, str | int]] = []
+        self.queries = 0
+        self.interrupts = 0
+        self.first_prefix_emitted = asyncio.Event()
+        self.end_first_receive = asyncio.Event()
+        self.interrupt_entered = asyncio.Event()
+        self.release_ack = asyncio.Event()
+        self.interrupt_returned = asyncio.Event()
+        self.interrupt_cancelled = asyncio.Event()
+        self.second_query_started = asyncio.Event()
+
+    async def connect(self) -> None: ...
+
+    async def query(self, text: str) -> None:
+        self.queries += 1
+        self.wire.append(("query", text))
+        if self.queries == 2:
+            self.second_query_started.set()
+
+    async def receive_turn(self):
+        if self.queries == 1:
+            yield AssistantMessage(
+                content=[
+                    ToolUseBlock(
+                        id="production-timeout-call-PLACEHOLDER",
+                        name="Read",
+                        input={"path": "production-timeout-path-PLACEHOLDER"},
+                    )
+                ],
+                model="fake-model",
+            )
+            self.first_prefix_emitted.set()
+            await self.end_first_receive.wait()
+            # Keep the first turn non-terminal after the ACK. Its attempted
+            # write to the released response drives the GeneratorExit cleanup.
+            yield AssistantMessage(
+                content=[TextBlock(text="post-timeout-PLACEHOLDER")],
+                model="fake-model",
+            )
+            return
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sdk-session-PLACEHOLDER",
+            result="healthy",
+        )
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+        self.wire.append(("interrupt", self.interrupts))
+        self.interrupt_entered.set()
+        try:
+            await self.release_ack.wait()
+        except asyncio.CancelledError:
+            self.interrupt_cancelled.set()
+            raise
+        self.end_first_receive.set()
+        self.interrupt_returned.set()
+
+    async def close(self) -> None:
+        self.release_ack.set()
+        self.end_first_receive.set()
+
+
+def test_production_http_timeout_handler_holds_next_query_until_ack(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def go() -> None:
+        session = _ProductionTimeoutPostureSession()
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="t",
+        )
+        await runner.start()
+        app_runner = web.AppRunner(
+            create_app(runner, token=_RUNNER_TOKEN), handler_cancellation=False
+        )
+        await app_runner.setup()
+        site = web.TCPSite(app_runner, "127.0.0.1", 0)
+        await site.start()
+        assert site._server is not None  # noqa: SLF001 - ephemeral bound port
+        sockets = site._server.sockets  # noqa: SLF001 - aiohttp exposes no port API
+        assert sockets is not None
+        port = sockets[0].getsockname()[1]
+        base_url = f"http://127.0.0.1:{port}"
+        client = RunnerClient(total_timeout_s=2.0, interrupt_timeout_s=0.05)
+        second_frames: list[Any] = []
+        second_stream_opened = asyncio.Event()
+        second_task: asyncio.Task[None] | None = None
+
+        async def consume_second() -> None:
+            turn = await client.start_turn(
+                base_url,
+                Event(
+                    type="message",
+                    text="second",
+                    user="U0EXAMPLE1",
+                    ts="2",
+                ),
+                token=_RUNNER_TOKEN,
+                remaining_s=2.0,
+            )
+            second_stream_opened.set()
+            async with turn:
+                async for frame in turn:
+                    second_frames.append(frame)
+
+        try:
+            first = await client.start_turn(
+                base_url,
+                Event(
+                    type="message",
+                    text="first",
+                    user="U0EXAMPLE1",
+                    ts="1",
+                ),
+                token=_RUNNER_TOKEN,
+                remaining_s=0.05,
+            )
+            with caplog.at_level(logging.WARNING, logger="curie_worker.runner_client"):
+                with pytest.raises(RunnerStreamTimeout):
+                    async with first:
+                        async for _frame in first:
+                            pass
+
+            await asyncio.wait_for(session.interrupt_entered.wait(), timeout=1.0)
+            second_task = asyncio.create_task(consume_second())
+            await asyncio.wait_for(second_stream_opened.wait(), timeout=1.0)
+            assert not session.interrupt_cancelled.is_set()
+            assert not session.second_query_started.is_set()
+
+            session.release_ack.set()
+            await asyncio.wait_for(session.interrupt_returned.wait(), timeout=1.0)
+            await asyncio.wait_for(session.second_query_started.wait(), timeout=1.0)
+            await asyncio.wait_for(second_task, timeout=1.0)
+
+            assert session.interrupts == 1
+            assert session.wire == [
+                ("query", "first"),
+                ("interrupt", 1),
+                ("query", "second"),
+            ]
+            assert isinstance(second_frames[-1], Final)
+            assert second_frames[-1].status is SessionStatus.DONE
+            assert any(
+                "runner timeout terminal notification failed"
+                in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            session.release_ack.set()
+            if second_task is not None and not second_task.done():
+                second_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await second_task
+            await client.close()
+            await app_runner.cleanup()
 
     asyncio.run(go())

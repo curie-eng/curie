@@ -170,11 +170,83 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
+{{/* Whether consumers reach Valkey over TLS, as the literal string "true" or
+     "false" (#2315). ONE helper, included from BOTH curie.env.valkey and
+     curie.langfuse.env: the bug class this chart has hit twice (#2052, #2327)
+     is "two consumer groups read the same valkey.* field and only one of them
+     was updated", and a shared helper makes that divergence structurally
+     impossible rather than merely tested against.
+
+     Why the guard. The in-chart valkey/valkey:8-alpine StatefulSet is started
+     with --requirepass and serves no TLS listener, so rendering TLS against it
+     would break every consumer at once behind a perfectly healthy-looking
+     manifest and no failing preflight -- silent and total. Refuse at render
+     time instead, naming both keys and both ways out.
+
+     Why toString. Go templates read any non-empty string as truthy, so a
+     quoted "false" arriving from --set-string would otherwise turn TLS on
+     against a cleartext store; this is the same scar curie.managedSecret
+     carries for security.allowDevDefaults. A nil -- a --reuse-values upgrade
+     of a release created before this key existed coalesces it away -- is not
+     "true" either, and renders the pre-change "false". */}}
+{{- define "curie.valkey.tls" -}}
+{{- $tls := eq (toString .Values.valkey.tls) "true" -}}
+{{- if and $tls .Values.valkey.deploy -}}
+{{- fail "valkey.tls is true but valkey.deploy is also true: the in-chart Valkey serves no TLS listener, so every consumer would fail to connect. Set valkey.deploy=false and point valkey.host at your external TLS store, or leave valkey.tls=false." -}}
+{{- end -}}
+{{- $tls -}}
+{{- end -}}
+
 {{- define "curie.clickhouse.host" -}}
 {{- if .Values.clickhouse.deploy -}}
 {{- printf "%s-clickhouse" (include "curie.fullname" .) -}}
 {{- else -}}
 {{- required "clickhouse.deploy is false: set clickhouse.host to your external ClickHouse" .Values.clickhouse.host -}}
+{{- end -}}
+{{- end -}}
+
+{{/* URL scheme for the ClickHouse endpoint Langfuse connects to (#2314).
+     Same shape as curie.rustfs.scheme (#1447): an explicit clickhouse.scheme
+     wins, otherwise a BYO server on the conventional ClickHouse HTTPS port
+     (8443) is assumed to speak TLS and everything else stays cleartext. The
+     chart-owned server is always http. */}}
+{{- define "curie.clickhouse.scheme" -}}
+{{- $scheme := .Values.clickhouse.scheme | default "" -}}
+{{- if $scheme -}}
+{{- if not (has $scheme (list "http" "https")) -}}
+{{- fail (printf "clickhouse.scheme must be either \"http\" or \"https\", got %q" $scheme) -}}
+{{- end -}}
+{{- $scheme -}}
+{{- else if and (not .Values.clickhouse.deploy) (eq (printf "%v" .Values.clickhouse.httpPort) "8443") -}}
+https
+{{- else -}}
+http
+{{- end -}}
+{{- end -}}
+
+{{/* The one HTTP endpoint every ClickHouse consumer uses. Call sites include
+     this helper rather than re-composing scheme://host:port (#2314). */}}
+{{- define "curie.clickhouse.httpUrl" -}}
+{{- include "curie.clickhouse.scheme" . }}://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.httpPort }}
+{{- end -}}
+
+{{/* Langfuse's ClickHouse migration DSN, on the native port. Deliberately
+     bare: Langfuse's `up.sh` appends its own query string
+     (`${CLICKHOUSE_MIGRATION_URL}?username=...`), so anything added here would
+     produce two `?` and break the migration. TLS is selected out of band by
+     CLICKHOUSE_MIGRATION_SSL (curie.clickhouse.migrationSsl). */}}
+{{- define "curie.clickhouse.migrationUrl" -}}
+clickhouse://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.nativePort }}
+{{- end -}}
+
+{{/* Whether the Langfuse migration connection on the native port uses TLS
+     (#2314). Tracks the HTTP scheme: a TLS ClickHouse endpoint terminates TLS
+     on both ports. */}}
+{{- define "curie.clickhouse.migrationSsl" -}}
+{{- if eq (include "curie.clickhouse.scheme" .) "https" -}}
+true
+{{- else -}}
+false
 {{- end -}}
 {{- end -}}
 
@@ -284,6 +356,31 @@ true
 {{- else -}}
 {{- required "langfuse.deploy is false: set langfuse.host to your external Langfuse hostname" .Values.langfuse.host -}}
 {{- end -}}
+{{- end -}}
+
+{{/* URL scheme for the Langfuse endpoint every consumer talks to (#2314).
+     Same shape as curie.rustfs.scheme (#1447): an explicit langfuse.scheme
+     wins, otherwise a BYO endpoint on 443 is assumed to speak TLS and
+     everything else stays cleartext. The chart-owned Service is always http. */}}
+{{- define "curie.langfuse.scheme" -}}
+{{- $scheme := .Values.langfuse.scheme | default "" -}}
+{{- if $scheme -}}
+{{- if not (has $scheme (list "http" "https")) -}}
+{{- fail (printf "langfuse.scheme must be either \"http\" or \"https\", got %q" $scheme) -}}
+{{- end -}}
+{{- $scheme -}}
+{{- else if and (not .Values.langfuse.deploy) (eq (printf "%v" .Values.langfuse.web.service.port) "443") -}}
+https
+{{- else -}}
+http
+{{- end -}}
+{{- end -}}
+
+{{/* The one Langfuse base URL. Call sites include this helper rather than
+     re-composing scheme://host:port, which is how the hardcoded `http://`
+     reached five consumers at once (#2314). */}}
+{{- define "curie.langfuse.url" -}}
+{{- include "curie.langfuse.scheme" . }}://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
 {{- end -}}
 
 {{/* Shared ServiceAccount name for both Langfuse Deployments. Empty
@@ -439,7 +536,7 @@ processors:
   batch: {}
 exporters:
   otlphttp/langfuse:
-    endpoint: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}/api/public/otel
+    endpoint: {{ include "curie.langfuse.url" . }}/api/public/otel
     headers:
       Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
     retry_on_failure:
@@ -509,8 +606,11 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 
 {{/* Fail closed on contradictory OTEL values always. Fail closed on accidental
      missing only when security.checkDefaultCredentials is on: local/offline
-     no-endpoint remains valid outside that gate. extraEnv-only does not satisfy
-     the production gate because the four workloads can drift. */}}
+     no-endpoint remains valid outside that gate. The instrumented set is
+     exactly the workloads that include curie.env.otel, recorded in
+     charts/curie/CLAUDE.md; extraEnv-only does not satisfy the production gate
+     because it would configure each of them independently and any one can
+     drift. */}}
 {{- define "curie.otel.validate" -}}
 {{- $otel := .Values.otelCollector -}}
 {{- if and $otel.telemetryDisabled $otel.deploy -}}
@@ -710,7 +810,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
           truthy and ship the published default -- a fail-OPEN regression.
        2. Explicit override: if the operator/CLI supplied a value that differs from
           the published default (`ne value default`), it wins even on `helm
-          upgrade`. For the nine non init credentials, this supports rotation or
+          upgrade`. For the eleven non init credentials, this supports rotation or
           recovery. The Langfuse init credentials are first boot inputs, so an
           upgrade only changes the Secret; it does not rotate Langfuse records.
           The override must sit ahead of the persist branch or an explicit value
@@ -774,7 +874,11 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- end -}}
 
 {{/* Valkey connection env for the app services (host/port + password from the
-     Secret). The apps build their own redis DSN from these parts. */}}
+     Secret, plus the transport). The apps build their own redis DSN from these
+     parts, and TLS is one of the parts -- rendered always, both values, so an
+     install that never set valkey.tls cannot be confused with a broken
+     template and a --reuse-values upgrade cannot leave a stale "true" behind
+     (#2315). */}}
 {{- define "curie.env.valkey" -}}
 - name: VALKEY_HOST
   value: {{ include "curie.valkey.host" . | quote }}
@@ -785,6 +889,8 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
     secretKeyRef:
       name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
       key: valkeyPassword
+- name: VALKEY_TLS
+  value: {{ include "curie.valkey.tls" . | quote }}
 {{- end -}}
 
 {{/* Platform API connection env for first party services that call the API.
@@ -910,31 +1016,49 @@ livenessProbe:
 {{/* ---- Langfuse shared environment (mirrors compose.dev.yaml's
         x-langfuse-env anchor). Rendered into both web and worker. ---- */}}
 {{- define "curie.langfuse.env" -}}
+{{- /* These three honour their store's own existingSecret, the same escape
+       curie.env.postgres and the CLICKHOUSE_PASSWORD/REDIS_AUTH refs below
+       already use. They were pinned to the chart Secret while every sibling
+       read the BYO one. On a BYO-Postgres install the api and worker
+       authenticated against the real instance while both Langfuse Deployments
+       presented the chart-generated password and crash-looped at Prisma auth,
+       with every other component green. On a BYO langfuse.existingSecret
+       install the operator's langfuseEncryptionKey was silently unused, and a
+       later regeneration of the chart Secret left previously written encrypted
+       columns undecryptable. See #2327. */}}
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: {{ include "curie.secretName" . }}
+      name: {{ .Values.postgres.existingSecret | default (include "curie.secretName" .) }}
       key: postgresPassword
 - name: DATABASE_URL
   value: postgresql://{{ .Values.postgres.auth.username }}:$(POSTGRES_PASSWORD)@{{ include "curie.postgres.host" . }}:{{ .Values.postgres.port }}/{{ .Values.postgres.auth.database }}
 - name: SALT
   valueFrom:
     secretKeyRef:
-      name: {{ include "curie.secretName" . }}
+      name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
       key: langfuseSalt
 - name: ENCRYPTION_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ include "curie.secretName" . }}
+      name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
       key: langfuseEncryptionKey
 - name: TELEMETRY_ENABLED
   value: {{ .Values.langfuse.telemetryEnabled | quote }}
 - name: LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES
   value: {{ .Values.langfuse.enableExperimentalFeatures | quote }}
 - name: CLICKHOUSE_MIGRATION_URL
-  value: clickhouse://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.nativePort }}
+  value: {{ include "curie.clickhouse.migrationUrl" . }}
 - name: CLICKHOUSE_URL
-  value: http://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.httpPort }}
+  value: {{ include "curie.clickhouse.httpUrl" . }}
+{{- if eq (include "curie.clickhouse.migrationSsl" .) "true" }}
+{{- /* Langfuse's documented switch for a TLS migration connection on the
+       native port; its migrator appends `secure=true` to the DSN itself, which
+       is why CLICKHOUSE_MIGRATION_URL above stays bare. Rendered only on the
+       https path so a cleartext install is byte-identical (#2314). */}}
+- name: CLICKHOUSE_MIGRATION_SSL
+  value: "true"
+{{- end }}
 - name: CLICKHOUSE_USER
   value: {{ .Values.clickhouse.auth.username | quote }}
 {{- /* Both of these honour the store's own existingSecret, the same escape
@@ -961,6 +1085,14 @@ livenessProbe:
     secretKeyRef:
       name: {{ .Values.valkey.existingSecret | default (include "curie.secretName" .) }}
       key: valkeyPassword
+{{- /* Same helper as curie.env.valkey, so the two Langfuse Deployments and the
+       first-party apps cannot disagree about the transport of the one store
+       they share (#2315). Langfuse's REDIS_TLS_CA/_CERT/_KEY siblings are
+       deliberately NOT rendered: system-CA verification is the boundary for
+       every consumer here, and giving Langfuse alone a private-CA capability
+       is the asymmetry this helper exists to prevent. */}}
+- name: REDIS_TLS_ENABLED
+  value: {{ include "curie.valkey.tls" . | quote }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_BUCKET
   value: {{ .Values.rustfs.bucket | quote }}
 {{- /* Both upload regions come from rustfs.region, never the literal
@@ -1343,14 +1475,15 @@ securityContext:
      ClickHouse that answers slowly needs a longer timeout, not a patched chart.
 
      Call with a dict: `root` (the chart context), `image` (the component's
-     image repository), `containerSecurityContext` and `resources` (the
+     fully-rendered image reference, built by curie.image so a digest pin
+     reaches the gate too), `containerSecurityContext` and `resources` (the
      component's, so the gate inherits the same posture and the pod's effective
      request is unchanged -- init and app container requests are maxed, not
      summed). */}}
 {{- define "curie.langfuse.clickhouseGate" -}}
 {{- $root := .root -}}
 - name: wait-for-clickhouse
-  image: "{{ .image }}:{{ $root.Values.langfuse.image.tag }}"
+  image: {{ .image | quote }}
   imagePullPolicy: {{ $root.Values.global.imagePullPolicy }}
   {{- with .containerSecurityContext }}
   securityContext:
@@ -1365,8 +1498,8 @@ securityContext:
       probe_timeout_ms={{ mulf $root.Values.langfuse.clickhouseReadiness.timeoutSeconds 1000 | int }}
       while [ "$attempt" -le "$max_attempts" ]; do
         if PROBE_TIMEOUT_MS="$probe_timeout_ms" node -e '
-      const http = require("http");
-      const request = http.get(process.env.CLICKHOUSE_URL + "/ping", { timeout: Number(process.env.PROBE_TIMEOUT_MS) }, (response) => {
+      const client = require(process.env.CLICKHOUSE_URL.startsWith("https:") ? "https" : "http");
+      const request = client.get(process.env.CLICKHOUSE_URL + "/ping", { timeout: Number(process.env.PROBE_TIMEOUT_MS) }, (response) => {
         response.resume();
         process.exit(response.statusCode === 200 ? 0 : 1);
       });
@@ -1388,7 +1521,43 @@ securityContext:
       exit 1
   env:
     - name: CLICKHOUSE_URL
-      value: http://{{ include "curie.clickhouse.host" $root }}:{{ $root.Values.clickhouse.httpPort }}
+      value: {{ include "curie.clickhouse.httpUrl" $root }}
   resources:
     {{- toYaml .resources | nindent 4 }}
+{{- end -}}
+{{/*
+Render the runner-sandbox egress rules for a list of {cidr, ports, except?}
+entries. The dot IS the entry list, and the caller supplies the indentation:
+
+    {{- include "curie.egress.ipBlockRules" .Values.api.egress | trim | nindent 4 }}
+
+Every ipBlock peer rail 1 renders goes through here, so the metadata carve-out
+is stated ONCE. That carve-out is the security invariant: NetworkPolicy allows
+are additive, so an entry broad enough to contain 169.254.169.254 re-permits the
+cloud metadata endpoint rail 1 otherwise denies. An explicit per-entry `except:`
+list wins (including an empty one, a deliberate operator override); otherwise
+curie.metadataExcept returns a same-family, subset-safe carve-out for ANY CIDR
+that contains the metadata address -- not just an exact /0 -- and "" for CIDRs
+that cannot reach it. See that helper for the containment/family rules.
+*/}}
+{{- define "curie.egress.ipBlockRules" -}}
+{{- range . }}
+- to:
+    - ipBlock:
+        cidr: {{ .cidr }}
+        {{- if .except }}
+        except:
+          {{- toYaml .except | nindent 10 }}
+        {{- else }}
+        {{- $auto := include "curie.metadataExcept" .cidr | trim }}
+        {{- if $auto }}
+        except:
+          - {{ $auto }}
+        {{- end }}
+        {{- end }}
+  {{- with .ports }}
+  ports:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
 {{- end -}}

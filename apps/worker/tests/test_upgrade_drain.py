@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import redis.asyncio
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
 )
@@ -46,7 +47,7 @@ from curie_test_support.valkey import (
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.delivery_lease import DeliveryLeaseStore
-from curie_worker.upgrade_drain import UpgradeDrainGate, main, run_gate
+from curie_worker.upgrade_drain import UpgradeDrainGate, _client, main, run_gate
 from redis.asyncio import Redis as AsyncRedis
 from redis.exceptions import ResponseError
 
@@ -497,3 +498,35 @@ def test_an_unknown_mode_is_refused_rather_than_silently_draining() -> None:
         assert exit_code.code == 2
     else:
         raise AssertionError("an unknown --mode was accepted")
+
+
+# --- _client TLS selection (#2315) -------------------------------------------
+#
+# Construction performs no I/O (no assertion here touches real Valkey), so
+# this is hermetic: the seam under test is redis-py's own pool selection, the
+# same shape run.py's _valkey_kwargs tests use.
+
+
+def _drain_config(**overrides: object) -> WorkerConfig:
+    base: dict[str, object] = {
+        "valkey_host": _VALKEY_HOST,
+        "valkey_port": _VALKEY_PORT,
+        "valkey_password": _VALKEY_PW,
+    }
+    base.update(overrides)
+    return WorkerConfig(**base)
+
+
+def test_client_selects_the_plain_connection_by_default() -> None:
+    client = _client(_drain_config())
+    assert (
+        client.connection_pool.connection_class is redis.asyncio.connection.Connection
+    )
+
+
+def test_client_selects_ssl_connection_when_tls_is_set() -> None:
+    client = _client(_drain_config(valkey_tls=True))
+    assert (
+        client.connection_pool.connection_class
+        is redis.asyncio.connection.SSLConnection
+    )

@@ -6,11 +6,12 @@ description: >-
   and RustFS backing stores, and the OTel Collector that adapts app traces into
   Langfuse. Every backing store is condition-gated with a bring-your-own block.
   A CPU-AVX / ClickHouse-pin check runs as a blocking pre-install, pre-upgrade
+  hook; a controller-ready check runs as a blocking post-install, post-upgrade
   hook; a NetworkPolicy-enforcement probe ships as a helm test that must be run
   explicitly.
 type: application
-version: 0.8.5
-appVersion: "0.8.5"
+version: 0.8.6
+appVersion: "0.8.6"
 kubeVersion: ">=1.25.0-0"
 maintainers:
   - name: Curie

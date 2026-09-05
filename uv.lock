@@ -817,6 +817,7 @@ source = { editable = "apps/mail-adapter" }
 dependencies = [
     { name = "aci-protocol" },
     { name = "curie-channel-protocol" },
+    { name = "curie-telemetry" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
 ]
@@ -825,6 +826,7 @@ dependencies = [
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
+    { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.7" },
 ]

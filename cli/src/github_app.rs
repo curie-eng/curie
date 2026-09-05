@@ -17,10 +17,10 @@
 //! chart-held connect does.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
 use crate::ops::{
@@ -54,6 +54,17 @@ pub struct GithubAppOpts {
 /// is rejected as a configuration error. An operator wiring up the App has
 /// exactly the wrong context to debug that, so we set both together.
 pub const DEFAULT_CLONE_BASE: &str = "https://github.com";
+
+/// Default GitHub REST API for github.com. GHE is `{host}/api/v3`. Overridable
+/// by `CURIE_GITHUB_API_URL` (tests) or `GITHUB_API_URL` (same env the API
+/// process already reads).
+pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
+
+/// Match `apps/api/src/curie_api/github_app.py`: GitHub rejects a JWT whose
+/// `iat` is in its future, so backdate by a minute. `exp` stays inside the
+/// documented 10-minute ceiling.
+const JWT_BACKDATE_SECONDS: i64 = 60;
+const JWT_LIFETIME_SECONDS: i64 = 480;
 
 /// The data key the chart defaults to inside a BYO Secret
 /// (`charts/curie/values.yaml`: `api.githubAppExistingSecretKey: privateKey`,
@@ -1459,6 +1470,278 @@ impl crate::ui::CliOutput for GithubAppOutput {
     }
 }
 
+/// The GitHub REST API this probe should call.
+///
+/// Precedence: `CURIE_GITHUB_API_URL` (tests and an explicit CLI override),
+/// then `GITHUB_API_URL` (the same env the API already reads), then github.com
+/// vs GHE derived from `--clone-base`. No new clap flag: a command-surface
+/// change would force a manifest regen this ticket does not need.
+pub(crate) fn github_api_url(clone_base: &str) -> String {
+    for var in ["CURIE_GITHUB_API_URL", "GITHUB_API_URL"] {
+        if let Ok(url) = std::env::var(var) {
+            let trimmed = url.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    let base = clone_base.trim().trim_end_matches('/');
+    if base.is_empty() || base == DEFAULT_CLONE_BASE || base == "http://github.com" {
+        return DEFAULT_GITHUB_API_URL.to_string();
+    }
+    format!("{base}/api/v3")
+}
+
+#[derive(Serialize)]
+struct GitHubAppJwtClaims {
+    iat: i64,
+    exp: i64,
+    iss: String,
+}
+
+/// Sign a GitHub App JWT the same way the API does (`_app_jwt` in
+/// `apps/api/src/curie_api/github_app.py`): RS256, `iss` = App id, `iat`
+/// backdated 60s, `exp` 480s. The two cannot share code across Python/Rust;
+/// the constants and claim names are the sibling.
+fn sign_app_jwt(app_id: &str, pem: &str) -> Result<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| {
+            crate::exit::CliError::failure(format!("system clock is before Unix epoch: {err}"))
+        })?
+        .as_secs() as i64;
+    let claims = GitHubAppJwtClaims {
+        iat: now - JWT_BACKDATE_SECONDS,
+        exp: now + JWT_LIFETIME_SECONDS,
+        iss: app_id.to_string(),
+    };
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|_| {
+        crate::exit::CliError::failure(
+            "could not sign a GitHub App JWT from the supplied private key; it is PEM-shaped \
+             but is not a usable RSA key",
+        )
+        .with_fix(
+            "re-download the App's private key (its settings page, under 'Private keys') and \
+             rerun; the last known-good credential was left unchanged",
+        )
+    })?;
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+        &claims,
+        &key,
+    )
+    .map_err(|_| {
+        crate::exit::CliError::failure(
+            "could not sign a GitHub App JWT from the supplied private key",
+        )
+        .with_fix(
+            "re-download the App's private key (its settings page, under 'Private keys') \
+                 and rerun; the last known-good credential was left unchanged",
+        )
+        .into()
+    })
+}
+
+fn pem_from_secret_json(body: &str, secret: &str, key: &str) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|_| {
+        crate::exit::CliError::failure(format!(
+            "kubectl get secret {secret} did not return JSON; cannot read the GitHub App private key"
+        ))
+        .with_fix(format!(
+            "inspect the Secret with kubectl -n <namespace> get secret {secret} -o json and \
+             rerun; the last known-good credential was left unchanged"
+        ))
+    })?;
+    if let Some(encoded) = value
+        .get("data")
+        .and_then(|d| d.get(key))
+        .and_then(|v| v.as_str())
+    {
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim())
+                .map_err(|_| {
+                    crate::exit::CliError::failure(format!(
+                "Secret {secret} key {key} is not standard base64; cannot read the GitHub App \
+                 private key"
+            ))
+            .with_fix(
+                "store the PEM as a normal Secret data value (kubectl create secret generic \
+                 --from-file) and rerun; the last known-good credential was left unchanged",
+            )
+                })?;
+        return String::from_utf8(bytes).map_err(|_| {
+            crate::exit::CliError::failure(format!(
+                "Secret {secret} key {key} is not UTF-8; a PEM private key is ASCII"
+            ))
+            .with_fix(
+                "store the PEM as UTF-8 text in that Secret data key and rerun; the last \
+                 known-good credential was left unchanged",
+            )
+            .into()
+        });
+    }
+    if let Some(plain_pem) = value
+        .get("stringData")
+        .and_then(|d| d.get(key))
+        .and_then(|v| v.as_str())
+    {
+        return Ok(plain_pem.to_string());
+    }
+    Err(crate::exit::CliError::failure(format!(
+        "Secret {secret} has no data key {key}; cannot probe GitHub App identity"
+    ))
+    .with_fix(format!(
+        "put the App PEM in Secret {secret} under key {key} and rerun; the last known-good \
+         credential was left unchanged"
+    ))
+    .into())
+}
+
+async fn load_existing_secret_pem(opts: &GithubAppOpts) -> Result<String> {
+    let args = crate::connectors::get_secret_args(&opts.common.namespace, &opts.existing_secret);
+    let cmd = OpsCommand::new(
+        "kubectl",
+        args.iter().skip(1).map(|a| plain(a.clone())).collect(),
+    );
+    let (ok, out, err) = run_capture(&cmd).await?;
+    if !ok {
+        return Err(crate::exit::CliError::failure(format!(
+            "could not read Secret {} in namespace {}: {err}",
+            opts.existing_secret, opts.common.namespace
+        ))
+        .with_fix(format!(
+            "create Secret {} (key {}) in namespace {} and rerun; the last known-good \
+             credential was left unchanged",
+            opts.existing_secret, opts.existing_secret_key, opts.common.namespace
+        ))
+        .into());
+    }
+    pem_from_secret_json(&out, &opts.existing_secret, &opts.existing_secret_key)
+}
+
+async fn load_connect_pem(opts: &GithubAppOpts) -> Result<String> {
+    if !opts.existing_secret.trim().is_empty() {
+        return load_existing_secret_pem(opts).await;
+    }
+    std::fs::read_to_string(&opts.private_key_path).map_err(|err| {
+        crate::exit::CliError::failure(format!(
+            "--private-key: cannot re-read {} for the GitHub identity probe: {err}",
+            opts.private_key_path
+        ))
+        .with_fix(
+            "rerun with --private-key pointing at a readable PEM file; the last known-good \
+             credential was left unchanged",
+        )
+        .into()
+    })
+}
+
+fn github_id_matches(body: &serde_json::Value, app_id: &str) -> bool {
+    match body.get("id") {
+        Some(serde_json::Value::Number(n)) => {
+            n.to_string() == app_id
+                || n.as_u64().is_some_and(|u| u.to_string() == app_id)
+                || n.as_i64().is_some_and(|i| i.to_string() == app_id)
+        }
+        Some(serde_json::Value::String(s)) => s == app_id,
+        _ => false,
+    }
+}
+
+fn reported_github_id(body: &serde_json::Value) -> String {
+    match body.get("id") {
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => "<missing>".into(),
+    }
+}
+
+/// Sign a JWT and `GET /app` before any helm mutation. A 401 or an App id
+/// that does not match `--app-id` is a configuration error (exit 1) with a
+/// fix; the last known-good credential is preserved because helm is never
+/// run. Network failures stay transient (exit 3) via reqwest classification.
+///
+/// Skipped on `--dry-run` (offline) and `--disconnect` by the caller.
+pub(crate) async fn guard_app_identity(opts: &GithubAppOpts, clone_base: &str) -> Result<()> {
+    let app_id = opts.app_id.trim();
+    let pem = load_connect_pem(opts).await?;
+    if !is_pem_private_key(&pem) {
+        return Err(crate::exit::CliError::failure(
+            "the GitHub App private key is not a PEM private key; refusing to change credentials",
+        )
+        .with_fix(
+            "put a PEM downloaded from the App's settings page under 'Private keys' and rerun; \
+             the last known-good credential was left unchanged",
+        )
+        .into());
+    }
+    let jwt = sign_app_jwt(app_id, &pem)?;
+    let api = github_api_url(clone_base);
+    let url = format!("{}/app", api.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|err| {
+            crate::exit::CliError::failure(format!("could not build an HTTP client: {err}"))
+        })?;
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", format!("curie/{}", env!("CARGO_PKG_VERSION")))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(crate::exit::CliError::failure(format!(
+            "the GitHub App private key does not authenticate as App {app_id}. GitHub \
+             returned HTTP {} for GET /app",
+            status.as_u16()
+        ))
+        .with_fix(format!(
+            "download the private key that belongs to App {app_id} (Settings -> Developer \
+             settings -> GitHub Apps -> your app -> Private keys) and rerun; the last \
+             known-good credential was left unchanged"
+        ))
+        .into());
+    }
+    if status.is_server_error() {
+        return Err(crate::exit::CliError::transient(format!(
+            "GitHub returned HTTP {} probing GET /app; the last known-good credential was \
+             left unchanged",
+            status.as_u16()
+        ))
+        .into());
+    }
+    if !status.is_success() {
+        return Err(crate::exit::CliError::failure(format!(
+            "GitHub returned HTTP {} probing GET /app for App {app_id}",
+            status.as_u16()
+        ))
+        .with_fix(
+            "check the App id and private key, then rerun; the last known-good credential \
+             was left unchanged",
+        )
+        .into());
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    if !github_id_matches(&parsed, app_id) {
+        let got = reported_github_id(&parsed);
+        return Err(crate::exit::CliError::failure(format!(
+            "GitHub authenticated the key as App {got}, not the requested --app-id {app_id}"
+        ))
+        .with_fix(format!(
+            "pass --app-id {got} for this key, or supply the private key that belongs to \
+             App {app_id}; the last known-good credential was left unchanged"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubAppOutput> {
     let ui = crate::ui::ui();
     require_connect_inputs(&opts)?;
@@ -1510,6 +1793,11 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
         .await
         .map_err(|error| manifest_preflight_failure(&opts, prior_revision, &error))?;
     guard_byo_key_conflict(&opts, revision_values.as_ref())?;
+    // Probe the configured App before either sandbox reconciliation or Helm
+    // mutation. Disconnect has no credential to authenticate; dry-run is offline.
+    if !opts.disconnect {
+        guard_app_identity(&opts, clone_base).await?;
+    }
     let expected_inventory = ExpectedSandboxInventory::from_values(revision_values.as_ref())?;
     let prior_sandboxes = read_desired_sandboxes(&opts, Some(prior_revision))
         .await

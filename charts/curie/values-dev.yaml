@@ -3,13 +3,16 @@
 #   helm install curie-dev charts/curie -n curie-dev --create-namespace \
 #     -f charts/curie/values-dev.yaml
 #
-# Sized to fit a ~4 GB / 4-core scratch cluster. Sum of memory
-# requests here is ~1.7 GB, leaving headroom for the kubelet/system and for
-# ClickHouse/Langfuse to burst toward their limits. Everything is single-replica
-# and ClickHouse cluster mode is off. This mirrors compose.dev.yaml (same
-# Langfuse pin; chart ClickHouse default is 25.12 / AVX-required, compose stays
-# 24.8 for SSE4.2-only local hosts) so V1 (compose) and V3 (chart) verify the
-# same application stack.
+# Sized to fit a ~4 GB / 4-core scratch cluster, tightly. Sum of memory
+# requests here is 2496 Mi (~2.44 GiB). That plus a distribution's kubelet
+# and system pods leaves little request headroom on a 4 GB node; ClickHouse
+# and Langfuse bursting toward their limits is the remaining squeeze, which
+# is why the README's measured steady state is ~3.3 GB / ~82% node memory.
+# Everything is single-replica and ClickHouse cluster mode is off. This
+# mirrors compose.dev.yaml (same Langfuse, Postgres and Valkey pins; chart
+# ClickHouse default is 25.12.11.4 / AVX-required, compose stays 24.8.14.39 for
+# SSE4.2-only local hosts) so
+# V1 (compose) and V3 (chart) verify the same application stack.
 
 langfuse:
   web:
@@ -40,7 +43,7 @@ valkey:
     limits: { cpu: 250m, memory: 256Mi }
 
 clickhouse:
-  # Inherits the chart-default :25.12 pin (AVX required, coupled to Langfuse).
+  # Inherits the chart-default :25.12.11.4 pin (AVX required, coupled to Langfuse).
   # Cluster mode off for single-node.
   clusterEnabled: false
   persistence:

@@ -67,7 +67,10 @@ done
   echo "release must be a lowercase Helm name of at most 53 characters" >&2
   exit 2
 }
-[[ "$POSTGRES_IMAGE" != "postgres:16-alpine" && "$POSTGRES_IMAGE" != *:latest ]] || {
+# The chart default (charts/curie/values.yaml postgres.image) is the one image
+# this fixture must NOT be: the whole point is a build that starts late (#2319).
+CHART_DEFAULT_POSTGRES_IMAGE="postgres:16.15-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685"
+[[ "$POSTGRES_IMAGE" != "$CHART_DEFAULT_POSTGRES_IMAGE" && "$POSTGRES_IMAGE" != *:latest ]] || {
   echo "--postgres-image must be a distinct, non-latest delayed fixture tag" >&2
   exit 2
 }

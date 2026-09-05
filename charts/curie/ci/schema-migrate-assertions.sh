@@ -12,7 +12,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 helm template t "$CHART" > "$TMP/default.yaml"
 helm template t "$CHART" --set api.migrate.enabled=false > "$TMP/disabled.yaml"
-helm template t "$CHART" --set api.deploy=false > "$TMP/no-api.yaml"
+helm template t "$CHART" --set api.deploy=false \
+  --set ui.apiBaseUrl=https://api.example.com > "$TMP/no-api.yaml"
 helm template t "$CHART" --set api.migrate.forwardOnly=true > "$TMP/forward.yaml"
 
 python3 - "$TMP/default.yaml" "$TMP/disabled.yaml" "$TMP/no-api.yaml" "$TMP/forward.yaml" <<'PY'

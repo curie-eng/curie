@@ -156,6 +156,16 @@ required tier, and a change that bears no runtime behavior records that reason
 once instead. A direct path change makes no behavior change and classifies
 nothing.
 
+The path set is runner MCP catalog projection, unscoped PreToolUse,
+in-process platform MCP tools, workspace publication, and
+built-in coding-tool session capability. A behavior-bearing change that
+reaches any of those reaches both live-provider and Slack external-integration.
+Those two rows are required on that path. "No model routing change" is not a valid n/a reason.
+Fake-model kind, skill ladder, and helper-only tests remain useful and are
+not sufficient for those acceptance criteria. Leave the required-tier item
+open when the evidence is missing; do not close it by marking the row n/a.
+This rule does not pull the live e2e ladder onto unrelated pull requests.
+
 ## Build rules
 
 For a behavior change, write or update the test first and confirm it fails for the
@@ -293,6 +303,27 @@ Before completion, run the full affected test suite plus the relevant type check
 lint. Check sibling paths when the change touches a known seam or guard. Demonstrate
 that a new or modified guard rejects violating input through its real consumer path.
 
+### P0, release-blocker, and sre-bot-e2e-demo Closes
+
+When the pull request this run will open uses a GitHub closing keyword
+(`Closes`, `Fixes`, `Resolves`, and their past-tense forms) on an issue labeled
+`P0`, `release-blocker`, or `sre-bot-e2e-demo`, the review stage adds one extra
+read-only spec-vs-impl pass. That pass's only job is: each issue acceptance
+criterion is visible in the product diff, not only in the e2e table or the Fix
+pin selector. Scope review already asks whether each hunk traces to an AC; this
+pass asks the converse, whether each AC is in the diff.
+
+A string or refusal-text test cannot be the sole pin for a routing, catalog, or
+live-trace AC. The documented insufficient pin is #2209, which closed #2202 with
+a message-only Fix pin on the record-miss copy; #2248 reopened the routing AC.
+
+If the diff does not implement an AC, the PR uses `Ref` and leaves the issue
+open.
+
+Ordinary bugfixes that close neither of those labels are unchanged: the existing
+code review, scope review, and Fix pin rules still apply, and this extra pass
+does not run.
+
 ## Stop and escalate
 
 Hand the decision back rather than pressing on when reviews cannot converge after
@@ -334,6 +365,10 @@ an item nobody had to answer for is an item nobody checked.
       falsifiable negative or a second independent path
 - [ ] The change does not undo an earlier deliberate decision, per Prior intent
 - [ ] Full affected test suite, type check, and lint pass on the final code
+- [ ] If this PR closes a `P0`, `release-blocker`, or `sre-bot-e2e-demo` issue,
+      spec-vs-impl confirmed each issue AC against the diff, not only the e2e
+      table or the Fix pin selector. Ordinary bugfixes that close neither label
+      mark this n/a.
 
 A quick path change marks the failing tests, separate contexts, and prior intent
 items not applicable. A direct path change applies only the suite and lint items.

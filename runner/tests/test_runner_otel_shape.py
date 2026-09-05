@@ -28,6 +28,7 @@ _TERMINAL_OUTCOMES = (
     ("aborted_streaming", "failed", 2),
     ("aborted_tools", "failed", 2),
     ("classified_failure", "failed", 2),
+    ("runner_timeout", "failed", 2),
     ("abandoned", "abandoned", 2),
 )
 
@@ -290,6 +291,7 @@ def test_root_terminal_closed_mapping_is_accepted(
         ("aborted_streaming", "abandoned"),
         ("aborted_tools", "succeeded"),
         ("classified_failure", "paused"),
+        ("runner_timeout", "abandoned"),
         ("abandoned", "failed"),
         ("unknown_terminal", "succeeded"),
         ("completed", "unknown_status"),

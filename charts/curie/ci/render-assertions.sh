@@ -39,6 +39,13 @@
 # control. The migration init container must wait for Postgres with bounded,
 # quiet retries before preserving the original Alembic upgrade command.
 #
+# Issue #2323 (NOTES app-service image tags), Assertion 15 and its negative
+# control. NOTES.txt must print the same image reference the corresponding
+# Deployment renders for api, dispatcher, worker, and ui. A rendered
+# reference that ends in a bare colon is refused, because docker/crictl
+# resolve `repo:` to `:latest`, which is a different image from the
+# appVersion tag the pods run.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -812,6 +819,7 @@ python3 "$RUNNER_API_CHECK" "$RUNNER_API_OUT" present \
 RUNNER_API_OFF_OUT="$(mktemp -d -p "$TMP")"
 helm template runner-api-render "$CHART" --namespace runner-api-namespace \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --output-dir "$RUNNER_API_OFF_OUT" > /dev/null
 python3 "$RUNNER_API_CHECK" "$RUNNER_API_OFF_OUT" absent \
   || fail "api.deploy=false did not remove the runner sandbox API egress allowance."
@@ -1018,6 +1026,7 @@ expected = {
     ("Deployment", f"{prefix}-otel-collector"): "platform",
     ("Deployment", f"{prefix}-langfuse-web"): "platform",
     ("Deployment", f"{prefix}-langfuse-worker"): "platform",
+    ("Deployment", f"{prefix}-mail-adapter"): "platform",
     ("StatefulSet", f"{prefix}-postgres"): "data",
     ("StatefulSet", f"{prefix}-valkey"): "data",
     ("StatefulSet", f"{prefix}-clickhouse"): "data",
@@ -1036,6 +1045,9 @@ expected = {
     ("Job", f"{prefix}-upgrade-drain-release"): "hooks",
     # The single schema upgrade phase (#2300).
     ("Job", f"{prefix}-schema-migrate"): "hooks",
+    ("Job", f"{prefix}-grafana-token-updater"): "hooks",
+    ("Job", f"{prefix}-grafana-token-cleanup"): "hooks",
+    ("Job", f"{prefix}-mail-persistence-preflight"): "hooks",
     ("Pod", f"{prefix}-security-probe-hardening"): "hooks",
     ("Deployment", "agent-sandbox-controller"): "controller",
 }
@@ -1169,12 +1181,19 @@ else:
 PYEOF
 
 # Enable every conditional pod surface so the expected inventory is exhaustive.
+# mailAdapter.deploy also needs a narrow provider CIDR (fail-closed egress) and
+# an existingClaim so the persistence preflight Job actually renders. The Job
+# name is mail-persistence-preflight, not mail-adapter-persistence.
 PLACEMENT_HELM_ARGS=(
   --set dispatcher.slack.appToken=xapp-placement-render
   --set dispatcher.slack.botToken=xoxb-placement-render
   --set inference.deploy=true
   --set inference.persistence.enabled=true
   --set security.gvisor.mode=require
+  --set mailAdapter.deploy=true
+  --set 'mailAdapter.agentmail.httpsCidrs[0]=203.0.113.0/24'
+  --set mailAdapter.persistence.existingClaim=placement-render-mail-state
+  --set grafanaConnector.enabled=true
 )
 
 PLACEMENT_OUT="$(mktemp -d -p "$TMP")"
@@ -1470,7 +1489,14 @@ WORKER_API_BYO="$TMP/worker_api_byo.yaml"
 cat > "$WORKER_API_BYO" <<'EOF'
 api:
   deploy: false
+  # Rail 1 needs a CIDR peer for a BYO API (#2317); this fixture only cares
+  # about the worker's CURIE_API_URL.
+  egress:
+    - cidr: 192.0.2.41/32
+      ports: [{ protocol: TCP, port: 443 }]
 dispatcher:
+  apiBaseUrl: https://byo-api.example
+ui:
   apiBaseUrl: https://byo-api.example
 EOF
 assert_worker_api byo curie https://byo-api.example chart -f "$WORKER_API_BYO"
@@ -1838,5 +1864,195 @@ if [[ "$api_migrate_negative_output" != *"direct Alembic command is not retry-sa
 fi
 echo "  ok: a direct Alembic API init is rejected (the assert can fail)"
 
+echo "=== Assertion 15: NOTES app-service images match Deployments and never end in a bare colon (#2323) ==="
+# helm template does not emit NOTES.txt. Render it through tpl so the
+# operator-facing image refs are asserted on the same consumer path as
+# `helm install`. Same probe as clickhouse-langfuse-pin-assertions.sh.
+NOTES_IMAGE_CHART="$TMP/notes-image-chart"
+cp -a "$CHART" "$NOTES_IMAGE_CHART"
+cp "$CHART/templates/NOTES.txt" "$NOTES_IMAGE_CHART/NOTES.txt"
+cat >"$NOTES_IMAGE_CHART/templates/notes-image-check.yaml" <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notes-image-check
+data:
+  notes: |
+{{ tpl (.Files.Get "NOTES.txt") . | nindent 4 }}
+EOF
+
+NOTES_IMAGE_CHECK="$TMP/check_notes_app_images.py"
+cat >"$NOTES_IMAGE_CHECK" <<'PYEOF'
+"""Assert NOTES app-service image refs match Deployment images and refuse a bare colon.
+
+argv: <notes-configmap.yaml> <rendered-dir> <svc> [<svc> ...]
+Exits 0 on pass, 1 naming the offending service or image on failure.
+"""
+import pathlib
+import re
+import sys
+
+import yaml
+
+notes_path, rendered_dir, *services = sys.argv[1:]
+if not services:
+    sys.stderr.write("expected at least one service name\n")
+    sys.exit(1)
+
+notes_doc = yaml.safe_load(pathlib.Path(notes_path).read_text())
+notes = ((notes_doc or {}).get("data") or {}).get("notes") or ""
+found = {}
+for match in re.finditer(
+    r"^  - (api|dispatcher|worker|ui) \(([^)]*)\)",
+    notes,
+    flags=re.MULTILINE,
+):
+    found[match.group(1)] = match.group(2).rstrip()
+
+for svc in services:
+    image = found.get(svc)
+    if image is None:
+        sys.stderr.write(
+            "NOTES image reference for %r is missing from the rendered notes\n" % svc
+        )
+        sys.exit(1)
+    if image.endswith(":"):
+        sys.stderr.write(
+            "NOTES image reference for %r ends in a bare colon: %r\n" % (svc, image)
+        )
+        sys.exit(1)
+
+    deploy_path = pathlib.Path(rendered_dir) / "curie" / "templates" / ("%s.yaml" % svc)
+    if not deploy_path.is_file():
+        sys.stderr.write("Deployment render is missing: %s\n" % deploy_path)
+        sys.exit(1)
+    deploy_image = None
+    for doc in yaml.safe_load_all(deploy_path.read_text()) or []:
+        if not doc or doc.get("kind") != "Deployment":
+            continue
+        containers = (
+            ((doc.get("spec") or {}).get("template") or {}).get("spec") or {}
+        ).get("containers") or []
+        for container in containers:
+            if container.get("name") == svc:
+                deploy_image = container.get("image")
+                break
+        if deploy_image is not None:
+            break
+    if not deploy_image:
+        sys.stderr.write(
+            "Deployment %s has no container named %r\n" % (deploy_path, svc)
+        )
+        sys.exit(1)
+    if str(deploy_image).endswith(":"):
+        sys.stderr.write(
+            "Deployment image for %r ends in a bare colon: %r\n" % (svc, deploy_image)
+        )
+        sys.exit(1)
+    if image != deploy_image:
+        sys.stderr.write(
+            "NOTES image for %r is %r but Deployment renders %r\n"
+            % (svc, image, deploy_image)
+        )
+        sys.exit(1)
+
+print("ok: NOTES images match Deployments for %s" % ", ".join(services))
+PYEOF
+
+render_notes_images() {
+  local dest="$1"
+  shift
+  helm template curie "$NOTES_IMAGE_CHART" \
+    --show-only templates/notes-image-check.yaml \
+    "$@" >"$dest"
+}
+
+NOTES_IMAGE_DEFAULT="$TMP/notes-images-default.yaml"
+NOTES_IMAGE_DEFAULT_OUT="$TMP/notes-images-default-out"
+mkdir -p "$NOTES_IMAGE_DEFAULT_OUT"
+helm template curie "$CHART" --output-dir "$NOTES_IMAGE_DEFAULT_OUT" >/dev/null
+render_notes_images "$NOTES_IMAGE_DEFAULT"
+python3 "$NOTES_IMAGE_CHECK" "$NOTES_IMAGE_DEFAULT" "$NOTES_IMAGE_DEFAULT_OUT" \
+  api worker ui \
+  || fail "default NOTES app-service images must match the corresponding Deployments and must not end in a bare colon."
+echo "  ok: default NOTES api/worker/ui images match Deployments (no Slack tokens)"
+
+NOTES_IMAGE_SLACK="$TMP/notes-images-slack.yaml"
+NOTES_IMAGE_SLACK_OUT="$TMP/notes-images-slack-out"
+mkdir -p "$NOTES_IMAGE_SLACK_OUT"
+helm template curie "$CHART" --output-dir "$NOTES_IMAGE_SLACK_OUT" \
+  --set dispatcher.slack.appToken=xapp-render-assert \
+  --set dispatcher.slack.botToken=xoxb-render-assert \
+  >/dev/null
+render_notes_images "$NOTES_IMAGE_SLACK" \
+  --set dispatcher.slack.appToken=xapp-render-assert \
+  --set dispatcher.slack.botToken=xoxb-render-assert
+python3 "$NOTES_IMAGE_CHECK" "$NOTES_IMAGE_SLACK" "$NOTES_IMAGE_SLACK_OUT" \
+  api dispatcher worker ui \
+  || fail "Slack-enabled NOTES app-service images must match the corresponding Deployments and must not end in a bare colon."
+echo "  ok: Slack-enabled NOTES api/dispatcher/worker/ui images match Deployments"
+
+NOTES_IMAGE_PIN="$TMP/notes-images-pin.yaml"
+NOTES_IMAGE_PIN_OUT="$TMP/notes-images-pin-out"
+mkdir -p "$NOTES_IMAGE_PIN_OUT"
+helm template curie "$CHART" --output-dir "$NOTES_IMAGE_PIN_OUT" \
+  --set api.image.tag=pin-2323 >/dev/null
+render_notes_images "$NOTES_IMAGE_PIN" --set api.image.tag=pin-2323
+python3 "$NOTES_IMAGE_CHECK" "$NOTES_IMAGE_PIN" "$NOTES_IMAGE_PIN_OUT" \
+  api worker ui \
+  || fail "explicit api.image.tag must appear in both NOTES and the API Deployment."
+if ! grep -q 'curie-api:pin-2323' "$NOTES_IMAGE_PIN"; then
+  fail "explicit api.image.tag=pin-2323 did not appear in rendered NOTES."
+fi
+echo "  ok: explicit api.image.tag=pin-2323 is printed in NOTES and the API Deployment"
+
+echo "=== Assertion 15 negative control: a bare-colon NOTES image FAILS ==="
+NOTES_IMAGE_MUTANT="$TMP/mutant-notes-image"
+cp -a "$NOTES_IMAGE_CHART" "$NOTES_IMAGE_MUTANT"
+python3 - "$NOTES_IMAGE_MUTANT/templates/NOTES.txt" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+services = ("api", "dispatcher", "worker", "ui")
+replaced = 0
+for svc in services:
+    include = (
+        '{{ include "curie.image" (dict "repository" .Values.%s.image.repository'
+        ' "tag" .Values.%s.image.tag "digest" .Values.%s.image.digest'
+        ' "defaultTag" .Chart.AppVersion) }}' % (svc, svc, svc)
+    )
+    old = "{{ .Values.%s.image.repository }}:{{ .Values.%s.image.tag }}" % (svc, svc)
+    if include in text:
+        text = text.replace(include, old)
+        replaced += 1
+    elif old in text:
+        replaced += 1
+    else:
+        sys.stderr.write("negative control could not find the %s image expression\n" % svc)
+        sys.exit(1)
+if replaced != 4:
+    sys.stderr.write("negative control expected to rewrite 4 image expressions\n")
+    sys.exit(1)
+path.write_text(text)
+PYEOF
+cp "$NOTES_IMAGE_MUTANT/templates/NOTES.txt" "$NOTES_IMAGE_MUTANT/NOTES.txt"
+NOTES_IMAGE_MUTANT_RENDER="$TMP/notes-images-mutant.yaml"
+NOTES_IMAGE_MUTANT_OUT="$TMP/notes-images-mutant-out"
+mkdir -p "$NOTES_IMAGE_MUTANT_OUT"
+helm template curie "$CHART" --output-dir "$NOTES_IMAGE_MUTANT_OUT" >/dev/null
+helm template curie "$NOTES_IMAGE_MUTANT" \
+  --show-only templates/notes-image-check.yaml \
+  >"$NOTES_IMAGE_MUTANT_RENDER"
+notes_image_negative_output=""
+if notes_image_negative_output="$(python3 "$NOTES_IMAGE_CHECK" "$NOTES_IMAGE_MUTANT_RENDER" "$NOTES_IMAGE_MUTANT_OUT" api worker ui 2>&1)"; then
+  fail "negative control did not fire: NOTES interpolated from image.tag still passed the bare-colon assert."
+fi
+if [[ "$notes_image_negative_output" != *"ends in a bare colon"* ]]; then
+  fail "bare-colon negative control failed unexpectedly: $notes_image_negative_output"
+fi
+echo "  ok: a NOTES image interpolated from empty image.tag is rejected (the assert can fail)"
+
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init command waits quietly with bounded retries before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init command waits quietly with bounded retries before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control)."

@@ -26,6 +26,12 @@ _TURN_OUTCOMES: Final = [
     "side_effect_halted",
     "idle",
     "interrupted",
+    # "deadline_halted" (#2278): the worker lifecycle's wall-clock delivery
+    # deadline (ADR-0131), distinct from model-spend ``budget_halted``.
+    # ``record_metric`` raises on an out-of-domain outcome, so omitting this
+    # value crashes terminal completion after the turn has already settled
+    # and leaves the stream entry pending.
+    "deadline_halted",
 ]
 
 
@@ -113,7 +119,7 @@ _SANDBOX_INVENTORY_ATTRIBUTES = {
 }
 _RUNNER_RPC_ATTRIBUTES = {
     "service.name": ["curie-worker"],
-    "operation": ["event", "steer", "interrupt", "reset", "status"],
+    "operation": ["event", "steer", "interrupt", "reset", "status", "timeout"],
     "role": ["client"],
     "outcome": ["success", "failure", "conflict", "timeout"],
 }

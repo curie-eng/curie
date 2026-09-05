@@ -203,11 +203,20 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         checksum/mail-adapter-credentials: {{ $credentialChecksumSources | toJson | sha256sum }}
       labels:
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "platform")) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "mail-adapter") | nindent 8 }}
     spec:
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.mailAdapter.podSecurityContext | nindent 8 }}
@@ -280,6 +289,18 @@ spec:
             # process fall back to its own default and start.
             - name: CURIE_MAIL_ALLOWED_SENDERS
               value: {{ join "," .Values.mailAdapter.allowedSenders | quote }}
+            # The shared OTLP env, so this adapter's records join the same
+            # redacted telemetry path as every other instrumented workload.
+            # extraEnv is deliberately an empty list, not a new
+            # mailAdapter.extraEnv values key: this pod is the one carrying
+            # three credentials behind a fail-closed egress rail with no
+            # ServiceAccount token, and ci/mail-adapter-wiring-assertions.sh
+            # asserts that NO CURIE_API_KEY env exists on it at all. A
+            # free-form env surface is exactly the hole through which that
+            # property is lost. Accepted cost: an operator cannot point only
+            # the mail adapter at a different collector; otelCollector.endpoint
+            # moves the whole release.
+            {{- include "curie.env.otel" (dict "root" . "extraEnv" list) | nindent 12 }}
           ports:
             - name: http
               containerPort: 8080
@@ -316,6 +337,15 @@ spec:
 # One egress-only policy selects exactly the mail adapter. It deliberately has
 # no ingress policy: kubelet-originated HTTP probes are not reliably labelable
 # as worker traffic, while authenticated POST remains the write gate.
+#
+# Destinations are DNS, the platform API (this release's pods, or the BYO CIDRs
+# when api.deploy is false), the AgentMail CIDRs on 443, and -- only while
+# otelCollector.deploy is true -- this release's collector. Read the rules
+# below for the current set rather than trusting a count in prose.
+#
+# With otelCollector.deploy false and an external otelCollector.endpoint set,
+# this policy has no peer for that address and OTLP export is dropped; see
+# charts/curie/README.md for the operator remedy.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -370,4 +400,23 @@ spec:
         {{- end }}
       ports:
         - { protocol: TCP, port: 443 }
+    {{- if .Values.otelCollector.deploy }}
+    # This release's in-chart OTel Collector. The adapter is the only
+    # first-party service with an egress policy, so unlike api/dispatcher/worker
+    # it needs an explicit peer or every OTLP export is dropped by this rail
+    # while the rendered env still looks correct. Mirrors the peer shape of
+    # security-networkpolicy.yaml's runner-allow-collector, kept as a rule in
+    # this policy rather than a second object so one object still shows
+    # everything this credential-bearing pod may reach.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "curie.selectorLabels" (dict "root" . "component" "otel-collector") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.otelCollector.service.grpcPort }} }
+        - { protocol: TCP, port: {{ .Values.otelCollector.service.httpPort }} }
+    {{- end }}
 {{- end }}

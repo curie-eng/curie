@@ -17,12 +17,15 @@
 # everyone on 2026-07-27, which broke every runner-image build repo-wide: curl
 # failed, nodejs never installed, and the next line died with `npm: not found`.
 # Copying from the official image removes the third-party apt repo from the build
-# path entirely, pins the version by tag, and is architecture-correct by
-# construction (Docker resolves the matching platform, so an arm64 dev box and an
-# amd64 CI runner both work -- a hardcoded tarball URL would not).
-FROM node:22-bookworm-slim AS node
+# path entirely, pins the version by tag plus digest so a rebuild at this commit
+# is the same image (#2320), and is architecture-correct by construction (Docker
+# resolves the matching platform from the multi-arch index, so an arm64 dev box
+# and an amd64 CI runner both work -- a hardcoded tarball URL would not).
+# Floating tags would still pick up upstream OS security patches without a
+# commit; Dependabot's docker ecosystem raises those base moves as PRs instead.
+FROM node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS node
 
-FROM python:3.13-slim-bookworm
+FROM python:3.13.15-slim-bookworm@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e
 
 # Only the Node bits, never all of /usr/local: the python base keeps its own
 # interpreter there, so a blanket copy would clobber it.

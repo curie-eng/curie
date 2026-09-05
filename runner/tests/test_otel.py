@@ -1,11 +1,13 @@
 """OTel: the gen_ai span tree is emitted for a turn; exporter wiring is gated."""
 
+import os
 import time
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import anyio
+import httpx
 import pytest
 from aci_protocol import (
     ErrorEvent,
@@ -41,6 +43,7 @@ from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
     OTLPSpanExporter as HttpOTLPSpanExporter,
 )
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -113,10 +116,22 @@ def _export_turn(
     session_factory: Callable[[], Any],
     *,
     model: str | None = "configured-model",
+    collector_endpoint: str | None = None,
 ) -> tuple[list[object], list[ReadableSpan]]:
     exporter = InMemorySpanExporter()
-    provider = TracerProvider()
+    resource = (
+        Resource.create({"service.name": "curie-runner-integration"})
+        if collector_endpoint
+        else None
+    )
+    provider = TracerProvider(resource=resource)
+    if collector_endpoint:
+        provider.add_span_processor(_SchemaValidatingSpanProcessor())
     provider.add_span_processor(SimpleSpanProcessor(exporter))
+    if collector_endpoint:
+        provider.add_span_processor(
+            SimpleSpanProcessor(HttpOTLPSpanExporter(endpoint=collector_endpoint))
+        )
     runner = SessionRunner(
         session_factory=session_factory,
         ceiling=0,
@@ -228,6 +243,33 @@ def _partial_boundary(event_type: str, *, second: bool = False) -> StreamEvent:
     )
 
 
+def _raw_stream_event(event: dict[str, Any]) -> StreamEvent:
+    return StreamEvent(
+        uuid=_STREAM_UUID,
+        session_id=_STREAM_SESSION_ID,
+        parent_tool_use_id=_PARENT_TOOL_ID,
+        event=event,
+    )
+
+
+# Anthropic documents tool starts as ``content_block_start`` events carrying a
+# ``tool_use`` block, exposed by the SDK through ``StreamEvent.event``.
+# https://platform.claude.com/docs/en/build-with-claude/streaming
+def _streamed_tool_start(call_id: str, name: str) -> StreamEvent:
+    return _raw_stream_event(
+        {
+            "type": "content_block_start",
+            "message": {"content": _STREAM_BODY},
+            "content_block": {
+                "type": "tool_use",
+                "id": call_id,
+                "name": name,
+                "input": {"argument": _STREAM_ARGUMENT},
+            },
+        }
+    )
+
+
 def _two_round_script(*, include_boundaries: bool = True) -> list[object]:
     first_usage = {
         "input_tokens": 3,
@@ -296,6 +338,44 @@ def _two_round_script(*, include_boundaries: bool = True) -> list[object]:
         ]
     )
     return script
+
+
+_FIRST_STREAMED_CALL_ID = "streamed-call-one-PLACEHOLDER"
+_SECOND_STREAMED_CALL_ID = "streamed-call-two-PLACEHOLDER"
+_PRIVATE_OTEL_VALUES = (
+    _STREAM_BODY, _STREAM_ARGUMENT, _TOOL_ARGUMENT, _TOOL_RESULT,
+    _STREAM_UUID, _STREAM_SESSION_ID, _PARENT_TOOL_ID, _TOOL_CALL_ID,
+    _FIRST_STREAMED_CALL_ID, _SECOND_STREAMED_CALL_ID,
+    "sdk-result-session-PLACEHOLDER",
+)
+
+
+def _two_streamed_tool_script(*, repeat_final_blocks: bool = False) -> list[object]:
+    repeated: list[object] = []
+    if repeat_final_blocks:
+        repeated = [
+            AssistantMessage(
+                content=[
+                    ToolUseBlock(id=_FIRST_STREAMED_CALL_ID, name="Bash", input={}),
+                    ToolUseBlock(id=_SECOND_STREAMED_CALL_ID, name="Write", input={}),
+                ],
+                model="observed-model",
+                usage={
+                    "input_tokens": 23,
+                    "output_tokens": 29,
+                    "cache_read_input_tokens": 31,
+                    "cache_creation_input_tokens": 37,
+                },
+            )
+        ]
+    return [
+        _streamed_tool_start(_FIRST_STREAMED_CALL_ID, "Bash"),
+        _streamed_tool_start(_SECOND_STREAMED_CALL_ID, "Write"),
+        *repeated,
+        _tool_result(_FIRST_STREAMED_CALL_ID),
+        _tool_result(_SECOND_STREAMED_CALL_ID),
+        _result(),
+    ]
 
 
 def _span_wire_material(spans: list[ReadableSpan]) -> str:
@@ -599,20 +679,232 @@ def test_fake_partial_boundaries_are_opt_in_payload_free_and_precede_each_assist
 
 def test_raw_stream_tool_payloads_and_provider_ids_never_reach_otel() -> None:
     _, finished = _export_turn(_adapter_session_factory(_two_round_script()))
-    material = _span_wire_material(finished)
+    streamed_script = _two_streamed_tool_script(repeat_final_blocks=True)
 
-    for private_value in (
-        _STREAM_BODY,
-        _STREAM_ARGUMENT,
-        _TOOL_ARGUMENT,
-        _TOOL_RESULT,
-        _STREAM_UUID,
-        _STREAM_SESSION_ID,
-        _PARENT_TOOL_ID,
-        _TOOL_CALL_ID,
-        "sdk-result-session-PLACEHOLDER",
-    ):
+    async def adapter_output() -> list[object]:
+        session = _adapter_session_factory([streamed_script[0]])()
+        return [message async for message in session.receive_turn()]
+
+    material = _span_wire_material(finished) + repr(anyio.run(adapter_output))
+
+    for private_value in _PRIVATE_OTEL_VALUES:
         assert private_value not in material
+
+
+@pytest.mark.parametrize("repeat_final_blocks", (False, True), ids=("stream-only", "dedupe"))
+def test_two_streamed_tool_starts_without_final_tool_blocks_emit_two_intervals(
+    repeat_final_blocks: bool,
+) -> None:
+    script = _two_streamed_tool_script(repeat_final_blocks=repeat_final_blocks)
+    events, finished = _export_turn(_adapter_session_factory(script))
+    spans = _spans_by_name(finished)
+    root = spans["agent.run"][0]
+    generations = spans["llm.generation"]
+    tools = spans["execute_tool"]
+
+    assert len(generations) == 2
+    assert len(tools) == 2
+    assert next(
+        span for span in generations if span.attributes["curie.generation.round"] == 1
+    ).end_time == tools[0].start_time
+    assert [span.attributes["gen_ai.tool.name"] for span in tools] == ["Bash", "Write"]
+    assert [span.attributes["curie.tool.call.index"] for span in tools] == [1, 2]
+    assert root.context is not None
+    assert all(
+        span.start_time is not None
+        and span.end_time is not None
+        and span.end_time > span.start_time
+        and span.parent is not None
+        and span.parent.span_id == root.context.span_id
+        and span.context is not None
+        and span.context.trace_id == root.context.trace_id
+        for span in tools
+    )
+    assert sum(getattr(event, "type", None) == "tool_note" for event in events) == (
+        2 if repeat_final_blocks else 0
+    )
+    if repeat_final_blocks:
+        first = next(
+            span for span in generations if span.attributes["curie.generation.round"] == 1
+        )
+        assert first.attributes["gen_ai.usage.input_tokens"] == 23
+        assert first.attributes["gen_ai.usage.output_tokens"] == 29
+        assert first.attributes["gen_ai.usage.cache_read_input_tokens"] == 31
+        assert first.attributes["gen_ai.usage.cache_creation_input_tokens"] == 37
+    material = _span_wire_material(finished)
+    for private_value in _PRIVATE_OTEL_VALUES:
+        assert private_value not in material
+
+
+@pytest.mark.parametrize(
+    ("tool_failed", "outcome", "status", "end_kind"),
+    (
+        pytest.param(False, "success", StatusCode.OK, "tool_result_inferred", id="success"),
+        pytest.param(True, "error", StatusCode.ERROR, "tool_result_inferred", id="failure"),
+        pytest.param(None, "cancelled", StatusCode.OK, "terminal_inferred", id="missing"),
+    ),
+)
+def test_streamed_tool_failure_status_matches_success_and_error_result(
+    tool_failed: bool | None,
+    outcome: str,
+    status: StatusCode,
+    end_kind: str,
+) -> None:
+    tail: list[object] = (
+        [_result()]
+        if tool_failed is None
+        else [_tool_result(_TOOL_CALL_ID, is_error=tool_failed), _result()]
+    )
+    _, finished = _export_turn(
+        _adapter_session_factory(
+            [_streamed_tool_start(_TOOL_CALL_ID, "Read"), *tail]
+        )
+    )
+    tool = _spans_by_name(finished)["execute_tool"][0]
+
+    assert tool.attributes["curie.phase.end_kind"] == end_kind
+    assert tool.attributes["curie.tool.outcome"] == outcome
+    assert tool.status.status_code is status
+    assert tool.start_time is not None
+    assert tool.end_time is not None
+    assert tool.end_time > tool.start_time
+
+
+def test_streamed_tool_malformed_and_no_tool_scripts_emit_no_tool_spans() -> None:
+    malformed_blocks: list[dict[str, object]] = [
+        {"type": "tool_use", "name": "Read"},
+        {"type": "tool_use", "id": 7, "name": "Read"},
+        {"type": "tool_use", "id": "", "name": "Read"},
+        {"type": "tool_use", "id": _TOOL_CALL_ID},
+        {"type": "tool_use", "id": _TOOL_CALL_ID, "name": 7},
+        {"type": "tool_use", "id": _TOOL_CALL_ID, "name": ""},
+        {"type": "text"},
+    ]
+    scripts = [
+        [_raw_stream_event({"type": "content_block_start", "content_block": block})]
+        for block in malformed_blocks
+    ]
+    scripts.extend(([_partial_boundary("message_start")], []))
+
+    for stream_messages in scripts:
+        script = [*stream_messages, _result()]
+        events, finished = _export_turn(_adapter_session_factory(script))
+        assert isinstance(events[-1], Final)
+        assert events[-1].status is SessionStatus.DONE
+        assert "execute_tool" not in _spans_by_name(finished)
+
+
+def _finished_trace_id(spans: list[ReadableSpan]) -> str:
+    roots = [span for span in spans if span.name == "agent.run"]
+    assert len(roots) == 1
+    root = roots[0]
+    assert root.context is not None
+    return format(root.context.trace_id, "032x")
+
+
+def _wait_for_exact_trace_counts(
+    client: httpx.Client,
+    *,
+    langfuse_host: str,
+    auth: tuple[str, str],
+    trace_id: str,
+    expected_generations: int,
+    expected_tool_names: tuple[str, ...],
+) -> tuple[int, int, tuple[str, ...]] | None:
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        try:
+            trace_body = client.get(
+                f"{langfuse_host}/api/public/traces/{trace_id}", auth=auth
+            ).json()
+            observations = client.get(
+                f"{langfuse_host}/api/public/observations",
+                params={"traceId": trace_id, "limit": 100},
+                auth=auth,
+            ).json()["data"]
+        except (KeyError, TypeError, httpx.HTTPError, ValueError):
+            trace_body = observations = None
+        if (
+            isinstance(trace_body, dict)
+            and trace_body.get("id") == trace_id
+            and isinstance(observations, list)
+            and all(isinstance(item, dict) for item in observations)
+            and all(item.get("traceId") == trace_id for item in observations)
+        ):
+            roots = [
+                item
+                for item in observations
+                if item.get("name") == "agent.run" and item.get("endTime")
+            ]
+            names = [item.get("name") for item in observations]
+            counts = (
+                len(roots),
+                names.count("llm.generation"),
+                tuple(
+                    sorted(
+                        item["name"]
+                        for item in observations
+                        if item.get("type") == "TOOL"
+                    )
+                ),
+            )
+            if counts == (1, expected_generations, expected_tool_names):
+                return counts
+        time.sleep(1)
+    return None
+
+
+@pytest.mark.skipif(
+    os.environ.get("CURIE_RUNNER_OTEL_INTEGRATION") != "1",
+    reason="set CURIE_RUNNER_OTEL_INTEGRATION=1 for the local observability stack",
+)
+def test_streamed_tool_starts_reach_langfuse_through_collector() -> None:
+    """Scripted SDK events cross real OTLP/HTTP without a model credential."""
+
+    collector_endpoint = "http://localhost:24318/v1/traces"
+    langfuse_host = "http://localhost:23000"
+    auth = ("pk-lf-curie-dev", "sk-lf-curie-dev")
+
+    with httpx.Client(timeout=2.0) as preflight_client:
+        try:
+            health = preflight_client.get(f"{langfuse_host}/api/public/health")
+            preflight_client.get(collector_endpoint)
+        except (httpx.HTTPError, ValueError):
+            pytest.skip("local Collector and Langfuse are not reachable")
+        if health.status_code != 200:
+            pytest.skip("local Collector and Langfuse are not reachable")
+
+    _, tool_spans = _export_turn(
+        _adapter_session_factory(_two_streamed_tool_script()),
+        collector_endpoint=collector_endpoint,
+    )
+    _, no_tool_spans = _export_turn(
+        _adapter_session_factory([_result()]),
+        collector_endpoint=collector_endpoint,
+    )
+
+    assert len(_spans_by_name(tool_spans)["execute_tool"]) == 2
+    assert "execute_tool" not in _spans_by_name(no_tool_spans)
+
+    with httpx.Client(timeout=5.0) as langfuse_client:
+        tool_counts = _wait_for_exact_trace_counts(
+            langfuse_client,
+            langfuse_host=langfuse_host,
+            auth=auth,
+            trace_id=_finished_trace_id(tool_spans),
+            expected_generations=2,
+            expected_tool_names=("Bash", "Write"),
+        )
+        no_tool_counts = _wait_for_exact_trace_counts(
+            langfuse_client,
+            langfuse_host=langfuse_host,
+            auth=auth,
+            trace_id=_finished_trace_id(no_tool_spans),
+            expected_generations=1,
+            expected_tool_names=(),
+        )
+    assert tool_counts == (1, 2, ("Bash", "Write"))
+    assert no_tool_counts == (1, 1, ())
 
 
 @pytest.mark.parametrize(
@@ -1353,6 +1645,37 @@ def test_interrupt_requested_wins_over_error_result_and_sdk_abort_reason() -> No
     assert generation.status.status_code is StatusCode.OK
     assert root.attributes["curie.terminal.cause"] == "interrupt_requested"
     assert root.attributes["curie.terminal.status"] == "cancelled"
+
+
+def test_runner_timeout_is_a_closed_error_terminal_and_is_first_store_stable() -> None:
+    """The private timeout control is a failure, never an ACI cancellation.
+
+    Timeout has higher precedence than an ordinary interrupt when both race, and
+    the existing idempotent terminal guard must keep a later abandonment fallback
+    from replacing the first stored cause.
+    """
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    with RunTracer(provider).run_span("curie-run:test", "fake-model") as gen:
+        gen.query_observed()
+        gen.finish_turn(
+            timeout_requested=True,
+            interrupt_requested=True,
+            classified_failure=True,
+        )
+        gen.set_abandoned()
+
+    spans = _spans_by_name(list(exporter.get_finished_spans()))
+    root = spans["agent.run"][0]
+    generation = spans["llm.generation"][0]
+    assert root.attributes["curie.terminal.cause"] == "runner_timeout"
+    assert root.attributes["curie.terminal.status"] == "failed"
+    assert root.status.status_code is StatusCode.ERROR
+    assert generation.status.status_code is StatusCode.ERROR
+    assert generation.attributes["curie.phase.end_kind"] == "terminal_inferred"
 
 
 def test_exhausted_stream_is_abandoned_not_a_false_success() -> None:

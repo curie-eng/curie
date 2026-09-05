@@ -130,8 +130,8 @@ CONNECTOR_FIXTURE="$REPO_ROOT/cli/scripts/fixtures/sre-bot-connectors-enabled.ya
 # The connectors the fixture builds FROM SOURCE, and the tool set each must
 # serve. These two are the subject of the assertion; the fixture's third
 # connector is an ordinary `image:` one, hosted beside them as the control.
-CONNECTOR_BUILT=(k8s-write tempo)
-CONNECTOR_TOOLS_K8S_WRITE="restart_deployment"
+CONNECTOR_BUILT=(self-upgrade tempo)
+CONNECTOR_TOOLS_SELF_UPGRADE="latest_release,upgrade_platform,upgrade_self"
 CONNECTOR_TOOLS_TEMPO="get_trace,list_trace_tag_values,list_trace_tags,search_traces"
 # The port every connector in the fixture serves on (`ConnectorSpec.port`'s
 # default). Release, agent and namespace are deliberately NOT constants here:
@@ -202,7 +202,7 @@ OBSERVABILITY_POLL_INTERVAL_SECONDS=2
 # installs, upgrades, uninstalls, or deletes cluster state in this mode.
 PRODUCT_OBSERVABILITY="${CURIE_E2E_PRODUCT_OBSERVABILITY:-0}"
 MCP_RECEIPT_FIXTURE="$REPO_ROOT/cli/scripts/fixtures/mcp-receipt"
-MCP_RECEIPT_CONNECTOR="mcp-receipt"
+MCP_RECEIPT_CONNECTOR="receipt-proof"
 MCP_RECEIPT_ALIAS=""
 MCP_RECEIPT_IMAGE=""
 LAST_ORDINARY_TRACE_ID=""
@@ -2088,28 +2088,27 @@ connector_mode() {
 # `curie secrets set` -- which writes the operator's real store -- is never run.
 #
 # The kubeconfigs need no cluster. These rungs assert HOSTING, not live
-# Kubernetes access: the write connector refuses to start without a kubeconfig
-# file and starts with a well-formed one, which is exactly the fail-closed
-# behavior under test.
+# Kubernetes access: connector bring-up refuses a missing declared kubeconfig,
+# while the MCP catalog probe never invokes an upgrade or contacts Kubernetes.
 provision_connector_credentials() {
     local creds="$WORKDIR/connector-creds"
     mkdir -p "$creds"
     chmod 700 "$creds"
 
     local name
-    for name in K8S_READONLY_KUBECONFIG K8S_WRITE_KUBECONFIG GRAFANA_SERVICE_ACCOUNT_TOKEN; do
+    for name in K8S_READONLY_KUBECONFIG SELF_UPGRADE_KUBECONFIG GRAFANA_SERVICE_ACCOUNT_TOKEN; do
         if [[ "$CONNECTOR_OMIT_SECRET" == "$name" ]]; then
             echo "connector credentials: SKIPPING $name deliberately (CURIE_E2E_CONNECTOR_OMIT_SECRET)."
             echo "connector credentials: the rung below MUST now fail closed on the missing credential. A rung that starts a connector anyway is the failure this run is looking for."
             continue
         fi
         case "$name" in
-            K8S_READONLY_KUBECONFIG|K8S_WRITE_KUBECONFIG)
+            K8S_READONLY_KUBECONFIG|SELF_UPGRADE_KUBECONFIG)
                 # A SEPARATE credential per connector, never one reused: that is
                 # the example's own rule (examples/sre-bot/connectors.yaml), and
                 # reusing one here would quietly assert the opposite shape.
                 local user="ladder-reader" file="$creds/readonly.kubeconfig"
-                if [[ "$name" == "K8S_WRITE_KUBECONFIG" ]]; then
+                if [[ "$name" == "SELF_UPGRADE_KUBECONFIG" ]]; then
                     user="ladder-writer"
                     file="$creds/writer.kubeconfig"
                 fi
@@ -2155,7 +2154,7 @@ prepare_mcp_receipt_bundle() {
         printf '%s\n' 'connectors:' > "$dir/connectors.yaml"
     fi
     cat >> "$dir/connectors.yaml" <<'YAML'
-  mcp-receipt:
+  receipt-proof:
     build:
       context: connectors/mcp-receipt
       platforms: [linux/amd64, linux/arm64]
@@ -2580,7 +2579,7 @@ assert_connector_parity() {
         if [[ "$connector" == "tempo" ]]; then
             probe_args+=("$CONNECTOR_TOOLS_TEMPO" "get_trace")
         else
-            probe_args+=("$CONNECTOR_TOOLS_K8S_WRITE")
+            probe_args+=("$CONNECTOR_TOOLS_SELF_UPGRADE")
         fi
         if [[ "$kind" == "docker" ]]; then
             probe_out="$(docker exec -i "$host_ref" python - "${probe_args[@]}" < "$WORKDIR/mcp_probe.py")" || {

@@ -51,7 +51,7 @@ spec:
             - name: CLICKHOUSE_TAG
               value: {{ .Values.clickhouse.image.tag | quote }}
             - name: CLICKHOUSE_IMAGE
-              value: "{{ .Values.clickhouse.image.repository }}:{{ .Values.clickhouse.image.tag }}"
+              value: {{ include "curie.image" (dict "repository" .Values.clickhouse.image.repository "tag" .Values.clickhouse.image.tag "digest" .Values.clickhouse.image.digest) | quote }}
             - name: SSE42_SAFE_TAGS
               value: {{ join " " .Values.clickhouse.sse42SafeTags | quote }}
             - name: FORCE_NO_AVX

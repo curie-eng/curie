@@ -245,13 +245,7 @@ class UpgradeDrainGate:
 
 
 def _client(config: WorkerConfig) -> Redis:
-    return Redis(
-        host=config.valkey_host,
-        port=config.valkey_port,
-        password=config.valkey_password or None,
-        db=config.valkey_db,
-        decode_responses=True,
-    )
+    return Redis(**config.valkey_client_kwargs())
 
 
 async def run_gate(config: WorkerConfig, *, mode: str) -> int:

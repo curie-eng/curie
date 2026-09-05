@@ -20,6 +20,7 @@ Responsibilities layered on the translation:
 from __future__ import annotations
 
 import contextlib
+import hmac
 import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -39,7 +40,12 @@ from claude_agent_sdk import AssistantMessage, ResultMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 
-from .adapter import ModelSession, PartialMessageBoundary, model_message_to_conversation
+from .adapter import (
+    ModelSession,
+    PartialMessageBoundary,
+    StreamedToolUseBoundary,
+    model_message_to_conversation,
+)
 from .approval import ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import (
@@ -250,6 +256,19 @@ class SessionRunner:
         # over-permitting two concurrent turns on the single SDK generator.
         self._turn_lock = anyio.Semaphore(1, max_value=1)
         self._interrupt_requested = False
+        # Timeout is deliberately distinct from an ACI/operator interrupt: the
+        # former is a failed delivery boundary while the latter is an intentional
+        # cancellation. The opaque epoch binds the side-channel request to exactly
+        # this handler-owned turn without becoming an ACI field or trace attribute.
+        self._timeout_requested = False
+        # Set only for an accepted timeout control request. The SDK serializes
+        # control and query lines onto its stdin, and the CLI interrupt applies
+        # only to the query live when that line is read. The run-turn owner waits
+        # for this event before deciding whether the ordered stop was delivered
+        # or needs the abandonment safety-net below.
+        self._timeout_interrupt_settled: anyio.Event | None = None
+        self._timeout_interrupt_delivered = False
+        self._turn_epoch: str | None = None
         self._status = SessionStatus.IDLE_AWAITING_INPUT
         self._started = False
         # True only while a turn can still accept a steer: from turn start until
@@ -447,6 +466,10 @@ class SessionRunner:
             self._session = self._factory()
             await self._session.connect()
             self._interrupt_requested = False
+            self._timeout_requested = False
+            self._timeout_interrupt_settled = None
+            self._timeout_interrupt_delivered = False
+            self._turn_epoch = None
             self._turn_open = False
             self._active_state = None
             self._status = SessionStatus.IDLE_AWAITING_INPUT
@@ -475,6 +498,40 @@ class SessionRunner:
         if self._session is not None:
             await self._session.interrupt()
 
+    async def timeout(self, turn_epoch: str) -> bool:
+        """Stop the exact current turn and mark its terminal as a timeout failure.
+
+        The accepted flag is stored before the SDK await so every completion race
+        sees timeout precedence. A replay, stale epoch, or call outside an open
+        turn is a no-op; in particular it cannot poison the next lock owner.
+        """
+
+        current_epoch = self._turn_epoch
+        if (
+            self._session is None
+            or not self._turn_open
+            or self._timeout_requested
+            or current_epoch is None
+            or not hmac.compare_digest(
+                turn_epoch.encode("utf-8"), current_epoch.encode("utf-8")
+            )
+        ):
+            return False
+        timeout_interrupt_settled = anyio.Event()
+        self._timeout_requested = True
+        self._timeout_interrupt_settled = timeout_interrupt_settled
+        try:
+            await self._session.interrupt()
+            # A delayed SDK acknowledgement can return after this turn has
+            # released ownership and a later turn has installed fresh timeout
+            # state. Only the turn that still owns this completion event may
+            # suppress its abandonment safety-net interrupt.
+            if self._timeout_interrupt_settled is timeout_interrupt_settled:
+                self._timeout_interrupt_delivered = True
+        finally:
+            timeout_interrupt_settled.set()
+        return True
+
     async def run_inbound(self, message: Event | Interrupt) -> AsyncIterator[str]:
         """Produce the NDJSON a compliant runner emits for one inbound frame.
 
@@ -493,7 +550,11 @@ class SessionRunner:
             yield line
 
     async def run_turn(
-        self, event: Event, *, parent: Context | None = None
+        self,
+        event: Event,
+        *,
+        parent: Context | None = None,
+        turn_epoch: str | None = None,
     ) -> AsyncGenerator[str]:
         """Run one turn, streaming ACI NDJSON lines and enforcing the budget.
 
@@ -509,6 +570,10 @@ class SessionRunner:
             start = time.monotonic()
             logger.info("turn start session=%s user=%s", self._session_id, event.user)
             self._interrupt_requested = False
+            self._timeout_requested = False
+            self._timeout_interrupt_settled = None
+            self._timeout_interrupt_delivered = False
+            self._turn_epoch = turn_epoch
             self._turn_open = True
             self._history_durable = False
             state = TurnState()
@@ -525,6 +590,25 @@ class SessionRunner:
                 "outcome": "accepted",
             }
             record_metric("curie.turn.accepted", attributes=metric_attributes)
+            metrics_emitted = False
+
+            def emit_completed_metrics() -> None:
+                """Emit the terminal metric pair once, synchronously."""
+
+                nonlocal metrics_emitted
+                if metrics_emitted:
+                    return
+                metrics_emitted = True
+                completed_attributes = {
+                    "service.name": "curie-runner",
+                    "source": "runner",
+                    "outcome": metric_outcome,
+                }
+                elapsed = time.monotonic() - start
+                record_metric("curie.turn.completed", attributes=completed_attributes)
+                record_metric(
+                    "curie.turn.duration", elapsed, attributes=completed_attributes
+                )
 
             try:
                 with self._tracer.run_span(
@@ -561,7 +645,25 @@ class SessionRunner:
                         # is intentionally not caught here -- the finally handles
                         # that abandonment case.
                         self._turn_open = False
-                        if self._interrupt_requested:
+                        if self._timeout_requested:
+                            # The body-boundary timeout is a failure even when the
+                            # SDK reports its interrupt as an iterator exception.
+                            # The caller may still be reading this direct session
+                            # path, so retain a terminal final when it is deliverable.
+                            self._status = SessionStatus.CLASSIFIED_FAILURE
+                            metric_outcome = self._metric_outcome(tracker)
+                            gen.finish_turn(
+                                timeout_requested=True,
+                                interrupt_requested=self._interrupt_requested,
+                                classified_failure=True,
+                            )
+                            yield to_ndjson_line(
+                                Final(
+                                    text="run timed out",
+                                    status=SessionStatus.CLASSIFIED_FAILURE,
+                                )
+                            )
+                        elif self._interrupt_requested:
                             # Some SDK iterators surface the runner-requested
                             # interrupt as an exception instead of a terminal
                             # ResultMessage. The interrupt remains authoritative:
@@ -590,7 +692,7 @@ class SessionRunner:
                             )
                             self._status = SessionStatus.CLASSIFIED_FAILURE
                             metric_outcome = self._metric_outcome(tracker)
-                            gen.set_failed()
+                            self._set_failed(gen)
                             yield to_ndjson_line(
                                 ErrorEvent(
                                     message=f"runner error: {exc}",
@@ -604,29 +706,71 @@ class SessionRunner:
                                 )
                             )
                     finally:
-                        # If the turn never reached a terminal final (_turn_open still
-                        # set), the consumer abandoned the stream mid-run (client
-                        # disconnect -> GeneratorExit, or cancellation). Stop the SDK
-                        # so it does not keep executing tools past the released turn
-                        # lock and bleed into the next turn. Best-effort.
-                        if self._turn_open and self._session is not None:
-                            with contextlib.suppress(Exception):
-                                await self._session.interrupt()
-                        self._turn_open = False
+                        try:
+                            # A timeout accepted while the stream was suspended at
+                            # a yield reaches this no-yield block via GeneratorExit
+                            # (or cancellation). Store its root terminal and metric
+                            # pair synchronously, before cleanup can await or be
+                            # cancelled; RunTracer's later abandonment fallback is
+                            # idempotent.
+                            if self._timeout_requested:
+                                self._status = SessionStatus.CLASSIFIED_FAILURE
+                                gen.finish_turn(
+                                    timeout_requested=True,
+                                    interrupt_requested=self._interrupt_requested,
+                                    classified_failure=True,
+                                )
+                                metric_outcome = self._metric_outcome(tracker)
+                                emit_completed_metrics()
+                        finally:
+                            # The SDK serializes this turn's stop and any later
+                            # query onto one locked stdin stream. Wait until the
+                            # timeout attempt settles before cleanup: a normally
+                            # returned stop is already ordered ahead of the next
+                            # query and the CLI cannot latch it for that later
+                            # turn. If the timeout call does not return normally,
+                            # the cleanup path below supplies the safety-net while
+                            # this turn still owns the lock; cancellation before
+                            # the write sends nothing for a later turn to observe.
+                            timeout_settled = self._timeout_interrupt_settled
+                            if timeout_settled is not None:
+                                with anyio.CancelScope(shield=True):
+                                    await timeout_settled.wait()
+                            # Retire this turn's control token before cleanup can
+                            # await the session-global interrupt. A timeout that
+                            # arrives during that await is stale and must not
+                            # queue a stop that could be consumed by the next
+                            # turn after this owner releases the lock.
+                            self._turn_epoch = None
+                            # If the turn never reached a terminal final (_turn_open
+                            # still set), the consumer abandoned the stream mid-run
+                            # (client disconnect -> GeneratorExit, or cancellation).
+                            # Stop the SDK so it cannot keep executing tools past the
+                            # released turn lock and bleed into the next turn.
+                            try:
+                                if (
+                                    self._turn_open
+                                    and not self._timeout_interrupt_delivered
+                                    and self._session is not None
+                                ):
+                                    with contextlib.suppress(Exception):
+                                        await self._session.interrupt()
+                            finally:
+                                self._turn_open = False
+                                self._turn_epoch = None
             finally:
-                self._active_state = None
-                completed_attributes = {
-                    "service.name": "curie-runner",
-                    "source": "runner",
-                    "outcome": metric_outcome,
-                }
-                elapsed = time.monotonic() - start
-                record_metric("curie.turn.completed", attributes=completed_attributes)
-                record_metric(
-                    "curie.turn.duration", elapsed, attributes=completed_attributes
-                )
+                try:
+                    emit_completed_metrics()
+                finally:
+                    self._active_state = None
+                    self._turn_open = False
+                    self._turn_epoch = None
+                    self._timeout_interrupt_settled = None
+                    self._timeout_interrupt_delivered = False
 
     def _metric_outcome(self, tracker: BudgetTracker) -> str:
+        if self._timeout_requested:
+            return "classified_failure"
         if self._status is SessionStatus.DONE:
             return "done"
         if self._status is SessionStatus.AWAITING_APPROVAL:
@@ -636,6 +780,18 @@ class SessionRunner:
         if self._interrupt_requested:
             return "interrupted"
         return "idle"
+
+    def _set_failed(self, gen: _GenerationSpan) -> None:
+        """Store timeout first when a generic failure site wins the race."""
+
+        if self._timeout_requested:
+            gen.finish_turn(
+                timeout_requested=True,
+                interrupt_requested=self._interrupt_requested,
+                classified_failure=True,
+            )
+        else:
+            gen.set_failed()
 
     async def _drive_turn(
         self,
@@ -650,6 +806,14 @@ class SessionRunner:
         gen.query_observed()
         await self._session.query(event.text)
         async for message in self._session.receive_turn():
+            if isinstance(message, StreamedToolUseBoundary):
+                gen.record_first_response_boundary()
+                gen.streamed_tool_use(
+                    message.call_id,
+                    message.tool_name,
+                    observed_time_ns=message.observed_time_ns,
+                )
+                continue
             if isinstance(message, PartialMessageBoundary):
                 gen.record_first_response_boundary()
                 continue
@@ -663,7 +827,7 @@ class SessionRunner:
                 # terminal ``model-credential-rejected`` error is emitted regardless.
                 with contextlib.suppress(Exception):
                     await self._session.interrupt()
-                gen.set_failed()
+                self._set_failed(gen)
                 for line in self._auth_halt_lines():
                     yield line
                 return
@@ -712,9 +876,9 @@ class SessionRunner:
             decided_result_final: Final | None = None
             if isinstance(message, ResultMessage):
                 terminal_reason = getattr(message, "terminal_reason", None)
-                cancelled = self._interrupt_requested
+                cancelled = self._interrupt_requested and not self._timeout_requested
                 subtype = message.subtype or ""
-                result_failed = budget_hit or (
+                result_failed = self._timeout_requested or budget_hit or (
                     not cancelled and (message.is_error or subtype.startswith("error"))
                 )
                 if not budget_hit:
@@ -746,7 +910,7 @@ class SessionRunner:
                     )
                 if isinstance(outbound, Final):
                     if budget_hit:
-                        gen.set_failed()
+                        self._set_failed(gen)
                         for line in self._budget_halt_lines():
                             yield line
                         return
@@ -761,9 +925,14 @@ class SessionRunner:
                         yield line
                     for line in self._false_completion_lines(state, final):
                         yield line
+                    # A timeout can land while one of the warning lines above is
+                    # suspended at its yield. Re-apply its precedence immediately
+                    # before publishing the terminal final.
+                    final = self._reclassify(final)
                     self._status = final.status
                     self._turn_open = False
                     gen.finish_turn(
+                        timeout_requested=self._timeout_requested,
                         interrupt_requested=self._interrupt_requested,
                         classified_failure=final.status
                         is SessionStatus.CLASSIFIED_FAILURE,
@@ -787,7 +956,7 @@ class SessionRunner:
                 # Budget crossed on a non-terminal message: stop the live run,
                 # then emit the same error+final pair.
                 await self._session.interrupt()
-                gen.set_failed()
+                self._set_failed(gen)
                 for line in self._budget_halt_lines():
                     yield line
                 return
@@ -795,20 +964,23 @@ class SessionRunner:
         # The turn iterator ended without a terminal result (e.g. an interrupt
         # aborted before the model produced one). Emit a final so the stream
         # always terminates in a final event.
-        status = (
-            SessionStatus.IDLE_AWAITING_INPUT
-            if self._interrupt_requested
-            else SessionStatus.DONE
-        )
+        if self._timeout_requested:
+            status = SessionStatus.CLASSIFIED_FAILURE
+        elif self._interrupt_requested:
+            status = SessionStatus.IDLE_AWAITING_INPUT
+        else:
+            status = SessionStatus.DONE
         self._merge_gate_block(state)
         final = _apply_approval_override(Final(text="", status=status), state)
         for line in self._approval_not_acted_lines(state, final):
             yield line
         for line in self._false_completion_lines(state, final):
             yield line
+        final = self._reclassify(final)
         self._status = final.status
         self._turn_open = False
         gen.finish_turn(
+            timeout_requested=self._timeout_requested,
             interrupt_requested=self._interrupt_requested,
             classified_failure=final.status is SessionStatus.CLASSIFIED_FAILURE,
             approval_paused=final.status is SessionStatus.AWAITING_APPROVAL,
@@ -960,7 +1132,11 @@ class SessionRunner:
 
         # See the "Approval halt" bullet above: an operator interrupt outranks a
         # runner-requested one, so the marker is copied only in its absence.
-        if gate.pending_halt and not self._interrupt_requested:
+        if (
+            gate.pending_halt
+            and not self._interrupt_requested
+            and not self._timeout_requested
+        ):
             state.approval_halt_requested = True
 
     def _budget_halt_lines(self) -> list[str]:
@@ -1026,6 +1202,11 @@ class SessionRunner:
         would look like a failure and could trip F1's escalation path.
         """
 
+        if self._timeout_requested:
+            return Final(
+                text=final.text or "run timed out",
+                status=SessionStatus.CLASSIFIED_FAILURE,
+            )
         if self._interrupt_requested:
             return Final(
                 text=final.text or "run interrupted",

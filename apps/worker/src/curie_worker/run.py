@@ -300,19 +300,11 @@ def _sandbox_client(
 
 def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     async_redis: AsyncRedis = AsyncRedis(
-        host=config.valkey_host,
-        port=config.valkey_port,
-        password=config.valkey_password or None,
-        db=config.valkey_db,
-        decode_responses=True,
+        **config.valkey_client_kwargs(),
         socket_timeout=config.valkey_socket_timeout_s,
     )
     sync_redis = redis.Redis(
-        host=config.valkey_host,
-        port=config.valkey_port,
-        password=config.valkey_password or None,
-        db=config.valkey_db,
-        decode_responses=True,
+        **config.valkey_client_kwargs(),
         socket_timeout=config.valkey_socket_timeout_s,
     )
     sub_config = _substrate_config(env)
@@ -434,11 +426,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     # reuses the same substrate (eval runs provision from the same warm pool) and
     # the binding resolver as its repo lookup for the /evals/report payload.
     eval_redis: AsyncRedis = AsyncRedis(
-        host=config.valkey_host,
-        port=config.valkey_port,
-        password=config.valkey_password or None,
-        db=config.valkey_db,
-        decode_responses=True,
+        **config.valkey_client_kwargs(),
         socket_timeout=config.valkey_socket_timeout_s,
     )
     eval_consumer = EvalStreamConsumer(

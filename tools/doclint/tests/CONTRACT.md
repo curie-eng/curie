@@ -20,10 +20,10 @@ private module/function names are free to change.
 ## Findings API (documented, not asserted directly)
 
 `curie_doclint.lint(repo_root: Path) -> list[Finding]` runs the generate,
-counts, agent-contract command, and citation lint phases in memory and
-returns the findings `main` prints. A `Finding` carries at least the
-repo-relative doc path, the offending citation/field, and a human reason.
-Tests exercise this through `main`.
+counts, agent-contract command, MCP/workspace live-tier, and citation lint
+phases in memory and returns the findings `main` prints. A `Finding` carries
+at least the repo-relative doc path, the offending citation/field, and a
+human reason. Tests exercise this through `main`.
 
 ## Generator surface
 
@@ -80,6 +80,9 @@ resolve is a finding (deletion, not a skip).
   contains `is not an argument of` and `not a global flag`.
 - SRE demo runbook names no command at all (vacuity guard): names the runbook
   path and contains `no \`curie\` command appears`.
+- MCP/workspace live-tier rule missing a required sentence: names the doc,
+  names the missing sentence, and contains `MCP/workspace live-tier rule is
+  missing this required sentence`.
 
 ## Front-matter schema (per `INTERFACE.md`)
 

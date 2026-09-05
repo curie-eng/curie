@@ -92,8 +92,18 @@ spec:
   template:
     metadata:
       labels:
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "hooks")) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "mail-persistence-preflight") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "hooks")) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "hooks")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       serviceAccountName: {{ include "curie.fullname" . }}-mail-persistence-preflight
       automountServiceAccountToken: false
       restartPolicy: Never

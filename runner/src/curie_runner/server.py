@@ -13,6 +13,8 @@ Productizes the prototype's aiohttp ``/run`` into the ACI session channel:
                          caller falls back to a fresh ``/v1/event``
 - ``POST /v1/interrupt`` hard-stop the live turn: body is an ACI ``interrupt``
                          frame; the open turn's final is reclassified to idle
+- ``POST /v1/timeout``   mark the exact open turn as timed out and stop it; the
+                         opaque epoch is carried only in a response/request header
 - ``POST /v1/reset``     discard the conversation and start a fresh model
                          session (eval isolation, #550); 409 while a turn is
                          active. Not an ACI wire frame -- a runner control route,
@@ -28,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import hmac
 import inspect
+import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from types import MappingProxyType
 from typing import TypedDict, cast
@@ -41,12 +44,23 @@ from .session import SessionRunner
 from .workspace_snapshot import WorkspaceSnapshot, WorkspaceSnapshotError
 
 _NDJSON = "application/x-ndjson"
+_TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
+_TURN_EPOCH_MIN_LENGTH = 32
+_TURN_EPOCH_MAX_LENGTH = 256
 
 # Authenticated control routes. /healthz and the probe-oriented /status stay
 # open so chart probes keep working; the worker reads replacement authority
 # from /v1/status with the per-claim bearer token.
 _GATED_PATHS = frozenset(
-    {"/v1/event", "/v1/steer", "/v1/interrupt", "/v1/reset", "/v1/snapshot", "/v1/status"}
+    {
+        "/v1/event",
+        "/v1/steer",
+        "/v1/interrupt",
+        "/v1/timeout",
+        "/v1/reset",
+        "/v1/snapshot",
+        "/v1/status",
+    }
 )
 
 # Typed app key so aiohttp resolves the runner without the string-key warning.
@@ -150,6 +164,7 @@ def create_app(
             web.post("/v1/event", _event),
             web.post("/v1/steer", _steer),
             web.post("/v1/interrupt", _interrupt),
+            web.post("/v1/timeout", _timeout),
             web.post("/v1/reset", _reset),
             web.post("/v1/snapshot", _snapshot),
         ]
@@ -221,7 +236,11 @@ async def _event(request: web.Request) -> web.StreamResponse:
             status=400,
         )
 
-    response = web.StreamResponse(status=200, headers={"Content-Type": _NDJSON})
+    turn_epoch = secrets.token_urlsafe(32)
+    response = web.StreamResponse(
+        status=200,
+        headers={"Content-Type": _NDJSON, _TURN_EPOCH_HEADER: turn_epoch},
+    )
     await response.prepare(request)
     # aclosing guarantees the generator is finalized on THIS driving task. On a
     # client disconnect, response.write() raises from this frame; without
@@ -234,7 +253,9 @@ async def _event(request: web.Request) -> web.StreamResponse:
     if traceparent is not None:
         carrier[TRACEPARENT_STREAM_FIELD] = traceparent
     parent = extract_trace_context(carrier)
-    async with contextlib.aclosing(runner.run_turn(frame, parent=parent)) as stream:
+    async with contextlib.aclosing(
+        runner.run_turn(frame, parent=parent, turn_epoch=turn_epoch)
+    ) as stream:
         async for line in stream:
             await response.write(line.encode("utf-8"))
     await response.write_eof()
@@ -268,6 +289,30 @@ async def _interrupt(request: web.Request) -> web.Response:
         return web.json_response({"error": "expected an interrupt frame"}, status=400)
 
     await runner.interrupt(frame.reason)
+    return web.json_response({"ok": True})
+
+
+def _valid_turn_epoch(epoch: str | None) -> bool:
+    """Whether an epoch header has the bounded opaque token shape we mint."""
+
+    return (
+        epoch is not None
+        and _TURN_EPOCH_MIN_LENGTH <= len(epoch) <= _TURN_EPOCH_MAX_LENGTH
+        and epoch.isascii()
+        and all(character.isalnum() or character in "-_" for character in epoch)
+    )
+
+
+async def _timeout(request: web.Request) -> web.Response:
+    """Stop only the currently open turn named by its private response epoch."""
+
+    runner: SessionRunner = request.app[RUNNER]
+    turn_epoch = request.headers.get(_TURN_EPOCH_HEADER)
+    if not _valid_turn_epoch(turn_epoch):
+        return web.json_response({"error": "invalid turn epoch"}, status=400)
+    assert turn_epoch is not None
+    if not await runner.timeout(turn_epoch):
+        return web.json_response({"error": "turn epoch is not active"}, status=409)
     return web.json_response({"ok": True})
 
 

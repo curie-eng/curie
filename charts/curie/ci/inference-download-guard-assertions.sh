@@ -13,6 +13,12 @@
 #   3. A pre-provisioned model (pullModel=false) may use ephemeral storage, but
 #      renders neither a postStart hook nor an `ollama pull` command.
 #   4. inference.deploy=false remains unaffected by inference value defaults.
+#   5. The same container is sized above the namespace LimitRange default and
+#      carries a securityContext (#2329). tenant-capacity-assertions.sh proves
+#      only that cpu/memory are PRESENT, which a regression setting
+#      `limits.memory: 1Gi` would still satisfy while restoring the exact bug:
+#      presence is not the defect, the CEILING is. So the numeric relationship
+#      to that default is pinned here, where the Deployment is already rendered.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -186,5 +192,71 @@ if ! helm template rel "$CHART" \
 fi
 assert_inference_disabled "$DISABLED"
 
+echo "=== Assertion 5: the inference container is sized above the LimitRange default and hardened (#2329) ==="
+# The chart's namespace LimitRange (tenant-limitrange.yaml, on by default) fills
+# `default.memory: 1Gi` / `default.cpu: "1"` into any container that declares
+# none. Ollama serving the chart's default qwen3:4b needs several times that, so
+# a container that merely "declares something" is not enough -- the memory limit
+# has to clear the LimitRange default it would otherwise inherit, and the memory
+# REQUEST has to cover the resident weights or the scheduler packs the pod onto a
+# node that cannot hold them.
+LIMITRANGE_DEFAULT_MEMORY_BYTES=$((1024 * 1024 * 1024))  # 1Gi, values.yaml limitRange.container.default.memory
+python3 - "$PERSISTENT" "$LIMITRANGE_DEFAULT_MEMORY_BYTES" <<'PYCHK' || fail "inference container capacity/hardening shape (#2329)"
+import sys, yaml
+
+path, lr_default = sys.argv[1], int(sys.argv[2])
+UNITS = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4,
+         "K": 10**3, "M": 10**6, "G": 10**9, "T": 10**12}
+
+
+def to_bytes(v):
+    v = str(v)
+    for suffix, mult in UNITS.items():
+        if v.endswith(suffix):
+            return float(v[: -len(suffix)]) * mult
+    return float(v)
+
+
+doc = next(d for d in yaml.safe_load_all(open(path))
+           if isinstance(d, dict) and d.get("kind") == "Deployment")
+c = next(x for x in doc["spec"]["template"]["spec"]["containers"] if x["name"] == "ollama")
+res = c.get("resources") or {}
+
+for section in ("requests", "limits"):
+    for dim in ("cpu", "memory"):
+        if (res.get(section) or {}).get(dim) is None:
+            sys.exit(f"inference container leaves {section}.{dim} undeclared, so the tenant "
+                     f"LimitRange default would engage for it (#2329)")
+
+lim = to_bytes(res["limits"]["memory"])
+if lim <= lr_default:
+    sys.exit(f"inference limits.memory is {res['limits']['memory']}, which does not exceed the "
+             f"tenant LimitRange default of 1Gi -- the ceiling is then itself the bug, and the "
+             f"model server OOMKills on first inference exactly as in #2329")
+
+req = to_bytes(res["requests"]["memory"])
+if req <= lr_default:
+    sys.exit(f"inference requests.memory is {res['requests']['memory']}; the scheduler packs on "
+             f"the REQUEST, so it must cover the resident model weights (the chart's default "
+             f"model is larger than the 1Gi LimitRange default)")
+if req > lim:
+    sys.exit(f"inference requests.memory ({res['requests']['memory']}) exceeds its own "
+             f"limits.memory ({res['limits']['memory']}); the pod is unschedulable")
+
+if not c.get("securityContext"):
+    sys.exit("inference container renders no securityContext, so it runs with "
+             "allowPrivilegeEscalation and the default capability set and is rejected at "
+             "admission on a namespace enforcing Pod Security Standards baseline (#2329)")
+sc = c["securityContext"]
+if sc.get("allowPrivilegeEscalation") is not False:
+    sys.exit(f"inference securityContext must deny privilege escalation; got {sc}")
+if (sc.get("seccompProfile") or {}).get("type") != "RuntimeDefault":
+    sys.exit(f"inference securityContext must pin the RuntimeDefault seccomp profile; got {sc}")
+
+print(f"  ok: requests.memory={res['requests']['memory']} limits.memory={res['limits']['memory']} "
+      f"(both above the 1Gi LimitRange default), securityContext denies escalation "
+      f"and pins RuntimeDefault")
+PYCHK
+
 echo
-echo "PASS: cluster inference refuses implicit emptyDir downloads and accepts both explicit recovery paths."
+echo "PASS: cluster inference refuses implicit emptyDir downloads, accepts both explicit recovery paths, and ships a container sized above the tenant LimitRange default with a hardened securityContext."

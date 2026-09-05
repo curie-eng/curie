@@ -27,8 +27,10 @@
 #      true and every first-party service shares this one release namespace;
 #      values-dev.yaml is a DIFFERENT, offline scratch-cluster profile that
 #      turns agentSandbox.deploy off and is not the topology in question here.
-#      Dispatcher tokens are set so every control-plane Deployment renders):
-#      every control-plane container still declares its OWN cpu+memory
+#      Dispatcher tokens are set so every control-plane Deployment renders, and
+#      the opt-in inference Deployment is turned on so it is rendered too --
+#      #2329 was invisible to this assertion for exactly as long as it was
+#      not): every control-plane container still declares its OWN cpu+memory
 #      request+limit. That is what keeps the LimitRange's defaults (assertion
 #      2) from ever engaging for the control plane -- a default only fills a
 #      dimension a container leaves unset, and this proves none of them do,
@@ -259,8 +261,15 @@ echo "=== Assertion 7: N=1 self-host render leaves the control plane's own cpu/m
 selfhost="$TMP/selfhost"
 mkdir -p "$selfhost"
 RELEASE_NS="curie-selfhost-assert"
+# inference.deploy is opt-in and OFF by default, so the published defaults alone
+# render no Ollama Deployment -- which is precisely how #2329 stayed invisible
+# here: the one control-plane container that declared no resources at all was
+# the one container this render never produced. Turn it on (persistence too,
+# which inference.yaml `fail`s without when pullModel is true) so the assertion
+# covers it. Any opt-in workload added later belongs here for the same reason.
 helm template curie "$CHART" --namespace "$RELEASE_NS" --output-dir "$selfhost" \
-  --set dispatcher.slack.appToken=xapp-assert --set dispatcher.slack.botToken=xoxb-assert >/dev/null
+  --set dispatcher.slack.appToken=xapp-assert --set dispatcher.slack.botToken=xoxb-assert \
+  --set inference.deploy=true --set inference.persistence.enabled=true >/dev/null
 [ -f "$selfhost/curie/templates/tenant-resourcequota.yaml" ] || fail "N=1 self-host render: ResourceQuota did not render"
 [ -f "$selfhost/curie/templates/tenant-limitrange.yaml" ] || fail "N=1 self-host render: LimitRange did not render"
 check controlplane-resources "$selfhost/curie/templates" "$RELEASE_NS"

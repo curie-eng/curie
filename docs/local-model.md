@@ -113,6 +113,22 @@ Persistence defaults to the chart's `10Gi` size unless
 `--set inference.persistence.size=<size>` supplies a non-boolean string. Size
 storage for the selected model; larger models need more than that default.
 
+Size **memory** for the selected model too. `inference.resources` ships sized for
+the chart's default `qwen3:4b` (`requests.memory: 4Gi`, `limits.memory: 6Gi`),
+and both numbers matter for a different reason. The request is what the
+scheduler packs against, so it has to cover the model's resident weights or the
+pod lands on a node that cannot hold them. The limit is what the OOM killer
+enforces, so a larger model left on the stock limit is killed mid-inference.
+Either way it presents as a model-server crash rather than as a sizing mistake.
+Raise both alongside the storage:
+
+```bash
+--set inference.resources.limits.memory=40Gi --set inference.resources.requests.memory=32Gi
+```
+
+The "Loaded (Q4)" column below is the floor for the **request**; leave headroom
+above it in the limit for the KV cache and a longer context.
+
 The advanced alternative is for operators whose custom image or other
 provisioning already supplies the requested model: disable the chart pull with
 `--set inference.pullModel=false`. Do this only when the model is actually

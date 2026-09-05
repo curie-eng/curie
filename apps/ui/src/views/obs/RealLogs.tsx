@@ -64,6 +64,38 @@ function resultFromError(e: unknown): Result {
   return { kind: "error", message: e instanceof Error ? e.message : String(e) };
 }
 
+// Cap on pod-log reads in flight at once. The cap exists to protect the API's
+// Kubernetes proxy from a burst of concurrent reads, not because the client
+// could not issue more.
+const LOG_FETCH_CONCURRENCY = 6;
+
+// Run `fn` over `items` with at most `limit` calls in flight. Results are
+// returned in ITEM order regardless of completion order, and a rejection is
+// captured as a settled result so one failing item never rejects the batch.
+async function mapWithLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  if (items.length === 0) return [];
+  const results = new Array<PromiseSettledResult<R>>(items.length);
+  let cursor = 0;
+  // A shared index cursor hands each worker the next unclaimed item, so a slow
+  // item parks one worker instead of stalling the whole batch behind it.
+  const worker = async () => {
+    while (cursor < items.length) {
+      const i = cursor++;
+      try {
+        results[i] = { status: "fulfilled", value: await fn(items[i]) };
+      } catch (reason) {
+        results[i] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
+}
+
 // Wired Logs tab: pick a runner pod (or all of them) and tail its logs, proxying
 // the K8s pod-logs API. The pod list comes from the runner-pods endpoint; the
 // distinct cluster states are designed (503 no cluster, 404 pod not found, 502
@@ -102,26 +134,36 @@ export function RealLogs() {
     void loadPods("curie", prefill ?? ALL);
   }, [loadPods, prefill]);
 
-  // Aggregate logs across every listed pod, one labeled block per pod. A single
-  // pod short-circuits to the plain per-pod result so its distinct error states
-  // (404/502/503) are preserved; only the multi-pod "All" view concatenates.
+  // Aggregate logs across every listed pod, one labeled block per pod, reading
+  // up to LOG_FETCH_CONCURRENCY pods at a time. A single pod short-circuits to
+  // the plain per-pod result so its distinct error states (404/502/503) are
+  // preserved; only the multi-pod "All" view concatenates.
   const fetchAll = async (ns: string, list: string[]) => {
-    const blocks: string[] = [];
-    for (const pod of list) {
-      try {
-        const data = await getRunnerLogs(ns, pod, { tail_lines: 200 });
-        blocks.push(`=== ${pod} ===\n${data.logs.trim() === "" ? "(no log lines)" : data.logs}`);
-      } catch (e) {
-        // A cluster-wide failure (503) aborts the whole aggregate; per-pod 404s
-        // are noted inline so one missing pod does not blank the others.
-        if (e instanceof ApiError && e.status === 503) {
-          setResult({ kind: "no-cluster", message: e.message });
-          return;
-        }
-        const msg = e instanceof ApiError ? `${e.status}: ${e.message}` : e instanceof Error ? e.message : String(e);
-        blocks.push(`=== ${pod} ===\n(could not fetch: ${msg})`);
+    const settled = await mapWithLimit(list, LOG_FETCH_CONCURRENCY, (pod) =>
+      getRunnerLogs(ns, pod, { tail_lines: 200 }),
+    );
+    // A cluster-wide failure (503) still aborts the whole aggregate, but because
+    // the reads now overlap it is detected in the results rather than mid-loop:
+    // the earliest 503 in list order stands in for the one the serial read would
+    // have hit first.
+    for (const outcome of settled) {
+      if (outcome.status === "rejected" && outcome.reason instanceof ApiError && outcome.reason.status === 503) {
+        setResult({ kind: "no-cluster", message: outcome.reason.message });
+        return;
       }
     }
+    // Per-pod failures (a 404 for a pod that has since gone) are noted inline so
+    // one missing pod does not blank the others.
+    const blocks = list.map((pod, i) => {
+      const outcome = settled[i];
+      if (outcome.status === "fulfilled") {
+        const data = outcome.value;
+        return `=== ${pod} ===\n${data.logs.trim() === "" ? "(no log lines)" : data.logs}`;
+      }
+      const e = outcome.reason;
+      const msg = e instanceof ApiError ? `${e.status}: ${e.message}` : e instanceof Error ? e.message : String(e);
+      return `=== ${pod} ===\n(could not fetch: ${msg})`;
+    });
     setResult({
       kind: "ok",
       data: { namespace: ns, pod: `all runner pods (${list.length})`, container: null, logs: blocks.join("\n\n") },

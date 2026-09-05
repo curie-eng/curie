@@ -183,6 +183,7 @@ testpaths = [
     "tools/sdk-lock-gate/tests",
     "tools/fix-pin-ci/tests",
     "tools/close-on-next/tests",
+    "tools/p0-closes-ci/tests",
 ]
 
 [tool.ruff]

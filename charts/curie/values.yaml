@@ -7,10 +7,11 @@
 #     bring-your-own block on the SAME object: to use an external instance, set
 #     `deploy: false` and fill `host` / `port` / `auth` (or `existingSecret`).
 #
-# SIZING: the defaults below carry a modest single-node footprint (sum of memory
-# requests ~1.7 GB) so a bare `helm install` schedules on an 8-16 GB node without
-# any overlay. This is NOT sized for production load -- for production raise every
-# `resources` block and persistence size, supply real secrets (or `existingSecret`),
+# SIZING: the defaults below carry a modest single-node footprint (sum of
+# steady-state memory requests 2512 Mi, ~2.45 GiB) so a bare `helm install`
+# schedules on an 8-16 GB node without any overlay. This is NOT sized for
+# production load -- for production raise every `resources` block and
+# persistence size, supply real secrets (or `existingSecret`),
 # and point the stores at managed services via the BYO blocks. For a laptop / fully
 # offline cluster use `-f values-dev.yaml`, which additionally swaps every image for
 # a locally-built, cluster-imported tag.
@@ -86,9 +87,12 @@ placement:
 #
 # Both names are cluster-scoped (PriorityClass has no namespace), so installing
 # a second curie release into the SAME cluster must override one release's
-# names to avoid an ownership conflict. `sandbox.name` is also the intended
-# `scopeSelector` handle for the sandbox-namespace ResourceQuota (issue #758) --
-# keep the two in sync if you rename it.
+# names to avoid an ownership conflict. The sandbox-namespace ResourceQuota
+# scope derives from `sandbox.name` when `resourceQuota.sandboxPriorityClassName`
+# is empty (the default). Do not pin that override to "keep them in sync" --
+# pinning it is what lets a later rename leave the quota scoped to a class
+# nothing carries. Set the override only for a PriorityClass managed outside
+# this chart.
 # ---------------------------------------------------------------------------
 priorityClasses:
   platform:
@@ -112,9 +116,18 @@ priorityClasses:
 # ---------------------------------------------------------------------------
 langfuse:
   deploy: true
-  # Bare external hostname required only when deploy is false. Consumers append
-  # langfuse.web.service.port; do not include a scheme or port here.
+  # Bare external hostname required only when deploy is false. Consumers build
+  # the URL as <langfuse.scheme>://<host>:<langfuse.web.service.port>, with the
+  # scheme coming from `langfuse.scheme` below; do not include a scheme or port
+  # here.
   host: ""
+  # URL scheme every Langfuse consumer uses (#2314). Empty derives it: `http`
+  # for the chart-owned Service, and with `deploy: false`, `https` when
+  # `langfuse.web.service.port` is 443 and `http` otherwise -- the same
+  # derivation `rustfs.scheme` uses (#1447). Set `https` explicitly for a TLS
+  # endpoint on any other port, or `http` to force cleartext on 443. Only
+  # `http` and `https` are accepted.
+  scheme: ""
   image:
     web: langfuse/langfuse
     worker: langfuse/langfuse-worker
@@ -122,10 +135,19 @@ langfuse:
     # rebuilt both the `3` and `3.225` tags in place to ship v3.225.6 without
     # ever publishing a 3.225.6 tag, breaking CI bring-up. Neither major nor
     # minor tags are safe -- only the exact patch tag is stable (#2190).
-    # Coupled to clickhouse.image.tag 25.12: Langfuse 3.225.x migrations from
-    # 39 onward need that ClickHouse version. Do not advance this pin without
-    # it, and do not move ClickHouse off 25.12 while this pin stays (#2210).
+    # Coupled to clickhouse.image.tag 25.12.11.4: Langfuse 3.225.x migrations
+    # from 39 onward need that ClickHouse 25.12 line. Do not advance this pin
+    # without it, and do not move ClickHouse off 25.12.11.4 while this pin
+    # stays (#2210).
     tag: "3.225.5"
+    # Optional immutable content digest per image (#2332). Set one and it wins
+    # over `tag` for that image, rendering `repo@sha256:...`; empty (the
+    # default) keeps the reviewed tag path above byte-for-byte. Give the bare
+    # `sha256:<64 hex>` form only -- a full `repo@sha256:...` here renders
+    # `repo@sha256:...@sha256:...` and the kubelet rejects it as
+    # InvalidImageName, which is the failure this key exists to end.
+    webDigest: ""
+    workerDigest: ""
   telemetryEnabled: false
   enableExperimentalFeatures: true
   # Startup gate on the ClickHouse endpoint Langfuse boots against (issue
@@ -290,7 +312,14 @@ langfuse:
 # ---------------------------------------------------------------------------
 postgres:
   deploy: true
-  image: postgres:16-alpine
+  # Digest-pinned (#2319). PostgreSQL's full version is two components
+  # (16.15), so a tag alone can never satisfy the pin gate's
+  # three-numeric-component rule; the digest is the multi-arch index for
+  # 16.15-alpine (linux/amd64 + linux/arm64). The tag is kept for readability
+  # only -- the digest is what the kubelet resolves, and it wins. Move this
+  # image and podSecurityContext.fsGroup below together: the fsGroup is read
+  # out of these exact bytes.
+  image: postgres:16.15-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
   host: ""
   port: 5432
   auth:
@@ -298,10 +327,14 @@ postgres:
     password: postgres
     database: postgres
   existingSecret: ""
-  # fsGroup that owns the mounted data volume. Defaults to the postgres:16-alpine
-  # image's postgres user (999); parameterized for BYO images with a different UID.
+  # fsGroup that owns the mounted data volume: the gid (and uid) of the
+  # `postgres` user INSIDE the pinned image above, read with
+  # `docker run --rm --entrypoint id <image> -g postgres`. Asserted against the
+  # running image by charts/curie/ci/postgres-fsgroup-assertions.sh, so it
+  # cannot drift from the pin. 999 was the Debian-variant uid and never matched
+  # this Alpine image (#2319). Parameterized for BYO images with a different gid.
   podSecurityContext:
-    fsGroup: 999
+    fsGroup: 70
   persistence:
     enabled: true
     size: 2Gi
@@ -331,15 +364,25 @@ postgres:
 
 # ---------------------------------------------------------------------------
 # Valkey (Redis-compatible). Langfuse cache/queue AND the dispatcher's Streams
-# queue. BYO: deploy=false + host/port (existingSecret key valkeyPassword).
+# queue. BYO: deploy=false + host/port (existingSecret key valkeyPassword), plus
+# tls=true for a managed store that only accepts TLS.
 # ---------------------------------------------------------------------------
 valkey:
   deploy: true
-  image: valkey/valkey:8-alpine
+  # Pinned to the patch build (#2319): a `8-alpine` alias moves under the
+  # chart version. 8.1.10-alpine is the multi-arch build that alias resolved
+  # to. Must equal the valkey image in compose.dev.yaml and the rust job's
+  # service image in .github/workflows/ci.yaml (asserted by compose/tests).
+  image: valkey/valkey:8.1.10-alpine
   host: ""
   port: 6379
   password: valkeypass
   existingSecret: ""
+  # Connect over TLS (#2315). For a BYO store ONLY: the in-chart StatefulSet
+  # serves no TLS listener, so tls=true with deploy=true fails the render rather
+  # than shipping six consumers that cannot connect. Verification uses the
+  # system CA bundle -- a private CA or mutual TLS is not supported by this knob.
+  tls: false
   persistence:
     enabled: true
     size: 1Gi
@@ -366,9 +409,11 @@ valkey:
 # ---------------------------------------------------------------------------
 # ClickHouse. Langfuse's OLAP store for traces/observations/scores. Coupled to
 # langfuse.image.tag 3.225.5: that release line's ClickHouse migrations from 39
-# onward need 25.12 (Langfuse v3.225.7 compose pins clickhouse-server:25.12).
-# AVX is a chart-default requirement because 25.12 is not SSE4.2-safe. Do not
-# move this pin independently of the Langfuse pin (#2210). The AVX preflight
+# onward need the 25.12 line (Langfuse v3.225.7 compose pins
+# clickhouse-server:25.12), pinned here to the 25.12.11.4 patch build so the
+# alias cannot move under the chart version (#2319). AVX is a chart-default
+# requirement because 25.12 is not SSE4.2-safe. Do not move this pin
+# independently of the Langfuse pin (#2210). The AVX preflight
 # still allows an explicit sse42SafeTags override on AVX-less nodes; that
 # override cannot apply the current Langfuse migration set.
 # BYO: deploy=false + host/httpPort/nativePort (existingSecret key clickhousePassword).
@@ -377,10 +422,19 @@ clickhouse:
   deploy: true
   image:
     repository: clickhouse/clickhouse-server
-    tag: "25.12"
+    # Coupled to langfuse.image.tag 3.225.5 -- see the block header (#2210).
+    tag: "25.12.11.4"
+    # Optional immutable content digest (#2332). Set it and it wins over `tag`,
+    # rendering `repo@sha256:...`; empty (the default) keeps the pinned tag
+    # path byte-for-byte. Bare `sha256:<64 hex>` only -- a full
+    # `repo@sha256:...` renders an InvalidImageName reference. The AVX
+    # preflight still evaluates `clickhouse.image.tag` against `sse42SafeTags`,
+    # so keep `tag` set to the version these bytes correspond to when pinning
+    # by digest, or the preflight judges the wrong build.
+    digest: ""
   # Tags whose upstream binaries still ship an SSE4.2 build (no AVX required).
   # The AVX preflight passes an AVX-less node only if the configured tag begins
-  # with one of these. Not a supported default: 25.12 is required by the
+  # with one of these. Not a supported default: the 25.12 line is required by the
   # Langfuse pin and is deliberately absent from this list. 24.8/24.3 are LTS
   # lines; 23.8 is the prior LTS.
   sse42SafeTags:
@@ -390,6 +444,18 @@ clickhouse:
   host: ""
   httpPort: 8123
   nativePort: 9000
+  # URL scheme Langfuse uses to reach ClickHouse (#2314). Empty derives it:
+  # `http` for the chart-owned server, and with `deploy: false`, `https` when
+  # `httpPort` is 8443 and `http` otherwise -- the same derivation
+  # `rustfs.scheme` uses (#1447). `https` also switches the Langfuse migration
+  # connection on `nativePort` to TLS (rendered as CLICKHOUSE_MIGRATION_SSL=true;
+  # Langfuse's migrator builds its own query string from that flag, so the URL
+  # stays bare). Set `https` explicitly for TLS on any other port, or `http` to
+  # force cleartext on 8443. Only `http` and `https` are accepted. A TLS
+  # ClickHouse needs both ports set: `httpPort: 8443` and `nativePort: 9440`
+  # (the migration DSN uses `nativePort` and only the flag changes, not the
+  # port), or an explicit `scheme: https` plus both ports.
+  scheme: ""
   auth:
     username: default
     password: clickhouse
@@ -614,7 +680,62 @@ inference:
   persistence:
     enabled: false
     size: 10Gi
-  resources: {}
+  # Sized for `model` above, NOT left to the namespace LimitRange (#2329). The
+  # chart ships a default-on LimitRange whose per-container `default` is
+  # `cpu: "1"` / `memory: 1Gi`; a container that declares no resources of its
+  # own inherits that, and a 1 GiB ceiling OOMKills a 4B-parameter model on its
+  # first inference -- presenting as a model-server crash rather than as a chart
+  # capacity default. So the memory limit here must stay comfortably ABOVE that
+  # LimitRange default, or the ceiling is itself the bug.
+  #
+  # The memory REQUEST has to cover the weights on its own, because that is what
+  # the scheduler packs against: a request below the model's resident size will
+  # happily place this pod on a node that cannot hold it, and the kill then
+  # arrives under node pressure instead of at the limit -- the same
+  # "model-server crash" symptom, just from packing rather than the LimitRange.
+  # qwen3:4b is ~2.6Gi of weights at the default quantisation, so 4Gi requested.
+  # 6Gi limit adds room for the KV cache and the runtime's own arena. That is
+  # sized for the default context window; a much longer `num_ctx` grows the KV
+  # cache roughly linearly and wants a higher limit.
+  #
+  # Raise BOTH for a bigger `model` -- weights scale roughly with parameter
+  # count, and the limit, not the request, is what the OOM killer enforces.
+  # docs/local-model.md carries the per-model figures and the override flags.
+  #
+  # The cpu limit is deliberately 1, not 2, for the reason spelled out at
+  # clickhouse.resources: on a 2-vCPU node a limit of 2 is the whole machine,
+  # and under contention the kernel divides CPU in proportion to REQUESTS, where
+  # the critical-path sandbox containers ask for 50m each. That chart already
+  # walked a neighbour of exactly this shape back from 2 to 1 after it starved
+  # sandbox claims past their 90s bind deadline; a bursty demo model server is
+  # not the component to re-learn it on. Raise it on a node with cores to spare.
+  resources:
+    requests: { cpu: 500m, memory: 4Gi }
+    limits: { cpu: "1", memory: 6Gi }
+  # Container securityContext (issue #67). Safe subset only, and the reason is
+  # the image: `ollama/ollama` declares no USER, so the server runs as uid 0 and
+  # keeps its model store under $HOME (/root/.ollama, the mount path in
+  # inference.yaml). Setting runAsNonRoot / runAsUser here would need the model
+  # store relocated off /root and the volume re-owned, so it is deliberately NOT
+  # set -- full restricted-PSS on this workload is a separate change with a
+  # validated uid. readOnlyRootFilesystem stays false for the same reason: only
+  # the model store is a mounted volume, and the server and its postStart pull
+  # still write elsewhere on the rootfs.
+  #
+  # What IS safe on this image: the entrypoint is the single `ollama` binary
+  # (no chown/gosu wrapper, so no privilege manipulation to preserve) and the
+  # server binds an unprivileged port, so it needs no Linux capabilities and
+  # must never gain privileges. Those, plus the RuntimeDefault seccomp profile,
+  # are enough for Pod Security Standards `baseline`; `restricted` additionally
+  # requires runAsNonRoot and is not met, by the documented exception above.
+  # Override fields or set the whole block to null to opt out.
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop: [ALL]
+    seccompProfile:
+      type: RuntimeDefault
   service:
     port: 11434
 
@@ -630,10 +751,37 @@ inference:
 otelCollector:
   deploy: true
   image: otel/opentelemetry-collector-contrib:0.119.0
-  # Chart-owned external OTLP endpoint used when deploy is false. Wired to API,
-  # dispatcher, worker, and runner. Ignored while deploy is true (in-cluster
-  # collector wins). extraEnv remains a per-workload override.
+  # Chart-owned external OTLP endpoint used when deploy is false. Wired to
+  # every workload that includes the curie.env.otel helper; that set is
+  # recorded in charts/curie/CLAUDE.md rather than counted here. Ignored while
+  # deploy is true (in-cluster collector wins). extraEnv remains a per-workload
+  # override where the workload exposes one.
+  #
+  # One asymmetry an operator hits here: the mail adapter is the only
+  # first-party service with its own egress NetworkPolicy, and that policy has
+  # no peer for an external endpoint (an address the chart cannot know). An
+  # install using this key with mailAdapter.deploy true needs an operator-
+  # supplied egress policy selecting the adapter, or its exports are dropped
+  # while every other workload's succeed.
   endpoint: ""
+  # Runner sandbox egress to a BYO collector endpoint (#2317). Rail 1 is
+  # fail-closed, and the in-chart runner-allow-collector policy selects this
+  # release's collector pod, so it does not render when deploy is false. Each
+  # entry is {cidr, ports, except?} like security.networkPolicy.allowedEgress.
+  # NetworkPolicy cannot target a DNS name, so the `endpoint` above is not
+  # enough. Required only when deploy is false, Rail 1 is on, and the resolved
+  # endpoint is non-empty; a telemetry-disabled or endpoint-less install needs
+  # nothing here because there is nothing for the runner to reach. It is read
+  # ONLY on that BYO branch: setting it while deploy is true is refused at
+  # render rather than silently ignored. Empty (the
+  # default) keeps fail-closed: otherwise the install is green, every other
+  # workload's traces flow, and only the sandbox's spans are silently dropped.
+  # Each entry must set cidr and ports. Default routes and CIDRs that reach
+  # 169.254.169.254 are refused: this is one collector endpoint, not a second
+  # model allowlist.
+  egress: []
+  #  - cidr: 192.0.2.10/32
+  #    ports: [{ protocol: TCP, port: 4318 }]
   protocol: http/protobuf
   # Optional OTEL_EXPORTER_OTLP_HEADERS. Prefer headersExistingSecret for
   # credentials so they never enter Helm values. The two sources are mutually
@@ -788,6 +936,27 @@ grafanaConnector:
 # ---------------------------------------------------------------------------
 api:
   deploy: true
+  # Runner sandbox egress to a BYO API endpoint (#2317). Rail 1 is fail-closed,
+  # and the in-chart runner-allow-api policy selects this release's api pod, so
+  # it does not render when deploy is false. Each entry is
+  # {cidr, ports, except?} like security.networkPolicy.allowedEgress.
+  # NetworkPolicy cannot target a DNS name, so dispatcher.apiBaseUrl is not
+  # enough. Required when deploy is false, Rail 1 is on, and
+  # dispatcher.apiBaseUrl names an external API; deploy false with no base URL
+  # at all names nothing for the runner to reach and that install already
+  # dead-ends loudly at dispatcher boot. It is read ONLY on that BYO branch:
+  # setting it while deploy is true is refused at render rather than silently
+  # ignored, and an external destination reached while the in-chart API is
+  # still deployed stays governed by security.networkPolicy.allowedEgress.
+  # Empty (the default) keeps fail-closed: otherwise the install is green and
+  # agents boot with no memory and no thread history, with only a warning line
+  # inside the sandbox to show for it. Each entry must set cidr and ports.
+  # Default routes and CIDRs that reach 169.254.169.254 are refused: this is
+  # one API endpoint, not a second model allowlist.
+  # mailAdapter.apiEgress.httpsCidrs is the same idea for the mail adapter pod.
+  egress: []
+  #  - cidr: 192.0.2.11/32
+  #    ports: [{ protocol: TCP, port: 443 }]
   replicas: 1
   image:
     repository: ghcr.io/curie-eng/curie-api
@@ -1597,6 +1766,14 @@ worker:
 ui:
   deploy: true
   replicas: 1
+  # Platform API the UI's nginx reverse-proxies /api/ to. Empty (the default)
+  # derives the in-chart API Service, http://<fullname>-api:<api.service.port>.
+  # Set it to a full base URL to point at an API this chart did not deploy; that
+  # BYO value renders verbatim as CURIE_API_TARGET. Required when api.deploy is
+  # false: unlike the dispatcher, the UI stays Ready while every /api/ request
+  # fails at the proxy, so the render fails closed rather than shipping a
+  # stranded UI.
+  apiBaseUrl: ""
   image:
     repository: ghcr.io/curie-eng/curie-ui
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
@@ -1634,8 +1811,10 @@ ui:
       type: RuntimeDefault
 
 # ---------------------------------------------------------------------------
-# Install-time preflights. Both are Helm hooks that block a broken install, and
-# both are re-runnable via `helm test`.
+# Install-time preflights. (a) AVX is a pre-install/pre-upgrade hook, (b)
+# NetworkPolicy is a helm test that never runs during helm install, and (c)
+# controllerReady is a post-install/post-upgrade hook. All three are
+# re-runnable via `helm test`.
 # ---------------------------------------------------------------------------
 preflights:
   # (a) CPU-AVX / ClickHouse-pin check. Runs as a pre-install/pre-upgrade hook
@@ -1646,7 +1825,7 @@ preflights:
   # crash-loop. Skipped when clickhouse.deploy is false (BYO ClickHouse).
   avxCheck:
     enabled: true
-    image: busybox:1.36
+    image: busybox:1.36.1
     # Test knob: pretend the node has no AVX. With the default 25.12 tag this
     # exercises the AVX-required failure branch; pin an sse42SafeTags tag to
     # exercise the older-tag override. Never set true in a real install.
@@ -1871,7 +2050,7 @@ agentSandbox:
       enabled: true
       bucket: curie-bundles
       fetchImage: amazon/aws-cli:2.32.6
-      extractImage: busybox:1.36
+      extractImage: busybox:1.36.1
       # Shared bundle volume mount point in the sandbox pod. The plugin dir the
       # worker injects (CURIE_PLUGIN_DIR=/bundles/current) is `<mountPath>/current`.
       mountPath: /bundles
@@ -2064,7 +2243,7 @@ security:
   # model; fake-model `auto` degrades gracefully; `off` skips it.
   gvisorPreflight:
     enabled: true
-    image: busybox:1.36
+    image: busybox:1.36.1
     resources:
       requests: { cpu: 50m, memory: 32Mi }
       limits: { cpu: 200m, memory: 64Mi }
@@ -2077,9 +2256,13 @@ security:
     # Driver image (must carry kubectl + bash); drives all three claims.
     kubectlImage: alpine/k8s:1.31.2
     # Egress-probe pod image (must carry curl + nslookup) the driver pod execs
-    # into to test egress under the chart's real NetworkPolicy.
-    netshootImage: nicolaka/netshoot
-    busyboxImage: busybox:1.36
+    # into to test egress under the chart's real NetworkPolicy. A bare
+    # repository resolves to :latest with imagePullPolicy Always (#2318), and
+    # netshoot's upstream version is two components (v0.16), so a tag alone
+    # cannot satisfy the pin gate's three-numeric-component rule either -- hence
+    # the digest, which is the multi-arch index for v0.16 (#2319).
+    netshootImage: nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70
+    busyboxImage: busybox:1.36.1
     # A public host the egress policy must BLOCK (reached on the baseline, denied
     # under the policy -- the before/after control that proves the CNI enforces).
     blockedTarget: example.com
@@ -2107,13 +2290,15 @@ security:
   # chart credentials once its design pass lands.)
   checkDefaultCredentials: false
   # Auto-generate per-release chart credentials (issue #195). Default false: a
-  # no-override `helm install` generates strong random values for the eleven
+  # no-override `helm install` generates strong random values for the thirteen
   # chart owned credentials: the backing store passwords, Langfuse
-  # salt/encryptionKey/nextauthSecret, the two init credentials, and the
-  # api/webhook keys. Set true (values-dev.yaml does) for a deterministic dev/CI
-  # render that keeps the published defaults byte-for-byte. The nine non init
-  # credentials persist via `lookup`, so `helm upgrade` re-uses them. Their
-  # explicit `--set` overrides and per store `existingSecret` values support
+  # salt/encryptionKey/nextauthSecret, the two init credentials, the
+  # api/webhook keys, worker.internalWorkerToken, and
+  # api.approvalChatAttesterSecret. Set true (values-dev.yaml does) for a
+  # deterministic dev/CI render that keeps the published defaults
+  # byte-for-byte. The eleven non init credentials persist via `lookup`, so
+  # `helm upgrade` re-uses them. Their explicit `--set` overrides and per
+  # store `existingSecret` values support
   # rotation and recovery. The two Langfuse init credentials are first boot
   # inputs: changing them during an upgrade does not rotate initialized records.
   # Caveat: generation relies on Helm `lookup`, which is empty under client-side

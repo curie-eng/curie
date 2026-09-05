@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import socket
-import time
+from collections.abc import Callable
 
 import pytest
 import redis
@@ -17,6 +17,20 @@ def _configure_unreachable_valkey(monkeypatch: pytest.MonkeyPatch) -> socket.soc
     monkeypatch.setattr(valkey, "VALKEY_HOST", "127.0.0.1")
     monkeypatch.setattr(valkey, "VALKEY_PORT", int(listener.getsockname()[1]))
     return listener
+
+
+def _capture_constructed_clients(monkeypatch: pytest.MonkeyPatch) -> list[redis.Redis]:
+    """Wrap redis.Redis so the test can inspect the client connect_or_skip built."""
+    captured: list[redis.Redis] = []
+    original: Callable[..., redis.Redis] = valkey.redis.Redis
+
+    def capture(*args: object, **kwargs: object) -> redis.Redis:
+        client = original(*args, **kwargs)
+        captured.append(client)
+        return client
+
+    monkeypatch.setattr(valkey.redis, "Redis", capture)
+    return captured
 
 
 def test_connect_or_skip_skips_an_unreachable_valkey_locally(
@@ -49,28 +63,38 @@ def test_connect_or_skip_fails_for_an_unreachable_valkey_when_required(
             valkey.connect_or_skip()
 
 
-def test_an_unreachable_valkey_costs_the_bounded_timeout_not_a_retry_ladder(
+def test_connect_or_skip_client_has_no_retry_and_a_connect_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The bound must hold end to end, not just be passed to the constructor.
+    """Removing either constructor pin must fail this test on Linux.
 
-    redis-py 8.x defaults to Retry(ExponentialWithJitterBackoff(), 3), which
-    multiplies socket_connect_timeout rather than capping it: measured on 8.1.0
-    against a bound but unlistening port, socket_connect_timeout=5 still took
-    58.74s and the unbounded default took 59.66s. So asserting the constructor
-    received a timeout would not catch a reintroduced retry policy. Assert the
-    wall clock instead, which is the thing that was wrong.
+    The previous control asserted elapsed < 5 against a bound-unlistening
+    loopback port. On Linux that port answers RST immediately, so redis-py
+    8.1.0 without these pins already returned in ~4.3s and both mutations
+    stayed green. The ~59s figures are macOS, where the SYN is dropped.
+    Inspect the client's effective configuration instead: that is what the
+    two pins change, and it does not depend on SYN-drop vs RST.
+
+    redis-py 8.1.0 defaults socket_connect_timeout to 5s, so asserting the
+    timeout is merely set would not catch deleting the kwarg. The bound must
+    equal CONNECT_TIMEOUT_SECONDS. Default retry.get_retries() is 10, so
+    retries == 0 catches deleting retry=NO_RETRY.
     """
     monkeypatch.delenv("CI_REQUIRE_VALKEY_TESTS", raising=False)
-    monkeypatch.setattr(valkey, "CONNECT_TIMEOUT_SECONDS", 0.25)
+    captured = _capture_constructed_clients(monkeypatch)
     listener = _configure_unreachable_valkey(monkeypatch)
 
     with listener:
-        started = time.monotonic()
-        with pytest.raises(pytest.skip.Exception):
+        with pytest.raises(pytest.skip.Exception, match="Valkey not reachable"):
             valkey.connect_or_skip()
-        elapsed = time.monotonic() - started
 
-    # Generous next to a 0.25s bound, and still two orders of magnitude under the
-    # ~59s the retry ladder cost.
-    assert elapsed < 5, f"an unreachable Valkey took {elapsed:.2f}s, so the bound is not holding"
+    assert captured, "connect_or_skip never constructed a Redis client"
+    client = captured[0]
+    try:
+        retry = client.get_retry()
+        assert retry is not None
+        assert retry.get_retries() == 0
+        timeout = client.connection_pool.connection_kwargs.get("socket_connect_timeout")
+        assert timeout == valkey.CONNECT_TIMEOUT_SECONDS
+    finally:
+        client.close()

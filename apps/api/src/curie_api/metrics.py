@@ -12,7 +12,9 @@ traces whose name contains `agent-<agent_id>`. `agent_trace_filter` builds that
 token; callers pass it as the `agent` argument below.
 """
 
+import asyncio
 import uuid
+from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -148,6 +150,73 @@ def _error_rate(rows: list[dict[str, Any]]) -> float:
     return errors / total
 
 
+async def _gather_ordered(*coros: Coroutine[Any, Any, Any]) -> list[Any]:
+    """Run independent units of work concurrently, failing in argument order.
+
+    The summary and cost_known queries share no state and the Langfuse client is
+    an httpx.AsyncClient, so running them together makes the wall time the
+    slowest round trip instead of the sum of all of them.
+
+    The re-raise is deliberately ordered rather than first-to-fail. These calls
+    used to be a sequence of awaits, so the caller saw the failure of the
+    EARLIEST unit in the list, and a later unit's failure was invisible
+    whenever an earlier one had already raised. A bare ``asyncio.gather`` would
+    instead surface whichever unit lost the race, which turns one Langfuse
+    outage into a nondeterministic error surface. ``return_exceptions=True``
+    lets every unit finish (the queries are read-only GETs, so completing them
+    is harmless and leaves no cancelled httpx connections), and the scan below
+    then raises the first exception in argument order, reproducing the old
+    behavior exactly.
+
+    What counts as one unit differs per caller, and inside ``summary`` it
+    differs per argument, because the sequential code each one replaces
+    differed. ``summary`` ran query-then-convert per scalar metric, so a bad
+    value in an earlier response raised before the next query was even issued;
+    its four scalar units are therefore "query plus its own conversion"
+    (``_scalar_value``), each returning a float. Its fifth unit, the level
+    query, is the query ALONE: the original reduced those rows to an error
+    rate inside the ``MetricsSummary(...)`` call, and constructor arguments
+    evaluate left to right, so the ``int()`` conversions of runs and tokens ran
+    before that reduction. Folding the reduction into this unit would let a bad
+    level row preempt them. ``cost_known`` awaited BOTH of its queries before
+    either conversion, so there a later query's failure legitimately beat an
+    earlier response's conversion failure; both of its units are "query only"
+    and it converts afterwards.
+
+    There is no type parameter, because the units are heterogeneous even within
+    one ``summary`` call: four floats and one list of rows. The elements are
+    typed as ``Any``; every caller destructures the result positionally and
+    knows what each of its own units returns.
+    """
+
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    ordered: list[Any] = []
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+        ordered.append(result)
+    return ordered
+
+
+async def _scalar_value(
+    lf: LangfuseClient,
+    metric: str,
+    start: str,
+    end: str,
+    environment: str | None,
+    agent: str | None,
+) -> float:
+    """One scalar metric: issue its query, then convert its own response.
+
+    Query and conversion stay in the same unit so that _gather_ordered's ordered
+    re-raise covers a conversion failure at the position the metric occupies,
+    exactly as the sequential awaits did.
+    """
+
+    rows = await lf.query_metrics(_scalar_query(metric, start, end, environment, agent))
+    return _num(rows[0], _SPEC[metric][3]) if rows else 0.0
+
+
 async def summary(
     lf: LangfuseClient,
     start: str,
@@ -155,15 +224,19 @@ async def summary(
     environment: str | None,
     agent: str | None,
 ) -> MetricsSummary:
-    scalars: dict[str, float] = {}
-    for metric in SCALAR_METRICS:
-        rows = await lf.query_metrics(
-            _scalar_query(metric, start, end, environment, agent)
-        )
-        key = _SPEC[metric][3]
-        scalars[metric] = _num(rows[0], key) if rows else 0.0
-
-    level_rows = await lf.query_metrics(_level_query(start, end, environment, agent))
+    # Scalars in SCALAR_METRICS order, each unit converting its own response,
+    # then the level query -- the same sequential order as before. The level
+    # rows come back unreduced on purpose: _error_rate runs where it originally
+    # did, as the last MetricsSummary argument, after the int() conversions
+    # above it. See _gather_ordered for why.
+    *scalar_values, level_rows = await _gather_ordered(
+        *(
+            _scalar_value(lf, metric, start, end, environment, agent)
+            for metric in SCALAR_METRICS
+        ),
+        lf.query_metrics(_level_query(start, end, environment, agent)),
+    )
+    scalars: dict[str, float] = dict(zip(SCALAR_METRICS, scalar_values, strict=True))
 
     return MetricsSummary(
         start=start,
@@ -200,8 +273,14 @@ async def cost_known(
     """The `cost_known` flag for a window, for callers (get_cost) that fetch cost
     without the token total. Runs the one extra tokens query summary already has."""
 
-    cost_rows = await lf.query_metrics(_scalar_query("cost_usd", start, end, environment, agent))
-    token_rows = await lf.query_metrics(_scalar_query("tokens", start, end, environment, agent))
+    # Cost first, tokens second. Unlike summary(), the unit here is the query
+    # ALONE, and both conversions run after both queries -- deliberately, so a
+    # later tokens-query failure beats an earlier cost-conversion failure. Do
+    # not "consistency-fix" this to match summary(); see _gather_ordered.
+    cost_rows, token_rows = await _gather_ordered(
+        lf.query_metrics(_scalar_query("cost_usd", start, end, environment, agent)),
+        lf.query_metrics(_scalar_query("tokens", start, end, environment, agent)),
+    )
     cost = _num(cost_rows[0], _SPEC["cost_usd"][3]) if cost_rows else 0.0
     tokens = _num(token_rows[0], _SPEC["tokens"][3]) if token_rows else 0.0
     return _cost_known(tokens, cost)

@@ -179,6 +179,51 @@ def test_history_resume_cache_read_is_declared_and_rejects_unbounded_attributes(
         )
 
 
+def test_deadline_halted_is_a_declared_terminal_turn_outcome(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """#2278: the worker lifecycle emits deadline_halted; the shared validator
+    must accept it on both turn-completion instruments.
+
+    Mocking telemetry is not enough: this calls the real ``record_metric``
+    allowlist. Red on omitting the value from ``_TURN_OUTCOMES``.
+    """
+    del metrics
+    attributes = {
+        "service.name": "curie-worker",
+        "source": "worker",
+        "outcome": "deadline_halted",
+    }
+    record_metric("curie.turn.completed", attributes=attributes)
+    record_metric("curie.turn.duration", 1.5, attributes=attributes)
+    manifest = _read(_MANIFEST)["metrics"]
+    for name in ("curie.turn.completed", "curie.turn.duration"):
+        outcomes = manifest[name]["attributes"]["outcome"]
+        assert "deadline_halted" in outcomes
+        for sibling in ("budget_halted", "interrupted", "side_effect_halted"):
+            assert sibling in outcomes
+        assert "fenced_out" not in outcomes
+        assert manifest[name]["cardinality_bound"] == 192
+
+
+def test_record_metric_still_rejects_unknown_turn_outcome(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """#2278 negative control: extending the domain for deadline_halted must
+    not disable the bounded validator. An undeclared outcome still raises.
+    """
+    del metrics
+    with pytest.raises(ValueError, match="outside its declared domain"):
+        record_metric(
+            "curie.turn.completed",
+            attributes={
+                "service.name": "curie-worker",
+                "source": "worker",
+                "outcome": "deadline_halted_unknown",
+            },
+        )
+
+
 def test_record_metric_rejects_undeclared_instrument_by_execution(
     metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:
