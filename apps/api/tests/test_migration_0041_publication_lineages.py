@@ -700,7 +700,8 @@ def test_0041_backfills_active_and_succeeded_pr_publications_and_round_trips(
         result_url="https://github.com/acme-corp/acme-bot/issues/123",
     )
 
-    command.upgrade(config, "head")
+    # This round trip owns 0041; later revisions have independent downgrade guards.
+    command.upgrade(config, "0041")
 
     active = _sql(
         "SELECT p.lineage_id::text, p.revision_number, p.expected_prior_head, "
@@ -798,7 +799,7 @@ def test_0041_backfills_active_and_succeeded_pr_publications_and_round_trips(
         "column_name IN ('lineage_id', 'revision_number', 'expected_prior_head')"
     ) == []
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "0041")
     assert _sql(
         "SELECT l.branch, p.revision_number FROM curie.publications p JOIN "
         "curie.thread_publication_lineages l ON l.id = p.lineage_id "

@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Enum,
     ForeignKey,
@@ -460,6 +461,26 @@ class ThreadPublicationLineage(Base):
             unique=True,
             postgresql_where=text("status = 'open'"),
         ),
+        CheckConstraint(
+            "(github_repository_id IS NULL AND github_installation_id IS NULL "
+            "AND github_pr_node_id IS NULL AND base_ref IS NULL) "
+            "OR (github_repository_id IS NOT NULL "
+            "AND github_repository_id > 0 "
+            "AND github_installation_id IS NOT NULL AND github_installation_id > 0 "
+            "AND github_pr_node_id IS NOT NULL "
+            "AND length(github_pr_node_id) > 0 AND pr_number IS NOT NULL "
+            "AND base_ref IS NOT NULL AND length(base_ref) > 0)",
+            name="thread_publication_lineages_github_identity_ck",
+        ),
+        Index("uq_publication_github_pr_owner", "github_repository_id", "pr_number", unique=True),
+        Index(
+            "uq_active_publication_github_conversation",
+            "agent_id",
+            "conversation_id",
+            "github_repository_id",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -479,10 +500,59 @@ class ThreadPublicationLineage(Base):
     status: Mapped[str] = mapped_column(server_default="open", default="open")
     version: Mapped[int] = mapped_column(server_default="1", default=1)
     latest_revision: Mapped[int] = mapped_column(server_default="1", default=1)
+    # Only new trusted publication creation captures routing authority. Historical
+    # NULL rows are deliberately never backfilled from a currently reused name.
+    binding_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_channels.id", ondelete="SET NULL"),
+        default=None,
+    )
+    binding_generation: Mapped[int | None] = mapped_column(default=None)
+    reply_conversation_id: Mapped[str | None] = mapped_column(default=None)
+    github_repository_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    github_installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    github_pr_node_id: Mapped[str | None] = mapped_column(default=None)
+    base_ref: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
     publications: Mapped[list[Publication]] = relationship(back_populates="lineage")
+
+
+class PublicationReviewReservation(Base):
+    """One review origin's claim on the existing publication revision writer."""
+
+    __tablename__ = "publication_review_reservations"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('reserved', 'consumed', 'cancelled')",
+            name="publication_review_reservations_status_ck",
+        ),
+        CheckConstraint(
+            "version >= 1 AND revision_number >= 1 AND lineage_version >= 1",
+            name="publication_review_reservations_versions_ck",
+        ),
+        Index(
+            "uq_reserved_review_per_lineage",
+            "lineage_id",
+            unique=True,
+            postgresql_where=text("status = 'reserved'"),
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    origin_key: Mapped[str] = mapped_column(unique=True)
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE"),
+        index=True,
+    )
+    lineage_version: Mapped[int]
+    expected_head_sha: Mapped[str]
+    revision_number: Mapped[int]
+    binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    binding_generation: Mapped[int]
+    status: Mapped[str] = mapped_column(default="reserved", server_default="reserved")
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
 class Publication(Base):

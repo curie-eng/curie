@@ -279,42 +279,43 @@ def test_crash_retry_does_not_double_apply(
         "applied_at timestamptz not null default now())"
     )
 
+    # Synthetic names cannot collide with future production migration numbers.
     alembic_copy = tmp_path / "alembic"
     shutil.copytree(ALEMBIC_DIR, alembic_copy)
     versions = alembic_copy / "versions"
-    (versions / "0042_compat_first.py").write_text(
+    (versions / "compat_probe_first_compat_first.py").write_text(
         '''
-revision = "0042"
+revision = "compat_probe_first"
 down_revision = "0041"
 
 def upgrade():
     from alembic import op
     op.execute(
-        "INSERT INTO curie.compat_probe (rev) VALUES ('0042')"
+        "INSERT INTO curie.compat_probe (rev) VALUES ('compat_probe_first')"
     )
 
 def downgrade():
     from alembic import op
-    op.execute("DELETE FROM curie.compat_probe WHERE rev = '0042'")
+    op.execute("DELETE FROM curie.compat_probe WHERE rev = 'compat_probe_first'")
 '''
     )
-    (versions / "0043_compat_second.py").write_text(
+    (versions / "compat_probe_second_compat_second.py").write_text(
         '''
 import os
-revision = "0043"
-down_revision = "0042"
+revision = "compat_probe_second"
+down_revision = "compat_probe_first"
 
 def upgrade():
     from alembic import op
     if os.environ.get("CURIE_COMPAT_PROBE_CRASH") == "1":
-        raise RuntimeError("injected crash after 0042")
+        raise RuntimeError("injected crash after compat_probe_first")
     op.execute(
-        "INSERT INTO curie.compat_probe (rev) VALUES ('0043')"
+        "INSERT INTO curie.compat_probe (rev) VALUES ('compat_probe_second')"
     )
 
 def downgrade():
     from alembic import op
-    op.execute("DELETE FROM curie.compat_probe WHERE rev = '0043'")
+    op.execute("DELETE FROM curie.compat_probe WHERE rev = 'compat_probe_second'")
 '''
     )
     probe_cfg = Config()
@@ -326,45 +327,45 @@ def downgrade():
             apply_upgrade(
                 forward_only=False,
                 alembic_config=probe_cfg,
-                window=AppWindow(schema_min=HEAD, schema_head="0043"),
+                window=AppWindow(schema_min=HEAD, schema_head="compat_probe_second"),
                 kinds={
                     **load_kinds(),
-                    "0042": KIND_EXPAND,
-                    "0043": KIND_EXPAND,
+                    "compat_probe_first": KIND_EXPAND,
+                    "compat_probe_second": KIND_EXPAND,
                 },
             )
     finally:
         os.environ.pop("CURIE_COMPAT_PROBE_CRASH", None)
 
-    assert current_revision() == "0042"
+    assert current_revision() == "compat_probe_first"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0042"]
+    assert [r[0] for r in rows] == ["compat_probe_first"]
 
     outcome = apply_upgrade(
         forward_only=False,
         alembic_config=probe_cfg,
-        window=AppWindow(schema_min=HEAD, schema_head="0043"),
+        window=AppWindow(schema_min=HEAD, schema_head="compat_probe_second"),
         kinds={
             **load_kinds(),
-            "0042": KIND_EXPAND,
-            "0043": KIND_EXPAND,
+            "compat_probe_first": KIND_EXPAND,
+            "compat_probe_second": KIND_EXPAND,
         },
     )
     assert outcome.outcome == "applied"
-    assert current_revision() == "0043"
+    assert current_revision() == "compat_probe_second"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0042", "0043"]
+    assert [r[0] for r in rows] == ["compat_probe_first", "compat_probe_second"]
 
     again = apply_upgrade(
         forward_only=False,
         alembic_config=probe_cfg,
-        window=AppWindow(schema_min=HEAD, schema_head="0043"),
+        window=AppWindow(schema_min=HEAD, schema_head="compat_probe_second"),
         kinds={
             **load_kinds(),
-            "0042": KIND_EXPAND,
-            "0043": KIND_EXPAND,
+            "compat_probe_first": KIND_EXPAND,
+            "compat_probe_second": KIND_EXPAND,
         },
     )
     assert again.action == "noop"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0042", "0043"]
+    assert [r[0] for r in rows] == ["compat_probe_first", "compat_probe_second"]

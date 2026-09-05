@@ -216,6 +216,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/cluster-message-replies/{reply_ref}",
     "/v1/internal/publications",
     "/v1/internal/publications/lineage",
+    "/v1/internal/publications/review-reservations",
+    "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
     "/v1/internal/publications/{publication_id}/lineage",
     "/v1/internal/publications/{publication_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/credential",

@@ -29,9 +29,11 @@ from .models import (
     Deployment,
     Environment,
     Publication,
+    PublicationReviewReservation,
     ThreadPublicationLineage,
     ThreadWorkspace,
 )
+from .publication_authority import VerifiedPublicationIdentity
 from .schemas import (
     ActionComplete,
     ActionRecord,
@@ -43,6 +45,7 @@ from .schemas import (
     HookPartitionConfig,
     PublicationCreate,
     PublicationLineageAdvance,
+    ReviewRevisionReserve,
     VersionCreate,
 )
 from .workspace_policy import repository_is_allowed
@@ -81,6 +84,13 @@ async def _adopt_publication_replay(
     deployment = await get_deployment(session, data.deployment_id)
     if deployment is None:
         raise LookupError("deployment not found")
+    review_origin = await session.scalar(
+        select(PublicationReviewReservation.origin_key).where(
+            PublicationReviewReservation.id == publication.id
+        )
+    )
+    if review_origin != data.review_origin_key:
+        raise PublicationReplayConflict("publication replay has a different review origin")
     reply_conversation_id = data.reply_conversation_id or data.conversation_id
     workspace_conversation_id = (
         data.conversation_id
@@ -114,8 +124,7 @@ async def _adopt_publication_replay(
         or publication.lineage is None
         or publication.lineage.agent_id != deployment.agent_id
         or publication.lineage.conversation_id != workspace_conversation_id
-        or publication.lineage.repo_full_name.casefold()
-        != publication.repo_full_name.casefold()
+        or publication.lineage.repo_full_name.casefold() != publication.repo_full_name.casefold()
     ):
         raise PublicationReplayConflict(
             "publication dedupe key was replayed with different snapshot facts"
@@ -124,9 +133,7 @@ async def _adopt_publication_replay(
         # 0041 canonicalizes every genuinely legacy row. A NULL observed after
         # that migration is corruption or an artificial downgrade lane, never
         # authority to fall back to an adapter-native reply id.
-        raise PublicationReplayConflict(
-            "publication replay has no canonical workspace identity"
-        )
+        raise PublicationReplayConflict("publication replay has no canonical workspace identity")
     authorized_conversation_id = publication.workspace_conversation_id
     await _require_current_publication_workspace(
         session,
@@ -783,7 +790,25 @@ async def create_publication(
         repo_full_name=thread_workspace.repo_full_name,
         for_update=True,
     )
+    reservation: PublicationReviewReservation | None = None
     if lineage is None:
+        if data.review_origin_key is not None:
+            raise PublicationLineageConflict(
+                "publication.review_ineligible", "review origin has no existing lineage"
+            )
+        binding = await session.scalar(
+            select(AgentChannel)
+            .where(
+                AgentChannel.agent_id == deployment.agent_id,
+                AgentChannel.kind == data.reply_kind,
+                AgentChannel.address == data.reply_channel,
+            )
+            .with_for_update()
+        )
+        if binding is not None and (
+            binding.endpoint != data.reply_endpoint or binding.adapter != data.reply_adapter
+        ):
+            binding = None
         lineage_id = uuid.uuid4()
         lineage = ThreadPublicationLineage(
             id=lineage_id,
@@ -796,6 +821,9 @@ async def create_publication(
             status="open",
             version=1,
             latest_revision=1,
+            binding_id=binding.id if binding is not None else None,
+            binding_generation=binding.generation if binding is not None else None,
+            reply_conversation_id=data.reply_conversation_id or data.conversation_id,
         )
         session.add(lineage)
         try:
@@ -849,7 +877,46 @@ async def create_publication(
                 "publication.revision_conflict",
                 "another publication revision is still in progress for this thread",
             )
-        revision_number = lineage.latest_revision + 1
+        reservation = await session.scalar(
+            select(PublicationReviewReservation)
+            .where(
+                PublicationReviewReservation.lineage_id == lineage.id,
+                PublicationReviewReservation.status == "reserved",
+            )
+            .with_for_update()
+        )
+        if reservation is not None:
+            if (
+                data.review_origin_key != reservation.origin_key
+                or reservation.lineage_version != lineage.version
+                or reservation.expected_head_sha != expected_prior_head
+            ):
+                raise PublicationLineageConflict(
+                    "publication.revision_conflict",
+                    "a different review origin or stale head owns this revision",
+                )
+            review_binding = await _require_review_binding(session, lineage)
+            if (
+                data.reply_kind != review_binding.kind
+                or data.reply_channel != review_binding.address
+                or data.reply_endpoint != review_binding.endpoint
+                or data.reply_adapter != review_binding.adapter
+                or (data.reply_conversation_id or data.conversation_id)
+                != lineage.reply_conversation_id
+            ):
+                raise PublicationLineageConflict(
+                    "publication.review_ineligible",
+                    "review publication reply differs from its reserved original binding",
+                )
+            revision_number = reservation.revision_number
+            reservation.status = "consumed"
+            reservation.version += 1
+        elif data.review_origin_key is not None:
+            raise PublicationLineageConflict(
+                "publication.review_ineligible", "review origin has no active reservation"
+            )
+        else:
+            revision_number = lineage.latest_revision + 1
         lineage.latest_revision = revision_number
         lineage.updated_at = func.now()
 
@@ -880,6 +947,7 @@ async def create_publication(
     )
     session.add(approval)
     publication = Publication(
+        id=reservation.id if reservation is not None else uuid.uuid4(),
         approval=approval,
         deployment_id=deployment.id,
         workspace_conversation_id=workspace_conversation_id,
@@ -1021,7 +1089,19 @@ async def publication_lineage_has_pending_revision(
         )
         .limit(1)
     )
-    return pending_id is not None
+    if pending_id is not None:
+        return True
+    return (
+        await session.scalar(
+            select(PublicationReviewReservation.id)
+            .where(
+                PublicationReviewReservation.lineage_id == lineage.id,
+                PublicationReviewReservation.status == "reserved",
+            )
+            .limit(1)
+        )
+        is not None
+    )
 
 
 async def publication_lineage_has_pending_outcome(
@@ -1180,6 +1260,8 @@ async def advance_publication_lineage(
     session: AsyncSession,
     publication_id: uuid.UUID,
     data: PublicationLineageAdvance,
+    *,
+    identity: VerifiedPublicationIdentity | None = None,
 ) -> ThreadPublicationLineage:
     """Atomically advance one approved revision and its exact lineage head."""
 
@@ -1236,6 +1318,52 @@ async def advance_publication_lineage(
             "publication revision must be approved before advancing its lineage",
         )
 
+    identity_values: dict[str, Any] = {}
+    if identity is not None:
+        if lineage.github_repository_id is None:
+            if lineage.pr_number is not None or lineage.binding_id is None:
+                raise PublicationLineageConflict(
+                    "publication.review_ineligible",
+                    "historical lineage identity cannot be reconstructed",
+                )
+        elif (
+            lineage.github_repository_id,
+            lineage.github_installation_id,
+            lineage.github_pr_node_id,
+            lineage.base_ref,
+        ) != (
+            identity.repository_id,
+            identity.installation_id,
+            identity.pr_node_id,
+            identity.base_ref,
+        ):
+            raise PublicationLineageConflict(
+                "publication.lineage_stale", "immutable GitHub lineage identity changed"
+            )
+        binding = (
+            await session.get(AgentChannel, lineage.binding_id, with_for_update=True)
+            if lineage.binding_id is not None
+            else None
+        )
+        if (
+            binding is None
+            or binding.agent_id != lineage.agent_id
+            or binding.generation != lineage.binding_generation
+        ):
+            raise PublicationLineageConflict(
+                "publication.lineage_stale", "original publication binding changed"
+            )
+        identity_values = {
+            "github_repository_id": identity.repository_id,
+            "github_installation_id": identity.installation_id,
+            "github_pr_node_id": identity.pr_node_id,
+            "base_ref": identity.base_ref,
+        }
+    elif lineage.github_repository_id is not None:
+        raise PublicationLineageConflict(
+            "publication.lineage_stale", "verified lineage advance requires current GitHub identity"
+        )
+
     head_predicate = (
         ThreadPublicationLineage.head_sha.is_(None)
         if data.expected_head_sha is None
@@ -1250,6 +1378,7 @@ async def advance_publication_lineage(
             head_predicate,
         )
         .values(
+            **identity_values,
             pr_number=data.pr_number,
             pr_url=data.pr_url,
             head_sha=data.head_sha,
@@ -2057,4 +2186,147 @@ async def revoke_console_session(
     row.revoked_at = now or datetime.now(UTC).replace(tzinfo=None)
     await session.commit()
     await session.refresh(row)
+    return row
+
+
+async def _require_review_binding(
+    session: AsyncSession, lineage: ThreadPublicationLineage
+) -> AgentChannel:
+    """Recheck original authority under the same transaction as reservation use."""
+    binding = (
+        await session.get(
+            AgentChannel, lineage.binding_id, with_for_update=True, populate_existing=True
+        )
+        if lineage.binding_id
+        else None
+    )
+    workspace = await get_thread_workspace(
+        session, agent_id=lineage.agent_id, conversation_id=lineage.conversation_id
+    )
+    deployment = await session.get(
+        Deployment, lineage.deployment_id, with_for_update=True, populate_existing=True
+    )
+    if (
+        binding is None
+        or binding.agent_id != lineage.agent_id
+        or binding.generation != lineage.binding_generation
+        or not lineage.reply_conversation_id
+        or scoped_conversation_id(binding.kind, binding.address, lineage.reply_conversation_id)
+        != lineage.conversation_id
+        or workspace is None
+        or workspace.repo_full_name.casefold() != lineage.repo_full_name.casefold()
+        or not repository_is_allowed(lineage.repo_full_name, get_settings().github_repo_allowlist)
+        or deployment is None
+        or deployment.agent_id != lineage.agent_id
+        or deployment.status != "active"
+    ):
+        raise PublicationLineageConflict(
+            "publication.review_ineligible",
+            "original review binding or workspace is no longer authorized",
+        )
+    return binding
+
+
+async def reserve_review_revision(
+    session: AsyncSession,
+    data: ReviewRevisionReserve,
+) -> tuple[PublicationReviewReservation, ThreadPublicationLineage, bool]:
+    """Reserve in the caller's transaction, so feedback insertion can be atomic.
+
+    No commit, approval, queue entry, or GitHub write occurs here. A reservation
+    is consumed only by PublicationCreate naming its exact accepted origin.
+    """
+    lineage = await session.scalar(
+        select(ThreadPublicationLineage)
+        .where(
+            ThreadPublicationLineage.github_repository_id == data.repository_id,
+            ThreadPublicationLineage.pr_number == data.pr_number,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (
+        lineage is None
+        or lineage.status != "open"
+        or lineage.head_sha is None
+        or lineage.github_installation_id is None
+        or lineage.github_pr_node_id is None
+    ):
+        raise PublicationLineageConflict(
+            "publication.review_ineligible",
+            "no verified open lineage owns this GitHub pull request",
+        )
+    binding = await _require_review_binding(session, lineage)
+    existing = await session.scalar(
+        select(PublicationReviewReservation)
+        .where(PublicationReviewReservation.origin_key == data.origin_key)
+        .with_for_update()
+    )
+    if existing is not None:
+        if (
+            existing.lineage_id != lineage.id
+            or existing.lineage_version != data.expected_lineage_version
+        ):
+            raise PublicationLineageConflict(
+                "publication.revision_conflict",
+                "review origin was replayed with different lineage facts",
+            )
+        return existing, lineage, False
+    if lineage.version != data.expected_lineage_version:
+        raise PublicationLineageConflict(
+            "publication.lineage_stale", "review expected a stale lineage version"
+        )
+    if await publication_lineage_has_pending_revision(
+        session, lineage
+    ) or await publication_lineage_has_pending_outcome(session, lineage):
+        raise PublicationLineageConflict(
+            "publication.revision_conflict",
+            "a revision or its durable outcome already owns this lineage",
+        )
+    row = PublicationReviewReservation(
+        id=uuid.uuid4(),
+        origin_key=data.origin_key,
+        lineage_id=lineage.id,
+        lineage_version=lineage.version,
+        expected_head_sha=lineage.head_sha,
+        revision_number=lineage.latest_revision + 1,
+        binding_id=binding.id,
+        binding_generation=binding.generation,
+        status="reserved",
+        version=1,
+    )
+    session.add(row)
+    try:
+        await session.flush()
+    except IntegrityError:
+        # Caller owns rollback, including its feedback insertion. A reused origin
+        # on a different PR cannot be adopted by this transaction.
+        raise PublicationLineageConflict(
+            "publication.revision_conflict", "review origin is already reserved"
+        ) from None
+    return row, lineage, True
+
+
+async def cancel_review_revision(
+    session: AsyncSession,
+    reservation_id: uuid.UUID,
+    *,
+    origin_key: str,
+    expected_version: int,
+) -> PublicationReviewReservation:
+    row = await session.scalar(
+        select(PublicationReviewReservation)
+        .where(PublicationReviewReservation.id == reservation_id)
+        .with_for_update()
+    )
+    if row is None:
+        raise LookupError("review reservation not found")
+    if row.origin_key != origin_key or row.version != expected_version or row.status != "reserved":
+        raise PublicationLineageConflict(
+            "publication.revision_conflict", "review reservation changed before cancellation"
+        )
+    row.status = "cancelled"
+    row.version += 1
+    row.updated_at = func.now()
+    await session.flush()
     return row

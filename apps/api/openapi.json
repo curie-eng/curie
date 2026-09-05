@@ -3483,6 +3483,19 @@
             "title": "Repo Full Name",
             "type": "string"
           },
+          "review_origin_key": {
+            "anyOf": [
+              {
+                "maxLength": 180,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Origin Key"
+          },
           "summary": {
             "minLength": 1,
             "title": "Summary",
@@ -4046,6 +4059,177 @@
           }
         },
         "title": "ResolvedTarget",
+        "type": "object"
+      },
+      "ReviewRevisionCancel": {
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "origin_key": {
+            "maxLength": 180,
+            "minLength": 1,
+            "title": "Origin Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "origin_key",
+          "expected_version"
+        ],
+        "title": "ReviewRevisionCancel",
+        "type": "object"
+      },
+      "ReviewRevisionOut": {
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "base_ref": {
+            "title": "Base Ref",
+            "type": "string"
+          },
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "binding_generation": {
+            "title": "Binding Generation",
+            "type": "integer"
+          },
+          "binding_id": {
+            "format": "uuid",
+            "title": "Binding Id",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "installation_id": {
+            "title": "Installation Id",
+            "type": "integer"
+          },
+          "lineage_id": {
+            "format": "uuid",
+            "title": "Lineage Id",
+            "type": "string"
+          },
+          "lineage_version": {
+            "title": "Lineage Version",
+            "type": "integer"
+          },
+          "pr_node_id": {
+            "title": "Pr Node Id",
+            "type": "string"
+          },
+          "pr_number": {
+            "title": "Pr Number",
+            "type": "integer"
+          },
+          "reply_conversation_id": {
+            "title": "Reply Conversation Id",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "repository_id": {
+            "title": "Repository Id",
+            "type": "integer"
+          },
+          "revision_id": {
+            "format": "uuid",
+            "title": "Revision Id",
+            "type": "string"
+          },
+          "revision_number": {
+            "title": "Revision Number",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "reserved",
+              "consumed",
+              "cancelled"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision_id",
+          "lineage_id",
+          "agent_id",
+          "conversation_id",
+          "reply_conversation_id",
+          "binding_id",
+          "binding_generation",
+          "repository_id",
+          "installation_id",
+          "pr_node_id",
+          "base_ref",
+          "repo_full_name",
+          "pr_number",
+          "branch",
+          "base_sha",
+          "expected_head_sha",
+          "lineage_version",
+          "revision_number",
+          "version",
+          "status"
+        ],
+        "title": "ReviewRevisionOut",
+        "type": "object"
+      },
+      "ReviewRevisionReserve": {
+        "properties": {
+          "expected_lineage_version": {
+            "minimum": 1.0,
+            "title": "Expected Lineage Version",
+            "type": "integer"
+          },
+          "origin_key": {
+            "maxLength": 180,
+            "minLength": 1,
+            "title": "Origin Key",
+            "type": "string"
+          },
+          "pr_number": {
+            "exclusiveMinimum": 0.0,
+            "title": "Pr Number",
+            "type": "integer"
+          },
+          "repository_id": {
+            "exclusiveMinimum": 0.0,
+            "title": "Repository Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository_id",
+          "pr_number",
+          "expected_lineage_version",
+          "origin_key"
+        ],
+        "title": "ReviewRevisionReserve",
         "type": "object"
       },
       "RoutingCheck": {
@@ -10711,6 +10895,134 @@
           }
         },
         "summary": "Get Publication Lineage",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/review-reservations": {
+      "post": {
+        "operationId": "reserve_review_revision_v1_internal_publications_review_reservations_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewRevisionReserve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewRevisionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reserve Review Revision",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/review-reservations/{reservation_id}/cancel": {
+      "post": {
+        "operationId": "cancel_review_revision_v1_internal_publications_review_reservations__reservation_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "reservation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Reservation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewRevisionCancel"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewRevisionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Review Revision",
         "tags": [
           "internal-publications"
         ]
