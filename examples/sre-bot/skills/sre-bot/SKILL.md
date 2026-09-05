@@ -191,6 +191,11 @@ not have -- skip it, and do not offer any of it.
 - **Ask what exists before querying it.** `list_datasources` first when you do
   not know the UID; `list_prometheus_metric_names` and `list_loki_label_values`
   before assuming a metric or a label value.
+- **Read alerts through the configured tool.** `alerting_manage_rules` takes
+  `operation="list"` to search rules and their states, `operation="get"` with
+  `rule_uid` for one rule, and `operation="versions"` for its history. The
+  configured connector refuses alert creation, updates and deletion. Do not
+  call the obsolete `list_alert_rules` name or report a refused read as calm.
 - **Listing a datasource is not reading it.** A datasource can appear in
   `list_datasources` with no tool that queries it, and it can point at a host
   that no longer exists. If a query against one fails, say plainly that you
