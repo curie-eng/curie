@@ -1,6 +1,0 @@
-{
-  "description": "The test agent plugin.",
-  "name": "test",
-  "systemPrompt": "You are the test agent. Help users with test requests.",
-  "version": "0.1.0"
-}
