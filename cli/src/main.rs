@@ -1510,6 +1510,11 @@ enum ConsoleAction<T: TierDefaults + Clone + Send + Sync + 'static> {
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
         api_key: String,
+        /// Who the session is for. Bound to the code at mint time (ADR-0106),
+        /// so the console session it becomes carries an identity rather than
+        /// being anonymous.
+        #[arg(long, value_name = "SUBJECT")]
+        subject: String,
         /// Where the console is served, for the printed instruction.
         #[arg(long, value_name = "URL")]
         console_url: Option<String>,
@@ -1530,6 +1535,9 @@ enum ClusterConsoleAction {
     Login {
         #[command(flatten)]
         conn: ClusterConn,
+        /// Who the session is for. Bound to the code at mint time (ADR-0106).
+        #[arg(long, value_name = "SUBJECT")]
+        subject: String,
         /// Where the console is served, for the printed instruction.
         #[arg(long, value_name = "URL")]
         console_url: Option<String>,
@@ -3950,6 +3958,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 ConsoleAction::Login {
                     api_url,
                     api_key,
+                    subject,
                     console_url,
                     dry_run,
                     ..
@@ -3957,6 +3966,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     commands::console_login(
                         api_url,
                         api_key,
+                        subject,
                         // The console is served beside the API in the dev stack;
                         // an explicit --console-url wins for anything else.
                         console_url.unwrap_or_else(|| "http://localhost:28080".to_string()),
@@ -5232,12 +5242,16 @@ async fn run(command: Option<Command>) -> Result<()> {
             ClusterAction::Console { action } => match action {
                 ClusterConsoleAction::Login {
                     conn,
+                    subject,
                     console_url,
                     dry_run,
                 } => {
                     let (api_url, api_key, _pf) = resolve_cluster_conn(conn, dry_run).await?;
                     let where_console = console_url.unwrap_or_else(|| api_url.clone());
-                    emit(commands::console_login(api_url, api_key, where_console, dry_run).await?)
+                    emit(
+                        commands::console_login(api_url, api_key, subject, where_console, dry_run)
+                            .await?,
+                    )
                 }
             },
             ClusterAction::Versions { target } => {
