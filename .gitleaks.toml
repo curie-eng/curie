@@ -130,6 +130,11 @@ regexes = [
   # Historical redaction regression input. Every token component is a repeated
   # zero or the literal FAKE marker, so it cannot identify a real Slack app.
   '''\bxapp-0-0000000000-0000000000-FAKEFAKEFAKEFAKE\b''',
+  # Historical warm-pool fixtures use these exact fabricated values to prove
+  # credential rotation and value-free equality. Anchor the complete finding:
+  # another value under either key must still be detected by generic-api-key.
+  '''^STATE_TOKEN_ENV: "sbx\.other2\.sig"$''',
+  '''^GH_TOKEN": "MATERIAL-B-91c2"$''',
 ]
 
 paths = [
