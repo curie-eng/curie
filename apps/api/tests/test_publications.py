@@ -4738,17 +4738,27 @@ def test_review_authority_downgrade_refuses_an_active_reservation(
 
     client, truth, _ = review_lineage_app
     _, _, lineage = _verified_lineage(client, truth, auth_headers)
-    reservation = _reserve_review(client, lineage, "review:retain-on-rollback")
-    assert reservation.status_code == 201, reservation.text
     api_dir = Path(__file__).resolve().parents[1]
     config = Config(str(api_dir / "alembic.ini"))
     config.set_main_option("script_location", str(api_dir / "alembic"))
-    with pytest.raises(RuntimeError, match="revisions are active"):
-        command.downgrade(config, "0041")
-    assert _rows("SELECT version_num FROM curie.alembic_version")[0]["version_num"] == "0042"
-    assert (
-        _rows("SELECT status FROM curie.publication_review_reservations")[0]["status"] == "reserved"
-    )
+    original_revision = _rows("SELECT version_num FROM curie.alembic_version")
+    try:
+        # #2300 commits each migration independently. Exercise the authority
+        # guard at its own boundary, after higher revisions have safely retired.
+        command.downgrade(config, "0042")
+        before_revision = _rows("SELECT version_num FROM curie.alembic_version")
+        assert before_revision == [{"version_num": "0042"}]
+        reservation = _reserve_review(client, lineage, "review:retain-on-rollback")
+        assert reservation.status_code == 201, reservation.text
+        before_reservation = _rows("SELECT * FROM curie.publication_review_reservations")
+        assert [row["status"] for row in before_reservation] == ["reserved"]
+        with pytest.raises(RuntimeError, match="revisions are active"):
+            command.downgrade(config, "0041")
+        assert _rows("SELECT version_num FROM curie.alembic_version") == before_revision
+        assert _rows("SELECT * FROM curie.publication_review_reservations") == before_reservation
+    finally:
+        command.upgrade(config, original_revision[0]["version_num"])
+    assert _rows("SELECT version_num FROM curie.alembic_version") == original_revision
 
 
 @pytest.mark.parametrize(

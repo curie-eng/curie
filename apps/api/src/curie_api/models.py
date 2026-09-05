@@ -555,6 +555,96 @@ class PublicationReviewReservation(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+class GitHubReviewDelivery(Base):
+    """One authenticated webhook receipt, including ignored actions and aliases."""
+
+    __tablename__ = "github_review_deliveries"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','accepted','ignored','rejected','retryable')",
+            name="github_review_deliveries_status_ck",
+        ),
+        CheckConstraint(
+            "version >= 1 AND replay_conflicts >= 0", name="github_review_deliveries_version_ck"
+        ),
+        CheckConstraint("length(body_sha256) = 64", name="github_review_deliveries_digest_ck"),
+        CheckConstraint(
+            "status IN ('pending','accepted') OR reason IS NOT NULL",
+            name="github_review_deliveries_reason_ck",
+        ),
+    )
+    delivery_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    event_kind: Mapped[str]
+    action: Mapped[str]
+    body_sha256: Mapped[str]
+    repository_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    pr_number: Mapped[int | None] = mapped_column(default=None)
+    source_object_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sender_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sender_type: Mapped[str]
+    sender_login: Mapped[str | None] = mapped_column(default=None)
+    author_association: Mapped[str]
+    event_id: Mapped[str | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.github_review_feedback.event_id", ondelete="SET NULL"),
+        default=None,
+    )
+    status: Mapped[str] = mapped_column(default="pending", server_default="pending")
+    reason: Mapped[str | None] = mapped_column(default=None)
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    replay_conflicts: Mapped[int] = mapped_column(default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class GitHubReviewFeedback(Base):
+    """One immutable human feedback identity and its durable enqueue receipt."""
+
+    __tablename__ = "github_review_feedback"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('waiting', 'queued', 'reserved', 'settled', 'refused', 'dead_lettered')",
+            name="github_review_feedback_status_ck",
+        ),
+        CheckConstraint("version >= 1", name="github_review_feedback_version_ck"),
+        CheckConstraint("enqueue_attempts >= 0", name="github_review_feedback_attempts_ck"),
+        Index("ix_github_review_feedback_pending", "status", "created_at"),
+    )
+
+    event_id: Mapped[str] = mapped_column(primary_key=True)
+    delivery_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), unique=True)
+    # Keep the semantic tombstone if an operator deletes the old binding or
+    # lineage. Recreating one cannot make an old comment executable again.
+    lineage_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="SET NULL")
+    )
+    binding_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_channels.id", ondelete="SET NULL")
+    )
+    binding_generation: Mapped[int]
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    lineage_version: Mapped[int]
+    reservation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publication_review_reservations.id", ondelete="SET NULL"),
+        default=None,
+    )
+    # Only normalized, bounded feedback and a credential-free QueuedTurn; never
+    # the unfiltered webhook body, headers or a GitHub credential.
+    feedback: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    turn: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    traceparent: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    enqueue_attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    quota_taken: Mapped[bool] = mapped_column(default=False, server_default="false")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(default=None)
+    error_code: Mapped[str | None] = mapped_column(default=None)
+    stream_id: Mapped[str | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    queued_at: Mapped[datetime | None] = mapped_column(default=None)
+    terminal_scan_cursor: Mapped[str | None] = mapped_column(default=None)
+
+
 class Publication(Base):
     """Private patch state settled by the platform publication reconciler."""
 

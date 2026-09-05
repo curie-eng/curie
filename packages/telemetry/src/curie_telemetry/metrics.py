@@ -215,6 +215,8 @@ _HTTP_OPERATIONS = [
     "/publications/{publication_id}",
     "/v1/internal/cluster-message-replies/{reply_ref}",
     "/v1/internal/publications",
+    "/v1/internal/github/reviews/{event_id}/reserve",
+    "/v1/internal/github/reviews/{event_id}/verify",
     "/v1/internal/publications/lineage",
     "/v1/internal/publications/review-reservations",
     "/v1/internal/publications/review-reservations/{reservation_id}/cancel",

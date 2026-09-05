@@ -84,6 +84,8 @@ from .approvals import (
     PublicationCreateRequest,
     PublicationCreator,
     PublicationLineage,
+    ReviewAuthorityUnavailable,
+    VerifiedReviewFeedback,
 )
 from .behaviorpacks import (
     BehaviorPacks,
@@ -572,6 +574,7 @@ class TurnOutcome:
     approval_granted_tool: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
+    review_origin_key: str | None = None
 
 
 class ThreadBusyError(RuntimeError):
@@ -2241,6 +2244,9 @@ class Kernel:
         # next same-thread event can route, and release the Valkey lock before
         # streaming so a follow-up can steer.
         routed: _RouteResult | None = None
+        review_head: str | None = None
+        review_receipt: str | None = None
+        verified_review: VerifiedReviewFeedback | None = None
 
         def close_routed_turn() -> None:
             if routed is not None and routed.turn is not None:
@@ -2248,6 +2254,36 @@ class Kernel:
 
         try:
             try:
+                if qevent.event_id.startswith("github-feedback-"):
+                    verifier = getattr(
+                        self._publication_creator, "verify_review_feedback", None
+                    )
+                    if verifier is None or workspace_deployment_id is None:
+                        raise WorkspaceSelectionRefused(
+                            "GitHub feedback requires a configured trusted workspace verifier; "
+                            "no model turn started."
+                        )
+                    try:
+                        started = time.monotonic()
+                        try:
+                            async with asyncio.timeout(remaining_s):
+                                verified = await verifier(qevent, workspace_deployment_id)
+                        finally:
+                            if remaining_s is not None:
+                                remaining_s = max(0.0, remaining_s - (time.monotonic() - started))
+                    except (ApprovalBackendError, TimeoutError):
+                        # No model turn has started. Preserve the same delivery
+                        # for bounded reclaim, rather than exhausting the model
+                        # attempt budget and ACKing feedback that never ran.
+                        raise ReviewAuthorityUnavailable(
+                            "GitHub feedback verification is temporarily unavailable"
+                        ) from None
+                    if verified.agent_id != agent_id or verified.sender != qevent.author:
+                        raise WorkspaceSelectionRefused(
+                            "GitHub feedback no longer belongs to this conversation."
+                        )
+                    review_head, review_receipt = verified.head_sha, verified.receipt
+                    verified_review = verified
                 async with self._lock.hold(self._config.lock_key(thread_key)):
                     routed = await self._route_and_start(
                         thread_key,
@@ -2258,6 +2294,9 @@ class Kernel:
                         agent_name=agent_name,
                         source=qevent.source,
                         remaining_s=remaining_s,
+                        required_review_head=review_head,
+                        verified_review=verified_review,
+                        review_turn=qevent if verified_review is not None else None,
                     )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -2369,6 +2408,16 @@ class Kernel:
             logger.warning("turn start failed for %s: %r", qevent.event_id, exc)
             return TurnOutcome(terminal_ok=False, classification="runner-error")
         assert routed is not None
+        if review_receipt is not None:
+            try:
+                await self._reply_for(qevent, route, review_receipt)
+            except asyncio.CancelledError:
+                close_routed_turn()
+                raise
+            except Exception:
+                # The turn's result uses the existing durable completion path;
+                # a receipt delivery outage cannot start a second model turn.
+                logger.warning("GitHub feedback receipt delivery unavailable")
         try:
             release_order()
         except BaseException:
@@ -2424,6 +2473,8 @@ class Kernel:
             ):
                 await self.interrupt_thread(thread_key, f"agent {agent_id} killed by operator")
             outcome = await self._consume(qevent, route, turn, nav, agent_id)
+            if verified_review is not None:
+                outcome.review_origin_key = verified_review.origin_key
             if (
                 outcome.status is SessionStatus.AWAITING_APPROVAL
                 and _is_publish_provenance(
@@ -2490,6 +2541,9 @@ class Kernel:
         publication_visible_outcome_revision: int | None = None,
         force_lineage_replacement: bool = False,
         pending_publication_approval: bool = False,
+        required_review_head: str | None = None,
+        verified_review: VerifiedReviewFeedback | None = None,
+        review_turn: QueuedTurn | None = None,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
         # before any platform response path. This deliberately precedes the
@@ -2502,7 +2556,12 @@ class Kernel:
                 raise WorkspacePreparationError(
                     "wiring", "workspace-enabled deployment has no trusted coordinator"
                 )
-            repo_fact = parse_github_repo_fact(event.text)
+            # A verified review already belongs to the persisted workspace. Its
+            # untrusted body may link other repositories; those are context,
+            # never a request to select a different workspace.
+            repo_fact = (
+                None if required_review_head is not None else parse_github_repo_fact(event.text)
+            )
             workspace_repo = await asyncio.to_thread(
                 self._workspace.select_repository,
                 thread_key=thread_key,
@@ -2535,7 +2594,18 @@ class Kernel:
                         # turn can observe it. Refuse before lookup/adopt so a
                         # failed suspend cannot reuse the dirty runner across
                         # either boundary.
-                        raise PendingPublicationError(thread_key)
+                        if verified_review is None:
+                            raise PendingPublicationError(thread_key)
+                        if (
+                            lineage.has_pending_outcome
+                            or verified_review.reservation_id is None
+                        ):
+                            raise ThreadBusyError(
+                                f"thread {thread_key} is waiting for its earlier publication"
+                            )
+                        # Only the API-verified origin may reuse its own reserved
+                        # boundary. The DB-only reserve CAS below rechecks this
+                        # again before any model input, including on reclaim.
                     if lineage is not None and lineage.head_sha is not None:
                         lineage_branch = lineage.branch
                         lineage_head = lineage.head_sha
@@ -2548,6 +2618,11 @@ class Kernel:
                             and lineage.visible_outcome_revision > 0
                         ):
                             lineage_base_sha = lineage.base_sha
+        if required_review_head is not None and lineage_head != required_review_head:
+            raise WorkspaceSelectionRefused(
+                "The pull request changed after GitHub feedback verification; "
+                "no model turn started."
+            )
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
         # the thread has no existing route, it is provably a NEW turn (it cannot be
@@ -2562,6 +2637,21 @@ class Kernel:
         # mere presence of an affinity record as proof that a live route was
         # retained.
         existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+        if (
+            required_review_head is not None
+            and existing_handle is not None
+            and not await self._workspace_handoff_ready(
+                existing_handle, remaining_s=remaining_s
+            )
+        ):
+            # The API-verified review owns a later publication revision. A steer
+            # cannot attribute an earlier turn's publication gate to this event,
+            # so retain this delivery in the existing bounded queue until the
+            # active turn has reached an idle, durable boundary. Ordinary Slack
+            # still follows its immediate steering path below.
+            raise ThreadBusyError(
+                f"thread {thread_key} is not ready for its queued review revision"
+            )
         materialized_lineage_head = lineage_head or lineage_base_sha
         if (
             materialized_lineage_head is not None
@@ -2612,7 +2702,7 @@ class Kernel:
             raise ThreadBusyError(
                 f"thread {thread_key} has not reached a durable workspace handoff boundary"
             )
-        if packs is not None:
+        if packs is not None and required_review_head is None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None and existing_handle is None:
                 return _RouteResult(steered=False, canned_reply=reply)
@@ -2659,7 +2749,7 @@ class Kernel:
         retained_live_route = existing_handle is not None and handle == existing_handle
         claim_ms = round((time.monotonic() - claim_started) * 1000)
         logger.info("claim latency for %s: %d ms", thread_key, claim_ms)
-        if source.is_job:
+        if source.is_job or required_review_head is not None:
             # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
             # a webhook must never fold itself into whatever a person is currently
             # saying, so this path does not attempt a steer at all.
@@ -2723,6 +2813,25 @@ class Kernel:
             if retained_live_route and active_before_steer:
                 _record_route("finish-race")
                 _lifecycle_event("runner.finish_race", "finish-race")
+        if verified_review is not None:
+            if (
+                review_turn is None
+                or workspace_deployment_id is None
+                or verified_review.origin_key != review_turn.event_id
+                or self._publication_creator is None
+            ):
+                raise WorkspaceSelectionRefused("GitHub feedback revision identity was refused.")
+            try:
+                await self._publication_creator.reserve_review_feedback(
+                    review_turn, workspace_deployment_id, verified_review
+                )
+            except ApprovalBackendError:
+                # The reserve sibling has the same pre-model transport policy.
+                # A transport failure must revalidate the exact origin
+                # on reclaim; the existing SQL reservation CAS remains sole writer.
+                raise ReviewAuthorityUnavailable(
+                    "GitHub review reservation is temporarily unavailable"
+                ) from None
         # The per-request timeout is min(runner_total_timeout_s, remaining
         # delivery budget): the budget can only ever SHORTEN a request, never
         # grant one more time than the delivery has left (ADR-0131).
@@ -3320,6 +3429,7 @@ class Kernel:
                         title=snapshot.publication_title,
                         body=snapshot.publication_body,
                         max_patch_bytes=self._config.publication_patch_max_bytes,
+                        review_origin_key=outcome.review_origin_key,
                     )
                 )
                 created = CreatedApproval(

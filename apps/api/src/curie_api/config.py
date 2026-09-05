@@ -126,6 +126,7 @@ class Settings(BaseSettings):
     # Git flow (J1). The webhook secret authenticates inbound GitHub events; the
     # two bot identities are the routing targets recorded on each deployment.
     github_webhook_secret: str = "dev-webhook-secret"
+    github_review_ingress_enabled: bool = False
     dev_branch: str = "dev"
     prod_branch: str = "main"
     # Outbound GitHub credential. Used for the eval PR check's commit-status
@@ -150,6 +151,9 @@ class Settings(BaseSettings):
     # never place it in argv.
     github_app_private_key: str = ""
     github_app_timeout_seconds: float = 15.0
+    # Durable human-review outbox. Zero disables only the periodic backstop;
+    # authenticated ingress still attempts an immediate enqueue.
+    github_review_reconciler_interval_s: float = Field(default=5.0, ge=0)
     # Repositories the runtime workspace selector may bind to a thread. Exact
     # owner/repository entries and owner-wide owner/* entries are supported.
     # Empty is fail-closed: enabling workspace capability alone grants no
@@ -194,6 +198,10 @@ class Settings(BaseSettings):
     valkey_host: str = "localhost"
     valkey_port: int = 26379
     valkey_url: str | None = None
+
+    # Read-only observer of worker terminal markers. WorkerConfig consumes the
+    # unprefixed KEY_PREFIX variable; CURIE_KEY_PREFIX is not its configuration.
+    worker_key_prefix: str = Field(default="curie:worker", validation_alias="KEY_PREFIX")
 
     # The runs stream approval resolutions enqueue resume turns onto (#244).
     # Must match the worker's CURIE_STREAM (its consumer side) -- which is why
@@ -400,6 +408,18 @@ class Settings(BaseSettings):
         if self.valkey_url:
             return self.valkey_url
         return f"redis://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
+
+    @model_validator(mode="after")
+    def _validate_review_ingress(self) -> "Settings":
+        if self.github_review_ingress_enabled and (
+            not self.github_app_id.strip()
+            or not self.github_app_private_key.strip()
+            or self.github_webhook_secret.strip() in ("", _DEV_DEFAULT_WEBHOOK_SECRET)
+        ):
+            raise ValueError(
+                "GitHub review ingress requires a configured App and non-default webhook secret"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_github_repo_allowlist(self) -> "Settings":

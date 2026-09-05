@@ -3984,6 +3984,101 @@
         "title": "PublicationOut",
         "type": "object"
       },
+      "QueuedTurn": {
+        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.",
+        "properties": {
+          "author": {
+            "title": "Author",
+            "type": "string"
+          },
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "received_at": {
+            "title": "Received At",
+            "type": "string"
+          },
+          "reply_handle": {
+            "$ref": "#/components/schemas/ReplyHandle"
+          },
+          "source": {
+            "$ref": "#/components/schemas/TurnSource",
+            "default": "slack"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "conversation_id",
+          "author",
+          "text",
+          "reply_handle",
+          "received_at"
+        ],
+        "title": "QueuedTurn",
+        "type": "object"
+      },
+      "ReplyHandle": {
+        "description": "Channel-neutral coordinates for where a turn's reply is delivered.\n\n``kind`` and ``channel`` are the **routing pair** (ADR-0096): the channel kind\n(``slack``, ``email``, ...) plus the address within that kind. Both halves are\nneeded to resolve the binding, because one address can legitimately exist under\ntwo kinds. ``kind`` is REQUIRED and deliberately has no default: an optional\nkind forces the resolver to invent one, and every honest answer there is an\naddress-only fallback or a ``\"slack\"`` guess -- the silent misroute this field\nexists to close.\n\nThe reply model supports editing an existing reply or carrying no existing\nreply reference. ``placeholder`` is a required, nullable, opaque correlation\nhandle minted by the adapter. The worker never parses it and only ever hands\nit back to the adapter that minted it. For the Slack adapter it happens to be\nthe ts of the preposted placeholder message. For another kind it is whatever\nthat adapter needs to find the same message again. ``None`` means this turn\nhas no existing reply to edit.\n\n``endpoint`` is the per-turn reply target: the base URL of the channel API the\nworker delivers this turn's reply through. It routes the reply back to the\ningress that enqueued the turn instead of a worker-global setting, so two\ningress paths (a real Slack workspace and a no-Slack CLI stub) can coexist on\none worker (issue #19). ``None`` means \"use the worker's configured default\"\n(its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set\nit keeps the pre-#19 behavior.\n\n``adapter`` names the egress adapter identity whose credential authenticates\nthe reply, so a sink call made *before* binding resolution can still select the\nright credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both\n**platform-set from the binding row** (never accepted from an ingress request\nbody); ``slack`` legitimately carries neither, because its route is the\nworker's configured Slack origin. ``adapter`` is optional at the schema so a\nthird-party or pre-upgrade producer is not rejected outright, but every\nfirst-party mint site sets it explicitly.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "channel": {
+            "title": "Channel",
+            "type": "string"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "placeholder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Placeholder"
+          }
+        },
+        "required": [
+          "kind",
+          "channel",
+          "placeholder"
+        ],
+        "title": "ReplyHandle",
+        "type": "object"
+      },
       "RepositoryCredentialOut": {
         "description": "One server-derived Git credential returned only to the trusted worker.",
         "properties": {
@@ -4059,6 +4154,56 @@
           }
         },
         "title": "ResolvedTarget",
+        "type": "object"
+      },
+      "ReviewReservationOut": {
+        "properties": {
+          "origin_key": {
+            "title": "Origin Key",
+            "type": "string"
+          },
+          "reservation_id": {
+            "format": "uuid",
+            "title": "Reservation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "origin_key",
+          "reservation_id"
+        ],
+        "title": "ReviewReservationOut",
+        "type": "object"
+      },
+      "ReviewReservationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "pattern": "^[0-9a-f]{40}$",
+            "title": "Expected Head Sha",
+            "type": "string"
+          },
+          "expected_lineage_version": {
+            "minimum": 1.0,
+            "title": "Expected Lineage Version",
+            "type": "integer"
+          },
+          "turn": {
+            "$ref": "#/components/schemas/QueuedTurn"
+          }
+        },
+        "required": [
+          "turn",
+          "deployment_id",
+          "expected_lineage_version",
+          "expected_head_sha"
+        ],
+        "title": "ReviewReservationRequest",
         "type": "object"
       },
       "ReviewRevisionCancel": {
@@ -4230,6 +4375,77 @@
           "origin_key"
         ],
         "title": "ReviewRevisionReserve",
+        "type": "object"
+      },
+      "ReviewVerificationOut": {
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "lineage_version": {
+            "title": "Lineage Version",
+            "type": "integer"
+          },
+          "origin_key": {
+            "title": "Origin Key",
+            "type": "string"
+          },
+          "receipt": {
+            "title": "Receipt",
+            "type": "string"
+          },
+          "reservation_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reservation Id"
+          },
+          "sender": {
+            "title": "Sender",
+            "type": "string"
+          }
+        },
+        "required": [
+          "head_sha",
+          "agent_id",
+          "sender",
+          "receipt",
+          "origin_key",
+          "lineage_version",
+          "reservation_id"
+        ],
+        "title": "ReviewVerificationOut",
+        "type": "object"
+      },
+      "ReviewVerificationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "turn": {
+            "$ref": "#/components/schemas/QueuedTurn"
+          }
+        },
+        "required": [
+          "turn",
+          "deployment_id"
+        ],
+        "title": "ReviewVerificationRequest",
         "type": "object"
       },
       "RoutingCheck": {
@@ -4632,6 +4848,16 @@
         ],
         "title": "TurnAccepted",
         "type": "object"
+      },
+      "TurnSource": {
+        "description": "What started this turn: a person speaking, or the system doing a job.\n\nADR-0079's new event kind. The values are the three the ADR names, and the\ndistinction the kernel actually acts on is binary: ``SLACK`` is a person's\nmessage and may steer a live turn; ``WEBHOOK`` and ``CRON`` are jobs, and a\njob is an OUTPUT, never a steering input. ``is_job`` is that predicate, kept\nhere rather than re-derived at each call site so a fourth value cannot be\nadded without deciding which side of the line it falls on.\n\n**This is a different axis from ``ReplyHandle.kind`` and the two do not\ncollapse.** ``kind`` answers *where the reply goes* (slack, email); ``source``\nanswers *what caused the turn*. A nightly digest posted into a Slack channel\nis ``kind=\"slack\"`` with ``source=CRON``: same transport as a mention, and it\nmust not steer whatever conversation is live in that thread. Reading either\nfield off the other is the silent misroute both exist to close.\n\n``SLACK`` is the ADR's spelling for \"a person's chat message\", which was the\nonly such ingress when ADR-0079 was accepted. A channel port turn from a\nhuman on another transport (an email that a person actually sent) is that\nsame category on a different ``kind``, and giving it its own value is a NEW\nENUM VALUE -- breaking under this package's rules, so it is a deliberate,\nseparately-decided bump rather than something this change assumes.",
+        "enum": [
+          "slack",
+          "webhook",
+          "cron"
+        ],
+        "title": "TurnSource",
+        "type": "string"
       },
       "ValidationError": {
         "properties": {
@@ -9771,6 +9997,16 @@
           },
           {
             "in": "header",
+            "name": "x-github-delivery",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Github-Delivery",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
             "name": "x-hub-signature-256",
             "required": false,
             "schema": {
@@ -10761,6 +10997,142 @@
         "summary": "Append Cluster Message Reply",
         "tags": [
           "internal-cluster-message-replies"
+        ]
+      }
+    },
+    "/v1/internal/github/reviews/{event_id}/reserve": {
+      "post": {
+        "operationId": "reserve_review_v1_internal_github_reviews__event_id__reserve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "event_id",
+            "required": true,
+            "schema": {
+              "title": "Event Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewReservationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewReservationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reserve Review",
+        "tags": [
+          "internal-github-reviews"
+        ]
+      }
+    },
+    "/v1/internal/github/reviews/{event_id}/verify": {
+      "post": {
+        "operationId": "verify_review_v1_internal_github_reviews__event_id__verify_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "event_id",
+            "required": true,
+            "schema": {
+              "title": "Event Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewVerificationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewVerificationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify Review",
+        "tags": [
+          "internal-github-reviews"
         ]
       }
     },
