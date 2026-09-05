@@ -299,6 +299,34 @@ fn missing_slack_secret_skips_with_reason_in_the_summary() {
 }
 
 #[test]
+fn missing_prerequisites_fail_required_live_acceptance() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let output = run_script("prereqs", &[("CURIE_SRE_DEMO_REQUIRED", "1")], work.path());
+    assert!(
+        !output.status.success(),
+        "required live acceptance cannot skip green"
+    );
+    let github_output = fs::read_to_string(work.path().join("output.txt")).unwrap_or_default();
+    assert!(github_output.contains("ready=false"));
+}
+
+#[test]
+fn outcome_checks_reject_false_positives_by_execution() {
+    let output = Command::new("uv")
+        .args(["run", "--locked", "--package", "curie-runner", "python"])
+        .current_dir(repo_root())
+        .arg(repo_root().join("cli/tests/sre_demo_e2e_test.py"))
+        .output()
+        .expect("execute outcome regression tests");
+    assert!(
+        output.status.success(),
+        "outcome regression failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn populated_prereqs_report_ready_without_touching_slack_or_kind() {
     let work = tempfile::tempdir().expect("tempdir");
     let output = run_script("prereqs", &populated_prereqs(), work.path());
