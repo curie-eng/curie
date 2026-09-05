@@ -324,7 +324,7 @@ impl SecretValuesFileGuard {
         Self::write_document(&nest_dotted_keys(pairs))
     }
 
-    fn write_document(doc: &serde_json::Value) -> Result<Self> {
+    pub(crate) fn write_document(doc: &serde_json::Value) -> Result<Self> {
         ensure_secret_signal_cleanup()?;
         let body = serde_json::to_vec(doc).context("serializing secret helm values")?;
 
@@ -360,6 +360,10 @@ impl SecretValuesFileGuard {
         let guard = Self { path };
         test_pause_after_first_secret_file();
         Ok(guard)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
     }
 }
 
@@ -498,6 +502,45 @@ pub(crate) fn require_on_path(bin: &str) -> Result<()> {
 
 /// Run one command capturing stdout; returns (success, stdout, stderr).
 pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
+    capture_process(cmd, false, None).await
+}
+
+/// Capture the Helm mutation owned by the transactional upgrade. On Linux its
+/// direct child is also stopped when the spawning CLI thread dies. This does
+/// not stop Kubernetes hook Jobs, plugins' descendants, or remote writers.
+pub(super) async fn run_upgrade_capture(
+    cmd: &OpsCommand,
+    ownership_fd: Option<i32>,
+) -> Result<(bool, String, String)> {
+    capture_process(cmd, true, ownership_fd).await
+}
+
+#[cfg(target_os = "linux")]
+fn arm_parent_death(expected_parent: libc::pid_t) -> std::io::Result<()> {
+    // The signal is preserved by ordinary exec, but is cleared by fork and
+    // privileged exec/credential changes. Supported Helm is an ordinary direct
+    // executable, not a wrapper or privilege-changing launcher. The signal is
+    // tied to the spawning thread; that thread awaits this child to completion.
+    // https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html
+    // SAFETY: pre_exec may not allocate or lock. These libc calls and raw errno
+    // construction perform neither. Capture the expected PID before fork and
+    // recheck after arming so a parent that already died cannot escape the guard.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::getppid() != expected_parent {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+    }
+    Ok(())
+}
+
+async fn capture_process(
+    cmd: &OpsCommand,
+    owned_upgrade: bool,
+    ownership_fd: Option<i32>,
+) -> Result<(bool, String, String)> {
     // Materialize any secret values into a private 0600 `-f` file so the secret
     // stays out of the argv/process table. `_secret_files` guards live until the
     // end of this function, so the temp files are removed after `helm` exits
@@ -510,10 +553,38 @@ pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
     // reads by a timeout for a wedged daemon, and each timed-out call would
     // otherwise strand another hung `docker` client (#1031). Inert for every
     // caller that awaits to completion: the child has already exited by then.
-    let output = Command::new(&cmd.program)
+    let mut process = Command::new(&cmd.program);
+    process
         .args(cmd.argv())
         .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    if owned_upgrade {
+        #[cfg(target_os = "linux")]
+        let expected_parent = unsafe { libc::getpid() };
+        // SAFETY: the callback only executes the non-allocating libc/errno
+        // operations documented in arm_parent_death.
+        unsafe {
+            process.pre_exec(move || {
+                #[cfg(target_os = "linux")]
+                arm_parent_death(expected_parent)?;
+                if let Some(fd) = ownership_fd {
+                    // Keep the same flock open description through direct Helm
+                    // exec. Parent exit cannot release ownership before this
+                    // child exits. fcntl affects only the forked descriptor table.
+                    if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    // Non-Unix targets retain ordinary subprocess behavior. On macOS the lock
+    // is inherited, but Linux's parent-death signal is not claimed or emulated.
+    #[cfg(not(unix))]
+    let _ = (owned_upgrade, ownership_fd);
+    let output = process
         .output()
         .await
         .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
@@ -748,5 +819,28 @@ mod tests {
             !line.contains("ghp-SENTI"),
             "a ninth token character reached the printed form: {line}"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod owned_upgrade_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parent_changed_before_guard_refuses_before_exec() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("must-not-run");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf reached > \"$1\"", "sh"]);
+        command.arg(&marker);
+        // An impossible parent PID deterministically exercises the same
+        // post-arm identity check used when the real owner dies before arming.
+        // The consumer is actual spawn/exec, not an internal flag assertion.
+        unsafe {
+            command.pre_exec(|| arm_parent_death(0));
+        }
+        let error = command.output().await.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert!(!marker.exists());
     }
 }

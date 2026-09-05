@@ -1,3 +1,10 @@
+# Internal transactional CLI hook witness. Ordinary upgrades leave this disabled.
+# Retained Jobs alone do not authorize recovery. Recovery consumers must verify
+# ownership and every original hook/Pod before any forward reapplication.
+upgradeRecovery:
+  enabled: false
+  operationId: ""
+
 # Default values for the Curie umbrella chart.
 #
 # Conventions (do not break):

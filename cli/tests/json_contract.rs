@@ -2482,7 +2482,7 @@ fn cluster_upgrade_output_validates_dry_run_success_and_failure() {
         previous_serving: true,
         unchanged: false,
         plan: vec!["phase plan: 0.8.6 -> 0.9.0".into()],
-        convergence: Some(curie::ops::Convergence {
+        convergence: Some(Box::new(curie::ops::Convergence {
             exact: true,
             images: true,
             generations: true,
@@ -2491,11 +2491,52 @@ fn cluster_upgrade_output_validates_dry_run_success_and_failure() {
             hooks_healthy: true,
             queues_drained: true,
             manifest_matches: true,
-        }),
+            observed_images: Vec::new(),
+        })),
         canary: Some(curie::ops::Canary { passed: true }),
         fail_forward: None,
     };
     assert_valid("cluster-upgrade.schema.json", &succeeded.to_json());
+    // ADR-0101: an optional observation field versions the closed schema,
+    // while the same new schema must still accept the older payload shape.
+    let mut observed = succeeded.to_json();
+    observed["convergence"]["observed_images"] = serde_json::json!([{
+        "workload": "acme-bot-api",
+        "pod": "acme-bot-api-example",
+        "container": "api",
+        "image": "example.com/acme-api:0.9.0",
+        "image_id": "containerd://sha256:example"
+    }]);
+    assert_valid("cluster-upgrade.schema.json", &observed);
+    let schema = load_schema("cluster-upgrade.schema.json");
+    assert_eq!(
+        schema["$id"],
+        "https://schemas.curietech.ai/cli/cluster-upgrade/v1.1.json"
+    );
+    let check = validator(&schema);
+    for invalid in [
+        serde_json::json!("not an observation array"),
+        serde_json::json!([{"workload": "acme-bot-api"}]),
+        serde_json::json!([{"workload": "acme-bot-api", "pod": "pod", "container": "api", "image": 9, "image_id": "opaque"}]),
+        serde_json::json!([{"workload": "acme-bot-api", "pod": "pod", "container": "api", "image": "example.com/acme-api:0.9.0", "image_id": "opaque", "unexpected": true}]),
+    ] {
+        let mut bad = observed.clone();
+        bad["convergence"]["observed_images"] = invalid;
+        assert!(
+            !check.is_valid(&bad),
+            "invalid image observation accepted: {bad}"
+        );
+    }
+    let mut old = observed.clone();
+    old["convergence"]
+        .as_object_mut()
+        .unwrap()
+        .remove("observed_images");
+    assert!(
+        check.is_valid(&old),
+        "new optional field must not invalidate old output: {old}"
+    );
+
     let failed = ClusterUpgradeOutput::Completed {
         status: "failed".into(),
         phase: "canary".into(),
@@ -2506,7 +2547,7 @@ fn cluster_upgrade_output_validates_dry_run_success_and_failure() {
         previous_serving: true,
         unchanged: false,
         plan: vec!["phase plan: 0.8.6 -> 0.9.0".into()],
-        convergence: Some(curie::ops::Convergence {
+        convergence: Some(Box::new(curie::ops::Convergence {
             exact: true,
             images: true,
             generations: true,
@@ -2515,7 +2556,8 @@ fn cluster_upgrade_output_validates_dry_run_success_and_failure() {
             hooks_healthy: true,
             queues_drained: true,
             manifest_matches: true,
-        }),
+            observed_images: Vec::new(),
+        })),
         canary: Some(curie::ops::Canary { passed: false }),
         fail_forward: Some(curie::ops::FailForward {
             command: "curie cluster rollback --yes".into(),

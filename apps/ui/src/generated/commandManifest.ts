@@ -2825,6 +2825,18 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Apply contract or irreversible migrations using the documented forward-only procedure",
+              "id": "forward_only",
+              "long": "forward-only",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Skip the interactive confirmation prompt",
               "id": "yes",
               "long": "yes",

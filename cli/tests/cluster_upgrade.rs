@@ -24,6 +24,7 @@ fn opts(to: &str) -> UpgradeOpts {
         to: to.into(),
         chart: None,
         yes: true,
+        forward_only: false,
     }
 }
 

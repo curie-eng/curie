@@ -123,7 +123,7 @@ fn workloads_command(namespace: &str) -> OpsCommand {
     )
 }
 
-fn node_images_command(node: &str) -> OpsCommand {
+pub(super) fn node_images_command(node: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -155,7 +155,7 @@ async fn helm_status(opts: &CommonOpts) -> Result<Value> {
     serde_json::from_str(&raw).context("Helm release state is malformed")
 }
 
-fn normalize_image(image: &str) -> String {
+pub(super) fn normalize_image(image: &str) -> String {
     let mut image = image.to_owned();
     let first = image.split('/').next().unwrap_or("");
     if !image.contains('/') {
@@ -187,12 +187,12 @@ fn manifest_identity(image: &str) -> Option<String> {
     Some(format!("{repository}@{digest}"))
 }
 
-fn needs_node_identity(expected: &str, status: &Value) -> bool {
+pub(super) fn needs_node_identity(expected: &str, status: &Value) -> bool {
     manifest_identity(expected).is_none()
         && normalize_image(text(status, "/image")) != normalize_image(expected)
 }
 
-fn observed_image_matches(expected: &str, status: &Value, node: Option<&Value>) -> bool {
+pub(super) fn observed_image_matches(expected: &str, status: &Value, node: Option<&Value>) -> bool {
     let image_id = text(status, "/imageID");
     if let Some(expected) = manifest_identity(expected) {
         // Containerd can report a config SHA in status.image for a digest-pinned

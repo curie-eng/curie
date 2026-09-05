@@ -799,6 +799,7 @@ dependencies = [
  "jsonschema",
  "jsonwebtoken",
  "keyring",
+ "libc",
  "proc-macro2",
  "quote",
  "ratatui",

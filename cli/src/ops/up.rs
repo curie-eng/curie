@@ -1743,6 +1743,20 @@ pub async fn fetch_release_values(o: &CommonOpts) -> Result<Option<serde_json::V
     fetch_existing_values(o).await
 }
 
+/// Transactional upgrade keeps every read on its captured Kubernetes target.
+/// Parsing and absent-release semantics stay shared with ordinary installation.
+pub(super) async fn fetch_release_values_with_environment(
+    o: &CommonOpts,
+    environment: Vec<(String, String)>,
+) -> Result<Option<serde_json::Value>> {
+    fetch_helm_values(
+        o,
+        helm_get_values_cmd(o).with_env(environment),
+        "Helm values",
+    )
+    .await
+}
+
 /// The **computed** values of an existing release: the chart's own defaults
 /// merged with whatever the operator overrode.
 ///

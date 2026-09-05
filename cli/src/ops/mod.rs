@@ -14,6 +14,9 @@ mod convergence;
 mod providers;
 mod up;
 mod upgrade;
+mod upgrade_images;
+mod upgrade_owner;
+mod upgrade_recovery;
 mod verbs;
 
 pub use command::*;

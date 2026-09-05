@@ -279,3 +279,6 @@ if failures:
 
 print("OK: upgrade drain gate render assertions passed")
 PY
+
+# Opt-in transactional recovery must retain all three phase witnesses.
+python3 "$SCRIPT_DIR/upgrade-recovery-assertions.py" "$CHART"

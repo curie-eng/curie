@@ -81,6 +81,10 @@ crypto_box = { version = "0.9.1", features = ["seal", "std"] }
 base64 = "0.23.1"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["use_pem", "rust_crypto"] }
 
+[target.'cfg(unix)'.dependencies]
+# Unix upgrade ownership/descriptor inheritance; Linux parent-death signal.
+libc = "0.2"
+
 [dev-dependencies]
 # The frozen ACI types are a normal dependency of the lib, but integration test
 # crates need them by name to build a SessionStatus for the status_json contract.

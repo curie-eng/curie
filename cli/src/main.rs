@@ -2133,6 +2133,9 @@ enum ClusterAction {
         /// builds; local `charts/curie` on dev builds.
         #[arg(long)]
         chart: Option<String>,
+        /// Apply contract or irreversible migrations using the documented forward-only procedure.
+        #[arg(long)]
+        forward_only: bool,
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
@@ -3784,6 +3787,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 namespace,
                 release,
                 chart,
+                forward_only,
                 yes,
                 dry_run,
             } => emit(
@@ -3795,6 +3799,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     },
                     to,
                     chart,
+                    forward_only,
                     yes,
                 })
                 .await?,

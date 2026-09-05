@@ -1,3 +1,4 @@
+{{- $operation := include "curie.upgradeRecovery.operation" . -}}
 {{- if and .Values.api.deploy .Values.api.migrate.enabled }}
 {{/*
 One controlled schema upgrade phase (#2300).
@@ -26,10 +27,13 @@ metadata:
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: schema-migrate
+    {{- if $operation }}
+    curie-upgrade-operation: {{ $operation | quote }}
+    {{- end }}
   annotations:
-    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook": post-install,pre-upgrade{{ if $operation }},pre-rollback{{ end }}
     "helm.sh/hook-weight": "-5"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-delete-policy": before-hook-creation{{ if not $operation }},hook-succeeded{{ end }}
 spec:
   backoffLimit: 3
   activeDeadlineSeconds: 600
@@ -40,6 +44,9 @@ spec:
         {{- . | nindent 8 }}
         {{- end }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "schema-migrate") | nindent 8 }}
+        {{- if $operation }}
+        curie-upgrade-operation: {{ $operation | quote }}
+        {{- end }}
       {{- with (include "curie.placement.annotations" (dict "root" $ "class" "hooks")) }}
       annotations:
         {{- . | nindent 8 }}
