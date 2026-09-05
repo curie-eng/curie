@@ -398,6 +398,11 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/schema-migrate-assertions.sh
 
+      - name: helm render assertions (schema metadata authority)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/schema-compat-assertions.sh
+
       # The resume reconciler may enqueue a replacement turn only after the
       # prior delivery has exhausted both its delivery budget and terminal
       # settlement reserve. Prove the default derives from that floor and an
