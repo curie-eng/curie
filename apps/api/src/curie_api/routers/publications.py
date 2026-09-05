@@ -6,11 +6,12 @@ GitHub side effects belong to the trusted worker publication reconciler.
 
 import re
 import uuid
-from typing import Any
+from typing import Any, Literal, cast
 
 import httpx
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from .. import crud
@@ -20,7 +21,12 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import ThreadPublicationLineage
+from ..models import PublicationReviewReservation, ThreadPublicationLineage
+from ..publication_authority import (
+    AuthorityRefused,
+    AuthorityUnavailable,
+    verify_publication_identity,
+)
 from ..repo_full_name import repo_url_path
 from ..repository_auth import resolve_repository_credential
 from ..schemas import (
@@ -29,6 +35,9 @@ from ..schemas import (
     PublicationLineageOut,
     PublicationOut,
     RepositoryCredentialOut,
+    ReviewRevisionCancel,
+    ReviewRevisionOut,
+    ReviewRevisionReserve,
 )
 from ..workspace_policy import credential_mode, repository_is_allowed
 
@@ -37,9 +46,7 @@ router = APIRouter(
     tags=["publications"],
     dependencies=[Depends(require_api_key)],
 )
-internal_router = APIRouter(
-    prefix="/v1/internal/publications", tags=["internal-publications"]
-)
+internal_router = APIRouter(prefix="/v1/internal/publications", tags=["internal-publications"])
 
 _GITHUB_API_VERSION = "2022-11-28"
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}")
@@ -336,9 +343,39 @@ async def advance_publication_lineage(
     publication_id: uuid.UUID,
     data: PublicationLineageAdvance,
     session: SessionDep,
+    request: Request,
 ) -> PublicationLineageOut:
     try:
-        lineage = await crud.advance_publication_lineage(session, publication_id, data)
+        publication = await crud.get_publication(session, publication_id)
+        if publication is None or publication.lineage is None:
+            raise LookupError("publication lineage not found")
+        identity = await verify_publication_identity(
+            publication.lineage, data, get_settings(), request.app.state.http_client
+        )
+        lineage = await crud.advance_publication_lineage(
+            session, publication_id, data, identity=identity
+        )
+    except AuthorityUnavailable:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, _GITHUB_UNAVAILABLE_DETAIL
+        ) from None
+    except AuthorityRefused:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.lineage_stale",
+                "message": "current GitHub publication identity was refused",
+            },
+        ) from None
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.revision_conflict",
+                "message": "another lineage already owns this immutable GitHub identity",
+            },
+        ) from None
     except LookupError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except crud.PublicationLineageConflict as exc:
@@ -484,3 +521,86 @@ async def redeem_publication_credential(
         clone_url=clone_url,
         authorization_header=authorization_header,
     )
+
+
+def _review_revision_out(
+    row: PublicationReviewReservation, lineage: ThreadPublicationLineage
+) -> ReviewRevisionOut:
+    assert lineage.reply_conversation_id is not None
+    assert lineage.github_repository_id is not None
+    assert lineage.github_installation_id is not None
+    assert lineage.github_pr_node_id is not None
+    assert lineage.pr_number is not None
+    assert lineage.base_ref is not None
+    return ReviewRevisionOut(
+        revision_id=row.id,
+        lineage_id=lineage.id,
+        agent_id=lineage.agent_id,
+        conversation_id=lineage.conversation_id,
+        reply_conversation_id=lineage.reply_conversation_id,
+        binding_id=row.binding_id,
+        binding_generation=row.binding_generation,
+        repository_id=lineage.github_repository_id,
+        installation_id=lineage.github_installation_id,
+        pr_node_id=lineage.github_pr_node_id,
+        base_ref=lineage.base_ref,
+        repo_full_name=lineage.repo_full_name,
+        pr_number=lineage.pr_number,
+        branch=lineage.branch,
+        base_sha=lineage.base_sha,
+        expected_head_sha=row.expected_head_sha,
+        lineage_version=row.lineage_version,
+        revision_number=row.revision_number,
+        version=row.version,
+        status=cast(Literal["reserved", "consumed", "cancelled"], row.status),
+    )
+
+
+@internal_router.post(
+    "/review-reservations",
+    response_model=ReviewRevisionOut,
+    dependencies=[Depends(require_internal_worker_token)],
+)
+async def reserve_review_revision(
+    data: ReviewRevisionReserve, session: SessionDep, response: Response
+) -> ReviewRevisionOut:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        row, lineage, created = await crud.reserve_review_revision(session, data)
+        await session.commit()
+    except crud.PublicationLineageConflict as exc:
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, {"code": exc.code, "message": exc.message}
+        ) from None
+    response.status_code = 201 if created else 200
+    return _review_revision_out(row, lineage)
+
+
+@internal_router.post(
+    "/review-reservations/{reservation_id}/cancel",
+    response_model=ReviewRevisionOut,
+    dependencies=[Depends(require_internal_worker_token)],
+)
+async def cancel_review_revision(
+    reservation_id: uuid.UUID, data: ReviewRevisionCancel, session: SessionDep, response: Response
+) -> ReviewRevisionOut:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        row = await crud.cancel_review_revision(
+            session,
+            reservation_id,
+            origin_key=data.origin_key,
+            expected_version=data.expected_version,
+        )
+        lineage = await session.get(ThreadPublicationLineage, row.lineage_id)
+        assert lineage is not None
+        await session.commit()
+    except LookupError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "review reservation not found") from None
+    except crud.PublicationLineageConflict as exc:
+        await session.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, {"code": exc.code, "message": exc.message}
+        ) from None
+    return _review_revision_out(row, lineage)

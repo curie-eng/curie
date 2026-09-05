@@ -162,6 +162,11 @@ cat > "$TMP/chart-owned-external.yaml" <<'YAML'
 otelCollector:
   deploy: false
   endpoint: https://otel.example.com:4318
+  # Rail 1 needs a CIDR peer for an external collector (#2317); this
+  # fixture only cares that the endpoint reaches the workloads.
+  egress:
+    - cidr: 192.0.2.40/32
+      ports: [{ protocol: TCP, port: 4318 }]
   protocol: http/protobuf
   headersExistingSecret: acme-otel-auth
   headersSecretKey: headers
@@ -176,6 +181,11 @@ cat > "$TMP/chart-owned-external-literal-headers.yaml" <<'YAML'
 otelCollector:
   deploy: false
   endpoint: https://otel.example.com:4318
+  # Rail 1 needs a CIDR peer for an external collector (#2317); this
+  # fixture only cares that the endpoint reaches the workloads.
+  egress:
+    - cidr: 192.0.2.40/32
+      ports: [{ protocol: TCP, port: 4318 }]
   headers: "x-scope-orgid=acme"
 dispatcher:
   deploy: true
@@ -203,6 +213,11 @@ cat > "$TMP/chart-owned-external-plus-extraenv-override.yaml" <<'YAML'
 otelCollector:
   deploy: false
   endpoint: https://otel.example.com:4318
+  # Rail 1 needs a CIDR peer for an external collector (#2317); this
+  # fixture only cares that the endpoint reaches the workloads.
+  egress:
+    - cidr: 192.0.2.40/32
+      ports: [{ protocol: TCP, port: 4318 }]
   protocol: http/protobuf
 dispatcher:
   deploy: true
@@ -222,6 +237,11 @@ cat > "$TMP/both-header-sources.yaml" <<'YAML'
 otelCollector:
   deploy: false
   endpoint: https://otel.example.com:4318
+  # Rail 1 needs a CIDR peer for an external collector (#2317); this
+  # fixture only cares that the endpoint reaches the workloads.
+  egress:
+    - cidr: 192.0.2.40/32
+      ports: [{ protocol: TCP, port: 4318 }]
   headers: "x-scope-orgid=acme"
   headersExistingSecret: acme-otel-auth
 YAML
@@ -243,6 +263,11 @@ cat > "$TMP/literal-sensitive-workload-headers.yaml" <<'YAML'
 otelCollector:
   deploy: false
   endpoint: https://otel.example.com:4318
+  # Rail 1 needs a CIDR peer for an external collector (#2317); this
+  # fixture only cares that the endpoint reaches the workloads.
+  egress:
+    - cidr: 192.0.2.40/32
+      ports: [{ protocol: TCP, port: 4318 }]
   headers: "Authorization=Basic placeholder-not-a-credential"
 YAML
 
@@ -566,7 +591,12 @@ def quantity_is_finite(value):
 
 
 def workload_containers(path):
-    """Return the four first-party Python workload containers by role."""
+    """Return the api/dispatcher/worker Deployments and the runner SandboxTemplate container, by role.
+
+    Not the authoritative instrumented set: the mail adapter also carries the
+    shared OTLP env and is pinned in ci/mail-adapter-wiring-assertions.sh. It
+    cannot appear here because these renders never set mailAdapter.deploy.
+    """
     selected = {}
     for doc in documents(path):
         kind = doc.get("kind")

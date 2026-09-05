@@ -1,4 +1,9 @@
 {{- if .Values.ui.deploy }}
+{{- if not .Values.api.deploy }}
+  {{- if not .Values.ui.apiBaseUrl }}
+  {{- fail "api.deploy is false: set ui.apiBaseUrl to the bring-your-own API URL" }}
+  {{- end }}
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -61,9 +66,12 @@ spec:
           {{- end }}
           env:
             # nginx reverse-proxies /api/ to this upstream (the /api prefix is
-            # stripped). Points at the in-chart API Service.
+            # stripped). Empty ui.apiBaseUrl (the default) derives the in-chart
+            # API Service; a set value renders verbatim and is the BYO answer,
+            # and the only correct one when api.deploy is false. Include
+            # curie.api.url, never a copy of its expression.
             - name: CURIE_API_TARGET
-              value: http://{{ include "curie.fullname" . }}-api:{{ .Values.api.service.port }}
+              value: {{ include "curie.api.url" (dict "root" . "baseUrl" .Values.ui.apiBaseUrl) | quote }}
           ports:
             - name: http
               containerPort: 8080

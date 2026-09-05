@@ -6,6 +6,12 @@ set -euo pipefail
 # must require it, route every consumer to it, and leave no dead in-chart
 # Langfuse resources or Service hostname behind.
 
+# Issue #2314: that shared endpoint had its `http://` scheme hardcoded at every
+# consumer, so a BYO Langfuse behind TLS was unreachable. The scheme now comes
+# from the `curie.langfuse.url` helper -- explicit `langfuse.scheme` wins,
+# otherwise it derives (https on port 443, http elsewhere), and an invalid
+# value fails the render rather than silently emitting cleartext.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
 TMP="$(mktemp -d)"
@@ -204,13 +210,50 @@ render "$CHART" internal --set-string langfuse.host=ignored.example.com
 python3 "$CHECKER" internal "$TMP/internal" "http://curie-langfuse-web:3000"
 echo "  ok: API, worker, and collector use the chart-owned Langfuse Service"
 
-echo "=== BYO Langfuse assertion 2: external host and non-default port reach every consumer ==="
+echo "=== BYO Langfuse assertion 2: an external TLS endpoint on 443 reaches every consumer over https ==="
 render "$CHART" external \
   --set langfuse.deploy=false \
   --set-string langfuse.host=langfuse.example.com \
+  --set langfuse.web.service.port=443
+python3 "$CHECKER" external "$TMP/external" "https://langfuse.example.com:443"
+echo "  ok: the derived https endpoint is shared and no chart-owned Langfuse residue remains"
+
+echo "=== BYO Langfuse assertion 2b: an explicit langfuse.scheme=https wins on a non-443 port ==="
+render "$CHART" external-explicit \
+  --set langfuse.deploy=false \
+  --set-string langfuse.host=langfuse.example.com \
+  --set-string langfuse.scheme=https \
   --set langfuse.web.service.port=4319
-python3 "$CHECKER" external "$TMP/external" "http://langfuse.example.com:4319"
-echo "  ok: exact BYO endpoint is shared and no chart-owned Langfuse residue remains"
+python3 "$CHECKER" external "$TMP/external-explicit" "https://langfuse.example.com:4319"
+echo "  ok: TLS on an arbitrary port is reachable without touching the port"
+
+echo "=== BYO Langfuse assertion 2c: a cleartext BYO endpoint is unchanged ==="
+render "$CHART" external-cleartext \
+  --set langfuse.deploy=false \
+  --set-string langfuse.host=langfuse.example.com \
+  --set langfuse.web.service.port=4319
+python3 "$CHECKER" external "$TMP/external-cleartext" "http://langfuse.example.com:4319"
+echo "  ok: a non-443 BYO port still derives http, so existing installs do not move"
+
+expect_scheme_failure() {
+  local name="$1"
+  shift
+  local stderr="$TMP/$name.stderr"
+  if helm template curie "$CHART" --output-dir "$TMP/$name" "$@" \
+    >/dev/null 2>"$stderr"; then
+    fail "$name: an invalid langfuse.scheme rendered instead of failing closed"
+  fi
+  if ! grep -qF "langfuse.scheme" "$stderr"; then
+    fail "$name: render failed without naming langfuse.scheme: $(<"$stderr")"
+  fi
+}
+
+echo "=== BYO Langfuse assertion 2d: an unsupported langfuse.scheme fails the render ==="
+expect_scheme_failure bad-scheme \
+  --set langfuse.deploy=false \
+  --set-string langfuse.host=langfuse.example.com \
+  --set-string langfuse.scheme=ftp
+echo "  ok: langfuse.scheme=ftp is rejected by name instead of falling back to cleartext"
 
 echo "=== BYO Langfuse assertion 3: trimmed runtime harness supplies its own Langfuse host ==="
 render "$CHART" harness \

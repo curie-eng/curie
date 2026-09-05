@@ -75,6 +75,9 @@ spec:
         - name: ollama
           image: {{ .Values.inference.image | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          {{- with .Values.inference.containerSecurityContext }}
+          {{- include "curie.containerSecurityContext" . | nindent 10 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.inference.port }}

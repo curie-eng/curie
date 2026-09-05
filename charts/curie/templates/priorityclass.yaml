@@ -40,6 +40,7 @@ globalDefault: false
 description: >-
   ADR-0059 decision 5: Curie sandbox runner pods. Ranked below
   {{ .Values.priorityClasses.platform.name }} for node-pressure eviction; also
-  the scopeSelector handle for the sandbox-namespace ResourceQuota (issue
-  #758) -- keep the two in sync if renamed.
+  the derived scopeSelector handle for the sandbox-namespace ResourceQuota
+  (issue #758). The quota follows this name unless an explicit
+  resourceQuota.sandboxPriorityClassName override is set.
 {{- end }}

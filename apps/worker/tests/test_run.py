@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import redis
+import redis.asyncio
 from curie_worker import run
 from curie_worker.config import WorkerConfig
 from curie_worker.run import (
@@ -770,3 +772,79 @@ def test_run_boots_the_consumers_when_the_migration_exceeds_its_budget(
     ]
     assert len(cut_short) == 1
     assert cut_short[0].levelno == logging.WARNING
+
+
+# --- WorkerConfig.valkey_client_kwargs: the seam shared by all three Valkey client
+# constructions in build() (#2315) ------------------------------------------
+#
+# build() itself is not driven directly here: it constructs
+# KubernetesSandboxClient, which loads a kubeconfig at __init__
+# (sandbox/k8s.py:226-229), and the sync affinity client it builds is not
+# reachable from Runtime anyway. valkey_client_kwargs is the seam precisely because
+# all three call sites go through it, so testing it once covers all three.
+#
+# Assertions read redis-py's own connection-class selection (never a mock of
+# the thing under test): ssl=True selects SSLConnection in both the sync and
+# async namespaces, which are distinct classes sharing a name -- both are
+# checked so a test cannot pass by importing the wrong one.
+
+
+def test_valkey_kwargs_selects_the_plain_connection_by_default() -> None:
+    kwargs = WorkerConfig().valkey_client_kwargs()
+    sync_client = redis.Redis(**kwargs)
+    assert sync_client.connection_pool.connection_class is redis.connection.Connection
+    async_client = redis.asyncio.Redis(**kwargs)
+    assert (
+        async_client.connection_pool.connection_class
+        is redis.asyncio.connection.Connection
+    )
+
+
+def test_valkey_kwargs_selects_ssl_connection_when_tls_is_set() -> None:
+    kwargs = WorkerConfig(valkey_tls=True).valkey_client_kwargs()
+    sync_client = redis.Redis(**kwargs)
+    assert sync_client.connection_pool.connection_class is redis.connection.SSLConnection
+    async_client = redis.asyncio.Redis(**kwargs)
+    assert (
+        async_client.connection_pool.connection_class
+        is redis.asyncio.connection.SSLConnection
+    )
+
+
+def test_valkey_kwargs_carries_host_port_password_db_unchanged() -> None:
+    # So a future edit cannot satisfy the TLS assertions above by dropping a
+    # field: every part of the connection identity must still be present.
+    config = WorkerConfig(
+        valkey_host="valkey.acme.internal",
+        valkey_port=6380,
+        valkey_password="s3cret",
+        valkey_db=2,
+        valkey_tls=True,
+    )
+    kwargs = config.valkey_client_kwargs()
+    assert kwargs["host"] == "valkey.acme.internal"
+    assert kwargs["port"] == 6380
+    assert kwargs["password"] == "s3cret"
+    assert kwargs["db"] == 2
+    assert kwargs["ssl"] is True
+
+
+# --- VALKEY_TLS env -> WorkerConfig.valkey_tls (the seam the chart actually
+# drives; a field that only works via kwargs is not wired) ------------------
+
+
+def test_valkey_tls_env_reaches_the_worker_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VALKEY_TLS", "true")
+    assert WorkerConfig().valkey_tls is True
+
+
+def test_valkey_tls_defaults_false_on_a_clean_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # VALKEY_TLS may be set in the ambient host/CI env; clear it explicitly so
+    # this default-value assertion cannot be flipped by something outside the
+    # test.
+    monkeypatch.delenv("VALKEY_TLS", raising=False)
+    assert WorkerConfig().valkey_tls is False

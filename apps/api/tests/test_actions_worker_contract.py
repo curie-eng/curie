@@ -73,9 +73,11 @@ async def _round_trip(app: Any) -> dict[str, Any]:
 def test_a_recorded_call_survives_the_worker_to_api_hop(client: Any, anyio_backend: Any) -> None:
     """Every field the worker sends is a field the API stores, under that name."""
 
-    import anyio
-
-    row = anyio.run(_round_trip, client.app)
+    # The TestClient lifespan owns the real asyncpg pool on its portal loop.
+    # Keep this ASGI round trip on that same loop, including when startup has
+    # already checked out a connection before this request.
+    assert client.portal is not None
+    row = client.portal.call(_round_trip, client.app)
 
     assert row["tool"] == "scale_deployment"
     assert row["call_id"] == "toolu_01"

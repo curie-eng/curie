@@ -52,6 +52,7 @@ def build_redis(config: DispatcherConfig) -> redis.Redis:
         password=config.valkey_password or None,
         db=config.valkey_db,
         decode_responses=True,
+        ssl=config.valkey_tls,
     )
 
 

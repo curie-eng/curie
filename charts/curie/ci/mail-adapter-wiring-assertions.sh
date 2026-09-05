@@ -65,6 +65,15 @@
 #      fixture, rather than merely grepping its shell source.
 #   20 The preflight Job opts out of token mounting and satisfies the Restricted
 #      Pod Security Standard at both pod and container scope.
+#   21 The container carries the SHARED OTLP env -- the same OTEL_EXPORTER_OTLP_*
+#      names and values the other instrumented workloads get -- when the chart
+#      collector is deployed, the external endpoint verbatim when it is not, and
+#      NOTHING when telemetry is explicitly disabled. The adapter joined the
+#      existing telemetry boundary; it did not acquire a private one.
+#   22 The single egress policy gains a collector peer exactly when
+#      otelCollector.deploy is true. The adapter is the ONLY first-party service
+#      with an egress-restricting policy, so OTLP env without this peer exports
+#      into a dropped connection while every render still looks green.
 #
 # NOTE ON `--output-dir`: copied deliberately from
 # dispatcher-api-wiring-assertions.sh. In this environment `helm template` into a
@@ -312,6 +321,7 @@ assert_env_value "$api_port_dir" CURIE_API_URL "http://curie-api:9999" \
   "The port must come from .Values.api.service.port, not a hardcoded 8000."
 byo_api_dir="$(render byo-api "${ON[@]}" "${CREDS[@]}" \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set mailAdapter.apiBaseUrl=https://byo-api.example:8443 \
   --set 'mailAdapter.apiEgress.httpsCidrs[0]=198.51.100.0/24' \
   --set mailAdapter.apiEgress.port=8443)"
@@ -755,10 +765,12 @@ assert_render_fails_named \
   "mailAdapter.apiEgress.httpsCidrs" \
   "${ON[@]}" "${CREDS[@]}" \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set mailAdapter.apiBaseUrl=https://byo-api.example:8443
 
 byo_api_default_port_dir="$(render byo-api-default-port "${ON[@]}" "${CREDS[@]}" \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set mailAdapter.apiBaseUrl=http://byo-api.example:8000 \
   --set 'mailAdapter.apiEgress.httpsCidrs[0]=198.51.100.128/25')"
 
@@ -846,6 +858,7 @@ assert_render_fails_named \
   "mailAdapter.apiEgress.httpsCidrs" \
   "${ON[@]}" "${CREDS[@]}" \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set mailAdapter.apiBaseUrl=https://byo-api.example:8443 \
   --set-string 'mailAdapter.apiEgress.httpsCidrs[0]=0.0.0.0/1' \
   --set-string 'mailAdapter.apiEgress.httpsCidrs[1]=128.0.0.0/1' \
@@ -1129,4 +1142,214 @@ python3 "$MATRIX_PY" \
   mail-adapter \
   || fail "the mail-adapter image is not wired into the standard build path; see the message above"
 
-echo "OK: mail-adapter chart wiring and build-path render assertions passed (20 assertions)"
+# ---------------------------------------------------------------------------
+# 21: the adapter carries the STANDARD OTLP env, and only when the shared
+#     telemetry boundary says so. The two values below are the SAME pair
+#     otel-collector-durability-assertions.sh pins for api/dispatcher/worker/
+#     runner; asserting them here is what makes the adapter a fifth member of
+#     that boundary rather than a workload with its own private wiring.
+# ---------------------------------------------------------------------------
+assert_env_value "$on_dir" OTEL_EXPORTER_OTLP_ENDPOINT "http://curie-otel-collector:4318" \
+  "The in-chart Collector Service must be derived exactly as it is for the other instrumented workloads; an adapter that exports nowhere leaves its records outside the shared, redacted OTLP path."
+assert_env_value "$on_dir" OTEL_EXPORTER_OTLP_PROTOCOL "http/protobuf" \
+  "The protocol must come from the shared helper default, not a per-workload literal."
+
+# A chart-owned EXTERNAL endpoint must reach the adapter verbatim. A template
+# that hardcoded the in-chart Service name would pass the assertion above and
+# silently ignore the operator here.
+otel_external_dir="$(render otel-external "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318')"
+assert_env_value "$otel_external_dir" OTEL_EXPORTER_OTLP_ENDPOINT "https://otel.example.com:4318" \
+  "otelCollector.endpoint must render verbatim on the adapter, exactly as it does on the other instrumented workloads."
+assert_env_value "$otel_external_dir" OTEL_EXPORTER_OTLP_PROTOCOL "http/protobuf" \
+  "The external-endpoint path must still carry the protocol; an endpoint with no protocol falls back to the SDK default and can disagree with the collector's receiver."
+
+# The negative direction, and the one that proves membership of the shared
+# boundary: with telemetry explicitly disabled the adapter must render NO
+# OTEL_EXPORTER_OTLP_* env at all, which is what the other four do under the
+# same values.
+otel_disabled_dir="$(render otel-disabled "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.telemetryDisabled=true)"
+# Non-vacuity floor. An absence check against a render that produced no
+# mail-adapter container passes for the wrong reason; assert a known-present env
+# first, then use the same rc -eq 3 guard assertion 5 uses.
+assert_env_value "$otel_disabled_dir" CURIE_API_URL "http://curie-api:8000" \
+  "The telemetry-disabled render must still be a real mail-adapter container, or the OTLP absence checks below pass vacuously."
+for otel_name in OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_PROTOCOL OTEL_EXPORTER_OTLP_HEADERS; do
+  set +e
+  env_field "$otel_disabled_dir" "$DEPLOY_NAME" "$otel_name" name >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -eq 3 ]; then
+    fail "the telemetry-disabled render produced no mail-adapter container, so the '$otel_name' absence assertion would pass vacuously"
+  fi
+  if [ "$rc" -ne 1 ]; then
+    fail "with otelCollector.telemetryDisabled=true the mail-adapter container still carries '$otel_name'. The adapter must sit inside the shared telemetry boundary: an operator who disabled telemetry for the release must not find one workload still exporting"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# 22: the collector egress peer exists exactly when otelCollector.deploy is
+#     true. Read structurally, never by grep: this rule is a conditional entry
+#     inside an existing list (Decision 3 keeps ONE policy object for this
+#     credential-bearing pod), so a line reader cannot tell a present rule from
+#     a reordered one, and an accidentally unconditional rule looks identical.
+# ---------------------------------------------------------------------------
+OTEL_EGRESS_PY="$TMP/mail-otel-egress.py"
+cat > "$OTEL_EGRESS_PY" <<'PY'
+"""Assert the mail adapter's collector egress peer in one rendered directory.
+
+argv: <rendered-dir> <expect-collector-rule: yes|no> <expected-total-egress-rules>
+      [<cidr-that-must-still-render>]
+"""
+import pathlib
+import sys
+
+import yaml
+
+rendered, expect, expected_rules = sys.argv[1], sys.argv[2], int(sys.argv[3])
+required_cidr = sys.argv[4] if len(sys.argv) > 4 else ""
+
+# helm template with no -n renders into the `default` namespace, so that is the
+# release namespace the peer must name. A rule that hardcoded another namespace
+# would select nothing at runtime and drop every export.
+NAMESPACE = "default"
+EXPECTED_POD_SELECTOR = {
+    "app.kubernetes.io/name": "curie",
+    "app.kubernetes.io/instance": "curie",
+    "app.kubernetes.io/component": "otel-collector",
+}
+EXPECTED_PORTS = [
+    {"protocol": "TCP", "port": 4317},
+    {"protocol": "TCP", "port": 4318},
+]
+
+docs = [
+    doc
+    for path in pathlib.Path(rendered).rglob("*.yaml")
+    for doc in yaml.safe_load_all(path.read_text())
+    if isinstance(doc, dict)
+]
+
+policies = [
+    doc
+    for doc in docs
+    if doc.get("kind") == "NetworkPolicy"
+    and doc.get("spec", {}).get("podSelector", {}).get("matchLabels", {}).get(
+        "app.kubernetes.io/component"
+    )
+    == "mail-adapter"
+]
+if len(policies) != 1:
+    raise SystemExit(
+        f"expected exactly ONE NetworkPolicy selecting the mail adapter, found "
+        f"{len(policies)} ({[p.get('metadata', {}).get('name') for p in policies]!r}). "
+        "The collector peer is a conditional rule inside the existing egress "
+        "policy, not a second policy object: an auditor must read one object to "
+        "see everything this credential-bearing pod may reach."
+    )
+policy = policies[0]
+egress = policy.get("spec", {}).get("egress") or []
+
+collector_peers = []
+for index, rule in enumerate(egress):
+    for peer in rule.get("to") or []:
+        pod_selector = peer.get("podSelector") or {}
+        labels = pod_selector.get("matchLabels") or {}
+        if labels.get("app.kubernetes.io/component") == "otel-collector":
+            collector_peers.append((index, rule, peer))
+
+if expect == "no":
+    if collector_peers:
+        raise SystemExit(
+            "otelCollector.deploy is false but the mail adapter's egress policy "
+            f"still carries a collector peer: {collector_peers[0][2]!r}. The rule "
+            "must be gated on otelCollector.deploy, or the chart opens a peer for "
+            "pods that do not exist."
+        )
+elif expect == "yes":
+    if len(collector_peers) != 1:
+        raise SystemExit(
+            "otelCollector.deploy is true but the mail adapter's egress policy "
+            f"carries {len(collector_peers)} collector peers, expected exactly 1. "
+            "Without it the adapter's OTLP export is dropped by its own egress "
+            "rail while the rendered env still looks correct. Rendered egress "
+            f"rules: {egress!r}"
+        )
+    _, rule, peer = collector_peers[0]
+    if (rule.get("to") or []).index(peer) != 0:
+        raise SystemExit(f"collector peer is not to[0] of its rule: {rule!r}")
+    namespace_selector = peer.get("namespaceSelector") or {}
+    got_namespace = (namespace_selector.get("matchLabels") or {}).get(
+        "kubernetes.io/metadata.name"
+    )
+    if got_namespace != NAMESPACE:
+        raise SystemExit(
+            f"collector peer namespaceSelector names {got_namespace!r}, expected "
+            f"{NAMESPACE!r}. A podSelector with no namespaceSelector matches pods "
+            "in the adapter's own namespace only by accident of this render, and a "
+            "wrong namespace selects nothing at all."
+        )
+    got_labels = peer.get("podSelector", {}).get("matchLabels") or {}
+    if got_labels != EXPECTED_POD_SELECTOR:
+        raise SystemExit(
+            f"collector peer podSelector is {got_labels!r}, expected "
+            f"{EXPECTED_POD_SELECTOR!r} (curie.selectorLabels for the "
+            "otel-collector component). A partial selector can match a different "
+            "release's collector in the same namespace."
+        )
+    if rule.get("ports") != EXPECTED_PORTS:
+        raise SystemExit(
+            f"collector peer ports are {rule.get('ports')!r}, expected "
+            f"{EXPECTED_PORTS!r} (otelCollector.service.grpcPort and .httpPort). "
+            "The chart's own OTLP endpoint is the HTTP port, so omitting 4318 "
+            "drops every export the default configuration makes."
+        )
+else:
+    raise SystemExit(f"bad expect argument {expect!r}")
+
+if len(egress) != expected_rules:
+    raise SystemExit(
+        f"the mail adapter's egress policy has {len(egress)} rules, expected "
+        f"{expected_rules}. The rule set is DNS, the API peer, the AgentMail "
+        "CIDRs, and -- only under otelCollector.deploy -- the collector. A count "
+        f"drift means a destination was added or lost silently. Rules: {egress!r}"
+    )
+
+if required_cidr:
+    cidrs = {
+        peer.get("ipBlock", {}).get("cidr")
+        for rule in egress
+        for peer in rule.get("to") or []
+        if peer.get("ipBlock")
+    }
+    if required_cidr not in cidrs:
+        raise SystemExit(
+            f"{required_cidr!r} no longer renders alongside the collector peer; "
+            f"rendered CIDRs were {sorted(c for c in cidrs if c)!r}"
+        )
+PY
+
+python3 "$OTEL_EGRESS_PY" "$on_dir" yes 4 203.0.113.0/24 \
+  || fail "with the chart collector deployed, the mail adapter's egress policy does not admit it; see the message above"
+
+# deploy=false: the rule must be GONE, and the policy must be back to exactly
+# its three original destinations. A count assertion, so an accidentally
+# unconditional rule fails here rather than rendering a peer for pods that were
+# never deployed.
+python3 "$OTEL_EGRESS_PY" "$otel_disabled_dir" no 3 203.0.113.0/24 \
+  || fail "with the chart collector not deployed, the mail adapter's egress policy is not back to its three original rules; see the message above"
+python3 "$OTEL_EGRESS_PY" "$otel_external_dir" no 3 203.0.113.0/24 \
+  || fail "an EXTERNAL otelCollector.endpoint must not synthesize an in-cluster collector peer; that destination is an IP the chart cannot know (see the template comment and README)"
+
+# The BYO-API render assertion 17 already exercises: the collector peer must
+# coexist with the explicit BYO API CIDR rule rather than replacing it.
+python3 "$OTEL_EGRESS_PY" "$byo_api_dir" yes 4 198.51.100.0/24 \
+  || fail "with api.deploy=false the collector peer and the BYO API CIDR rule do not coexist; see the message above"
+
+echo "OK: mail-adapter chart wiring and build-path render assertions passed (22 assertions)"

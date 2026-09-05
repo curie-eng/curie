@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 
 #[allow(unused_imports)]
-use super::{command::*, providers::*, up::*};
+use super::{command::*, convergence, providers::*, up::*};
 
 pub struct DownOpts {
     pub common: CommonOpts,
@@ -53,13 +53,15 @@ pub async fn chart_version(chart: &str) -> Result<String> {
 /// (live for a real run, [`chart_fullname`] under `--dry-run`), so this builder
 /// still makes no cluster call of its own.
 pub fn status_commands(o: &CommonOpts, fullname: &ReleaseFullname) -> Vec<OpsCommand> {
-    vec![
+    let mut commands = vec![
         helm_status_cmd(o),
         pods_cmd(o),
         svc_cmd(o, fullname, "ui"),
         svc_cmd(o, fullname, "langfuse-web"),
         kubeconfig_host_cmd(),
-    ]
+    ];
+    commands.extend(convergence::dry_run_commands(o));
+    commands
 }
 
 fn helm_status_cmd(o: &CommonOpts) -> OpsCommand {
@@ -675,9 +677,12 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         // `dry_run_fullname` computes it and emits the caveat that says so.
         let fullname = dry_run_fullname(&opts.release);
         return Ok(ClusterStatusOutput::DryRun(crate::ui::DryRunPlan {
-            lines: status_commands(&opts, &fullname)
-                .iter()
-                .map(|cmd| cmd.display())
+            lines: std::iter::once(convergence::DRY_RUN_NOTE.to_owned())
+                .chain(
+                    status_commands(&opts, &fullname)
+                        .iter()
+                        .map(OpsCommand::display),
+                )
                 .collect(),
         }));
     }
@@ -709,7 +714,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
 
     // (b) Pod health.
     let (ok, out, _) = run_capture(&pods_cmd(&opts)).await?;
-    let (pods, ready, total, unhealthy) = if ok {
+    let (pods, ready, total, mut unhealthy) = if ok {
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&out)
             .ok()
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
@@ -718,6 +723,16 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     } else {
         (Vec::new(), 0, 0, Vec::new())
     };
+
+    // The same target-manifest check gates up/apply and this read surface.
+    // Keep the existing JSON schema: diagnoses use its unhealthy string list.
+    match convergence::observe(&opts).await {
+        Ok(observation) => unhealthy.extend(observation.issues),
+        Err(error) => unhealthy.push(format!("convergence could not be verified: {error}")),
+    }
+    if !ok {
+        unhealthy.push("could not list release pods".to_string());
+    }
 
     // (c) URL discovery. Resolve the release's rendered fullname once, here on
     // the live branch -- `--dry-run` returned above without touching kubectl.
@@ -741,7 +756,7 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
     )
     .await;
 
-    Ok(ClusterStatusOutput::Status(Box::new(ClusterStatus {
+    let output = ClusterStatusOutput::Status(Box::new(ClusterStatus {
         namespace: opts.namespace.clone(),
         revision,
         release_state,
@@ -754,7 +769,20 @@ pub async fn status(opts: CommonOpts) -> Result<ClusterStatusOutput> {
         pods_listed: ok,
         urls,
         upgrade,
-    })))
+    }));
+    let json = crate::ui::CliOutput::to_json(&output);
+    if json["healthy"] != true {
+        return Err(crate::ui::ui().failed_report(
+            &output,
+            crate::exit::CliError::failure(format!(
+                "target release has not converged: {}",
+                json["pods"]["unhealthy"].as_array().map(|reasons| reasons.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default()
+            ))
+                .with_fix("inspect the unhealthy rollout reasons, correct the target configuration and rerun `curie cluster up`")
+                .into(),
+        ));
+    }
+    Ok(output)
 }
 
 /// Output of `cluster down`: the dry-run plan, an operator abort, or the removed
@@ -1514,7 +1542,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
         let display_status = if terminating {
             "Terminating"
         } else if !reason.is_empty() {
-            reason
+            convergence::reason(reason)
         } else {
             phase
         };

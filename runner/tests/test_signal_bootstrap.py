@@ -39,6 +39,7 @@ def _wire_process_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         port=8080,
         harness="claude",
         runner_token=None,
+        runner_bootstrap_token=None,
     )
     monkeypatch.setenv("CURIE_FAKE_MODEL", "1")
     monkeypatch.setattr(RunnerConfig, "from_env", lambda _env: config)

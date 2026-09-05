@@ -190,6 +190,22 @@ impl Ui {
         }
     }
 
+    /// Preserve a structured failed report's human view while the centralized
+    /// error path emits its single JSON object and semantic exit code. Used by
+    /// cluster status, whose unhealthy report still contains useful rows/URLs.
+    pub fn failed_report(&self, out: &dyn CliOutput, error: anyhow::Error) -> anyhow::Error {
+        if !self.json {
+            out.render(self);
+        }
+        let (message, remedy) = crate::exit::present_error(&error);
+        let (_, fix) = crate::exit::classify(&error);
+        crate::exit::operator_context(
+            crate::exit::with_json_payload(error, out.to_json()),
+            message,
+            remedy.or(fix),
+        )
+    }
+
     // -- styling helpers ---------------------------------------------------
 
     /// Wrap `s` in `style`'s ANSI codes when stdout color is on, else raw.

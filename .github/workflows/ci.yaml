@@ -96,6 +96,28 @@ jobs:
       # this sits with the other static gates before the dev stack boots.
       - name: Shellcheck sre-bot platform-upgrade script
         run: shellcheck --severity=warning examples/sre-bot/platform-upgrade/upgrade.sh
+      # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock above. Reuse
+      # ignored_prefixes from .github/e2e-selection.yaml so a guides edit does
+      # not boot postgres; packages/, apps/, runner/, examples/tests/, cli,
+      # uv.lock, and pyproject.toml still select pytest. The required check
+      # name stays `Python (ruff + mypy + pytest)` so the ruleset gates the
+      # suite when it is selected.
+      - name: Decide whether compose and pytest are needed
+        id: python-runtime
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            uv run python tools/e2e-ci-selection/select_tiers.py \
+              --registry .github/e2e-selection.yaml \
+              --push
+          else
+            base="${{ github.base_ref || 'main' }}"
+            git fetch --quiet origin "$base"
+            uv run python tools/e2e-ci-selection/select_tiers.py \
+              --registry .github/e2e-selection.yaml \
+              --base "origin/$base" \
+              --head HEAD
+          fi
       # Integration tests dial the real dev stack (Postgres 25432, Valkey 26379,
       # RustFS 29000, Langfuse 23000 + ClickHouse + OTel Collector). Boot it after
       # ruff/mypy so cheap failures stay fast. The first up starts the one-shot
@@ -107,6 +129,8 @@ jobs:
       # DB with alembic below, so their image is never needed here -- and it lives
       # in a private registry, so a bare `up` that pulled it failed the job.
       - name: Start dev stack
+        id: dev-stack
+        if: steps.python-runtime.outputs.pytest == 'true'
         run: |
           docker compose -f compose.dev.yaml up -d \
             postgres valkey clickhouse rustfs rustfs-init \
@@ -119,6 +143,7 @@ jobs:
       # actually serving, so the full-stack readiness gate fails fast with an
       # actionable error before integration tests begin.
       - name: Wait for Langfuse to serve
+        if: steps.python-runtime.outputs.pytest == 'true'
         run: |
           for i in $(seq 1 60); do
             if curl -fsS http://localhost:23000/api/public/health >/dev/null 2>&1; then
@@ -128,6 +153,7 @@ jobs:
           done
           echo "Langfuse did not become ready within 180s"; exit 1
       - name: Released database upgrade gate
+        if: steps.python-runtime.outputs.pytest == 'true'
         run: |
           uv run python scripts/check-released-upgrade.py --self-test
           uv run python scripts/check-released-upgrade.py
@@ -137,6 +163,7 @@ jobs:
       # Apply the real migrations to it so those tests run against a real
       # schema; this also exercises the alembic upgrade path on virgin Postgres.
       - name: Migrate the shared database
+        if: steps.python-runtime.outputs.pytest == 'true'
         working-directory: apps/api
         run: uv run alembic upgrade head
       # The committed-lock test only proves the lock matches the current wire; it
@@ -159,7 +186,32 @@ jobs:
       # Sharding on numbers like those would have split the suite along the wrong
       # seam. This prints the real ones on every run, for the price of 25 lines.
       - name: Pytest
+        id: pytest
+        if: steps.python-runtime.outputs.pytest == 'true'
         run: uv run pytest -q --durations=25
+      # Keep the required Python check honest when compose+pytest are skipped:
+      # a selected skip (or an unselected success) fails this job, so the
+      # ruleset still gates the suite whenever the selector asked for it.
+      - name: Require pytest outcome to match selection
+        if: success()
+        env:
+          PYTEST_SELECTED: ${{ steps.python-runtime.outputs.pytest }}
+          PYTEST_RESULT: ${{ steps.pytest.outcome }}
+          STACK_RESULT: ${{ steps.dev-stack.outcome }}
+        run: |
+          set -euo pipefail
+          expected=skipped
+          if [[ "$PYTEST_SELECTED" == "true" ]]; then
+            expected=success
+          elif [[ "$PYTEST_SELECTED" != "false" ]]; then
+            echo "pytest selection must be true or false, got ${PYTEST_SELECTED:-<empty>}" >&2
+            exit 1
+          fi
+          if [[ "$PYTEST_RESULT" != "$expected" || "$STACK_RESULT" != "$expected" ]]; then
+            echo "compose and pytest selected=$PYTEST_SELECTED pytest=$PYTEST_RESULT stack=$STACK_RESULT" >&2
+            exit 1
+          fi
+          echo "Python pytest selection matched $expected"
       # Build ONLY when the declaration parser would invoke the curie binary.
       # tools/fix-pin-ci/check.py reaches it at exactly one place, the
       # `curie dev verify-fix-pin` call, and only once `declaration.selector` is
@@ -211,7 +263,7 @@ jobs:
       # --profile full, `docker compose logs` matches no service and prints
       # nothing, so a real outage gets diagnosed with no container logs at all.
       - name: Dump dev stack logs on failure
-        if: failure()
+        if: ${{ failure() && steps.python-runtime.outputs.pytest == 'true' }}
         run: docker compose --profile full -f compose.dev.yaml logs --no-color --tail=200
 
   rust:
@@ -222,7 +274,11 @@ jobs:
       TEST_VALKEY_URL: redis://localhost:26379
     services:
       valkey:
-        image: valkey/valkey:8-alpine
+        # Must equal `valkey.image` in charts/curie/values.yaml and the valkey
+        # service in compose.dev.yaml so the valkey_or_skip tests cover the
+        # shipped default rather than a different build (#2319);
+        # compose/tests/test_generate_release_compose.py asserts the three agree.
+        image: valkey/valkey:8.1.10-alpine
         ports:
           - 26379:6379
         options: >-
@@ -275,6 +331,10 @@ jobs:
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           python-version: "3.13"
+      - name: Install Helm for CLI consumer render tests
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.16.4
       - name: Test
         run: cargo test --locked
       - name: Generated ACI protocol crate compiles
@@ -593,6 +653,20 @@ jobs:
   # (docker driver), whose FROM lookup consults the local image store -- so the
   # overlay resolves the just-built base with no GHCR pull, no registry auth,
   # and works on any branch (including forks). Build only, never pushed.
+  #
+  # The base build is GHA-layer-cached off the SAME scope the `images` matrix
+  # writes for the worker image (`scope=worker`), via a named buildx builder
+  # that is NOT made the default (`use: false`) -- the mechanism the e2e-ladder
+  # job below documents at length (#697/#791/#803). `use: false` is load-bearing
+  # here: the overlay step is a plain `docker build` whose `FROM
+  # ...curie-worker:ci-local` must resolve out of the local daemon image store,
+  # which only the default `docker` driver consults. `load: true` puts the
+  # freshly built base into that store. Read-only cache (`cache-from` with no
+  # `cache-to`): the `images` matrix already refreshes `scope=worker` with
+  # `mode=max` on every run, and a second concurrent writer on one scope only
+  # contends for the reservation -- the exact failure the matrix comment above
+  # records. The overlay itself stays a plain `docker build`: it has no entry in
+  # the `images` matrix, so there is no scope for it to share.
   worker-local-image:
     name: Build worker-local overlay image (no push)
     runs-on: ubuntu-latest
@@ -600,8 +674,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Build the base worker image locally
-        run: docker build -t ghcr.io/curie-eng/curie-worker:ci-local -f apps/worker/Dockerfile .
+      - name: Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the base worker image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/worker/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: ghcr.io/curie-eng/curie-worker:ci-local
+          push: false
+          load: true
+          cache-from: type=gha,scope=worker
       - name: Build the worker-local overlay (no push)
         run: docker build --build-arg BASE_TAG=ci-local -f compose/worker-local.Dockerfile compose
 
@@ -613,6 +700,13 @@ jobs:
   # startup (issue #428). The build-only `images` job above cannot catch this
   # (it never runs the image). Build the real image and assert the entrypoint's
   # imports resolve inside it -- the one place that gap is observable.
+  #
+  # GHA-layer-cached off the same scope the `images` matrix writes for this
+  # image (`scope=dispatcher`), read-only: the matrix refreshes it with
+  # `mode=max` every run, so a second writer would only contend. `load: true`
+  # is required -- the assertion step runs the built image. The builder is
+  # created with `use: false` so the default `docker` driver stays current,
+  # matching the ladder jobs and keeping any local-tag lookup working.
   dispatcher-image-smoke:
     name: Dispatcher image imports resolve
     runs-on: ubuntu-latest
@@ -620,8 +714,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Build the dispatcher image locally
-        run: docker build -t curie-dispatcher:ci-smoke -f apps/dispatcher/Dockerfile .
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the dispatcher image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: curie-dispatcher:ci-smoke
+          push: false
+          load: true
+          cache-from: type=gha,scope=dispatcher
       - name: Entrypoint imports resolve in the built image
         run: docker run --rm --entrypoint python curie-dispatcher:ci-smoke -c "import curie_dispatcher; import aci_protocol"
 
@@ -631,6 +738,13 @@ jobs:
   # stay importable from a source checkout while being absent from the isolated
   # image venv, and the process crash-loops on startup. The build-only `images`
   # job above never runs the image, so this is the one place that is observable.
+  #
+  # GHA-layer-cached off `scope=mail-adapter`, the scope the `images` matrix
+  # writes for this image, read-only for the same reason as the dispatcher job.
+  # `context: .` is kept explicit here (it is what the plain `docker build` this
+  # replaces used); the matrix entry for mail-adapter omits `context`, so the
+  # two builds may not share every layer -- that pre-existing asymmetry is left
+  # alone rather than widened by this change.
   mail-adapter-image-smoke:
     name: Mail adapter image imports resolve
     runs-on: ubuntu-latest
@@ -638,10 +752,325 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Build the mail adapter image locally
-        run: docker build -t curie-mail-adapter:ci-smoke -f apps/mail-adapter/Dockerfile .
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the mail adapter image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/mail-adapter/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: curie-mail-adapter:ci-smoke
+          push: false
+          load: true
+          cache-from: type=gha,scope=mail-adapter
       - name: Entrypoint imports resolve in the built image
         run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_mail_adapter; import aci_protocol; import pydantic_settings"
+
+  # The console UI image serves its build through an nginx template that lives
+  # as a heredoc in apps/ui/Dockerfile, not as a checked-in config file, so
+  # nothing reviews it directly. The build-only `images` job above never runs
+  # the image, and the Playwright suite previews the raw Vite build on port
+  # 4273, bypassing nginx entirely. That leaves the built container as the
+  # only place the served response headers, compression and cache behavior
+  # are observable at all. This job builds the real image, boots it, and pins
+  # those headers so a template regression fails CI instead of surfacing as a
+  # production caching or compression bug.
+  ui-image-smoke:
+    name: UI image response headers are correct
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the UI image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/ui/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: curie-ui:ci-smoke
+          push: false
+          load: true
+          cache-from: type=gha,scope=ui
+      - name: Start the stub API upstream
+        run: |
+          set -euo pipefail
+          docker network create curie-ui-smoke-net
+          docker run -d --name curie-api-smoke \
+            --network curie-ui-smoke-net \
+            --network-alias curie-api \
+            -v "${PWD}/apps/ui/ci/smoke-upstream-api.py:/app/upstream.py:ro" \
+            python:3.13-slim \
+            python -u /app/upstream.py
+          # nginx resolves the proxy_pass upstream at startup, so the alias must
+          # already be resolvable and serving before the UI container starts or
+          # the UI exits 1.
+          for i in $(seq 1 40); do
+            if docker exec curie-api-smoke python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/agents').read()" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "Stub API upstream never became ready" >&2
+          docker logs curie-api-smoke || true
+          exit 1
+      - name: Start the UI container
+        run: |
+          set -euo pipefail
+          docker run -d --name curie-ui-smoke \
+            --network curie-ui-smoke-net \
+            -e CURIE_API_TARGET=http://curie-api:8000 \
+            -p 18080:8080 \
+            curie-ui:ci-smoke
+          for i in $(seq 1 40); do
+            if curl -sf -o /dev/null http://127.0.0.1:18080/; then
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "UI container never became ready" >&2
+          docker logs curie-ui-smoke || true
+          exit 1
+      - name: Assert response headers
+        run: |
+          set -euo pipefail
+
+          # Resolve the hashed asset path from the running container rather
+          # than hardcoding a hash that changes on every build.
+          JS_ASSET_NAME="$(docker exec curie-ui-smoke sh -c 'cd /usr/share/nginx/html/assets && ls *.js' | head -1)"
+          if [ -z "$JS_ASSET_NAME" ]; then
+            echo "No hashed JS asset found in the built image" >&2
+            exit 1
+          fi
+          ASSET_PATH="/assets/${JS_ASSET_NAME}"
+          BASE_URL="http://127.0.0.1:18080"
+
+          gzip_headers="$(curl -sS -D - -o /dev/null -H 'Accept-Encoding: gzip' "${BASE_URL}${ASSET_PATH}" | tr 'A-Z' 'a-z')"
+
+          if ! echo "$gzip_headers" | grep -q '^content-encoding: gzip'; then
+            echo "Missing header: Content-Encoding: gzip on ${ASSET_PATH}" >&2
+            echo "$gzip_headers" >&2
+            exit 1
+          fi
+
+          if ! echo "$gzip_headers" | grep 'cache-control' | grep -q 'public'; then
+            echo "Missing token in Cache-Control: public on ${ASSET_PATH}" >&2
+            echo "$gzip_headers" >&2
+            exit 1
+          fi
+
+          if ! echo "$gzip_headers" | grep 'cache-control' | grep -q 'immutable'; then
+            echo "Missing token in Cache-Control: immutable on ${ASSET_PATH}" >&2
+            echo "$gzip_headers" >&2
+            exit 1
+          fi
+
+          if ! echo "$gzip_headers" | grep 'cache-control' | grep -q 'max-age=31536000'; then
+            echo "Missing token in Cache-Control: max-age=31536000 on ${ASSET_PATH}" >&2
+            echo "$gzip_headers" >&2
+            exit 1
+          fi
+
+          if ! echo "$gzip_headers" | grep -q '^vary: accept-encoding'; then
+            echo "Missing header: Vary: Accept-Encoding on ${ASSET_PATH}" >&2
+            echo "$gzip_headers" >&2
+            exit 1
+          fi
+
+          # Compressed transfer size must be meaningfully smaller than the
+          # identity size, proving gzip actually ran rather than the header
+          # being stamped without real compression behind it.
+          identity_size="$(curl -sS -o /dev/null -H 'Accept-Encoding: identity' -w '%{size_download}' "${BASE_URL}${ASSET_PATH}")"
+          compressed_size="$(curl -sS -o /dev/null -H 'Accept-Encoding: gzip' -w '%{size_download}' "${BASE_URL}${ASSET_PATH}")"
+          if [ "$identity_size" -le 0 ]; then
+            echo "Identity response for ${ASSET_PATH} was empty" >&2
+            exit 1
+          fi
+          half_identity=$((identity_size / 2))
+          if [ "$compressed_size" -ge "$half_identity" ]; then
+            echo "Gzip transfer size not meaningfully smaller than identity for ${ASSET_PATH}" >&2
+            echo "identity_size=${identity_size} compressed_size=${compressed_size}" >&2
+            exit 1
+          fi
+
+          # NEGATIVE case: without gzip in the request, the response must not
+          # claim to be gzip encoded, proving the header tracks the request
+          # rather than being stamped unconditionally.
+          identity_headers="$(curl -sS -D - -o /dev/null -H 'Accept-Encoding: identity' "${BASE_URL}${ASSET_PATH}" | tr 'A-Z' 'a-z')"
+          if echo "$identity_headers" | grep -q '^content-encoding: gzip'; then
+            echo "Content-Encoding: gzip present on an identity request for ${ASSET_PATH}" >&2
+            echo "$identity_headers" >&2
+            exit 1
+          fi
+
+          # index.html must not carry a long-lived cache like the hashed assets do.
+          index_headers="$(curl -sS -D - -o /dev/null "${BASE_URL}/" | tr 'A-Z' 'a-z')"
+          if ! echo "$index_headers" | grep 'cache-control' | grep -q 'no-cache'; then
+            echo "Missing token in Cache-Control: no-cache on / (index.html)" >&2
+            echo "$index_headers" >&2
+            exit 1
+          fi
+          if echo "$index_headers" | grep 'cache-control' | grep -q 'immutable'; then
+            echo "index.html Cache-Control unexpectedly contains immutable" >&2
+            echo "$index_headers" >&2
+            exit 1
+          fi
+          if echo "$index_headers" | grep 'cache-control' | grep -q 'max-age=31536000'; then
+            echo "index.html Cache-Control unexpectedly contains max-age=31536000" >&2
+            echo "$index_headers" >&2
+            exit 1
+          fi
+
+          # GUARD DEMONSTRATION for `try_files $uri =404` in the assets
+          # location. Without it a missing hashed asset falls through to the SPA
+          # fallback and returns an HTML body under a year-long immutable cache
+          # at a URL that will never be requested again with different content.
+          missing_asset_status="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE_URL}/assets/does-not-exist-0000000.js")"
+          if [ "$missing_asset_status" != "404" ]; then
+            echo "A missing hashed asset returned ${missing_asset_status}, expected 404" >&2
+            exit 1
+          fi
+          missing_asset_headers="$(curl -sS -D - -o /dev/null "${BASE_URL}/assets/does-not-exist-0000000.js" | tr 'A-Z' 'a-z')"
+          if echo "$missing_asset_headers" | grep 'cache-control' | grep -q 'immutable'; then
+            echo "A missing hashed asset was served with an immutable Cache-Control" >&2
+            echo "$missing_asset_headers" >&2
+            exit 1
+          fi
+          if echo "$missing_asset_headers" | grep 'cache-control' | grep -q 'max-age=31536000'; then
+            echo "A missing hashed asset was served with a year-long max-age" >&2
+            echo "$missing_asset_headers" >&2
+            exit 1
+          fi
+
+          # API ISOLATION. `gzip off` inside location /api/ is what keeps proxied
+          # responses byte-identical. The subtle pairing: application/json IS in
+          # gzip_types, so this JSON body would be compressed by the server-scope
+          # gzip if the location-scope `gzip off` were removed. A gzipped
+          # response here is therefore a direct failure of that directive.
+          api_headers="$(curl -sS -D - -o /dev/null -H 'Accept-Encoding: gzip' "${BASE_URL}/api/agents" | tr 'A-Z' 'a-z')"
+          if echo "$api_headers" | grep -q '^content-encoding:'; then
+            echo "Proxied API response carries a Content-Encoding header; gzip off in location /api/ is not in effect" >&2
+            echo "$api_headers" >&2
+            exit 1
+          fi
+          api_declared_length="$(echo "$api_headers" | awk '/^content-length:/ {gsub(/[^0-9]/, "", $2); print $2}' | head -1)"
+          if [ -z "$api_declared_length" ]; then
+            echo "Proxied API response has no Content-Length; nginx re-chunked or rewrote the upstream body" >&2
+            echo "$api_headers" >&2
+            exit 1
+          fi
+          api_received_bytes="$(curl -sS -o /dev/null -H 'Accept-Encoding: gzip' -w '%{size_download}' "${BASE_URL}/api/agents")"
+          if [ "$api_declared_length" != "$api_received_bytes" ]; then
+            echo "Proxied API Content-Length ${api_declared_length} does not match the ${api_received_bytes} bytes received; the body was recompressed or re-chunked" >&2
+            exit 1
+          fi
+
+          # STREAMING. The upstream emits five SSE events 0.4s apart, so a
+          # pass-through proxy delivers them over roughly 1.6s. If nginx buffers
+          # the response they all land at once and the elapsed span collapses to
+          # near zero, which fails here.
+          sse_result="$(curl -sN --max-time 30 "${BASE_URL}/api/stream" | python3 -u -c '
+          import sys
+          import time
+
+          first = None
+          last = None
+          count = 0
+          while True:
+              line = sys.stdin.readline()
+              if not line:
+                  break
+              if line.startswith("data:"):
+                  now = time.monotonic()
+                  if first is None:
+                      first = now
+                  last = now
+                  count += 1
+          span_ms = int((last - first) * 1000) if first is not None else 0
+          print("%d %d" % (count, span_ms))
+          ')"
+          sse_count="$(echo "$sse_result" | awk '{print $1}')"
+          sse_span_ms="$(echo "$sse_result" | awk '{print $2}')"
+          if [ "$sse_count" != "5" ]; then
+            echo "Expected 5 SSE events through the /api/ proxy, received ${sse_count}" >&2
+            exit 1
+          fi
+          if [ "$sse_span_ms" -lt 1000 ]; then
+            echo "SSE events arrived within ${sse_span_ms}ms of each other; nginx buffered the stream instead of passing it through" >&2
+            exit 1
+          fi
+
+          # CONFIG-LEVEL PIN for the full gzip_types list. The build emits no
+          # JSON or SVG asset large enough to clear gzip_min_length, so there is
+          # no runtime path that would notice those types being dropped from the
+          # template; this assertion is their pin. The JS asset above already
+          # proves the runtime path end to end for the JavaScript types.
+          # Anchor on the directive line itself: this same config file also has
+          # an nginx comment mentioning gzip_types, and a plain grep would match
+          # that comment too, letting a required type be silently dropped from
+          # the real directive while the check still passes.
+          gzip_types_line="$(docker exec curie-ui-smoke grep -E '^[[:space:]]*gzip_types[[:space:]]' /etc/nginx/conf.d/default.conf)"
+          if [ -z "$gzip_types_line" ]; then
+            echo "nginx config has no gzip_types directive at all" >&2
+            exit 1
+          fi
+          for required_type in application/javascript text/javascript text/css application/json image/svg+xml; do
+            if ! echo "$gzip_types_line" | grep -qF "$required_type"; then
+              echo "nginx gzip_types is missing the required type: ${required_type}" >&2
+              echo "$gzip_types_line" >&2
+              exit 1
+            fi
+          done
+
+          # A CSS asset is gzipped too, if the build emits one and it is large
+          # enough to clear the server's gzip_min_length floor. Below that
+          # floor nginx correctly declines to compress it, so the check falls
+          # back to asserting the config declares text/css as compressible.
+          # Skip gracefully if the build emits no CSS asset at all.
+          GZIP_MIN="$(docker exec curie-ui-smoke sh -c "awk '/gzip_min_length/ {gsub(/[^0-9]/, \"\", \$2); print \$2}' /etc/nginx/conf.d/default.conf" | head -1)"
+          GZIP_MIN="${GZIP_MIN:-1024}"
+          CSS_ASSET_NAME="$(docker exec curie-ui-smoke sh -c 'cd /usr/share/nginx/html/assets && ls *.css 2>/dev/null || true' | head -1)"
+          if [ -n "$CSS_ASSET_NAME" ]; then
+            CSS_ASSET_SIZE="$(docker exec curie-ui-smoke sh -c "wc -c < /usr/share/nginx/html/assets/${CSS_ASSET_NAME}" | tr -d '[:space:]')"
+            css_headers="$(curl -sS -D - -o /dev/null -H 'Accept-Encoding: gzip' "${BASE_URL}/assets/${CSS_ASSET_NAME}" | tr 'A-Z' 'a-z')"
+            if ! echo "$css_headers" | grep 'cache-control' | grep -q 'immutable'; then
+              echo "Missing token in Cache-Control: immutable on /assets/${CSS_ASSET_NAME}" >&2
+              echo "$css_headers" >&2
+              exit 1
+            fi
+            if [ "$CSS_ASSET_SIZE" -ge "$GZIP_MIN" ]; then
+              if ! echo "$css_headers" | grep -q '^content-encoding: gzip'; then
+                echo "Missing header: Content-Encoding: gzip on /assets/${CSS_ASSET_NAME}" >&2
+                echo "$css_headers" >&2
+                exit 1
+              fi
+            else
+              echo "CSS asset ${CSS_ASSET_NAME} is ${CSS_ASSET_SIZE} bytes, below the gzip_min_length floor of ${GZIP_MIN}; asserting gzip_types config instead of runtime encoding"
+              if ! echo "$gzip_types_line" | grep -qF 'text/css'; then
+                echo "nginx config does not declare text/css in gzip_types" >&2
+                exit 1
+              fi
+            fi
+          else
+            echo "No CSS asset found in this build; skipping the CSS gzip assertion"
+          fi
+
+          echo "All UI image header assertions passed"
+      - name: Tear down the UI container and its API upstream
+        if: always()
+        run: |
+          docker rm -f curie-ui-smoke || true
+          docker rm -f curie-api-smoke || true
+          docker network rm curie-ui-smoke-net || true
 
   # FALSIFIABILITY gate for the committed eval suites (issue #619). This is NOT
   # an E2E test: it never runs a real agent or makes a model call. It boots the
@@ -658,7 +1087,10 @@ jobs:
   # ride the Rust job (cli/tests/eval_falsifiability.rs) -- the fake model can
   # only ever say "all done", so those cannot be expressed through this path.
   # Reuses the release binary the Rust job already built and uploaded, and builds
-  # the runner image locally (plain `docker build`, no registry auth).
+  # the runner image locally (no registry auth), GHA-layer-cached off
+  # `scope=runner` -- the same scope the `images` matrix writes for the runner.
+  # Read-only cache for the same reason as the smoke jobs above; `load: true`
+  # because the gate script runs a container from the tag.
   eval-falsifiability:
     name: Eval falsifiability gate (fake model, offline)
     runs-on: ubuntu-latest
@@ -674,8 +1106,21 @@ jobs:
           path: cli/target/release
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
-      - name: Build the runner image locally
-        run: docker build -t curie-runner -f runner/Dockerfile .
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the runner image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: runner/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: curie-runner
+          push: false
+          load: true
+          cache-from: type=gha,scope=runner
       - name: Falsifiability gate (every committed case must go RED against the fake model)
         env:
           CURIE_BIN: cli/target/release/curie

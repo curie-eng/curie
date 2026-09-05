@@ -1,0 +1,99 @@
+name: P0 Closes spec-vs-impl reminder
+
+# Advisory only. A PR that Closes a P0, release-blocker, or sre-bot-e2e-demo
+# issue gets a comment asking for spec-vs-impl of each issue AC against the
+# diff (#2306). This workflow must not fail that pull request and must not
+# raise GitHub required reviews. Keep it out of ci.yaml so it cannot join the
+# required Python check.
+on:
+  pull_request:
+    branches: [main, next]
+    # A closing keyword can appear or disappear in a body-only edit. Re-run so
+    # the reminder tracks the body GitHub will actually close from.
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  remind:
+    name: Comment when a Closes targets P0 / release-blocker / sre-bot-e2e-demo
+    runs-on: ubuntu-latest
+    # A job-level block REPLACES the workflow-level one, so `contents: read` is
+    # repeated here. `issues: read` is the label lookup; `pull-requests: write`
+    # is the comment. Neither is a required review.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Decide whether this Closes a trigger-labeled issue
+        env:
+          COMMENT_FILE: ${{ runner.temp }}/curie-p0-closes-comment.md
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          python3 tools/p0-closes-ci/check.py
+          --event "$GITHUB_EVENT_PATH"
+          --comment-file "$COMMENT_FILE"
+      - name: Upsert or remove the spec-vs-impl reminder comment
+        uses: actions/github-script@v9
+        env:
+          COMMENT_FILE: ${{ runner.temp }}/curie-p0-closes-comment.md
+        with:
+          script: |
+            const fs = require("node:fs");
+            const marker = "<!-- curie-p0-closes-spec-vs-impl -->";
+            const commentPath = process.env.COMMENT_FILE;
+            try {
+              if (!commentPath) {
+                core.warning("COMMENT_FILE is not set");
+                return;
+              }
+              const body = fs.existsSync(commentPath)
+                ? fs.readFileSync(commentPath, { encoding: "utf8" })
+                : "";
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100,
+              });
+              const existing = comments.find(
+                (comment) =>
+                  typeof comment.body === "string" && comment.body.includes(marker)
+              );
+              if (!body.trim()) {
+                if (existing) {
+                  await github.rest.issues.deleteComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: existing.id,
+                  });
+                }
+                return;
+              }
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+            } catch (error) {
+              core.warning(`P0 Closes reminder comment was not posted: ${error.message}`);
+            }

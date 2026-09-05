@@ -50,6 +50,9 @@ _DEFAULT_INTERRUPT_TIMEOUT_S = 5.0
 _MIN_REQUEST_TIMEOUT_S = 0.05
 _POST_FINAL_CLEANUP_TIMEOUT_S = 1.0
 _POST_FINAL_DISCARD_CHUNK_BYTES = 64 * 1024
+_TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
+_TURN_EPOCH_MIN_LENGTH = 32
+_TURN_EPOCH_MAX_LENGTH = 256
 _T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
@@ -77,8 +80,90 @@ def _mark_rpc_failed(span: Any, outcome: str, cause: BaseException) -> None:
     )
 
 
+def _valid_turn_epoch(value: str | None) -> bool:
+    """Accept only the runner's bounded, URL-safe opaque turn capability."""
+    return bool(
+        value
+        and _TURN_EPOCH_MIN_LENGTH <= len(value) <= _TURN_EPOCH_MAX_LENGTH
+        and value.isascii()
+        and all(character.isalnum() or character in "-_" for character in value)
+    )
+
+
 class RunnerError(Exception):
     """The runner returned an unexpected HTTP status or an unreadable stream."""
+
+
+class AdoptionAttestationMismatch(RunnerError):
+    """A readable ``/v1/status`` attested no conversation, or another one.
+
+    Distinct from a server fault (5xx) or a transport error, which say nothing
+    about the pod's identity: this shape is definitive, the answering runner
+    is not bound to the caller's conversation.
+    """
+
+
+class AdoptionRefused(RunnerError):
+    """The runner refused an adopting ``/v1/event`` (ADR-0122).
+
+    ``status`` is the runner's HTTP status: 401 means the bootstrap it was
+    presented with is not the active credential there (wrong pool, or already
+    retired by an earlier adoption), 403/409 that the runner is not adoptable
+    (bound already, or a cold per-claim pod), 400 that the frame was refused
+    before anything was applied. The message never contains the credential:
+    the runner does not echo it, and every failure message raised from
+    ``start_adopting_turn`` (refusal or not) is scrubbed of both credentials so
+    a non-conforming server cannot route one into a log line.
+    """
+
+    def __init__(self, status: int, reason: str) -> None:
+        super().__init__(f"/v1/event -> {status}: adoption refused: {reason}")
+        self.status = status
+        self.reason = reason
+
+
+def _scrub(text: str, *secrets: str) -> str:
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    return text
+
+
+_REFUSAL_STATUSES = frozenset({400, 401, 403, 409})
+# The runner's fixed refusal for a bootstrap principal on any route but the
+# adopting /v1/event (runner/src/curie_runner/server.py). Its presence on a 403
+# is the only signal that the server is a realizing bootstrap-mode adopter.
+_BOOTSTRAP_ADOPTION_ONLY = "bootstrap credential permits adoption only"
+
+
+def _refusal(message: str, *secrets: str) -> tuple[int | None, str]:
+    """Split a ``start_turn`` failure into (refusal status, scrubbed reason).
+
+    Only the statuses the runner uses to refuse an adoption before applying
+    anything are refusals; everything else (5xx, a lost connection) is left to
+    the caller as the ordinary runner error it always was, because after a
+    503 or a dropped socket the adoption MAY have been applied and only the
+    recovery read can say.
+    """
+
+    prefix = "/v1/event -> "
+    if not message.startswith(prefix):
+        return None, ""
+    status_text, _, body = message[len(prefix):].partition(": ")
+    try:
+        status = int(status_text)
+    except ValueError:
+        return None, ""
+    if status not in _REFUSAL_STATUSES:
+        return None, ""
+    reason = body
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+            reason = parsed["error"]
+    except ValueError:
+        pass
+    return status, _scrub(reason, *secrets)
 
 
 class RunnerStreamTimeout(TimeoutError):
@@ -111,7 +196,10 @@ class TurnStream:
     """An open ``/v1/event`` response: the turn is active; iterate for frames."""
 
     def __init__(
-        self, response: aiohttp.ClientResponse, budget_s: float | None = None
+        self,
+        response: aiohttp.ClientResponse,
+        budget_s: float | None = None,
+        timeout_callback: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._response = response
         self._saw_final = False
@@ -119,6 +207,27 @@ class TurnStream:
         # client so the stream can NAME the budget it blew (#2011). Optional so
         # a directly-constructed TurnStream (tests, evals) still works.
         self._budget_s = budget_s
+        # A successful /v1/event response may bind its opaque turn epoch to a
+        # separately bounded control call. Consume it before awaiting so a
+        # repeated iterator cannot notify the same turn twice.
+        self._timeout_callback = timeout_callback
+        # ADR-0122 ack: None until a frame is read; then True only while EVERY
+        # frame of the turn carried ``adoption_applied: true``. A tolerant
+        # consumer that ignored the credential serves the turn with no ack, so
+        # an HTTP 200 alone is never adoption.
+        self._adoption_acked: bool | None = None
+
+    @property
+    def adoption_ack_observed(self) -> bool | None:
+        """``None`` before any frame; otherwise whether every frame so far acked."""
+
+        return self._adoption_acked
+
+    @property
+    def adoption_acked(self) -> bool:
+        """True only once at least one frame was read and all of them acked."""
+
+        return self._adoption_acked is True
 
     async def __aiter__(self) -> AsyncIterator[OutboundEvent]:
         try:
@@ -127,6 +236,10 @@ class TurnStream:
                 if not line:
                     continue
                 frame = parse_ndjson_line(line)
+                acked = frame.adoption_applied is True
+                self._adoption_acked = (
+                    acked if self._adoption_acked is None else (self._adoption_acked and acked)
+                )
                 if isinstance(frame, Final):
                     self._saw_final = True
                 yield frame
@@ -145,7 +258,24 @@ class TurnStream:
             # subclass TimeoutError, so cooperative cancellation still passes
             # straight through -- do not broaden this clause.
             self._record_stream_timeout(cause)
+            await self._notify_timeout()
             raise RunnerStreamTimeout(self._timeout_reason(cause)) from cause
+
+    async def _notify_timeout(self) -> None:
+        callback = self._timeout_callback
+        self._timeout_callback = None
+        if callback is None:
+            return
+        try:
+            await callback()
+        except Exception as exc:  # noqa: BLE001 - preserve the causal body timeout
+            # The epoch, bearer, and response body are deliberately absent. A
+            # failed notification leaves abandonment as the runner's truthful
+            # best-effort terminal, but must never replace RunnerStreamTimeout.
+            logger.warning(
+                "runner timeout terminal notification failed (%s)",
+                type(exc).__name__,
+            )
 
     def _timeout_reason(self, cause: BaseException) -> str:
         budget = "unbounded" if self._budget_s is None else f"{self._budget_s}s"
@@ -378,9 +508,195 @@ class RunnerClient:
                 body = await resp.text()
                 resp.release()
                 raise RunnerError(f"/v1/event -> {resp.status}: {body}")
-            return TurnStream(resp, stream_timeout_s), "success"
+            turn_epoch = resp.headers.get(_TURN_EPOCH_HEADER)
+            timeout_callback: Callable[[], Awaitable[None]] | None = None
+            if _valid_turn_epoch(turn_epoch):
+                # ``turn_epoch`` is narrowed by the validation above. Keep the
+                # callback response-bound so a retry can never inherit a stale
+                # epoch from an earlier /v1/event.
+                async def notify_timeout() -> None:
+                    assert turn_epoch is not None
+                    # Adoption retires the bootstrap before accepting the stream.
+                    # Its timeout control must use the installed conversation
+                    # credential, while ordinary turns retain their bearer.
+                    control_token = event.adoption_credential or token
+                    await self._notify_timeout(base_url, turn_epoch, control_token)
+
+                timeout_callback = notify_timeout
+            return TurnStream(resp, stream_timeout_s, timeout_callback), "success"
 
         return await self._rpc("event", token, request)
+
+    async def _notify_timeout(
+        self,
+        base_url: str,
+        turn_epoch: str,
+        token: str | None,
+    ) -> None:
+        """Best-effort causal timeout notification for one accepted turn."""
+
+        async def request(headers: dict[str, str] | None) -> tuple[None, str]:
+            control_headers = dict(headers or {})
+            control_headers[_TURN_EPOCH_HEADER] = turn_epoch
+            async with self._session.post(
+                f"{base_url}/v1/timeout",
+                headers=control_headers,
+                timeout=self._interrupt_timeout,
+            ) as resp:
+                if resp.status not in (200, 409):
+                    # Do not read or echo an arbitrary response body on this
+                    # sensitive best-effort path.
+                    raise RunnerError(f"/v1/timeout -> {resp.status}")
+                return None, "conflict" if resp.status == 409 else "success"
+
+        await self._rpc("timeout", token, request)
+
+    async def start_adopting_turn(
+        self,
+        base_url: str,
+        event: Event,
+        *,
+        bootstrap_token: str,
+        conversation_token: str,
+        session_id: str,
+        history_ref: str | None,
+        remaining_s: float | None = None,
+    ) -> TurnStream:
+        """Open the one turn a bootstrap credential may authenticate (ADR-0122).
+
+        The existing ``Event`` is the transport: the conversation's identity
+        and its fresh credential ride on the frame, the pool bootstrap is the
+        bearer, and no new route or header exists. The caller has already
+        recorded ``conversation_token`` on the thread's route as pending; this
+        call does not persist anything. Read ``TurnStream.adoption_acked`` after
+        streaming to learn whether the runner applied it, and
+        ``adoption_applied`` to recover when the response was lost. A refusal
+        raises ``AdoptionRefused`` with the status and a credential-free reason.
+        """
+
+        if not bootstrap_token or not conversation_token or not session_id:
+            raise RunnerError("adoption requires a bootstrap credential, a conversation "
+                              "credential, and a session id")
+        adopting = event.model_copy(
+            update={
+                "session_id": session_id,
+                "history_ref": history_ref,
+                "adoption_credential": conversation_token,
+            }
+        )
+        try:
+            return await self.start_turn(
+                base_url, adopting, bootstrap_token, remaining_s=remaining_s
+            )
+        except RunnerError as exc:
+            status, reason = _refusal(str(exc), bootstrap_token, conversation_token)
+            if status is None:
+                # Not a refusal (5xx, unreadable body): the adoption MAY have
+                # been applied and only ``adoption_applied`` can say. Re-raise
+                # as the ordinary runner error, scrubbed the same way.
+                raise RunnerError(
+                    _scrub(str(exc), bootstrap_token, conversation_token)
+                ) from None
+            raise AdoptionRefused(status, reason) from None
+
+    async def adoption_authority(
+        self,
+        base_url: str,
+        *,
+        bootstrap_token: str,
+        remaining_s: float | None = None,
+    ) -> bool:
+        """Is this runner a realizing bootstrap-mode adopter for ``bootstrap_token``?
+
+        The pre-activation gate before any adopting event is sent: an older
+        runner that ignores the optional adoption fields (and the bootstrap
+        BootEnv key) would serve the adopting turn under its boot identity and
+        START A MODEL TURN, and its missing ack is only visible afterwards. So
+        the authority is established first, through the existing gated status
+        route rather than the protocol version (a contract-only build carries
+        the same version): a realizing runner in bootstrap mode answers a
+        bootstrap bearer on ``GET /v1/status`` with the fixed 403 refusal and
+        starts nothing; an old open runner answers 200, an old or cold
+        per-claim runner 401, and anything else is a transport or server
+        fault. Only the exact 403 is ``True``; everything else fails closed.
+        """
+
+        if not bootstrap_token:
+            raise RunnerError("adoption authority requires the bootstrap credential")
+
+        async def request(headers: dict[str, str] | None) -> tuple[bool, str]:
+            async with self._session.get(
+                f"{base_url}/v1/status",
+                headers=headers,
+                timeout=self._request_timeout(remaining_s),
+            ) as resp:
+                if resp.status != 403:
+                    await resp.read()
+                    return False, "conflict"
+                try:
+                    body = await resp.json()
+                except Exception:  # noqa: BLE001 - any unreadable body is "not established"
+                    return False, "conflict"
+                error = body.get("error") if isinstance(body, dict) else None
+                return error == _BOOTSTRAP_ADOPTION_ONLY, (
+                    "success" if error == _BOOTSTRAP_ADOPTION_ONLY else "conflict"
+                )
+
+        return await self._rpc("status", bootstrap_token, request)
+
+    async def adoption_applied(
+        self,
+        base_url: str,
+        *,
+        conversation_token: str,
+        session_id: str,
+        remaining_s: float | None = None,
+    ) -> bool:
+        """Did the runner install ``conversation_token`` for ``session_id``?
+
+        The recovery read for a lost adopting response: ``GET /v1/status``
+        under the conversation credential. ``True`` (200 with an attested
+        ``session_id`` equal to ours) proves the binding was applied to that
+        pod, and ONLY that: it says nothing about whether the lost turn ran to
+        completion or produced side effects, so the caller must not replay the
+        first event as if it had never been delivered. ``False`` (401) means
+        the credential is not active on the pod answering, which is NOT proof
+        that the bootstrap is still adoptable there: a rotated or wrong
+        authority, a replaced pod behind the same route, or lost bound state
+        answer the same way. A retry is permitted only through the original
+        fenced claim and pod, fails closed on any refusal, and is reported as
+        unconfirmed rather than as a fresh adoption. A 200 attesting another
+        conversation, or one attesting none, is refused as ``RunnerError``: it
+        is not a runner this thread may be routed to.
+        """
+
+        if not conversation_token:
+            raise RunnerError("adoption recovery requires the conversation credential")
+
+        async def request(headers: dict[str, str] | None) -> tuple[bool, str]:
+            async with self._session.get(
+                f"{base_url}/v1/status",
+                headers=headers,
+                timeout=self._request_timeout(remaining_s),
+            ) as resp:
+                if resp.status == 401:
+                    return False, "conflict"
+                if resp.status != 200:
+                    await resp.read()
+                    raise RunnerError(f"/v1/status -> {resp.status}: adoption recovery refused")
+                data = await resp.json()
+                attested = data.get("session_id") if isinstance(data, dict) else None
+                if not isinstance(attested, str) or not attested:
+                    raise AdoptionAttestationMismatch(
+                        "/v1/status attested no conversation; not adopted"
+                    )
+                if attested != session_id:
+                    raise AdoptionAttestationMismatch(
+                        "/v1/status attested a different conversation; refusing this route"
+                    )
+                return True, "success"
+
+        return await self._rpc("status", conversation_token, request)
 
     async def steer(
         self,

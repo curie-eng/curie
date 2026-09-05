@@ -716,10 +716,12 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
 
     diagnostic_index = _single_step_index(
         steps,
-        lambda step: "compose.dev.yaml logs" in _string(step, "run")
-        and _string(step, "if") == "failure()",
+        lambda step: "compose.dev.yaml logs" in _string(step, "run"),
         "failure stack diagnostic",
     )
+    diagnostic_if = _string(steps[diagnostic_index], "if")
+    assert "failure()" in diagnostic_if
+    assert "steps.python-runtime.outputs.pytest == 'true'" in diagnostic_if
     assert gate_index < diagnostic_index
 
 

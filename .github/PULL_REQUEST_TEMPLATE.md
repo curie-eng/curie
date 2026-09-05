@@ -76,7 +76,14 @@ Fix pin waiver: <reason>
 
      Documentation and ADR changes are not automatically exempt. If they alter
      runtime behavior, use the behavior-bearing path. See "E2E verification is
-     mandatory" in AGENTS.md. -->
+     mandatory" in AGENTS.md.
+
+     A change that reaches runner MCP catalog projection, unscoped PreToolUse,
+     in-process platform MCP tools, workspace publication, or
+     built-in coding-tool session capability must record live-provider plus
+     Slack external-integration evidence, or leave those required-tier rows open.
+     "No model routing change" is not a valid n/a reason. Fake-model kind,
+     skill ladder, and helper-only tests are not sufficient. -->
 
 | Tier | Required / n/a | Reason | Mode (fake / live) | Command and observed outcome |
 | --- | --- | --- | --- | --- |

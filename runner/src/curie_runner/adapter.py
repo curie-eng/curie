@@ -18,9 +18,10 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -265,6 +266,15 @@ class PartialMessageBoundary:
     event_type: str
 
 
+@dataclass(frozen=True, slots=True)
+class StreamedToolUseBoundary:
+    """Sanitized evidence that the provider began a tool call."""
+
+    call_id: str = field(repr=False)
+    tool_name: str
+    observed_time_ns: int
+
+
 class ModelSession(Protocol):
     """One long-lived model session the runner drives turn by turn."""
 
@@ -400,11 +410,28 @@ class ClaudeAgentSession:
             async with contextlib.aclosing(response):
                 async for message in response:
                     if isinstance(message, StreamEvent):
+                        event = message.event
                         event_type = (
-                            message.event.get("type")
-                            if isinstance(message.event, dict)
-                            else None
+                            event.get("type") if isinstance(event, dict) else None
                         )
+                        if event_type == "content_block_start":
+                            content_block = event.get("content_block")
+                            if isinstance(content_block, dict):
+                                call_id = content_block.get("id")
+                                tool_name = content_block.get("name")
+                                if (
+                                    content_block.get("type") == "tool_use"
+                                    and isinstance(call_id, str)
+                                    and call_id
+                                    and isinstance(tool_name, str)
+                                    and tool_name
+                                ):
+                                    yield StreamedToolUseBoundary(
+                                        call_id=call_id,
+                                        tool_name=tool_name,
+                                        observed_time_ns=time.time_ns(),
+                                    )
+                                    continue
                         if event_type in _ALLOWED_PARTIAL_BOUNDARY_TYPES:
                             # Do not forward the StreamEvent object: its event body,
                             # uuid, SDK session id, and parent tool id are all

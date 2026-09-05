@@ -11,11 +11,15 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
+
+use support::{serve, MockServer, Request, Response};
 
 const RELEASE: &str = "acme-platform";
 const NAMESPACE: &str = "acme-system";
@@ -117,7 +121,7 @@ spec:
 
 // One script is installed under both tool names. Python keeps the fake
 // cluster's state machine readable without depending on PyYAML or a shell YAML
-// parser. It never receives credential material.
+// parser. It receives only the generated test credential, never live material.
 const TOOL_SHIM: &str = r#"#!/usr/bin/env python3
 import json
 import os
@@ -353,6 +357,9 @@ if tool == "helm":
     raise SystemExit(1)
 
 if tool == "kubectl":
+    if args == ["-n", os.environ["FAKE_CLUSTER_NAMESPACE"], "get", "secret", "acme-github-app", "-o", "json"]:
+        print((root / "github-app-secret.json").read_text())
+        raise SystemExit(0)
     joined = " ".join(args)
     if args and args[0] == "proxy":
         event("kubectl:proxy")
@@ -443,10 +450,15 @@ raise SystemExit(1)
 
 struct FakeCluster {
     dir: tempfile::TempDir,
+    github: MockServer,
 }
 
 impl FakeCluster {
     fn new(scenario: &str) -> Self {
+        Self::with_identity_status(scenario, 200)
+    }
+
+    fn with_identity_status(scenario: &str, status: u16) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin_dir = dir.path().join("bin");
         fs::create_dir(&bin_dir).expect("create shim dir");
@@ -481,7 +493,44 @@ impl FakeCluster {
                 fs::write(dir.path().join(format!("live__{name}")), "").expect("seed live object");
             }
         }
-        Self { dir }
+        // The released identity guard authenticates the BYO key before the
+        // sandbox barrier. Generate a real PEM and mock only GitHub's documented
+        // GET /app response, as in github_app_identity (issue #2269).
+        // https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app
+        let key = Command::new("openssl")
+            .args(["genrsa", "2048"])
+            .output()
+            .expect("generate test App PEM");
+        assert!(key.status.success(), "openssl genrsa failed");
+        let secret = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "acme-github-app"},
+            "data": {
+                "app-pem": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &key.stdout,
+                )
+            }
+        });
+        let secret_path = dir.path().join("github-app-secret.json");
+        fs::write(&secret_path, secret.to_string()).expect("write test App Secret");
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600))
+            .expect("protect test App Secret");
+        let github = serve(move |request: &Request| {
+            if status == 200
+                && request.method == "GET"
+                && request.path == "/app"
+                && request
+                    .header("authorization")
+                    .is_some_and(|value| value.starts_with("Bearer "))
+            {
+                Response::json(200, r#"{"id":1234567,"name":"acme-bot"}"#)
+            } else {
+                Response::json(401, r#"{"message":"Unauthorized"}"#)
+            }
+        });
+        Self { dir, github }
     }
 
     fn state(&self) -> &Path {
@@ -536,6 +585,8 @@ impl FakeCluster {
             .env("PATH", self.child_path())
             .env("FAKE_CLUSTER_STATE", self.state())
             .env("FAKE_CLUSTER_SCENARIO", scenario)
+            .env("FAKE_CLUSTER_NAMESPACE", namespace)
+            .env("CURIE_GITHUB_API_URL", &self.github.base_url)
             .env("FAKE_SENSITIVE_SENTINEL", sensitive_stderr_sentinel());
         if scenario == "helm-upgrade-hang" {
             command.env("CURIE_TEST_GITHUB_APP_HELM_TIMEOUT_MS", "150");
@@ -2176,4 +2227,33 @@ fn disconnect_uses_the_same_sandbox_barrier_and_retains_its_sibling_output() {
                 < position(&events, "kubectl:rollout-restart"),
         "disconnect bypassed the shared sandbox recovery barrier: {events:?}"
     );
+}
+
+#[test]
+fn invalid_app_identity_cannot_repair_missing_sandboxes_or_upgrade() {
+    let cluster = FakeCluster::with_identity_status("pre-missing", 401);
+    let output = cluster.run("pre-missing", false);
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["error"]
+        .as_str()
+        .unwrap()
+        .contains("does not authenticate"));
+    assert!(value["fix"].as_str().is_some_and(|fix| !fix.is_empty()));
+    assert!(cluster
+        .github
+        .recorded()
+        .iter()
+        .any(|request| request.method == "GET" && request.path == "/app"));
+    let events = cluster.events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("kubectl:create") || event.starts_with("helm:upgrade")),
+        "{events:?}"
+    );
+    assert!(!cluster
+        .state()
+        .join("live__acme-platform-agent-red-runner")
+        .exists());
 }

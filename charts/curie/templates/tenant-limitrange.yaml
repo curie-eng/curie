@@ -8,14 +8,43 @@ is deliberate and is the whole point of shipping one: "a sandbox created
 outside the chart's own templates still inherits a ceiling" only holds if the
 default is namespace-wide, not sandbox-scoped.
 
-This is safe for the N=1 self-host control plane because every first-party
-component in this chart (api, worker, dispatcher, ui, postgres, valkey,
-clickhouse, rustfs, langfuse, the otel collector, the preflight/probe jobs, and
-the runner-prewarm DaemonSet) already declares BOTH a cpu and a memory
-request+limit of its own in values.yaml -- so this LimitRange's cpu/memory
-default/defaultRequest never overrides an already-set value for any of them;
-it only ever fills in the one dimension the chart leaves undeclared everywhere
-today, `ephemeral-storage` (the exact gap ADR-0059 opens with). Deliberately NOT
+This is safe for the N=1 self-host control plane because every container this
+chart puts in the release namespace already declares BOTH a cpu and a memory
+request+limit of its own -- api, worker, dispatcher, ui, mail-adapter,
+inference, postgres, valkey, clickhouse, rustfs, the langfuse web and worker
+Deployments (and their `wait-for-clickhouse` init containers), the otel
+collector, the runner-prewarm DaemonSet, the langfuse model-pricing, rustfs-init,
+preflight-avx, preflight-gvisor, netpol-probe and worker upgrade-drain Jobs, and
+the security-probe hardening Pod. Most declare it in values.yaml; the fixed-cost
+hook Jobs (rustfs-init, upgrade-drain) hardcode it in their own template, which
+is the same guarantee from the LimitRange's point of view. So this LimitRange's
+cpu/memory default/defaultRequest never overrides an already-set value for any
+of them; it only ever fills in the one dimension the chart leaves undeclared
+everywhere today, `ephemeral-storage` (the exact gap ADR-0059 opens with).
+
+That list is the whole safety argument, so it has to stay exhaustive: a workload
+it quietly omits is a workload silently running on this generic, sandbox-shaped
+default instead of an intentional value. `inference` was exactly that omission
+(#2329) -- its container declared no resources at all, so the model server was
+admitted with `limits.memory: 1Gi` and OOMKilled on first inference, presenting
+as a model-server crash rather than as a chart capacity default. Prose rots, so
+it is not the enforcement: `ci/tenant-capacity-assertions.sh` assertion 7 is,
+and it now renders with `inference.deploy=true` so it can actually see this one.
+Note what that assertion does and does not cover -- Deployment and StatefulSet
+containers only, so the Jobs, the DaemonSet and the init containers named above
+rest on this comment alone, and an opt-in workload is invisible to it until its
+flag is added to that render.
+
+Three deliberately short-lived containers are the named exceptions and DO
+inherit the cpu/memory default: the api `migrate` init container, the
+langfuse-web `wait-for-postgres` init container, and the security-probe driver
+Job. Each runs for seconds and never serves traffic, so a 1 cpu / 1Gi ceiling is
+a sane bound for them rather than a capacity decision -- they are named here
+rather than left implied by the sentence above. Two more workloads sit outside
+this object's reach entirely and so are outside the claim either way: the
+vendored agent-sandbox controller (hardcoded to `agent-sandbox-system`) and the
+grafana-connector updater Job (rendered beside Grafana in
+`grafanaConnector.namespace`). Deliberately NOT
 setting `min`/`max` here: those are enforced against every container's
 DECLARED resources too (not just undeclared ones), so a `max` picked without
 perfect knowledge of every component's configured limit could reject an

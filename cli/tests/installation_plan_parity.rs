@@ -78,6 +78,15 @@ const STAGED_OBJECT: &str = "100 bundle.tar";
 /// dance both the helm and kubectl stubs need identically. Returns the path
 /// written.
 fn write_exec(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let body = if matches!(name, "helm" | "kubectl") {
+        format!(
+            "#!/bin/sh\n{}\n{}",
+            include_str!("data/converged-installation-read.sh"),
+            body.strip_prefix("#!/bin/sh\n").unwrap_or(body)
+        )
+    } else {
+        body.to_string()
+    };
     let path = dir.join(name);
     fs::write(&path, body).unwrap_or_else(|error| panic!("write {name} stub: {error}"));
     let mut permissions = fs::metadata(&path)
@@ -152,6 +161,9 @@ if [ "$1" = show ] && [ "$2" = chart ]; then
     exit 0
 fi
 if [ "$1" = template ]; then
+    if [ -n "${CURIE_TEST_REAL_HELM:-}" ]; then
+        exec "$CURIE_TEST_REAL_HELM" "$@"
+    fi
     case " $* " in
         *" --show-only templates/preflight-gvisor.yaml "*)
             printf '%s\n' 'Error: could not find template templates/preflight-gvisor.yaml in chart' >&2
@@ -269,6 +281,9 @@ if [ "$1" = upgrade ]; then
     runner_real_mode_preserved='no'
     runner_egress_preserved='no'
     for argument in "$@"; do
+        if [ "$previous" = '-f' ] && [ -n "${CURIE_TEST_CAPTURE_MAIL_VALUES:-}" ] && grep -Fq '"mailAdapter"' "$argument"; then
+            cp "$argument" "$CURIE_TEST_CAPTURE_MAIL_VALUES"
+        fi
         if [ "$previous" = '-f' ] && grep -q '"sealing"' "$argument" && grep -q '"privateKey"' "$argument"; then
             sealing_key_present='yes'
         fi
@@ -1558,6 +1573,363 @@ fn cluster_up_dry_run_defers_sealing_resolution_without_inventing_a_key() {
             && visible.contains("generat"),
         "the preview must explain that live release discovery decides preservation or generation:\n{visible}"
     );
+}
+
+#[test]
+fn clean_external_mail_diff_has_no_phantom_inline_additions() {
+    let existing = external_mail_sources();
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(existing),
+    );
+    let diff = json_output(fixture.diff(&[]), "clean external mail diff");
+    for entry in diff["entries"].as_array().unwrap() {
+        assert!(
+            ![
+                "mailAdapter.agentmail.apiKey",
+                "mailAdapter.channelToken",
+                "mailAdapter.egressSecret",
+                "worker.adapterCredentials"
+            ]
+            .contains(&entry["key"].as_str().unwrap()),
+            "an absent inline credential must stay absent from a clean diff: {entry}"
+        );
+    }
+}
+
+fn external_mail_sources() -> Value {
+    json!({
+        "mailAdapter": {
+            "deploy": true,
+            "agentmail": {"apiKeyExistingSecret": "acme-provider", "apiKeyExistingSecretKey": "provider-key"},
+            "channelTokenExistingSecret": "acme-channel", "channelTokenExistingSecretKey": "channel-key",
+            "egressSecretExistingSecret": "acme-egress", "egressSecretExistingSecretKey": "egress-key"
+        },
+        "worker": {"adapterCredentialsExistingSecret": "acme-worker", "adapterCredentialsExistingSecretKey": "worker-map"}
+    })
+}
+
+#[test]
+fn typed_worker_mail_credential_map_removal_has_no_phantom_parent_diff() {
+    for inline_map in [json!({}), json!({"mail-adapter": "obsolete-inline"})] {
+        let mut existing = external_mail_sources();
+        existing["worker"]["adapterCredentials"] = inline_map.clone();
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            HelmValuesResponse::Object(existing),
+        );
+        let diff = json_output(fixture.diff(&[]), "typed worker map diff");
+        let entries = diff["entries"].as_array().unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry["key"] == "worker.adapterCredentials"),
+            "an object is not a new scalar Helm value"
+        );
+        if !inline_map.as_object().unwrap().is_empty() {
+            let leaf = entries
+                .iter()
+                .find(|entry| entry["key"] == "worker.adapterCredentials.mail-adapter")
+                .unwrap();
+            assert_eq!(
+                leaf["kind"], "change",
+                "the stale inline map must not claim preservation"
+            );
+        }
+        let captured = fixture.temp.path().join("mail-values.json");
+        json_output(
+            fixture.cluster_up_with(
+                &["--fake-model"],
+                &[("CURIE_TEST_CAPTURE_MAIL_VALUES", captured.to_str().unwrap())],
+            ),
+            "typed worker map up",
+        );
+        let actual: Value = serde_json::from_slice(&fs::read(captured).unwrap()).unwrap();
+        assert!(actual["worker"].get("adapterCredentials").is_none());
+        assert_eq!(
+            actual["worker"]["adapterCredentialsExistingSecret"],
+            "acme-worker"
+        );
+    }
+}
+
+#[test]
+fn empty_inline_mail_clears_preserve_external_sources_through_up_and_apply() {
+    for (inline, value) in [
+        ("mailAdapter.agentmail.apiKey", ""),
+        ("mailAdapter.channelToken", ""),
+        ("mailAdapter.egressSecret", ""),
+        ("worker.adapterCredentials", ""),
+        ("worker.adapterCredentials", "{}"),
+    ] {
+        for surface in ["up", "apply"] {
+            let config = format!(
+                "{}set:\n  {inline}: {value:?}\n",
+                installation_for_the_stateful_guard()
+            );
+            let fixture =
+                HelmFixture::new(&config, HelmValuesResponse::Object(external_mail_sources()));
+            let captured = fixture.temp.path().join("mail-values.json");
+            let env = [("CURIE_TEST_CAPTURE_MAIL_VALUES", captured.to_str().unwrap())];
+            let set = format!("{inline}={value}");
+            let output = if surface == "up" {
+                fixture.cluster_up_with(&["--fake-model", "--set", &set], &env)
+            } else {
+                fixture.apply(&[], &env)
+            };
+            json_output(output, surface);
+            let actual: Value = serde_json::from_slice(&fs::read(captured).unwrap()).unwrap();
+            for (pointer, expected) in [
+                (
+                    "/mailAdapter/agentmail/apiKeyExistingSecret",
+                    "acme-provider",
+                ),
+                ("/mailAdapter/channelTokenExistingSecret", "acme-channel"),
+                ("/mailAdapter/egressSecretExistingSecret", "acme-egress"),
+                ("/worker/adapterCredentialsExistingSecret", "acme-worker"),
+            ] {
+                assert_eq!(
+                    actual.pointer(pointer).and_then(Value::as_str),
+                    Some(expected),
+                    "{surface}: empty {inline}={value:?} must not switch credential sources"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_worker_map_clear_reaches_real_helm_with_its_map_type_intact() {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(
+        helm.status.success(),
+        "real Helm is required for the CLI consumer render"
+    );
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    for value in ["", "{}"] {
+        for surface in ["up", "apply"] {
+            let config = format!(
+                "{}set:\n  security.gvisor.mode: off\n  worker.adapterCredentials: {value:?}\n",
+                installation_for_the_stateful_guard()
+            );
+            let mut existing = external_mail_sources();
+            existing["mailAdapter"]["ingressEnabled"] = json!(false);
+            existing["mailAdapter"]["agentmail"]["httpsCidrs"] = json!(["203.0.113.10/32"]);
+            let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing));
+            let env = [("CURIE_TEST_REAL_HELM", helm.trim())];
+            let output = if surface == "up" {
+                fixture.cluster_up_with(
+                    &[
+                        "--fake-model",
+                        "--set",
+                        "security.gvisor.mode=off",
+                        "--set",
+                        &format!("worker.adapterCredentials={value}"),
+                    ],
+                    &env,
+                )
+            } else {
+                fixture.apply(
+                    &[
+                        "--chart",
+                        concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie"),
+                    ],
+                    &env,
+                )
+            };
+            json_output(
+                output,
+                &format!("{surface}: real Helm accepts empty map {value:?}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn changing_mail_egress_source_requires_an_explicit_worker_pair_decision() {
+    for set in [
+        "mailAdapter.egressSecret=new-inline",
+        "mailAdapter.egressSecretExistingSecret=",
+        "mailAdapter.egressSecretExistingSecretKey=new-egress-key",
+    ] {
+        let (key, value) = set.split_once('=').unwrap();
+        let config = format!(
+            "{}set:\n  {key}: {value:?}\n",
+            installation_for_the_stateful_guard()
+        );
+        for surface in ["up", "apply", "diff"] {
+            let fixture =
+                HelmFixture::new(&config, HelmValuesResponse::Object(external_mail_sources()));
+            let output = match surface {
+                "up" => fixture.cluster_up_with(&["--fake-model", "--set", set], &[]),
+                "apply" => fixture.apply(&[], &[]),
+                _ => fixture.diff(&[]),
+            };
+            assert!(
+                !output.status.success(),
+                "{surface}: unpaired egress source change must be refused before Helm"
+            );
+            assert!(
+                !fixture.calls().contains("upgrade --install"),
+                "refusal must precede mutation"
+            );
+            let visible = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                visible.contains("paired worker"),
+                "actionable paired-source refusal: {visible}"
+            );
+        }
+    }
+    // A paired switch can use the chart's derived worker credential map.
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(external_mail_sources()),
+    );
+    json_output(
+        fixture.cluster_up_with(
+            &[
+                "--fake-model",
+                "--set",
+                "mailAdapter.egressSecret=new-inline",
+                "--set",
+                "worker.adapterCredentialsExistingSecret=",
+            ],
+            &[],
+        ),
+        "paired inline switch",
+    );
+    // Repeating an existing source is not a source change.
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(external_mail_sources()),
+    );
+    json_output(
+        fixture.cluster_up_with(
+            &[
+                "--fake-model",
+                "--set",
+                "mailAdapter.egressSecretExistingSecret=acme-egress",
+            ],
+            &[],
+        ),
+        "reassert unchanged source",
+    );
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(external_mail_sources()),
+    );
+    json_output(
+        fixture.cluster_up_with(
+            &[
+                "--fake-model",
+                "--set",
+                "mailAdapter.egressSecretExistingSecretKey=egress-key",
+            ],
+            &[],
+        ),
+        "reassert unchanged source key",
+    );
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(external_mail_sources()),
+    );
+    json_output(
+        fixture.cluster_up_with(
+            &[
+                "--fake-model",
+                "--set",
+                "mailAdapter.egressSecretExistingSecretKey=new-egress-key",
+                "--set",
+                "worker.adapterCredentialsExistingSecretKey=new-worker-key",
+            ],
+            &[],
+        ),
+        "paired source key rotation",
+    );
+}
+
+#[test]
+fn apply_and_plain_up_preserve_omitted_mail_but_honor_explicit_source_clear() {
+    let existing = json!({
+        "mailAdapter": {
+            "deploy": true,
+            "inbox": "mail@example.com",
+            "channelToken": "obsolete-inline-token",
+            "channelTokenExistingSecret": "acme-mail-credentials",
+            "channelTokenExistingSecretKey": "channel-key",
+            "allowedSenders": ["operator@example.com"],
+            "pollIntervalSeconds": 37
+        },
+        "worker": {
+            "adapterCredentialsExistingSecret": "acme-mail-credentials",
+            "adapterCredentialsExistingSecretKey": "worker-map"
+        }
+    });
+    for surface in ["up", "apply", "apply-clear"] {
+        let config = if surface == "apply-clear" {
+            format!(
+                "{}set:\n  mailAdapter.channelTokenExistingSecret: \"\"\n",
+                installation_for_the_stateful_guard()
+            )
+        } else {
+            installation_for_the_stateful_guard().to_string()
+        };
+        let fixture = HelmFixture::new(&config, HelmValuesResponse::Object(existing.clone()));
+        let captured = fixture.temp.path().join("mail-values.json");
+        let env = [("CURIE_TEST_CAPTURE_MAIL_VALUES", captured.to_str().unwrap())];
+        let output = if surface == "up" {
+            fixture.cluster_up_with(&["--fake-model"], &env)
+        } else {
+            fixture.apply(&[], &env)
+        };
+        json_output(output, surface);
+        let actual: Value =
+            serde_json::from_slice(&fs::read(captured).expect("Helm received mail values"))
+                .unwrap();
+        assert_eq!(actual["mailAdapter"]["deploy"], true);
+        assert_eq!(actual["mailAdapter"]["pollIntervalSeconds"], 37);
+        assert_eq!(
+            actual["mailAdapter"]["allowedSenders"],
+            json!(["operator@example.com"])
+        );
+        assert!(actual["mailAdapter"].get("channelToken").is_none());
+        if surface == "apply-clear" {
+            assert!(actual["mailAdapter"]
+                .get("channelTokenExistingSecret")
+                .is_none());
+            assert!(fixture
+                .calls()
+                .contains("--set-string mailAdapter.channelTokenExistingSecret="));
+        } else {
+            assert_eq!(
+                actual["mailAdapter"]["channelTokenExistingSecret"],
+                "acme-mail-credentials"
+            );
+        }
+        let diff = json_output(fixture.diff(&[]), "diff retained mail");
+        let entries = diff["entries"].as_array().unwrap();
+        let deploy = entries
+            .iter()
+            .find(|entry| entry["key"] == "mailAdapter.deploy")
+            .unwrap();
+        assert_eq!(deploy["kind"], "preserved");
+        let stale = entries
+            .iter()
+            .find(|entry| entry["key"] == "mailAdapter.channelToken")
+            .unwrap();
+        assert_eq!(
+            stale["kind"], "change",
+            "diff must disclose stripping the stale inline copy"
+        );
+        assert!(!fixture.calls().contains("obsolete-inline-token"));
+    }
 }
 
 #[test]

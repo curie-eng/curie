@@ -124,6 +124,44 @@ def test_inbound_event_session_context_survives_json_roundtrip() -> None:
     assert isinstance(decoded, Event)
     assert decoded.session_id == "session-example"
     assert decoded.history_ref == "history-example"
+    assert decoded.adoption_credential is None
+
+
+def test_legacy_inbound_event_without_adoption_credential_defaults_to_none() -> None:
+    raw = json.dumps(
+        {
+            "kind": "event",
+            "type": "message",
+            "text": "hi",
+            "user": "U0EXAMPLE1",
+            "ts": "1.0",
+            "session_id": "session-example",
+            "history_ref": "history-example",
+        }
+    )
+
+    message = parse_inbound(raw)
+
+    assert isinstance(message, Event)
+    assert message.adoption_credential is None
+
+
+def test_inbound_event_accepts_explicit_null_adoption_credential() -> None:
+    raw = json.dumps(
+        {
+            "kind": "event",
+            "type": "message",
+            "text": "hi",
+            "user": "U0EXAMPLE1",
+            "ts": "1.0",
+            "adoption_credential": None,
+        }
+    )
+
+    message = parse_inbound(raw)
+
+    assert isinstance(message, Event)
+    assert message.adoption_credential is None
 
 
 # --- Reader policy: tolerant consumers, strict producers ----------------------

@@ -44,6 +44,7 @@ from fastapi import Response
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 REPO = "acme-corp/acme-bot"
@@ -4350,3 +4351,621 @@ def test_publication_lineage_route_operations_are_in_every_http_metric_domain(
     complete = {**active, "outcome": "2xx"}
     record_metric("curie.http.server.request", attributes=complete)
     record_metric("curie.http.server.request.duration", 0.001, attributes=complete)
+
+
+# These API integration tests use the actual disposable Postgres/Valkey stack;
+# only GitHub HTTP is fixture-controlled. Provider identity fields are documented
+# at https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request and
+# https://docs.github.com/en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app.
+
+
+def _reserve_review(
+    client: TestClient, lineage: dict[str, Any], origin: str, *, version: int | None = None
+) -> Any:
+    return client.post(
+        "/v1/internal/publications/review-reservations",
+        headers=WORKER_HEADERS,
+        json={
+            "repository_id": 9001,
+            "pr_number": PR_NUMBER,
+            "expected_lineage_version": version or lineage["version"],
+            "origin_key": origin,
+        },
+    )
+
+
+def test_review_reservation_refuses_legacy_unproved_lineage(
+    clean_db: None, publication_stack: tuple[TestClient, str], auth_headers: dict[str, str]
+) -> None:
+    client, stream = publication_stack
+    _, publication = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id='test-1',
+    )
+    response = _reserve_review(client, {"version": 2}, "review:legacy")
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "publication.review_ineligible"
+    assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0
+    assert (
+        _rows(
+            "SELECT github_repository_id FROM curie.thread_publication_lineages WHERE id=:id",
+            {"id": publication["lineage_id"]},
+        )[0]["github_repository_id"]
+        is None
+    )
+    valkey = connect_or_skip(decode_responses=True)
+    try:
+        assert valkey.xlen(stream) == 0
+    finally:
+        valkey.close()
+
+
+def test_review_reservation_requires_worker_identity(
+    clean_db: None, publication_stack: tuple[TestClient, str], auth_headers: dict[str, str]
+) -> None:
+    client, _ = publication_stack
+    response = client.post(
+        "/v1/internal/publications/review-reservations",
+        headers=auth_headers,
+        json={
+            "repository_id": 9001,
+            "pr_number": PR_NUMBER,
+            "expected_lineage_version": 1,
+            "origin_key": "review:untrusted",
+        },
+    )
+    assert response.status_code == 401, response.text
+    assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0
+
+
+@pytest.fixture
+def review_lineage_app(
+    clean_db: None, publication_stack: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[TestClient, dict[str, Any], str]]:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    client, stream = publication_stack
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    monkeypatch.setenv("GITHUB_APP_ID", "51")
+    monkeypatch.setenv(
+        "GITHUB_APP_PRIVATE_KEY",
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode(),
+    )
+    get_settings.cache_clear()
+    truth: dict[str, Any] = {
+        "repository_id": 9001,
+        "installation_id": 41,
+        "node_id": "PR_example_123",
+        "branch": "pending",
+        "head_sha": FIRST_REVISION_SHA,
+        "status": 200,
+        "calls": [],
+    }
+    real_client = httpx.Client
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        truth["calls"].append((request.method, request.url.path))
+        if request.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": truth["installation_id"]})
+        if request.url.path.endswith("/access_tokens"):
+            return httpx.Response(
+                201,
+                json={
+                    "token": "fixture-publication-app-token",
+                    "expires_at": "2999-01-01T00:00:00Z",
+                },
+            )
+        assert request.headers["authorization"] == "Bearer fixture-publication-app-token"
+        if truth["status"] != 200:
+            return httpx.Response(truth["status"], json={"message": "fixture-unavailable"})
+        repo = {"id": truth["repository_id"], "full_name": REPO}
+        if request.url.path == f"/repos/{REPO}":
+            return httpx.Response(200, json=repo)
+        return httpx.Response(
+            200,
+            json={
+                "number": PR_NUMBER,
+                "html_url": PR_URL,
+                "node_id": truth["node_id"],
+                "state": "open",
+                "merged": False,
+                "head": {"sha": truth["head_sha"], "ref": truth["branch"], "repo": repo},
+                "base": {"repo": repo, "ref": "main"},
+            },
+        )
+
+    monkeypatch.setattr(
+        "curie_api.github_app.httpx.Client",
+        lambda *a, **kw: real_client(transport=httpx.MockTransport(handle)),
+    )
+    injected = httpx.AsyncClient(transport=httpx.MockTransport(handle), follow_redirects=True)
+    original = client.app.state.http_client
+    client.app.state.http_client = injected
+    try:
+        yield client, truth, stream
+    finally:
+        client.app.state.http_client = original
+        asyncio.run(injected.aclose())
+        _RESOLVERS.clear()
+        get_settings.cache_clear()
+
+
+def _verified_lineage(
+    client: TestClient,
+    truth: dict[str, Any],
+    auth_headers: dict[str, str],
+    *,
+    conversation: str = "review-original",
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client, _publication_payload(deployment["id"], conversation_id=conversation)
+    )
+    truth["branch"] = publication["branch"]
+    resolved = _resolve(client, auth_headers, publication["approval_id"])
+    assert resolved.status_code == 200, resolved.text
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    _mark_outcome_history_ready(publication["id"])
+    return deployment, publication, advanced.json()
+
+
+def test_review_reservation_captures_verified_identity_and_exact_replay(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    client, truth, stream = review_lineage_app
+    deployment, publication, lineage = _verified_lineage(client, truth, auth_headers)
+    before_approvals = _rows("SELECT count(*) AS n FROM curie.approvals")[0]["n"]
+    first = _reserve_review(client, lineage, "review:123:71")
+    assert first.status_code == 201, first.text
+    result = first.json()
+    assert first.headers["cache-control"] == "no-store"
+    assert (result["repository_id"], result["installation_id"], result["pr_node_id"]) == (
+        9001,
+        41,
+        "PR_example_123",
+    )
+    assert result["agent_id"] == deployment["agent_id"]
+    assert result["reply_conversation_id"] == "review-original"
+    assert result["conversation_id"] == channel_protocol.scoped_conversation_id(
+        "slack", "C0EXAMPLE1", "review-original"
+    )
+    assert result["revision_number"] == 2 and result["expected_head_sha"] == FIRST_REVISION_SHA
+    replay = _reserve_review(client, lineage, "review:123:71")
+    assert replay.status_code == 200 and replay.json() == result
+    conflict = _reserve_review(client, lineage, "review:123:72")
+    assert (
+        conflict.status_code == 409
+        and conflict.json()["detail"]["code"] == "publication.revision_conflict"
+    )
+    assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 1
+    assert _rows("SELECT count(*) AS n FROM curie.approvals")[0]["n"] == before_approvals
+    valkey = connect_or_skip(decode_responses=True)
+    try:
+        assert valkey.xlen(stream) == 0
+    finally:
+        valkey.close()
+
+
+def test_review_reservation_stale_version_and_binding_reassert_are_refused(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
+    stale = _reserve_review(client, lineage, "review:stale", version=1)
+    assert (
+        stale.status_code == 409 and stale.json()["detail"]["code"] == "publication.lineage_stale"
+    )
+    rebind = client.patch(
+        f"/agents/{deployment['agent_id']}/channels",
+        params={"kind": "slack", "address": "C0EXAMPLE1", "expected_generation": 0},
+        json={"kind": "slack", "address": "C0EXAMPLE1"},
+        headers=auth_headers,
+    )
+    assert rebind.status_code == 200, rebind.text
+    denied = _reserve_review(client, lineage, "review:rebound")
+    assert (
+        denied.status_code == 409
+        and denied.json()["detail"]["code"] == "publication.review_ineligible"
+    )
+    assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0
+
+
+def test_review_reservation_concurrency_has_one_winner(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    client, truth, _ = review_lineage_app
+    _, _, lineage = _verified_lineage(client, truth, auth_headers)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(
+            pool.map(lambda n: _reserve_review(client, lineage, f"review:concurrent:{n}"), range(4))
+        )
+    assert sorted(response.status_code for response in responses) == [201, 409, 409, 409]
+    assert (
+        _rows(
+            "SELECT count(*) AS n FROM curie.publication_review_reservations "
+            "WHERE status='reserved'"
+        )[0]["n"]
+        == 1
+    )
+
+
+def test_review_reservation_only_explicit_origin_can_create_fresh_approval(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
+    reservation = _reserve_review(client, lineage, "review:accepted-origin")
+    assert reservation.status_code == 201, reservation.text
+    payload = _publication_payload(
+        deployment["id"], conversation_id="review-original", base_sha=FIRST_REVISION_SHA
+    )
+    for origin in (None, "review:other-origin"):
+        attempted = dict(payload)
+        if origin is not None:
+            attempted["review_origin_key"] = origin
+        refused = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=attempted)
+        assert refused.status_code == 409, refused.text
+    payload["review_origin_key"] = "review:accepted-origin"
+    created = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=payload)
+    assert created.status_code == 201, created.text
+    assert created.json()["id"] == reservation.json()["revision_id"]
+    assert created.json()["status"] == "pending" and created.json()["revision_number"] == 2
+    assert created.json()["pr_number"] == PR_NUMBER
+    assert (
+        _rows("SELECT status FROM curie.publication_review_reservations")[0]["status"] == "consumed"
+    )
+    # Replaying an ordinary snapshot cannot strip the review origin from an
+    # already-created approval, even if all patch and dedupe bytes match.
+    payload.pop("review_origin_key")
+    changed = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=payload)
+    assert changed.status_code == 409, changed.text
+
+
+def test_review_reservation_cancel_is_fenced_and_frees_only_its_own_slot(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    client, truth, _ = review_lineage_app
+    _, _, lineage = _verified_lineage(client, truth, auth_headers)
+    reservation = _reserve_review(client, lineage, "review:cancel-me").json()
+    path = f"/v1/internal/publications/review-reservations/{reservation['revision_id']}/cancel"
+    for origin, version in (("review:other", 1), ("review:cancel-me", 2)):
+        refused = client.post(
+            path, headers=WORKER_HEADERS, json={"origin_key": origin, "expected_version": version}
+        )
+        assert refused.status_code == 409, refused.text
+    cancelled = client.post(
+        path, headers=WORKER_HEADERS, json={"origin_key": "review:cancel-me", "expected_version": 1}
+    )
+    assert cancelled.status_code == 200 and cancelled.json()["status"] == "cancelled"
+    repeated = client.post(
+        path, headers=WORKER_HEADERS, json={"origin_key": "review:cancel-me", "expected_version": 1}
+    )
+    assert repeated.status_code == 409
+    next_origin = _reserve_review(client, lineage, "review:after-cancel")
+    assert next_origin.status_code == 201 and next_origin.json()["revision_number"] == 2
+
+
+@pytest.mark.parametrize(
+    "mutation", ["repository_id", "installation_id", "node_id", "head_sha", "status"]
+)
+def test_review_identity_cannot_change_on_existing_pr_advance(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    mutation: str,
+) -> None:
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"], conversation_id="review-original", base_sha=FIRST_REVISION_SHA
+        ),
+    )
+    assert _resolve(client, auth_headers, publication["approval_id"]).status_code == 200
+    truth["head_sha"] = SECOND_REVISION_SHA
+    truth[mutation] = {
+        "repository_id": 9002,
+        "installation_id": 42,
+        "node_id": "PR_other_123",
+        "head_sha": EXTERNAL_REVISION_SHA,
+        "status": 503,
+    }[mutation]
+    refused = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=lineage["version"],
+        expected_head_sha=FIRST_REVISION_SHA,
+        head_sha=SECOND_REVISION_SHA,
+    )
+    assert refused.status_code == (503 if mutation == "status" else 409), refused.text
+    stored = _rows(
+        "SELECT github_repository_id, github_installation_id, github_pr_node_id, "
+        "head_sha, version FROM curie.thread_publication_lineages WHERE id=:id",
+        {"id": lineage["id"]},
+    )[0]
+    assert stored == {
+        "github_repository_id": 9001,
+        "github_installation_id": 41,
+        "github_pr_node_id": "PR_example_123",
+        "head_sha": FIRST_REVISION_SHA,
+        "version": lineage["version"],
+    }
+
+
+def test_review_identity_constraints_reject_partial_authority(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    client, truth, _ = review_lineage_app
+    _, _, lineage = _verified_lineage(client, truth, auth_headers)
+    for assignment in (
+        "github_repository_id=NULL",
+        "github_installation_id=NULL",
+        "github_pr_node_id=NULL",
+        "base_ref=NULL",
+    ):
+        with pytest.raises(IntegrityError):
+            _execute(
+                "UPDATE curie.thread_publication_lineages SET " + assignment + " WHERE id=:id",
+                {"id": lineage["id"]},
+            )
+    assert (
+        _rows(
+            "SELECT github_repository_id FROM curie.thread_publication_lineages WHERE id=:id",
+            {"id": lineage["id"]},
+        )[0]["github_repository_id"]
+        == 9001
+    )
+
+
+def test_review_authority_downgrade_refuses_an_active_reservation(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    client, truth, _ = review_lineage_app
+    _, _, lineage = _verified_lineage(client, truth, auth_headers)
+    api_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(api_dir / "alembic.ini"))
+    config.set_main_option("script_location", str(api_dir / "alembic"))
+    original_revision = _rows("SELECT version_num FROM curie.alembic_version")
+    try:
+        # #2300 commits each migration independently. Exercise the authority
+        # guard at its own boundary, after higher revisions have safely retired.
+        command.downgrade(config, "0042")
+        before_revision = _rows("SELECT version_num FROM curie.alembic_version")
+        assert before_revision == [{"version_num": "0042"}]
+        reservation = _reserve_review(client, lineage, "review:retain-on-rollback")
+        assert reservation.status_code == 201, reservation.text
+        before_reservation = _rows("SELECT * FROM curie.publication_review_reservations")
+        assert [row["status"] for row in before_reservation] == ["reserved"]
+        with pytest.raises(RuntimeError, match="revisions are active"):
+            command.downgrade(config, "0041")
+        assert _rows("SELECT version_num FROM curie.alembic_version") == before_revision
+        assert _rows("SELECT * FROM curie.publication_review_reservations") == before_reservation
+    finally:
+        command.upgrade(config, original_revision[0]["version_num"])
+    assert _rows("SELECT version_num FROM curie.alembic_version") == original_revision
+
+
+@pytest.mark.parametrize(
+    "changed_route", [{"reply_channel": "C0EXAMPLE2"}, {"reply_conversation_id": "another-thread"}]
+)
+def test_scoped_review_consumption_cannot_redirect_the_fresh_approval(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    changed_route: dict[str, str],
+) -> None:
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
+    reservation = _reserve_review(client, lineage, "review:scoped-route")
+    assert reservation.status_code == 201, reservation.text
+    payload = _publication_payload(
+        deployment["id"], conversation_id=lineage["conversation_id"], base_sha=FIRST_REVISION_SHA
+    )
+    payload.update(reply_conversation_id="review-original", review_origin_key="review:scoped-route")
+    payload.update(changed_route)
+    refused = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=payload)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.review_ineligible"
+    assert _rows("SELECT count(*) AS n FROM curie.publications WHERE status='pending'")[0]["n"] == 0
+    assert (
+        _rows("SELECT status FROM curie.publication_review_reservations")[0]["status"] == "reserved"
+    )
+    payload.update(reply_channel="C0EXAMPLE1", reply_conversation_id="review-original")
+    accepted = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=payload)
+    assert accepted.status_code == 201, accepted.text
+    assert accepted.json()["id"] == reservation.json()["revision_id"]
+    assert accepted.json()["reply_channel"] == "C0EXAMPLE1"
+
+
+def test_cancelled_review_origin_remains_a_non_executing_tombstone(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
+    reserved = _reserve_review(client, lineage, "review:never-rearm").json()
+    response = client.post(
+        f"/v1/internal/publications/review-reservations/{reserved['revision_id']}/cancel",
+        headers=WORKER_HEADERS,
+        json={"origin_key": "review:never-rearm", "expected_version": 1},
+    )
+    assert response.status_code == 200
+    replay = _reserve_review(client, lineage, "review:never-rearm")
+    assert replay.status_code == 200 and replay.json()["status"] == "cancelled"
+    payload = _publication_payload(
+        deployment["id"], conversation_id="review-original", base_sha=FIRST_REVISION_SHA
+    )
+    payload["review_origin_key"] = "review:never-rearm"
+    rejected = client.post("/v1/internal/publications", headers=WORKER_HEADERS, json=payload)
+    assert rejected.status_code == 409
+    assert _rows("SELECT count(*) AS n FROM curie.publications WHERE status='pending'")[0]["n"] == 0
+
+
+def test_verified_github_pr_has_only_one_conversation_owner(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
+    _, other = _create_publication(
+        client, _publication_payload(deployment["id"], conversation_id="other-conversation")
+    )
+    assert _resolve(client, auth_headers, other["approval_id"]).status_code == 200
+    truth["branch"] = other["branch"]
+    conflict = _advance_lineage(
+        client, other["id"], expected_version=1, expected_head_sha=None, head_sha=FIRST_REVISION_SHA
+    )
+    assert (
+        conflict.status_code == 409
+        and conflict.json()["detail"]["code"] == "publication.revision_conflict"
+    )
+    owners = _rows(
+        "SELECT id FROM curie.thread_publication_lineages "
+        "WHERE github_repository_id=9001 AND pr_number=:number",
+        {"number": PR_NUMBER},
+    )
+    assert owners == [{"id": uuid.UUID(lineage["id"])}]
+    assert _rows(
+        "SELECT github_repository_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
+        {"id": other["lineage_id"]},
+    ) == [{"github_repository_id": None, "head_sha": None}]
+
+
+def test_adding_app_after_pat_publication_does_not_backfill_legacy_identity(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, truth, _ = review_lineage_app
+    conversation_id = "legacy-pat-thread"
+    app_id = get_settings().github_app_id
+    monkeypatch.setenv("GITHUB_APP_ID", "")
+    get_settings.cache_clear()
+    deployment, publication = _open_lineage(
+        client,
+        auth_headers,
+        conversation_id=conversation_id,
+    )
+    monkeypatch.setenv("GITHUB_APP_ID", app_id)
+    get_settings.cache_clear()
+    _, later = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"], conversation_id=conversation_id, base_sha=FIRST_REVISION_SHA
+        ),
+    )
+    assert _resolve(client, auth_headers, later["approval_id"]).status_code == 200
+    advanced = _advance_lineage(
+        client,
+        later["id"],
+        expected_version=2,
+        expected_head_sha=FIRST_REVISION_SHA,
+        head_sha=SECOND_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    assert truth["calls"] == []
+    assert _rows(
+        "SELECT github_repository_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
+        {"id": publication["lineage_id"]},
+    ) == [{"github_repository_id": None, "head_sha": SECOND_REVISION_SHA}]
+    assert _reserve_review(client, advanced.json(), "review:legacy-replay").status_code == 409
+
+
+@pytest.mark.parametrize("mutation", ["binding", "head", "deployment"])
+def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    mutation: str,
+) -> None:
+    """A row lock must refresh objects retained during earlier authority reads."""
+    from curie_api.models import AgentChannel, Deployment, ThreadPublicationLineage
+    from curie_api.schemas import ReviewRevisionReserve
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
+    later = None
+    if mutation == "head":
+        _, later = _create_publication(
+            client,
+            _publication_payload(
+                deployment["id"], conversation_id="review-original", base_sha=FIRST_REVISION_SHA
+            ),
+        )
+        assert _resolve(client, auth_headers, later["approval_id"]).status_code == 200
+
+    async def exercise() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                loaded = await session.get(ThreadPublicationLineage, uuid.UUID(lineage["id"]))
+                assert loaded is not None
+                binding = await session.get(AgentChannel, loaded.binding_id)
+                assert binding is not None
+                held_deployment = await session.get(Deployment, loaded.deployment_id)
+                assert held_deployment is not None
+                # Keep both strong references while another real API transaction
+                # changes authority. FOR UPDATE alone does not refresh this map.
+                if mutation == "binding":
+                    response = await asyncio.to_thread(
+                        client.patch,
+                        f"/agents/{deployment['agent_id']}/channels",
+                        params={
+                            "kind": "slack",
+                            "address": "C0EXAMPLE1",
+                            "expected_generation": binding.generation,
+                        },
+                        json={"kind": "slack", "address": "C0EXAMPLE1"},
+                        headers=auth_headers,
+                    )
+                elif mutation == "deployment":
+                    response = await asyncio.to_thread(
+                        client.delete, f"/deployments/{deployment['id']}", headers=auth_headers
+                    )
+                else:
+                    assert later is not None
+                    truth["head_sha"] = EXTERNAL_REVISION_SHA
+                    response = await asyncio.to_thread(
+                        _advance_lineage,
+                        client,
+                        later["id"],
+                        expected_version=lineage["version"],
+                        expected_head_sha=FIRST_REVISION_SHA,
+                        head_sha=EXTERNAL_REVISION_SHA,
+                    )
+                    await asyncio.to_thread(_mark_outcome_history_ready, later["id"])
+                assert response.status_code == (204 if mutation == "deployment" else 200), (
+                    response.text
+                )
+                with pytest.raises(crud.PublicationLineageConflict) as conflict:
+                    await crud.reserve_review_revision(
+                        session,
+                        ReviewRevisionReserve(
+                            repository_id=9001,
+                            pr_number=PR_NUMBER,
+                            expected_lineage_version=lineage["version"],
+                            origin_key=f"review:cached-{mutation}",
+                        ),
+                    )
+                assert conflict.value.code == (
+                    "publication.review_ineligible" if mutation != "head"
+                    else "publication.lineage_stale"
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(exercise())
+    assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0

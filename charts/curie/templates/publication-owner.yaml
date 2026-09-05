@@ -100,6 +100,9 @@ spec:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
     - to:
+      {{- if not .Values.worker.publication.githubHttpsCidrs }}
+      {{- fail "worker.publication.enabled is true: set at least one worker.publication.githubHttpsCidrs entry; publication HTTPS egress fails closed" }}
+      {{- end }}
       {{- range .Values.worker.publication.githubHttpsCidrs }}
         - ipBlock:
             cidr: {{ . | quote }}

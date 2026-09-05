@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Enum,
     ForeignKey,
@@ -460,6 +461,26 @@ class ThreadPublicationLineage(Base):
             unique=True,
             postgresql_where=text("status = 'open'"),
         ),
+        CheckConstraint(
+            "(github_repository_id IS NULL AND github_installation_id IS NULL "
+            "AND github_pr_node_id IS NULL AND base_ref IS NULL) "
+            "OR (github_repository_id IS NOT NULL "
+            "AND github_repository_id > 0 "
+            "AND github_installation_id IS NOT NULL AND github_installation_id > 0 "
+            "AND github_pr_node_id IS NOT NULL "
+            "AND length(github_pr_node_id) > 0 AND pr_number IS NOT NULL "
+            "AND base_ref IS NOT NULL AND length(base_ref) > 0)",
+            name="thread_publication_lineages_github_identity_ck",
+        ),
+        Index("uq_publication_github_pr_owner", "github_repository_id", "pr_number", unique=True),
+        Index(
+            "uq_active_publication_github_conversation",
+            "agent_id",
+            "conversation_id",
+            "github_repository_id",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -479,10 +500,149 @@ class ThreadPublicationLineage(Base):
     status: Mapped[str] = mapped_column(server_default="open", default="open")
     version: Mapped[int] = mapped_column(server_default="1", default=1)
     latest_revision: Mapped[int] = mapped_column(server_default="1", default=1)
+    # Only new trusted publication creation captures routing authority. Historical
+    # NULL rows are deliberately never backfilled from a currently reused name.
+    binding_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_channels.id", ondelete="SET NULL"),
+        default=None,
+    )
+    binding_generation: Mapped[int | None] = mapped_column(default=None)
+    reply_conversation_id: Mapped[str | None] = mapped_column(default=None)
+    github_repository_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    github_installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    github_pr_node_id: Mapped[str | None] = mapped_column(default=None)
+    base_ref: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
     publications: Mapped[list[Publication]] = relationship(back_populates="lineage")
+
+
+class PublicationReviewReservation(Base):
+    """One review origin's claim on the existing publication revision writer."""
+
+    __tablename__ = "publication_review_reservations"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('reserved', 'consumed', 'cancelled')",
+            name="publication_review_reservations_status_ck",
+        ),
+        CheckConstraint(
+            "version >= 1 AND revision_number >= 1 AND lineage_version >= 1",
+            name="publication_review_reservations_versions_ck",
+        ),
+        Index(
+            "uq_reserved_review_per_lineage",
+            "lineage_id",
+            unique=True,
+            postgresql_where=text("status = 'reserved'"),
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    origin_key: Mapped[str] = mapped_column(unique=True)
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE"),
+        index=True,
+    )
+    lineage_version: Mapped[int]
+    expected_head_sha: Mapped[str]
+    revision_number: Mapped[int]
+    binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    binding_generation: Mapped[int]
+    status: Mapped[str] = mapped_column(default="reserved", server_default="reserved")
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class GitHubReviewDelivery(Base):
+    """One authenticated webhook receipt, including ignored actions and aliases."""
+
+    __tablename__ = "github_review_deliveries"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','accepted','ignored','rejected','retryable')",
+            name="github_review_deliveries_status_ck",
+        ),
+        CheckConstraint(
+            "version >= 1 AND replay_conflicts >= 0", name="github_review_deliveries_version_ck"
+        ),
+        CheckConstraint("length(body_sha256) = 64", name="github_review_deliveries_digest_ck"),
+        CheckConstraint(
+            "status IN ('pending','accepted') OR reason IS NOT NULL",
+            name="github_review_deliveries_reason_ck",
+        ),
+    )
+    delivery_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    event_kind: Mapped[str]
+    action: Mapped[str]
+    body_sha256: Mapped[str]
+    repository_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    pr_number: Mapped[int | None] = mapped_column(default=None)
+    source_object_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sender_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sender_type: Mapped[str]
+    sender_login: Mapped[str | None] = mapped_column(default=None)
+    author_association: Mapped[str]
+    event_id: Mapped[str | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.github_review_feedback.event_id", ondelete="SET NULL"),
+        default=None,
+    )
+    status: Mapped[str] = mapped_column(default="pending", server_default="pending")
+    reason: Mapped[str | None] = mapped_column(default=None)
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    replay_conflicts: Mapped[int] = mapped_column(default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class GitHubReviewFeedback(Base):
+    """One immutable human feedback identity and its durable enqueue receipt."""
+
+    __tablename__ = "github_review_feedback"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('waiting', 'queued', 'reserved', 'settled', 'refused', 'dead_lettered')",
+            name="github_review_feedback_status_ck",
+        ),
+        CheckConstraint("version >= 1", name="github_review_feedback_version_ck"),
+        CheckConstraint("enqueue_attempts >= 0", name="github_review_feedback_attempts_ck"),
+        Index("ix_github_review_feedback_pending", "status", "created_at"),
+    )
+
+    event_id: Mapped[str] = mapped_column(primary_key=True)
+    delivery_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), unique=True)
+    # Keep the semantic tombstone if an operator deletes the old binding or
+    # lineage. Recreating one cannot make an old comment executable again.
+    lineage_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="SET NULL")
+    )
+    binding_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_channels.id", ondelete="SET NULL")
+    )
+    binding_generation: Mapped[int]
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    lineage_version: Mapped[int]
+    reservation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publication_review_reservations.id", ondelete="SET NULL"),
+        default=None,
+    )
+    # Only normalized, bounded feedback and a credential-free QueuedTurn; never
+    # the unfiltered webhook body, headers or a GitHub credential.
+    feedback: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    turn: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    traceparent: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    enqueue_attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    quota_taken: Mapped[bool] = mapped_column(default=False, server_default="false")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(default=None)
+    error_code: Mapped[str | None] = mapped_column(default=None)
+    stream_id: Mapped[str | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    queued_at: Mapped[datetime | None] = mapped_column(default=None)
+    terminal_scan_cursor: Mapped[str | None] = mapped_column(default=None)
 
 
 class Publication(Base):

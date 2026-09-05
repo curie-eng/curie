@@ -20,20 +20,28 @@ VALKEY_HOST = os.environ.get("TEST_VALKEY_HOST", "localhost")
 VALKEY_PORT = int(os.environ.get("TEST_VALKEY_PORT", "26379"))
 VALKEY_PW = os.environ.get("TEST_VALKEY_PW", "valkeypass")
 
-# How long one connect attempt may block. redis-py leaves socket_connect_timeout
-# at None by default, so a connect to an unreachable Valkey blocks on the OS
-# default rather than on anything this repo chose.
+# How long one connect attempt may block. redis-py 8.1.0 defaults
+# socket_connect_timeout to 5s. A SYN-drop (typical on macOS) waits that bound;
+# a RST (typical on Linux loopback) returns immediately, so this pin is not the
+# Linux cost driver. Keep it anyway: the helper must not inherit a library
+# default, and TEST_VALKEY_CONNECT_TIMEOUT raises the bound for a slow
+# environment.
 CONNECT_TIMEOUT_SECONDS = float(os.environ.get("TEST_VALKEY_CONNECT_TIMEOUT", "2"))
 
-# No retries, deliberately. redis-py 8.x defaults to Retry(ExponentialWithJitter,
-# 3), which is a MULTIPLIER on the timeout above and is what actually made an
-# unreachable Valkey cost a minute: measured on redis-py 8.1.0 against a bound
-# but unlistening port, socket_connect_timeout=5 still took 58.74s and the
-# unbounded default took 59.66s, while no-retry with a bounded timeout returns in
-# the timeout. Retrying is wrong for this helper regardless of the cost. Its
-# whole contract is one ping that decides skip-or-raise, the compose Valkey is
-# either up before the suite starts or it is not, and a helper that retries turns
-# "your stack is not running" into a minute of silence per fixture.
+# No retries, deliberately, including after a successful connect.
+# redis-py 8.1.0 defaults to Retry(ExponentialWithJitterBackoff, 10). That Retry
+# is client-level: redis-py copies it onto each connection, so it governs
+# connect AND command-path ConnectionError/TimeoutError. On Linux a
+# bound-unlistening loopback port answers RST immediately, so the default retry
+# ladder (not the connect timeout) is what costs ~4s; with NO_RETRY the same
+# path returns in ~0s. The ~59s figures are macOS, where the SYN is dropped and
+# each attempt waits the timeout. Retrying is wrong for this helper regardless
+# of the cost. Its whole contract is one ping that decides skip-or-raise, the
+# compose Valkey is either up before the suite starts or it is not, and a helper
+# that retries turns "your stack is not running" into seconds of silence per
+# fixture. Command-path retries are off for the same reason: fixtures should
+# fail loud on a dropped Valkey rather than paper over it. Do not restore the
+# default retry ladder to "fix" command-path transients.
 NO_RETRY = Retry(NoBackoff(), 0)
 
 
@@ -46,10 +54,10 @@ def connect_or_skip(*, decode_responses: bool = True) -> redis.Redis:
     ``RedisError`` fail the required CI job instead. The caller owns the returned
     client (yield it from a fixture and ``.close()`` on teardown).
 
-    The connect is bounded by ``CONNECT_TIMEOUT_SECONDS`` and does not retry, so
-    an unreachable Valkey costs that timeout once rather than a minute. See the
-    constants above for why; ``TEST_VALKEY_CONNECT_TIMEOUT`` raises the bound for
-    a slow environment.
+    The connect is bounded by ``CONNECT_TIMEOUT_SECONDS`` and does not retry
+    (connect or command path), so an unreachable Valkey costs that timeout once
+    rather than a retry ladder. See the constants above for why;
+    ``TEST_VALKEY_CONNECT_TIMEOUT`` raises the bound for a slow environment.
     """
     client: redis.Redis = redis.Redis(
         host=VALKEY_HOST,

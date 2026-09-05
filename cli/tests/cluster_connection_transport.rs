@@ -54,6 +54,7 @@ fn write_kubectl_stub(dir: &Path) {
         r#"#!/usr/bin/env python3
 import json
 import os
+import select
 import socket
 import sys
 import threading
@@ -63,37 +64,21 @@ args = sys.argv[1:]
 with open(os.environ["CURIE_TEST_KUBECTL_LOG"], "a", encoding="utf-8") as log:
     log.write(" ".join(args) + "\n")
 
-def read_message(sock):
-    data = b""
-    while b"\r\n\r\n" not in data:
-        chunk = sock.recv(65536)
-        if not chunk:
-            return data
-        data += chunk
-    head, body = data.split(b"\r\n\r\n", 1)
-    length = 0
-    for line in head.split(b"\r\n")[1:]:
-        if line.lower().startswith(b"content-length:"):
-            length = int(line.split(b":", 1)[1].strip())
-            break
-    while len(body) < length:
-        chunk = sock.recv(65536)
-        if not chunk:
-            break
-        body += chunk
-    return head + b"\r\n\r\n" + body
-
 def proxy(client, backend_host, backend_port):
     try:
-        request = read_message(client)
-        if not request:
-            return
         upstream = socket.create_connection((backend_host, backend_port), timeout=5)
         try:
-            upstream.sendall(request)
-            response = read_message(upstream)
-            if response:
-                client.sendall(response)
+            # kubectl forwards a TCP stream, not one HTTP exchange. Preserve
+            # keep-alive connections and half-closes in both directions.
+            peers = {client: upstream, upstream: client}
+            while peers:
+                readable, _, _ = select.select(list(peers), [], [])
+                for source in readable:
+                    data = source.recv(65536)
+                    if data:
+                        peers[source].sendall(data)
+                    else:
+                        peers.pop(source).shutdown(socket.SHUT_WR)
         finally:
             upstream.close()
     finally:
@@ -200,6 +185,69 @@ sys.exit(64)
         .permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).expect("make fake kubectl executable");
+}
+
+/// kubectl port-forward carries TCP bytes, including multiple HTTP requests on
+/// one connection. The fixture must preserve that contract: closing a socket
+/// after a keep-alive response races reqwest's next non-idempotent POST.
+#[test]
+fn fixture_tunnel_preserves_a_connection_from_read_to_write() {
+    let tools = tempfile::tempdir().expect("create tunnel fixture directory");
+    write_kubectl_stub(tools.path());
+    let backend = serve(|request| Response::json(200, &request.path));
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            r#"
+import http.client
+import selectors
+import subprocess
+import sys
+
+child = subprocess.Popen(
+    [sys.argv[1], "port-forward", "svc/acme-api", "0:3000"],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+connection = None
+try:
+    with selectors.DefaultSelector() as ready:
+        ready.register(child.stdout, selectors.EVENT_READ)
+        assert ready.select(3), "fixture tunnel did not become ready"
+    line = child.stdout.readline()
+    assert line.startswith("Forwarding from 127.0.0.1:"), line
+    port = int(line.split(":", 1)[1].split()[0])
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    connection.request("GET", "/agents")
+    first = connection.getresponse()
+    assert not first.will_close, "fixture promised a persistent connection"
+    assert first.read() == b"/agents"
+    original_socket = connection.sock
+    connection.request("POST", "/agents", body=b"synthetic agent")
+    second = connection.getresponse()
+    assert second.read() == b"/agents"
+    assert connection.sock is original_socket, "write must use the same tunnel"
+finally:
+    if connection is not None:
+        connection.close()
+    child.terminate()
+    try:
+        child.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=3)
+"#,
+        ])
+        .arg(tools.path().join("kubectl"))
+        .env("CURIE_TEST_KUBECTL_LOG", tools.path().join("kubectl.log"))
+        .env("CURIE_TEST_TUNNEL_BACKEND", &backend.base_url)
+        .output()
+        .expect("run actual external tunnel fixture");
+    assert!(output.status.success(), "{}", describe(&output));
+    let requests = backend.recorded();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].body, b"synthetic agent");
 }
 
 #[derive(Clone, Debug)]

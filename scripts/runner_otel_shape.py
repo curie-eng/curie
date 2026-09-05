@@ -46,6 +46,7 @@ _TERMINAL_OUTCOMES = {
     ("aborted_streaming", "failed"): _OTEL_STATUS_ERROR,
     ("aborted_tools", "failed"): _OTEL_STATUS_ERROR,
     ("classified_failure", "failed"): _OTEL_STATUS_ERROR,
+    ("runner_timeout", "failed"): _OTEL_STATUS_ERROR,
     ("completed", "succeeded"): _OTEL_STATUS_OK,
     ("abandoned", "abandoned"): _OTEL_STATUS_ERROR,
 }

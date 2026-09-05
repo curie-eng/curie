@@ -26,6 +26,8 @@
 //! `charts/curie` relative to the test process's cwd, which is the `cli`
 //! package root.
 
+mod support;
+
 use std::process::Command;
 
 fn bin() -> &'static str {
@@ -251,6 +253,10 @@ if [ "$tool" = "kubectl" ] && [ "$1" = "get" ] \
   echo '{"items":[{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"SandboxTemplate","metadata":{"name":"curie-runner","labels":{"app.kubernetes.io/component":"agent-sandbox","app.kubernetes.io/instance":"curie","app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"curie","meta.helm.sh/release-namespace":"curie"}},"spec":{"service":true}},{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"SandboxWarmPool","metadata":{"name":"curie-runner-pool","labels":{"app.kubernetes.io/component":"agent-sandbox","app.kubernetes.io/instance":"curie","app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"curie","meta.helm.sh/release-namespace":"curie"}},"spec":{"replicas":0,"sandboxTemplateRef":{"name":"curie-runner"}}}]}'
   exit 0
 fi
+if [ "$tool" = "kubectl" ] && echo "$*" | grep -q " get secret "; then
+  echo "$FAKE_SECRET_JSON"
+  exit 0
+fi
 echo "shim: refusing to execute: $tool $*" >&2
 exit 1
 "#;
@@ -279,16 +285,7 @@ exit 1
     /// `Command::env`.
     struct FakeRelease {
         dir: tempfile::TempDir,
-    }
-
-    /// One PEM marker line, composed from its boundary word rather than
-    /// written out whole. This fixture carries no key material -- the
-    /// placeholder bytes between the markers are never read as a key -- but
-    /// spelling the markers out contiguously reads as a pasted credential to
-    /// a secret scanner, a false positive that would otherwise have to be
-    /// allowlisted in every repo that vendors this test.
-    fn pem_marker(boundary: &str) -> String {
-        format!("-----{boundary} RSA PRIVATE KEY-----")
+        github: super::support::MockServer,
     }
 
     impl FakeRelease {
@@ -303,24 +300,25 @@ exit 1
                 perms.set_mode(0o755);
                 std::fs::set_permissions(&path, perms).expect("chmod shim");
             }
-            // Must be PEM-SHAPED: since #1260, `require_connect_inputs`
-            // validates the file's shape (a BEGIN/END PRIVATE KEY pair), not
-            // just `Path::is_file`, so a non-PEM body would be refused before
-            // ever reaching the BYO-conflict guard these tests exercise. The
-            // contents are still never parsed as an actual key -- the
-            // chart-held branch only hands helm the PATH (never the
-            // contents) via `--set-file` -- so an inert placeholder between
-            // the markers is enough; no credential-shaped body is needed.
-            std::fs::write(
-                dir.path().join("app.pem"),
-                format!(
-                    "{}\nplaceholder; these bytes are never read as a key\n{}\n",
-                    pem_marker("BEGIN"),
-                    pem_marker("END"),
-                ),
-            )
-            .expect("write pem fixture");
-            Self { dir }
+            // A real RSA key: since #2269 the live path signs a JWT and
+            // probes GitHub before helm upgrade, so a PEM-shaped placeholder
+            // would be refused at signing and never reach the BYO-conflict
+            // call site these tests exist to pin. Generated at runtime so
+            // this file never carries key material.
+            let pem = std::process::Command::new("openssl")
+                .args(["genrsa", "2048"])
+                .output()
+                .unwrap_or_else(|e| panic!("openssl genrsa: {e}"));
+            assert!(
+                pem.status.success(),
+                "openssl genrsa failed: {}",
+                String::from_utf8_lossy(&pem.stderr)
+            );
+            std::fs::write(dir.path().join("app.pem"), &pem.stdout).expect("write pem fixture");
+            let github = super::support::serve(|_req: &super::support::Request| {
+                super::support::Response::json(200, r#"{"id":1234567,"name":"acme-bot"}"#)
+            });
+            Self { dir, github }
         }
 
         /// A real file, because `require_connect_inputs` stats the path long
@@ -348,6 +346,18 @@ exit 1
         /// Run the binary with the shim dir PREPENDED to the child's PATH.
         /// Prepended rather than replacing: the shims must win over a real helm
         /// or kubectl, and the binary still needs the rest of PATH.
+        fn secret_json(&self) -> String {
+            let pem = std::fs::read(self.dir.path().join("app.pem")).expect("read pem");
+            let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pem);
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {"name": "my-github-app"},
+                "data": {"app-pem": encoded, "privateKey": encoded}
+            })
+            .to_string()
+        }
+
         fn run(&self, values: &str, argv: &[&str]) -> Output {
             let mut dirs = vec![self.dir.path().join("bin")];
             if let Some(existing) = std::env::var_os("PATH") {
@@ -358,6 +368,8 @@ exit 1
                 .args(argv)
                 .env("PATH", path)
                 .env("FAKE_VALUES", values)
+                .env("FAKE_SECRET_JSON", self.secret_json())
+                .env("CURIE_GITHUB_API_URL", &self.github.base_url)
                 .env("SHIM_LOG", self.log_path())
                 .output()
                 .unwrap_or_else(|e| panic!("run curie {}: {e}", argv.join(" ")))

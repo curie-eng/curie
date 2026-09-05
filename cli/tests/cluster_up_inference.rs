@@ -25,6 +25,15 @@ fn chart() -> &'static str {
 }
 
 fn write_exec(dir: &Path, name: &str, body: &str) {
+    let body = if matches!(name, "helm" | "kubectl") {
+        format!(
+            "#!/bin/sh\n{}\n{}",
+            include_str!("data/converged-installation-read.sh"),
+            body.strip_prefix("#!/bin/sh\n").unwrap_or(body)
+        )
+    } else {
+        body.to_string()
+    };
     let path = dir.join(name);
     fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
     let mut permissions = fs::metadata(&path)

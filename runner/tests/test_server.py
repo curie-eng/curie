@@ -15,6 +15,38 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+_TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
+
+
+class _EpochControlledSession:
+    """Two no-result turns whose SDK wait is released only by interrupt."""
+
+    def __init__(self) -> None:
+        self.entered = [anyio.Event(), anyio.Event()]
+        self.release = [anyio.Event(), anyio.Event()]
+        self.turn = -1
+        self.interrupts = 0
+
+    async def connect(self) -> None: ...
+
+    async def query(self, _text: str) -> None:
+        self.turn += 1
+
+    async def receive_turn(self):
+        turn = self.turn
+        self.entered[turn].set()
+        await self.release[turn].wait()
+        if False:  # pragma: no cover - retain the async-generator shape
+            yield None
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+        self.release[self.turn].set()
+
+    async def close(self) -> None:
+        for release in self.release:
+            release.set()
+
 
 def _runner() -> tuple[SessionRunner, FakeModelSession]:
     fake = FakeModelSession()
@@ -425,6 +457,118 @@ def test_interrupt_requires_auth_and_proceeds_with_token() -> None:
             assert resp.status == 200
             assert (await resp.json())["ok"] is True
             assert fake.interrupts >= 1
+
+    anyio.run(go)
+
+
+def test_timeout_route_auth_epoch_validation_and_turn_isolation() -> None:
+    """Only the authenticated current epoch may label and stop its own turn."""
+
+    async def go() -> None:
+        session = _EpochControlledSession()
+        runner = SessionRunner(
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="t",
+        )
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+            first = await client.post("/v1/event", json=_EVENT_FRAME, headers=_AUTH)
+            first_epoch = first.headers[_TURN_EPOCH_HEADER]
+            assert 32 <= len(first_epoch) <= 256
+            assert all(
+                character.isalnum() or character in "-_"
+                for character in first_epoch
+            )
+            await session.entered[0].wait()
+
+            unauthenticated = await client.post(
+                "/v1/timeout", headers={_TURN_EPOCH_HEADER: first_epoch}
+            )
+            assert unauthenticated.status == 401
+            wrong_bearer = await client.post(
+                "/v1/timeout",
+                headers={
+                    "Authorization": "Bearer wrong-token-PLACEHOLDER",
+                    _TURN_EPOCH_HEADER: first_epoch,
+                },
+            )
+            assert wrong_bearer.status == 401
+            assert session.interrupts == 0
+
+            missing = await client.post("/v1/timeout", headers=_AUTH)
+            malformed = await client.post(
+                "/v1/timeout",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: "not*an*epoch"},
+            )
+            oversized = await client.post(
+                "/v1/timeout",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: "A" * 1025},
+            )
+            assert missing.status == 400
+            assert malformed.status == 400
+            assert oversized.status == 400
+
+            guessed_epoch = (
+                ("A" if first_epoch[0] != "A" else "B") + first_epoch[1:]
+            )
+            spoofed = await client.post(
+                "/v1/timeout",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: guessed_epoch},
+            )
+            assert spoofed.status == 409
+            assert session.interrupts == 0
+
+            accepted = await client.post(
+                "/v1/timeout",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: first_epoch},
+            )
+            assert accepted.status == 200
+            assert (await accepted.json())["ok"] is True
+            assert session.interrupts == 1
+            first_body = await first.text()
+            assert first_epoch not in first_body
+
+            replayed = await client.post(
+                "/v1/timeout",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: first_epoch},
+            )
+            assert replayed.status == 409
+            assert session.interrupts == 1
+
+            second = await client.post("/v1/event", json=_EVENT_FRAME, headers=_AUTH)
+            second_epoch = second.headers[_TURN_EPOCH_HEADER]
+            assert second_epoch != first_epoch
+            await session.entered[1].wait()
+
+            stale = await client.post(
+                "/v1/timeout",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: first_epoch},
+            )
+            spoofed_retry = await client.post(
+                "/v1/timeout",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: guessed_epoch},
+            )
+            assert stale.status == 409
+            assert spoofed_retry.status == 409
+            assert session.interrupts == 1
+
+            accepted_retry = await client.post(
+                "/v1/timeout",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: second_epoch},
+            )
+            assert accepted_retry.status == 200
+            await second.text()
+            assert session.interrupts == 2
+
+            delayed_replay = await client.post(
+                "/v1/timeout",
+                headers={**_AUTH, _TURN_EPOCH_HEADER: second_epoch},
+            )
+            assert delayed_replay.status == 409
+            assert session.interrupts == 2
 
     anyio.run(go)
 

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/cluster-upgrade/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/cluster-upgrade/v1.1.json",
   "title": "curie cluster upgrade --json",
-  "description": "The agent-facing payload of `curie cluster upgrade`: the redacted dry-run plan, or the completed lifecycle (succeeded or failed). Success requires exact convergence and a passing target-version canary. A failure either leaves the previous known-good version serving or returns one fail-forward command.",
+  "description": "The agent-facing payload of `curie cluster upgrade`: the redacted dry-run plan, or the completed lifecycle (succeeded or failed). Success requires exact convergence and a passing API/storage identity canary. A failure records the last known-good version and recovery instructions; it does not guarantee that version remains serving.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -50,6 +50,38 @@
         },
         "manifest_matches": {
           "type": "boolean"
+        },
+        "observed_images": {
+          "type": "array",
+          "description": "Actual Pod/container image observations; image_id is opaque runtime evidence, not proof of registry digest equivalence. Optional for compatibility with older CLI reports.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "workload": {
+                "type": "string"
+              },
+              "pod": {
+                "type": "string"
+              },
+              "container": {
+                "type": "string"
+              },
+              "image": {
+                "type": "string"
+              },
+              "image_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "workload",
+              "pod",
+              "container",
+              "image",
+              "image_id"
+            ]
+          }
         }
       },
       "required": [

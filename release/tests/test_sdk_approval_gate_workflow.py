@@ -1,6 +1,6 @@
 """Contract tests for the SDK-bump live approval-gate PR workflow.
 
-This workflow runs on a rare trigger -- a pull request that touches `uv.lock` --
+This workflow runs when the SDK lock or a named approval enforcement path changes
 so a maintainer will not notice in the ordinary course of review if a future edit
 quietly narrows its `paths` filter, decouples its `if:` gate from `detect`, or
 strips the `CURIE_E2E_LIVE` flag that makes the ladder step actually dispatch a
@@ -27,7 +27,9 @@ def all_steps(workflow: dict) -> list[dict]:
 
 
 class TestSdkApprovalGateWorkflowContract:
-    def test_trigger_is_pull_request_on_main_and_next_scoped_to_the_lock_file(self) -> None:
+    def test_trigger_is_pull_request_on_main_and_next_scoped_to_sdk_and_approval_paths(
+        self,
+    ) -> None:
         workflow = load_workflow()
         trigger = workflow["on"]
 
@@ -36,9 +38,31 @@ class TestSdkApprovalGateWorkflowContract:
         assert set(trigger["pull_request"]["paths"]) == {
             "uv.lock",
             ".github/workflows/sdk-approval-gate.yaml",
-            "tools/sdk-lock-gate/**",
+            "tools/sdk-lock-gate/detect.py",
+            "tools/sdk-lock-gate/run-proof.py",
+            "tools/sdk-lock-gate/tests/test_approval_paths.py",
+            "tools/sdk-lock-gate/tests/test_live_proof_consumer.py",
+            "tools/sdk-lock-gate/tests/test_sdk_lock_gate.py",
+            "runner/src/curie_runner/__main__.py",
+            "runner/src/curie_runner/adapter.py",
+            "runner/src/curie_runner/approval.py",
+            "runner/src/curie_runner/config.py",
+            "runner/src/curie_runner/connectors.py",
+            "runner/src/curie_runner/hooks.py",
+            "runner/src/curie_runner/session.py",
+            "runner/tests/fixtures/mcp_tool_capability_server.py",
+            "runner/tests/test_approval.py",
+            "runner/tests/test_approval_gate_enforcement.py",
+            "runner/tests/test_connectors.py",
+            "runner/tests/test_gate_e2e.py",
+            "runner/tests/test_gate_shadowing.py",
+            "runner/tests/test_hooks.py",
+            "runner/tests/test_hosted_mcp_approval_catalog.py",
+            "runner/tests/test_ladder_approval_gate_case.py",
+            "runner/tests/test_live.py",
+            "runner/tests/test_mcp_tool_capability.py",
         }
-        assert len(trigger["pull_request"]["paths"]) == 3
+        assert len(trigger["pull_request"]["paths"]) == 25
 
     def test_detect_job_runs_detect_py_and_exposes_its_output(self) -> None:
         workflow = load_workflow()
@@ -76,7 +100,9 @@ class TestSdkApprovalGateWorkflowContract:
         ladder_steps = [
             step
             for step in live_job["steps"]
-            if step.get("run") == "bash cli/scripts/e2e-ladder.sh"
+            # #2308's consumer executes the ladder and refuses missing case,
+            # park/no-effect proof, or a later ladder failure.
+            if step.get("run") == "python3 tools/sdk-lock-gate/run-proof.py"
         ]
         assert len(ladder_steps) == 1
         env = ladder_steps[0]["env"]

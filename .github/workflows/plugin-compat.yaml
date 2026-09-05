@@ -19,6 +19,9 @@ on:
       - "packages/plugin-format/**"
       - ".github/workflows/plugin-compat.yaml"
       - "scripts/check-plugin-compat.sh"
+      - "scripts/assert-gates-are-live-tools.py"
+      - "tools/sre-contract/**"
+      - "docs/agents.md"
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
@@ -55,3 +58,37 @@ jobs:
       # agreeing, which drifted apart on the same install.
       - name: Assert every write path is gated
         run: python3 scripts/check-write-path-gated.py
+
+  sre-contract:
+    name: Supported SRE bundle consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install contract checker dependencies
+        run: python -m pip install -r tools/sre-contract/requirements.txt -e packages/plugin-format
+      - name: Exercise causal contract and HTTP catalog mutations
+        run: python -m pytest -q tools/sre-contract/tests
+      - name: Validate the shipped supported bundle
+        run: python tools/sre-contract/check.py
+
+  sre-live-catalog:
+    name: Supported SRE actual connector catalogs
+    needs: sre-contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install contract checker dependencies
+        run: python -m pip install -r tools/sre-contract/requirements.txt -e packages/plugin-format
+      - name: Probe declared connector images and execute live gate checker
+        run: python tools/sre-contract/catalog_ci.py

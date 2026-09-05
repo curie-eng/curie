@@ -141,8 +141,8 @@ admins maintain (issue #632).
   workflow runs `cargo audit` (Rust), `pip-audit` (the uv/Python workspace), and
   `pnpm audit` (the `apps/ui` JavaScript workspace) as advisory checks.
 - **CodeQL** static analysis over the Python and JavaScript/TypeScript code.
-- **Dependabot** keeps the four ecosystems (GitHub Actions, Cargo, uv, npm)
-  current through grouped weekly PRs (`.github/dependabot.yml`).
+- **Dependabot** keeps the five ecosystems (GitHub Actions, Cargo, uv, npm,
+  Docker) current through grouped weekly PRs (`.github/dependabot.yml`).
 - **Third-party actions and scanner images on sensitive workflows are pinned to
   immutable revisions** — a commit SHA for actions, a digest for images;
   first-party `actions/*` are referenced by major-version tag.

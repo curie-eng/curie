@@ -106,6 +106,30 @@ class RouteState(StrEnum):
     SUSPENDED = "suspended"
 
 
+class AdoptionState(StrEnum):
+    """Whether the route's runner credential has been installed on its pod.
+
+    ADR-0122 delivers a warm bind's per-conversation credential over the first
+    authenticated ACI ``Event`` and keeps the durable copy on the route, so a
+    lost response, a crash, or a second replica recovers it from the store
+    rather than from a worker's memory.
+
+    - ``NONE``: cold path. The token reached the runner as per-claim boot env
+      (``CURIE_RUNNER_TOKEN``); nothing is adoptable. Also what every route
+      written before this field existed rehydrates as.
+    - ``PENDING``: warm bind. The worker minted the credential and recorded it
+      here BEFORE sending the adopting event; the runner still holds only the
+      pool bootstrap, so the adopting request may be retried.
+    - ``APPLIED``: the runner acked ``adoption_applied: true`` for this
+      credential, or its ``/v1/status`` attestation proved the binding. The
+      bootstrap is retired on that pod; only this credential reaches it.
+    """
+
+    NONE = "none"
+    PENDING = "pending"
+    APPLIED = "applied"
+
+
 @dataclass(frozen=True)
 class SandboxHandle:
     """A claimed sandbox bound to a thread: identity plus the ACI dial target.
@@ -138,6 +162,15 @@ class SandboxHandle:
     # when a denied/failed revision leaves the git head unchanged.
     publication_visible_outcome_revision: int = 0
     generation: int = 0
+    # ADR-0122: whether ``token`` has been installed on the runner. Defaulted so
+    # every route written before the field existed rehydrates as the cold path.
+    adoption_state: AdoptionState = AdoptionState.NONE
+    # ADR-0122 / root correction 3: the id of the event whose adopting turn
+    # this route's pod was (or is being) bound with, recorded at the PENDING
+    # write and cleared only once that turn's terminal answer is known. A
+    # redelivery of that same event that finds the route APPLIED with its own
+    # id here must not open a plain turn: the first turn may already have run.
+    adopting_event_id: str | None = None
 
     @property
     def sandbox_id(self) -> str:
@@ -160,12 +193,28 @@ class RouteRecord:
     def to_json(self) -> str:
         payload = asdict(self.handle)
         payload["state"] = self.state.value
+        # Mixed-fleet safety: a worker built before this field rehydrates a
+        # record with ``SandboxHandle(**payload)`` and would raise on an
+        # unknown key, then evict or reap the live claim. The cold path is the
+        # default, so it is written in the legacy shape; only a route that is
+        # actually pending or applied carries the key, and those are written
+        # only once every replica understands it (rollout order: worker last).
+        if payload["adoption_state"] == AdoptionState.NONE.value:
+            del payload["adoption_state"]
+        if payload["adopting_event_id"] is None:
+            del payload["adopting_event_id"]
         return json.dumps(payload, sort_keys=True)
 
     @classmethod
     def from_json(cls, raw: str) -> RouteRecord:
         payload = json.loads(raw)
         state = RouteState(payload.pop("state", RouteState.LIVE.value))
+        # An unknown value raises rather than being guessed: a route that
+        # claims a state this build does not know must not be treated as
+        # either adoptable or applied.
+        payload["adoption_state"] = AdoptionState(
+            payload.get("adoption_state", AdoptionState.NONE.value)
+        )
         return cls(handle=SandboxHandle(**payload), state=state)
 
 

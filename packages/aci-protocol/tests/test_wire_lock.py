@@ -175,9 +175,12 @@ def test_committed_lock_matches_the_current_wire() -> None:
     assert lock["wire_sha256"] == wire_fingerprint()
 
 
-def test_event_session_context_contract_uses_patch_version_0_4_4() -> None:
+def test_bootstrap_token_contract_uses_patch_version_0_4_6() -> None:
+    # Session identity landed as 0.4.4 (optional session_id/history_ref), the
+    # adoption credential and its ack as 0.4.5. This patch adds the optional
+    # BootEnv.runner_bootstrap_token key and nothing on the event wire.
     lock_path = schema_export.schema_path().parent / "wire.lock"
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
 
-    assert PROTOCOL_VERSION == "0.4.4"
-    assert lock["protocol_version"] == "0.4.4"
+    assert PROTOCOL_VERSION == "0.4.6"
+    assert lock["protocol_version"] == "0.4.6"

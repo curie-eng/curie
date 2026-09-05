@@ -1405,6 +1405,7 @@ class PublicationCreate(BaseModel):
     reply_endpoint: str | None = None
     reply_adapter: str | None = None
     dedupe_key: str = Field(min_length=1)
+    review_origin_key: str | None = Field(default=None, min_length=1, max_length=180)
     base_sha: str
     patch_b64: str = Field(min_length=1)
     changed_paths: list[str] = Field(min_length=1, max_length=4096)
@@ -1466,6 +1467,41 @@ class PublicationCreate(BaseModel):
             return base64.b64decode(self.patch_b64, validate=True)
         except (binascii.Error, ValueError) as exc:
             raise ValueError("patch_b64 must be canonical base64") from exc
+
+
+class ReviewRevisionReserve(BaseModel):
+    repository_id: int = Field(gt=0, strict=True)
+    pr_number: int = Field(gt=0, strict=True)
+    expected_lineage_version: int = Field(ge=1, strict=True)
+    origin_key: str = Field(min_length=1, max_length=180)
+
+
+class ReviewRevisionOut(BaseModel):
+    revision_id: uuid.UUID
+    lineage_id: uuid.UUID
+    agent_id: uuid.UUID
+    conversation_id: str
+    reply_conversation_id: str
+    binding_id: uuid.UUID
+    binding_generation: int
+    repository_id: int
+    installation_id: int
+    pr_node_id: str
+    base_ref: str
+    repo_full_name: str
+    pr_number: int
+    branch: str
+    base_sha: str
+    expected_head_sha: str
+    lineage_version: int
+    revision_number: int
+    version: int
+    status: Literal["reserved", "consumed", "cancelled"]
+
+
+class ReviewRevisionCancel(BaseModel):
+    origin_key: str = Field(min_length=1, max_length=180)
+    expected_version: int = Field(ge=1, strict=True)
 
 
 class PublicationLineageAdvance(BaseModel):

@@ -86,9 +86,67 @@ def test_every_pinned_core_tool_is_classified_exactly_once() -> None:
         for entry in policy["approvalRequired"]
     }
     assert kubernetes_allow == READ_TOOLS
+    # Keep the sibling whitelist exact after the approved SRE read restoration
+    # and pinned connector catalog reconciliation (#2285, #2295). The actual
+    # catalogs contain 48 Grafana, four Tempo and three self-upgrade tools;
+    # connector read-only flags and live catalog annotations are separately
+    # verified by tools/sre-contract. No wildcard or extra tool is admitted here.
     assert other_allow == {
-        "self-upgrade/upgrade_self",
+        "grafana/alerting_manage_routing",
+        "grafana/alerting_manage_rules",
+        "grafana/analyze_loki_labels",
+        "grafana/check_datasources_health",
+        "grafana/generate_deeplink",
+        "grafana/get_alert_group",
+        "grafana/get_annotation_tags",
+        "grafana/get_annotations",
+        "grafana/get_assertions",
+        "grafana/get_current_oncall_users",
+        "grafana/get_dashboard_by_uid",
+        "grafana/get_dashboard_panel_queries",
+        "grafana/get_dashboard_property",
+        "grafana/get_dashboard_summary",
+        "grafana/get_datasource",
+        "grafana/get_oncall_shift",
+        "grafana/get_query_examples",
+        "grafana/get_sift_analysis",
+        "grafana/get_sift_investigation",
+        "grafana/list_alert_groups",
+        "grafana/list_cloudwatch_dimensions",
+        "grafana/list_cloudwatch_metrics",
+        "grafana/list_cloudwatch_namespaces",
+        "grafana/list_datasources",
+        "grafana/list_loki_label_names",
+        "grafana/list_loki_label_values",
+        "grafana/list_oncall_schedules",
+        "grafana/list_oncall_teams",
+        "grafana/list_oncall_users",
+        "grafana/list_prometheus_label_names",
+        "grafana/list_prometheus_label_values",
+        "grafana/list_prometheus_metric_metadata",
+        "grafana/list_prometheus_metric_names",
+        "grafana/list_pyroscope_label_names",
+        "grafana/list_pyroscope_label_values",
+        "grafana/list_pyroscope_profile_types",
+        "grafana/list_sift_investigations",
+        "grafana/query_cloudwatch",
+        "grafana/query_loki_logs",
+        "grafana/query_loki_patterns",
+        "grafana/query_loki_stats",
+        "grafana/query_prometheus",
+        "grafana/query_prometheus_histogram",
+        "grafana/query_pyroscope",
+        "grafana/run_panel_query",
+        "grafana/search_dashboards",
+        "grafana/search_folders",
+        "grafana/suggest_loki_alloy_label_config",
+        "self-upgrade/latest_release",
         "self-upgrade/upgrade_platform",
+        "self-upgrade/upgrade_self",
+        "tempo/get_trace",
+        "tempo/list_trace_tag_values",
+        "tempo/list_trace_tags",
+        "tempo/search_traces",
     }
     assert approval == MUTATING_TOOLS
     assert not (kubernetes_allow & approval)

@@ -161,12 +161,16 @@ keys:
   Partial bodies, arguments, provider identifiers, and results never enter telemetry.
 - **Boundary confidence is explicit.** Generation start kinds are `query_observed` or
   `tool_result_inferred`; end kinds are `tool_use_observed`, `result_observed`, or
-  `terminal_inferred`. An `execute_tool` span starts at an SDK tool-use block with
-  `curie.phase.start_kind=tool_use_inferred` and ends on the matching tool result with
-  `curie.phase.end_kind=tool_result_inferred`, or at terminal cleanup with
-  `terminal_inferred`. Matching uses the SDK call id only inside the process. The id is
-  never exported; `curie.tool.call.index` is the bounded numeric correlation value, while
-  `gen_ai.tool.name` and `gen_ai.operation.name=execute_tool` describe the operation.
+  `terminal_inferred`. An `execute_tool` span starts when the adapter observes either a
+  streamed SDK tool-use boundary or an SDK tool-use block, with
+  `curie.phase.start_kind=tool_use_inferred`. A streamed boundary still produces this
+  payload-free observation when no final `AssistantMessage` tool-use block arrives: tool
+  inputs, result bodies, and call IDs are never recorded. The span ends on the matching
+  tool result with `curie.phase.end_kind=tool_result_inferred`, or at terminal cleanup
+  with `terminal_inferred`. Matching uses the SDK call ID only inside the process; the ID
+  is never exported. `curie.tool.call.index` is the bounded numeric correlation value,
+  while `gen_ai.tool.name` and `gen_ai.operation.name=execute_tool` describe the
+  operation.
 - **Terminal state is truthful and bounded.** `curie.phase` marks each interval as
   `provider_wait` or `tool_wait`, and on `agent.run` retains the last active phase.
   The root terminal mapping is closed and ordered:

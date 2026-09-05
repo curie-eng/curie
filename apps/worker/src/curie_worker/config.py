@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import socket
-from typing import Annotated
+from typing import Annotated, Any
 
 from aci_protocol.service_config import (
     API_KEY_ENV,
@@ -158,6 +158,10 @@ class WorkerConfig(BaseSettings):
     valkey_port: int = 6379
     valkey_password: str = ""
     valkey_db: int = 0
+    # TLS transport for a BYO Valkey (VALKEY_TLS, rendered by the chart from
+    # valkey.tls). Off by default: the in-chart store and the compose lane are
+    # both cleartext by design (#2315).
+    valkey_tls: bool = False
 
     # Slack
     slack_bot_token: str = ""
@@ -994,6 +998,26 @@ class WorkerConfig(BaseSettings):
         never api_base_url directly (#678).
         """
         return self.runner_api_base_url or self.api_base_url
+
+    def valkey_client_kwargs(self) -> dict[str, Any]:
+        """The connection parts every Valkey client in the worker is built from.
+
+        One place -- the three clients in ``run.build`` and the upgrade-drain
+        hook's own client -- so they cannot drift on the transport: ``ssl``
+        reaching some of them and not the rest is a lane that goes silently
+        cleartext against a TLS-only BYO store (#2315), and for the drain hook
+        that failure blocks every ``helm upgrade`` on the install (#2010).
+        ``socket_timeout`` stays at the call sites: the drain hook deliberately
+        does not set one.
+        """
+        return {
+            "host": self.valkey_host,
+            "port": self.valkey_port,
+            "password": self.valkey_password or None,
+            "db": self.valkey_db,
+            "decode_responses": True,
+            "ssl": self.valkey_tls,
+        }
 
     @property
     def valkey_socket_timeout_s(self) -> float:

@@ -555,7 +555,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 previous_serving: true,
                 unchanged: false,
                 plan: vec!["phase plan: 0.8.6 -> 0.9.0".into()],
-                convergence: Some(curie::ops::Convergence {
+                convergence: Some(Box::new(curie::ops::Convergence {
                     exact: true,
                     images: true,
                     generations: true,
@@ -564,7 +564,8 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     hooks_healthy: true,
                     queues_drained: true,
                     manifest_matches: true,
-                }),
+                    observed_images: Vec::new(),
+                })),
                 canary: Some(curie::ops::Canary { passed: true }),
                 fail_forward: None,
             },

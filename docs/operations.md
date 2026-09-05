@@ -133,6 +133,16 @@ Installs (or upgrades) Curie's Helm chart onto the cluster you're pointed at:
 curie cluster up
 ```
 
+This is a full Helm upgrade. It carries forward the recorded generated secrets,
+sealing keys, Slack tokens, GitHub App and token, runner model and credential,
+gVisor mode, worker extra environment, trusted Slack origins, runner egress,
+and the installed `mailAdapter.*` values with the worker's paired adapter
+credential map or external Secret reference. Other values must be supplied again.
+Explicit `--set` and `--set-string` inputs override retained values. Retained mail
+values use a private temporary values file; the command shows field names only.
+The offline `--dry-run` does not read an installed release, so it cannot display
+that release's retained values.
+
 | Flag / env var | What it does |
 |---|---|
 | `--chart <path-or-tgz>` | Install from a local chart instead of the pinned release asset (for chart development). |
@@ -208,6 +218,11 @@ cluster facts.
 ```bash
 curie cluster status
 ```
+
+A release that has not converged returns exit code 1 with its status report and
+rollout reasons. `--json` retains the same report object with `healthy: false`.
+The check compares the installed Helm target with live workload generations,
+replica counts and serving pod images; an `Available` condition alone is insufficient.
 
 Reports whether the release is healthy, which pods are ready, and the URLs
 to reach it -- including the web console, where you can see your agents,
@@ -488,6 +503,20 @@ There is no `curie cluster comms --email` yet, so email is wired with a private
 Helm values file. The mail adapter ships off by default
 ([`apps/mail-adapter`](../apps/mail-adapter)).
 
+After email is configured, a plain `curie cluster up` preserves its recorded
+settings, PVC configuration, and all three credential references together with
+`worker.adapterCredentialsExistingSecret` and its key. Inline credentials on
+older installs are also retained through the protected values-file path. An
+explicit `--set mailAdapter.deploy=false` disables it; clearing an external
+credential reference does not restore a stale inline credential. A nonempty
+inline credential replaces its retained external reference; an empty inline
+clear leaves the external source active. An empty worker credential map also
+leaves its external source active. Changing the adapter's egress source while
+the worker uses an external credential map requires an explicit paired worker
+source decision; the CLI refuses an unpaired change before Helm runs. Restating
+the worker's Secret name or key acknowledges a pairing updated inside that
+Secret. The CLI checks this explicit decision, not equality of opaque credentials.
+
 Two platform-side steps come first, in this order:
 
 1. **Bind the agent** to `{"kind": "email", "address": "<the inbox address>"}` with a
@@ -568,6 +597,8 @@ independently; the chart cannot safely infer IP ranges from a hostname:
 ```yaml
 api:
   deploy: false
+ui:
+  apiBaseUrl: https://api.example.com:8443
 mailAdapter:
   apiBaseUrl: https://api.example.com:8443
   apiEgress:

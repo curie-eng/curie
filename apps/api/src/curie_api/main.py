@@ -33,6 +33,7 @@ from .db import create_engine, create_sessionmaker
 from .evalqueue import EvalQueue
 from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
+from .github_review_store import GitHubReviewReconciler
 from .graveyardwatcher import GraveyardWatcher
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
@@ -54,6 +55,7 @@ from .routers import (
     evals,
     gitflow_routing,
     github,
+    github_reviews,
     hooks,
     memory,
     observability,
@@ -106,6 +108,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         valkey,
         stream=settings.runs_stream,
         dead_letter_stream=settings.resume_dead_letter_stream or settings.dead_letter_stream_name(),
+    )
+    app.state.github_review_reconciler = GitHubReviewReconciler(
+        app.state.sessionmaker,
+        valkey,
+        settings,
+    )
+    app.state.github_review_reconciler_task = (
+        asyncio.create_task(app.state.github_review_reconciler.run_forever())
+        if settings.github_review_reconciler_interval_s > 0
+        else None
     )
     # The composition root for approvals (#420, ADR-0034): the only place that
     # names Slack to build the approver-set selector, so the authorizer and the
@@ -210,6 +222,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        review_task = app.state.github_review_reconciler_task
+        if review_task is not None:
+            review_task.cancel()
+            try:
+                await review_task
+            except asyncio.CancelledError:
+                pass
         # Both background loops enqueue via resume_queue (which uses the valkey
         # client) and read via the sessionmaker, so both are stopped BEFORE
         # valkey.aclose()/engine.dispose() below.
@@ -335,6 +354,7 @@ def create_app() -> FastAPI:
     app.include_router(bundles.router)
     app.include_router(deploy_targets.router)
     app.include_router(github.router)
+    app.include_router(github_reviews.router)
     app.include_router(gitflow_routing.router)
     app.include_router(observability.router)
     app.include_router(control.router)

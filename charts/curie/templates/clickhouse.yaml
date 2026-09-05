@@ -86,8 +86,9 @@ spec:
       containers:
         - name: clickhouse
           # Pinned tag (coupled to langfuse.image.tag); the AVX preflight
-          # validates it against the node's CPU.
-          image: "{{ .Values.clickhouse.image.repository }}:{{ .Values.clickhouse.image.tag }}"
+          # validates it against the node's CPU. clickhouse.image.digest wins
+          # over the tag when set (#2332).
+          image: {{ include "curie.image" (dict "repository" .Values.clickhouse.image.repository "tag" .Values.clickhouse.image.tag "digest" .Values.clickhouse.image.digest) | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           {{- with .Values.clickhouse.containerSecurityContext }}
           securityContext:

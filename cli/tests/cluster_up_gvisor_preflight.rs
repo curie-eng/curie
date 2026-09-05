@@ -24,6 +24,15 @@ fn chart() -> &'static str {
 }
 
 fn write_exec(dir: &Path, name: &str, body: &str) {
+    let body = if matches!(name, "helm" | "kubectl") {
+        format!(
+            "#!/bin/sh\n{}\n{}",
+            include_str!("data/converged-installation-read.sh"),
+            body.strip_prefix("#!/bin/sh\n").unwrap_or(body)
+        )
+    } else {
+        body.to_string()
+    };
     let path = dir.join(name);
     fs::write(&path, body).unwrap_or_else(|error| panic!("write {name}: {error}"));
     let mut permissions = fs::metadata(&path)
@@ -868,6 +877,26 @@ fn explicit_gvisor_mode_contradicting_admission_is_rejected_before_retry() {
         fixture.assert_graceful_helm_interruption();
         fixture.assert_children_stopped();
     }
+}
+
+#[test]
+fn failed_helm_revision_does_not_replace_explicit_gvisor_usage_recovery() {
+    let fixture = Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL);
+    fs::write(fixture.bin_dir.join("convergence-release-failed"), "").unwrap();
+    let (output, _) = fixture.run(&["--json", "--set", "security.gvisor.mode=require"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["fix"]
+        .as_str()
+        .unwrap()
+        .contains("remove the explicit"));
+    assert_eq!(fixture.upgrade_count(), 1);
+    fixture.assert_children_stopped();
 }
 
 #[test]

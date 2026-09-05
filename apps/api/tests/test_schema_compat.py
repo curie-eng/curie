@@ -78,12 +78,20 @@ def _exec(sql: str, params: dict[str, Any] | None = None) -> None:
 
 def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
-    assert window.schema_min == HEAD
-    assert window.schema_head == HEAD
+    assert window.schema_min == "0043"
+    assert window.schema_head == "0043"
     kinds = load_kinds()
+    assert kinds["0043"] == KIND_EXPAND
+    assert kinds["0042"] == KIND_EXPAND
     assert kinds[HEAD] == KIND_CONTRACT
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
+    # The current ORM reads the 0042 authority and 0043 delivery tables. Those
+    # additive migrations let an older API keep serving, not a newer API boot
+    # before its required tables exist. Exercise the actual startup predicate.
+    assert not can_serve("0041", window, kinds)
+    assert not can_serve("0042", window, kinds)
+    assert can_serve("0043", window, kinds)
 
 
 def test_planner_refuses_0041_contract_without_forward_only() -> None:
@@ -167,7 +175,11 @@ def test_assert_servable_refuses_below_min(isolated_migration_db: None) -> None:
     command.upgrade(cfg, PREV)
     with pytest.raises(RuntimeError, match="below application min"):
         asyncio.run(assert_servable())
-    command.upgrade(cfg, HEAD)
+    for revision in (HEAD, "0042"):
+        command.upgrade(cfg, revision)
+        with pytest.raises(RuntimeError, match="below application min"):
+            asyncio.run(assert_servable())
+    command.upgrade(cfg, "0043")
     asyncio.run(assert_servable())
 
 
@@ -237,7 +249,7 @@ def test_0041_contract_requires_forward_only_and_closes_n_minus_one_window(
     assert outcome.outcome == "applied"
     assert outcome.rollback_compatible is False
     assert outcome.forward_only is True
-    assert current_revision() == HEAD
+    assert current_revision() == "0043"
 
     rows = _sql(
         "SELECT summary FROM curie.approvals WHERE id = :id",
@@ -255,11 +267,12 @@ def test_0041_contract_requires_forward_only_and_closes_n_minus_one_window(
     )
     assert pubs, "0041 contract column must exist after upgrade"
 
-    # Red-on-revert: min=head=0041 closes the application rollback window.
+    # The current application requires the later additive delivery tables too;
+    # its window still excludes the database before the 0041 contract.
     n = load_window()
-    assert n.schema_min == HEAD
-    assert n.schema_head == HEAD
-    assert can_serve(PREV, n, {PREV, HEAD}) is False
+    assert n.schema_min == "0043"
+    assert n.schema_head == "0043"
+    assert can_serve(PREV, n, load_kinds()) is False
 
 
 def test_crash_retry_does_not_double_apply(
@@ -279,42 +292,43 @@ def test_crash_retry_does_not_double_apply(
         "applied_at timestamptz not null default now())"
     )
 
+    # Synthetic names cannot collide with future production migration numbers.
     alembic_copy = tmp_path / "alembic"
     shutil.copytree(ALEMBIC_DIR, alembic_copy)
     versions = alembic_copy / "versions"
-    (versions / "0042_compat_first.py").write_text(
+    (versions / "compat_probe_first_compat_first.py").write_text(
         '''
-revision = "0042"
+revision = "compat_probe_first"
 down_revision = "0041"
 
 def upgrade():
     from alembic import op
     op.execute(
-        "INSERT INTO curie.compat_probe (rev) VALUES ('0042')"
+        "INSERT INTO curie.compat_probe (rev) VALUES ('compat_probe_first')"
     )
 
 def downgrade():
     from alembic import op
-    op.execute("DELETE FROM curie.compat_probe WHERE rev = '0042'")
+    op.execute("DELETE FROM curie.compat_probe WHERE rev = 'compat_probe_first'")
 '''
     )
-    (versions / "0043_compat_second.py").write_text(
+    (versions / "compat_probe_second_compat_second.py").write_text(
         '''
 import os
-revision = "0043"
-down_revision = "0042"
+revision = "compat_probe_second"
+down_revision = "compat_probe_first"
 
 def upgrade():
     from alembic import op
     if os.environ.get("CURIE_COMPAT_PROBE_CRASH") == "1":
-        raise RuntimeError("injected crash after 0042")
+        raise RuntimeError("injected crash after compat_probe_first")
     op.execute(
-        "INSERT INTO curie.compat_probe (rev) VALUES ('0043')"
+        "INSERT INTO curie.compat_probe (rev) VALUES ('compat_probe_second')"
     )
 
 def downgrade():
     from alembic import op
-    op.execute("DELETE FROM curie.compat_probe WHERE rev = '0043'")
+    op.execute("DELETE FROM curie.compat_probe WHERE rev = 'compat_probe_second'")
 '''
     )
     probe_cfg = Config()
@@ -326,45 +340,45 @@ def downgrade():
             apply_upgrade(
                 forward_only=False,
                 alembic_config=probe_cfg,
-                window=AppWindow(schema_min=HEAD, schema_head="0043"),
+                window=AppWindow(schema_min=HEAD, schema_head="compat_probe_second"),
                 kinds={
                     **load_kinds(),
-                    "0042": KIND_EXPAND,
-                    "0043": KIND_EXPAND,
+                    "compat_probe_first": KIND_EXPAND,
+                    "compat_probe_second": KIND_EXPAND,
                 },
             )
     finally:
         os.environ.pop("CURIE_COMPAT_PROBE_CRASH", None)
 
-    assert current_revision() == "0042"
+    assert current_revision() == "compat_probe_first"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0042"]
+    assert [r[0] for r in rows] == ["compat_probe_first"]
 
     outcome = apply_upgrade(
         forward_only=False,
         alembic_config=probe_cfg,
-        window=AppWindow(schema_min=HEAD, schema_head="0043"),
+        window=AppWindow(schema_min=HEAD, schema_head="compat_probe_second"),
         kinds={
             **load_kinds(),
-            "0042": KIND_EXPAND,
-            "0043": KIND_EXPAND,
+            "compat_probe_first": KIND_EXPAND,
+            "compat_probe_second": KIND_EXPAND,
         },
     )
     assert outcome.outcome == "applied"
-    assert current_revision() == "0043"
+    assert current_revision() == "compat_probe_second"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0042", "0043"]
+    assert [r[0] for r in rows] == ["compat_probe_first", "compat_probe_second"]
 
     again = apply_upgrade(
         forward_only=False,
         alembic_config=probe_cfg,
-        window=AppWindow(schema_min=HEAD, schema_head="0043"),
+        window=AppWindow(schema_min=HEAD, schema_head="compat_probe_second"),
         kinds={
             **load_kinds(),
-            "0042": KIND_EXPAND,
-            "0043": KIND_EXPAND,
+            "compat_probe_first": KIND_EXPAND,
+            "compat_probe_second": KIND_EXPAND,
         },
     )
     assert again.action == "noop"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0042", "0043"]
+    assert [r[0] for r in rows] == ["compat_probe_first", "compat_probe_second"]

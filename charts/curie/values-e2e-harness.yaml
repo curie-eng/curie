@@ -10,9 +10,10 @@
 # the #56 credential-isolation fix lives in. It disables every backing store and
 # app service that the bundle-fetch/runner path does not need (langfuse,
 # postgres, valkey, clickhouse, inference, otel collector, api, dispatcher,
-# worker, ui) and both install-time preflights, keeping only RustFS (the bundle
-# store) and the agent-sandbox substrate (the SandboxTemplate whose podTemplate
-# the harness renders into a bound Pod).
+# worker, ui) and the avx and networkpolicy preflights (controllerReady is
+# already gated off by controller.deploy false below), keeping only RustFS
+# (the bundle store) and the agent-sandbox substrate (the SandboxTemplate
+# whose podTemplate the harness renders into a bound Pod).
 #
 # The vendored controller is OFF: the harness builds the bound sandbox Pod
 # directly from the SandboxTemplate.spec.podTemplate, so it never needs the

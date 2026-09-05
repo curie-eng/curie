@@ -1,4 +1,4 @@
-# Dependabot keeps the four dependency ecosystems in this repo current. Grouped
+# Dependabot keeps the five dependency ecosystems in this repo current. Grouped
 # into one PR per ecosystem per week to keep the update volume reviewable.
 version: 2
 updates:
@@ -47,3 +47,23 @@ updates:
     ignore:
       - dependency-name: "typescript"
         update-types: ["version-update:semver-major"]
+
+  # First-party image bases. Each FROM is pinned to a version plus digest
+  # (#2320); this ecosystem raises the bumps as reviewable PRs so a nightly
+  # ladder rebuild does not silently pick up a new base. Directories are the
+  # product Dockerfiles only; `/` would also scan compose and chart image
+  # refs that #2319 tracks separately.
+  - package-ecosystem: docker
+    directories:
+      - /apps/api
+      - /apps/dispatcher
+      - /apps/mail-adapter
+      - /apps/ui
+      - /apps/worker
+      - /adapters/discord
+      - /runner
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]

@@ -10,9 +10,13 @@
 //! and gives one place to mask secrets before anything is printed.
 
 mod command;
+mod convergence;
 mod providers;
 mod up;
 mod upgrade;
+mod upgrade_images;
+mod upgrade_owner;
+mod upgrade_recovery;
 mod verbs;
 
 pub use command::*;
@@ -151,6 +155,7 @@ mod testsupport {
     /// assertion below reads exactly one variable.
     pub(super) fn up_with_github_token(plan: GithubTokenPlan) -> Vec<OpsCommand> {
         up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: plan,
             set_string: vec![],

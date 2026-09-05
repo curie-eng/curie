@@ -198,7 +198,7 @@ spec:
             - name: GITHUB_CLONE_BASE
               value: {{ .Values.api.githubCloneBase | quote }}
             - name: LANGFUSE_HOST
-              value: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
+              value: {{ include "curie.langfuse.url" . }}
             - name: LANGFUSE_PUBLIC_KEY
               value: {{ .Values.langfuse.init.projectPublicKey | quote }}
             - name: LANGFUSE_SECRET_KEY

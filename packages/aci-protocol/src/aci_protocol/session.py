@@ -17,17 +17,24 @@ Env mapping:
 
 ``BootEnv`` (#488, ADR-0049) is the Curie-platform superset: SessionConfig
 COMPOSED as a field plus the platform-operational boot vars (runner token,
-bundle ref, approval plumbing, history port, model routing, the operator knobs).
+pool bootstrap token, bundle ref, approval plumbing, history port, model
+routing, the operator knobs).
 It is deliberately not an extension of SessionConfig -- see ADR-0049 and the
 class docstring.
 """
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 
-from pydantic import Field
+from pydantic import Field, ValidationError, model_validator
 
-from .events import _AciModel
+from .events import (
+    _AciModel,
+    _malformed_credential_error,
+    admit_bounded_credential,
+    redact_credential_error,
+)
 
 
 class Budget(_AciModel):
@@ -155,6 +162,43 @@ _SESSION_ENV: dict[str, tuple[str, tuple[Producer, ...]]] = {
     "otel_headers": ("OTEL_EXPORTER_OTLP_HEADERS", ("operator",)),
     "otel_protocol": ("OTEL_EXPORTER_OTLP_PROTOCOL", ("substrate",)),
 }
+
+
+# Opaque pool bootstrap credential (#1492, ADR-0122). Same character cap as
+# ``ADOPTION_CREDENTIAL_MAX_CHARS`` and for the same reason: long enough for a
+# typical bearer, short enough to reject a dump. Not a product secret format.
+RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS = 4096
+
+_BOOTSTRAP_FIELD = "runner_bootstrap_token"
+_BOOTSTRAP_MALFORMED = "malformed runner bootstrap token"
+
+
+def _malformed_bootstrap_token() -> ValueError:
+    """Reject without attaching the presented material to the exception."""
+
+    return ValueError(_BOOTSTRAP_MALFORMED)
+
+
+def _malformed_boot_env_error() -> ValidationError:
+    """A material-free ValidationError for a bad runner_bootstrap_token."""
+
+    return _malformed_credential_error("BootEnv", _BOOTSTRAP_FIELD, _BOOTSTRAP_MALFORMED)
+
+
+def parse_runner_bootstrap_token(value: Any) -> str | None:
+    """Admit an optional bootstrap token, or raise without echoing it.
+
+    ``None`` is "no bootstrap presented" (the key is absent). Any other
+    well-formed value is a non-empty string no longer than
+    ``RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS`` that is not whitespace-only; an empty
+    string is malformed, not unset. Same admission rule and same no-echo
+    guarantee as ``parse_adoption_credential``; the two are one helper bound
+    twice.
+    """
+
+    return admit_bounded_credential(
+        value, max_chars=RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS, error=_malformed_bootstrap_token
+    )
 
 
 def _env(key: str, *producers: Producer) -> dict[str, Any]:
@@ -298,6 +342,50 @@ class BootEnv(_AciModel):
     runner_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_RUNNER_TOKEN", "worker")
     )
+    # Pool bootstrap credential (#1492; ADR-0116 decision 2, ADR-0122). Written
+    # by the SUBSTRATE only: one Secret per warm pool, delivered through the
+    # pool template's ``secretKeyRef``. The worker's per-claim render never
+    # writes it, and ``render_worker`` has no parameter for it by design.
+    #
+    # It is a distinct key rather than a reuse of ``runner_token`` because the
+    # two credentials carry different AUTHORITY, and an unbound warm runner has
+    # to tell them apart at boot: ``CURIE_RUNNER_TOKEN`` means "bound,
+    # per-conversation, enforced on every gated ACI route", while a bootstrap
+    # may authorize exactly one atomic adoption (an ``Event`` carrying
+    # ``adoption_credential``) and is retired for that pod once applied. The
+    # chart's ``CURIE_SESSION_ID=warm-unbound`` placeholder is a template value,
+    # not a contract signal, and must not be used as the mode switch.
+    #
+    # Consumer authority policy (documented here; realized by the runner, not
+    # by this package):
+    #   - ``runner_token`` present: bound per-conversation mode. The bootstrap
+    #     value is ignored and never admitted, so the cold path is unchanged
+    #     even if a pool template and a per-claim render both wrote a key.
+    #   - only ``runner_bootstrap_token`` present: bootstrap mode. The
+    #     credential authorizes one adoption; any other gated request that
+    #     presents it is refused before a model turn starts, and after the
+    #     adoption is applied it authenticates nothing against that pod.
+    #   - neither present: today's tokenless legacy boot, unchanged. Nothing
+    #     is relaxed and nothing new is enforced by this field's existence.
+    #
+    # Secret material: omitted from ``repr``/``str``; a present value that is
+    # empty, blank, oversize or not a string fails the parse closed with an
+    # error that never carries the material (``_admit_runner_bootstrap_token``,
+    # on every construction path including ``from_env``). Unlike every other
+    # optional boot var, a declared-but-EMPTY value is NOT "unset": the only
+    # producer is a pool Secret, an empty ``secretKeyRef`` is a mis-render, and
+    # decoding it as "neither token present" would boot a warm pod that
+    # enforces nothing. Only an ABSENT key is the compatible legacy case.
+    # Declaring the key is not bootstrap mode, adoption, retirement, or a
+    # pool; those remain #1492 realizing work.
+    runner_bootstrap_token: str | None = Field(
+        default=None,
+        repr=False,
+        min_length=1,
+        max_length=RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS,
+        pattern=r".*\S.*",
+        json_schema_extra=_env("CURIE_RUNNER_BOOTSTRAP_TOKEN", "substrate"),
+    )
     # The agent's pinned model (#254), overriding the worker default. The chart
     # also bakes a template default (inference.model, or runner.model) so a warm
     # pod boots resolvable; the per-claim value wins under Overrides.
@@ -428,6 +516,55 @@ class BootEnv(_AciModel):
     history_max_bytes: int | None = Field(
         default=None, json_schema_extra=_env("CURIE_HISTORY_MAX_BYTES", "operator")
     )
+
+    @classmethod
+    def model_validate_json(
+        cls,
+        json_data: str | bytes | bytearray,
+        **kwargs: Any,
+    ) -> "BootEnv":
+        # The redacted error is raised OUTSIDE the except block on purpose:
+        # ``raise ... from None`` only suppresses display, and the original
+        # error (whose ``json_invalid`` input is the raw material) would stay
+        # reachable through ``__context__``. Leaving the block first drops it.
+        redacted: ValidationError | None = None
+        try:
+            return super().model_validate_json(json_data, **kwargs)
+        except ValidationError as exc:
+            redacted = redact_credential_error(
+                exc, title="BootEnv", field=_BOOTSTRAP_FIELD, message=_BOOTSTRAP_MALFORMED
+            )
+        except json.JSONDecodeError:
+            redacted = _malformed_boot_env_error()
+        raise redacted
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _admit_runner_bootstrap_token(cls, data: Any, handler: Any) -> Any:
+        # Validate and (on failure) drop the presented value before pydantic
+        # records ``input_value``, exactly as ``Event._admit_adoption_credential``
+        # does: the wrap path is what keeps a boot-time log line or an HTTP body
+        # that interpolates ``ValidationError`` from echoing the credential.
+        # Redacted errors are raised outside their except blocks (see
+        # ``model_validate_json``) so no ``__context__`` retains the material.
+        redacted: ValidationError | None = None
+        if isinstance(data, Mapping) and _BOOTSTRAP_FIELD in data:
+            incoming = dict(data)
+            raw = incoming.pop(_BOOTSTRAP_FIELD)
+            try:
+                incoming[_BOOTSTRAP_FIELD] = parse_runner_bootstrap_token(raw)
+            except ValueError:
+                redacted = _malformed_boot_env_error()
+            if redacted is not None:
+                raise redacted
+            data = incoming
+        try:
+            return handler(data)
+        except ValidationError as exc:
+            redacted = redact_credential_error(
+                exc, title="BootEnv", field=_BOOTSTRAP_FIELD, message=_BOOTSTRAP_MALFORMED
+            )
+        raise redacted
 
     @classmethod
     def _declared(cls) -> dict[str, tuple[str, tuple[Producer, ...]]]:
@@ -621,6 +758,8 @@ class BootEnv(_AciModel):
             env[self.env_key("bundle_version")] = self.bundle_version
         if self.runner_token is not None:
             env[self.env_key("runner_token")] = self.runner_token
+        if self.runner_bootstrap_token is not None:
+            env[self.env_key("runner_bootstrap_token")] = self.runner_bootstrap_token
         if self.model is not None:
             env[self.env_key("model")] = self.model
         if self.fake_model is not None:
@@ -689,6 +828,13 @@ class BootEnv(_AciModel):
             bundle_ref=_str_or_none(env.get("CURIE_BUNDLE_REF")),
             bundle_version=_str_or_none(env.get("CURIE_BUNDLE_VERSION")),
             runner_token=_str_or_none(env.get("CURIE_RUNNER_TOKEN")),
+            # Passed through RAW, not via ``_str_or_none``: for this key a
+            # declared-but-empty value is a mis-rendered pool Secret, not
+            # "unset", and must fail the boot closed rather than decode as the
+            # tokenless legacy boot. ``_admit_runner_bootstrap_token`` is the
+            # single admission point for absent (None), empty, blank, oversize
+            # and non-string values, on every construction path.
+            runner_bootstrap_token=env.get("CURIE_RUNNER_BOOTSTRAP_TOKEN"),
             model=_str_or_none(env.get("CURIE_MODEL")),
             fake_model=_fake_model_or_none(env.get("CURIE_FAKE_MODEL")),
             history_ref=_str_or_none(env.get("CURIE_HISTORY_REF")),

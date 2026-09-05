@@ -74,7 +74,13 @@ BLANKS = ("", "   ")
 # so registering the module here is the decision this alarm asks for -- it WIDENS
 # the sweep onto those bodies rather than exempting them.
 KNOWN_BODY_MODULES = frozenset(
-    {"curie_api.schemas", "aci_protocol.wire", "curie_api.routers.channels"}
+    {
+        "curie_api.schemas",
+        "aci_protocol.wire",
+        "aci_protocol.turn",
+        "curie_api.routers.channels",
+        "curie_api.routers.github_reviews",
+    }
 )
 # FastAPI synthesises one wrapper model per multi-param body (`Body_<operation>`)
 # in its own module. It is only a container the walk descends THROUGH when every

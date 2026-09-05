@@ -47,8 +47,9 @@ per-entry `except:` list, which wins over this auto carve-out.
 {{- end -}}
 {{- end -}}
 {{/*
-Validate one rustfs.egress / rustfs.stsEgress entry. These lists are store
-(and STS) endpoints, not the model allowlist: a default route or a CIDR that
+Validate one BYO endpoint egress entry (rustfs.egress, rustfs.stsEgress,
+otelCollector.egress, api.egress). Each of those lists names ONE external peer
+the runner must reach, not the model allowlist: a default route or a CIDR that
 reaches the cloud metadata address would additively re-open the prompt-injectable
 runner. Require cidr + ports, refuse prefix 0/1, and refuse any CIDR that
 contains 169.254.169.254 or fd00:ec2::254.
@@ -73,7 +74,7 @@ contains 169.254.169.254 or fd00:ec2::254.
 {{- end -}}
 {{- $prefix := int $prefixText -}}
 {{- if le $prefix 1 -}}
-{{- fail (printf "%s entry %q is a default or equivalently broad route; use a VPC interface endpoint /32 or a regional store/STS prefix, not a default route" $key $cidr) -}}
+{{- fail (printf "%s entry %q is a default or equivalently broad route; use a VPC interface endpoint /32 or the narrowest prefix that reaches this one endpoint, not a default route" $key $cidr) -}}
 {{- end -}}
 {{- $auto := include "curie.metadataExcept" $cidr | trim -}}
 {{- if or $auto (eq $ip "169.254.169.254") (hasPrefix "fd00:ec2:" $ip) -}}
@@ -139,6 +140,9 @@ spec:
         - { protocol: TCP, port: 53 }
 {{- end }}
 {{- if .Values.otelCollector.deploy }}
+{{- if .Values.otelCollector.egress }}
+{{- fail "otelCollector.egress is set while otelCollector.deploy is true, where the chart never reads it: it is only read on the BYO branch (otelCollector.deploy false). With the collector in-chart, runner egress to it is governed by the rendered runner-allow-collector policy's in-chart pod selector, so either clear otelCollector.egress or set otelCollector.deploy: false. If a CIDR for this endpoint already sits in security.networkPolicy.allowedEgress, move it to (or duplicate it into) otelCollector.egress when you flip deploy off: allowedEgress is the model/MCP allowlist, and rail 1 renders no runner peer for this endpoint without the dedicated key." }}
+{{- end }}
 ---
 {{/* Allow the runner to ship OTLP traces to THIS release's in-chart collector.
      Without this, the default-deny blocks span export and sandbox traces vanish
@@ -166,13 +170,54 @@ spec:
       ports:
         - { protocol: TCP, port: {{ .Values.otelCollector.service.grpcPort }} }
         - { protocol: TCP, port: {{ .Values.otelCollector.service.httpPort }} }
+{{- else }}
+{{- $otlpEndpoint := include "curie.otel.endpoint" . | trim }}
+{{- if $otlpEndpoint }}
+{{/* BYO collector (#2317). There is no in-chart collector pod to select, yet
+     curie.env.otel still hands the sandbox OTEL_EXPORTER_OTLP_ENDPOINT for an
+     external host, and NetworkPolicy cannot target that host (a DNS name). So
+     the operator must declare CIDRs. Empty keeps fail-closed: without this the
+     install is green, api/worker/dispatcher traces flow, and only the runner's
+     spans are silently dropped -- while every turn also pays the exporter's
+     flush stall. An empty resolved endpoint (telemetry off, or no endpoint at
+     all) requires nothing and renders no policy: there is nothing to reach. */}}
+{{- if not .Values.otelCollector.egress }}
+{{- fail "otelCollector.deploy is false with an OTLP endpoint set: set otelCollector.egress to the collector endpoint CIDRs the runner sandbox must reach. Rail 1 is fail-closed and the in-chart runner-allow-collector policy does not render without an in-cluster collector pod. NetworkPolicy cannot target a DNS name, so otelCollector.endpoint alone is not enough -- without this key every runner, agent.run, llm.generation and execute_tool span is silently dropped while every other workload's traces keep flowing. If a CIDR for this endpoint already sits in security.networkPolicy.allowedEgress, move it to (or duplicate it into) otelCollector.egress: allowedEgress is the model/MCP allowlist, and rail 1 renders no runner peer for this endpoint without the dedicated key." }}
+{{- end }}
+{{- range .Values.otelCollector.egress }}
+{{- include "curie.objectStore.egressEntry" (dict "key" "otelCollector.egress" "entry" .) }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-runner-allow-collector-endpoint
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    {{- include "curie.egress.ipBlockRules" .Values.otelCollector.egress | trim | nindent 4 }}
+{{- end }}
 {{- end }}
 {{- if .Values.api.deploy }}
+{{- if .Values.api.egress }}
+{{- fail "api.egress is set while api.deploy is true, where the chart never reads it: it is only read on the BYO branch (api.deploy false). With the API in-chart, runner egress to it is governed by the rendered runner-allow-api policy's in-chart pod selector, and an external destination reached while the in-chart API is still deployed stays governed by security.networkPolicy.allowedEgress -- so either clear api.egress or set api.deploy: false. If a CIDR for this endpoint already sits in allowedEgress, move it to (or duplicate it into) api.egress when you flip deploy off: allowedEgress is the model/MCP allowlist, and rail 1 renders no runner peer for this endpoint without the dedicated key." }}
+{{- end }}
 ---
 {{/* Allow the runner to reach THIS release's in chart API for memory and history calls;
      without this carve out, rail 1 default deny blocks those calls. TCP 8000 is the API
-     container port, not the configurable Service port. An external or overridden API
-     destination remains governed by the operator's allowedEgress list. */}}
+     container port, not the configurable Service port. Two different destinations,
+     two different mechanisms: `api.egress` in the BYO branch below covers the
+     `api.deploy: false` shape, where there is no in-chart api pod to select. It
+     is NOT read here -- with api.deploy true the chart renders this pod selector
+     even when dispatcher.apiBaseUrl points at an external host, and reaching that
+     external destination remains governed by the operator's
+     security.networkPolicy.allowedEgress list. */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -195,6 +240,45 @@ spec:
               {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 14 }}
       ports:
         - { protocol: TCP, port: 8000 }
+{{- else }}
+{{- $apiBaseUrl := trim (printf "%v" (.Values.dispatcher.apiBaseUrl | default "")) }}
+{{- if $apiBaseUrl }}
+{{/* BYO API (#2317). There is no in-chart api pod to select, and NetworkPolicy
+     cannot target dispatcher.apiBaseUrl (a DNS name), so the operator must
+     declare CIDRs. Empty keeps fail-closed: without this the install is green
+     and the failure is silent and agent-shaped -- every turn boots with no
+     prior memory and no thread transcript, `remember` writes never persist, the
+     auto-mounted curie-state MCP server cannot reach its store, and boot burns
+     timeout latency inside the worker's claim-bind window. The only trace is a
+     `memory load failed` warning inside the sandbox. Mirrors the BYO object
+     store branch below; mailAdapter.apiEgress.httpsCidrs is the same idea for
+     the mail adapter pod. Scoped to a set dispatcher.apiBaseUrl, mirroring the
+     collector branch above: api.deploy false with no base URL at all names no
+     API for the runner to reach -- that install already dead-ends loudly at
+     dispatcher boot (see curie.env.apiUrl), and the trimming overlays render on
+     it. */}}
+{{- if not .Values.api.egress }}
+{{- fail "api.deploy is false: set api.egress to the external API endpoint CIDRs the runner sandbox must reach for memory, history and state. Rail 1 is fail-closed and the in-chart runner-allow-api policy does not render without an in-cluster api pod. NetworkPolicy cannot target a DNS name, so dispatcher.apiBaseUrl alone is not enough -- without this key agents boot with no memory and no history, remember writes never persist, and the only symptom is a warning line inside the sandbox. If a CIDR for this endpoint already sits in security.networkPolicy.allowedEgress, move it to (or duplicate it into) api.egress: allowedEgress is the model/MCP allowlist, and rail 1 renders no runner peer for this endpoint without the dedicated key." }}
+{{- end }}
+{{- range .Values.api.egress }}
+{{- include "curie.objectStore.egressEntry" (dict "key" "api.egress" "entry" .) }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-runner-allow-api-endpoint
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    {{- include "curie.egress.ipBlockRules" .Values.api.egress | trim | nindent 4 }}
+{{- end }}
 {{- end }}
 {{- if or .Values.agentSandbox.runner.bundleFetch.enabled .Values.agentSandbox.runner.workspace.enabled }}
 {{- if .Values.rustfs.deploy }}
@@ -260,25 +344,7 @@ spec:
       {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
   policyTypes: [Egress]
   egress:
-    {{- range concat (.Values.rustfs.egress | default list) (.Values.rustfs.stsEgress | default list) }}
-    - to:
-        - ipBlock:
-            cidr: {{ .cidr }}
-            {{- if .except }}
-            except:
-              {{- toYaml .except | nindent 14 }}
-            {{- else }}
-            {{- $auto := include "curie.metadataExcept" .cidr | trim }}
-            {{- if $auto }}
-            except:
-              - {{ $auto }}
-            {{- end }}
-            {{- end }}
-      {{- with .ports }}
-      ports:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-    {{- end }}
+    {{- include "curie.egress.ipBlockRules" (concat (.Values.rustfs.egress | default list) (.Values.rustfs.stsEgress | default list)) | trim | nindent 4 }}
 {{- end }}
 {{- end }}
 {{- if .Values.inference.deploy }}
@@ -324,33 +390,7 @@ spec:
       {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
   policyTypes: [Egress]
   egress:
-    {{- range $np.allowedEgress }}
-    - to:
-        - ipBlock:
-            cidr: {{ .cidr }}
-            {{- /* NetworkPolicy allows are additive, so a broad allow (the
-                   realistic 0.0.0.0/0 model-API case, a /1 split, or ::/0) would
-                   re-permit the cloud metadata endpoint that rail 1 blocks. Carve
-                   it back out with `except`. An explicit per-entry `except:` list
-                   wins; otherwise curie.metadataExcept returns a same-family,
-                   subset-safe carve-out for ANY CIDR that contains the metadata
-                   address (not just exact /0), and "" for CIDRs that cannot reach
-                   it. See the helper for the containment/family rules. */}}
-            {{- if .except }}
-            except:
-              {{- toYaml .except | nindent 14 }}
-            {{- else }}
-            {{- $auto := include "curie.metadataExcept" .cidr | trim }}
-            {{- if $auto }}
-            except:
-              - {{ $auto }}
-            {{- end }}
-            {{- end }}
-      {{- with .ports }}
-      ports:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-    {{- end }}
+    {{- include "curie.egress.ipBlockRules" $np.allowedEgress | trim | nindent 4 }}
 {{- end }}
 {{- $connectorEgress := .Values.agentSandbox.connectorEgress | default dict }}
 {{- range $agent := keys $connectorEgress | sortAlpha }}
@@ -375,25 +415,7 @@ spec:
       curietech.ai/agent: {{ $agent | quote }}
   policyTypes: [Egress]
   egress:
-    {{- range $entries }}
-    - to:
-        - ipBlock:
-            cidr: {{ .cidr }}
-            {{- if .except }}
-            except:
-              {{- toYaml .except | nindent 14 }}
-            {{- else }}
-            {{- $auto := include "curie.metadataExcept" .cidr | trim }}
-            {{- if $auto }}
-            except:
-              - {{ $auto }}
-            {{- end }}
-            {{- end }}
-      {{- with .ports }}
-      ports:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-    {{- end }}
+    {{- include "curie.egress.ipBlockRules" $entries | trim | nindent 4 }}
 {{- end }}
 {{- end }}
 {{- if $np.lockIngress }}

@@ -437,10 +437,12 @@ assert_env k \
 assert_refused k runnerTotalTimeoutSeconds \
   --set worker.deploy=false \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set worker.runnerTotalTimeoutSeconds=0
 assert_refused k runnerTotalTimeoutSeconds \
   --set worker.deploy=false \
   --set api.deploy=false \
+  --set ui.deploy=false \
   --set-json worker.runnerTotalTimeoutSeconds=1800.1
 
 # Individually valid scalar values, relationally invalid together. Capture the

@@ -21,6 +21,48 @@ def test_valkey_dsn_honors_the_password_override() -> None:
     )
 
 
+def test_valkey_dsn_uses_rediss_scheme_when_tls_is_enabled() -> None:
+    # #2315: a BYO TLS-only Valkey/Redis needs rediss://, otherwise redis-py
+    # sends a cleartext connection to a store that never negotiates or
+    # downgrades. Verified on redis-py 8.1.0: redis.from_url("rediss://...")
+    # selects redis.connection.SSLConnection, redis://... selects Connection.
+    assert Settings(valkey_tls=True).valkey_dsn() == (
+        "rediss://:valkeypass@localhost:26379/0"
+    )
+    # Otherwise byte-identical to the plain scheme -- only the scheme changes.
+    assert Settings().valkey_dsn() == "redis://:valkeypass@localhost:26379/0"
+
+
+def test_valkey_url_still_wins_over_valkey_tls() -> None:
+    # The escape hatch stays outright authoritative even when the new signal
+    # is also set.
+    assert (
+        Settings(
+            valkey_tls=True, valkey_url="redis://:x@other:1/2"
+        ).valkey_dsn()
+        == "redis://:x@other:1/2"
+    )
+
+
+# --- VALKEY_TLS env -> Settings.valkey_tls (the seam the chart actually
+# drives; a field that only works via kwargs is not wired) ------------------
+
+
+def test_valkey_tls_env_reaches_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VALKEY_TLS", "true")
+    assert Settings().valkey_tls is True
+
+
+def test_valkey_tls_defaults_false_on_a_clean_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # VALKEY_TLS may be set in the ambient host/CI env; clear it explicitly so
+    # this default-value assertion cannot be flipped by something outside the
+    # test.
+    monkeypatch.delenv("VALKEY_TLS", raising=False)
+    assert Settings().valkey_tls is False
+
+
 def test_kill_key_matches_the_seam_contract() -> None:
     agent_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
     assert kill_key(agent_id) == "curie:kill:00000000-0000-0000-0000-000000000001"

@@ -19,6 +19,7 @@ from typing import Any, Literal, Union, get_args, get_origin
 from pydantic import BaseModel
 
 from .events import (
+    ADOPTION_CREDENTIAL_MAX_CHARS,
     ErrorEvent,
     Event,
     Final,
@@ -35,7 +36,13 @@ from .service_config import (
     STREAM_PAYLOAD_FIELD,
     WORKER_GROUP_DEFAULT,
 )
-from .session import BootEnv, Budget, OtelConfig, SessionConfig
+from .session import (
+    RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS,
+    BootEnv,
+    Budget,
+    OtelConfig,
+    SessionConfig,
+)
 from .turn import QueuedTurn, ReplyHandle, TurnSource
 from .version import PROTOCOL_VERSION, WIRE_VERSION_FIELD
 from .wire import ApprovalRequest, EvalJob, EvalReport, GateKind
@@ -180,6 +187,14 @@ def _struct_fields(model: type[BaseModel], skip: set[str], public: bool) -> list
             # not by type, so dropping the old Literal does not silently remove
             # the guard and let #[serde(default)] make version optional.
             out.append('    #[serde(deserialize_with = "require_compatible_protocol_version")]')
+        elif field_name == "adoption_credential":
+            out.append(
+                '    #[serde(default, deserialize_with = "deserialize_adoption_credential")]'
+            )
+        elif field_name == "runner_bootstrap_token":
+            out.append(
+                '    #[serde(default, deserialize_with = "deserialize_runner_bootstrap_token")]'
+            )
         elif field.is_required() and nullable:
             out.append('    #[serde(deserialize_with = "deserialize_required_nullable")]')
         elif not field.is_required():
@@ -190,13 +205,53 @@ def _struct_fields(model: type[BaseModel], skip: set[str], public: bool) -> list
     return out
 
 
-def _struct(model: type[BaseModel]) -> str:
+def _struct(model: type[BaseModel], redact: frozenset[str] = frozenset()) -> str:
     # No deny_unknown_fields: the reader path is deliberately tolerant of unknown
     # fields (strict producers, tolerant consumers). A Rust producer stays strict
     # by construction -- a struct cannot serialize a field it does not have -- so
     # dropping it only loosens the read path we mean to loosen.
-    lines = [_STRUCT_DERIVES, f"pub struct {model.__name__} {{"]
+    #
+    # ``redact`` names secret-bearing fields: the struct then gets a hand-rolled
+    # Debug (generated below, not written by hand) that prints ``<redacted>``
+    # in their place, so a ``{:?}`` of the boot env cannot echo a credential.
+    derives = _STRUCT_DERIVES.replace("Debug, ", "") if redact else _STRUCT_DERIVES
+    lines = [derives, f"pub struct {model.__name__} {{"]
     lines.extend(_struct_fields(model, skip=set(), public=True))
+    lines.append("}")
+    if redact:
+        unknown = redact - set(model.model_fields)
+        if unknown:
+            raise TypeError(f"{model.__name__} has no field(s) {sorted(unknown)} to redact")
+        lines.append("")
+        lines.append(_debug_impl(model, redact))
+    return "\n".join(lines)
+
+
+def _debug_impl(model: type[BaseModel], redact: frozenset[str]) -> str:
+    """A field-complete Debug impl that redacts the named fields.
+
+    Every field is listed (a derived Debug would print all of them), and the
+    redacted ones print ``<redacted>`` when set and ``None`` when unset, so a
+    debug line still says whether a credential was configured.
+    """
+
+    name = model.__name__
+    lines = [
+        f"impl std::fmt::Debug for {name} {{",
+        "    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {",
+        f'        f.debug_struct("{name}")',
+    ]
+    for field_name in model.model_fields:
+        rust_name = _rust_field(field_name)
+        if field_name in redact:
+            lines.append("            .field(")
+            lines.append(f'                "{field_name}",')
+            lines.append(f'                &self.{rust_name}.as_ref().map(|_| "<redacted>"),')
+            lines.append("            )")
+        else:
+            lines.append(f'            .field("{field_name}", &self.{rust_name})')
+    lines.append("            .finish()")
+    lines.append("    }")
     lines.append("}")
     return "\n".join(lines)
 
@@ -225,8 +280,13 @@ def _env_keys_module() -> str:
 
 
 def _tagged_enum(name: str, tag: str, variants: tuple[type[BaseModel], ...]) -> str:
+    derives = (
+        "#[derive(Clone, PartialEq, Serialize, Deserialize)]"
+        if name == "InboundMessage"
+        else _ENUM_DERIVES
+    )
     lines = [
-        _ENUM_DERIVES,
+        derives,
         f'#[serde(tag = "{tag}")]',
         f"pub enum {name} {{",
     ]
@@ -238,6 +298,9 @@ def _tagged_enum(name: str, tag: str, variants: tuple[type[BaseModel], ...]) -> 
             lines.append(f"    {field_line}")
         lines.append("    },")
     lines.append("}")
+    if name == "InboundMessage":
+        lines.append("")
+        lines.append(_INBOUND_DEBUG_IMPL.rstrip("\n"))
     return "\n".join(lines)
 
 
@@ -296,6 +359,93 @@ where
 }"""
 
 
+# One admission rule for every credential-bearing field, mirroring the Python
+# ``admit_bounded_credential``: absent/null is None; a present value must be a
+# non-blank string within the cap, and the error names the field, never the
+# value. Decoded as a ``serde_json::Value`` first so a non-string (a number, a
+# bool, an array) also lands in the fixed-message arm: serde's own type error
+# for ``Option<String>`` would echo a scalar ("invalid type: integer `4711`").
+# The caps are interpolated from the Python constants so the two lanes cannot
+# drift on the bound.
+_BOUNDED_CREDENTIAL_DESERIALIZER = """fn deserialize_bounded_credential<'de, D>(
+    deserializer: D,
+    what: &'static str,
+    max_chars: usize,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s))
+            if !s.trim().is_empty() && s.chars().count() <= max_chars =>
+        {
+            Ok(Some(s))
+        }
+        Some(_) => Err(serde::de::Error::custom(format!("malformed {what}"))),
+    }
+}"""
+
+_ADOPTION_CREDENTIAL_DESERIALIZER = f"""fn deserialize_adoption_credential<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{{
+    deserialize_bounded_credential(
+        deserializer,
+        "adoption credential",
+        {ADOPTION_CREDENTIAL_MAX_CHARS},
+    )
+}}"""
+
+_RUNNER_BOOTSTRAP_TOKEN_DESERIALIZER = f"""fn deserialize_runner_bootstrap_token<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{{
+    deserialize_bounded_credential(
+        deserializer,
+        "runner bootstrap token",
+        {RUNNER_BOOTSTRAP_TOKEN_MAX_CHARS},
+    )
+}}"""
+
+
+_INBOUND_DEBUG_IMPL = """impl std::fmt::Debug for InboundMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Event {
+                r#type,
+                text,
+                user,
+                ts,
+                session_id,
+                history_ref,
+                adoption_credential,
+            } => f
+                .debug_struct("Event")
+                .field("type", r#type)
+                .field("text", text)
+                .field("user", user)
+                .field("ts", ts)
+                .field("session_id", session_id)
+                .field("history_ref", history_ref)
+                .field(
+                    "adoption_credential",
+                    &adoption_credential.as_ref().map(|_| "<redacted>"),
+                )
+                .finish(),
+            Self::Interrupt { reason } => {
+                f.debug_struct("Interrupt").field("reason", reason).finish()
+            }
+        }
+    }
+}"""
+
+
 _TESTS = """#[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +462,7 @@ mod tests {
             approval_granted_tool: None,
             input_tokens: None,
             output_tokens: None,
+            adoption_applied: None,
         };
         let encoded = serde_json::to_string(&event).unwrap();
         let decoded: OutboundEvent = serde_json::from_str(&encoded).unwrap();
@@ -330,6 +481,7 @@ mod tests {
             approval_granted_tool: None,
             input_tokens: None,
             output_tokens: None,
+            adoption_applied: None,
         };
         let encoded = serde_json::to_string(&event).unwrap();
         let decoded: OutboundEvent = serde_json::from_str(&encoded).unwrap();
@@ -345,10 +497,127 @@ mod tests {
             ts: "1.0".to_string(),
             session_id: None,
             history_ref: None,
+            adoption_credential: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn inbound_event_debug_redacts_adoption_credential() {
+        let message = InboundMessage::Event {
+            r#type: EventType::Message,
+            text: "hello".to_string(),
+            user: "U1".to_string(),
+            ts: "1.0".to_string(),
+            session_id: None,
+            history_ref: None,
+            adoption_credential: Some("adoption-credential-fixture-PLACEHOLDER".to_string()),
+        };
+        let rendered = format!("{message:?}");
+        assert!(!rendered.contains("adoption-credential-fixture-PLACEHOLDER"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn inbound_event_rejects_empty_adoption_credential() {
+        let raw = concat!(
+            r#"{"kind":"event","type":"message","text":"hi","user":"U1","ts":"1.0","#,
+            r#""adoption_credential":""}"#
+        );
+        let error = serde_json::from_str::<InboundMessage>(raw).unwrap_err();
+        assert!(error.to_string().contains("malformed adoption credential"));
+        assert!(!error.to_string().contains("adoption-credential-fixture-PLACEHOLDER"));
+    }
+
+    const BOOT_ENV_MINIMAL: &str = concat!(
+        r#"{"session":{"plugin_dir":"/plugins/bundle","session_id":"sess-abc","#,
+        r#""sandbox_id":"curie-sandbox-abc123","#,
+        r#""budget":{"max_output_tokens_per_run":4096,"max_usd_per_day":5.0}}"#
+    );
+
+    #[test]
+    fn boot_env_omitted_bootstrap_token_is_none() {
+        let raw = format!("{BOOT_ENV_MINIMAL}}}");
+        let decoded: BootEnv = serde_json::from_str(&raw).unwrap();
+        assert_eq!(decoded.runner_bootstrap_token, None);
+        assert_eq!(decoded.runner_token, None);
+    }
+
+    #[test]
+    fn boot_env_bootstrap_token_roundtrips() {
+        let boot = BootEnv {
+            runner_bootstrap_token: Some("runner-bootstrap-token-fixture-PLACEHOLDER".to_string()),
+            ..BootEnv::default()
+        };
+        let encoded = serde_json::to_string(&boot).unwrap();
+        let decoded: BootEnv = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(boot, decoded);
+    }
+
+    #[test]
+    fn boot_env_debug_redacts_bootstrap_token() {
+        let boot = BootEnv {
+            runner_bootstrap_token: Some("runner-bootstrap-token-fixture-PLACEHOLDER".to_string()),
+            ..BootEnv::default()
+        };
+        let rendered = format!("{boot:?}");
+        assert!(!rendered.contains("runner-bootstrap-token-fixture-PLACEHOLDER"));
+        assert!(rendered.contains("runner_bootstrap_token: Some(\\"<redacted>\\")"));
+        let unset = format!("{:?}", BootEnv::default());
+        assert!(unset.contains("runner_bootstrap_token: None"));
+    }
+
+    #[test]
+    fn boot_env_rejects_blank_bootstrap_token() {
+        let raw = format!("{BOOT_ENV_MINIMAL},\\"runner_bootstrap_token\\":\\"   \\"}}");
+        let error = serde_json::from_str::<BootEnv>(&raw).unwrap_err();
+        assert!(error.to_string().contains("malformed runner bootstrap token"));
+    }
+
+    #[test]
+    fn boot_env_rejects_non_string_bootstrap_token_without_echo() {
+        let specimens = [
+            "4711",
+            "true",
+            r#"["runner-bootstrap-token-fixture-PLACEHOLDER"]"#,
+            r#"{"v":"runner-bootstrap-token-fixture-PLACEHOLDER"}"#,
+        ];
+        for specimen in specimens {
+            let raw = format!("{BOOT_ENV_MINIMAL},\\"runner_bootstrap_token\\":{specimen}}}");
+            let rendered = serde_json::from_str::<BootEnv>(&raw).unwrap_err().to_string();
+            assert!(rendered.contains("malformed runner bootstrap token"), "{rendered}");
+            assert!(!rendered.contains("4711"), "{rendered}");
+            assert!(!rendered.contains("runner-bootstrap-token-fixture-PLACEHOLDER"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn boot_env_explicit_null_bootstrap_token_is_none() {
+        let raw = format!("{BOOT_ENV_MINIMAL},\\"runner_bootstrap_token\\":null}}");
+        let decoded: BootEnv = serde_json::from_str(&raw).unwrap();
+        assert_eq!(decoded.runner_bootstrap_token, None);
+    }
+
+    #[test]
+    fn inbound_event_rejects_non_string_adoption_credential_without_echo() {
+        let raw = concat!(
+            r#"{"kind":"event","type":"message","text":"hi","user":"U1","ts":"1.0","#,
+            r#""adoption_credential":4711}"#
+        );
+        let rendered = serde_json::from_str::<InboundMessage>(raw).unwrap_err().to_string();
+        assert!(rendered.contains("malformed adoption credential"), "{rendered}");
+        assert!(!rendered.contains("4711"), "{rendered}");
+    }
+
+    #[test]
+    fn boot_env_rejects_oversize_bootstrap_token_without_echo() {
+        let material = format!("runner-bootstrap-token-fixture-PLACEHOLDER{}", "x".repeat(4096));
+        let raw = format!("{BOOT_ENV_MINIMAL},\\"runner_bootstrap_token\\":\\"{material}\\"}}");
+        let error = serde_json::from_str::<BootEnv>(&raw).unwrap_err();
+        assert!(error.to_string().contains("malformed runner bootstrap token"));
+        assert!(!error.to_string().contains("runner-bootstrap-token-fixture-PLACEHOLDER"));
     }
 
     #[test]
@@ -445,6 +714,9 @@ def render_rust() -> str:
         f'pub const STREAM_PAYLOAD_FIELD: &str = "{STREAM_PAYLOAD_FIELD}";',
         _VERSION_GUARD,
         _REQUIRED_NULLABLE_DESERIALIZER,
+        _BOUNDED_CREDENTIAL_DESERIALIZER,
+        _ADOPTION_CREDENTIAL_DESERIALIZER,
+        _RUNNER_BOOTSTRAP_TOKEN_DESERIALIZER,
         _string_enum(
             "SessionStatus",
             tuple(m.value for m in SessionStatus),
@@ -466,7 +738,7 @@ def render_rust() -> str:
         _struct(Budget),
         _struct(OtelConfig),
         _struct(SessionConfig),
-        _struct(BootEnv),
+        _struct(BootEnv, redact=frozenset({"runner_bootstrap_token"})),
         _env_keys_module(),
         _struct(ReplyHandle),
         _struct(QueuedTurn),

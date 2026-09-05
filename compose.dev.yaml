@@ -28,10 +28,16 @@
 #   OTel Collector .... localhost:24317 (gRPC) / localhost:24318 (HTTP)
 #   Collector metrics . http://localhost:28888/metrics
 #
-# ClickHouse is pinned to :24.8 on purpose. Newer ClickHouse requires AVX and
-# SIGILLs with exit 132 on CPUs without it; :24.8 still ships an SSE4.2 build.
-# The Helm chart default is :25.12 (AVX required) so it can apply the Langfuse
-# pin's ClickHouse migrations; do not treat the two pins as the same knob.
+# ClickHouse is pinned to :24.8.14.39 on purpose. Newer ClickHouse requires AVX
+# and SIGILLs with exit 132 on CPUs without it; the 24.8 line still ships an
+# SSE4.2 build. The Helm chart default is :25.12.11.4 (AVX required) so it can
+# apply the Langfuse pin's ClickHouse migrations; do not treat the two pins as
+# the same knob. Both sides are pinned to a patch build rather than a
+# major.minor alias so the bytes cannot move under a release (#2319).
+#
+# Postgres and Valkey carry no such split: their images here must EQUAL
+# charts/curie/values.yaml `postgres.image` and `valkey.image` exactly, which
+# compose/tests/test_generate_release_compose.py asserts.
 
 # Pin the Compose project name so `local up`/`down` target the same project
 # regardless of where this file sits (repo checkout or fetched cache dir).
@@ -74,7 +80,10 @@ x-full-profiles: &full_profiles [full]
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # Must equal charts/curie/values.yaml `postgres.image` (compose/tests).
+    # Digest-pinned because PostgreSQL's full version is two components, which
+    # a tag alone cannot pin under the chart's gate rule (#2319).
+    image: postgres:16.15-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     profiles: *core_profiles
     environment:
       POSTGRES_USER: postgres
@@ -91,7 +100,8 @@ services:
       retries: 10
 
   valkey:
-    image: valkey/valkey:8-alpine
+    # Must equal charts/curie/values.yaml `valkey.image` (compose/tests).
+    image: valkey/valkey:8.1.10-alpine
     profiles: *core_profiles
     command: ["valkey-server", "--requirepass", "${VALKEY_PASSWORD:-valkeypass}"]
     environment:
@@ -107,9 +117,10 @@ services:
       retries: 10
 
   clickhouse:
-    # Pinned to 24.8: newer ClickHouse needs AVX and crashes (exit 132) on CPUs
-    # without AVX. See the header comment.
-    image: clickhouse/clickhouse-server:24.8
+    # Pinned to 24.8.14.39: newer ClickHouse needs AVX and crashes (exit 132)
+    # on CPUs without AVX, and the 24.8 alias would drift. Deliberately the
+    # SSE4.2-safe line while the chart default is 25.12.11.4. See the header.
+    image: clickhouse/clickhouse-server:24.8.14.39
     profiles: *full_profiles
     environment:
       CLICKHOUSE_PASSWORD: clickhouse

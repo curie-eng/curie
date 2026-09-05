@@ -10,9 +10,45 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 
 #[allow(unused_imports)]
-use super::{command::*, providers::*, verbs::*};
+use super::{command::*, convergence, providers::*, verbs::*};
+
+/// Typed retained values use the same protected file lifecycle as credentials.
+/// Debug and command rendering expose field names only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrivateHelmValues(pub(super) serde_json::Value, BTreeMap<String, String>);
+
+impl PrivateHelmValues {
+    pub(super) fn keys(&self) -> Vec<String> {
+        [
+            "mailAdapter",
+            "worker.adapterCredentials",
+            "worker.adapterCredentialsExistingSecret",
+            "worker.adapterCredentialsExistingSecretKey",
+        ]
+        .into_iter()
+        .filter(|key| {
+            self.0
+                .pointer(&format!("/{}", key.replace('.', "/")))
+                .is_some()
+        })
+        .map(str::to_string)
+        .collect()
+    }
+}
+
+impl std::fmt::Debug for PrivateHelmValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivateHelmValues")
+            .field("keys", &self.keys())
+            .finish()
+    }
+}
 
 pub struct UpOpts {
+    /// Existing mail lifecycle and paired worker credentials, with explicit
+    /// operator overrides removed. Populated by the one release-values read.
+    pub retained_mail_values: Option<PrivateHelmValues>,
+
     pub common: CommonOpts,
     pub chart: String,
     pub no_expose: bool,
@@ -493,6 +529,159 @@ fn resolve_sealing_values(
     resolved
 }
 
+/// Preserve the installed mail surface as typed values: booleans, arrays and
+/// credential maps must not become strings when delivered through Helm -f.
+/// This family includes the paired worker credential source, because preserving
+/// only the adapter side can leave the channel unable to receive replies.
+fn resolve_retained_mail_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Result<Option<PrivateHelmValues>> {
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let mut retained = serde_json::json!({});
+    if let Some(mail) = existing.get("mailAdapter") {
+        retained["mailAdapter"] = mail.clone();
+    }
+    for key in [
+        "adapterCredentials",
+        "adapterCredentialsExistingSecret",
+        "adapterCredentialsExistingSecretKey",
+    ] {
+        if let Some(value) = existing.get("worker").and_then(|worker| worker.get(key)) {
+            retained["worker"][key] = value.clone();
+        }
+    }
+    let overridden = operator_set_keys(operator_sets);
+    let operator_values: BTreeMap<_, _> = operator_set_entries(operator_sets)
+        .into_iter()
+        .map(|(key, value)| (key.trim(), value))
+        .collect();
+    let replaces_inline = |inline: &str| {
+        operator_values.iter().any(|(key, value)| {
+            key_is_or_descends_from(key, inline)
+                && !value.is_empty()
+                && !(*key == inline
+                    && inline == "worker.adapterCredentials"
+                    && serde_json::from_str::<serde_json::Value>(value)
+                        .is_ok_and(|value| value.as_object().is_some_and(|map| map.is_empty())))
+        })
+    };
+    // An externally managed worker map is opaque: changing only the adapter's
+    // source cannot safely derive or replace its paired worker credential.
+    // Require an explicit paired decision instead of creating a silent 401.
+    let changes_adapter_source = replaces_inline("mailAdapter.egressSecret")
+        || operator_values
+            .get("mailAdapter.egressSecretExistingSecret")
+            .is_some_and(|value| {
+                Some(*value)
+                    != lookup_dotted(existing, "mailAdapter.egressSecretExistingSecret").as_deref()
+            })
+        || (lookup_dotted(existing, "mailAdapter.egressSecretExistingSecret")
+            .is_some_and(|value| !value.is_empty())
+            && operator_values
+                .get("mailAdapter.egressSecretExistingSecretKey")
+                .is_some_and(|value| {
+                    *value
+                        != lookup_dotted(existing, "mailAdapter.egressSecretExistingSecretKey")
+                            .as_deref()
+                            .unwrap_or("mailEgressSecret")
+                }));
+    let changes_worker_source = replaces_inline("worker.adapterCredentials")
+        || overridden.contains("worker.adapterCredentialsExistingSecret")
+        || overridden.contains("worker.adapterCredentialsExistingSecretKey");
+    if changes_adapter_source
+        && !changes_worker_source
+        && lookup_dotted(existing, "worker.adapterCredentialsExistingSecret")
+            .is_some_and(|value| !value.is_empty())
+    {
+        bail!(
+            "changing the mail egress credential source requires an explicit paired worker \
+             source decision: also set worker.adapterCredentialsExistingSecret (clear it \
+             to use the chart-derived inline pair), its ExistingSecretKey, or supply \
+             worker.adapterCredentials"
+        );
+    }
+    let mut cleared = BTreeMap::new();
+    for inline in [
+        "mailAdapter.agentmail.apiKey",
+        "mailAdapter.channelToken",
+        "mailAdapter.egressSecret",
+        "worker.adapterCredentials",
+    ] {
+        let reference = format!("{inline}ExistingSecret");
+        // A nonempty inline value replaces the external source. An empty inline
+        // clear leaves that source active; its explicit reference clear remains
+        // the operator's way to remove it. Active sources never replay stale
+        // inline copies left in Helm before token rotation.
+        let remove = if replaces_inline(inline) {
+            vec![reference.clone()]
+        } else if overridden.contains(&reference)
+            || lookup_dotted(&retained, &reference).is_some_and(|value| !value.is_empty())
+        {
+            vec![inline.to_string()]
+        } else {
+            vec![]
+        };
+        for path in remove {
+            let (parent, leaf) = path.rsplit_once('.').expect("credential path");
+            let pointer = format!("/{}", parent.replace('.', "/"));
+            if let Some(object) = retained
+                .pointer_mut(&pointer)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                if let Some(removed) = object.remove(leaf) {
+                    let mut removed_leaves = BTreeMap::new();
+                    crate::installation::flatten_values(&removed, &path, &mut removed_leaves);
+                    cleared.extend(removed_leaves.into_keys().map(|key| (key, String::new())));
+                }
+            }
+        }
+    }
+    fn without_overrides(
+        value: &serde_json::Value,
+        path: &str,
+        overridden: &std::collections::HashSet<String>,
+    ) -> Option<serde_json::Value> {
+        if overridden
+            .iter()
+            .any(|key| key_is_or_descends_from(path, key))
+        {
+            return None;
+        }
+        match value {
+            serde_json::Value::Object(object) => {
+                let remaining: serde_json::Map<String, serde_json::Value> = object
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        let child = if path.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{path}.{key}")
+                        };
+                        without_overrides(value, &child, overridden)
+                            .map(|value| (key.clone(), value))
+                    })
+                    .collect();
+                (!remaining.is_empty() || object.is_empty())
+                    .then_some(serde_json::Value::Object(remaining))
+            }
+            serde_json::Value::Array(_)
+                if overridden
+                    .iter()
+                    .any(|key| key_is_or_descends_from(key, path)) =>
+            {
+                None
+            }
+            _ => Some(value.clone()),
+        }
+    }
+    Ok(without_overrides(&retained, "", &overridden)
+        .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+        .map(|document| PrivateHelmValues(document, cleared)))
+}
+
 /// Every value a plain `cluster up` must carry forward, in one place.
 ///
 /// `up` does a FULL upgrade and drops anything it does not re-pass, so each
@@ -968,6 +1157,13 @@ fn reindex_inferred_provider_egress(
     }
 }
 
+fn is_retained_mail_key(key: &str) -> bool {
+    key_is_or_descends_from(key, "mailAdapter")
+        || key_is_or_descends_from(key, "worker.adapterCredentials")
+        || key == "worker.adapterCredentialsExistingSecret"
+        || key == "worker.adapterCredentialsExistingSecretKey"
+}
+
 /// Does a plain `cluster up` carry this key forward when nothing re-passes it?
 ///
 /// The honest half of `curie diff`. `up` does a FULL upgrade, so a key present
@@ -993,7 +1189,8 @@ fn reindex_inferred_provider_egress(
 /// says it carries names and never secrets. `sealing_test` below asserts the
 /// two lists agree by construction rather than by a hand-kept fixture.
 pub fn is_preserved_by_up(key: &str) -> bool {
-    COMMS_MANAGED_KEYS.contains(&key)
+    is_retained_mail_key(key)
+        || COMMS_MANAGED_KEYS.contains(&key)
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
@@ -1546,6 +1743,20 @@ pub async fn fetch_release_values(o: &CommonOpts) -> Result<Option<serde_json::V
     fetch_existing_values(o).await
 }
 
+/// Transactional upgrade keeps every read on its captured Kubernetes target.
+/// Parsing and absent-release semantics stay shared with ordinary installation.
+pub(super) async fn fetch_release_values_with_environment(
+    o: &CommonOpts,
+    environment: Vec<(String, String)>,
+) -> Result<Option<serde_json::Value>> {
+    fetch_helm_values(
+        o,
+        helm_get_values_cmd(o).with_env(environment),
+        "Helm values",
+    )
+    .await
+}
+
 /// The **computed** values of an existing release: the chart's own defaults
 /// merged with whatever the operator overrode.
 ///
@@ -1612,6 +1823,10 @@ fn complete_up_opts_without_runner_egress(
     overlay_live: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
+    // This resolver independently strips stale inline mail credentials. Read
+    // their original leaves before generic migration sanitizes them, so diff
+    // still reports those removals instead of calling them preserved.
+    opts.retained_mail_values = resolve_retained_mail_values(existing, &operator_sets)?;
     let migrated_owned;
     let existing = if let Some(values) = existing {
         let outcome = crate::config_migrate::migrate_installed_config(values.clone(), None)?;
@@ -1756,6 +1971,10 @@ fn overlay_secret_refs(
         } else {
             format!("{prefix}.{key}")
         };
+        // Retained mail values already own typed preservation and source changes.
+        if is_retained_mail_key(&path) {
+            continue;
+        }
         if is_external_secret_ref_key(&path) && !overridden.contains(&path) {
             match child {
                 serde_json::Value::String(raw) if raw.is_empty() => {}
@@ -1833,6 +2052,9 @@ fn overlay_json(
                     key_is_or_descends_from(prefix, key) || key_is_or_descends_from(key, prefix)
                 })
             {
+                return;
+            }
+            if is_retained_mail_key(prefix) {
                 return;
             }
             if overlay_family_is_managed(prefix) && !is_external_secret_ref_key(prefix) {
@@ -2044,6 +2266,7 @@ enum DiffParticipation {
 
 #[derive(Clone, PartialEq, Eq)]
 enum PlannedHelmValues {
+    RetainedMail(PrivateHelmValues),
     Set {
         flag: HelmSetFlag,
         expression: String,
@@ -2059,6 +2282,16 @@ enum PlannedHelmValues {
 enum HelmSetFlag {
     Set,
     SetString,
+    SetJson,
+}
+
+fn typed_empty_worker_map_override(expression: &str) -> Option<String> {
+    let (key, value) = expression.split_once('=')?;
+    (key.trim() == "worker.adapterCredentials"
+        && (value.is_empty()
+            || serde_json::from_str::<serde_json::Value>(value)
+                .is_ok_and(|value| value.as_object().is_some_and(|map| map.is_empty()))))
+    .then(|| "worker.adapterCredentials={}".to_string())
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -2082,9 +2315,14 @@ impl UpValuePlan {
             .into_iter()
             .map(|(key, value)| (key.trim().to_string(), value.to_string()))
             .collect();
+        let typed = typed_empty_worker_map_override(&expression);
         self.entries.push(PlannedHelmValues::Set {
-            flag: HelmSetFlag::Set,
-            expression,
+            flag: if typed.is_some() {
+                HelmSetFlag::SetJson
+            } else {
+                HelmSetFlag::Set
+            },
+            expression: typed.unwrap_or(expression),
             effective,
         });
     }
@@ -2101,9 +2339,14 @@ impl UpValuePlan {
                 .map(|(key, value)| (key.trim().to_string(), value.to_string()))
                 .collect()
         };
+        let typed = typed_empty_worker_map_override(&expression);
         self.entries.push(PlannedHelmValues::Set {
-            flag: HelmSetFlag::SetString,
-            expression,
+            flag: if typed.is_some() {
+                HelmSetFlag::SetJson
+            } else {
+                HelmSetFlag::SetString
+            },
+            expression: typed.unwrap_or(expression),
             effective,
         });
     }
@@ -2118,12 +2361,16 @@ impl UpValuePlan {
     fn append_command_args(&self, args: &mut Vec<CmdArg>) {
         for entry in &self.entries {
             match entry {
+                PlannedHelmValues::RetainedMail(values) => {
+                    args.push(CmdArg::PrivateJsonValuesFile(values.clone()));
+                }
                 PlannedHelmValues::Set {
                     flag, expression, ..
                 } => {
                     args.push(plain(match flag {
                         HelmSetFlag::Set => "--set",
                         HelmSetFlag::SetString => "--set-string",
+                        HelmSetFlag::SetJson => "--set-json",
                     }));
                     args.push(CmdArg::HelmSetExpression(expression.clone()));
                 }
@@ -2138,6 +2385,14 @@ impl UpValuePlan {
         let mut values = BTreeMap::new();
         for entry in &self.entries {
             match entry {
+                PlannedHelmValues::RetainedMail(retained) => {
+                    values.extend(
+                        retained
+                            .1
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone())),
+                    );
+                }
                 PlannedHelmValues::Set { effective, .. } => {
                     values.extend(effective.iter().cloned());
                 }
@@ -2212,6 +2467,10 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
         );
     }
     plan.secret_file(o.secrets.clone(), DiffParticipation::Preserve);
+    if let Some(values) = &o.retained_mail_values {
+        plan.entries
+            .push(PlannedHelmValues::RetainedMail(values.clone()));
+    }
     if let Some(model) = &o.model {
         if explicit_runner_model(&o.operator_sets()).is_none() {
             plan.set(RUNNER_MODEL_KEY, model);
@@ -3619,6 +3878,12 @@ async fn run_prepared_up(
         inference.render(ui);
     }
     let operator_sets = opts.operator_sets();
+    if let Some(values) = &opts.retained_mail_values {
+        ui.note(&format!(
+            "preserving {} mail value(s) recorded by the release",
+            values.keys().len()
+        ));
+    }
     let preserved = resolve_preserved_values(existing.as_ref(), &operator_sets);
     if !preserved.is_empty() {
         let sealing_values = preserved
@@ -3847,9 +4112,15 @@ async fn run_prepared_up(
         ));
     }
     if opts.common.dry_run {
-        return Ok(ClusterUpOutput::DryRun(crate::ui::DryRunPlan {
-            lines: cmds.iter().map(|cmd| cmd.display()).collect(),
-        }));
+        let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        lines.push("# After Helm and ownership stamping, verify convergence for at most 300 seconds; repeat observations every 2 seconds while rollout is pending.".to_owned());
+        lines.push(convergence::DRY_RUN_NOTE.to_owned());
+        lines.extend(
+            convergence::dry_run_commands(&opts.common)
+                .iter()
+                .map(OpsCommand::display),
+        );
+        return Ok(ClusterUpOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
     let release_namespace_existed_before_install = ownership_candidates
         .iter()
@@ -3873,7 +4144,7 @@ async fn run_prepared_up(
     let label = format!("installing release {}", opts.common.release);
     for cmd in &cmds {
         if let Some(job) = gvisor_preflight_job.as_deref() {
-            let outcome = run_install_with_gvisor_observer(
+            let outcome = match run_install_with_gvisor_observer(
                 &cl,
                 &label,
                 "installed",
@@ -3882,7 +4153,13 @@ async fn run_prepared_up(
                 job,
                 release_namespace_existed_before_install,
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return Err(convergence::installation_failure(&opts.common, error).await)
+                }
+            };
             match outcome {
                 GvisorInstallOutcome::Installed => {}
                 GvisorInstallOutcome::RuntimeClassRejected { rejection, step } if detect_facts => {
@@ -3907,7 +4184,9 @@ async fn run_prepared_up(
                         .into_iter()
                         .next()
                         .expect("cluster up always has one Helm command");
-                    run_step(&cl, &label, "installed", &retry).await?;
+                    if let Err(error) = run_step(&cl, &label, "installed", &retry).await {
+                        return Err(convergence::installation_failure(&opts.common, error).await);
+                    }
                 }
                 GvisorInstallOutcome::RuntimeClassRejected { rejection, step } => {
                     step.fail("failed");
@@ -3920,7 +4199,9 @@ async fn run_prepared_up(
                 }
             }
         } else {
-            run_step(&cl, &label, "installed", cmd).await?;
+            if let Err(error) = run_step(&cl, &label, "installed", cmd).await {
+                return Err(convergence::installation_failure(&opts.common, error).await);
+            }
         }
     }
 
@@ -3947,6 +4228,12 @@ async fn run_prepared_up(
         }
     }
 
+    let step = cl.step("waiting for exact target workload convergence");
+    if let Err(error) = convergence::wait(&opts.common).await {
+        step.fail("not converged");
+        return Err(error);
+    }
+    step.done("converged");
     Ok(ClusterUpOutput::Up {
         namespace: opts.common.namespace.clone(),
         release: opts.common.release.clone(),
@@ -3959,9 +4246,205 @@ mod tests {
 
     use crate::ops::testsupport::*;
 
+    fn mail_upgrade_opts(existing: &serde_json::Value, set: Vec<String>) -> UpOpts {
+        complete_up_opts_without_runner_egress(
+            UpOpts {
+                retained_mail_values: None,
+                common: common(),
+                chart: "charts/curie".into(),
+                no_expose: true,
+                set,
+                set_string: vec![],
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+                secrets: vec![],
+                github_token: GithubTokenPlan::Untouched,
+                dev: true,
+            },
+            Some(existing),
+            None,
+            false,
+            true,
+        )
+        .unwrap()
+    }
+
+    fn retained_mail_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "mailAdapter": {
+                "deploy": true,
+                "inbox": "mail@example.com",
+                "allowedSenders": ["operator@example.com"],
+                "pollIntervalSeconds": 37,
+                "persistence": {"existingClaim": "acme-mail-state"},
+                "agentmail": {
+                    "apiKeyExistingSecret": "acme-mail-credentials",
+                    "apiKeyExistingSecretKey": "provider-key",
+                    "httpsCidrs": ["203.0.113.8/32"]
+                },
+                "channelTokenExistingSecret": "acme-mail-credentials",
+                "channelTokenExistingSecretKey": "channel-key",
+                "egressSecretExistingSecret": "acme-mail-credentials",
+                "egressSecretExistingSecretKey": "egress-key"
+            },
+            "worker": {
+                "adapterCredentialsExistingSecret": "acme-mail-credentials",
+                "adapterCredentialsExistingSecretKey": "worker-map"
+            }
+        })
+    }
+
+    fn materialized_mail_values(opts: &UpOpts) -> serde_json::Value {
+        let commands = up_commands(opts);
+        let command = &commands[0];
+        let (materialized, _guards) = command.materialize_secret_files().unwrap();
+        let argv = materialized.argv();
+        for pair in argv.windows(2).filter(|pair| pair[0] == "-f") {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&pair[1]).unwrap()).unwrap();
+            if value.get("mailAdapter").is_some() {
+                return value;
+            }
+        }
+        panic!("plain cluster up dropped the installed mail values");
+    }
+
+    #[test]
+    fn plain_up_preserves_mail_lifecycle_and_external_secret_pairs() {
+        let existing = retained_mail_fixture();
+        let opts = mail_upgrade_opts(&existing, vec![]);
+        let actual = materialized_mail_values(&opts);
+        assert_eq!(
+            actual, existing,
+            "mail and worker credential state must survive unchanged"
+        );
+        let mut leaves = BTreeMap::new();
+        crate::installation::flatten_values(&actual, "", &mut leaves);
+        for key in leaves.keys() {
+            assert!(is_preserved_by_up(key), "diff disagrees with up for {key}");
+        }
+        let shown = up_commands(&opts)[0].display();
+        for private in ["mail@example.com", "acme-mail-credentials", "provider-key"] {
+            assert!(
+                !shown.contains(private),
+                "private retained mail values leaked"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_mail_command_and_debug_hide_dynamic_keys_and_inline_secrets() {
+        let mut existing = retained_mail_fixture();
+        existing["worker"]["adapterCredentials"] = serde_json::json!({
+            "private-adapter-identity": "private-inline-credential"
+        });
+        existing["worker"]
+            .as_object_mut()
+            .unwrap()
+            .remove("adapterCredentialsExistingSecret");
+        existing["worker"]
+            .as_object_mut()
+            .unwrap()
+            .remove("adapterCredentialsExistingSecretKey");
+        existing["mailAdapter"]["podAnnotations"] = serde_json::json!({
+            "private.example.com/identity": "private-annotation-value"
+        });
+        let opts = mail_upgrade_opts(&existing, vec![]);
+        let command = &up_commands(&opts)[0];
+        let display = command.display();
+        let debug = format!("{command:?}");
+        let (materialized, _guards) = command.materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        for private in [
+            "private-adapter-identity",
+            "private-inline-credential",
+            "private.example.com/identity",
+            "private-annotation-value",
+        ] {
+            for surface in [&display, &debug, &argv] {
+                assert!(!surface.contains(private), "retained mail metadata leaked");
+            }
+        }
+        assert_eq!(materialized_mail_values(&opts), existing);
+    }
+
+    #[test]
+    fn plain_mail_upgrade_never_replays_inline_copies_behind_external_sources() {
+        let expected = retained_mail_fixture();
+        let mut existing = expected.clone();
+        existing["mailAdapter"]["channelToken"] = "stale-channel-token".into();
+        existing["mailAdapter"]["egressSecret"] = "stale-egress-secret".into();
+        existing["mailAdapter"]["agentmail"]["apiKey"] = "stale-provider-key".into();
+        existing["worker"]["adapterCredentials"] =
+            serde_json::json!({"mail-adapter": "stale-egress-secret"});
+        let opts = mail_upgrade_opts(&existing, vec![]);
+        assert_eq!(materialized_mail_values(&opts), expected);
+    }
+
+    #[test]
+    fn explicit_mail_disable_and_secret_clear_override_retained_values() {
+        let mut existing = retained_mail_fixture();
+        existing["mailAdapter"]["channelToken"] = "obsolete-inline-token".into();
+        let opts = mail_upgrade_opts(
+            &existing,
+            vec![
+                "mailAdapter.deploy=false".into(),
+                "mailAdapter.channelTokenExistingSecret=".into(),
+                "mailAdapter.allowedSenders={}".into(),
+            ],
+        );
+        let actual = materialized_mail_values(&opts);
+        assert!(actual["mailAdapter"].get("deploy").is_none());
+        assert!(actual["mailAdapter"].get("allowedSenders").is_none());
+        assert!(
+            actual["mailAdapter"].get("channelToken").is_none(),
+            "clearing an external reference cannot resurrect an obsolete inline token"
+        );
+        assert!(actual["mailAdapter"]
+            .get("channelTokenExistingSecret")
+            .is_none());
+        assert_eq!(actual["mailAdapter"]["pollIntervalSeconds"], 37);
+        let effective = up_value_plan(&opts).effective_values();
+        assert_eq!(
+            effective.get("mailAdapter.deploy").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn explicit_inline_mail_credential_replaces_the_external_reference() {
+        let opts = mail_upgrade_opts(
+            &retained_mail_fixture(),
+            vec!["mailAdapter.channelToken=new-inline-token".into()],
+        );
+        let actual = materialized_mail_values(&opts);
+        assert!(actual["mailAdapter"]
+            .get("channelTokenExistingSecret")
+            .is_none());
+        assert_eq!(
+            actual["mailAdapter"]["channelTokenExistingSecretKey"],
+            "channel-key"
+        );
+        let command = &up_commands(&opts)[0];
+        assert!(
+            !command.display().contains("channelTokenExistingSecret="),
+            "migration overlay must not resurrect the replaced external reference"
+        );
+        assert_eq!(
+            actual["worker"]["adapterCredentialsExistingSecretKey"],
+            "worker-map"
+        );
+    }
+
     #[test]
     fn up_defaults_expose_ui_and_langfuse() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4005,6 +4488,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4059,6 +4543,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4114,6 +4599,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4176,6 +4662,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4257,6 +4744,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4302,6 +4790,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4347,6 +4836,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4393,6 +4883,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -4448,6 +4939,7 @@ mod tests {
         ] {
             let opts = complete_up_opts_without_runner_egress(
                 UpOpts {
+                    retained_mail_values: None,
                     common: common(),
                     github_token: GithubTokenPlan::Untouched,
                     allow_egress_host: vec![],
@@ -4500,6 +4992,7 @@ mod tests {
     #[test]
     fn up_no_expose_drops_the_nodeport_sets() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4524,6 +5017,7 @@ mod tests {
     #[test]
     fn up_passthrough_set_is_appended_verbatim() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4552,6 +5046,7 @@ mod tests {
         // No credential and not --fake-model: a plain install with no real-model
         // or egress sets (the fake model stays on, egress stays fail-closed).
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4579,6 +5074,7 @@ mod tests {
         // --fake-model resolves to no credential, so the argv is the sealed
         // install even when the caller had a credential in the environment.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4603,6 +5099,7 @@ mod tests {
     #[test]
     fn up_with_credentials_enables_real_model_and_masks() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4710,6 +5207,7 @@ mod tests {
     #[test]
     fn up_local_model_adds_inference_sets() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4734,6 +5232,7 @@ mod tests {
     #[test]
     fn up_without_local_model_omits_inference_sets() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4759,6 +5258,7 @@ mod tests {
     fn up_defaults_runner_model_from_env() {
         // CURIE_MODEL set, no explicit --set: inject the runner model (#361).
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4786,6 +5286,7 @@ mod tests {
     fn up_without_env_model_omits_runner_model_set() {
         // No CURIE_MODEL: inject nothing, the chart default stands (#361).
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4811,6 +5312,7 @@ mod tests {
         // CURIE_MODEL set AND an explicit matching --set: the operator's set
         // already carries it, so no duplicate injection (#361).
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -4842,6 +5344,7 @@ mod tests {
         // `--set` must be detected so `up` does not inject a redundant
         // `--set agentSandbox.runner.model=<model>` on top of it (#361).
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4869,6 +5372,7 @@ mod tests {
     #[test]
     fn up_opens_web_egress_after_model() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec!["anthropic".into()],
@@ -4907,6 +5411,7 @@ mod tests {
     #[test]
     fn up_web_egress_without_model_uses_index_zero() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4942,6 +5447,7 @@ mod tests {
     #[test]
     fn up_web_egress_multiple_cidrs_contiguous() {
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec!["anthropic".into()],
@@ -4976,6 +5482,7 @@ mod tests {
     #[test]
     fn up_no_web_egress_stays_sealed() {
         let sealed_cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -4996,6 +5503,7 @@ mod tests {
         assert!(!sealed_line.contains("allowedEgress"), "{sealed_line}");
 
         let model_cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -5215,6 +5723,7 @@ mod tests {
         // live credential, so it must land in the private -f file like any other
         // secret and never appear in argv or the printed line.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -5398,6 +5907,7 @@ mod tests {
     fn completed_dev_up(existing: Option<&serde_json::Value>, set: Vec<String>) -> UpOpts {
         complete_up_opts_without_runner_egress(
             UpOpts {
+                retained_mail_values: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],
@@ -5558,6 +6068,7 @@ mod tests {
         // Success criterion: a missing secret's generated value lands in the
         // private -f values file, never in the executed argv / process table.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -5614,6 +6125,7 @@ mod tests {
         // The pure builder with no supplied secrets (the --dev path, and every
         // pre-#196 argv test) emits no secret values file.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -5640,6 +6152,7 @@ mod tests {
         // to helm (issue #195). Without it the sealed chart generates strong
         // random values and the dev/e2e stack would not match compose.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -5668,6 +6181,7 @@ mod tests {
         // The default (non-dev) path must NOT opt into the published defaults;
         // the sealed chart generates strong per-release credentials there.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             set_string: vec![],
@@ -5718,6 +6232,7 @@ mod tests {
         // Resolved provider CIDRs take the first slots (in order), then declared
         // web destinations continue contiguously -- one array, no gaps.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             model: None,
@@ -5768,6 +6283,7 @@ mod tests {
         // unconditional Anthropic carve-out is removed entirely (#362). The
         // sandbox stays sealed and the model is unreachable by design.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             model: None,
@@ -5801,6 +6317,7 @@ mod tests {
         // Existing behavior preserved: with no credential and no provider host,
         // a declared web destination still occupies index [0].
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             model: None,
@@ -6089,6 +6606,7 @@ mod tests {
         // Between them these two pin the read DECISION and the argv it feeds; the
         // live evidence is the E2E's `--dev` arm.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
             allow_egress_host: vec![],
@@ -6340,6 +6858,7 @@ mod tests {
         // `operator_sets` chains `--set` THEN `--set-string`, and a key the
         // operator supplied only through the latter must exempt the run too.
         let opts = UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
@@ -6475,6 +6994,7 @@ mod tests {
         // credential, so both keys must survive to their own file and neither
         // may reach argv.
         let cmds = up_commands(&UpOpts {
+            retained_mail_values: None,
             common: common(),
             github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
             set_string: vec![],

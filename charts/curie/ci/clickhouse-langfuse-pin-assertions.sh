@@ -4,17 +4,19 @@
 # supported pair, and fail CI when either side drifts.
 #
 # Langfuse 3.225.x ClickHouse migration 39 cannot parse on 24.8 or 25.8. The
-# chart default must be 25.12 (the version Langfuse's own compose pins at
-# v3.225.7) so the Langfuse pin can be advanced, and AVX is a chart-default
-# requirement because 25.12 is not SSE4.2-safe. Comments on both values.yaml
-# keys must name the other pin so they are not moved independently.
+# chart default must be on the 25.12 line (the version Langfuse's own compose
+# pins at v3.225.7) so the Langfuse pin can be advanced, and AVX is a
+# chart-default requirement because 25.12 is not SSE4.2-safe. Since #2319 the
+# expected value is the 25.12.11.4 patch build rather than the moving 25.12
+# alias. Comments on both values.yaml keys must name the other pin so they are
+# not moved independently.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
 VALUES="$CHART/values.yaml"
 EXPECTED_LANGFUSE="3.225.5"
-EXPECTED_CLICKHOUSE="25.12"
+EXPECTED_CLICKHOUSE="25.12.11.4"
 EXPECTED_CLICKHOUSE_IMAGE="clickhouse/clickhouse-server:${EXPECTED_CLICKHOUSE}"
 
 TMP="$(mktemp -d)"

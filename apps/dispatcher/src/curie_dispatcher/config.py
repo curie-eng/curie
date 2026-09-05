@@ -15,6 +15,7 @@ Env mapping:
     VALKEY_PORT                -> valkey_port
     VALKEY_PASSWORD            -> valkey_password
     VALKEY_DB                  -> valkey_db
+    VALKEY_TLS                 -> valkey_tls
     CURIE_STREAM             -> stream
     CURIE_DEDUPE_PREFIX      -> dedupe_prefix
     CURIE_DEDUPE_TTL_SECONDS -> dedupe_ttl_seconds
@@ -96,6 +97,10 @@ class DispatcherConfig(BaseSettings):
     valkey_port: int = 6379
     valkey_password: str = ""
     valkey_db: int = 0
+    # TLS transport for a BYO Valkey, rendered by the chart from valkey.tls.
+    # Off by default: the in-chart store and the compose lane are both cleartext
+    # by design (#2315).
+    valkey_tls: bool = False
 
     stream: str = Field(default=RUNS_STREAM_DEFAULT, validation_alias=STREAM_ENV)
     dedupe_prefix: str = Field(

@@ -1,3 +1,4 @@
+{{- $pgReadiness := fromYaml (include "curie.langfuse.postgresReadinessValues" .) -}}
 {{- if .Values.langfuse.deploy }}
 {{- if .Values.langfuse.serviceAccount.create }}
 apiVersion: v1
@@ -73,82 +74,24 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       serviceAccountName: {{ include "curie.langfuse.serviceAccountName" . }}
-      {{- if or .Values.langfuse.clickhouseReadiness.enabled .Values.langfuse.web.postgresReadiness.enabled }}
+      {{- if or .Values.langfuse.clickhouseReadiness.enabled $pgReadiness.enabled }}
       initContainers:
-      {{- if .Values.langfuse.web.postgresReadiness.enabled }}
-      {{- $postgresReadiness := .Values.langfuse.web.postgresReadiness }}
-      {{- $readinessSecurityContext := deepCopy (.Values.langfuse.web.containerSecurityContext | default dict) }}
-      {{- $_ := set $readinessSecurityContext "runAsNonRoot" true }}
-      {{- if not (hasKey $readinessSecurityContext "runAsUser") }}
-      {{- $_ := set $readinessSecurityContext "runAsUser" 1001 }}
-      {{- else if eq (int64 (get $readinessSecurityContext "runAsUser")) 0 }}
-      {{- $_ := set $readinessSecurityContext "runAsUser" 1001 }}
-      {{- end }}
-      {{- range $field := list "attempts" "intervalSeconds" "probeTimeoutSeconds" }}
-      {{- $value := index $postgresReadiness $field }}
-      {{- $integerKind := or (kindIs "int" $value) (kindIs "int64" $value) (kindIs "float64" $value) }}
-      {{- if or (not $integerKind) (not (regexMatch "^[0-9]+$" (printf "%v" $value))) (lt (int64 $value) 1) }}
-      {{- fail (printf "langfuse.web.postgresReadiness.%s must be an integer >= 1" $field) }}
-      {{- end }}
-      {{- end }}
-        - name: wait-for-postgres
-          image: {{ $postgresReadiness.image | default .Values.postgres.image | quote }}
-          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
-          securityContext:
-            {{- toYaml $readinessSecurityContext | nindent 12 }}
-          command:
-            - sh
-            - -ec
-            - |
-              echo "waiting for Postgres readiness"
-              attempt=1
-              last_exit_code=1
-              while [ "$attempt" -le "$POSTGRES_READINESS_ATTEMPTS" ]; do
-                if pg_isready \
-                  -h "$POSTGRES_HOST" \
-                  -p "$POSTGRES_PORT" \
-                  -U "$POSTGRES_USER" \
-                  -d "$POSTGRES_DATABASE" \
-                  -t "$POSTGRES_READINESS_PROBE_TIMEOUT_SECONDS" \
-                  >/dev/null 2>&1; then
-                  exit 0
-                else
-                  last_exit_code=$?
-                fi
-                if [ "$attempt" -lt "$POSTGRES_READINESS_ATTEMPTS" ]; then
-                  sleep "$POSTGRES_READINESS_INTERVAL_SECONDS"
-                fi
-                attempt=$((attempt + 1))
-              done
-              echo "Postgres readiness exhausted for ${POSTGRES_HOST}:${POSTGRES_PORT} after ${POSTGRES_READINESS_ATTEMPTS} attempts: pg_isready=${last_exit_code} (0=accepting, 1=rejecting, 2=no-response, 3=no-attempt)" >&2
-              exit 1
-          env:
-            - name: POSTGRES_HOST
-              value: {{ include "curie.postgres.host" . | quote }}
-            - name: POSTGRES_PORT
-              value: {{ .Values.postgres.port | quote }}
-            - name: POSTGRES_USER
-              value: {{ .Values.postgres.auth.username | quote }}
-            - name: POSTGRES_DATABASE
-              value: {{ .Values.postgres.auth.database | quote }}
-            - name: POSTGRES_READINESS_ATTEMPTS
-              value: {{ .Values.langfuse.web.postgresReadiness.attempts | quote }}
-            - name: POSTGRES_READINESS_INTERVAL_SECONDS
-              value: {{ .Values.langfuse.web.postgresReadiness.intervalSeconds | quote }}
-            - name: POSTGRES_READINESS_PROBE_TIMEOUT_SECONDS
-              value: {{ .Values.langfuse.web.postgresReadiness.probeTimeoutSeconds | quote }}
+      {{- if $pgReadiness.enabled }}
+        {{- include "curie.langfuse.postgresGate" (dict
+             "root" .
+             "containerSecurityContext" .Values.langfuse.web.containerSecurityContext) | nindent 8 }}
       {{- end }}
       {{- if .Values.langfuse.clickhouseReadiness.enabled }}
         {{- include "curie.langfuse.clickhouseGate" (dict
              "root" .
-             "image" .Values.langfuse.image.web
+             "image" (include "curie.image" (dict "repository" .Values.langfuse.image.web "tag" .Values.langfuse.image.tag "digest" .Values.langfuse.image.webDigest))
              "containerSecurityContext" .Values.langfuse.web.containerSecurityContext
              "resources" .Values.langfuse.web.resources) | nindent 8 }}
       {{- end }}
       {{- end }}
       containers:
         - name: langfuse-web
-          image: "{{ .Values.langfuse.image.web }}:{{ .Values.langfuse.image.tag }}"
+          image: {{ include "curie.image" (dict "repository" .Values.langfuse.image.web "tag" .Values.langfuse.image.tag "digest" .Values.langfuse.image.webDigest) | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           {{- with .Values.langfuse.web.containerSecurityContext }}
           securityContext:
@@ -246,17 +189,24 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       serviceAccountName: {{ include "curie.langfuse.serviceAccountName" . }}
-      {{- if .Values.langfuse.clickhouseReadiness.enabled }}
+      {{- if or .Values.langfuse.clickhouseReadiness.enabled $pgReadiness.enabled }}
       initContainers:
+      {{- if $pgReadiness.enabled }}
+        {{- include "curie.langfuse.postgresGate" (dict
+             "root" .
+             "containerSecurityContext" .Values.langfuse.worker.containerSecurityContext) | nindent 8 }}
+      {{- end }}
+      {{- if .Values.langfuse.clickhouseReadiness.enabled }}
         {{- include "curie.langfuse.clickhouseGate" (dict
              "root" .
-             "image" .Values.langfuse.image.worker
+             "image" (include "curie.image" (dict "repository" .Values.langfuse.image.worker "tag" .Values.langfuse.image.tag "digest" .Values.langfuse.image.workerDigest))
              "containerSecurityContext" .Values.langfuse.worker.containerSecurityContext
              "resources" .Values.langfuse.worker.resources) | nindent 8 }}
       {{- end }}
+      {{- end }}
       containers:
         - name: langfuse-worker
-          image: "{{ .Values.langfuse.image.worker }}:{{ .Values.langfuse.image.tag }}"
+          image: {{ include "curie.image" (dict "repository" .Values.langfuse.image.worker "tag" .Values.langfuse.image.tag "digest" .Values.langfuse.image.workerDigest) | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           {{- with .Values.langfuse.worker.containerSecurityContext }}
           securityContext:
@@ -271,6 +221,32 @@ spec:
           ports:
             - name: http
               containerPort: 3030
+          # Readiness is the SIGTERM-aware /api/ready (the worker image's only
+          # endpoint that fails during shutdown, so a terminating pod drains).
+          # Liveness is deliberately tcpSocket, NOT an HTTP path: both
+          # /api/health and /api/ready run a Prisma `SELECT 1` and a Redis ping,
+          # and this Deployment is replicas:1 + Recreate with Prisma/ClickHouse
+          # migrations at container boot. Init containers do NOT re-run on a
+          # liveness restart, so a store blip would restart the only replica
+          # straight into those boot migrations against a sick Postgres -- the
+          # exact P1001/BackOff class the wait-for-postgres gate exists to stop
+          # (#71, #2330). timeoutSeconds is explicit on both: the kubelet
+          # default is 1s, which langfuse-web's block above silently takes.
+          readinessProbe:
+            httpGet:
+              path: /api/ready
+              port: 3030
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: 3030
+            initialDelaySeconds: 90
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
             {{- toYaml .Values.langfuse.worker.resources | nindent 12 }}
 {{- end }}

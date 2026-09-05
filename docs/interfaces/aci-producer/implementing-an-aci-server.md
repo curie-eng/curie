@@ -17,7 +17,7 @@ truth (the committed JSON Schema and generated Rust/TS are derived from them).
 
 ## What "an ACI server" is
 
-An ACI server is an **HTTP process** inside the sandbox that exposes five POST
+An ACI server is an **HTTP process** inside the sandbox that exposes six POST
 routes and streams NDJSON back:
 
 | Route | Purpose |
@@ -27,6 +27,7 @@ routes and streams NDJSON back:
 | `POST /v1/interrupt` | Hard-stop the live turn. Body is an `interrupt` frame; the open turn's `final` is reclassified to idle. |
 | `POST /v1/reset` | Discard the conversation and start a fresh model session, so the next turn cannot answer from earlier history; return `409` while a turn is active. No body, no wire frame (#550). |
 | `POST /v1/snapshot` | Capture a bounded, credential-free snapshot of the managed repository workspace for the authenticated worker; return `409` when the session has no managed workspace. |
+| `POST /v1/timeout` | Stop the exact open turn named by the event response epoch. This runner-private control route is authenticated; a server omitting the epoch response header is simply not notified, and worker timeout classification remains unaffected. |
 
 Plus two unauthenticated GETs the platform relies on: `GET /healthz` (liveness)
 and `GET /status` (session status + readiness). The chart's readiness probe hits
@@ -46,9 +47,13 @@ that has not opted into shared history. The reference implementation is
 Startup configuration remains **environment-only**. Read it once with
 `SessionConfig.from_env()` (the `CURIE_*` mapping: `plugin_dir`, `session_id`,
 `sandbox_id`, `budget`, optional `memory_ref`, `credentials_ref`, `otel`). The
-inbound `Event` separately has optional `session_id` and `history_ref` fields for
-conversation-scoped identity after a sandbox is bound. They are wire metadata,
-not a replacement for `SessionConfig`, and older producers may omit either one.
+inbound `Event` separately has optional `session_id`, `history_ref`, and
+`adoption_credential` fields. The first two are conversation-scoped identity
+after a sandbox is bound. `adoption_credential` is the optional per-conversation
+runner credential delivered on this same authenticated event (ADR-0122); omitted
+or null means no adoption. They are wire metadata, not a replacement for
+`SessionConfig`, and older producers may omit any of them. A schema field is
+not bootstrap retirement or warm-pool activation.
 
 ## The wire contract in one screen
 
@@ -57,24 +62,28 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
 **Inbound** — a discriminated union on `kind` (`parse_inbound` decodes it):
 
 - `Event` = `{kind: "event", type: "message"|"job"|"eval_case", text, user, ts,
-  session_id?, history_ref?}`. The optional fields are nullable strings; either
-  may be omitted independently.
+  session_id?, history_ref?, adoption_credential?}`. The optional fields are
+  nullable strings and may be omitted independently. `adoption_credential` is
+  secret material: omit/null is the legacy cold path, a malformed value is a
+  hard decode error, and the value must not appear in `repr`, errors, model
+  prompts, or evidence.
 - `Interrupt` = `{kind: "interrupt", reason}`
 
 **Outbound** — a discriminated union on `type`, each carrying `version`
 (`to_ndjson_line` encodes, `parse_ndjson_line` decodes one line):
 
-- `TextDelta` → `text_delta` `{version, text}`
-- `ToolNote` → `tool_note` `{version, text, tool?}`
-- `Final` → `final` `{version, text, status}` where `status ∈ {done,
+- `TextDelta` → `text_delta` `{version, text, adoption_applied?}`
+- `ToolNote` → `tool_note` `{version, text, tool?, adoption_applied?}`
+- `Final` → `final` `{version, text, status, adoption_applied?}` where `status ∈ {done,
   idle-awaiting-input, classified-failure}`
-- `ErrorEvent` → `error` `{version, message, classification?}`
+- `ErrorEvent` → `error` `{version, message, classification?, adoption_applied?}`
 - `SideEffectFlag` → `side_effect_flag` `{version, tool?, detail?, call_id?,
-  arguments?, result?, failed?}`, emitted once when a side-effecting call is
-  made and once when its result arrives, joined on `call_id` (ADR-0117)
+  arguments?, result?, failed?, adoption_applied?}`, emitted once when a
+  side-effecting call is made and once when its result arrives, joined on
+  `call_id` (ADR-0117)
 
 **Version gate (strict producer, tolerant consumer).** Your producer emits its
-**exact build `PROTOCOL_VERSION`** (currently `0.4.4`) on every outbound event and
+**exact build `PROTOCOL_VERSION`** (currently `0.4.6`) on every outbound event and
 constructs strictly -- an unknown field is an error at construction, catching your
 mistakes at the source. A **consumer** decoding the wire is tolerant the other way:
 it accepts any version compatible with its own build (`major.minor` match under
@@ -185,6 +194,10 @@ Route contract to honor:
   turn is active, rather than resetting under an open `/v1/event` stream.
 - **`/v1/snapshot`**: no body. Return the bounded managed-workspace snapshot to
   the authenticated worker, or **409** when no managed workspace is mounted.
+- **`/v1/timeout`**: no body. Require the event response's opaque epoch header and
+  stop only that open turn. This is a runner-private authenticated control route;
+  servers omitting the response header are simply not notified, and worker timeout
+  classification remains unaffected.
 - **`/healthz`**, **`/status`**: always-open GETs; `/status` returns
   `{status, ready, turn_active}`.
 - **Auth (optional):** when a bearer token is configured, require

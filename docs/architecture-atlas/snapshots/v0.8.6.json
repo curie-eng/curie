@@ -1,0 +1,3709 @@
+{
+  "schemaVersion": "1.4",
+  "asOf": "2026-09-05",
+  "repository": {
+    "name": "curie-eng/curie",
+    "branch": "main",
+    "commit": "0aa92eeaa319a1e7799053765e63ed6985effe91",
+    "shortCommit": "0aa92eea",
+    "release": "v0.8.6"
+  },
+  "title": "Curie architecture atlas",
+  "subtitle": "The production loop, its swappable seams, and the distance between current state and vision.",
+  "architectureGroups": [
+    {
+      "id": "channel-surface",
+      "label": "Channel surface",
+      "subtitle": "3 current \u00b7 1 planned",
+      "kind": "surface",
+      "state": "implemented",
+      "zone": "surfaces",
+      "x": 0.075,
+      "y": 0.25,
+      "description": "One stable channel role in the architecture. Slack, Discord, and email are shipped implementations of this role; Teams remains planned. Concrete surfaces stay inside this expandable node.",
+      "memberIds": [
+        "slack",
+        "discord",
+        "email",
+        "teams"
+      ]
+    },
+    {
+      "id": "sandbox-substrate",
+      "label": "Sandbox substrate",
+      "mapLabel": "Substrate",
+      "subtitle": "2 proven implementations",
+      "kind": "substrate",
+      "state": "implemented",
+      "zone": "foundation",
+      "x": 0.92,
+      "y": 0.765,
+      "description": "The stable substrate role beneath sandbox lifecycle. Kubernetes and Docker prove that the same boundary has multiple implementations.",
+      "memberIds": [
+        "kubernetes",
+        "docker"
+      ]
+    }
+  ],
+  "overview": {
+    "title": "The request-to-reply loop",
+    "description": "Read left to right. Every colored connector is a seam: green is proven, yellow is clean but unproven, red is intertwined, and blue is planned.",
+    "stages": [
+      {
+        "id": "surfaces",
+        "eyebrow": "1 \u00b7 Enter",
+        "label": "External surfaces",
+        "description": "A person, repository, or operator starts work.",
+        "nodeIds": [
+          "slack",
+          "discord",
+          "email",
+          "cli",
+          "github",
+          "external-hook"
+        ]
+      },
+      {
+        "id": "ingress",
+        "eyebrow": "2 \u00b7 Normalize",
+        "label": "Ingress + API",
+        "description": "Authenticate, bind the agent, and turn the event into work.",
+        "nodeIds": [
+          "dispatcher",
+          "channel-api",
+          "api"
+        ]
+      },
+      {
+        "id": "dispatch",
+        "eyebrow": "3 \u00b7 Route",
+        "label": "Queue + worker",
+        "description": "Claim delivery, lock the conversation, and resolve the run.",
+        "nodeIds": [
+          "queue",
+          "worker"
+        ]
+      },
+      {
+        "id": "runtime",
+        "eyebrow": "4 \u00b7 Isolate",
+        "label": "Sandbox + runner",
+        "description": "Start or resume an isolated, steerable ACI session.",
+        "nodeIds": [
+          "sandbox",
+          "runner"
+        ]
+      },
+      {
+        "id": "execution",
+        "eyebrow": "5 \u00b7 Execute",
+        "label": "Harness + MCP + model",
+        "description": "Run the multi-turn model loop, call hosted MCP tools, and produce side effects.",
+        "nodeIds": [
+          "harness",
+          "model",
+          "connector-host",
+          "oauth-gateway"
+        ]
+      }
+    ],
+    "connections": [
+      {
+        "from": "surfaces",
+        "to": "ingress",
+        "label": "channel ingress",
+        "seamId": "channel-ingress"
+      },
+      {
+        "from": "ingress",
+        "to": "dispatch",
+        "label": "durable work",
+        "seamId": "queue-stream"
+      },
+      {
+        "from": "dispatch",
+        "to": "runtime",
+        "label": "sandbox claim",
+        "seamId": "substrate"
+      },
+      {
+        "from": "runtime",
+        "to": "execution",
+        "label": "model session",
+        "seamId": "harness-modelsession"
+      }
+    ],
+    "return": {
+      "label": "stream result, request approval when needed, then reply to the originating surface",
+      "seamId": "channel-reply"
+    },
+    "rails": [
+      {
+        "id": "approval-loop",
+        "label": "Approval loop",
+        "description": "Pause, authorize, and resume a live turn.",
+        "nodeIds": [
+          "approvals"
+        ],
+        "seamIds": [
+          "approval-authorizer",
+          "approval-principal"
+        ]
+      },
+      {
+        "id": "evidence-plane",
+        "label": "Evidence plane",
+        "description": "Traces, telemetry, eval cases, scores, and results surround every run.",
+        "nodeIds": [
+          "otel",
+          "langfuse",
+          "eval-plane"
+        ],
+        "seamIds": [
+          "telemetry",
+          "eval-scorer"
+        ]
+      },
+      {
+        "id": "substrate",
+        "label": "Substrate",
+        "description": "Kubernetes is the production baseline; Docker proves the same sandbox boundary locally.",
+        "nodeIds": [
+          "kubernetes",
+          "docker"
+        ],
+        "seamIds": [
+          "substrate"
+        ]
+      }
+    ]
+  },
+  "maturityRubric": [
+    {
+      "id": "green",
+      "label": "Proven",
+      "symbol": "\u2713",
+      "definition": "Multiple real implementations have exercised the same boundary."
+    },
+    {
+      "id": "yellow",
+      "label": "Clean, unproven",
+      "symbol": "\u25c7",
+      "definition": "One real implementation sits behind a credible boundary, but a second implementation has not tested the shape."
+    },
+    {
+      "id": "red",
+      "label": "Intertwined",
+      "symbol": "\u00d7",
+      "definition": "A swap still requires coordinated knowledge or changes across implementation owners."
+    },
+    {
+      "id": "planned",
+      "label": "Planned / reserved",
+      "symbol": "\u25cb",
+      "definition": "The intended line is documented, but there is not a real implementation to score."
+    }
+  ],
+  "sources": [
+    {
+      "id": "architecture",
+      "type": "architecture",
+      "title": "Architecture as built",
+      "path": "ARCHITECTURE.md",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/ARCHITECTURE.md"
+    },
+    {
+      "id": "vision",
+      "type": "vision",
+      "title": "Product vision",
+      "path": "docs/vision.md",
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/vision.md"
+    },
+    {
+      "id": "architecture-vision",
+      "type": "architecture",
+      "title": "Swappable jobs around an opinionated core",
+      "path": "docs/architecture-vision.md",
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/architecture-vision.md"
+    },
+    {
+      "id": "interfaces",
+      "type": "catalog",
+      "title": "Interface catalog",
+      "path": "docs/interfaces.md",
+      "href": "https://github.com/curie-eng/curie/blob/617df5bef46864f9abd7d01ac630ac672100afdd/docs/interfaces.md"
+    },
+    {
+      "id": "message-flow",
+      "type": "diagram",
+      "title": "Message flow",
+      "path": "docs/diagrams/message-flow.md",
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/diagrams/message-flow.md"
+    },
+    {
+      "id": "kubernetes",
+      "type": "diagram",
+      "title": "Kubernetes architecture",
+      "path": "docs/diagrams/kubernetes.md",
+      "href": "https://github.com/curie-eng/curie/blob/5185e6bf5c153271ec9eb37fd84334c59b3f4a5f/docs/diagrams/kubernetes.md"
+    },
+    {
+      "id": "aci-diagram",
+      "type": "diagram",
+      "title": "Agent Container Interface",
+      "path": "docs/diagrams/aci.md",
+      "href": "https://github.com/curie-eng/curie/blob/5185e6bf5c153271ec9eb37fd84334c59b3f4a5f/docs/diagrams/aci.md"
+    },
+    {
+      "id": "channel-api-code",
+      "type": "code",
+      "title": "Generic channel HTTP ingress",
+      "path": "apps/api/src/curie_api/routers/channels.py",
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/apps/api/src/curie_api/routers/channels.py"
+    },
+    {
+      "id": "reply-sink-code",
+      "type": "code",
+      "title": "Neutral reply sink and router",
+      "path": "apps/worker/src/curie_worker/reply_sink.py",
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/apps/worker/src/curie_worker/reply_sink.py"
+    },
+    {
+      "id": "binding-code",
+      "type": "code",
+      "title": "Kind/address deployment binding",
+      "path": "apps/worker/src/curie_worker/binding.py",
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/apps/worker/src/curie_worker/binding.py"
+    },
+    {
+      "id": "runner-adapter-code",
+      "type": "code",
+      "title": "Claude-shaped ModelSession boundary",
+      "path": "runner/src/curie_runner/adapter.py",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/runner/src/curie_runner/adapter.py"
+    },
+    {
+      "id": "runner-telemetry-code",
+      "type": "code",
+      "title": "Runner phase telemetry",
+      "path": "runner/src/curie_runner/otel.py",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/runner/src/curie_runner/otel.py"
+    },
+    {
+      "id": "approval-principal-code",
+      "type": "code",
+      "title": "Authenticated approval principals",
+      "path": "apps/api/src/curie_api/approval_principal.py",
+      "href": "https://github.com/curie-eng/curie/blob/617df5bef46864f9abd7d01ac630ac672100afdd/apps/api/src/curie_api/approval_principal.py"
+    },
+    {
+      "id": "approval-auth-code",
+      "type": "code",
+      "title": "Approval resolution authentication",
+      "path": "apps/api/src/curie_api/approval_auth.py",
+      "href": "https://github.com/curie-eng/curie/blob/617df5bef46864f9abd7d01ac630ac672100afdd/apps/api/src/curie_api/approval_auth.py"
+    },
+    {
+      "id": "cli-doctor-code",
+      "type": "code",
+      "title": "Doctor API discovery",
+      "path": "cli/src/doctor.rs",
+      "href": "https://github.com/curie-eng/curie/blob/617df5bef46864f9abd7d01ac630ac672100afdd/cli/src/doctor.rs"
+    },
+    {
+      "id": "mail-adapter-code",
+      "type": "code",
+      "title": "First-party email adapter",
+      "path": "apps/mail-adapter/src/curie_mail_adapter/adapter.py",
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/apps/mail-adapter/src/curie_mail_adapter/adapter.py"
+    },
+    {
+      "id": "discord-adapter-code",
+      "type": "code",
+      "title": "Discord channel adapter",
+      "path": "adapters/discord/src/curie_discord_adapter/main.py",
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/adapters/discord/src/curie_discord_adapter/main.py"
+    },
+    {
+      "id": "hook-code",
+      "type": "code",
+      "title": "Bounded external-hook ingress",
+      "path": "apps/api/src/curie_api/routers/hooks.py",
+      "href": "https://github.com/curie-eng/curie/blob/5185e6bf5c153271ec9eb37fd84334c59b3f4a5f/apps/api/src/curie_api/routers/hooks.py"
+    },
+    {
+      "id": "dispatcher-preflight-code",
+      "type": "code",
+      "title": "Dispatcher startup preflight",
+      "path": "apps/dispatcher/src/curie_dispatcher/preflight.py",
+      "href": "https://github.com/curie-eng/curie/blob/5185e6bf5c153271ec9eb37fd84334c59b3f4a5f/apps/dispatcher/src/curie_dispatcher/preflight.py"
+    },
+    {
+      "id": "approval-actions-code",
+      "type": "code",
+      "title": "Slack approval action ownership",
+      "path": "apps/dispatcher/src/curie_dispatcher/approval_actions.py",
+      "href": "https://github.com/curie-eng/curie/blob/69cbe26af299e01d16b2e667e627a0b672238662/apps/dispatcher/src/curie_dispatcher/approval_actions.py"
+    },
+    {
+      "id": "worker-runner-client-code",
+      "type": "code",
+      "title": "Delivery-bounded runner client",
+      "path": "apps/worker/src/curie_worker/runner_client.py",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/apps/worker/src/curie_worker/runner_client.py"
+    },
+    {
+      "id": "chart-values",
+      "type": "code",
+      "title": "Helm runtime values",
+      "path": "charts/curie/values.yaml",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/charts/curie/values.yaml"
+    },
+    {
+      "id": "chart-secret-template",
+      "type": "code",
+      "title": "Managed and external Secret rendering",
+      "path": "charts/curie/templates/secrets.yaml",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/charts/curie/templates/secrets.yaml"
+    },
+    {
+      "id": "runner-server-code",
+      "type": "code",
+      "title": "Authenticated runner control routes",
+      "path": "runner/src/curie_runner/server.py",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/runner/src/curie_runner/server.py"
+    },
+    {
+      "id": "chart-helpers-code",
+      "type": "code",
+      "title": "Shared Helm endpoint and transport helpers",
+      "path": "charts/curie/templates/_helpers.tpl",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/charts/curie/templates/_helpers.tpl"
+    },
+    {
+      "id": "mail-runtime-bootstrap-code",
+      "type": "code",
+      "title": "Mail adapter telemetry bootstrap",
+      "path": "apps/mail-adapter/src/curie_mail_adapter/run.py",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/apps/mail-adapter/src/curie_mail_adapter/run.py"
+    },
+    {
+      "id": "chart-mail-template",
+      "type": "code",
+      "title": "Mail adapter configuration and telemetry",
+      "path": "charts/curie/templates/mail-adapter.yaml",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/charts/curie/templates/mail-adapter.yaml"
+    },
+    {
+      "id": "chart-runner-netpol",
+      "type": "code",
+      "title": "Runner egress NetworkPolicy",
+      "path": "charts/curie/templates/security-networkpolicy.yaml",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/charts/curie/templates/security-networkpolicy.yaml"
+    },
+    {
+      "id": "chart-ui-template",
+      "type": "code",
+      "title": "Console API proxy configuration",
+      "path": "charts/curie/templates/ui.yaml",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/charts/curie/templates/ui.yaml"
+    },
+    {
+      "id": "cli-ops-code",
+      "type": "code",
+      "title": "Retained operator configuration execution",
+      "path": "cli/src/ops.rs",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/cli/src/ops.rs"
+    },
+    {
+      "id": "cli-installation-code",
+      "type": "code",
+      "title": "Typed retained installation configuration",
+      "path": "cli/src/installation.rs",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/cli/src/installation.rs"
+    },
+    {
+      "id": "cli-convergence-code",
+      "type": "code",
+      "title": "Shared installed workload convergence observer",
+      "path": "cli/src/ops/convergence.rs",
+      "href": "https://github.com/curie-eng/curie/blob/0aa92eeaa319a1e7799053765e63ed6985effe91/cli/src/ops/convergence.rs"
+    }
+  ],
+  "documentationDrift": [
+    {
+      "id": "drift-channel-catalog-count",
+      "title": "The generated channel catalog still counts one implementation",
+      "claim": "docs/interfaces.md and the Communication grade row still describe Slack plus HttpReplyAdapter as the proof, not a second first-party production channel, and the generated Channel/ingress header still says impls: 1.",
+      "current": "ARCHITECTURE.md, adapters/discord, and apps/mail-adapter ship Slack, Discord, and email as wired channels on the same HTTP ingress and HttpReplyAdapter egress. Discord v1 and email do not implement interactive approvals.",
+      "evidence": [
+        "architecture",
+        "architecture-vision",
+        "interfaces",
+        "discord-adapter-code",
+        "mail-adapter-code"
+      ]
+    }
+  ],
+  "zones": [
+    {
+      "id": "surfaces",
+      "label": "External surfaces",
+      "x": 0.01,
+      "y": 0.04,
+      "w": 0.14,
+      "h": 0.91
+    },
+    {
+      "id": "control",
+      "label": "Control & ingress",
+      "x": 0.17,
+      "y": 0.04,
+      "w": 0.22,
+      "h": 0.91
+    },
+    {
+      "id": "core",
+      "label": "Opinionated core",
+      "x": 0.41,
+      "y": 0.04,
+      "w": 0.21,
+      "h": 0.91
+    },
+    {
+      "id": "runtime",
+      "label": "Isolated runtime",
+      "x": 0.64,
+      "y": 0.04,
+      "w": 0.35,
+      "h": 0.55
+    },
+    {
+      "id": "foundation",
+      "label": "Data \u00b7 evidence \u00b7 substrate",
+      "x": 0.64,
+      "y": 0.62,
+      "w": 0.35,
+      "h": 0.33
+    }
+  ],
+  "nodes": [
+    {
+      "id": "slack",
+      "label": "Slack",
+      "subtitle": "Surface today",
+      "kind": "surface",
+      "state": "implemented",
+      "zone": "surfaces",
+      "x": 0.075,
+      "y": 0.18,
+      "description": "The original production channel. Bolt Socket Mode handles ingress; Slack Web API renders replies, progress cards, and approval cards. It is no longer the only registered production kind.",
+      "technology": [
+        "Slack Bolt",
+        "Socket Mode",
+        "Block Kit"
+      ],
+      "evidence": [
+        "architecture",
+        "message-flow"
+      ],
+      "adrIds": [
+        "ADR-0010",
+        "ADR-0020",
+        "ADR-0096",
+        "ADR-0118",
+        "ADR-0130"
+      ]
+    },
+    {
+      "id": "discord",
+      "label": "Discord",
+      "subtitle": "Shipped surface",
+      "kind": "surface",
+      "state": "implemented",
+      "zone": "surfaces",
+      "x": 0.075,
+      "y": 0.26,
+      "description": "Out-of-process Gateway adapter. Mentions in a bound parent channel create a public thread and placeholder; later thread messages continue the same conversation. v1 supports text, mentions, threads, and streamed edits. It does not implement buttons, DMs, attachments, or interactive approvals, and a Discord failure never falls back to Slack.",
+      "technology": [
+        "Discord Gateway",
+        "Discord REST",
+        "SQLite"
+      ],
+      "evidence": [
+        "discord-adapter-code",
+        "channel-api-code",
+        "architecture"
+      ],
+      "adrIds": [
+        "ADR-0020",
+        "ADR-0096",
+        "ADR-0118"
+      ]
+    },
+    {
+      "id": "email",
+      "label": "Email",
+      "subtitle": "Shipped surface",
+      "kind": "surface",
+      "state": "implemented",
+      "zone": "surfaces",
+      "x": 0.075,
+      "y": 0.34,
+      "description": "First-party AgentMail adapter. It polls an inbox, posts to POST /channels/turns under a scoped channel token, and sends one threaded reply per turn.completed. Delivery state is local SQLite with one serialized writer. Provider, channel, and egress credentials may come from per-field existing Secrets without chart ownership of their values. It does not implement interactive approvals. The adapter uses shared telemetry and credential redaction, including OTLP export and startup-failure logs, without a generic environment-injection surface.",
+      "technology": [
+        "AgentMail",
+        "SQLite",
+        "HTTP channel wire"
+      ],
+      "evidence": [
+        "mail-adapter-code",
+        "channel-api-code",
+        "architecture",
+        "chart-secret-template",
+        "mail-runtime-bootstrap-code",
+        "chart-mail-template"
+      ],
+      "adrIds": [
+        "ADR-0020",
+        "ADR-0096",
+        "ADR-0120",
+        "ADR-0118"
+      ]
+    },
+    {
+      "id": "teams",
+      "label": "Teams",
+      "subtitle": "Future surface",
+      "kind": "surface",
+      "state": "planned",
+      "zone": "surfaces",
+      "x": 0.075,
+      "y": 0.47,
+      "description": "Named in the vision, but deliberately deferred until a real second channel teaches the adapter interface.",
+      "technology": [
+        "Future adapter"
+      ],
+      "evidence": [
+        "vision",
+        "architecture-vision"
+      ],
+      "adrIds": [
+        "ADR-0016",
+        "ADR-0020"
+      ]
+    },
+    {
+      "id": "cli",
+      "label": "Curie CLI",
+      "subtitle": "Agent-facing control",
+      "kind": "surface",
+      "state": "implemented",
+      "zone": "surfaces",
+      "x": 0.075,
+      "y": 0.61,
+      "description": "Drives skill, local, and cluster loops. The local/cluster message verbs can replace Slack ingress and reply transport without changing the worker path. A bare curie doctor discovers the platform API from cluster state, cluster up --dev preserves recorded comms and sealing values, and release builds embed the exact source commit used to resolve installer artifacts. Plain cluster up, apply, and diff also retain installed typed mail settings, the three mail external Secret pairs, and the paired worker adapter credential source. Explicit source decisions take precedence without replaying stale inline credentials. Offline dry-run plans do not read an installed release. Cluster up and apply wait for the installed Helm target workloads to converge; cluster status returns failure with redacted generation, replica, image and hook diagnoses when the target is unhealthy. Sibling-tag image reports require a unique serving-Node inventory binding and conditional Node read; this does not prove mutable-tag freshness.",
+      "technology": [
+        "Rust",
+        "structured --json"
+      ],
+      "evidence": [
+        "architecture",
+        "interfaces",
+        "cli-doctor-code",
+        "cli-ops-code",
+        "cli-installation-code",
+        "cli-convergence-code"
+      ],
+      "adrIds": [
+        "ADR-0021",
+        "ADR-0041",
+        "ADR-0074"
+      ]
+    },
+    {
+      "id": "github",
+      "label": "GitHub",
+      "subtitle": "Push / PR trigger",
+      "kind": "surface",
+      "state": "implemented",
+      "zone": "surfaces",
+      "x": 0.075,
+      "y": 0.76,
+      "description": "Webhook and outbound commit polling converge on the API git-flow engine. Dev pushes build and evaluate; production pushes promote. The platform can also clone a managed workspace and publish through an approval-gated path that does not leave write credentials inside the sandbox.",
+      "technology": [
+        "HMAC webhook",
+        "commit poller",
+        "commit status"
+      ],
+      "evidence": [
+        "architecture"
+      ],
+      "adrIds": [
+        "ADR-0014",
+        "ADR-0091",
+        "ADR-0092",
+        "ADR-0125",
+        "ADR-0126"
+      ]
+    },
+    {
+      "id": "external-hook",
+      "label": "External hook",
+      "subtitle": "HMAC-triggered turn",
+      "kind": "surface",
+      "state": "implemented",
+      "zone": "surfaces",
+      "x": 0.075,
+      "y": 0.53,
+      "description": "A named, HMAC-authenticated API hook creates a quota- and body-bounded webhook-sourced turn whose authenticated payload is escaped and delimited as untrusted prompt content. Bundle-declared hook lifecycle and schedules remain planned.",
+      "technology": [
+        "HTTP",
+        "HMAC",
+        "typed QueuedTurn"
+      ],
+      "evidence": [
+        "interfaces",
+        "architecture",
+        "hook-code"
+      ],
+      "adrIds": [
+        "ADR-0079"
+      ]
+    },
+    {
+      "id": "console",
+      "label": "Console UI",
+      "subtitle": "Operations surface",
+      "kind": "surface",
+      "state": "implemented",
+      "zone": "surfaces",
+      "x": 0.075,
+      "y": 0.89,
+      "description": "A real API-backed console for fleet, runs, metrics, cost, logs, versions, evals, approvals, and memory. Approval resolution uses the authenticated Console session subject rather than a caller-supplied actor. Usage and Settings remain honest stubs. An external API requires an explicit proxy target; chart rendering refuses a disabled in-chart API without that target.",
+      "technology": [
+        "React",
+        "Vite",
+        "TypeScript"
+      ],
+      "evidence": [
+        "architecture",
+        "chart-ui-template"
+      ],
+      "adrIds": [
+        "ADR-0024",
+        "ADR-0083"
+      ]
+    },
+    {
+      "id": "dispatcher",
+      "label": "Dispatcher",
+      "subtitle": "Ingress \u00b7 dedupe \u00b7 placeholder",
+      "kind": "service",
+      "state": "implemented",
+      "zone": "control",
+      "x": 0.245,
+      "y": 0.2,
+      "description": "Before Socket Mode, a bounded startup preflight waits for API health and verifies configured Slack destination capabilities. The live dispatcher then normalizes Slack events and Block Kit text into QueuedTurn, records adapter-owned refusals, deduplicates ingress, posts the placeholder, and appends to the run stream. Approval clicks become independently signed, approval-bound chat principal attestations; an exact record miss is treated as another release owning that approval, never as authority to mutate it.",
+      "technology": [
+        "Python",
+        "Slack Bolt",
+        "Valkey"
+      ],
+      "evidence": [
+        "message-flow",
+        "architecture",
+        "dispatcher-preflight-code",
+        "approval-actions-code"
+      ],
+      "adrIds": [
+        "ADR-0012",
+        "ADR-0013"
+      ]
+    },
+    {
+      "id": "port-adapter",
+      "label": "Port adapter service",
+      "subtitle": "Third-party channel edge",
+      "kind": "service",
+      "state": "planned",
+      "zone": "surfaces",
+      "x": 0.105,
+      "y": 0.39,
+      "description": "The accepted placement for a generic third-party adapter kit: a deployed service, not a bundle-loaded plugin. Slack, Discord, and email already ship as first-party surfaces. The generic adapter manifest, install flow, service discovery, and conformance kit remain unbuilt.",
+      "technology": [
+        "Deployed service",
+        "future adapter kit"
+      ],
+      "evidence": [
+        "interfaces",
+        "architecture-vision"
+      ],
+      "adrIds": [
+        "ADR-0096"
+      ]
+    },
+    {
+      "id": "channel-api",
+      "label": "Channel HTTP edge",
+      "mapLabel": "Channel edge",
+      "subtitle": "Generic ingress + egress",
+      "kind": "service",
+      "state": "implemented",
+      "zone": "control",
+      "x": 0.285,
+      "y": 0.41,
+      "description": "The API mints row-scoped channel tokens and platform-owned QueuedTurn records. Discord and email already consume this HTTP edge. Worker-side HttpReplyAdapter posts the four versioned reply events to each binding's server-controlled endpoint.",
+      "technology": [
+        "POST /channels/turns",
+        "HttpReplyAdapter",
+        "scoped chn token"
+      ],
+      "evidence": [
+        "channel-api-code",
+        "reply-sink-code",
+        "binding-code",
+        "interfaces",
+        "architecture"
+      ],
+      "adrIds": [
+        "ADR-0096",
+        "ADR-0118"
+      ]
+    },
+    {
+      "id": "api",
+      "label": "API",
+      "subtitle": "Control plane \u00b7 git flow",
+      "kind": "service",
+      "state": "implemented",
+      "zone": "control",
+      "x": 0.275,
+      "y": 0.67,
+      "description": "Owns agents, versions, deployments, multi-surface channel bindings, approvals, state, connector rendering, managed repository workspaces, bundle validation, git-flow deploys, and read proxies. Approval resolution authenticates chat, Console, or operator principals; the platform key alone cannot resolve.",
+      "technology": [
+        "FastAPI",
+        "SQLAlchemy",
+        "Alembic"
+      ],
+      "evidence": [
+        "architecture",
+        "approval-principal-code",
+        "approval-auth-code"
+      ],
+      "adrIds": [
+        "ADR-0014",
+        "ADR-0033",
+        "ADR-0046",
+        "ADR-0118",
+        "ADR-0125",
+        "ADR-0126"
+      ]
+    },
+    {
+      "id": "queue",
+      "label": "Valkey streams",
+      "subtitle": "Runs \u00b7 evals \u00b7 delivery",
+      "kind": "broker",
+      "state": "implemented",
+      "zone": "core",
+      "x": 0.455,
+      "y": 0.31,
+      "description": "At-least-once streams carry run and eval jobs. Shared consumer machinery provides bounded delivery, a renewable fenced owner per delivery, and dead-letter handling. An external Valkey can require TLS; one shared chart helper keeps all seven consumers on the same transport and refuses TLS for the in-chart broker without a TLS listener.",
+      "technology": [
+        "Valkey",
+        "redis-py",
+        "consumer groups"
+      ],
+      "evidence": [
+        "architecture",
+        "interfaces",
+        "chart-helpers-code"
+      ],
+      "adrIds": [
+        "ADR-0013",
+        "ADR-0027",
+        "ADR-0039",
+        "ADR-0131"
+      ]
+    },
+    {
+      "id": "worker",
+      "label": "Worker kernel",
+      "mapLabel": "Worker",
+      "subtitle": "Route \u00b7 claim \u00b7 steer \u00b7 recover",
+      "kind": "service",
+      "state": "implemented",
+      "zone": "core",
+      "x": 0.575,
+      "y": 0.31,
+      "description": "The concurrency hub: resolves the active deployment, emits a typed terminal failure instead of dropping turns when none exists, enforces one live session per conversation, selects steer versus fresh turn, protects side effects, and reclaims crashed delivery only after sustained renewable-lease absence with one recovery owner. Each runner request is capped by both the configured runner ceiling and the delivery's remaining deadline.",
+      "technology": [
+        "Python",
+        "Valkey",
+        "Postgres"
+      ],
+      "evidence": [
+        "architecture",
+        "message-flow",
+        "worker-runner-client-code"
+      ],
+      "adrIds": [
+        "ADR-0013",
+        "ADR-0039",
+        "ADR-0059",
+        "ADR-0130",
+        "ADR-0131"
+      ]
+    },
+    {
+      "id": "approvals",
+      "label": "Approval plane",
+      "subtitle": "Durable human gate",
+      "kind": "capability",
+      "state": "implemented",
+      "zone": "core",
+      "x": 0.485,
+      "y": 0.58,
+      "description": "A gate terminates the turn as AWAITING_APPROVAL, persists a durable record and its validated originating trace context, suspends the sandbox, and later resumes through a new queued resolution turn that continues that trace when available. Legacy or malformed carriers intentionally start a clean root. The resume reconciler's grace is derived from the delivery budget plus shutdown reserve. Resolution accepts only authenticated chat, Console, or operator principals and checks every principal, including the requester, against the captured approver set. When multiple releases share one Slack app, only the API owning the approval record may resolve it. Known read-only tools avoid approval and receipt side effects.",
+      "technology": [
+        "API record",
+        "authorizer sets",
+        "semantic confirm"
+      ],
+      "evidence": [
+        "architecture",
+        "message-flow",
+        "approval-principal-code",
+        "approval-auth-code",
+        "approval-actions-code",
+        "chart-values"
+      ],
+      "adrIds": [
+        "ADR-0010",
+        "ADR-0034",
+        "ADR-0035",
+        "ADR-0046",
+        "ADR-0106",
+        "ADR-0123"
+      ]
+    },
+    {
+      "id": "eval-plane",
+      "label": "Eval plane",
+      "subtitle": "Cases \u00b7 graders \u00b7 report",
+      "kind": "capability",
+      "state": "implemented",
+      "zone": "core",
+      "x": 0.57,
+      "y": 0.72,
+      "description": "The same bundle-carried eval suite runs across skill, local, local-release, and cluster. Worker scores and records cases, then reports a rollup to the API.",
+      "technology": [
+        "frozen case schema",
+        "text graders",
+        "trajectory matcher"
+      ],
+      "evidence": [
+        "architecture",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0019",
+        "ADR-0022",
+        "ADR-0042",
+        "ADR-0055"
+      ]
+    },
+    {
+      "id": "sandbox",
+      "label": "Sandbox",
+      "subtitle": "One isolated session",
+      "kind": "runtime",
+      "state": "implemented",
+      "zone": "runtime",
+      "x": 0.69,
+      "y": 0.2,
+      "description": "An isolated runtime claimed per conversation. Kubernetes Agent Sandbox is production; Docker runs the same image locally. Session identity can arrive over the ACI so a warm pool sandbox may be pre-bound before the turn. Chart render fails closed if the retired in-path LiteLLM sidecar is re-enabled (ADR-0037).",
+      "technology": [
+        "Agent Sandbox",
+        "Docker",
+        "network policy"
+      ],
+      "evidence": [
+        "architecture",
+        "kubernetes"
+      ],
+      "adrIds": [
+        "ADR-0002",
+        "ADR-0028",
+        "ADR-0054",
+        "ADR-0059",
+        "ADR-0116"
+      ]
+    },
+    {
+      "id": "runner",
+      "label": "Runner / ACI server",
+      "mapLabel": "Runner",
+      "subtitle": "Multi-turn session loop",
+      "kind": "runtime",
+      "state": "implemented",
+      "zone": "runtime",
+      "x": 0.79,
+      "y": 0.2,
+      "description": "Serves event, steer, interrupt, timeout, reset, and snapshot; translates harness events into the frozen NDJSON union; injects memory and history; and probes MCP capabilities conservatively. Telemetry records each observed provider-wait and tool-wait interval as root siblings with bounded phase, terminal, round, TTFT, and outcome attributes.",
+      "technology": [
+        "Python",
+        "FastAPI",
+        "frozen ACI"
+      ],
+      "evidence": [
+        "architecture",
+        "aci-diagram",
+        "runner-adapter-code",
+        "runner-telemetry-code",
+        "runner-server-code"
+      ],
+      "adrIds": [
+        "ADR-0005",
+        "ADR-0017",
+        "ADR-0036",
+        "ADR-0049",
+        "ADR-0116",
+        "ADR-0117"
+      ]
+    },
+    {
+      "id": "harness",
+      "label": "Claude harness",
+      "mapLabel": "Harness",
+      "subtitle": "Declared package today",
+      "kind": "runtime",
+      "state": "implemented",
+      "zone": "runtime",
+      "x": 0.79,
+      "y": 0.4,
+      "description": "The only production harness contribution. ModelSession exists, but raw SDK messages and the Claude Code plugin format still cross the conceptual boundary.",
+      "technology": [
+        "claude-agent-sdk",
+        "Claude Code plugin format"
+      ],
+      "evidence": [
+        "architecture-vision",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0005",
+        "ADR-0060",
+        "ADR-0061",
+        "ADR-0062"
+      ]
+    },
+    {
+      "id": "model",
+      "label": "Model endpoint",
+      "mapLabel": "Model",
+      "subtitle": "Provider-selected inference",
+      "kind": "external",
+      "state": "implemented",
+      "zone": "runtime",
+      "x": 0.93,
+      "y": 0.4,
+      "description": "Anthropic is the default; OpenRouter, Zhipu, Moonshot, DeepSeek, and opt-in Ollama routes are also built. Cluster Ollama pulls now require an explicit durable-storage policy or a declaration that weights are pre-provisioned; ephemeral implicit downloads are refused before mutation. Native OpenAI wire format remains absent.",
+      "technology": [
+        "Anthropic",
+        "OpenRouter",
+        "provider-native endpoints",
+        "Ollama"
+      ],
+      "evidence": [
+        "architecture",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0015",
+        "ADR-0032",
+        "ADR-0048"
+      ]
+    },
+    {
+      "id": "connector-host",
+      "label": "MCP connector hosts",
+      "mapLabel": "MCP hosts",
+      "subtitle": "Collapsed MCP implementations",
+      "kind": "runtime",
+      "state": "implemented",
+      "zone": "runtime",
+      "x": 0.69,
+      "y": 0.48,
+      "description": "The stable MCP role in the architecture. Bundle-declared local and remote MCP servers stay collapsed behind this host boundary, so adding another server does not add another architecture box.",
+      "technology": [
+        "Kubernetes",
+        "MCP",
+        "bundle declaration"
+      ],
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0009",
+        "ADR-0086",
+        "ADR-0087",
+        "ADR-0088",
+        "ADR-0090"
+      ]
+    },
+    {
+      "id": "oauth-gateway",
+      "label": "MCP OAuth gateway",
+      "mapLabel": "OAuth gateway",
+      "subtitle": "Per-person delegated access",
+      "kind": "runtime",
+      "state": "planned",
+      "zone": "runtime",
+      "x": 0.87,
+      "y": 0.52,
+      "description": "The accepted vision boundary for delegated MCP authorization. The control plane owns OAuth discovery, PKCE, encrypted tokens, refresh, revocation, and grants; the gateway applies the active run principal's grant without exposing raw OAuth tokens to the runner.",
+      "technology": [
+        "OAuth 2.1",
+        "PKCE",
+        "MCP authorization",
+        "principal-bound grants"
+      ],
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0088",
+        "ADR-0106"
+      ]
+    },
+    {
+      "id": "agent-proxy",
+      "label": "Agent Proxy",
+      "subtitle": "Credentials + egress boundary",
+      "kind": "runtime",
+      "state": "planned",
+      "zone": "runtime",
+      "x": 0.93,
+      "y": 0.2,
+      "description": "Accepted architecture moves provider credentials and enforceable egress policy out of the sandbox. The direction is decided, but substrate, TLS termination, credential injection, and implementation remain follow-up work.",
+      "technology": [
+        "Accepted proxy boundary"
+      ],
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0075"
+      ]
+    },
+    {
+      "id": "otel",
+      "label": "OTel collector",
+      "subtitle": "Telemetry write port",
+      "kind": "observability",
+      "state": "implemented",
+      "zone": "foundation",
+      "x": 0.735,
+      "y": 0.69,
+      "description": "Receives OTLP from Curie services and the runner and exports to Langfuse over HTTP. Ingress, durable approval resolution, expiry, and reconciliation preserve the originating W3C trace context when valid; missing or malformed legacy carriers start clean roots. The runner emits truthful sibling provider/tool phase intervals with a closed versioned attribute set; the collector boundary remains mostly vendor-neutral. For chart-managed sandboxes with NetworkPolicy enabled, a configured external collector endpoint requires declared runner egress CIDRs; chart rendering refuses an undeclared route. Disabling telemetry requires no collector egress rule.",
+      "technology": [
+        "OpenTelemetry",
+        "OTLP HTTP/gRPC"
+      ],
+      "evidence": [
+        "architecture",
+        "interfaces",
+        "runner-telemetry-code",
+        "chart-runner-netpol"
+      ],
+      "adrIds": [
+        "ADR-0004",
+        "ADR-0076"
+      ]
+    },
+    {
+      "id": "langfuse",
+      "label": "Langfuse",
+      "subtitle": "Traces \u00b7 metrics \u00b7 eval scores",
+      "kind": "observability",
+      "state": "implemented",
+      "zone": "foundation",
+      "x": 0.865,
+      "y": 0.69,
+      "description": "The current trace and eval store. The shipping Helm surface pins the reviewed Langfuse web and worker migration set together with ClickHouse 25.12.11.4, avoiding an upstream-republished minor alias; its AVX preflight fails the default installation on AVX-less nodes rather than allowing a migration-incompatible store. Compose retains its separate SSE4.2-safe ClickHouse pin for local evidence. The API reconstructs trees and metrics through a vendor-specific read adapter. Operators can disable the in-chart deployment and point every consumer at an explicit external Langfuse host without rendering a nonexistent in-cluster Service. External Langfuse and ClickHouse endpoints use validated HTTP or HTTPS scheme settings shared by their chart consumers.",
+      "technology": [
+        "Langfuse v3",
+        "ClickHouse"
+      ],
+      "evidence": [
+        "architecture",
+        "architecture-vision",
+        "chart-values",
+        "chart-helpers-code"
+      ],
+      "adrIds": [
+        "ADR-0004"
+      ]
+    },
+    {
+      "id": "postgres",
+      "label": "Postgres",
+      "subtitle": "Control-plane state",
+      "kind": "data",
+      "state": "implemented",
+      "zone": "foundation",
+      "x": 0.735,
+      "y": 0.87,
+      "description": "Stores agents, versions, deployments, channel bindings, approvals, memory, history, and other durable control-plane state. Workflow-state identity distinguishes binding-scoped rows from one shared NULL scope, enforced with PostgreSQL 15 NULLS NOT DISTINCT so legacy shared memory cannot fork into duplicates.",
+      "technology": [
+        "Postgres",
+        "SQLAlchemy",
+        "JSONB"
+      ],
+      "evidence": [
+        "architecture-vision",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0008",
+        "ADR-0025",
+        "ADR-0029"
+      ]
+    },
+    {
+      "id": "object-store",
+      "label": "RustFS / S3",
+      "subtitle": "Immutable bundles",
+      "kind": "data",
+      "state": "implemented",
+      "zone": "foundation",
+      "x": 0.865,
+      "y": 0.87,
+      "description": "Stores immutable agent bundles and eval inputs behind an S3-compatible protocol and ObjectStore port. With a bring-your-own store and egress rail enabled, runner bundle fetch is fail-closed until explicit store CIDRs and ports are supplied; the key-free path also requires separate STS egress and uses projected service-account identity rather than node metadata.",
+      "technology": [
+        "RustFS",
+        "S3 protocol",
+        "boto3"
+      ],
+      "evidence": [
+        "architecture-vision",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0014",
+        "ADR-0026"
+      ]
+    },
+    {
+      "id": "kubernetes",
+      "label": "Kubernetes",
+      "subtitle": "Production substrate",
+      "kind": "substrate",
+      "state": "implemented",
+      "zone": "foundation",
+      "x": 0.945,
+      "y": 0.72,
+      "description": "Baseline production substrate: platform services, Agent Sandbox CRDs, security rails, connector workloads, and observability dependencies. Helm upgrades preserve external credential references and heal missing or blank legacy chart-managed Secret keys while retaining nonblank persisted values.",
+      "technology": [
+        "Kubernetes",
+        "Helm",
+        "Agent Sandbox"
+      ],
+      "evidence": [
+        "kubernetes",
+        "architecture",
+        "chart-secret-template",
+        "chart-values"
+      ],
+      "adrIds": [
+        "ADR-0002",
+        "ADR-0006",
+        "ADR-0023"
+      ]
+    },
+    {
+      "id": "docker",
+      "label": "Docker",
+      "subtitle": "Local parity substrate",
+      "kind": "substrate",
+      "state": "implemented",
+      "zone": "foundation",
+      "x": 0.945,
+      "y": 0.87,
+      "description": "Runs the same worker and runner image locally behind the same SandboxClient contract.",
+      "technology": [
+        "Docker Compose",
+        "Docker sandbox"
+      ],
+      "evidence": [
+        "architecture",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0012",
+        "ADR-0028",
+        "ADR-0054"
+      ]
+    }
+  ],
+  "seams": [
+    {
+      "id": "channel-ingress",
+      "label": "Channel ingress + binding",
+      "maturity": "green",
+      "catalogKind": "SOFT",
+      "grade": "B-",
+      "implementations": "3 production channels (Slack Bolt, Discord HTTP adapter, email HTTP adapter) plus the CLI transport stub",
+      "contract": "QueuedTurn + ReplyHandle; neutral {kind, address} deployment binding",
+      "reason": "Slack, Discord, and email all mint or consume the same channel-neutral QueuedTurn and (kind, address) binding. Discord and email prove the HTTP edge that Slack does not use.",
+      "leakage": "The generated interface catalog still says one implementation. Discord v1 and email do not share Slack's in-process dispatcher or approval cards.",
+      "nextStep": "Regenerate the Communication catalog row from the three shipped adapters, then decide whether Teams or Discord approvals is the remaining proof.",
+      "evidence": [
+        "channel-api-code",
+        "binding-code",
+        "discord-adapter-code",
+        "mail-adapter-code",
+        "interfaces",
+        "architecture"
+      ],
+      "adrIds": [
+        "ADR-0012",
+        "ADR-0020",
+        "ADR-0096",
+        "ADR-0118"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "discord-turn",
+        "email-turn",
+        "approval-loop"
+      ]
+    },
+    {
+      "id": "channel-reply",
+      "label": "Reply delivery semantics",
+      "maturity": "yellow",
+      "catalogKind": "SOFT",
+      "grade": "B-",
+      "implementations": "SlackReplyAdapter plus HttpReplyAdapter consumed by Discord and email",
+      "contract": "ReplySink.emit over turn.status, reply.update, reply.post, and turn.completed",
+      "reason": "The four versioned reply events now leave the worker for three surfaces. Slack still owns edit-in-place streaming and approval-card settlement.",
+      "leakage": "Discord v1 falls back to text and does not implement buttons. Email sends one correspondent-visible reply per turn.completed and does not settle approvals. Neither surface may fall back to Slack.",
+      "nextStep": "Keep the HTTP reply wire; add Discord interaction or treat email's one-shot reply as a distinct delivery policy rather than a missing Slack feature.",
+      "evidence": [
+        "reply-sink-code",
+        "channel-api-code",
+        "discord-adapter-code",
+        "mail-adapter-code",
+        "interfaces",
+        "message-flow"
+      ],
+      "adrIds": [
+        "ADR-0020",
+        "ADR-0063",
+        "ADR-0078",
+        "ADR-0096",
+        "ADR-0120",
+        "ADR-0130"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "discord-turn",
+        "email-turn",
+        "approval-loop"
+      ]
+    },
+    {
+      "id": "channel-interaction",
+      "label": "Semantic channel interaction",
+      "maturity": "green",
+      "catalogKind": "CLEAN",
+      "grade": "\u2014",
+      "implementations": "2 real renderers (Slack Block Kit, terminal selector)",
+      "contract": "Versioned OutboundMessage with text fallback, Choice, Confirm, and semantic action values",
+      "reason": "Two distinct surfaces render the same semantic message without putting their widgets in the contract.",
+      "leakage": "The terminal mirror is handwritten and capabilities are modeled but not dynamically negotiated. Discord and email do not render Choice or Confirm.",
+      "nextStep": "Wire capability negotiation when a shipped surface other than Slack needs buttons or cards.",
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0020"
+      ],
+      "flowIds": [
+        "approval-loop",
+        "email-turn",
+        "discord-turn"
+      ]
+    },
+    {
+      "id": "queue-stream",
+      "label": "Queue / stream broker",
+      "maturity": "yellow",
+      "catalogKind": "CLEAN",
+      "grade": "\u2014",
+      "implementations": "1 real broker (Valkey) behind producer and consumer ports",
+      "contract": "StreamPublisher + StreamBroker ports, frozen payload field, shared bounded consumer, and one renewable fenced owner per delivery",
+      "reason": "The port and consumer invariants are explicit, but a second broker has not exercised them.",
+      "leakage": "Some API producers and graveyard readers still bypass the ports; the adjacent consumer-liveness store, set verbs, and redis-py exception types also leak Valkey semantics.",
+      "nextStep": "No speculative adapter; promote only if a real broker demand appears.",
+      "evidence": [
+        "interfaces",
+        "architecture"
+      ],
+      "adrIds": [
+        "ADR-0013",
+        "ADR-0027",
+        "ADR-0039",
+        "ADR-0131"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "discord-turn",
+        "email-turn",
+        "approval-loop",
+        "git-deploy",
+        "eval-loop"
+      ]
+    },
+    {
+      "id": "substrate",
+      "label": "Sandbox substrate",
+      "maturity": "green",
+      "catalogKind": "CLEAN",
+      "grade": "\u2014",
+      "implementations": "2 real implementations (Kubernetes, Docker)",
+      "contract": "Six-method SandboxClient claim lifecycle plus ClaimView and SandboxView outcome types",
+      "reason": "The same kernel and runner operate through two materially different runtime implementations.",
+      "leakage": "SandboxView.port, model-credential forwarding, connector-secret delivery, warm-pool behavior, and production capacity still differ across Kubernetes and Docker.",
+      "nextStep": "Keep parity tests focused on the shared outcomes; do not turn substrate choice into a product axis.",
+      "evidence": [
+        "interfaces",
+        "architecture",
+        "kubernetes"
+      ],
+      "adrIds": [
+        "ADR-0002",
+        "ADR-0028"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "approval-loop",
+        "eval-loop"
+      ]
+    },
+    {
+      "id": "aci",
+      "label": "Frozen ACI protocol",
+      "maturity": "yellow",
+      "catalogKind": "CLEAN, frozen",
+      "grade": "A-",
+      "implementations": "1 production producer + scripted reference/conformance implementation",
+      "contract": "SessionConfig, boot env, HTTP control verbs, and versioned NDJSON events across Python/TS/Rust",
+      "reason": "This is the strongest documented boundary, but only one production harness stack has proven it end to end.",
+      "leakage": "A non-Claude harness must still consume or translate the Claude Code plugin bundle shape.",
+      "nextStep": "Use the conformance guide against a genuinely different production harness.",
+      "evidence": [
+        "aci-diagram",
+        "architecture-vision",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0005",
+        "ADR-0017",
+        "ADR-0036",
+        "ADR-0062",
+        "ADR-0116"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "approval-loop",
+        "eval-loop"
+      ]
+    },
+    {
+      "id": "harness-modelsession",
+      "label": "Runner \u2194 harness / ModelSession",
+      "maturity": "red",
+      "catalogKind": "CLEAN",
+      "grade": "A-",
+      "implementations": "1 production SDK + fake",
+      "contract": "In-process ModelSession protocol and declared harness contribution",
+      "reason": "The named protocol is real, but its message union is still SDK-shaped and the bundle distribution format is Claude Code verbatim.",
+      "leakage": "A foreign harness must emit Claude SDK-shaped objects or replace the runner adapter while also interpreting the Claude plugin format.",
+      "nextStep": "Prove the out-of-process ACI boundary with a second harness; keep provider-native checkpointing an optional capability.",
+      "evidence": [
+        "runner-adapter-code",
+        "architecture-vision",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0005",
+        "ADR-0060",
+        "ADR-0061",
+        "ADR-0105"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "approval-loop",
+        "eval-loop"
+      ]
+    },
+    {
+      "id": "harness-package",
+      "label": "Declared harness package",
+      "maturity": "yellow",
+      "catalogKind": "CLEAN",
+      "grade": "\u2014",
+      "implementations": "1 declared contribution (Claude)",
+      "contract": "HarnessContribution manifest; built-ins resolve directly and third-party contributions use curie.harness entry points",
+      "reason": "Selection and declared assets are clean, but there is no second real package and third-party conformance remains unproven.",
+      "leakage": "The registry currently wraps the same built-in adapter rather than demonstrating substitution.",
+      "nextStep": "Publish and run contribution conformance against a non-built-in package.",
+      "evidence": [
+        "architecture-vision",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0060",
+        "ADR-0062"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "eval-loop"
+      ]
+    },
+    {
+      "id": "model-provider",
+      "label": "Model provider + credentials",
+      "maturity": "yellow",
+      "catalogKind": "SOFT",
+      "grade": "\u2014",
+      "implementations": "Multiple live endpoints through one Claude-SDK / Anthropic-wire strategy",
+      "contract": "Declared wire protocol, provider endpoint, canonical credential keys, and boot-env forwarding",
+      "reason": "Several endpoints exercise routing and credential resolution, but they do not represent multiple independent provider or harness implementations of the boundary.",
+      "leakage": "Native OpenAI wire format is absent; several providers share compatibility routing rather than independent harness implementations.",
+      "nextStep": "Add native OpenAI wire only when its semantics are tested through the live-provider parity tier.",
+      "evidence": [
+        "architecture",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0015",
+        "ADR-0032",
+        "ADR-0048",
+        "ADR-0049"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "eval-loop"
+      ]
+    },
+    {
+      "id": "telemetry",
+      "label": "Telemetry / OTLP",
+      "maturity": "yellow",
+      "catalogKind": "SOFT",
+      "grade": "B+",
+      "implementations": "1 trace backend (Langfuse) behind an OTel collector",
+      "contract": "OTLP write path + versioned phase semantics + Curie API DTO read path",
+      "reason": "Curie preserves valid W3C parentage from ingress through durable approval resolution, expiry, and reconciliation, the runner records real provider/tool intervals behind a closed attribute contract, and the UI sees Curie DTOs; only Langfuse has exercised both sides.",
+      "leakage": "Vendor attributes and /langfuse URL namespaces still leak into the otherwise neutral boundary; the read adapter spans multiple modules.",
+      "nextStep": "Map vendor span attributes in the collector and neutralize read-route naming.",
+      "evidence": [
+        "architecture",
+        "architecture-vision",
+        "interfaces",
+        "runner-telemetry-code",
+        "approval-actions-code"
+      ],
+      "adrIds": [
+        "ADR-0004",
+        "ADR-0076"
+      ],
+      "flowIds": [
+        "observability",
+        "eval-loop"
+      ]
+    },
+    {
+      "id": "eval-scorer",
+      "label": "Eval case + scorer",
+      "maturity": "green",
+      "catalogKind": "SOFT",
+      "grade": "B",
+      "implementations": "Multiple grader kinds plus a trajectory matcher across Python and Rust",
+      "contract": "Frozen eval-case schema + shared trajectory vectors + tri-state outcomes",
+      "reason": "Distinct scoring implementations and two languages exercise the case boundary, with shared fixtures pinning semantics.",
+      "leakage": "Python and Rust still implement graders separately; cluster answer-quality failure is not yet universally fatal.",
+      "nextStep": "Land semantic provenance verification before making cluster answer-quality promotion fatal.",
+      "evidence": [
+        "architecture",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0019",
+        "ADR-0022",
+        "ADR-0042",
+        "ADR-0053",
+        "ADR-0055"
+      ],
+      "flowIds": [
+        "git-deploy",
+        "eval-loop"
+      ]
+    },
+    {
+      "id": "eval-store",
+      "label": "Eval result store",
+      "maturity": "yellow",
+      "catalogKind": "SOFT",
+      "grade": "B",
+      "implementations": "1 backend (Langfuse traces + scores)",
+      "contract": "Eval recorder write + EvalMatrix read DTO + version:/suite: tag convention",
+      "reason": "The platform owns the result shape, but only one backend and one unfrozen tag convention have exercised it.",
+      "leakage": "The recorder and matrix reader encode Langfuse tags and API behavior directly.",
+      "nextStep": "Record or freeze the tag convention; wait for a real second store before inventing a generic adapter.",
+      "evidence": [
+        "architecture-vision",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0004",
+        "ADR-0019"
+      ],
+      "flowIds": [
+        "git-deploy",
+        "eval-loop",
+        "observability"
+      ]
+    },
+    {
+      "id": "blob-storage",
+      "label": "Blob storage",
+      "maturity": "yellow",
+      "catalogKind": "CLEAN",
+      "grade": "B+",
+      "implementations": "1 backend (RustFS) over S3-compatible protocol",
+      "contract": "ObjectStore port + shared S3 client + bundle-fetch init path",
+      "reason": "The port is explicit and S3-compatible services are configuration swaps, but no non-S3 implementation has tested the abstraction.",
+      "leakage": "API and worker use separate async/sync adapters, while bucket bootstrap, init containers, migration, key-free auth, and NetworkPolicy CIDR configuration retain S3-specific obligations.",
+      "nextStep": "Leave it alone until a real non-S3 demand appears; keep the BYO egress and web-identity render assertions as the fail-closed operational boundary.",
+      "evidence": [
+        "architecture-vision",
+        "interfaces",
+        "chart-values"
+      ],
+      "adrIds": [
+        "ADR-0026"
+      ],
+      "flowIds": [
+        "git-deploy",
+        "eval-loop"
+      ]
+    },
+    {
+      "id": "relational-db",
+      "label": "Relational database",
+      "maturity": "yellow",
+      "catalogKind": "SOFT",
+      "grade": "A-",
+      "implementations": "1 engine family (Postgres; self-hosted or managed)",
+      "contract": "SQLAlchemy models + Alembic migrations + DSN",
+      "reason": "Managed Postgres is a clean operational swap, but another SQL engine has not exercised the model boundary.",
+      "leakage": "Postgres UUID, JSONB, schema qualification, native enums, DISTINCT ON SQL, asyncpg-specific JSONB decoding, and PostgreSQL 15 NULLS NOT DISTINCT workflow-state identity remain in application code or migrations.",
+      "nextStep": "Keep Postgres opinionated unless a concrete alternate engine demand emerges.",
+      "evidence": [
+        "architecture-vision",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0008"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "approval-loop",
+        "git-deploy"
+      ]
+    },
+    {
+      "id": "approval-authorizer",
+      "label": "Approval authorizer",
+      "maturity": "green",
+      "catalogKind": "CLEAN",
+      "grade": "\u2014",
+      "implementations": "3 real approver sets (channel, user group, explicit users)",
+      "contract": "ApproverSet / ApprovalCreator + authenticated ApprovalPrincipal + durable semantic approval record",
+      "reason": "Three distinct membership strategies exercise one API-owned authorization interface after resolver identity is authenticated separately.",
+      "leakage": "Channel membership remains Slack-shaped, while Console and operator principals are intentionally eligible for only the approver sets their credential kind can satisfy.",
+      "nextStep": "Exercise the same authenticated-principal and membership boundary through a second interactive channel before broadening approval authority.",
+      "evidence": [
+        "interfaces",
+        "architecture",
+        "approval-principal-code",
+        "approval-auth-code"
+      ],
+      "adrIds": [
+        "ADR-0010",
+        "ADR-0034",
+        "ADR-0046",
+        "ADR-0106"
+      ],
+      "flowIds": [
+        "approval-loop"
+      ]
+    },
+    {
+      "id": "approval-principal",
+      "label": "Approval principal identity",
+      "maturity": "green",
+      "catalogKind": "SOFT",
+      "grade": "\u2014",
+      "implementations": "3 authenticated principal kinds (chat, Console, operator)",
+      "contract": "Canonical ApprovalPrincipal + credential-kind eligibility + authenticated audit fields",
+      "reason": "Three independent credential paths derive one server-owned principal shape before the common membership decision.",
+      "leakage": "Chat attestations remain Slack-specific, operator principals are limited to explicit-user sets, and Console principals cannot assert channel evidence.",
+      "nextStep": "Add a second adapter-scoped interactive credential without widening any existing principal kind or accepting the platform key as resolver identity.",
+      "evidence": [
+        "architecture",
+        "interfaces",
+        "approval-principal-code",
+        "approval-auth-code"
+      ],
+      "adrIds": [
+        "ADR-0033",
+        "ADR-0034",
+        "ADR-0106"
+      ],
+      "flowIds": [
+        "approval-loop"
+      ]
+    },
+    {
+      "id": "workflow-state",
+      "label": "Workflow state store",
+      "maturity": "red",
+      "catalogKind": "SOFT",
+      "grade": "\u2014",
+      "implementations": "1 state API router over Postgres JSONB",
+      "contract": "Scoped namespace/key document API with size limits, CAS behavior, and singular shared NULL-scope identity",
+      "reason": "The HTTP state router is useful, but not every state consumer stays behind it; operator memory and relational paths can bypass the supposed boundary.",
+      "leakage": "A second state backend would not cover direct model/JSONB access, while memory and transcript loaders still depend on the HTTP shape and capacity limits.",
+      "nextStep": "Inventory and close bypasses before extracting another backend; then treat retention, capacity, and back-pressure as one admission policy.",
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0025",
+        "ADR-0029",
+        "ADR-0109"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "approval-loop"
+      ]
+    },
+    {
+      "id": "memory",
+      "label": "Agent memory",
+      "maturity": "yellow",
+      "catalogKind": "CLEAN",
+      "grade": "\u2014",
+      "implementations": "1 real loader (StateApiMemoryStore)",
+      "contract": "MemoryStore load/append, optional replace, and boot-preamble injection over a scoped state token",
+      "reason": "The loader port and null implementation are clean, but no alternate durable memory backend has exercised them.",
+      "leakage": "The operator inspect/seed/edit/delete plane addresses the Postgres WorkflowStateEntry backing directly instead of going through MemoryStore.",
+      "nextStep": "Keep the operator plane and any future loader consistent before adding another backing; automatic learned-record extraction remains future work.",
+      "evidence": [
+        "interfaces",
+        "architecture"
+      ],
+      "adrIds": [
+        "ADR-0025",
+        "ADR-0030",
+        "ADR-0095",
+        "ADR-0111"
+      ],
+      "flowIds": [
+        "slack-turn"
+      ]
+    },
+    {
+      "id": "conversation-history",
+      "label": "Conversation history",
+      "maturity": "yellow",
+      "catalogKind": "CLEAN",
+      "grade": "\u2014",
+      "implementations": "1 real loader (StateApiTranscriptStore)",
+      "contract": "TranscriptStore load/append + deterministic per-agent/thread reference",
+      "reason": "The harness-neutral replay path is explicit, but only one store and prompt-preamble rehydration have proven it. Append records only a successful model-produced terminal final with DONE status; classified failures, budget/auth halts, awaiting-approval, and synthetic incomplete finals are omitted.",
+      "leakage": "Stored append logs remain unbounded under state-store caps; replay is semantic, not token-exact or native-session restoration.",
+      "nextStep": "Keep portable replay mandatory; add native checkpoints only as an optional harness capability.",
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0003",
+        "ADR-0029",
+        "ADR-0105"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "approval-loop"
+      ]
+    },
+    {
+      "id": "triggers",
+      "label": "Trigger ingestion",
+      "maturity": "red",
+      "catalogKind": "SOFT",
+      "grade": "\u2014",
+      "implementations": "4 hardcoded trigger paths (Slack, GitHub webhook, commit poller, generic HMAC hook)",
+      "contract": "No unified runtime trigger port; API hooks mint bounded webhook-sourced turns while bundle declarations and schedules remain planned",
+      "reason": "Several triggers exist, but they do not implement one shared trigger interface or one event lifecycle.",
+      "leakage": "Slack enters through dispatcher while GitHub, polling, and generic hooks enter through API-specific handlers; bundle-declared hooks and schedules are not consumed.",
+      "nextStep": "Connect declarations and schedules to the shipped bounded hook lifecycle before expanding trigger types.",
+      "evidence": [
+        "interfaces",
+        "architecture"
+      ],
+      "adrIds": [
+        "ADR-0079",
+        "ADR-0099"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "git-deploy",
+        "webhook-turn",
+        "future-hooks"
+      ]
+    },
+    {
+      "id": "cli-output",
+      "label": "Agent-facing CLI output",
+      "maturity": "green",
+      "catalogKind": "CLEAN",
+      "grade": "\u2014",
+      "implementations": "46 typed outputs behind one trait across many verbs",
+      "contract": "CliOutput + Ui.emit + versioned JSON result schemas",
+      "reason": "Many independent command results exercise the same human/JSON emission boundary.",
+      "leakage": "A tracked set of legacy/operator verbs still has inline or unstructured success output.",
+      "nextStep": "Finish migrating the tracked exceptions without widening the output contract.",
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0021",
+        "ADR-0041",
+        "ADR-0074"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "git-deploy"
+      ]
+    },
+    {
+      "id": "connector-host",
+      "label": "MCP connector host",
+      "maturity": "red",
+      "catalogKind": "CLEAN",
+      "grade": "\u2014",
+      "implementations": "1 real Kubernetes host + in-memory fake",
+      "contract": "Bundle declaration \u2192 rendered connector workload \u2192 MCP reachability",
+      "reason": "The typed client exposes raw Kubernetes JSON, rendering is Kubernetes-specific outside the port, and CLI and reconciler paths do not share identical apply/prune semantics.",
+      "leakage": "Build inputs, pinned images, delegated OAuth, runtime injection, reconciliation, and Kubernetes objects cross control-plane and cluster ownership.",
+      "nextStep": "Close runtime injection and converge CLI/reconciler lifecycle before calling the host portable.",
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0086",
+        "ADR-0087",
+        "ADR-0088",
+        "ADR-0090",
+        "ADR-0113",
+        "ADR-0117"
+      ],
+      "flowIds": [
+        "slack-turn",
+        "mcp-service-call",
+        "mcp-delegated-oauth"
+      ]
+    },
+    {
+      "id": "mcp-service-auth",
+      "label": "MCP service-key authentication",
+      "maturity": "yellow",
+      "catalogKind": "SOFT",
+      "grade": "\u2014",
+      "implementations": "1 deployment-owned service identity mode",
+      "contract": "Named connector secret \u2192 platform-hosted MCP environment or authorization header",
+      "reason": "Service credentials already cross a named secret boundary and stay owned by the deployment, but no second production identity mode has proved the abstraction.",
+      "leakage": "Secret rendering and delivery still span bundle declaration, API, Kubernetes, and the incomplete sealed-credential consumer path.",
+      "nextStep": "Keep service authentication explicit and fail closed; prove delegated OAuth as a separate identity mode with no fallback between them.",
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0009",
+        "ADR-0086",
+        "ADR-0094"
+      ],
+      "flowIds": [
+        "mcp-service-call"
+      ]
+    },
+    {
+      "id": "mcp-delegated-oauth",
+      "label": "Per-person MCP OAuth",
+      "maturity": "planned",
+      "catalogKind": "NONE",
+      "grade": "\u2014",
+      "implementations": "0; accepted architecture only",
+      "contract": "Canonical run principal \u2192 principal-scoped grant \u2192 control-plane-owned OAuth gateway \u2192 MCP server",
+      "reason": "ADR-0088 defines the ownership and fail-closed behavior, but the gateway, grant lifecycle, connection action, and resume path are not shipped.",
+      "leakage": "Until implemented, MCP calls cannot safely act with each human's authority; the existing deployment service identity is the only current mode.",
+      "nextStep": "Implement discovery, PKCE, encrypted grant storage, refresh and revocation, then prove missing-auth pause and post-callback resume without giving the runner a raw token.",
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0088",
+        "ADR-0106"
+      ],
+      "flowIds": [
+        "mcp-delegated-oauth"
+      ]
+    },
+    {
+      "id": "sealed-credential",
+      "label": "Sealed connector credential",
+      "maturity": "red",
+      "catalogKind": "SOFT",
+      "grade": "\u2014",
+      "implementations": "1 cross-language wire (Rust sealer, Python opener)",
+      "contract": "Frozen sealed-credential envelope with cluster-side opening",
+      "reason": "The Rust sealer and Python opener interoperate, but the product path is disconnected: validation and delivery do not yet form one working production consumer path.",
+      "leakage": "Security depends on exact agreement between CLI, API rendering, cluster delivery, and the currently uncalled opener.",
+      "nextStep": "Connect and prove the complete sealed-secret path before expanding its wire or consumers.",
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0009",
+        "ADR-0094"
+      ],
+      "flowIds": [
+        "git-deploy"
+      ]
+    },
+    {
+      "id": "bundle-format",
+      "label": "Bundle / plugin format",
+      "maturity": "yellow",
+      "catalogKind": "CLEAN, frozen",
+      "grade": "\u2014",
+      "implementations": "1 deliberately adopted format (Claude Code plugin)",
+      "contract": "Frozen Pydantic models + regenerated committed JSON Schema (no generated Rust/TS) + immutable content-addressed bundle",
+      "reason": "The format is strongly enforced but intentionally has one implementation and one ecosystem shape.",
+      "leakage": "This is the main coupling that a non-Claude harness must interpret or translate.",
+      "nextStep": "Do not invent another format; require alternate harnesses to demonstrate a translation strategy.",
+      "evidence": [
+        "architecture-vision",
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0007",
+        "ADR-0014",
+        "ADR-0017"
+      ],
+      "flowIds": [
+        "git-deploy",
+        "eval-loop"
+      ]
+    },
+    {
+      "id": "port-adapter-service",
+      "label": "Third-party port adapter",
+      "maturity": "planned",
+      "catalogKind": "NONE",
+      "grade": "\u2014",
+      "implementations": "0 generic adapter-kit services; Discord and email are first-party adapters on the shipped HTTP edge",
+      "contract": "Intended deployed-service placement; no runtime implementation",
+      "reason": "ADR-0096 still places a third-party adapter as a deployed service. The generic kit is unbuilt; first-party Discord and email adapters already use the HTTP edge without that kit.",
+      "leakage": "Adapter discovery, routing, credentials, conformance, and lifecycle are still future work.",
+      "nextStep": "Build the adapter kit only if a third-party channel needs install, discovery, and conformance beyond the two shipped first-party adapters.",
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0096"
+      ],
+      "flowIds": []
+    },
+    {
+      "id": "agent-proxy",
+      "label": "Agent Proxy boundary",
+      "maturity": "planned",
+      "catalogKind": "NONE",
+      "grade": "\u2014",
+      "implementations": "0",
+      "contract": "Accepted credential and egress enforcement boundary outside the sandbox",
+      "reason": "The direction is accepted but intentionally unimplemented pending narrower substrate, TLS, and injection decisions.",
+      "leakage": "Provider credentials and web egress still enter the sandbox under current controls.",
+      "nextStep": "Land the follow-up ADRs for substrate, TLS termination, and credential injection before implementation.",
+      "evidence": [
+        "interfaces"
+      ],
+      "adrIds": [
+        "ADR-0075"
+      ],
+      "flowIds": [
+        "slack-turn"
+      ]
+    },
+    {
+      "id": "promotion-gate",
+      "label": "Eval result \u2192 promotion authority",
+      "maturity": "planned",
+      "catalogKind": "NONE",
+      "grade": "\u2014",
+      "implementations": "Commit status exists; internal promotion enforcement does not",
+      "contract": "Reserved policy boundary between graded evidence and production deployment",
+      "reason": "The API reports eval state to GitHub, but process_push does not read that result before creating a production deployment.",
+      "leakage": "Safety depends on external branch protection and release policy rather than a product invariant.",
+      "nextStep": "Land semantic provenance first, then bind promotion to an authoritative graded result without rebuilding the artifact.",
+      "evidence": [
+        "architecture"
+      ],
+      "adrIds": [
+        "ADR-0014",
+        "ADR-0022",
+        "ADR-0042"
+      ],
+      "flowIds": [
+        "git-deploy",
+        "eval-loop"
+      ]
+    }
+  ],
+  "routes": [
+    {
+      "id": "slack-dispatcher",
+      "from": "slack",
+      "to": "dispatcher",
+      "label": "mention / DM",
+      "state": "current",
+      "seamId": "channel-ingress",
+      "bend": 0
+    },
+    {
+      "id": "email-adapter",
+      "from": "email",
+      "to": "channel-api",
+      "label": "POST /channels/turns",
+      "state": "current",
+      "seamId": "channel-ingress",
+      "bend": -8
+    },
+    {
+      "id": "discord-channel-api",
+      "from": "discord",
+      "to": "channel-api",
+      "label": "POST /channels/turns",
+      "state": "current",
+      "seamId": "channel-ingress",
+      "bend": 8
+    },
+    {
+      "id": "teams-adapter",
+      "from": "teams",
+      "to": "port-adapter",
+      "label": "normalized event",
+      "state": "planned",
+      "seamId": "port-adapter-service",
+      "bend": 18
+    },
+    {
+      "id": "adapter-channel-api",
+      "from": "port-adapter",
+      "to": "channel-api",
+      "label": "scoped HTTP",
+      "state": "planned",
+      "seamId": "port-adapter-service",
+      "bend": 0
+    },
+    {
+      "id": "channel-api-adapter",
+      "from": "channel-api",
+      "to": "port-adapter",
+      "label": "reply event callback",
+      "state": "planned",
+      "seamId": "port-adapter-service",
+      "bend": 20
+    },
+    {
+      "id": "adapter-email-reply",
+      "from": "port-adapter",
+      "to": "email",
+      "label": "email reply",
+      "state": "planned",
+      "seamId": "channel-reply",
+      "bend": 18
+    },
+    {
+      "id": "channel-api-queue",
+      "from": "channel-api",
+      "to": "queue",
+      "label": "platform-minted QueuedTurn",
+      "state": "current",
+      "seamId": "channel-ingress",
+      "bend": -12
+    },
+    {
+      "id": "cli-queue",
+      "from": "cli",
+      "to": "queue",
+      "label": "same QueuedTurn",
+      "state": "current",
+      "seamId": "channel-ingress",
+      "bend": -26
+    },
+    {
+      "id": "github-api",
+      "from": "github",
+      "to": "api",
+      "label": "push / poll",
+      "state": "current",
+      "seamId": "triggers",
+      "bend": 0
+    },
+    {
+      "id": "external-hook-api",
+      "from": "external-hook",
+      "to": "api",
+      "label": "named HMAC hook",
+      "state": "current",
+      "seamId": "triggers",
+      "bend": 14
+    },
+    {
+      "id": "console-api",
+      "from": "console",
+      "to": "api",
+      "label": "Curie API DTOs",
+      "state": "current",
+      "seamId": "telemetry",
+      "bend": 16
+    },
+    {
+      "id": "dispatcher-queue",
+      "from": "dispatcher",
+      "to": "queue",
+      "label": "XADD curie:runs",
+      "state": "current",
+      "seamId": "queue-stream",
+      "bend": 0
+    },
+    {
+      "id": "api-queue",
+      "from": "api",
+      "to": "queue",
+      "label": "eval / resume turn",
+      "state": "current",
+      "seamId": "queue-stream",
+      "bend": -18
+    },
+    {
+      "id": "queue-worker",
+      "from": "queue",
+      "to": "worker",
+      "label": "XREADGROUP",
+      "state": "current",
+      "seamId": "queue-stream",
+      "bend": 0
+    },
+    {
+      "id": "worker-sandbox",
+      "from": "worker",
+      "to": "sandbox",
+      "label": "claim / resume",
+      "state": "current",
+      "seamId": "substrate",
+      "bend": 0
+    },
+    {
+      "id": "sandbox-runner",
+      "from": "sandbox",
+      "to": "runner",
+      "label": "start ACI server",
+      "state": "current",
+      "seamId": "aci",
+      "bend": 0
+    },
+    {
+      "id": "worker-runner",
+      "from": "worker",
+      "to": "runner",
+      "label": "event / steer / interrupt / timeout",
+      "state": "current",
+      "seamId": "aci",
+      "bend": -12
+    },
+    {
+      "id": "runner-worker",
+      "from": "runner",
+      "to": "worker",
+      "label": "NDJSON events",
+      "state": "current",
+      "seamId": "aci",
+      "bend": 24
+    },
+    {
+      "id": "runner-harness",
+      "from": "runner",
+      "to": "harness",
+      "label": "ModelSession",
+      "state": "current",
+      "seamId": "harness-modelsession",
+      "bend": 0
+    },
+    {
+      "id": "harness-model",
+      "from": "harness",
+      "to": "model",
+      "label": "provider call",
+      "state": "current",
+      "seamId": "model-provider",
+      "bend": 0
+    },
+    {
+      "id": "model-harness",
+      "from": "model",
+      "to": "harness",
+      "label": "streamed result",
+      "state": "current",
+      "seamId": "model-provider",
+      "bend": 19
+    },
+    {
+      "id": "worker-slack",
+      "from": "worker",
+      "to": "slack",
+      "label": "status / post / update",
+      "state": "current",
+      "seamId": "channel-reply",
+      "bend": -92
+    },
+    {
+      "id": "worker-email",
+      "from": "worker",
+      "to": "email",
+      "label": "HttpReplyAdapter /replies",
+      "state": "current",
+      "seamId": "channel-reply",
+      "bend": 16
+    },
+    {
+      "id": "worker-discord",
+      "from": "worker",
+      "to": "discord",
+      "label": "HttpReplyAdapter /replies",
+      "state": "current",
+      "seamId": "channel-reply",
+      "bend": -16
+    },
+    {
+      "id": "worker-channel-api",
+      "from": "worker",
+      "to": "channel-api",
+      "label": "neutral reply events",
+      "state": "current",
+      "seamId": "channel-reply",
+      "bend": 28
+    },
+    {
+      "id": "worker-approvals",
+      "from": "worker",
+      "to": "approvals",
+      "label": "AWAITING_APPROVAL",
+      "state": "current",
+      "seamId": "approval-authorizer",
+      "bend": 0
+    },
+    {
+      "id": "approvals-api",
+      "from": "approvals",
+      "to": "api",
+      "label": "persist / resolve",
+      "state": "current",
+      "seamId": "approval-authorizer",
+      "bend": 0
+    },
+    {
+      "id": "slack-api-approval",
+      "from": "slack",
+      "to": "api",
+      "label": "approve / reject",
+      "state": "current",
+      "seamId": "approval-principal",
+      "bend": 66
+    },
+    {
+      "id": "worker-api-approval",
+      "from": "worker",
+      "to": "api",
+      "label": "approval create",
+      "state": "current",
+      "seamId": "approval-authorizer",
+      "bend": 18
+    },
+    {
+      "id": "worker-api-eval-report",
+      "from": "worker",
+      "to": "api",
+      "label": "eval report",
+      "state": "current",
+      "seamId": "eval-store",
+      "bend": 30
+    },
+    {
+      "id": "runner-api-state",
+      "from": "runner",
+      "to": "api",
+      "label": "state get / put / list / delete / append",
+      "state": "current",
+      "seamId": "workflow-state",
+      "bend": 34
+    },
+    {
+      "id": "runner-api-memory",
+      "from": "runner",
+      "to": "api",
+      "label": "memory load / append / replace",
+      "state": "current",
+      "seamId": "memory",
+      "bend": 46
+    },
+    {
+      "id": "api-postgres",
+      "from": "api",
+      "to": "postgres",
+      "label": "control-plane state",
+      "state": "current",
+      "seamId": "relational-db",
+      "bend": 0
+    },
+    {
+      "id": "worker-postgres",
+      "from": "worker",
+      "to": "postgres",
+      "label": "binding read",
+      "state": "current",
+      "seamId": "relational-db",
+      "bend": 22
+    },
+    {
+      "id": "api-store",
+      "from": "api",
+      "to": "object-store",
+      "label": "store bundle",
+      "state": "current",
+      "seamId": "blob-storage",
+      "bend": -20
+    },
+    {
+      "id": "worker-store",
+      "from": "worker",
+      "to": "object-store",
+      "label": "load eval bundle",
+      "state": "current",
+      "seamId": "blob-storage",
+      "bend": 18
+    },
+    {
+      "id": "sandbox-store",
+      "from": "object-store",
+      "to": "sandbox",
+      "label": "bundle-fetch init",
+      "state": "current",
+      "seamId": "blob-storage",
+      "bend": -18
+    },
+    {
+      "id": "runner-otel",
+      "from": "runner",
+      "to": "otel",
+      "label": "OTLP spans",
+      "state": "current",
+      "seamId": "telemetry",
+      "bend": 0
+    },
+    {
+      "id": "otel-langfuse",
+      "from": "otel",
+      "to": "langfuse",
+      "label": "OTLP HTTP",
+      "state": "current",
+      "seamId": "telemetry",
+      "bend": 0
+    },
+    {
+      "id": "eval-langfuse",
+      "from": "eval-plane",
+      "to": "langfuse",
+      "label": "traces + scores",
+      "state": "current",
+      "seamId": "eval-store",
+      "bend": 0
+    },
+    {
+      "id": "api-langfuse",
+      "from": "langfuse",
+      "to": "api",
+      "label": "trace / matrix read",
+      "state": "current",
+      "seamId": "telemetry",
+      "bend": 32
+    },
+    {
+      "id": "api-github-status",
+      "from": "api",
+      "to": "github",
+      "label": "commit status; gate external",
+      "state": "current",
+      "seamId": "promotion-gate",
+      "bend": -34
+    },
+    {
+      "id": "worker-evals",
+      "from": "worker",
+      "to": "eval-plane",
+      "label": "run + grade cases",
+      "state": "current",
+      "seamId": "eval-scorer",
+      "bend": 0
+    },
+    {
+      "id": "sandbox-kubernetes",
+      "from": "kubernetes",
+      "to": "sandbox",
+      "label": "production claim",
+      "state": "current",
+      "seamId": "substrate",
+      "bend": -20
+    },
+    {
+      "id": "sandbox-docker",
+      "from": "docker",
+      "to": "sandbox",
+      "label": "local container",
+      "state": "current",
+      "seamId": "substrate",
+      "bend": 25
+    },
+    {
+      "id": "api-mcp-service",
+      "from": "api",
+      "to": "connector-host",
+      "label": "service-key binding",
+      "state": "current",
+      "seamId": "mcp-service-auth",
+      "bend": -26
+    },
+    {
+      "id": "runner-connectors",
+      "from": "runner",
+      "to": "connector-host",
+      "label": "MCP request / result",
+      "state": "current",
+      "seamId": "mcp-service-auth",
+      "bend": 0,
+      "bidirectional": true
+    },
+    {
+      "id": "worker-kubernetes-connectors",
+      "from": "worker",
+      "to": "kubernetes",
+      "label": "list / apply / delete connector workloads",
+      "state": "current",
+      "seamId": "connector-host",
+      "bend": 42
+    },
+    {
+      "id": "api-oauth-gateway",
+      "from": "api",
+      "to": "oauth-gateway",
+      "label": "principal + OAuth grant",
+      "state": "planned",
+      "seamId": "mcp-delegated-oauth",
+      "bend": 34
+    },
+    {
+      "id": "runner-oauth-gateway",
+      "from": "runner",
+      "to": "oauth-gateway",
+      "label": "principal-bound MCP",
+      "state": "planned",
+      "seamId": "mcp-delegated-oauth",
+      "bend": -12,
+      "bidirectional": true
+    },
+    {
+      "id": "oauth-gateway-host",
+      "from": "oauth-gateway",
+      "to": "connector-host",
+      "label": "OAuth-applied MCP",
+      "state": "planned",
+      "seamId": "mcp-delegated-oauth",
+      "bend": 0,
+      "bidirectional": true
+    },
+    {
+      "id": "proxy-model",
+      "from": "harness",
+      "to": "agent-proxy",
+      "label": "credential-free request",
+      "state": "planned",
+      "seamId": "agent-proxy",
+      "bend": 0
+    },
+    {
+      "id": "proxy-provider",
+      "from": "agent-proxy",
+      "to": "model",
+      "label": "authorized egress",
+      "state": "planned",
+      "seamId": "agent-proxy",
+      "bend": -18
+    }
+  ],
+  "flows": [
+    {
+      "id": "whole-system",
+      "label": "Whole system",
+      "state": "current",
+      "summary": "Every currently visible component and route in one architecture map. Choose a specific flow to isolate and walk its path.",
+      "showRouteLabels": false,
+      "steps": []
+    },
+    {
+      "id": "slack-turn",
+      "label": "Slack turn",
+      "state": "current",
+      "summary": "A mention becomes one queued, isolated, multi-turn model session and one edited thread reply.",
+      "steps": [
+        {
+          "routeId": "slack-dispatcher",
+          "title": "Receive and deduplicate",
+          "caption": "Bolt receives the mention; the dispatcher claims the event id and posts the placeholder."
+        },
+        {
+          "routeId": "dispatcher-queue",
+          "title": "Normalize ingress",
+          "caption": "The dispatcher serializes a channel-neutral QueuedTurn onto curie:runs."
+        },
+        {
+          "routeId": "queue-worker",
+          "title": "Claim delivery",
+          "caption": "The worker consumer group claims the event and acquires the conversation lock."
+        },
+        {
+          "routeId": "worker-sandbox",
+          "title": "Resolve and isolate",
+          "caption": "The binding selects agent, version, and bundle; SandboxClient claims or resumes the runtime."
+        },
+        {
+          "routeId": "worker-runner",
+          "title": "Start or steer",
+          "caption": "The worker sends event for a fresh turn or steer for a live one."
+        },
+        {
+          "routeId": "runner-api-memory",
+          "title": "Rehydrate durable memory",
+          "caption": "At boot the runner loads the agent memory log over the scoped state token before composing the effective prompt."
+        },
+        {
+          "routeId": "runner-harness",
+          "title": "Enter the harness",
+          "caption": "The runner translates the ACI request into the active ModelSession."
+        },
+        {
+          "routeId": "harness-model",
+          "title": "Run inference",
+          "caption": "The declared Claude harness calls the selected provider and streams its result."
+        },
+        {
+          "routeId": "runner-worker",
+          "title": "Stream outcomes",
+          "caption": "The runner emits text deltas, tool notes, side-effect markers, and a terminal result as NDJSON."
+        },
+        {
+          "routeId": "worker-slack",
+          "title": "Return to the surface",
+          "caption": "ReplySink updates the original placeholder and the worker acknowledges the stream entry."
+        }
+      ]
+    },
+    {
+      "id": "discord-turn",
+      "label": "Discord turn",
+      "state": "current",
+      "summary": "A Discord mention becomes a public thread, a platform-minted QueuedTurn, and streamed text edits on that thread.",
+      "steps": [
+        {
+          "routeId": "discord-channel-api",
+          "title": "Admit the mention",
+          "caption": "adapters/discord creates a public thread and placeholder, then posts to POST /channels/turns under a scoped channel token."
+        },
+        {
+          "routeId": "channel-api-queue",
+          "title": "Enter the same core",
+          "caption": "The API mints a channel-neutral QueuedTurn onto curie:runs."
+        },
+        {
+          "routeId": "queue-worker",
+          "title": "Claim delivery",
+          "caption": "The worker consumer group claims the event under one renewable fenced owner."
+        },
+        {
+          "routeId": "worker-sandbox",
+          "title": "Resolve and isolate",
+          "caption": "Multi-surface binding selects the agent by (kind, address) without cloning the bot identity."
+        },
+        {
+          "routeId": "worker-runner",
+          "title": "Start or steer",
+          "caption": "The worker sends event for a fresh turn or steer for a live one."
+        },
+        {
+          "routeId": "worker-discord",
+          "title": "Return to the thread",
+          "caption": "HttpReplyAdapter streams text edits to the Discord placeholder. Buttons and approvals are not implemented."
+        }
+      ]
+    },
+    {
+      "id": "approval-loop",
+      "label": "Approval + resume",
+      "state": "current",
+      "summary": "A gated tool call ends the turn, persists authority, suspends the sandbox, then resumes through a new queued event.",
+      "steps": [
+        {
+          "routeId": "worker-approvals",
+          "title": "Gate the side effect",
+          "caption": "The runner terminates AWAITING_APPROVAL; the kernel converts it into durable governance work."
+        },
+        {
+          "routeId": "approvals-api",
+          "title": "Persist the decision point",
+          "caption": "The API stores the approval, policy, requester, allowed approver set, and validated originating trace context."
+        },
+        {
+          "routeId": "worker-slack",
+          "title": "Render a semantic confirm",
+          "caption": "The worker posts a channel-neutral confirm intent; Slack renders the approval card."
+        },
+        {
+          "routeId": "slack-api-approval",
+          "title": "Authorize the human",
+          "caption": "Slack signs an approval-bound chat attestation; the API derives the principal and resolves membership without trusting caller-supplied identity or channel. A non-owning release acknowledges an exact record miss without changing the approval or card, leaving the owning release's compare-and-set as the only mutation path."
+        },
+        {
+          "routeId": "api-queue",
+          "title": "Queue a new resolution turn",
+          "caption": "The original event is already acknowledged; resolution enters as its own QueuedTurn under the stored trace context, while legacy or malformed carriers start clean roots."
+        },
+        {
+          "routeId": "queue-worker",
+          "title": "Reclaim the conversation",
+          "caption": "The worker restores the same thread affinity and suspended sandbox."
+        },
+        {
+          "routeId": "worker-runner",
+          "title": "Resume with one-shot allowance",
+          "caption": "The resolution turn tells the runner whether to continue or terminate the rejected action."
+        },
+        {
+          "routeId": "worker-slack",
+          "title": "Settle the surface",
+          "caption": "The card becomes non-interactive and the final reply returns to the same conversation."
+        }
+      ]
+    },
+    {
+      "id": "git-deploy",
+      "label": "PR / git deploy",
+      "state": "current",
+      "summary": "A development branch push becomes an immutable bundle, deployment, and eval fan-out; a production push promotes the stored artifact without cloning or rebuilding it.",
+      "steps": [
+        {
+          "routeId": "github-api",
+          "title": "Ingest a push",
+          "caption": "HMAC webhook or outbound commit poller converges on the same process_push function."
+        },
+        {
+          "routeId": "api-store",
+          "title": "Archive, validate, store",
+          "caption": "The API archives the SHA, validates the frozen plugin shape, and writes an immutable bundle."
+        },
+        {
+          "routeId": "api-postgres",
+          "title": "Create version + deployment",
+          "caption": "Dev branches activate the new version; production branches promote an existing artifact."
+        },
+        {
+          "routeId": "api-queue",
+          "title": "Fan out evals",
+          "caption": "A newly built development bundle appends one deduplicated EvalJob to curie:evals."
+        },
+        {
+          "routeId": "worker-evals",
+          "title": "Grade the exact bundle",
+          "caption": "The eval consumer loads cases from the immutable bundle and drives the runner."
+        },
+        {
+          "routeId": "eval-langfuse",
+          "title": "Record evidence",
+          "caption": "Each case writes a trace and eval score tagged by version and suite."
+        },
+        {
+          "routeId": "worker-api-eval-report",
+          "title": "Report the rollup",
+          "caption": "The worker posts the result to the API."
+        },
+        {
+          "routeId": "api-github-status",
+          "title": "Publish, but do not internally gate",
+          "caption": "GitHub receives a commit status; production promotion still relies on external policy rather than an API invariant."
+        }
+      ]
+    },
+    {
+      "id": "eval-loop",
+      "label": "Eval + parity ladder",
+      "state": "current",
+      "summary": "One bundle and one case file cross skill, local, local-release, and cluster to expose environment drift.",
+      "steps": [
+        {
+          "routeId": "api-store",
+          "title": "Pin the artifact",
+          "caption": "Bundle identity fixes the code, tools, and eval cases under test."
+        },
+        {
+          "routeId": "worker-store",
+          "title": "Load the suite",
+          "caption": "The worker reads evals/cases.json from that exact immutable bundle."
+        },
+        {
+          "routeId": "worker-sandbox",
+          "title": "Choose the required tier",
+          "caption": "Skill, Docker, released Compose, or Kubernetes changes only the substrate rung."
+        },
+        {
+          "routeId": "worker-runner",
+          "title": "Run a fresh case",
+          "caption": "Each case defaults to a fresh conversation and uses the same ACI loop."
+        },
+        {
+          "routeId": "worker-evals",
+          "title": "Score the outcome",
+          "caption": "Text graders and trajectory matching produce pass, fail, or plumbing-only."
+        },
+        {
+          "routeId": "eval-langfuse",
+          "title": "Persist the evidence",
+          "caption": "Traces and scores support the matrix and later diagnosis."
+        }
+      ]
+    },
+    {
+      "id": "observability",
+      "label": "Observability read/write",
+      "state": "current",
+      "summary": "Curie preserves valid ingress and approval trace lineage into OTLP; the API turns vendor reads back into Curie DTOs for agents and humans.",
+      "steps": [
+        {
+          "routeId": "runner-otel",
+          "title": "Emit the run",
+          "caption": "The runner writes an agent.run root plus real sibling provider-wait and tool-wait intervals, with bounded terminal and outcome attributes, over OTLP."
+        },
+        {
+          "routeId": "otel-langfuse",
+          "title": "Export once",
+          "caption": "The collector handles Langfuse authentication and HTTP-only OTLP ingest."
+        },
+        {
+          "routeId": "api-langfuse",
+          "title": "Reconstruct the evidence",
+          "caption": "The API reads traces, builds the tool tree, and proxies metrics and cost."
+        },
+        {
+          "routeId": "console-api",
+          "title": "Expose one read surface",
+          "caption": "Console and CLI use Curie API shapes instead of talking to Langfuse directly."
+        }
+      ]
+    },
+    {
+      "id": "mcp-service-call",
+      "label": "MCP with service key",
+      "state": "current",
+      "summary": "Today an MCP connector acts as a deployment-owned bot or service account: the platform binds its named secret and the runner talks through the collapsed MCP host boundary.",
+      "steps": [
+        {
+          "routeId": "worker-kubernetes-connectors",
+          "title": "Reconcile the hosted workload",
+          "caption": "The worker uses ConnectorClient to list, apply, and delete the Kubernetes connector resources derived from the bundle."
+        },
+        {
+          "routeId": "api-mcp-service",
+          "title": "Bind the service identity",
+          "caption": "The bundle names the connector secret; deployment configuration supplies the value and the platform injects it into the hosted MCP connector."
+        },
+        {
+          "routeId": "runner-connectors",
+          "title": "Call the MCP server",
+          "caption": "The runner exchanges MCP requests and results with the hosted connector. Every human currently shares the deployment's service authority."
+        }
+      ]
+    },
+    {
+      "id": "mcp-delegated-oauth",
+      "label": "Future per-person MCP OAuth",
+      "state": "planned",
+      "summary": "The accepted vision binds each run's canonical human principal to that person's OAuth grant. Curie applies the grant at a gateway, and the runner never receives the raw token.",
+      "steps": [
+        {
+          "routeId": "api-oauth-gateway",
+          "title": "Resolve principal and grant",
+          "caption": "The control plane owns OAuth discovery, PKCE, encrypted token storage, refresh, revocation, and the principal-to-grant binding."
+        },
+        {
+          "routeId": "runner-oauth-gateway",
+          "title": "Call as the run principal",
+          "caption": "The runner sends a principal-bound MCP request to the gateway without receiving a provider token."
+        },
+        {
+          "routeId": "oauth-gateway-host",
+          "title": "Apply delegated authority",
+          "caption": "The gateway applies only that principal's active grant and exchanges MCP traffic with the declared server. Missing auth pauses the run for a connection action, then resumes after callback."
+        }
+      ]
+    },
+    {
+      "id": "email-turn",
+      "label": "Email turn",
+      "state": "current",
+      "summary": "The first-party mail adapter polls AgentMail, the API mints a QueuedTurn, and HttpReplyAdapter returns one threaded email at turn.completed.",
+      "steps": [
+        {
+          "routeId": "email-adapter",
+          "title": "Poll and admit",
+          "caption": "apps/mail-adapter polls AgentMail, applies provider and allow-list filters, and keeps delivery ownership in local SQLite."
+        },
+        {
+          "routeId": "email-adapter",
+          "title": "Use the shipped HTTP edge",
+          "caption": "The adapter authenticates with a row-scoped chn token and posts the provider message id as the delivery id."
+        },
+        {
+          "routeId": "channel-api-queue",
+          "title": "Enter the same core",
+          "caption": "The API, not the adapter, mints the same QueuedTurn used by Slack, Discord, and the CLI stub."
+        },
+        {
+          "routeId": "queue-worker",
+          "title": "Reuse the worker invariants",
+          "caption": "Routing, concurrency, sandboxing, and renewable delivery ownership remain unchanged."
+        },
+        {
+          "routeId": "worker-runner",
+          "title": "Reuse the ACI",
+          "caption": "The agent does not learn which channel started the turn."
+        },
+        {
+          "routeId": "worker-email",
+          "title": "Send one threaded reply",
+          "caption": "HttpReplyAdapter posts the four reply events to the mail adapter; one turn.completed becomes one correspondent-visible email."
+        }
+      ]
+    },
+    {
+      "id": "webhook-turn",
+      "label": "Generic webhook turn",
+      "state": "current",
+      "summary": "A named HMAC-authenticated hook becomes a bounded webhook-sourced turn on the shared run stream.",
+      "steps": [
+        {
+          "routeId": "external-hook-api",
+          "title": "Authenticate the named hook",
+          "caption": "The API verifies the per-hook HMAC and resolves the target agent."
+        },
+        {
+          "routeId": "api-queue",
+          "title": "Mint the platform turn",
+          "caption": "The API creates the typed webhook-sourced QueuedTurn with bounded delivery metadata and an escaped, explicitly delimited untrusted payload."
+        },
+        {
+          "routeId": "queue-worker",
+          "title": "Reuse bounded delivery",
+          "caption": "The shared consumer claims, caps, and dead-letters the hook turn like other run traffic."
+        },
+        {
+          "routeId": "worker-runner",
+          "title": "Run through the same ACI",
+          "caption": "The worker drives the selected bundle without a channel adapter in the path."
+        }
+      ]
+    },
+    {
+      "id": "future-hooks",
+      "label": "Future bundle hooks",
+      "state": "planned",
+      "summary": "Generic webhook consumption ships; bundle-declared hook installation and scheduled turns remain planned.",
+      "steps": [
+        {
+          "routeId": "external-hook-api",
+          "title": "Reuse API-owned ingress",
+          "caption": "A future declaration resolves onto the shipped named-hook endpoint rather than a new dispatcher."
+        },
+        {
+          "routeId": "api-queue",
+          "title": "Create a typed turn",
+          "caption": "A new event kind would carry source, authorization, concurrency, expiry, and delivery policy."
+        },
+        {
+          "routeId": "queue-worker",
+          "title": "Reuse bounded delivery",
+          "caption": "The shared stream consumer must still cap attempts, dead-letter, and expose failure."
+        }
+      ]
+    }
+  ],
+  "adrs": [
+    {
+      "id": "ADR-0002",
+      "number": 2,
+      "title": "Kubernetes Agent Sandbox as the interactive runtime substrate",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "Kubernetes is the production runtime substrate; Docker is the parity implementation behind SandboxClient.",
+      "nodeIds": [
+        "sandbox",
+        "kubernetes",
+        "docker"
+      ],
+      "seamIds": [
+        "substrate"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0002-kubernetes-agent-sandbox-as-runtime-substrate.md"
+    },
+    {
+      "id": "ADR-0005",
+      "number": 5,
+      "title": "claude-agent-sdk adapter behind a frozen ACI",
+      "status": "accepted",
+      "implementation": "partial",
+      "summary": "The outer protocol is strong; the in-runner message types and plugin format retain Claude coupling.",
+      "nodeIds": [
+        "runner",
+        "harness"
+      ],
+      "seamIds": [
+        "aci",
+        "harness-modelsession"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md"
+    },
+    {
+      "id": "ADR-0009",
+      "number": 9,
+      "title": "Per-agent connector auth",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "Connector credentials are named by the bundle and supplied per deployment, giving current MCP servers one service or bot identity rather than a human principal.",
+      "nodeIds": [
+        "api",
+        "connector-host"
+      ],
+      "seamIds": [
+        "mcp-service-auth",
+        "sealed-credential"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0009-per-agent-connector-auth.md"
+    },
+    {
+      "id": "ADR-0010",
+      "number": 10,
+      "title": "Approval gates and human-in-the-loop",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "A gated turn persists a durable decision and resumes later through a new event.",
+      "nodeIds": [
+        "approvals",
+        "worker",
+        "slack"
+      ],
+      "seamIds": [
+        "approval-authorizer",
+        "channel-interaction"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0010-approval-gates-and-human-in-the-loop.md"
+    },
+    {
+      "id": "ADR-0014",
+      "number": 14,
+      "title": "A git push is the deploy",
+      "status": "accepted",
+      "implementation": "partial",
+      "summary": "Git flow, immutable bundles, and eval fan-out are built; a red eval does not yet universally enforce promotion.",
+      "nodeIds": [
+        "github",
+        "api",
+        "eval-plane",
+        "object-store"
+      ],
+      "seamIds": [
+        "triggers",
+        "bundle-format",
+        "eval-scorer"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0014-git-push-is-the-deploy.md"
+    },
+    {
+      "id": "ADR-0016",
+      "number": 16,
+      "title": "Swappable jobs around an opinionated core",
+      "status": "accepted",
+      "implementation": "guiding",
+      "summary": "One curated default per job; a second implementation teaches the interface instead of a speculative registry.",
+      "nodeIds": [
+        "worker",
+        "runner",
+        "api"
+      ],
+      "seamIds": [
+        "aci",
+        "channel-ingress",
+        "telemetry",
+        "blob-storage",
+        "relational-db"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0016-swappable-jobs-around-an-opinionated-core.md"
+    },
+    {
+      "id": "ADR-0020",
+      "number": 20,
+      "title": "Rendering-free channel interface",
+      "status": "accepted",
+      "implementation": "partial",
+      "summary": "Semantic Choice and Confirm still render in Slack and terminal. Discord and email are shipped text surfaces; capability negotiation remains open.",
+      "nodeIds": [
+        "slack",
+        "cli",
+        "discord",
+        "email"
+      ],
+      "seamIds": [
+        "channel-ingress",
+        "channel-reply",
+        "channel-interaction"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0020-message-port-rendering-free-channel-interface.md"
+    },
+    {
+      "id": "ADR-0025",
+      "number": 25,
+      "title": "Memory port and first loader",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "Scoped state-backed agent memory reaches the runner as a harness-neutral boot preamble.",
+      "nodeIds": [
+        "runner",
+        "postgres",
+        "api"
+      ],
+      "seamIds": [
+        "memory",
+        "workflow-state"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0025-memory-port-and-first-loader.md"
+    },
+    {
+      "id": "ADR-0029",
+      "number": 29,
+      "title": "Conversation-history port and first loader",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "A fresh or restarted sandbox rehydrates the same thread from durable transcript state, without SDK-native resume.",
+      "nodeIds": [
+        "runner",
+        "postgres",
+        "api"
+      ],
+      "seamIds": [
+        "conversation-history",
+        "workflow-state"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0029-conversation-history-port-and-first-loader.md"
+    },
+    {
+      "id": "ADR-0030",
+      "number": 30,
+      "title": "Proactive within-episode memory agent",
+      "status": "accepted",
+      "implementation": "planned",
+      "summary": "Drafts an injected within-episode memory agent; automatic generation remains absent.",
+      "nodeIds": [
+        "runner"
+      ],
+      "seamIds": [
+        "memory"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0030-proactive-within-episode-memory-agent.md"
+    },
+    {
+      "id": "ADR-0042",
+      "number": 42,
+      "title": "LLM-as-a-Verifier grader and progress signal",
+      "status": "accepted",
+      "implementation": "reserved",
+      "summary": "The semantic provenance grader is an accepted slot, but no verifier grader exists in Python or Rust today.",
+      "nodeIds": [
+        "eval-plane"
+      ],
+      "seamIds": [
+        "eval-scorer"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0042-llm-as-a-verifier-grader-and-progress-signal.md"
+    },
+    {
+      "id": "ADR-0060",
+      "number": 60,
+      "title": "The harness is a declared package",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "Harness assets and selection are declared; only the built-in Claude contribution exists.",
+      "nodeIds": [
+        "harness",
+        "runner"
+      ],
+      "seamIds": [
+        "harness-package",
+        "harness-modelsession"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0060-the-harness-is-a-declared-package.md"
+    },
+    {
+      "id": "ADR-0061",
+      "number": 61,
+      "title": "Out-of-process harness boundary",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Would make alternate harness adapters consumable out of process across an Omnigent-compatible wire.",
+      "nodeIds": [
+        "runner",
+        "harness"
+      ],
+      "seamIds": [
+        "aci",
+        "harness-modelsession"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0061-out-of-process-harness-boundary.md"
+    },
+    {
+      "id": "ADR-0062",
+      "number": 62,
+      "title": "Harness conformance has teeth",
+      "status": "accepted",
+      "implementation": "partial",
+      "summary": "A reusable conformance suite exists; third-party production contributions have not yet proved it.",
+      "nodeIds": [
+        "runner",
+        "harness"
+      ],
+      "seamIds": [
+        "aci",
+        "harness-package"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0062-harness-conformance-has-teeth.md"
+    },
+    {
+      "id": "ADR-0075",
+      "number": 75,
+      "title": "Agent Proxy credential and egress boundary",
+      "status": "accepted",
+      "implementation": "planned",
+      "summary": "Accepts moving credentials and enforceable FQDN egress outside the sandbox; substrate, TLS termination, credential injection, and implementation remain follow-up work.",
+      "nodeIds": [
+        "agent-proxy",
+        "sandbox",
+        "model"
+      ],
+      "seamIds": [
+        "agent-proxy",
+        "model-provider"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/617df5bef46864f9abd7d01ac630ac672100afdd/docs/adr/0075-the-agent-proxy-credential-and-egress-boundary.md"
+    },
+    {
+      "id": "ADR-0079",
+      "number": 79,
+      "title": "Inbound triggers as a new event kind",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "API-owned, HMAC-authenticated generic hooks mint typed webhook-sourced turns; declaration installation and schedules remain future work.",
+      "nodeIds": [
+        "external-hook",
+        "api",
+        "queue",
+        "worker"
+      ],
+      "seamIds": [
+        "triggers",
+        "queue-stream"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0079-inbound-triggers-as-a-new-event-kind.md"
+    },
+    {
+      "id": "ADR-0094",
+      "number": 94,
+      "title": "A bundle carries its own sealed connector keys",
+      "status": "accepted",
+      "implementation": "partial",
+      "summary": "Defines the cross-language sealed-box wire and cluster-owned opening key; end-to-end production delivery is not yet fully connected.",
+      "nodeIds": [
+        "api",
+        "connector-host",
+        "kubernetes"
+      ],
+      "seamIds": [
+        "sealed-credential",
+        "mcp-service-auth"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0094-a-bundle-carries-its-own-sealed-connector-keys.md"
+    },
+    {
+      "id": "ADR-0086",
+      "number": 86,
+      "title": "Bundles declare connectors; the platform hosts them",
+      "status": "accepted",
+      "implementation": "partial",
+      "summary": "The bundle declares MCP connectors and Curie derives their hosted runtime, secrets, policy, and MCP configuration; lifecycle portability remains intertwined with Kubernetes.",
+      "nodeIds": [
+        "api",
+        "connector-host"
+      ],
+      "seamIds": [
+        "connector-host",
+        "mcp-service-auth"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0086-bundles-declare-connectors-the-platform-hosts-them.md"
+    },
+    {
+      "id": "ADR-0088",
+      "number": 88,
+      "title": "Per-user delegated OAuth for MCP",
+      "status": "accepted",
+      "implementation": "planned",
+      "summary": "Defines principal-scoped OAuth, control-plane-owned grants, a token-hiding MCP gateway, and missing-auth pause and resume semantics. The service-key mode remains separate and cannot silently substitute.",
+      "nodeIds": [
+        "api",
+        "runner",
+        "oauth-gateway",
+        "connector-host",
+        "approvals"
+      ],
+      "seamIds": [
+        "mcp-delegated-oauth",
+        "mcp-service-auth",
+        "approval-authorizer"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0088-per-user-delegated-oauth-for-mcp.md"
+    },
+    {
+      "id": "ADR-0095",
+      "number": 95,
+      "title": "Tiered memory lifecycle",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Defines agent and channel memory tiers, lifecycle turns, trust, and bootstrap/update obligations.",
+      "nodeIds": [
+        "runner",
+        "api",
+        "postgres"
+      ],
+      "seamIds": [
+        "memory",
+        "workflow-state"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0095-tiered-memory-lifecycle.md"
+    },
+    {
+      "id": "ADR-0096",
+      "number": 96,
+      "title": "Port adapters are deployed services",
+      "status": "accepted",
+      "implementation": "partial",
+      "summary": "First-party Discord and email adapters are deployed services on the shipped HTTP edge. The generic third-party adapter kit remains unbuilt.",
+      "nodeIds": [
+        "port-adapter",
+        "slack",
+        "discord",
+        "email"
+      ],
+      "seamIds": [
+        "port-adapter-service",
+        "channel-ingress",
+        "channel-reply"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0096-port-adapters-are-deployed-services.md"
+    },
+    {
+      "id": "ADR-0099",
+      "number": 99,
+      "title": "Hooks are bundle-declared turns",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Drafts scheduled and webhook turns with authorization, silence, concurrency, and test-fire semantics.",
+      "nodeIds": [
+        "api",
+        "queue",
+        "worker"
+      ],
+      "seamIds": [
+        "triggers"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md"
+    },
+    {
+      "id": "ADR-0100",
+      "number": 100,
+      "title": "Agents search their own surface through the channel port",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Proposes a spike before committing channel search verbs; intentionally not current behavior.",
+      "nodeIds": [
+        "slack",
+        "port-adapter"
+      ],
+      "seamIds": [
+        "channel-ingress",
+        "port-adapter-service"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0100-agents-search-their-own-surface-through-the-channel-port.md"
+    },
+    {
+      "id": "ADR-0105",
+      "number": 105,
+      "title": "External native session checkpoints",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Makes provider-native checkpoints an optional harness capability while retaining portable projection.",
+      "nodeIds": [
+        "harness",
+        "runner",
+        "object-store"
+      ],
+      "seamIds": [
+        "harness-modelsession",
+        "conversation-history"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0105-external-native-session-checkpoints.md"
+    },
+    {
+      "id": "ADR-0106",
+      "number": 106,
+      "title": "An approver is an authenticated principal",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "Approval resolution derives authenticated chat, Console, or operator principals from credentials; membership, not requester inequality, decides authority, and the platform key alone cannot resolve.",
+      "nodeIds": [
+        "approvals",
+        "api"
+      ],
+      "seamIds": [
+        "approval-authorizer",
+        "approval-principal"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/617df5bef46864f9abd7d01ac630ac672100afdd/docs/adr/0106-an-approver-is-an-authenticated-principal.md"
+    },
+    {
+      "id": "ADR-0107",
+      "number": 107,
+      "title": "An agent reads its own runs",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Proposes a first-party scoped runs MCP surface with structured attribution and fail-closed identity.",
+      "nodeIds": [
+        "runner",
+        "api",
+        "langfuse"
+      ],
+      "seamIds": [
+        "telemetry",
+        "connector-host"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0107-an-agent-reads-its-own-runs-through-a-first-party-scoped-surface.md"
+    },
+    {
+      "id": "ADR-0108",
+      "number": 108,
+      "title": "Deploy targets carry environment values",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Moves environment-specific non-secret values onto deploy targets while preserving connector declaration shape.",
+      "nodeIds": [
+        "api",
+        "github",
+        "connector-host"
+      ],
+      "seamIds": [
+        "bundle-format",
+        "connector-host"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0108-a-deploy-target-carries-its-environments-values.md"
+    },
+    {
+      "id": "ADR-0109",
+      "number": 109,
+      "title": "Retention, capacity, and back pressure are one policy",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Would admit claims against a coherent capacity policy instead of discovering overload after launch.",
+      "nodeIds": [
+        "worker",
+        "sandbox",
+        "postgres"
+      ],
+      "seamIds": [
+        "substrate",
+        "workflow-state"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0109-retention-capacity-and-back-pressure-are-one-policy.md"
+    },
+    {
+      "id": "ADR-0110",
+      "number": 110,
+      "title": "Deterministic security posture classification",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Computes posture from shipped layers and operator gates instead of trusting a configured label.",
+      "nodeIds": [
+        "sandbox",
+        "api",
+        "connector-host"
+      ],
+      "seamIds": [
+        "connector-host",
+        "agent-proxy"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0110-deterministic-security-posture-classification.md"
+    },
+    {
+      "id": "ADR-0111",
+      "number": 111,
+      "title": "Default memory compaction algorithm",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Drafts opt-in, from-source compaction with validation, scope defaults, and an auditable write path.",
+      "nodeIds": [
+        "runner",
+        "api",
+        "postgres"
+      ],
+      "seamIds": [
+        "memory",
+        "conversation-history"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0111-the-default-memory-compaction-algorithm.md"
+    },
+    {
+      "id": "ADR-0116",
+      "number": 116,
+      "title": "Session identity arrives over the ACI so a sandbox can be pre-bound",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "The claim path can bind a warm sandbox before the turn by passing session identity over the ACI, without changing isolation rails.",
+      "nodeIds": [
+        "sandbox",
+        "runner",
+        "worker"
+      ],
+      "seamIds": [
+        "aci",
+        "substrate"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md"
+    },
+    {
+      "id": "ADR-0117",
+      "number": 117,
+      "title": "A tool that changes the world reports what it changed",
+      "status": "accepted",
+      "implementation": "partial",
+      "summary": "A mutating tool reports the world change so the platform can restore it later. Restore remains a connector-owned verb under a draft follow-up.",
+      "nodeIds": [
+        "runner",
+        "connector-host"
+      ],
+      "seamIds": [
+        "connector-host",
+        "aci"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0117-a-tool-that-changes-the-world-reports-what-it-changed.md"
+    },
+    {
+      "id": "ADR-0118",
+      "number": 118,
+      "title": "Binding cardinality is the multi-surface opt-in",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "One agent may bind several (kind, address) surfaces. Adding Discord or email does not clone the bot identity.",
+      "nodeIds": [
+        "api",
+        "worker",
+        "slack",
+        "discord",
+        "email"
+      ],
+      "seamIds": [
+        "channel-ingress",
+        "channel-reply"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0118-binding-cardinality-is-the-multi-surface-opt-in.md"
+    },
+    {
+      "id": "ADR-0120",
+      "number": 120,
+      "title": "Durable first-party email state",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "The mail adapter keeps ingress and reply ownership in local SQLite with one serialized writer, not in-process maps.",
+      "nodeIds": [
+        "email",
+        "channel-api"
+      ],
+      "seamIds": [
+        "channel-ingress",
+        "channel-reply"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0120-durable-first-party-email-state.md"
+    },
+    {
+      "id": "ADR-0123",
+      "number": 123,
+      "title": "A pending approval's approver set does not follow its route binding",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "The allowed approver set is captured when the approval is created and does not track a later binding change.",
+      "nodeIds": [
+        "approvals",
+        "api"
+      ],
+      "seamIds": [
+        "approval-authorizer"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0123-a-pending-approvals-approver-set-does-not-follow-its-route-binding.md"
+    },
+    {
+      "id": "ADR-0125",
+      "number": 125,
+      "title": "Managed repository workspaces and approval-gated publication",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "The platform clones and publishes through its own GitHub identity. Write credentials do not remain inside the sandbox.",
+      "nodeIds": [
+        "github",
+        "api",
+        "sandbox"
+      ],
+      "seamIds": [
+        "triggers",
+        "approval-authorizer"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0125-managed-repository-workspaces-and-approval-gated-publication.md"
+    },
+    {
+      "id": "ADR-0126",
+      "number": 126,
+      "title": "Runtime repository selection is sticky authorized thread state",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "The selected repository sticks on the thread as authorized state rather than being re-derived from the prompt.",
+      "nodeIds": [
+        "api",
+        "github",
+        "runner"
+      ],
+      "seamIds": [
+        "workflow-state"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0126-runtime-repository-selection-is-sticky-authorized-thread-state.md"
+    },
+    {
+      "id": "ADR-0130",
+      "number": 130,
+      "title": "Deliberate progress is bounded durable channel state",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "Progress is durable channel state with a bound, not a substitute for streaming the final answer.",
+      "nodeIds": [
+        "worker",
+        "slack"
+      ],
+      "seamIds": [
+        "channel-reply",
+        "channel-interaction"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0130-deliberate-progress-is-bounded-durable-channel-state.md"
+    },
+    {
+      "id": "ADR-0131",
+      "number": 131,
+      "title": "A delivery has one deadline and one renewable fenced owner",
+      "status": "accepted",
+      "implementation": "implemented",
+      "summary": "Stream delivery ownership is a renewable fence with one deadline. A second replica cannot steal a live delivery.",
+      "nodeIds": [
+        "queue",
+        "worker"
+      ],
+      "seamIds": [
+        "queue-stream"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md"
+    },
+    {
+      "id": "ADR-0134",
+      "number": 134,
+      "title": "A hook shares one thread per partition",
+      "status": "draft",
+      "implementation": "planned",
+      "summary": "Drafts per-delivery conversation identity for hooks so concurrent firings do not share one thread by default.",
+      "nodeIds": [
+        "external-hook",
+        "api",
+        "queue"
+      ],
+      "seamIds": [
+        "triggers"
+      ],
+      "href": "https://github.com/curie-eng/curie/blob/687322e4be896e2ef1fe63770eac1ed040ccaa5c/docs/adr/0134-a-hook-shares-one-thread-per-partition.md"
+    }
+  ],
+  "investments": [
+    {
+      "rank": 1,
+      "title": "Close remaining channel interaction and the generic adapter kit",
+      "seamIds": [
+        "channel-reply",
+        "channel-interaction",
+        "port-adapter-service",
+        "approval-principal"
+      ],
+      "why": "Slack, Discord, and email now prove ingress and HTTP reply. Approvals, Choice/Confirm, and the generic third-party adapter kit are still Slack-only or unbuilt, and the generated catalog still counts one implementation.",
+      "unlock": "Discord or email approvals, a truthful Communication grade, and a kit only if a third-party channel needs it.",
+      "factors": {
+        "flowImpact": 4,
+        "visionUnlock": 4,
+        "couplingRisk": 3,
+        "evidenceGap": 3,
+        "effort": 4
+      }
+    },
+    {
+      "rank": 2,
+      "title": "Run a genuinely different harness through the ACI",
+      "seamIds": [
+        "harness-modelsession",
+        "aci",
+        "harness-package"
+      ],
+      "why": "The outer contract is strong, but the current in-process path and bundle distribution wedge still hide the real replacement cost.",
+      "unlock": "Credible Codex/ADK/Strands support, truthful harness conformance, optional native checkpoints.",
+      "factors": {
+        "flowImpact": 5,
+        "visionUnlock": 5,
+        "couplingRisk": 5,
+        "evidenceGap": 4,
+        "effort": 5
+      }
+    },
+    {
+      "rank": 3,
+      "title": "Close the semantic eval and promotion gap",
+      "seamIds": [
+        "eval-scorer",
+        "eval-store",
+        "promotion-gate"
+      ],
+      "why": "The parity ladder is the product promise, but provenance quality and red-eval promotion still have reserved or validated-only clauses.",
+      "unlock": "Fatal cluster quality gates, meaningful source verification, stronger PR-to-production trust.",
+      "factors": {
+        "flowImpact": 4,
+        "visionUnlock": 5,
+        "couplingRisk": 3,
+        "evidenceGap": 4,
+        "effort": 4
+      }
+    },
+    {
+      "rank": 4,
+      "title": "Unify generic trigger and hook lifecycle",
+      "seamIds": [
+        "triggers",
+        "queue-stream"
+      ],
+      "why": "Three trigger paths exist, but they are hardcoded lanes rather than one typed, bounded event lifecycle.",
+      "unlock": "Bundle-declared schedules/webhooks, explicit delivery destinations, shared concurrency and failure semantics.",
+      "factors": {
+        "flowImpact": 4,
+        "visionUnlock": 4,
+        "couplingRisk": 4,
+        "evidenceGap": 5,
+        "effort": 4
+      }
+    },
+    {
+      "rank": 5,
+      "title": "Move credentials and enforceable egress out of the sandbox",
+      "seamIds": [
+        "agent-proxy",
+        "connector-host",
+        "mcp-service-auth",
+        "mcp-delegated-oauth",
+        "sealed-credential"
+      ],
+      "why": "The current service-key path and accepted delegated-OAuth design expose the same unresolved security boundary: credentials, principal binding, and enforceable egress still span several owners.",
+      "unlock": "Stronger tenant isolation, explicit service versus delegated identity, per-person MCP authority, centralized credential policy, and auditable outbound access.",
+      "factors": {
+        "flowImpact": 4,
+        "visionUnlock": 4,
+        "couplingRisk": 5,
+        "evidenceGap": 5,
+        "effort": 5
+      }
+    },
+    {
+      "rank": 6,
+      "title": "Neutralize the observability read side",
+      "seamIds": [
+        "telemetry",
+        "eval-store"
+      ],
+      "why": "OTLP is already a good write port; vendor attributes, route names, and read modules are the remaining concentrated leakage.",
+      "unlock": "A practical second trace backend without UI or API contract churn.",
+      "factors": {
+        "flowImpact": 3,
+        "visionUnlock": 3,
+        "couplingRisk": 2,
+        "evidenceGap": 3,
+        "effort": 2
+      }
+    }
+  ]
+}

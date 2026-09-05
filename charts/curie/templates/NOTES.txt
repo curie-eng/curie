@@ -4,7 +4,7 @@ Components deployed:
 {{- if .Values.langfuse.deploy }}
   - Langfuse web + worker (v{{ .Values.langfuse.image.tag }})
 {{- else }}
-  - Langfuse: BYO at http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
+  - Langfuse: BYO at {{ include "curie.langfuse.url" . }}
 {{- end }}
 {{- if .Values.postgres.deploy }}
   - Postgres ({{ .Values.postgres.image }})
@@ -24,7 +24,7 @@ Components deployed:
 {{- $sse42 = true }}
 {{- end }}
 {{- end }}
-  - ClickHouse ({{ .Values.clickhouse.image.repository }}:{{ $chTag }}){{ if $sse42 }}  [SSE4.2-safe override]{{ else }}  [AVX required]{{ end }}
+  - ClickHouse ({{ include "curie.image" (dict "repository" .Values.clickhouse.image.repository "tag" .Values.clickhouse.image.tag "digest" .Values.clickhouse.image.digest) }}){{ if $sse42 }}  [SSE4.2-safe override]{{ else }}  [AVX required]{{ end }}
 {{- else }}
   - ClickHouse: BYO at {{ .Values.clickhouse.host }}
 {{- end }}
@@ -46,13 +46,13 @@ Components deployed:
 
 App services:
 {{- if .Values.api.deploy }}
-  - api ({{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}) on Service {{ include "curie.fullname" . }}-api:{{ .Values.api.service.port }}
+  - api ({{ include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) }}) on Service {{ include "curie.fullname" . }}-api:{{ .Values.api.service.port }}
 {{- if and (eq .Values.api.service.type "NodePort") .Values.api.service.nodePort }}
     NodePort {{ .Values.api.service.nodePort }} is pinned by api.service.nodePort. Set it to an empty string to let Kubernetes allocate a port.
 {{- end }}
 {{- end }}
 {{- if include "curie.dispatcher.enabled" . }}
-  - dispatcher ({{ .Values.dispatcher.image.repository }}:{{ .Values.dispatcher.image.tag }}) [Slack Socket Mode, no Service]
+  - dispatcher ({{ include "curie.image" (dict "repository" .Values.dispatcher.image.repository "tag" .Values.dispatcher.image.tag "digest" .Values.dispatcher.image.digest "defaultTag" .Chart.AppVersion) }}) [Slack Socket Mode, no Service]
 {{- else }}
   - dispatcher: NOT deployed (no Slack tokens set) -- see "Enable a real model and a Slack workspace" below
 {{- end }}
@@ -70,7 +70,7 @@ App services:
            --set api.apiKey=<key that API accepts>
 {{- end }}
 {{- if .Values.worker.deploy }}
-  - worker ({{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }})
+  - worker ({{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) }})
 {{- end }}
 {{- if and .Values.worker.deploy .Values.worker.publication.enabled }}
   - managed publication Jobs: namespace {{ include "curie.publicationNamespace" . }}
@@ -78,7 +78,7 @@ App services:
     App installation tokens are preferred; api.githubToken is the fallback.
 {{- end }}
 {{- if .Values.ui.deploy }}
-  - ui ({{ .Values.ui.image.repository }}:{{ .Values.ui.image.tag }}) on Service {{ include "curie.fullname" . }}-ui:{{ .Values.ui.service.port }}
+  - ui ({{ include "curie.image" (dict "repository" .Values.ui.image.repository "tag" .Values.ui.image.tag "digest" .Values.ui.image.digest "defaultTag" .Chart.AppVersion) }}) on Service {{ include "curie.fullname" . }}-ui:{{ .Values.ui.service.port }}
 
 Reach the UI (port-forward):
   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "curie.fullname" . }}-ui {{ .Values.ui.service.port }}:{{ .Values.ui.service.port }}
@@ -98,6 +98,10 @@ Preflights:
   - NetworkPolicy-enforcement probe runs on demand:
       helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
       kubectl logs -n {{ .Release.Namespace }} job/{{ include "curie.fullname" . }}-netpol-probe
+{{- end }}
+{{- if and .Values.agentSandbox.controller.deploy .Values.preflights.controllerReady.enabled }}
+  - Controller-ready check ran as a post-install hook. Read its verdict:
+      kubectl logs -n {{ .Release.Namespace }} job/{{ include "curie.fullname" . }}-preflight-controller
 {{- end }}
 
 Check rollout:
@@ -183,6 +187,14 @@ The nodePort is pinned in values (langfuse.web.service.nodePort) so it survives 
 
 App services send OTLP traces to the collector, NOT directly to Langfuse:
   {{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.grpcPort }} (gRPC) / :{{ .Values.otelCollector.service.httpPort }} (HTTP)
+{{- $legacyPostgresReadiness := get (.Values.langfuse.web | default dict) "postgresReadiness" }}
+{{- if and $legacyPostgresReadiness (kindIs "map" $legacyPostgresReadiness) (gt (len $legacyPostgresReadiness) 0) }}
+
+!! langfuse.web.postgresReadiness is DEPRECATED. The value you supplied is
+   still being honoured, and now applies to BOTH the Langfuse web and worker
+   Deployments (#2330), not web only. Move it to langfuse.postgresReadiness;
+   the alias is removed in a future minor.
+{{- end }}
 {{- end }}
 
 {{/*

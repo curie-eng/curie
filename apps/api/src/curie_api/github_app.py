@@ -102,6 +102,10 @@ class GitHubAppError(RuntimeError):
     """The App is configured but could not produce a token."""
 
 
+class GitHubInstallationRefused(GitHubAppError):
+    """Fresh App installation identity was deterministically refused."""
+
+
 class _GitHubNotFound(GitHubAppError):
     """GitHub answered 404.
 
@@ -234,6 +238,75 @@ class GitHubCredentials:
             while len(self._tokens) > _REPOSITORY_CACHE_LIMIT:
                 self._tokens.popitem(last=False)
             return token
+
+    def fresh_installation_token(
+        self, repo_full_name: str, expected_installation_id: int | None = None
+    ) -> tuple[int, str]:
+        """Revalidate a review sender's installation with this platform's App.
+
+        A cached token or a user PAT proves neither which App sent an event nor
+        whether its claimed installation still owns this repository. Discovery
+        uses our App JWT on a repository-derived endpoint on every check; the
+        caller must also read the current repository/PR with the returned token.
+        """
+        repo_full_name = normalize_repo_full_name(repo_full_name)
+        if not self.app_configured:
+            raise GitHubInstallationRefused("review feedback requires a configured GitHub App")
+        url = (
+            f"{self.settings.github_api_url.rstrip('/')}"
+            f"/repos/{repo_url_path(repo_full_name)}/installation"
+        )
+        with self._mint_lock_for(repo_full_name):
+            try:
+                with httpx.Client(timeout=self.settings.github_app_timeout_seconds) as client:
+                    response = client.get(url, headers=self._headers(), follow_redirects=False)
+                if response.status_code != 200:
+                    if response.status_code < 500 and response.status_code not in {
+                        401,
+                        403,
+                        404,
+                        429,
+                    }:
+                        raise GitHubInstallationRefused("current review installation was refused")
+                    raise GitHubAppError("current review installation could not be verified")
+                payload = response.json()
+            except (httpx.HTTPError, ValueError):
+                raise GitHubAppError("current review installation could not be verified") from None
+            actual = payload.get("id") if isinstance(payload, dict) else None
+            if (
+                not isinstance(actual, int)
+                or isinstance(actual, bool)
+                or actual <= 0
+                or (expected_installation_id is not None and actual != expected_installation_id)
+            ):
+                raise GitHubInstallationRefused(
+                    "review installation differs from the current App installation"
+                )
+            if self._installations.get(repo_full_name) != actual:
+                # A token is scoped to an installation, not just a repository.
+                # Reinstallation invalidates even an otherwise unexpired cache.
+                self._tokens.pop(repo_full_name, None)
+            self._installations[repo_full_name] = actual
+            self._installations.move_to_end(repo_full_name)
+            while len(self._installations) > _REPOSITORY_CACHE_LIMIT:
+                self._installations.popitem(last=False)
+            cached = self._tokens.get(repo_full_name)
+            if cached is not None and cached.usable(time.time()):
+                self._tokens.move_to_end(repo_full_name)
+                return actual, cached.token
+            token, expires_at = self._mint_for_installation(repo_full_name, actual)
+            self._tokens[repo_full_name] = _CachedToken(token=token, expires_at=expires_at)
+            self._tokens.move_to_end(repo_full_name)
+            while len(self._tokens) > _REPOSITORY_CACHE_LIMIT:
+                self._tokens.popitem(last=False)
+            return actual, token
+
+    def token_for_verified_installation(
+        self, repo_full_name: str, expected_installation_id: int
+    ) -> str:
+        """Return a token only for an independently rediscovered exact installation."""
+        _, token = self.fresh_installation_token(repo_full_name, expected_installation_id)
+        return token
 
     def _mint_lock_for(self, repo_full_name: str) -> threading.Lock:
         with self._mint_locks_guard:

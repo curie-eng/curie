@@ -13,9 +13,13 @@ Run it with ``python -m curie_mail_adapter``.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 
+from curie_telemetry import bootstrap_service_telemetry
+
+from . import __version__
 from .adapter import MailAdapter
 from .config import MailAdapterConfig
 from .egress import make_server
@@ -57,45 +61,64 @@ def boot_problems(config: MailAdapterConfig) -> list[str]:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    config = MailAdapterConfig()
-
-    problems = boot_problems(config)
-    if problems:
-        for problem in problems:
-            logger.error("%s", problem)
-        raise SystemExit(1)
-
-    adapter = MailAdapter(config)
-    server = make_server(adapter, config.port)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    logger.info(
-        "mail adapter starting: kind=email port=%s ingress_enabled=%s",
-        server.server_address[1],
-        config.ingress_enabled,
+    # The *package* logger is handed over, not this module's. `run`, `adapter`
+    # and `egress` each hold their own `getLogger(__name__)` child of it, and
+    # `configure_service_logging` sets `propagate=False` on exactly the logger it
+    # is given — so one bootstrap installs the redacting JSON handler for all
+    # three and nothing walks past it to a root handler. Bootstrapping the three
+    # module loggers instead would leave a fourth module silently unredacted.
+    telemetry = bootstrap_service_telemetry(
+        "curie-mail-adapter",
+        service_version=__version__,
+        logger=logging.getLogger("curie_mail_adapter"),
+        environ=os.environ,
     )
-
-    def _handle_signal(signum: int, _frame: object) -> None:
-        logger.info("received signal %s, shutting down", signum)
-        adapter.shutdown.set()
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
     try:
-        if config.ingress_enabled:
-            adapter.poll_loop()
-        else:
-            # The flag gates the poller, never the server: a staged cutover
-            # serves replies before it starts ingesting.
-            logger.info("ingress disabled; serving egress only")
-            adapter.ready.set()
-        adapter.shutdown.wait()
+        config = MailAdapterConfig()
+
+        problems = boot_problems(config)
+        if problems:
+            for problem in problems:
+                logger.error("%s", problem)
+            # Inside the outer try on purpose: the outer `finally` force-flushes
+            # these records before exit, and a crash-looping pod's boot error is
+            # the one log an operator most needs to have been exported.
+            raise SystemExit(1)
+
+        adapter = MailAdapter(config)
+        server = make_server(adapter, config.port)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        logger.info(
+            "mail adapter starting: kind=email port=%s ingress_enabled=%s",
+            server.server_address[1],
+            config.ingress_enabled,
+        )
+
+        def _handle_signal(signum: int, _frame: object) -> None:
+            logger.info("received signal %s, shutting down", signum)
+            adapter.shutdown.set()
+
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
+
+        try:
+            if config.ingress_enabled:
+                adapter.poll_loop()
+            else:
+                # The flag gates the poller, never the server: a staged cutover
+                # serves replies before it starts ingesting.
+                logger.info("ingress disabled; serving egress only")
+                adapter.ready.set()
+            adapter.shutdown.wait()
+        finally:
+            server.shutdown()
+            server.server_close()
+            adapter.close()
+        logger.info("mail adapter stopped")
     finally:
-        server.shutdown()
-        server.server_close()
-        adapter.close()
-    logger.info("mail adapter stopped")
+        # After the stop record is emitted, never before: shutdown force-flushes,
+        # so flushing first would drop the last record of every graceful stop.
+        telemetry.shutdown()
 
 
 if __name__ == "__main__":

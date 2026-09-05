@@ -54,10 +54,11 @@
           "classified_failure",
           "side_effect_halted",
           "idle",
-          "interrupted"
+          "interrupted",
+          "deadline_halted"
         ]
       },
-      "cardinality_bound": 168
+      "cardinality_bound": 192
     },
     "curie.turn.duration": {
       "type": "histogram",
@@ -86,10 +87,11 @@
           "classified_failure",
           "side_effect_halted",
           "idle",
-          "interrupted"
+          "interrupted",
+          "deadline_halted"
         ]
       },
-      "cardinality_bound": 168
+      "cardinality_bound": 192
     },
     "curie.history.resume.cache_read": {
       "type": "histogram",
@@ -690,7 +692,8 @@
           "steer",
           "interrupt",
           "reset",
-          "status"
+          "status",
+          "timeout"
         ],
         "role": [
           "client"
@@ -702,7 +705,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 20
+      "cardinality_bound": 24
     },
     "curie.runner.rpc.result": {
       "type": "counter",
@@ -718,7 +721,8 @@
           "steer",
           "interrupt",
           "reset",
-          "status"
+          "status",
+          "timeout"
         ],
         "role": [
           "client"
@@ -730,7 +734,7 @@
           "timeout"
         ]
       },
-      "cardinality_bound": 20
+      "cardinality_bound": 24
     },
     "curie.approval.lifecycle": {
       "type": "counter",
@@ -977,7 +981,11 @@
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/publications",
+          "/v1/internal/github/reviews/{event_id}/reserve",
+          "/v1/internal/github/reviews/{event_id}/verify",
           "/v1/internal/publications/lineage",
+          "/v1/internal/publications/review-reservations",
+          "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
@@ -1005,7 +1013,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2880
+      "cardinality_bound": 3040
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1083,7 +1091,11 @@
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/publications",
+          "/v1/internal/github/reviews/{event_id}/reserve",
+          "/v1/internal/github/reviews/{event_id}/verify",
           "/v1/internal/publications/lineage",
+          "/v1/internal/publications/review-reservations",
+          "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
@@ -1111,7 +1123,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2880
+      "cardinality_bound": 3040
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1189,7 +1201,11 @@
           "/publications/{publication_id}",
           "/v1/internal/cluster-message-replies/{reply_ref}",
           "/v1/internal/publications",
+          "/v1/internal/github/reviews/{event_id}/reserve",
+          "/v1/internal/github/reviews/{event_id}/verify",
           "/v1/internal/publications/lineage",
+          "/v1/internal/publications/review-reservations",
+          "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/credential",
@@ -1210,7 +1226,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 576
+      "cardinality_bound": 608
     },
     "curie.background.loop": {
       "type": "counter",

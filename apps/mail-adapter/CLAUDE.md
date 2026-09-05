@@ -52,6 +52,32 @@ the enforceable-rule summary.
   provider message/thread ids, or reply text. Use a one-way correlation token
   and a reason/state label so operators can join retries without copying mail
   content into the cluster log-retention system.
+- **Every log record leaves through the shared service logger, and that filter
+  is a backstop, not a licence.** `main()` calls `bootstrap_service_telemetry`
+  on the *package* logger `curie_mail_adapter`, which installs one redacting
+  single-line-JSON stderr handler and sets `propagate=False` there; `run`,
+  `adapter` and `egress` each hold a `getLogger(__name__)` child, so one
+  bootstrap covers all three and nothing walks past it to a root handler. Do not
+  reintroduce `logging.basicConfig` (it installs a root handler and the same
+  record is then emitted twice, once unformatted), and do not attach a handler
+  that bypasses the service logger -- either move re-opens the unfiltered path
+  this closed. What the filter does **not** do is the load-bearing half:
+  `packages/telemetry/src/curie_telemetry/redact.py`'s `REDACTION_RULES` has no
+  rule for any of this adapter's own credential shapes. A `chn-` channel token,
+  an AgentMail API key and `CURIE_EGRESS_SECRET` all pass through verbatim
+  unless they happen to appear as a URL query parameter (`?token=`,
+  `?api_key=`), as a bare `token=`/`secret=`/`api_key=` assignment, or after
+  `Authorization: Bearer`. `CURIE_CHANNEL_TOKEN=<value>` is specifically **not**
+  redacted -- the `secret_assignment` rule needs a word boundary before `token`,
+  and the preceding `_` denies it -- and neither is an `X-API-Key: <value>`
+  header rendered into a message. The "no raw mail PII" rule above is likewise a
+  code-level obligation the filter cannot enforce: no rule matches an address,
+  subject, body or provider id. Keep credentials and mail content out of the
+  record in the first place; the filter only catches the shapes it knows.
+  Deliberately absent for now: this adapter authors **no spans**. The bootstrap
+  installs the resource and the exporters, so records and any future spans carry
+  `service.name: curie-mail-adapter`, but neither the poll loop nor the egress
+  path is instrumented -- traces will show nothing from it until that lands.
 - **Empty allow-list plus ingress enabled is a boot failure, not deny-all.** The
   inbox is a public mailbox by construction, so fail-open would make every install
   an open trigger for agent turns. Allow-all must be written as `*`.

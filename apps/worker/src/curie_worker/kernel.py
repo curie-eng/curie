@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import secrets
 import time
 import uuid
 from collections.abc import Callable, Coroutine
@@ -84,6 +85,8 @@ from .approvals import (
     PublicationCreateRequest,
     PublicationCreator,
     PublicationLineage,
+    ReviewAuthorityUnavailable,
+    VerifiedReviewFeedback,
 )
 from .behaviorpacks import (
     BehaviorPacks,
@@ -102,20 +105,23 @@ from .publication_validation import validate_snapshot_against_base
 from .receipt import render_receipt
 from .reply_sink import ObservedReplySink, ReplySink, TargetRoute
 from .runner_client import (
+    AdoptionAttestationMismatch,
     RunnerClient,
     RunnerError,
     RunnerStreamTimeout,
     RunnerWorkspaceSnapshot,
     TurnStream,
 )
-from .sandbox import SandboxSubstrate
+from .sandbox import HISTORY_ENV, SESSION_ENV, SandboxSubstrate
 from .sandbox.types import (
+    AdoptionState,
     CapacityExhaustedError,
     SandboxError,
     SandboxHandle,
     SuspendedThreadError,
 )
 from .threadlock import ThreadLock
+from .warm_bind import ADOPTION_UNCONFIRMED, AdoptionUnconfirmedError, WarmBindPolicy
 from .workspace import (
     WorkspaceClaimCoordinator,
     WorkspacePreparationError,
@@ -329,6 +335,13 @@ _MIN_ATTEMPT_BUDGET_S = 5.0
 # never consume the whole deadline; an interrupt that has not landed inside this
 # window is treated as an unreadable runner, which fails closed.
 _RECLAIM_PREFLIGHT_IDLE_TIMEOUT_S = 5.0
+
+# The bound on the two control-plane reads an adopting start performs UNDER the
+# per-thread route lock (adoption authority, then the recovery attestation).
+# Short on purpose: a hung status route on one pod must not hold the thread's
+# steering hostage for the delivery budget, and reset's lock acquire is 5s, so
+# both reads back to back must fit under it.
+_ADOPTION_PROBE_TIMEOUT_S = 2.0
 _RECLAIM_PREFLIGHT_POLL_S = 0.05
 
 # ``WorkspaceClaimCoordinator`` performs blocking clone/archive/upload work on
@@ -572,6 +585,7 @@ class TurnOutcome:
     approval_granted_tool: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
+    review_origin_key: str | None = None
 
 
 class ThreadBusyError(RuntimeError):
@@ -614,6 +628,9 @@ class _RouteResult:
     # route) under the route lock: the canned reply to deliver instead of
     # claiming a sandbox or starting a model turn. None on every other path.
     canned_reply: str | None = None
+    # The turn was opened with an adopting event on a PENDING warm-bind route
+    # (ADR-0116 d2): the caller settles the route after the stream ends.
+    adopting: bool = False
 
 
 @dataclass
@@ -806,6 +823,7 @@ class Kernel:
         card_store: ApprovalCardStore | None = None,
         route_ttl_seconds: int = 3600,
         suspended_route_ttl_seconds: int = 86400,
+        warm_bind: WarmBindPolicy | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -827,6 +845,12 @@ class Kernel:
         # directory and giving the appearance of success.
         self._workspace = workspace
         self._killswitch = killswitch
+        # The warm-bind seam (ADR-0116 d2 / ADR-0122): absent, every claim takes
+        # the cold path exactly as before. Present, a non-workspace claim whose
+        # pool the policy knows to be booted in bootstrap mode is claimed
+        # env-free and adopted over the ACI, with authority established before
+        # any event and the route settled after the turn.
+        self._warm_bind = warm_bind
         # The approval-record backend (#244). When absent (unwired tests, a
         # deployment without the API), an awaiting-approval run degrades to an
         # escalation instead of suspending a session nothing could ever resume.
@@ -1729,6 +1753,10 @@ class Kernel:
         """Wire the kill switch after construction (it needs interrupt_agent)."""
         self._killswitch = killswitch
 
+    def attach_warm_bind(self, policy: WarmBindPolicy | None) -> None:
+        """Wire (or clear) the warm-bind policy after construction."""
+        self._warm_bind = policy
+
     async def interrupt_agent(self, agent_id: uuid.UUID) -> int:
         """Interrupt every live turn belonging to an agent (kill switch). Returns
         the number of turns signalled. The kill flag stays set (the API owns it),
@@ -2241,6 +2269,9 @@ class Kernel:
         # next same-thread event can route, and release the Valkey lock before
         # streaming so a follow-up can steer.
         routed: _RouteResult | None = None
+        review_head: str | None = None
+        review_receipt: str | None = None
+        verified_review: VerifiedReviewFeedback | None = None
 
         def close_routed_turn() -> None:
             if routed is not None and routed.turn is not None:
@@ -2248,6 +2279,36 @@ class Kernel:
 
         try:
             try:
+                if qevent.event_id.startswith("github-feedback-"):
+                    verifier = getattr(
+                        self._publication_creator, "verify_review_feedback", None
+                    )
+                    if verifier is None or workspace_deployment_id is None:
+                        raise WorkspaceSelectionRefused(
+                            "GitHub feedback requires a configured trusted workspace verifier; "
+                            "no model turn started."
+                        )
+                    try:
+                        started = time.monotonic()
+                        try:
+                            async with asyncio.timeout(remaining_s):
+                                verified = await verifier(qevent, workspace_deployment_id)
+                        finally:
+                            if remaining_s is not None:
+                                remaining_s = max(0.0, remaining_s - (time.monotonic() - started))
+                    except (ApprovalBackendError, TimeoutError):
+                        # No model turn has started. Preserve the same delivery
+                        # for bounded reclaim, rather than exhausting the model
+                        # attempt budget and ACKing feedback that never ran.
+                        raise ReviewAuthorityUnavailable(
+                            "GitHub feedback verification is temporarily unavailable"
+                        ) from None
+                    if verified.agent_id != agent_id or verified.sender != qevent.author:
+                        raise WorkspaceSelectionRefused(
+                            "GitHub feedback no longer belongs to this conversation."
+                        )
+                    review_head, review_receipt = verified.head_sha, verified.receipt
+                    verified_review = verified
                 async with self._lock.hold(self._config.lock_key(thread_key)):
                     routed = await self._route_and_start(
                         thread_key,
@@ -2258,6 +2319,10 @@ class Kernel:
                         agent_name=agent_name,
                         source=qevent.source,
                         remaining_s=remaining_s,
+                        required_review_head=review_head,
+                        verified_review=verified_review,
+                        review_turn=qevent if verified_review is not None else None,
+                        delivery_id=qevent.event_id,
                     )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -2353,6 +2418,14 @@ class Kernel:
                 workspace_deployment_id=workspace_deployment_id,
             )
             return TurnOutcome(terminal_ok=False, classification="workspace-error")
+        except AdoptionUnconfirmedError as exc:
+            # A warm route whose pod already holds the binding from a lost
+            # owner (ADR-0122; root correction 3): no turn was opened here,
+            # but the first turn may have run there, so this is escalated and
+            # never replayed. Deliberately not the retryable clause below.
+            release_order()
+            logger.warning("adoption unconfirmed for %s: %s", qevent.event_id, exc)
+            return TurnOutcome(terminal_ok=False, classification=ADOPTION_UNCONFIRMED)
         except (
             RunnerError,
             aiohttp.ClientError,
@@ -2369,6 +2442,16 @@ class Kernel:
             logger.warning("turn start failed for %s: %r", qevent.event_id, exc)
             return TurnOutcome(terminal_ok=False, classification="runner-error")
         assert routed is not None
+        if review_receipt is not None:
+            try:
+                await self._reply_for(qevent, route, review_receipt)
+            except asyncio.CancelledError:
+                close_routed_turn()
+                raise
+            except Exception:
+                # The turn's result uses the existing durable completion path;
+                # a receipt delivery outage cannot start a second model turn.
+                logger.warning("GitHub feedback receipt delivery unavailable")
         try:
             release_order()
         except BaseException:
@@ -2424,6 +2507,12 @@ class Kernel:
             ):
                 await self.interrupt_thread(thread_key, f"agent {agent_id} killed by operator")
             outcome = await self._consume(qevent, route, turn, nav, agent_id)
+            if verified_review is not None:
+                outcome.review_origin_key = verified_review.origin_key
+            if routed.adopting:
+                outcome = await self._settle_adoption(
+                    thread_key, routed.handle, turn, outcome, remaining_s=remaining_s
+                )
             if (
                 outcome.status is SessionStatus.AWAITING_APPROVAL
                 and _is_publish_provenance(
@@ -2490,6 +2579,10 @@ class Kernel:
         publication_visible_outcome_revision: int | None = None,
         force_lineage_replacement: bool = False,
         pending_publication_approval: bool = False,
+        required_review_head: str | None = None,
+        verified_review: VerifiedReviewFeedback | None = None,
+        review_turn: QueuedTurn | None = None,
+        delivery_id: str | None = None,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
         # before any platform response path. This deliberately precedes the
@@ -2502,7 +2595,12 @@ class Kernel:
                 raise WorkspacePreparationError(
                     "wiring", "workspace-enabled deployment has no trusted coordinator"
                 )
-            repo_fact = parse_github_repo_fact(event.text)
+            # A verified review already belongs to the persisted workspace. Its
+            # untrusted body may link other repositories; those are context,
+            # never a request to select a different workspace.
+            repo_fact = (
+                None if required_review_head is not None else parse_github_repo_fact(event.text)
+            )
             workspace_repo = await asyncio.to_thread(
                 self._workspace.select_repository,
                 thread_key=thread_key,
@@ -2535,7 +2633,18 @@ class Kernel:
                         # turn can observe it. Refuse before lookup/adopt so a
                         # failed suspend cannot reuse the dirty runner across
                         # either boundary.
-                        raise PendingPublicationError(thread_key)
+                        if verified_review is None:
+                            raise PendingPublicationError(thread_key)
+                        if (
+                            lineage.has_pending_outcome
+                            or verified_review.reservation_id is None
+                        ):
+                            raise ThreadBusyError(
+                                f"thread {thread_key} is waiting for its earlier publication"
+                            )
+                        # Only the API-verified origin may reuse its own reserved
+                        # boundary. The DB-only reserve CAS below rechecks this
+                        # again before any model input, including on reclaim.
                     if lineage is not None and lineage.head_sha is not None:
                         lineage_branch = lineage.branch
                         lineage_head = lineage.head_sha
@@ -2548,6 +2657,11 @@ class Kernel:
                             and lineage.visible_outcome_revision > 0
                         ):
                             lineage_base_sha = lineage.base_sha
+        if required_review_head is not None and lineage_head != required_review_head:
+            raise WorkspaceSelectionRefused(
+                "The pull request changed after GitHub feedback verification; "
+                "no model turn started."
+            )
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
         # the thread has no existing route, it is provably a NEW turn (it cannot be
@@ -2562,6 +2676,21 @@ class Kernel:
         # mere presence of an affinity record as proof that a live route was
         # retained.
         existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+        if (
+            required_review_head is not None
+            and existing_handle is not None
+            and not await self._workspace_handoff_ready(
+                existing_handle, remaining_s=remaining_s
+            )
+        ):
+            # The API-verified review owns a later publication revision. A steer
+            # cannot attribute an earlier turn's publication gate to this event,
+            # so retain this delivery in the existing bounded queue until the
+            # active turn has reached an idle, durable boundary. Ordinary Slack
+            # still follows its immediate steering path below.
+            raise ThreadBusyError(
+                f"thread {thread_key} is not ready for its queued review revision"
+            )
         materialized_lineage_head = lineage_head or lineage_base_sha
         if (
             materialized_lineage_head is not None
@@ -2612,7 +2741,7 @@ class Kernel:
             raise ThreadBusyError(
                 f"thread {thread_key} has not reached a durable workspace handoff boundary"
             )
-        if packs is not None:
+        if packs is not None and required_review_head is None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None and existing_handle is None:
                 return _RouteResult(steered=False, canned_reply=reply)
@@ -2630,10 +2759,28 @@ class Kernel:
         # model). This is the only place that can measure claim latency at
         # all -- the runner's own per-turn logging starts only once its
         # process is already up, so it cannot see the wait that got it there.
+        # Warm bind (ADR-0116 d2): only a non-workspace claim with a bound
+        # session identity, and only when the policy knows this claim's pool is
+        # booted in bootstrap mode. Anything else is the cold path, unchanged.
+        # getattr: test doubles build a Kernel without __init__ (the same
+        # tolerance the publication-creator probe above extends).
+        warm_bind: WarmBindPolicy | None = getattr(self, "_warm_bind", None)
+        bootstrap: str | None = None
+        if (
+            warm_bind is not None
+            and workspace_repo is None
+            and boot_env is not None
+            and boot_env.get(SESSION_ENV)
+        ):
+            bootstrap = warm_bind.bootstrap_for(
+                thread_key, boot_env=boot_env, agent_name=agent_name
+            )
         claim_started = time.monotonic()
         handle = await self._claim_or_resume(
             thread_key,
             boot_env,
+            bootstrap=bootstrap,
+            adopting_event_id=delivery_id,
             workspace_deployment_id=(
                 workspace_deployment_id if workspace_repo is not None else None
             ),
@@ -2659,7 +2806,43 @@ class Kernel:
         retained_live_route = existing_handle is not None and handle == existing_handle
         claim_ms = round((time.monotonic() - claim_started) * 1000)
         logger.info("claim latency for %s: %d ms", thread_key, claim_ms)
-        if source.is_job:
+        if (
+            handle.adoption_state is AdoptionState.APPLIED
+            and delivery_id is not None
+            and handle.adopting_event_id == delivery_id
+        ):
+            # This very delivery adopted that pod and its turn's fate was lost
+            # (a crash or cancel between the runner's 200 and the settle). The
+            # first turn may have run there: never a plain replay (root
+            # correction 3). The marker stays until a terminal answer clears
+            # it, so every redelivery of this event escalates the same way.
+            raise AdoptionUnconfirmedError(thread_key)
+        if handle.adoption_state is AdoptionState.PENDING:
+            # A warm-bind route whose adoption has not been applied: the pod
+            # is unbound (or a previous attempt lost its response), so it is
+            # never steered and never opened with a plain event. Authority is
+            # established first; the adopting event is the turn.
+            adopting = await self._start_adopting(
+                thread_key,
+                handle,
+                event,
+                bootstrap=bootstrap,
+                delivery_id=delivery_id,
+                remaining_s=remaining_s,
+            )
+            if adopting is not None:
+                return adopting
+            # A lost owner's adoption was just settled APPLIED for a DIFFERENT
+            # event: this message continues on the cold path's steer-or-open
+            # logic against the now-bound pod. Re-read the authoritative route.
+            settled = await asyncio.to_thread(self._substrate.lookup, thread_key)
+            if settled is None or settled.adoption_state is not AdoptionState.APPLIED:
+                raise RunnerError(f"warm route for {thread_key} was lost while settling")
+            handle = settled
+            retained_live_route = existing_handle is not None and (
+                existing_handle.claim_name == handle.claim_name
+            )
+        if source.is_job or required_review_head is not None:
             # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
             # a webhook must never fold itself into whatever a person is currently
             # saying, so this path does not attempt a steer at all.
@@ -2723,6 +2906,25 @@ class Kernel:
             if retained_live_route and active_before_steer:
                 _record_route("finish-race")
                 _lifecycle_event("runner.finish_race", "finish-race")
+        if verified_review is not None:
+            if (
+                review_turn is None
+                or workspace_deployment_id is None
+                or verified_review.origin_key != review_turn.event_id
+                or self._publication_creator is None
+            ):
+                raise WorkspaceSelectionRefused("GitHub feedback revision identity was refused.")
+            try:
+                await self._publication_creator.reserve_review_feedback(
+                    review_turn, workspace_deployment_id, verified_review
+                )
+            except ApprovalBackendError:
+                # The reserve sibling has the same pre-model transport policy.
+                # A transport failure must revalidate the exact origin
+                # on reclaim; the existing SQL reservation CAS remains sole writer.
+                raise ReviewAuthorityUnavailable(
+                    "GitHub review reservation is temporarily unavailable"
+                ) from None
         # The per-request timeout is min(runner_total_timeout_s, remaining
         # delivery budget): the budget can only ever SHORTEN a request, never
         # grant one more time than the delivery has left (ADR-0131).
@@ -2732,6 +2934,256 @@ class Kernel:
         _record_route("start")
         _lifecycle_event("runner.turn.started", "start")
         return _RouteResult(steered=False, handle=handle, turn=turn)
+
+    async def _start_adopting(
+        self,
+        thread_key: str,
+        handle: SandboxHandle,
+        event: Event,
+        *,
+        bootstrap: str | None,
+        delivery_id: str | None,
+        remaining_s: float | None,
+    ) -> _RouteResult | None:
+        """Open the adopting turn on a PENDING warm-bind route (ADR-0116 d2).
+
+        Returns ``None`` in exactly one case: the pod already held the binding
+        from a lost owner whose adopting event was a DIFFERENT event; the
+        route is then settled APPLIED and the caller continues on the ordinary
+        steer-or-open path. The same delivery reaching that state raises
+        ``AdoptionUnconfirmedError`` instead.
+
+        Runs under the per-thread route lock like ``start_turn``. Before the
+        event: the runner must prove, by behavior on the existing gated status
+        route, that it is a realizing bootstrap-mode adopter. An old or open
+        runner would serve the event under its boot identity and START A MODEL
+        TURN, so a failed probe releases the claim (the pod is never reused)
+        and raises ``RunnerError``: the delivery retries within its bounded
+        attempt budget and escalates if no capable pod is found. Nothing is
+        inferred from the protocol version.
+
+        Lock hold: the probe is bounded by ``_ADOPTION_PROBE_TIMEOUT_S``; the
+        adopting POST is the same shape as ``start_turn`` under this lock, plus
+        the runner's conversation bind (history load) before its 200. That
+        bind must complete before the lock releases: rule 1 needs the route
+        APPLIED before any follow-up can route, and the route is settled here
+        on the runner's 200. Interrupt: the conversation credential is inert
+        until the runner's ``adopt`` commits, but no model turn is live before
+        that commit (the runner adopts first, then streams), so the window in
+        which ``/v1/interrupt`` would refuse the bearer contains no turn to
+        stop; the kill-switch recheck after registration covers everything
+        after the 200.
+        """
+
+        if not bootstrap:
+            # A pending route reached a worker without the pool credential
+            # (policy absent or changed under a live route): it cannot be
+            # adopted here and must never be opened with a plain event.
+            raise RunnerError(f"pending warm-bind route for {thread_key} has no bootstrap")
+        # Control-plane reads under the route lock get a SHORT bound, never the
+        # delivery budget: a hung status route must not hold steering hostage.
+        probe_s = (
+            _ADOPTION_PROBE_TIMEOUT_S
+            if remaining_s is None
+            else max(0.0, min(_ADOPTION_PROBE_TIMEOUT_S, remaining_s))
+        )
+        established = await self._runner.adoption_authority(
+            handle.base_url, bootstrap_token=bootstrap, remaining_s=probe_s
+        )
+        if not established:
+            # Not a bootstrap adopter NOW. Either it never was (an old or open
+            # pod: release it, nothing ran there) or a lost owner of this very
+            # delivery already adopted it (200 from the runner, then no route
+            # write): the conversation credential attests that pod, the route
+            # is settled APPLIED, and the delivery is unconfirmed, because the
+            # first turn may have run. The attestation decides which.
+            try:
+                applied_on_pod = await self._runner.adoption_applied(
+                    handle.base_url,
+                    conversation_token=handle.token,
+                    session_id=handle.session_id,
+                    remaining_s=probe_s,
+                )
+            except AdoptionAttestationMismatch as exc:
+                # A readable answer that attests NO or ANOTHER conversation:
+                # an open or old runner (200 to any bearer) or a pod bound
+                # elsewhere. Nothing ran here for this thread; end it, fenced.
+                logger.warning(
+                    "warm sandbox %s attested no adoptable identity (%s); releasing it",
+                    handle.sandbox_name,
+                    _exception_reason(exc),
+                )
+                await asyncio.to_thread(
+                    self._substrate.release_claim, thread_key, expected=handle
+                )
+                raise RunnerError("warm sandbox is not a realizing bootstrap adopter") from None
+            except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
+                # Unreadable or a server fault, not a refusal: keep the claim
+                # (a retry re-probes the same fenced pod) and let the delivery
+                # back off.
+                raise RunnerError(
+                    f"warm sandbox could not be attested: {_exception_reason(exc)}"
+                ) from None
+            if applied_on_pod:
+                # The pod holds the binding a lost owner applied. The route's
+                # marker names the event that adopted it (written at PENDING):
+                # the same delivery is unconfirmed (its turn may have run);
+                # any other event continues on the ordinary path.
+                if (
+                    await asyncio.to_thread(
+                        self._substrate.mark_adoption_applied, thread_key, expected=handle
+                    )
+                    is None
+                ):
+                    logger.warning(
+                        "adoption fence lost for %s on claim %s generation %d",
+                        thread_key,
+                        handle.claim_name,
+                        handle.generation,
+                    )
+                if delivery_id is not None and handle.adopting_event_id == delivery_id:
+                    raise AdoptionUnconfirmedError(thread_key)
+                logger.info(
+                    "warm route for %s settled from a lost owner's adoption; continuing",
+                    thread_key,
+                )
+                return None
+            logger.warning(
+                "warm sandbox %s did not establish adoption authority; releasing it",
+                handle.sandbox_name,
+            )
+            await asyncio.to_thread(self._substrate.release_claim, thread_key, expected=handle)
+            raise RunnerError("warm sandbox is not a realizing bootstrap adopter")
+        turn = await self._runner.start_adopting_turn(
+            handle.base_url,
+            event,
+            bootstrap_token=bootstrap,
+            conversation_token=handle.token,
+            session_id=handle.session_id,
+            history_ref=handle.history_ref,
+            remaining_s=remaining_s,
+        )
+        # The runner commits the adoption BEFORE its 200 (server.py: adopt,
+        # then prepare the stream), so the binding is applied on the pod the
+        # moment start_adopting_turn returns. Settle the route now, still under
+        # the route lock: every later routing decision on this thread (a
+        # follow-up, a job, another replica) then sees an APPLIED route and
+        # steers or opens under the conversation credential exactly as on the
+        # cold path (rules 1 and 2), instead of re-entering this branch. The
+        # per-frame ack is re-checked after the stream as the second proof.
+        if (
+            await asyncio.to_thread(
+                self._substrate.mark_adoption_applied, thread_key, expected=handle
+            )
+            is None
+        ):
+            logger.warning(
+                "adoption fence lost for %s on claim %s generation %d",
+                thread_key,
+                handle.claim_name,
+                handle.generation,
+            )
+        # The metric outcome stays "start" (the allowlisted route outcomes are
+        # a telemetry contract); the lifecycle span event names the adoption.
+        _record_route("start")
+        _lifecycle_event("runner.turn.adopting", "start")
+        return _RouteResult(steered=False, handle=handle, turn=turn, adopting=True)
+
+    async def _settle_adoption(
+        self,
+        thread_key: str,
+        handle: SandboxHandle,
+        turn: TurnStream,
+        outcome: TurnOutcome,
+        *,
+        remaining_s: float | None,
+    ) -> TurnOutcome:
+        """Settle a PENDING route after its adopting turn (ADR-0122 d3).
+
+        Acked on every frame: the binding is APPLIED through the store's fenced
+        predicate; a lost fence (the route was replaced under the turn) is
+        logged and the outcome stands. Lost response (no terminal, or a
+        transport drop): the runner's status attestation under the
+        conversation credential says whether the binding was applied to that
+        pod and ONLY that. Either way the turn is ``adoption-unconfirmed``: it
+        may already have run, so it is escalated, never retried as if the
+        event had not been delivered. A terminal stream without the per-frame
+        ack contradicts the runner contract; the already-APPLIED session is
+        retained and the violation is logged.
+        """
+
+        # The runner's terminal answer (a final of any status) is the only
+        # thing that makes the adopting turn's fate known. Without it the turn
+        # may already have run, so whatever the binding did, the delivery must
+        # not be replayed as a plain event on the now-bound pod.
+        terminal = outcome.terminal_ok or outcome.status is not None
+        if turn.adoption_acked:
+            # Already APPLIED at the runner's 200 (see _start_adopting); the
+            # per-frame ack is the second proof, and the write is idempotent.
+            applied = await asyncio.to_thread(
+                self._substrate.mark_adoption_applied, thread_key, expected=handle
+            )
+            if applied is None:
+                logger.warning(
+                    "adoption fence lost for %s on claim %s generation %d",
+                    thread_key,
+                    handle.claim_name,
+                    handle.generation,
+                )
+        elif terminal:
+            # A 200 without the per-frame ack contradicts the runner contract
+            # (a realizing adopter stamps every frame of the adopting turn).
+            # The 200 was already taken as the adoption commit and the route
+            # is APPLIED; follow-ups may have steered into this session, so
+            # it is NOT destroyed here. Logged as a contract violation.
+            logger.error(
+                "adopting turn on %s ended without an adoption ack (contract violation)",
+                handle.sandbox_name,
+            )
+        else:
+            try:
+                applied_on_pod = await self._runner.adoption_applied(
+                    handle.base_url,
+                    conversation_token=handle.token,
+                    session_id=handle.session_id,
+                    remaining_s=remaining_s,
+                )
+            except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
+                logger.warning(
+                    "adoption recovery read failed for %s: %s",
+                    thread_key,
+                    _exception_reason(exc),
+                )
+                applied_on_pod = None
+            if applied_on_pod:
+                if (
+                    await asyncio.to_thread(
+                        self._substrate.mark_adoption_applied, thread_key, expected=handle
+                    )
+                    is None
+                ):
+                    logger.warning(
+                        "adoption fence lost for %s on claim %s generation %d",
+                        thread_key,
+                        handle.claim_name,
+                        handle.generation,
+                    )
+            elif applied_on_pod is False:
+                await asyncio.to_thread(
+                    self._substrate.release_claim, thread_key, expected=handle
+                )
+        if not terminal:
+            outcome.classification = ADOPTION_UNCONFIRMED
+            return outcome
+        # The adopting turn's fate is known: drop the marker so a later retry
+        # of this same event (after a classified failure) opens normally.
+        if not await asyncio.to_thread(
+            self._substrate.clear_adopting_event, thread_key, expected=handle
+        ):
+            logger.warning(
+                "adopting-event marker for %s not cleared (fence lost or absent)", thread_key
+            )
+        return outcome
 
     async def _turn_active(
         self, handle: SandboxHandle, *, remaining_s: float | None = None
@@ -2869,6 +3321,8 @@ class Kernel:
         pending_publication_approval: bool = False,
         agent_name: str | None = None,
         remaining_s: float | None = None,
+        bootstrap: str | None = None,
+        adopting_event_id: str | None = None,
     ) -> SandboxHandle:
         # A live route is an adopt/steer, not a session start. Preparing before
         # this check would clone on every threaded steer and could even replace
@@ -3010,6 +3464,25 @@ class Kernel:
                     "claim", "workspace substrate returned an invalid sandbox handle"
                 )
             return workspace_claim.handle
+        if bootstrap is not None and boot_env is not None and boot_env.get(SESSION_ENV):
+            # Warm bind: an env-free claim binds a pool pod; the identity and a
+            # freshly minted conversation credential are recorded PENDING on
+            # the route before any event leaves this worker. A suspended thread
+            # still resumes cold below: its replacement pod boots from env.
+            try:
+                return await asyncio.to_thread(
+                    self._substrate.claim,
+                    thread_key,
+                    session_id=boot_env[SESSION_ENV],
+                    history_ref=boot_env.get(HISTORY_ENV),
+                    conversation_token=secrets.token_urlsafe(32),
+                    adopting_event_id=adopting_event_id,
+                    agent_name=agent_name,
+                )
+            except SuspendedThreadError:
+                return await asyncio.to_thread(
+                    self._substrate.resume, thread_key, env=boot_env, agent_name=agent_name
+                )
         try:
             return await asyncio.to_thread(
                 self._substrate.claim, thread_key, env=boot_env, agent_name=agent_name
@@ -3320,6 +3793,7 @@ class Kernel:
                         title=snapshot.publication_title,
                         body=snapshot.publication_body,
                         max_patch_bytes=self._config.publication_patch_max_bytes,
+                        review_origin_key=outcome.review_origin_key,
                     )
                 )
                 created = CreatedApproval(

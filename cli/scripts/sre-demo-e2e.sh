@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Nightly SRE demo e2e (#2246).
 #
-# One driver for the six demo assertions on a kind cluster with the pinned
+# One driver for observations toward six demo assertions on a kind cluster with the pinned
 # upstream kubernetes-mcp-server, a CI-only Socket Mode Slack app, a live
 # provider, and an allowlisted throwaway repo.
 #
@@ -9,8 +9,8 @@
 #   prereqs  Check the CI Slack app, throwaway repo, and live provider.
 #            Missing any of them writes SKIPPED plus the reason to
 #            GITHUB_STEP_SUMMARY, sets ready=false on GITHUB_OUTPUT, and
-#            exits 0. That is the documented skip, not a green that proved
-#            the six assertions.
+#            exits 0 for pull-request inventory only. Required scheduled,
+#            dispatch and release-candidate runs fail closed on missing setup.
 #   run      Drive the six assertions against an already-installed kind
 #            release. Refuses unless CURIE_SRE_DEMO_ALLOW_LIVE=1 so a
 #            laptop invocation cannot touch Slack or a cluster. Missing
@@ -39,9 +39,16 @@
 #   CURIE_SRE_DEMO_ALLOW_LIVE=1
 #
 # Optional: CURIE_MODEL, CURIE_NAMESPACE (default curie), CURIE_RELEASE (default curie),
-# CURIE_SRE_DEMO_AGENT (default sre-bot).
+# CURIE_SRE_DEMO_AGENT (default sre-bot), CURIE_SRE_DEMO_EVIDENCE_DIR (private
+# parent directory in which raw row logs are retained; otherwise removed on exit).
+# CURIE_SRE_DEMO_RESULTS_FILE retains fixed row/status JSON only. GH_TOKEN may
+# supply a read-only disposable-repository verifier identity; its absence blocks
+# that coding observation and never substitutes for the product GitHub App.
+# Rows needing real Slack card interaction, trace correlation, or continuous
+# coding proof are explicitly BLOCKED until those integrations are implemented.
 
 set -euo pipefail
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PHASE="${CURIE_SRE_DEMO_PHASE:-${1:-}}"
@@ -53,6 +60,11 @@ DEMO_DEPLOY="sre-demo-app"
 # Keep in lockstep with examples/sre-bot/connectors.yaml.
 K8S_MCP_DIGEST="sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423"
 K8S_MCP_IMAGE="ghcr.io/containers/kubernetes-mcp-server@${K8S_MCP_DIGEST}"
+READ_THREAD_TS=""
+BOT_ID=""
+MCP_FORWARD_PID=""
+PROBE_NS=""
+PROBE_NS_CREATED=0
 
 if [[ -z "$PHASE" ]]; then
   if [[ "${CURIE_SRE_DEMO_ALLOW_LIVE:-}" == "1" ]]; then
@@ -91,6 +103,15 @@ missing_prereqs() {
   fi
 }
 
+validate_throwaway_repo() {
+  if [[ ! "$CI_THROWAY_REPO" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+     [[ "${CI_THROWAY_REPO,,}" == curie-eng/curie || "${CI_THROWAY_REPO,,}" == curie-eng/agentos ]]; then
+    write_summary "BLOCKED: CI_THROWAY_REPO must name a disposable repository, never the platform repository."
+    write_output ready false
+    return 1
+  fi
+}
+
 phase_prereqs() {
   local missing
   missing="$(missing_prereqs || true)"
@@ -112,9 +133,13 @@ EOF
 )"
     write_output ready false
     write_output skip_reason "missing CI Slack app and/or throwaway repo and/or live provider"
-    echo "sre-demo-e2e: skipped (prerequisites missing)" >&2
+    echo "sre-demo-e2e: acceptance BLOCKED (prerequisites missing)" >&2
+    if [[ "${CURIE_SRE_DEMO_REQUIRED:-0}" == "1" ]]; then
+      exit 1
+    fi
     exit 0
   fi
+  validate_throwaway_repo
   write_summary "### SRE demo e2e prerequisites ready
 
 Live provider, CI-only Slack app, and throwaway repo secrets are present. The
@@ -153,11 +178,6 @@ else:
     print(cur)' "$1"
 }
 
-replicas_of() {
-  local ns="$1" name="$2"
-  kubectl get deploy "$name" -n "$ns" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0
-}
-
 spec_replicas_of() {
   local ns="$1" name="$2"
   kubectl get deploy "$name" -n "$ns" -o jsonpath='{.spec.replicas}'
@@ -167,22 +187,32 @@ wait_replicas() {
   local ns="$1" name="$2" want="$3" timeout="${4:-180}"
   local i
   for i in $(seq 1 "$timeout"); do
-    if [[ "$(spec_replicas_of "$ns" "$name")" == "$want" ]]; then
+    if kubectl get deploy "$name" -n "$ns" -o json | python3 -c '
+import json,sys
+d=json.load(sys.stdin); want=int(sys.argv[1]); s=d.get("status", {})
+generation=d.get("metadata", {}).get("generation")
+ready=(isinstance(generation,int) and s.get("observedGeneration",-1)>=generation
+       and d.get("spec",{}).get("replicas")==want
+       and all(s.get(k,0)==want for k in
+               ("replicas","updatedReplicas","readyReplicas","availableReplicas"))
+       and s.get("unavailableReplicas",0)==0)
+sys.exit(0 if ready else 1)' "$want"; then
       return 0
     fi
     sleep 1
   done
-  echo "timed out waiting for $ns/$name spec.replicas=$want (have $(spec_replicas_of "$ns" "$name"))" >&2
+  echo "timed out waiting for observed generation and all desired replicas ready/available" >&2
   return 1
 }
 
 slack_api() {
   local token="$1" method="$2"
   shift 2
-  python3 - "$token" "$method" "$@" <<'PY'
-import json, sys, urllib.parse, urllib.request
-token, method = sys.argv[1], sys.argv[2]
-pairs = sys.argv[3:]
+  # A token must never be a process argument or appear in diagnostics.
+  CURIE_SRE_SLACK_TOKEN="$token" python3 - "$method" "$@" <<'PY'
+import json, os, sys, urllib.parse, urllib.request
+token, method = os.environ["CURIE_SRE_SLACK_TOKEN"], sys.argv[1]
+pairs = sys.argv[2:]
 data = {}
 for item in pairs:
     key, _, value = item.partition("=")
@@ -194,41 +224,62 @@ req = urllib.request.Request(
     headers={"Authorization": f"Bearer {token}"},
     method="POST",
 )
-with urllib.request.urlopen(req, timeout=30) as resp:
-    payload = json.load(resp)
+try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.load(resp)
+except Exception:
+    raise SystemExit("Slack request failed; response withheld") from None
 if not payload.get("ok"):
-    sys.stderr.write(f"slack {method} failed: {payload.get('error', payload)}\n")
+    sys.stderr.write("Slack API refused the request; response withheld\n")
     sys.exit(1)
 json.dump(payload, sys.stdout)
 PY
 }
 
 mention_bot() {
-  local text="$1"
+  local text="$1" thread_ts="${2:-}"
   local bot_id
-  bot_id="$(slack_api "$CI_SLACK_BOT_TOKEN" auth.test | json_get user_id)"
+  bot_id="${BOT_ID:-$(slack_api "$CI_SLACK_BOT_TOKEN" auth.test | json_get user_id)}"
+  local thread_args=()
+  [[ -z "$thread_ts" ]] || thread_args+=("thread_ts=$thread_ts")
   slack_api "$CI_SLACK_USER_TOKEN" chat.postMessage \
     "channel=${CI_SLACK_CHANNEL_ID}" \
-    "text=<@${bot_id}> ${text}"
+    "text=<@${bot_id}> ${text}" "${thread_args[@]}"
 }
 
 wait_thread_reply() {
-  local thread_ts="$1" timeout="${2:-180}"
-  local i payload messages
-  for i in $(seq 1 "$timeout"); do
-    payload="$(slack_api "$CI_SLACK_BOT_TOKEN" conversations.replies \
+  local thread_ts="$1" timeout="${2:-180}" after_ts="${3:-$1}" mode="${4:-text}"
+  local payload selected deadline=$((SECONDS + timeout))
+  local bot_id="${BOT_ID:-$(slack_api "$CI_SLACK_BOT_TOKEN" auth.test | json_get user_id)}"
+  while (( SECONDS <= deadline )); do
+    # Slack channel-thread history uses the user token; the bot token is only
+    # the target identity. https://docs.slack.dev/reference/methods/conversations.replies/
+    payload="$(slack_api "$CI_SLACK_USER_TOKEN" conversations.replies \
       "channel=${CI_SLACK_CHANNEL_ID}" "ts=${thread_ts}")"
-    messages="$(printf '%s' "$payload" | python3 -c 'import json,sys
-data=json.load(sys.stdin)
-msgs=data.get("messages") or []
-print(len(msgs))')"
-    if [[ "$messages" -gt 1 ]]; then
-      printf '%s' "$payload"
+    if selected="$(printf '%s' "$payload" | python3 -c 'import json,os,re,sys
+from decimal import Decimal
+d=json.load(sys.stdin); root,user,after,placeholder,mode=sys.argv[1:]
+# An edit to an older response does not correlate it with this instruction.
+rows=[m for m in d.get("messages",[]) if m.get("user")==user
+      and m.get("thread_ts")==root and Decimal(m.get("ts","0"))>Decimal(after)
+      and m.get("text", "").strip() and m["text"].strip()!=placeholder]
+if not d.get("ok") or not rows: sys.exit(1)
+# This is substantive delivery only, never a terminal/run-success signal.
+text="\n".join(m["text"] for m in rows)
+if mode=="namespaces":
+    names={r["metadata"]["name"] for r in json.loads(os.environ["EXPECTED_NAMESPACES"])["items"]}
+    words=set(re.findall(r"[a-z0-9][a-z0-9-]*",text))
+    if not names or not names<=words: sys.exit(1)
+elif mode=="pr" and not re.search(r"https://github\.com/[^/\s<>|]+/[^/\s<>|]+/pull/[0-9]+",text):
+    sys.exit(1)
+print(text)' \
+      "$thread_ts" "$bot_id" "$after_ts" "${CURIE_PLACEHOLDER_TEXT:-On it. Working on your request.}" "$mode")"; then
+      printf '%s' "$selected"
       return 0
     fi
     sleep 2
   done
-  echo "timed out waiting for a Slack reply in thread $thread_ts" >&2
+  echo "timed out waiting for a substantive target-authored Slack reply" >&2
   return 1
 }
 
@@ -238,45 +289,30 @@ list_pending() {
   "$bin" cluster approvals "$AGENT" --list --json
 }
 
-pending_count() {
-  list_pending | json_get count
-}
-
-pending_tools() {
+thread_pending() {
   list_pending | python3 -c 'import json,sys
-data=json.load(sys.stdin)
-tools=[row.get("granted_tool") or "" for row in data.get("pending") or []]
-print("\n".join(tools))'
-}
-
-latest_pending_id() {
-  list_pending | python3 -c 'import json,sys
-data=json.load(sys.stdin)
-pending=data.get("pending") or []
-if not pending:
-    sys.exit(1)
-print(pending[0]["id"])'
+d=json.load(sys.stdin)
+if d.get("truncated",True): raise SystemExit("approval list incomplete")
+rows=[r for r in d["pending"] if r.get("conversation_id")==sys.argv[1]
+      and r.get("status")=="pending"]
+json.dump(rows,sys.stdout)' "$1"
 }
 
 approve() {
-  local id="$1"
-  local bin
-  bin="$(curie_bin)"
-  "$bin" cluster approvals "$AGENT" --resolve "$id" --json
+  # An operator credential is a different principal and cannot prove a human
+  # card interaction. Keep this row blocked until authenticated Slack browser
+  # automation plus matching chat-principal audit verification is implemented.
+  echo "BLOCKED: actual authenticated Slack approval/deny button interaction and chat-principal audit evidence are unavailable" >&2
+  return 3
 }
 
-connector_args() {
-  kubectl get deploy -n "$NAMESPACE" -o json | python3 -c 'import json,sys
-data=json.load(sys.stdin)
-needle="kubernetes-mcp-server"
-for item in data.get("items") or []:
-    for container in (item.get("spec") or {}).get("template", {}).get("spec", {}).get("containers") or []:
-        image=container.get("image") or ""
-        if needle in image:
-            print("\n".join(container.get("args") or []))
-            print("IMAGE="+image)
-            sys.exit(0)
-sys.exit(1)'
+connector_deployment() {
+  kubectl get deploy -n "$NAMESPACE" -o json | python3 -c '
+import json,sys
+rows=[r["metadata"]["name"] for r in json.load(sys.stdin)["items"]
+      if any(c.get("image")==sys.argv[1] for c in r["spec"]["template"]["spec"]["containers"])]
+if len(rows)!=1: raise SystemExit("expected exactly one pinned connector deployment")
+print(rows[0])' "$K8S_MCP_IMAGE"
 }
 
 build_kubeconfig() {
@@ -359,6 +395,7 @@ phase_run() {
     printf '%s\n' "$missing" >&2
     exit 1
   fi
+  validate_throwaway_repo
 
   local bin
   bin="$(curie_bin)"
@@ -366,12 +403,6 @@ phase_run() {
   local kubeconfig
   kubeconfig="$(build_kubeconfig)"
   ensure_demo_workload
-
-  local args
-  args="$(connector_args || true)"
-  if [[ -n "$args" ]]; then
-    echo "$args" | grep -q "$K8S_MCP_DIGEST\|kubernetes-mcp-server" || true
-  fi
 
   export K8S_KUBECONFIG="$kubeconfig"
   export SLACK_APP_TOKEN="${CI_SLACK_APP_TOKEN}"
@@ -385,184 +416,252 @@ phase_run() {
     --plugin-dir "$ROOT/examples/sre-bot" \
     --chart "$ROOT/charts/curie" \
     --slack-channel "$CI_SLACK_CHANNEL_ID" \
-    --workspace \
     --secret K8S_KUBECONFIG
 
-  local waited
+  local waited deployment
   waited=0
   while [[ $waited -lt 90 ]]; do
-    if connector_args >/dev/null 2>&1; then
+    if deployment="$(connector_deployment 2>/dev/null)"; then
       break
     fi
     sleep 2
     waited=$((waited + 1))
   done
-  if ! connector_args >/dev/null 2>&1; then
+  if ! deployment="$(connector_deployment)"; then
     echo "the pinned kubernetes-mcp-server connector did not become ready" >&2
     exit 1
   fi
 
-  local mint
-  mint="$("$bin" cluster approvals "$AGENT" --mint-operator-principal "ci-sre-demo" --json)"
-  export CURIE_APPROVAL_PRINCIPAL_TOKEN
-  CURIE_APPROVAL_PRINCIPAL_TOKEN="$(printf '%s' "$mint" | json_get operator_principal.token)"
+  kubectl rollout status "deploy/$deployment" -n "$NAMESPACE" --timeout=180s
 
-  assert_read
-  assert_scale
-  assert_rearm
-  assert_configuration_denial
-  assert_rbac_ceiling
-  assert_coding_handoff
+  # The verification namespace is created by this driver only; its name is
+  # deliberately absent from the Slack prompt, so an echoed request cannot pass.
+  if [[ -n "${CURIE_SRE_DEMO_EVIDENCE_DIR:-}" ]]; then
+    mkdir -p "$CURIE_SRE_DEMO_EVIDENCE_DIR"
+    evidence_dir="$(mktemp -d "$CURIE_SRE_DEMO_EVIDENCE_DIR/sre-demo.XXXXXX")"
+  else
+    evidence_dir="$(mktemp -d)"
+  fi
+  trap '[[ "$PROBE_NS_CREATED" == 0 ]] || kubectl delete namespace "$PROBE_NS" --wait=false >/dev/null 2>&1; [[ -n "${CURIE_SRE_DEMO_EVIDENCE_DIR:-}" ]] || rm -rf "$evidence_dir"' EXIT
+  PROBE_NS="sre-e2e-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+  kubectl create namespace "$PROBE_NS" >/dev/null
+  PROBE_NS_CREATED=1
+  export CURIE_SRE_DEMO_THREAD_FILE="$evidence_dir/read-thread"
+  BOT_ID="$(slack_api "$CI_SLACK_BOT_TOKEN" auth.test | json_get user_id)"
+  OBSERVATION_FAILURES=0
+  run_assertion read assert_read
+  run_assertion scale assert_scale
+  run_assertion rearm assert_rearm
+  run_assertion configuration-denial assert_configuration_denial
+  run_assertion rbac-ceiling assert_rbac_ceiling
+  run_assertion coding-handoff assert_coding_handoff
+  if (( OBSERVATION_FAILURES )); then
+    write_summary "SRE demo acceptance incomplete. BLOCKED rows are unproved and do not count as passes. See each row above. No operator resolution stands in for a Slack button click."
+    return 1
+  fi
+}
 
-  write_summary "### SRE demo e2e passed
+run_assertion() {
+  local row="$1" function="$2" result status
+  # Do not put the function in an if/|| condition: Bash would disable errexit
+  # throughout it and a failed check could fall through to a passing echo.
+  set +e
+  (set -e; "$function") >"$evidence_dir/$row.log" 2>&1
+  result=$?
+  set -e
+  case "$result" in
+    0) status=PASS; write_summary "- $row: PASS (only the named assertion)." ;;
+    3) status=BLOCKED; write_summary "- $row: BLOCKED. ${BLOCK_REASONS[$row]}"
+       OBSERVATION_FAILURES=$((OBSERVATION_FAILURES + 1)) ;;
+    *) status=FAILED; write_summary "- $row: FAILED. Raw diagnostics were kept private during execution."
+       OBSERVATION_FAILURES=$((OBSERVATION_FAILURES + 1)) ;;
+  esac
+  if [[ -n "${CURIE_SRE_DEMO_RESULTS_FILE:-}" ]]; then
+    # Only fixed row/status enums are public artifacts. Raw Slack, GitHub and
+    # cluster diagnostics may contain deployment identifiers or credentials.
+    python3 - "$row" "$status" >>"$CURIE_SRE_DEMO_RESULTS_FILE" <<'PYOUTCOME'
+import json,sys
+row,status=sys.argv[1:]
+assert row in {"read","scale","rearm","configuration-denial","rbac-ceiling","coding-handoff"}
+assert status in {"PASS","BLOCKED","FAILED"}
+print(json.dumps({"row":row,"status":status},sort_keys=True))
+PYOUTCOME
+  fi
+}
 
-All six assertions passed against kind, the pinned kubernetes-mcp-server
-(${K8S_MCP_DIGEST}), the CI-only Slack app, a live provider, and the
-allowlisted throwaway repo."
+declare -A BLOCK_REASONS=(
+  [read]="Substantive target reply and observed namespace data are checked; a correlated successful tool/run trace is still required."
+  [scale]="Pending tool and held replicas are checked; authenticated Slack card approval/deny and matching chat-principal audit are unavailable."
+  [rearm]="Requires a completed real Slack grant followed by a new request and actual deny; the preceding grant path is blocked."
+  [configuration-denial]="The real connector MCP endpoint could not be reached."
+  [rbac-ceiling]="Requires actual Slack approval and an explicit forbidden tool result, with the platform deployment unchanged."
+  [coding-handoff]="Same-thread delivery and real PR metadata are inspected where available; publication approval, sandbox tests, follow-up commits and product App review-event proof are still required."
+)
+
+workload_specs() {
+  kubectl get deploy,statefulset,daemonset -A -o json | python3 -c '
+import json,sys
+rows=[[r["kind"],r["metadata"]["namespace"],r["metadata"]["name"],r["spec"]]
+      for r in json.load(sys.stdin)["items"]]
+print(json.dumps(sorted(rows,key=lambda r:r[:3]),sort_keys=True))'
 }
 
 assert_read() {
-  local before after posted ts
-  before="$(pending_count)"
-  posted="$(mention_bot "List the Kubernetes namespaces using the namespaces_list tool. Do not scale or mutate anything.")"
+  local before after posted ts replies namespaces
+  before="$(workload_specs)"
+  namespaces="$(kubectl get ns -o json)"
+  posted="$(mention_bot "List all current Kubernetes namespaces using namespaces_list. Include every namespace name in your answer. Do not scale or mutate anything.")"
   ts="$(printf '%s' "$posted" | json_get ts)"
-  wait_thread_reply "$ts" >/dev/null
-  after="$(pending_count)"
-  if [[ "$after" != "$before" ]]; then
-    echo "negative failed: namespaces_list created an approval record (before=$before after=$after)" >&2
-    exit 1
-  fi
-  echo "assert 1 read (namespaces_list): reply observed, no approval record" >&2
+  printf '%s' "$ts" >"$CURIE_SRE_DEMO_THREAD_FILE"
+  replies="$(EXPECTED_NAMESPACES="$namespaces" wait_thread_reply "$ts" 180 "$ts" namespaces)"
+  printf '%s' "$replies" | EXPECTED_NAMESPACES="$namespaces" python3 -c '
+import json,os,re,sys
+names={r["metadata"]["name"] for r in json.loads(os.environ["EXPECTED_NAMESPACES"])["items"]}
+words=set(re.findall(r"[a-z0-9][a-z0-9-]*",sys.stdin.read()))
+if not names or not names<=words: raise SystemExit("reply omitted observed namespace data")'
+  thread_pending "$ts" | python3 -c 'import json,sys; sys.exit(bool(json.load(sys.stdin)))'
+  after="$(workload_specs)"
+  [[ "$before" == "$after" ]] || { echo "read changed workload specifications" >&2; return 1; }
+  # Slack delivery has no terminal marker. Never label a text observation a
+  # successful namespaces_list execution without its correlated tool trace.
+  return 3
+}
+
+wait_scale_pending() {
+  local ts="$1" deadline=$((SECONDS + 180)) pending
+  while (( SECONDS < deadline )); do
+    pending="$(thread_pending "$ts")"
+    if printf '%s' "$pending" | python3 -c '
+import json,sys
+r=json.load(sys.stdin)
+if len(r)>1: raise SystemExit(2)
+if not r: raise SystemExit(1)
+if r[0].get("granted_tool")!="mcp__kubernetes__resources_scale": raise SystemExit(2)
+print(r[0]["id"])'; then
+      return 0
+    else
+      local result=$?
+      [[ "$result" == 1 ]] || return 1
+    fi
+    sleep 2
+  done
+  echo "no exact conversation-scoped resources_scale approval appeared" >&2
+  return 1
 }
 
 assert_scale() {
-  local before id tools posted ts
-  if [[ "$(spec_replicas_of "$DEMO_NS" "$DEMO_DEPLOY")" != "1" ]]; then
-    kubectl scale deploy/"$DEMO_DEPLOY" -n "$DEMO_NS" --replicas=1
-    wait_replicas "$DEMO_NS" "$DEMO_DEPLOY" 1
-  fi
-  before="$(pending_count)"
-  posted="$(mention_bot "Scale the ${DEMO_DEPLOY} Deployment in namespace ${DEMO_NS} from 1 replica to 2 using resources_scale.")"
+  local posted ts id
+  wait_replicas "$DEMO_NS" "$DEMO_DEPLOY" 1
+  posted="$(mention_bot "Scale the ${DEMO_DEPLOY} Deployment in namespace ${DEMO_NS} from 1 replica to 2 using resources_scale. Request approval first.")"
   ts="$(printf '%s' "$posted" | json_get ts)"
-  local i
-  id=""
-  for i in $(seq 1 90); do
-    if [[ "$(pending_count)" -gt "$before" ]]; then
-      id="$(latest_pending_id)"
-      break
-    fi
-    sleep 2
-  done
-  if [[ -z "$id" ]]; then
-    echo "scale did not create a pending approval" >&2
-    wait_thread_reply "$ts" >/dev/null || true
-    exit 1
-  fi
-  tools="$(pending_tools)"
-  if ! printf '%s\n' "$tools" | grep -qx 'kubernetes/resources_scale' && \
-     ! printf '%s\n' "$tools" | grep -q 'resources_scale'; then
-    echo "pending approval did not name resources_scale; tools=${tools}" >&2
-    exit 1
-  fi
-  if [[ "$(spec_replicas_of "$DEMO_NS" "$DEMO_DEPLOY")" != "1" ]]; then
-    echo "negative failed: replicas moved before approve" >&2
-    exit 1
-  fi
-  approve "$id" >/dev/null
-  wait_replicas "$DEMO_NS" "$DEMO_DEPLOY" 2
-  echo "assert 2 resources_scale: one pending, replicas held at 1 until approve, then 2/2" >&2
+  id="$(wait_scale_pending "$ts")"
+  wait_replicas "$DEMO_NS" "$DEMO_DEPLOY" 1
+  approve "$id"
 }
 
 assert_rearm() {
-  local before id posted
-  before="$(pending_count)"
-  posted="$(mention_bot "Scale the ${DEMO_DEPLOY} Deployment in namespace ${DEMO_NS} from 2 replicas to 3 using resources_scale.")"
-  local i
-  id=""
-  for i in $(seq 1 90); do
-    if [[ "$(pending_count)" -gt "$before" ]]; then
-      id="$(latest_pending_id)"
-      break
-    fi
-    sleep 2
-  done
-  if [[ -z "$id" ]]; then
-    echo "re-arm did not create a new pending approval; first grant was reused" >&2
-    exit 1
-  fi
-  if [[ "$(spec_replicas_of "$DEMO_NS" "$DEMO_DEPLOY")" != "2" ]]; then
-    echo "negative failed: re-arm reused the first grant and moved replicas" >&2
-    exit 1
-  fi
-  echo "assert 3 re-arm: new pending approval, replicas stayed 2/2" >&2
+  # A pending request alone proves neither a spent grant nor a fresh grant.
+  # Do not manufacture the prerequisite with a CLI operator principal.
+  return 3
 }
 
 assert_configuration_denial() {
-  local args
-  args="$(connector_args)"
-  if ! printf '%s\n' "$args" | grep -qx 'core'; then
-    echo "connector args do not pin toolsets core; configuration_view may be catalogued" >&2
-    echo "$args" >&2
-    exit 1
-  fi
-  if printf '%s\n' "$args" | grep -q 'configuration_view'; then
-    echo "negative failed: configuration_view is present in connector args" >&2
-    exit 1
-  fi
-  if ! printf '%s\n' "$args" | grep -q "$K8S_MCP_DIGEST\|kubernetes-mcp-server"; then
-    echo "connector is not the pinned kubernetes-mcp-server image" >&2
-    echo "$args" >&2
-    exit 1
-  fi
-  echo "assert 4 configuration_view: absent from catalog (toolsets core); namespaces_list remains on the core surface" >&2
+  local deployment port
+  deployment="$(connector_deployment)"
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  kubectl port-forward --address=127.0.0.1 -n "$NAMESPACE" "deploy/$deployment" "$port:8000" >/dev/null 2>&1 &
+  MCP_FORWARD_PID=$!
+  trap 'kill "$MCP_FORWARD_PID" 2>/dev/null || true; wait "$MCP_FORWARD_PID" 2>/dev/null || true' EXIT
+  local i
+  for i in $(seq 1 20); do
+    kill -0 "$MCP_FORWARD_PID" 2>/dev/null || return 3
+    if python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1",int(sys.argv[1])),timeout=.2).close()' "$port" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  # Use the same MCP SDK transport as the runner, not container command-line args.
+  uv run --locked --package curie-runner --project "$ROOT" python "$ROOT/cli/scripts/sre-demo-mcp-probe.py" \
+    "http://127.0.0.1:$port/mcp" "$PROBE_NS"
 }
 
 assert_rbac_ceiling() {
-  local before want posted id i
-  want="$(spec_replicas_of "$NAMESPACE" "${RELEASE}-api" 2>/dev/null || spec_replicas_of "$NAMESPACE" curie-api)"
-  before="$(pending_count)"
-  posted="$(mention_bot "Scale the platform API Deployment in namespace ${NAMESPACE} to $((want + 1)) replicas using resources_scale.")"
-  id=""
-  for i in $(seq 1 90); do
-    if [[ "$(pending_count)" -gt "$before" ]]; then
-      id="$(latest_pending_id)"
-      break
-    fi
-    sleep 2
-  done
-  if [[ -z "$id" ]]; then
-    echo "RBAC ceiling turn did not create a pending approval" >&2
-    exit 1
-  fi
-  approve "$id" >/dev/null
-  sleep 15
-  local after
-  after="$(spec_replicas_of "$NAMESPACE" "${RELEASE}-api" 2>/dev/null || spec_replicas_of "$NAMESPACE" curie-api)"
-  if [[ "$after" != "$want" ]]; then
-    echo "negative failed: approved scale of the platform API changed replicas ($want -> $after)" >&2
-    exit 1
-  fi
-  echo "assert 5 RBAC ceiling: approved scale of the platform API left replicas unchanged" >&2
+  # Do not call an unchanged desired replica count an RBAC denial. This row
+  # needs the real grant, explicit Forbidden result, and healthy target control.
+  return 3
+}
+
+pr_number_from_reply() {
+  python3 -c '
+import re,sys
+from urllib.parse import urlparse
+repo=sys.argv[1]
+urls=re.findall(r"https://github\.com/[^/\s<>|]+/[^/\s<>|]+/pull/[0-9]+",sys.stdin.read())
+if not urls: sys.exit(3)
+paths={urlparse(u).path for u in urls}
+if any(not p.startswith("/"+repo+"/pull/") for p in paths):
+    raise SystemExit("reply linked a PR outside the authorized repository")
+if len(paths)!=1: raise SystemExit("expected one PR")
+print(next(iter(paths)).rsplit("/",1)[1])' "$CI_THROWAY_REPO"
+}
+
+verify_pr_metadata() {
+  python3 -c '
+import json,sys
+from datetime import datetime
+p=json.load(sys.stdin); repo,number,started=sys.argv[1:]
+if p.get("url")!=f"https://github.com/{repo}/pull/{number}": raise SystemExit("PR repository mismatch")
+if p.get("state")!="OPEN" or p.get("isCrossRepository"): raise SystemExit("PR is not an open in-repository change")
+try:
+    created=datetime.fromisoformat(p.get("createdAt","").replace("Z","+00:00"))
+    trigger=datetime.fromisoformat(started.replace("Z","+00:00"))
+except (ValueError,TypeError): raise SystemExit("invalid PR creation timestamp")
+if created.tzinfo is None or trigger.tzinfo is None: raise SystemExit("timestamp has no timezone")
+if created<trigger: raise SystemExit("preexisting PR cannot prove this handoff")
+if not p.get("files") or not p.get("commits") or not p.get("headRefOid") or not p.get("author",{}).get("login"):
+    raise SystemExit("PR lacks actual changes, commits, head identity or author")
+if not p.get("baseRefName") or p.get("baseRefName")==p.get("headRefName"):
+    raise SystemExit("PR branch identity is invalid")
+checks=p.get("statusCheckRollup") or []
+if not checks: sys.exit(3)
+if any((c.get("status")!="COMPLETED") if c.get("__typename")=="CheckRun"
+       else c.get("state") in {None,"PENDING","EXPECTED"} for c in checks): sys.exit(3)
+if any((c.get("conclusion")!="SUCCESS") if c.get("__typename")=="CheckRun"
+       else c.get("state")!="SUCCESS" for c in checks):
+    raise SystemExit("PR checks completed unsuccessfully")' "$CI_THROWAY_REPO" "$1" "$2"
 }
 
 assert_coding_handoff() {
-  local posted ts replies
-  posted="$(mention_bot "In this thread, attach the allowlisted workspace ${CI_THROWAY_REPO} and open a pull request against that repository only. Edit a file under /workspace. Do not open a pull request against any other repository.")"
+  local posted ts replies number started metadata
+  READ_THREAD_TS="${READ_THREAD_TS:-$(cat "$CURIE_SRE_DEMO_THREAD_FILE" 2>/dev/null || true)}"
+  [[ -n "$READ_THREAD_TS" ]] || return 3
+  started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  posted="$(mention_bot "Now attach the authorized workspace ${CI_THROWAY_REPO} to this existing thread. Make a small tested documentation change locally and request fresh publication approval before opening a pull request. Do not publish without approval or write to any other repository." "$READ_THREAD_TS")"
   ts="$(printf '%s' "$posted" | json_get ts)"
-  replies="$(wait_thread_reply "$ts" 300 || true)"
-  if [[ -z "$replies" ]]; then
-    echo "coding handoff produced no Slack reply" >&2
-    exit 1
+  if ! replies="$(wait_thread_reply "$READ_THREAD_TS" 300 "$ts" pr)"; then
+    return 3
   fi
-  if ! printf '%s' "$replies" | grep -q "$CI_THROWAY_REPO"; then
-    echo "coding handoff reply did not name the allowlisted throwaway repo" >&2
-    exit 1
+  if number="$(printf '%s' "$replies" | pr_number_from_reply)"; then
+    # gh is the verifier identity, never presented as the product App author.
+    # Repository mentions, URLs and a preexisting green PR alone cannot pass.
+    command -v gh >/dev/null || return 3
+    if metadata="$(GH_PROMPT_DISABLED=1 gh pr view "$number" --repo "$CI_THROWAY_REPO" --json \
+      url,state,isCrossRepository,createdAt,files,commits,headRefOid,baseRefName,headRefName,author,statusCheckRollup)"; then
+      printf '%s' "$metadata" | verify_pr_metadata "$number" "$started"
+    else
+      echo "BLOCKED: the GitHub verifier identity cannot read the disposable repository" >&2
+      return 3
+    fi
+  else
+    local result=$?
+    # Absence is unproved publication; an off-repository/multiple PR link is an
+    # observed negative-control failure and must not be relabeled a setup block.
+    [[ "$result" == 3 ]] || return 1
   fi
-  if printf '%s' "$replies" | grep -Eq 'curie-eng/curie|curie-eng/agentos'; then
-    echo "negative failed: coding handoff named the platform repository" >&2
-    exit 1
-  fi
-  echo "assert 6 coding handoff: workspace turn named the throwaway repo only" >&2
+  # Even a fresh PR with green checks is only one observation: the real card,
+  # same-workspace follow-up tests/commits and App-authored review-event routing
+  # have not been proved by this driver and must remain blocked.
+  return 3
 }
 
 case "$PHASE" in

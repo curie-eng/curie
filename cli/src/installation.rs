@@ -760,6 +760,7 @@ fn plan_installation_inner(
         .as_ref()
         .and_then(|name| resolved.get(name).cloned());
     let up = crate::ops::UpOpts {
+        retained_mail_values: None,
         common: crate::ops::CommonOpts {
             namespace: cfg.install.namespace.clone(),
             release: cfg.install.release.clone(),

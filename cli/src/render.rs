@@ -147,6 +147,7 @@ mod tests {
         let delta = OutboundEvent::TextDelta {
             version: v(),
             text: "all done".into(),
+            adoption_applied: None,
         };
         let final_frame = OutboundEvent::Final {
             version: v(),
@@ -158,6 +159,7 @@ mod tests {
             approval_granted_tool: None,
             input_tokens: None,
             output_tokens: None,
+            adoption_applied: None,
         };
         // A delta routes to stdout as a raw token.
         assert!(matches!(printer.part_for(&delta), Some(TurnPart::Token(t)) if t == "all done"));
@@ -180,6 +182,7 @@ mod tests {
             approval_granted_tool: None,
             input_tokens: None,
             output_tokens: None,
+            adoption_applied: None,
         };
         // The caller prints this token to stdout, then appends the status trailer.
         assert!(
@@ -200,6 +203,7 @@ mod tests {
             approval_granted_tool: None,
             input_tokens: None,
             output_tokens: None,
+            adoption_applied: None,
         };
         assert!(
             matches!(printer.part_for(&final_frame), Some(TurnPart::Status(s)) if s == "-- final (done)")
@@ -213,6 +217,7 @@ mod tests {
             version: v(),
             text: "running echo hi".into(),
             tool: Some("Bash".into()),
+            adoption_applied: None,
         };
         let flag = OutboundEvent::SideEffectFlag {
             version: v(),
@@ -225,11 +230,13 @@ mod tests {
             arguments: None,
             result: None,
             failed: None,
+            adoption_applied: None,
         };
         let error = OutboundEvent::ErrorEvent {
             version: v(),
             message: "boom".into(),
             classification: Some("budget".into()),
+            adoption_applied: None,
         };
         // Tool note and side-effect flag are diagnostics -> Note (stderr).
         assert!(matches!(printer.part_for(&note), Some(TurnPart::Note(_))));

@@ -57,6 +57,7 @@ from .generate import (
     replace_region,
     seam_link,
 )
+from .mcp_workspace_live_tiers import check_mcp_workspace_live_tiers
 from .symbols import SymbolCache, SymbolSyntaxError, dataclass_fields, resolve_symbol
 from .vision import VISION_REL, read_swap_readiness
 
@@ -118,6 +119,9 @@ def _lint_and_count(repo_root: Path) -> tuple[list[Finding], int]:
     # machine-readable ground truth, never rewritten, so `--write` leaves it
     # alone.
     findings.extend(check_agent_contract(repo_root))
+    # Implement-workflow live-tier rule (#2305). Same class as check_counts:
+    # required sentences asserted against the workflow docs, never rewritten.
+    findings.extend(check_mcp_workspace_live_tiers(repo_root))
     doc_findings, ignored = _check_docs(repo_root, cache)
     findings.extend(doc_findings)
     return findings, ignored
