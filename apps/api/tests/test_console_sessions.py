@@ -215,7 +215,11 @@ def _sign_in(client: Any, auth_headers: dict[str, str]) -> None:
     browser does send a Secure cookie to http://localhost, so dev is unaffected;
     what is under test here is the dependency, not the browser's cookie policy.
     """
-    code = client.post("/console/login-codes", headers=auth_headers).json()["code"]
+    # Minting binds an administrator-selected subject to the row (ADR-0106), so
+    # the body is not optional.
+    code = client.post(
+        "/console/login-codes", json={"subject": SUBJECT}, headers=auth_headers
+    ).json()["code"]
     exchanged = client.post("/console/session", json={"code": code})
     assert exchanged.status_code == 200, exchanged.text
     raw = exchanged.headers["set-cookie"]

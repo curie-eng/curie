@@ -115,6 +115,9 @@ export const SURFACES: readonly Surface[] = [
     actions: [
       { id: "skill.versions", label: "Why no versions here", quiet: true },
       { id: "skill.memory", label: "Why no memory here", quiet: true },
+      { id: "skill.observability.runs", label: "Why no recent activity here", quiet: true },
+      { id: "skill.observability.run", label: "Why no conversations here", quiet: true },
+      { id: "skill.observability.metrics", label: "Why no usage here", quiet: true },
     ],
   },
   {
@@ -189,6 +192,7 @@ export const SURFACES: readonly Surface[] = [
       { id: "cluster.message", label: "Send it a message" },
       { id: "cluster.eval", label: "Score an agent" },
       { id: "cluster.migrate-store", label: "Move stored files", tone: "danger", hint: "Carries saved agents across an upgrade that changes where files are kept" },
+      { id: "cluster.upgrade", label: "Move it to a new version", hint: "Picks up where it left off if an upgrade stops partway" },
       { id: "cluster.rollback", label: "Put the last good version back", hint: "Skips versions that never finished installing, so this lands on one that actually ran" },
       { id: "cluster.down", label: "Tear it down", tone: "danger" },
     ],
@@ -340,6 +344,8 @@ export const SURFACES: readonly Surface[] = [
       { id: "dev.netpol-check", label: "Network policy enforced" },
       { id: "dev.e2e", label: "CLI end-to-end" },
       { id: "dev.e2e-ladder", label: "Cold-start ladder" },
+      { id: "dev.e2e-ci-selection", label: "Which end-to-end tiers CI picks" },
+      { id: "dev.sre-demo-e2e", label: "SRE demo end-to-end" },
       { id: "dev.plugin-compat", label: "Bundle compatibility" },
       { id: "dev.agent-skills", label: "Skills match the spec" },
       { id: "dev.eval-falsifiability", label: "Evals can fail" },
