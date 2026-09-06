@@ -291,8 +291,13 @@ def test_the_platform_key_needs_no_database_session(clean_db: None) -> None:
 
     app = FastAPI()
 
+    # Sync on purpose. The handler body is irrelevant here -- the dependency is
+    # what is under test, and it resolves the same either way -- but a nested
+    # `async def` inside a test is what the unrun-coroutine gate looks for, and
+    # it cannot see that this one is reached through `@app.get` and a request
+    # rather than through `asyncio.run`.
     @app.get("/probe", dependencies=[Depends(require_api_key)])
-    async def probe() -> dict[str, bool]:
+    def probe() -> dict[str, bool]:
         return {"ok": True}
 
     # No `state.sessionmaker`: this app has no database at all.
