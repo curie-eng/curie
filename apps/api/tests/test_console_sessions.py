@@ -285,10 +285,9 @@ def test_the_platform_key_needs_no_database_session(clean_db: None) -> None:
     resolve, before the function body's ordering can matter -- so this asserts
     the guarantee against an app with no sessionmaker at all.
     """
+    from curie_api.auth import require_api_key
     from fastapi import Depends, FastAPI
     from fastapi.testclient import TestClient
-
-    from curie_api.auth import require_api_key
 
     app = FastAPI()
 
