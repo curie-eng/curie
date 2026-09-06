@@ -693,21 +693,47 @@ fn cluster_namespace_env_reaches_every_cluster_verb() {
         let name = subcommand["name"]
             .as_str()
             .expect("cluster subcommand has a name");
-        let namespace_args: Vec<_> = subcommand["args"]
+        assert!(
+            namespace_is_reachable(subcommand),
+            "cluster {name} must expose exactly one CURIE_NAMESPACE argument, \
+             on itself or on every verb beneath it"
+        );
+    }
+}
+
+/// Whether `CURIE_NAMESPACE` reaches this command.
+///
+/// Two shapes satisfy it, because the CLI has both. `cluster observability`
+/// carries the flag on the group and its verbs inherit it at parse time.
+/// `cluster console` takes no arguments of its own and runs nothing, so the
+/// flag lives on the verb underneath. Either way the thing that finally dials a
+/// cluster has read the namespace, which is the property this protects; asking
+/// only about the direct subcommand would pass a group that hides an
+/// unconfigurable verb under it.
+fn namespace_is_reachable(node: &serde_json::Value) -> bool {
+    let own: Vec<_> = node["args"]
+        .as_array()
+        .map(|args| {
+            args.iter()
+                .filter(|arg| arg["id"] == "namespace" && arg["env"] == "CURIE_NAMESPACE")
+                .collect()
+        })
+        .unwrap_or_default();
+    if own.len() == 1 {
+        // A group only passes the flag down when clap marks it global. Without
+        // that, the flag parses on the group and is rejected on the verb, which
+        // reads as reachable here and is not.
+        let is_group = node["subcommands"]
             .as_array()
-            .expect("cluster subcommand has arguments")
-            .iter()
-            .filter(|arg| arg["id"] == "namespace")
-            .collect();
-        assert_eq!(
-            namespace_args.len(),
-            1,
-            "cluster {name} must expose exactly one namespace argument"
-        );
-        assert_eq!(
-            namespace_args[0]["env"], "CURIE_NAMESPACE",
-            "cluster {name} must read CURIE_NAMESPACE"
-        );
+            .is_some_and(|children| !children.is_empty());
+        return !is_group || own[0]["global"] == true;
+    }
+    if !own.is_empty() {
+        return false;
+    }
+    match node["subcommands"].as_array() {
+        Some(children) if !children.is_empty() => children.iter().all(namespace_is_reachable),
+        _ => false,
     }
 }
 
