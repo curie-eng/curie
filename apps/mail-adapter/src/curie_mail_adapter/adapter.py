@@ -486,6 +486,20 @@ class MailAdapter:
     def thread_carries(self, conversation_id: str, event_id: str) -> bool | None:
         status, thread = self.client.get_thread(conversation_id)
         if status == 404:
+            # Only the PROVIDER's own answer is deletion. `request` parses a JSON
+            # body and hands back the raw text when it is not JSON, so a 404
+            # carrying anything but an object came from something between us and
+            # AgentMail -- an edge or gateway 404 page, a stale route mid-deploy,
+            # a path that never reached the API. Believing one of those writes a
+            # PERMANENT tombstone (`delete_event`) after which no retry ever
+            # calls the provider again, and the reply is lost with the release
+            # otherwise healthy. Ambiguity retries; only a confirmed answer is
+            # terminal, which is the invariant CLAUDE.md already states.
+            if not isinstance(thread, dict):
+                logger.warning(
+                    "thread listing -> 404 with no provider body; durable witness unreadable"
+                )
+                return None
             raise ProviderThreadDeletedError
         if status != 200 or not isinstance(thread, dict):
             logger.warning("thread listing -> %s; durable witness unreadable", status)

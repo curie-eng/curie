@@ -729,6 +729,39 @@ def test_deleted_provider_thread_is_terminal_once_across_restart(
     assert "ev-deleted" not in messages[0]
 
 
+def test_a_404_without_a_provider_body_is_not_terminal(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+) -> None:
+    """An edge 404 is "could not read", not "deleted".
+
+    Get Thread answering 404 with an HTML error page is a gateway, proxy or
+    stale route between the adapter and AgentMail -- not the provider saying the
+    thread is gone. Classifying it as deletion writes a permanent receipt and no
+    later attempt ever consults the provider again, so one transient edge answer
+    silently destroys the reply on an otherwise healthy release.
+
+    The mutation this pins: drop the body check in `thread_carries` and the
+    first completion below answers 410, the receipt is written, `thread_calls`
+    stops at 1, and the recovery never sends.
+    """
+    seed(mail, adapter)
+    post_event(egress_url, update("answer one"))
+    mail.fail_next_thread = 404
+    mail.injected_raw_body = "<html><head><title>404 Not Found</title></head></html>"
+
+    assert post_event(egress_url, completed("ev-1"))[0] == 502
+    assert mail.replies == []
+
+    # No tombstone was written, so the retry asks the provider again and the
+    # completion still settles normally.
+    mail.injected_raw_body = None
+    assert post_event(egress_url, completed("ev-1"))[0] == 200
+    assert mail.thread_calls == 2
+    assert len(mail.replies) == 1
+
+
 def test_deleted_unadmitted_thread_does_not_create_a_terminal_receipt(
     mail: MailState,
     adapter: MailAdapter,

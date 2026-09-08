@@ -245,7 +245,11 @@ subprocess.
 
 ### Deleted provider threads
 
-A thread lookup returning HTTP 404 after admission is terminal for that reply.
+A thread lookup returning HTTP 404 after admission is terminal for that reply
+only when the 404 carries the provider's own JSON body. A 404 whose body is not
+JSON came from an edge, gateway or stale route rather than AgentMail, and stays
+retryable as an unreadable witness (502): the receipt below is permanent, and a
+signal that ambiguous must never write one.
 The adapter durably records deletion, logs one warning with a hashed correlation,
 and returns HTTP 410 on the first and any duplicate completion, including after
 restart. The response body carries `{"detail":"thread deleted at provider"}`;

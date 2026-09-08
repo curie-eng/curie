@@ -102,6 +102,12 @@ class MailState:
         # adapter must never render into a log, and putting recognisable content
         # in one is the only way a test can prove it never does.
         self.injected_body: dict[str, Any] | None = None
+        # A NON-JSON failure body, as an edge proxy, gateway or load balancer
+        # serves. Distinct from `injected_body`, which is the provider's own
+        # JSON: the adapter's terminal-vs-retryable split on a 404 turns on
+        # exactly that difference, so a test cannot prove it without being able
+        # to serve a body the provider would never have written.
+        self.injected_raw_body: str | None = None
         # N CONSECUTIVE transport failures on List Messages before answering
         # normally, mirroring `IngressState.drop_next`. `fail_next_list` is
         # one-shot and so cannot express a repeated outage, which is the whole
@@ -266,6 +272,15 @@ class _JsonHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_raw(self, status: int, text: str) -> None:
+        """Answer with a body that is not JSON, the way an edge 404 page is."""
+        body = text.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 class MailHandler(_JsonHandler):
     @property
@@ -286,6 +301,10 @@ class MailHandler(_JsonHandler):
             return False
         if failure == 0:
             self.close_connection = True  # a real transport failure
+            return True
+        raw = self.state.injected_raw_body
+        if raw is not None:
+            self._send_raw(failure, raw)
             return True
         body = self.state.injected_body
         self._send(failure, body if body is not None else {"detail": "injected provider failure"})
