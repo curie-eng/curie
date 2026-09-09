@@ -227,9 +227,9 @@ failure it prevents is silent: agents boot with no
 prior memory and no thread transcript, `remember` writes never persist, and the
 only symptom is a warning line inside the sandbox.
 `security.networkPolicy.allowedEgress` remains the documented legacy allow for
-the inverse (`deploy: true` + external URL) so an install that already listed
-that host on the model allowlist keeps rendering; `api.egress` is the dedicated
-one-peer key. The same effective-endpoint rule applies to the collector:
+the inverse (`deploy: true` + external URL) so an install that already has a
+non-empty model allowlist keeps rendering. The chart cannot prove those CIDRs
+cover the hostname; `api.egress` is the dedicated one-peer key. The same effective-endpoint rule applies to the collector:
 `otelCollector.egress` is required when the runner's OTLP URL is external,
 including an `agentSandbox.runner.extraEnv` `OTEL_EXPORTER_OTLP_ENDPOINT`
 override while the in-chart collector is still deployed.

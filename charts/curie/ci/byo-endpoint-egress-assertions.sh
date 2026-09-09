@@ -1187,7 +1187,49 @@ python3 "$CHECKER" "$EXTRAENV_OTLP_OUT" inverse-collector-dedicated \
   "$COLLECTOR_CIDR" "$GRPC_PORT" "$HTTP_PORT" \
   || fail "runner extraEnv OTEL + otelCollector.egress must render ${COLLECTOR_BYO_POLICY} beside the in-chart collector allow"
 
-echo "=== Assertion 24: Rail 1 off does not require a peer for an external apiBaseUrl with api.deploy=true ==="
+echo "=== Assertion 24: api.deploy=false with dispatcher.apiBaseUrl set to this release's Service DNS still requires api.egress ==="
+INCHART_BYO_API="$TMP/inchart-byo-api.yaml"
+cat > "$INCHART_BYO_API" <<'EOF'
+api:
+  deploy: false
+dispatcher:
+  apiBaseUrl: http://curie-api:8000
+ui:
+  apiBaseUrl: http://curie-api:8000
+EOF
+must_fail_naming "deploy-false in-chart apiBaseUrl missing peer" "api.egress" "$INCHART_BYO_API"
+
+echo "=== Assertion 25: runner extraEnv OTEL_EXPORTER_OTLP_TRACES_ENDPOINT with no peer fails, naming otelCollector.egress ==="
+EXTRAENV_OTLP_TRACES="$TMP/extraenv-otlp-traces.yaml"
+cat > "$EXTRAENV_OTLP_TRACES" <<EOF
+agentSandbox:
+  runner:
+    extraEnv:
+      - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+        value: ${OTLP_ENDPOINT}
+EOF
+must_fail_naming "extraEnv OTEL_EXPORTER_OTLP_TRACES_ENDPOINT missing peer" "otelCollector.egress" "$EXTRAENV_OTLP_TRACES"
+
+echo "=== Assertion 26: runner extraEnv OTEL + allowedEgress is the documented collector legacy allow ==="
+INVERSE_OTLP_LEGACY="$TMP/inverse-otlp-legacy.yaml"
+cat > "$INVERSE_OTLP_LEGACY" <<EOF
+agentSandbox:
+  runner:
+    extraEnv:
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: ${OTLP_ENDPOINT}
+security:
+  networkPolicy:
+    allowedEgress:
+      - cidr: ${COLLECTOR_CIDR}
+        ports: [{ protocol: TCP, port: 4318 }]
+EOF
+INVERSE_OTLP_LEGACY_OUT="$(render_dir inverse-otlp-legacy --values "$INVERSE_OTLP_LEGACY")"
+python3 "$CHECKER" "$INVERSE_OTLP_LEGACY_OUT" inverse-api-legacy \
+  "$COLLECTOR_POLICY" "$COLLECTOR_BYO_POLICY" "$DEFAULT_DENY_EGRESS" "$ALLOW_EGRESS" \
+  || fail "inverse OTEL extraEnv + allowedEgress must keep runner-allow-collector and runner-allow-egress without a dedicated endpoint policy"
+
+echo "=== Assertion 27: Rail 1 off does not require a peer for an external apiBaseUrl with api.deploy=true ==="
 INVERSE_RAIL_OFF="$TMP/inverse-rail-off.yaml"
 cat > "$INVERSE_RAIL_OFF" <<EOF
 security:

@@ -347,7 +347,7 @@ spec:
      legacy allow; never invent a CIDR from the hostname. */}}
 {{- if not .Values.otelCollector.egress }}
 {{- if not $np.allowedEgress }}
-{{- fail (printf "%s points the runner at an external OTLP endpoint while Rail 1 is on: set otelCollector.egress to the collector endpoint CIDRs the runner sandbox must reach. The in-chart runner-allow-collector pod selector does not cover that host. NetworkPolicy cannot target a DNS name. Without a declared peer every runner, agent.run, llm.generation and execute_tool span is silently dropped. security.networkPolicy.allowedEgress is the documented legacy allow for this inverse shape; this refusal fires only when that list is also empty." (include "curie.runner.effectiveOtlpSource" .)) }}
+{{- fail (printf "%s points the runner at an external OTLP endpoint while Rail 1 is on: set otelCollector.egress to the collector endpoint CIDRs the runner sandbox must reach. The in-chart runner-allow-collector pod selector does not cover that host. NetworkPolicy cannot target a DNS name. Without a declared peer every runner, agent.run, llm.generation and execute_tool span is silently dropped. security.networkPolicy.allowedEgress is the documented legacy allow for this inverse shape; this refusal fires only when that list is also empty. The chart cannot prove a CIDR in allowedEgress covers this hostname." (include "curie.runner.effectiveOtlpSource" .)) }}
 {{- end }}
 {{- else }}
 {{- range .Values.otelCollector.egress }}
@@ -447,7 +447,7 @@ spec:
      allowedEgress legacy allow; never invent a CIDR from the hostname. */}}
 {{- if not .Values.api.egress }}
 {{- if not $np.allowedEgress }}
-{{- fail (printf "%s points the runner at an external API while Rail 1 is on: set api.egress to the external API endpoint CIDRs the runner sandbox must reach for memory, history and state. The in-chart runner-allow-api pod selector does not cover that host. NetworkPolicy cannot target a DNS name. Without a declared peer agents boot with no memory and no history, remember writes never persist, and the only symptom is a warning line inside the sandbox. security.networkPolicy.allowedEgress is the documented legacy allow for this inverse shape; this refusal fires only when that list is also empty." (include "curie.runner.effectiveApiSource" .)) }}
+{{- fail (printf "%s points the runner at an external API while Rail 1 is on: set api.egress to the external API endpoint CIDRs the runner sandbox must reach for memory, history and state. The in-chart runner-allow-api pod selector does not cover that host. NetworkPolicy cannot target a DNS name. Without a declared peer agents boot with no memory and no history, remember writes never persist, and the only symptom is a warning line inside the sandbox. security.networkPolicy.allowedEgress is the documented legacy allow for this inverse shape; this refusal fires only when that list is also empty. The chart cannot prove a CIDR in allowedEgress covers this hostname." (include "curie.runner.effectiveApiSource" .)) }}
 {{- end }}
 {{- else }}
 {{- range .Values.api.egress }}
@@ -471,8 +471,7 @@ spec:
 {{- end }}
 {{- end }}
 {{- else }}
-{{- $apiExternalByo := include "curie.runner.apiIsExternal" . | trim }}
-{{- if $apiExternalByo }}
+{{- if include "curie.runner.apiOverrideSet" . }}
 {{/* BYO API (#2317). There is no in-chart api pod to select, and NetworkPolicy
      cannot target the effective API URL (a DNS name), so the operator must
      declare CIDRs. Empty keeps fail-closed: without this the install is green
@@ -482,11 +481,13 @@ spec:
      timeout latency inside the worker's claim-bind window. The only trace is a
      `memory load failed` warning inside the sandbox. Mirrors the BYO object
      store branch below; mailAdapter.apiEgress.httpsCidrs is the same idea for
-     the mail adapter pod. Gated on the effective runner-facing URL, not only
-     dispatcher.apiBaseUrl, so a worker.extraEnv override cannot skip this
-     gate. api.deploy false with no external URL at all names no API for the
-     runner to reach -- that install already dead-ends loudly at dispatcher
-     boot (see curie.env.apiUrl), and the trimming overlays render on it. */}}
+     the mail adapter pod. Gated on dispatcher.apiBaseUrl or a worker extraEnv
+     API override, including an in-chart Service DNS leftover, so extraEnv
+     cannot skip this gate and api.deploy false plus apiBaseUrl=http://<release>-api
+     still requires api.egress. api.deploy false with no override at all names
+     no API for the runner to reach -- that install already dead-ends loudly at
+     dispatcher boot (see curie.env.apiUrl), and the trimming overlays render
+     on it. */}}
 {{- if not .Values.api.egress }}
 {{- fail "api.deploy is false: set api.egress to the external API endpoint CIDRs the runner sandbox must reach for memory, history and state. Rail 1 is fail-closed and the in-chart runner-allow-api policy does not render without an in-cluster api pod. NetworkPolicy cannot target a DNS name, so dispatcher.apiBaseUrl alone is not enough -- without this key agents boot with no memory and no history, remember writes never persist, and the only symptom is a warning line inside the sandbox. If a CIDR for this endpoint already sits in security.networkPolicy.allowedEgress, move it to (or duplicate it into) api.egress: allowedEgress is the model/MCP allowlist, and rail 1 renders no runner peer for this endpoint without the dedicated key." }}
 {{- end }}

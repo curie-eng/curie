@@ -830,8 +830,9 @@ otelCollector:
   # OTEL_EXPORTER_OTLP_ENDPOINT override) is not enough. Required when Rail 1
   # is on and the effective runner-facing OTLP URL is external -- including
   # deploy true with a runner extraEnv override -- unless
-  # security.networkPolicy.allowedEgress already holds a covering CIDR (the
-  # documented legacy allow). A telemetry-disabled or endpoint-less install
+  # security.networkPolicy.allowedEgress is already non-empty (the documented
+  # legacy allow). The chart cannot prove a CIDR covers the hostname. A
+  # telemetry-disabled or endpoint-less install
   # needs nothing here because there is nothing for the runner to reach.
   # Setting it while the runner still dials the in-chart collector is refused
   # at render rather than silently ignored. Empty (the default) keeps
@@ -1007,8 +1008,9 @@ api:
   # CURIE_RUNNER_API_URL) is not enough. Required when Rail 1 is on and the
   # effective runner-facing API URL is external -- including deploy true with
   # an external apiBaseUrl or extraEnv override -- unless
-  # security.networkPolicy.allowedEgress already holds a covering CIDR (the
-  # documented legacy allow). deploy false with no external URL at all names
+  # security.networkPolicy.allowedEgress is already non-empty (the documented
+  # legacy allow). The chart cannot prove a CIDR covers the hostname. deploy
+  # false with no external URL at all names
   # nothing for the runner to reach and that install already dead-ends loudly
   # at dispatcher boot. Setting it while the runner still dials the in-chart
   # API is refused at render rather than silently ignored. Empty (the default)

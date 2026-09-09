@@ -1064,14 +1064,19 @@ before contacting Valkey.
 
 {{/* Literal extraEnv value for one name, or the sentinel __valueFrom__ when
      the entry exists without a string value. Empty when the name is absent.
-     Used by the runner-facing endpoint helpers: a valueFrom destination cannot
-     be proven in-cluster at render, so Rail 1 treats it as external. */}}
+     A present empty value is the sentinel __empty__: worker.yaml treats name
+     presence as an override, so Rail 1 must not fall through to the in-chart
+     URL. valueFrom cannot be proven in-cluster at render. */}}
 {{- define "curie.extraEnv.lookup" -}}
 {{- $found := "" -}}
 {{- range (.env | default list) -}}
 {{- if eq .name $.name -}}
 {{- if and (hasKey . "value") (kindIs "string" .value) -}}
+{{- if eq (trim .value) "" -}}
+{{- $found = "__empty__" -}}
+{{- else -}}
 {{- $found = .value -}}
+{{- end -}}
 {{- else if hasKey . "value" -}}
 {{- $found = printf "%v" .value -}}
 {{- else -}}
@@ -1083,12 +1088,17 @@ before contacting Valkey.
 {{- end -}}
 
 {{/* Hostname of a URL, port stripped for host:port. Bracketed IPv6 is left
-     intact; those hosts are never this chart's in-cluster Service DNS. */}}
+     intact; those hosts are never this chart's in-cluster Service DNS. A
+     host:port with no scheme (sprig urlParse leaves host empty) is treated
+     as the raw string so curie-api:8000 still matches the in-chart Service. */}}
 {{- define "curie.endpoint.host" -}}
 {{- $raw := trim . -}}
 {{- if $raw -}}
 {{- $parsed := urlParse $raw -}}
 {{- $host := $parsed.host | default "" -}}
+{{- if not $host -}}
+{{- $host = $raw -}}
+{{- end -}}
 {{- if contains "[" $host -}}
 {{- $host -}}
 {{- else -}}
@@ -1140,28 +1150,62 @@ the in-chart API Service
 
 {{- define "curie.runner.apiIsExternal" -}}
 {{- $url := include "curie.runner.effectiveApiUrl" . | trim -}}
-{{- if or (empty $url) (eq $url "__valueFrom__") -}}
-{{- if eq $url "__valueFrom__" -}}true{{- end -}}
+{{- if or (eq $url "__valueFrom__") (eq $url "__empty__") -}}
+true
+{{- else if empty $url -}}
 {{- else if include "curie.host.inChartService" (dict "root" . "host" (include "curie.endpoint.host" $url) "component" "api") -}}
 {{- else -}}
 true
 {{- end -}}
 {{- end -}}
 
-{{/* OTLP URL the runner sandbox actually dials (#2367). runner extraEnv wins
-     over the chart-owned curie.otel.endpoint. */}}
+{{/* True when the operator overrode the runner-facing API URL, including an
+     in-chart Service DNS leftover. The deploy-false BYO gate uses this so
+     api.deploy false plus dispatcher.apiBaseUrl=http://<release>-api still
+     requires api.egress (#2317), while empty apiBaseUrl with no extraEnv
+     still dead-ends at dispatcher boot. */}}
+{{- define "curie.runner.apiOverrideSet" -}}
+{{- $base := trim (printf "%v" (.Values.dispatcher.apiBaseUrl | default "")) -}}
+{{- $runner := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_RUNNER_API_URL") | trim -}}
+{{- $api := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_API_URL") | trim -}}
+{{- if or $base $runner $api -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* OTLP URL the runner sandbox actually dials (#2367). Signal-specific
+     extraEnv (traces, then metrics, then logs) wins over the generic
+     OTEL_EXPORTER_OTLP_ENDPOINT, then the chart-owned curie.otel.endpoint. */}}
 {{- define "curie.runner.effectiveOtlpEndpoint" -}}
-{{- $extra := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_ENDPOINT") | trim -}}
-{{- if $extra -}}
-{{- $extra -}}
+{{- $traces := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") | trim -}}
+{{- $metrics := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") | trim -}}
+{{- $logs := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") | trim -}}
+{{- $generic := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_ENDPOINT") | trim -}}
+{{- if $traces -}}
+{{- $traces -}}
+{{- else if $metrics -}}
+{{- $metrics -}}
+{{- else if $logs -}}
+{{- $logs -}}
+{{- else if $generic -}}
+{{- $generic -}}
 {{- else -}}
 {{- include "curie.otel.endpoint" . | trim -}}
 {{- end -}}
 {{- end -}}
 
 {{- define "curie.runner.effectiveOtlpSource" -}}
-{{- $extra := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_ENDPOINT") | trim -}}
-{{- if $extra -}}
+{{- $traces := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") | trim -}}
+{{- $metrics := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") | trim -}}
+{{- $logs := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") | trim -}}
+{{- $generic := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_ENDPOINT") | trim -}}
+{{- if $traces -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+{{- else if $metrics -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+{{- else if $logs -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
+{{- else if $generic -}}
 agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_ENDPOINT
 {{- else -}}
 curie.otel.endpoint
@@ -1170,8 +1214,9 @@ curie.otel.endpoint
 
 {{- define "curie.runner.otlpIsExternal" -}}
 {{- $url := include "curie.runner.effectiveOtlpEndpoint" . | trim -}}
-{{- if or (empty $url) (eq $url "__valueFrom__") -}}
-{{- if eq $url "__valueFrom__" -}}true{{- end -}}
+{{- if or (eq $url "__valueFrom__") (eq $url "__empty__") -}}
+true
+{{- else if empty $url -}}
 {{- else if include "curie.host.inChartService" (dict "root" . "host" (include "curie.endpoint.host" $url) "component" "otel-collector") -}}
 {{- else -}}
 true
