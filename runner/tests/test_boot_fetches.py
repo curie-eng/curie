@@ -295,6 +295,46 @@ def test_boot_fetches_bad_memory_ref_fails_visibly(tmp_path: Path) -> None:
     anyio.run(go)
 
 
+def test_boot_fetches_diagnoses_empty_expansion_on_fake_model_without_probing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_dir = tmp_path / "bundle"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "acme-bot"}), encoding="utf-8"
+    )
+    (plugin_dir / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  github:\n"
+        "    url: http://127.0.0.1:9/mcp\n"
+        "    headers:\n"
+        "      Authorization: Bearer ${GITHUB_TOKEN}\n",
+        encoding="utf-8",
+    )
+
+    async def boom(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("fake-model must not HTTP-probe a connector")
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", boom)
+    app = _state_app(memory_value=[_MEMORY_ITEM], history_value=[_HISTORY_ITEM])
+
+    async def go() -> None:
+        async with TestServer(app) as server:
+            config = _config(
+                plugin_dir,
+                memory_ref=str(server.make_url("/agents/A/state/memory")),
+                history_ref=str(server.make_url("/agents/A/state/transcript/t1")),
+            )
+            fetches = await boot._load_boot_fetches(config, True, {"GITHUB_TOKEN": ""})
+            assert fetches.mcp_capability is None
+            assert fetches.connector_failures
+            assert fetches.connector_failures[0].connector == "github"
+            assert fetches.connector_failures[0].reason == "empty_expansion"
+            assert fetches.connector_failures[0].credential_names == ("GITHUB_TOKEN",)
+
+    anyio.run(go)
+
+
 def test_boot_fetches_skips_probe_on_fake_model(tmp_path: Path) -> None:
     plugin_dir = _bundle(tmp_path / "bundle", mcp_command=[sys.executable, str(_SERVER)])
     app = _state_app(memory_value=[_MEMORY_ITEM], history_value=[_HISTORY_ITEM])

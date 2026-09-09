@@ -48,6 +48,37 @@ _PROBE_TIMEOUT_SECONDS = 15
 
 
 @dataclass(frozen=True)
+class ConnectorCapabilityFailure:
+    """A declared-connector capability/auth failure safe to show a caller (#2519).
+
+    Names the connector and the credential env var. Never carries a secret
+    value: diagnosis keys on placeholder presence versus env emptiness, and
+    probe exceptions are mapped to ``probe_failed`` without ``str(exc)``.
+    """
+
+    connector: str
+    credential_names: tuple[str, ...]
+    reason: str
+
+    def caller_message(self) -> str:
+        """The exact sentence the message caller sees. Values never appear."""
+
+        names = ", ".join(self.credential_names)
+        if self.reason == "empty_expansion":
+            detail = f"credential {names} expanded empty"
+        elif self.reason == "missing_credential":
+            detail = f"credential {names} is not set in the sandbox"
+        elif self.credential_names:
+            detail = f"credential {names}; capability probe failed"
+        else:
+            detail = "capability probe failed"
+        return (
+            f"declared connector '{self.connector}' failed MCP capability probe: "
+            f"{detail}. Connector tools are unavailable."
+        )
+
+
+@dataclass(frozen=True)
 class McpToolCapabilityProbe:
     """The conservative capability conclusion for one session's MCP surface."""
 
@@ -56,6 +87,58 @@ class McpToolCapabilityProbe:
     tool_count: int
     failures: tuple[str, ...] = ()
     readonly_tools: frozenset[str] = frozenset()
+    connector_failures: tuple[ConnectorCapabilityFailure, ...] = ()
+
+
+def _header_placeholders(config: Mapping[str, Any]) -> tuple[str, ...]:
+    """Credential env-var names referenced by ``${NAME}`` in MCP headers."""
+
+    headers = config.get("headers")
+    if not isinstance(headers, Mapping):
+        return ()
+    found: list[str] = []
+    for value in headers.values():
+        if isinstance(value, str):
+            for var in _VARIABLE.findall(value):
+                if var not in found:
+                    found.append(var)
+    return tuple(found)
+
+
+def diagnose_derived_connector_headers(
+    derived_servers: Mapping[str, Mapping[str, Any]],
+    inherited_env: Mapping[str, str] | None = None,
+) -> tuple[ConnectorCapabilityFailure, ...]:
+    """Network-free diagnosis of empty or missing header placeholders (#2519).
+
+    Shared with #2352 via ``tests/vectors/connector-probe-diagnosis.json``.
+    Inspects env presence and emptiness only; it never interpolates values.
+    """
+
+    env = dict(inherited_env or {})
+    failures: list[ConnectorCapabilityFailure] = []
+    for name, config in derived_servers.items():
+        if not isinstance(config, Mapping):
+            continue
+        placeholders = _header_placeholders(config)
+        if not placeholders:
+            continue
+        empty: list[str] = []
+        missing: list[str] = []
+        for var in placeholders:
+            if var not in env:
+                missing.append(var)
+            elif not str(env[var]).strip():
+                empty.append(var)
+        if empty or missing:
+            failures.append(
+                ConnectorCapabilityFailure(
+                    connector=str(name),
+                    credential_names=tuple(empty + missing),
+                    reason="empty_expansion" if empty else "missing_credential",
+                )
+            )
+    return tuple(failures)
 
 
 def _expand(value: str, env: Mapping[str, str]) -> str:
@@ -241,6 +324,9 @@ async def probe_mcp_tool_capability(
     env = {**os.environ, **dict(inherited_env or {})}
     failures: list[str] = []
     observations: list[tuple[int, bool, frozenset[str]]] = []
+    expansion_failures = diagnose_derived_connector_headers(derived_servers, env)
+    skip_http = {failure.connector for failure in expansion_failures}
+    connector_failures: list[ConnectorCapabilityFailure] = list(expansion_failures)
 
     try:
         declared = _bundle_server_configs(root) if root is not None else []
@@ -251,11 +337,13 @@ async def probe_mcp_tool_capability(
             has_potential_write_tool=True,
             tool_count=0,
             failures=("bundle-config",),
+            connector_failures=tuple(expansion_failures),
         )
 
     work: list[tuple[str, Mapping[str, Any], Path | None, str]] = [
         (name, config, root, tool_prefix) for name, config, tool_prefix in declared
     ]
+    derived_names: set[str] = set()
     for name, config in derived_servers.items():
         if not isinstance(config, Mapping):
             failures.append(str(name))
@@ -265,6 +353,7 @@ async def probe_mcp_tool_capability(
             )
             continue
         server_name = str(name)
+        derived_names.add(server_name)
         work.append((server_name, config, None, connector_tool_prefix(server_name)))
 
     async def inspect(
@@ -273,6 +362,12 @@ async def probe_mcp_tool_capability(
         cwd: Path | None,
         tool_prefix: str,
     ) -> None:
+        derived = cwd is None and name in derived_names
+        if derived and name in skip_http:
+            # Empty/missing expansion already diagnosed; do not dial /mcp with
+            # an empty Bearer (the exception text is the leak surface).
+            failures.append(name)
+            return
         try:
             observations.append(
                 await _probe_server(
@@ -289,6 +384,14 @@ async def probe_mcp_tool_capability(
                 name,
                 exc,
             )
+            if derived and name not in skip_http:
+                connector_failures.append(
+                    ConnectorCapabilityFailure(
+                        connector=name,
+                        credential_names=_header_placeholders(config),
+                        reason="probe_failed",
+                    )
+                )
 
     async with anyio.create_task_group() as task_group:
         for name, config, cwd, tool_prefix in work:
@@ -307,4 +410,5 @@ async def probe_mcp_tool_capability(
         tool_count=tool_count,
         failures=tuple(sorted(set(failures))),
         readonly_tools=readonly_tools,
+        connector_failures=tuple(connector_failures),
     )

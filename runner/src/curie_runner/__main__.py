@@ -58,7 +58,12 @@ from .history import (
     resolve_history,
 )
 from .hooks import _merge_pre_tool_use_hooks, load_bundle_hooks
-from .mcp_tool_capability import McpToolCapabilityProbe, probe_mcp_tool_capability
+from .mcp_tool_capability import (
+    ConnectorCapabilityFailure,
+    McpToolCapabilityProbe,
+    diagnose_derived_connector_headers,
+    probe_mcp_tool_capability,
+)
 from .memory import MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
 from .redact import install_stdout_redaction
@@ -134,6 +139,7 @@ def build_runner(
     mcp_capability: McpToolCapabilityProbe | None = None,
     harness: HarnessContribution | None = None,
     workspace_path: Path | None = None,
+    connector_failures: tuple[ConnectorCapabilityFailure, ...] = (),
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -266,6 +272,7 @@ def build_runner(
 
     real_options: ClaudeAgentOptions | None = None
     observed_readonly_tools: frozenset[str] = frozenset()
+    capability = mcp_capability
     if not fake_model:
         # The bundle's live MCP ``tools/list`` response is the actual advertised
         # MCP surface. Probe even when an explicit gate already requires the
@@ -274,7 +281,6 @@ def build_runner(
         # and probe failures preserve the historical fail-closed behavior. The
         # annotation remains a non-authoritative hint: it never authorizes or
         # denies tool execution.
-        capability = mcp_capability
         if capability is None:
             capability = anyio.run(
                 probe_mcp_tool_capability,
@@ -393,6 +399,12 @@ def build_runner(
         approval_resumed_kind=config.approval_resumed_kind,
         approval_decision=config.approval_decision,
         false_completion_check=config.false_completion_check,
+        connector_failures=connector_failures
+        or (
+            capability.connector_failures
+            if capability is not None
+            else ()
+        ),
     )
 
 
@@ -469,6 +481,7 @@ class _BootFetches:
     history_store: TranscriptStore
     conversation_preamble: str | None
     mcp_capability: McpToolCapabilityProbe | None
+    connector_failures: tuple[ConnectorCapabilityFailure, ...] = ()
 
 
 async def _load_boot_fetches(
@@ -494,6 +507,19 @@ async def _load_boot_fetches(
     memory: tuple[MemoryStore, str | None] | None = None
     history: tuple[TranscriptStore, str | None] | None = None
     capability: McpToolCapabilityProbe | None = None
+    derived = derive_mcp_servers(
+        config.session.plugin_dir,
+        release=config.connector_release,
+        agent=config.connector_agent,
+        namespace=config.connector_namespace,
+    )
+    expansion_failures = (
+        diagnose_derived_connector_headers(
+            derived, {**os.environ, **dict(sdk_env or {})}
+        )
+        if fake_model
+        else ()
+    )
 
     async def load_memory() -> None:
         nonlocal memory
@@ -505,12 +531,6 @@ async def _load_boot_fetches(
 
     async def probe() -> None:
         nonlocal capability
-        derived = derive_mcp_servers(
-            config.session.plugin_dir,
-            release=config.connector_release,
-            agent=config.connector_agent,
-            namespace=config.connector_namespace,
-        )
         capability = await probe_mcp_tool_capability(
             config.session.plugin_dir,
             derived,
@@ -525,12 +545,16 @@ async def _load_boot_fetches(
 
     assert memory is not None
     assert history is not None
+    connector_failures = (
+        capability.connector_failures if capability is not None else expansion_failures
+    )
     return _BootFetches(
         memory_store=memory[0],
         memory_preamble=memory[1],
         history_store=history[0],
         conversation_preamble=history[1],
         mcp_capability=capability,
+        connector_failures=connector_failures,
     )
 
 
@@ -590,6 +614,7 @@ def _serve() -> None:
         mcp_capability=fetches.mcp_capability,
         harness=harness,
         workspace_path=workspace_path,
+        connector_failures=fetches.connector_failures,
     )
 
     def capture_mounted_workspace() -> WorkspaceSnapshot:
