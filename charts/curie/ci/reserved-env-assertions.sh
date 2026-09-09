@@ -104,7 +104,24 @@ with tempfile.TemporaryDirectory() as tmp:
         assert result.returncode != 0, "accepted exact or conflicting timeout duplicate"
         assert "worker.runnerTotalTimeoutSeconds" in result.stderr, result.stderr
     # Ordinary extension envs and the existing single-entry override contract survive.
-    _, output = render(chart, "--set", "worker.extraEnv[0].name=ACME_EXTENSION", "--set-string", "worker.extraEnv[0].value=preserved", "--set", "worker.extraEnv[1].name=CURIE_API_URL", "--set-string", "worker.extraEnv[1].value=https://api.example.com")
+    # Rail 1 requires a declared peer when CURIE_API_URL is external (#2367).
+    _, output = render(
+        chart,
+        "--set",
+        "worker.extraEnv[0].name=ACME_EXTENSION",
+        "--set-string",
+        "worker.extraEnv[0].value=preserved",
+        "--set",
+        "worker.extraEnv[1].name=CURIE_API_URL",
+        "--set-string",
+        "worker.extraEnv[1].value=https://api.example.com",
+        "--set",
+        "api.egress[0].cidr=192.0.2.21/32",
+        "--set",
+        "api.egress[0].ports[0].protocol=TCP",
+        "--set",
+        "api.egress[0].ports[0].port=443",
+    )
     env = envs(output, "worker.yaml", "worker")
     assert [e for e in env if e["name"] == "ACME_EXTENSION"] == [{"name": "ACME_EXTENSION", "value": "preserved"}]
     assert [e for e in env if e["name"] == "CURIE_API_URL"] == [{"name": "CURIE_API_URL", "value": "https://api.example.com"}]

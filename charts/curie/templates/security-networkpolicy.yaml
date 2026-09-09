@@ -250,6 +250,8 @@ never reach it because this validator refuses the CIDRs that would populate it.
 {{- end -}}
 {{- if and .Values.agentSandbox.deploy .Values.security.networkPolicy.enabled }}
 {{- $np := .Values.security.networkPolicy }}
+{{- $apiExternal := include "curie.runner.apiIsExternal" . | trim }}
+{{- $otlpExternal := include "curie.runner.otlpIsExternal" . | trim }}
 {{/*
 Rail 1: default-deny egress on runner sandboxes, with explicit allows.
 
@@ -307,8 +309,8 @@ spec:
         - { protocol: TCP, port: 53 }
 {{- end }}
 {{- if .Values.otelCollector.deploy }}
-{{- if .Values.otelCollector.egress }}
-{{- fail "otelCollector.egress is set while otelCollector.deploy is true, where the chart never reads it: it is only read on the BYO branch (otelCollector.deploy false). With the collector in-chart, runner egress to it is governed by the rendered runner-allow-collector policy's in-chart pod selector, so either clear otelCollector.egress or set otelCollector.deploy: false. If a CIDR for this endpoint already sits in security.networkPolicy.allowedEgress, move it to (or duplicate it into) otelCollector.egress when you flip deploy off: allowedEgress is the model/MCP allowlist, and rail 1 renders no runner peer for this endpoint without the dedicated key." }}
+{{- if and .Values.otelCollector.egress (not $otlpExternal) }}
+{{- fail "otelCollector.egress is set while the runner still dials this release's in-chart collector: the key is only read when the effective runner-facing OTLP endpoint is external. With the collector in-chart and no extraEnv override, runner egress to it is governed by the rendered runner-allow-collector policy's in-chart pod selector, so either clear otelCollector.egress or point the runner at an external collector. If a CIDR for this endpoint already sits in security.networkPolicy.allowedEgress, move it to (or duplicate it into) otelCollector.egress when the runner's destination leaves the in-chart Service: allowedEgress is the model/MCP allowlist, and rail 1 renders no dedicated runner peer for an external collector without the dedicated key." }}
 {{- end }}
 ---
 {{/* Allow the runner to ship OTLP traces to THIS release's in-chart collector.
@@ -337,17 +339,49 @@ spec:
       ports:
         - { protocol: TCP, port: {{ .Values.otelCollector.service.grpcPort }} }
         - { protocol: TCP, port: {{ .Values.otelCollector.service.httpPort }} }
+{{- if $otlpExternal }}
+{{/* Inverse of #2317 (#2367): the in-chart collector is still deployed, but
+     the runner actually dials an external OTLP endpoint (runner extraEnv
+     OTEL_EXPORTER_OTLP_ENDPOINT). The pod selector above does not cover that
+     host. Require otelCollector.egress or the documented allowedEgress
+     legacy allow; never invent a CIDR from the hostname. */}}
+{{- if not .Values.otelCollector.egress }}
+{{- if not $np.allowedEgress }}
+{{- fail (printf "%s points the runner at an external OTLP endpoint while Rail 1 is on: set otelCollector.egress to the collector endpoint CIDRs the runner sandbox must reach. The in-chart runner-allow-collector pod selector does not cover that host. NetworkPolicy cannot target a DNS name. Without a declared peer every runner, agent.run, llm.generation and execute_tool span is silently dropped. security.networkPolicy.allowedEgress is the documented legacy allow for this inverse shape; this refusal fires only when that list is also empty." (include "curie.runner.effectiveOtlpSource" .)) }}
+{{- end }}
 {{- else }}
-{{- $otlpEndpoint := include "curie.otel.endpoint" . | trim }}
+{{- range .Values.otelCollector.egress }}
+{{- include "curie.objectStore.egressEntry" (dict "key" "otelCollector.egress" "entry" .) }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-runner-allow-collector-endpoint
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    {{- include "curie.egress.ipBlockRules" .Values.otelCollector.egress | trim | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- else }}
+{{- $otlpEndpoint := include "curie.runner.effectiveOtlpEndpoint" . | trim }}
 {{- if $otlpEndpoint }}
 {{/* BYO collector (#2317). There is no in-chart collector pod to select, yet
-     curie.env.otel still hands the sandbox OTEL_EXPORTER_OTLP_ENDPOINT for an
-     external host, and NetworkPolicy cannot target that host (a DNS name). So
-     the operator must declare CIDRs. Empty keeps fail-closed: without this the
-     install is green, api/worker/dispatcher traces flow, and only the runner's
-     spans are silently dropped -- while every turn also pays the exporter's
-     flush stall. An empty resolved endpoint (telemetry off, or no endpoint at
-     all) requires nothing and renders no policy: there is nothing to reach. */}}
+     the runner is handed OTEL_EXPORTER_OTLP_ENDPOINT for an external host, and
+     NetworkPolicy cannot target that host (a DNS name). So the operator must
+     declare CIDRs. Empty keeps fail-closed: without this the install is green,
+     api/worker/dispatcher traces flow, and only the runner's spans are silently
+     dropped -- while every turn also pays the exporter's flush stall. An empty
+     resolved endpoint (telemetry off, or no endpoint at all) requires nothing
+     and renders no policy: there is nothing to reach. Effective URL includes
+     runner extraEnv, so an extraEnv override cannot skip this gate. */}}
 {{- if not .Values.otelCollector.egress }}
 {{- fail "otelCollector.deploy is false with an OTLP endpoint set: set otelCollector.egress to the collector endpoint CIDRs the runner sandbox must reach. Rail 1 is fail-closed and the in-chart runner-allow-collector policy does not render without an in-cluster collector pod. NetworkPolicy cannot target a DNS name, so otelCollector.endpoint alone is not enough -- without this key every runner, agent.run, llm.generation and execute_tool span is silently dropped while every other workload's traces keep flowing. If a CIDR for this endpoint already sits in security.networkPolicy.allowedEgress, move it to (or duplicate it into) otelCollector.egress: allowedEgress is the model/MCP allowlist, and rail 1 renders no runner peer for this endpoint without the dedicated key." }}
 {{- end }}
@@ -372,19 +406,17 @@ spec:
 {{- end }}
 {{- end }}
 {{- if .Values.api.deploy }}
-{{- if .Values.api.egress }}
-{{- fail "api.egress is set while api.deploy is true, where the chart never reads it: it is only read on the BYO branch (api.deploy false). With the API in-chart, runner egress to it is governed by the rendered runner-allow-api policy's in-chart pod selector, and an external destination reached while the in-chart API is still deployed stays governed by security.networkPolicy.allowedEgress -- so either clear api.egress or set api.deploy: false. If a CIDR for this endpoint already sits in allowedEgress, move it to (or duplicate it into) api.egress when you flip deploy off: allowedEgress is the model/MCP allowlist, and rail 1 renders no runner peer for this endpoint without the dedicated key." }}
+{{- if and .Values.api.egress (not $apiExternal) }}
+{{- fail "api.egress is set while the runner still dials this release's in-chart API: the key is only read when the effective runner-facing API URL is external. With the API in-chart and no extraEnv / apiBaseUrl override, runner egress to it is governed by the rendered runner-allow-api policy's in-chart pod selector, so either clear api.egress or point the runner at an external API. If a CIDR for this endpoint already sits in security.networkPolicy.allowedEgress, move it to (or duplicate it into) api.egress when the runner's destination leaves the in-chart Service: allowedEgress is the model/MCP allowlist, and rail 1 renders no dedicated runner peer for an external API without the dedicated key." }}
 {{- end }}
 ---
 {{/* Allow the runner to reach THIS release's in chart API for memory and history calls;
      without this carve out, rail 1 default deny blocks those calls. TCP 8000 is the API
      container port, not the configurable Service port. Two different destinations,
-     two different mechanisms: `api.egress` in the BYO branch below covers the
-     `api.deploy: false` shape, where there is no in-chart api pod to select. It
-     is NOT read here -- with api.deploy true the chart renders this pod selector
-     even when dispatcher.apiBaseUrl points at an external host, and reaching that
-     external destination remains governed by the operator's
-     security.networkPolicy.allowedEgress list. */}}
+     two different mechanisms: `api.egress` covers an external host the runner
+     actually dials (api.deploy false, or api.deploy true with an external
+     effective URL -- #2367). The pod selector here only covers this release's
+     API pods. */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -407,11 +439,42 @@ spec:
               {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 14 }}
       ports:
         - { protocol: TCP, port: 8000 }
+{{- if $apiExternal }}
+{{/* Inverse of #2317 (#2367): the in-chart API is still deployed, but the
+     runner actually dials an external API (dispatcher.apiBaseUrl, or
+     worker.extraEnv CURIE_API_URL / CURIE_RUNNER_API_URL). The pod selector
+     above does not cover that host. Require api.egress or the documented
+     allowedEgress legacy allow; never invent a CIDR from the hostname. */}}
+{{- if not .Values.api.egress }}
+{{- if not $np.allowedEgress }}
+{{- fail (printf "%s points the runner at an external API while Rail 1 is on: set api.egress to the external API endpoint CIDRs the runner sandbox must reach for memory, history and state. The in-chart runner-allow-api pod selector does not cover that host. NetworkPolicy cannot target a DNS name. Without a declared peer agents boot with no memory and no history, remember writes never persist, and the only symptom is a warning line inside the sandbox. security.networkPolicy.allowedEgress is the documented legacy allow for this inverse shape; this refusal fires only when that list is also empty." (include "curie.runner.effectiveApiSource" .)) }}
+{{- end }}
 {{- else }}
-{{- $apiBaseUrl := trim (printf "%v" (.Values.dispatcher.apiBaseUrl | default "")) }}
-{{- if $apiBaseUrl }}
+{{- range .Values.api.egress }}
+{{- include "curie.objectStore.egressEntry" (dict "key" "api.egress" "entry" .) }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-runner-allow-api-endpoint
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    {{- include "curie.egress.ipBlockRules" .Values.api.egress | trim | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- else }}
+{{- $apiExternalByo := include "curie.runner.apiIsExternal" . | trim }}
+{{- if $apiExternalByo }}
 {{/* BYO API (#2317). There is no in-chart api pod to select, and NetworkPolicy
-     cannot target dispatcher.apiBaseUrl (a DNS name), so the operator must
+     cannot target the effective API URL (a DNS name), so the operator must
      declare CIDRs. Empty keeps fail-closed: without this the install is green
      and the failure is silent and agent-shaped -- every turn boots with no
      prior memory and no thread transcript, `remember` writes never persist, the
@@ -419,11 +482,11 @@ spec:
      timeout latency inside the worker's claim-bind window. The only trace is a
      `memory load failed` warning inside the sandbox. Mirrors the BYO object
      store branch below; mailAdapter.apiEgress.httpsCidrs is the same idea for
-     the mail adapter pod. Scoped to a set dispatcher.apiBaseUrl, mirroring the
-     collector branch above: api.deploy false with no base URL at all names no
-     API for the runner to reach -- that install already dead-ends loudly at
-     dispatcher boot (see curie.env.apiUrl), and the trimming overlays render on
-     it. */}}
+     the mail adapter pod. Gated on the effective runner-facing URL, not only
+     dispatcher.apiBaseUrl, so a worker.extraEnv override cannot skip this
+     gate. api.deploy false with no external URL at all names no API for the
+     runner to reach -- that install already dead-ends loudly at dispatcher
+     boot (see curie.env.apiUrl), and the trimming overlays render on it. */}}
 {{- if not .Values.api.egress }}
 {{- fail "api.deploy is false: set api.egress to the external API endpoint CIDRs the runner sandbox must reach for memory, history and state. Rail 1 is fail-closed and the in-chart runner-allow-api policy does not render without an in-cluster api pod. NetworkPolicy cannot target a DNS name, so dispatcher.apiBaseUrl alone is not enough -- without this key agents boot with no memory and no history, remember writes never persist, and the only symptom is a warning line inside the sandbox. If a CIDR for this endpoint already sits in security.networkPolicy.allowedEgress, move it to (or duplicate it into) api.egress: allowedEgress is the model/MCP allowlist, and rail 1 renders no runner peer for this endpoint without the dedicated key." }}
 {{- end }}

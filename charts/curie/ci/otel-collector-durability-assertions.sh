@@ -119,6 +119,11 @@ YAML
 cat > "$TMP/external-otel-workload-env.yaml" <<'YAML'
 otelCollector:
   deploy: false
+  # Rail 1 keys on the effective runner OTLP URL (#2367); extraEnv below is
+  # external, so the dedicated peer is required even with no chart-owned endpoint.
+  egress:
+    - cidr: 192.0.2.40/32
+      ports: [{ protocol: TCP, port: 4318 }]
 dispatcher:
   deploy: true
   slack:
@@ -144,6 +149,12 @@ agentSandbox:
 YAML
 
 cat > "$TMP/internal-runner-otel-override.yaml" <<'YAML'
+otelCollector:
+  # In-chart collector stays deployed; runner extraEnv points OTLP elsewhere.
+  # Rail 1 requires the dedicated peer (#2367).
+  egress:
+    - cidr: 192.0.2.40/32
+      ports: [{ protocol: TCP, port: 4318 }]
 dispatcher:
   deploy: true
   slack:

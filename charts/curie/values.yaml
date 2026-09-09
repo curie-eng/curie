@@ -821,22 +821,26 @@ otelCollector:
   # supplied egress policy selecting the adapter, or its exports are dropped
   # while every other workload's succeed.
   endpoint: ""
-  # Runner sandbox egress to a BYO collector endpoint (#2317). Rail 1 is
-  # fail-closed, and the in-chart runner-allow-collector policy selects this
-  # release's collector pod, so it does not render when deploy is false. Each
-  # entry is {cidr, ports, except?} like security.networkPolicy.allowedEgress.
-  # NetworkPolicy cannot target a DNS name, so the `endpoint` above is not
-  # enough. Required only when deploy is false, Rail 1 is on, and the resolved
-  # endpoint is non-empty; a telemetry-disabled or endpoint-less install needs
-  # nothing here because there is nothing for the runner to reach. It is read
-  # ONLY on that BYO branch: setting it while deploy is true is refused at
-  # render rather than silently ignored. Empty (the
-  # default) keeps fail-closed: otherwise the install is green, every other
-  # workload's traces flow, and only the sandbox's spans are silently dropped.
-  # Each entry must set cidr and a concrete port (not protocol-only, not
-  # endPort). Default routes, IPv4 prefixes shorter than /8, IPv6 prefixes
-  # shorter than /32, and CIDRs that reach 169.254.169.254 or fd00:ec2::254
-  # are refused: this is one collector endpoint, not a second model allowlist.
+  # Runner sandbox egress to an external collector endpoint (#2317, #2367).
+  # Rail 1 is fail-closed. The in-chart runner-allow-collector policy selects
+  # this release's collector pod, so it does not cover a host the runner
+  # actually dials. Each entry is {cidr, ports, except?} like
+  # security.networkPolicy.allowedEgress. NetworkPolicy cannot target a DNS
+  # name, so the `endpoint` above (or a runner extraEnv
+  # OTEL_EXPORTER_OTLP_ENDPOINT override) is not enough. Required when Rail 1
+  # is on and the effective runner-facing OTLP URL is external -- including
+  # deploy true with a runner extraEnv override -- unless
+  # security.networkPolicy.allowedEgress already holds a covering CIDR (the
+  # documented legacy allow). A telemetry-disabled or endpoint-less install
+  # needs nothing here because there is nothing for the runner to reach.
+  # Setting it while the runner still dials the in-chart collector is refused
+  # at render rather than silently ignored. Empty (the default) keeps
+  # fail-closed: otherwise the install is green, every other workload's traces
+  # flow, and only the sandbox's spans are silently dropped. Each entry must
+  # set cidr and a concrete port (not protocol-only, not endPort). Default
+  # routes, IPv4 prefixes shorter than /8, IPv6 prefixes shorter than /32, and
+  # CIDRs that reach 169.254.169.254 or fd00:ec2::254 are refused: this is one
+  # collector endpoint, not a second model allowlist.
   egress: []
   #  - cidr: 192.0.2.10/32
   #    ports: [{ protocol: TCP, port: 4318 }]
@@ -994,26 +998,28 @@ grafanaConnector:
 # ---------------------------------------------------------------------------
 api:
   deploy: true
-  # Runner sandbox egress to a BYO API endpoint (#2317). Rail 1 is fail-closed,
-  # and the in-chart runner-allow-api policy selects this release's api pod, so
-  # it does not render when deploy is false. Each entry is
-  # {cidr, ports, except?} like security.networkPolicy.allowedEgress.
-  # NetworkPolicy cannot target a DNS name, so dispatcher.apiBaseUrl is not
-  # enough. Required when deploy is false, Rail 1 is on, and
-  # dispatcher.apiBaseUrl names an external API; deploy false with no base URL
-  # at all names nothing for the runner to reach and that install already
-  # dead-ends loudly at dispatcher boot. It is read ONLY on that BYO branch:
-  # setting it while deploy is true is refused at render rather than silently
-  # ignored, and an external destination reached while the in-chart API is
-  # still deployed stays governed by security.networkPolicy.allowedEgress.
-  # Empty (the default) keeps fail-closed: otherwise the install is green and
-  # agents boot with no memory and no thread history, with only a warning line
-  # inside the sandbox to show for it. Each entry must set cidr and a concrete
-  # port (not protocol-only, not endPort). Default routes, IPv4 prefixes
-  # shorter than /8, IPv6 prefixes shorter than /32, and CIDRs that reach
-  # 169.254.169.254 or fd00:ec2::254 are refused: this is one API endpoint,
-  # not a second model allowlist.
-  # mailAdapter.apiEgress.httpsCidrs is the same idea for the mail adapter pod.
+  # Runner sandbox egress to an external API endpoint (#2317, #2367). Rail 1
+  # is fail-closed. The in-chart runner-allow-api policy selects this
+  # release's api pod, so it does not cover a host the runner actually dials.
+  # Each entry is {cidr, ports, except?} like
+  # security.networkPolicy.allowedEgress. NetworkPolicy cannot target a DNS
+  # name, so dispatcher.apiBaseUrl (or worker.extraEnv CURIE_API_URL /
+  # CURIE_RUNNER_API_URL) is not enough. Required when Rail 1 is on and the
+  # effective runner-facing API URL is external -- including deploy true with
+  # an external apiBaseUrl or extraEnv override -- unless
+  # security.networkPolicy.allowedEgress already holds a covering CIDR (the
+  # documented legacy allow). deploy false with no external URL at all names
+  # nothing for the runner to reach and that install already dead-ends loudly
+  # at dispatcher boot. Setting it while the runner still dials the in-chart
+  # API is refused at render rather than silently ignored. Empty (the default)
+  # keeps fail-closed: otherwise the install is green and agents boot with no
+  # memory and no thread history, with only a warning line inside the sandbox
+  # to show for it. Each entry must set cidr and a concrete port (not
+  # protocol-only, not endPort). Default routes, IPv4 prefixes shorter than
+  # /8, IPv6 prefixes shorter than /32, and CIDRs that reach 169.254.169.254
+  # or fd00:ec2::254 are refused: this is one API endpoint, not a second
+  # model allowlist. mailAdapter.apiEgress.httpsCidrs is the same idea for
+  # the mail adapter pod.
   egress: []
   #  - cidr: 192.0.2.11/32
   #    ports: [{ protocol: TCP, port: 443 }]
