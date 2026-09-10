@@ -16,8 +16,11 @@ The assertions below are deliberately **sentence-scoped**: each rule-bearing
 regex uses ``[^.]`` spans so it cannot be satisfied by a neighbouring sentence.
 An earlier revision used loose cross-sentence spans (``.{0,140}``), and a
 mutation sweep showed three rules were not actually pinned -- deleting them left
-the test green because an adjacent sentence supplied the matched words. The
-mutation classes each assertion must kill are named alongside it.
+the test green because an adjacent sentence supplied the matched words. A later
+adversarial pass found a further hole: the cleanup sentence's ``otherwise``
+fallback (report generated artifacts and do not publish, when no documented
+cleanup procedure exists) was unpinned on its own. The mutation classes each
+assertion must kill are named alongside it.
 """
 
 import re
@@ -103,4 +106,18 @@ def test_publication_description_requires_a_reported_verification_first() -> Non
     ), (
         "cleanup must go through the repository's own documented procedure and "
         "must not remove requested or unrelated work"
+    )
+    # Kills: dropping the "otherwise" fallback entirely (no documented cleanup
+    # procedure exists), and gutting just its consequence so the artifacts are
+    # reported but publication is no longer forbidden. Sentence-local, so the
+    # cleanup-procedure clause earlier in the same sentence cannot supply the
+    # missing fallback.
+    assert re.search(
+        r"otherwise\s+report\s+the\s+generated\s+artifacts?[^.]{0,60}"
+        r"session\s+thread[^.]{0,40}(?:do\s+not|must\s+not|never)\s+publish",
+        verification_text,
+        flags=re.IGNORECASE,
+    ), (
+        "when no documented cleanup procedure exists, the generated artifacts must "
+        "be reported in the session thread and publication must not proceed"
     )

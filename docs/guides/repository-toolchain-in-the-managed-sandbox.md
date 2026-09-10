@@ -19,21 +19,32 @@ disagree, the harness is right and this file is stale.
 ## 1. The pinned toolchain
 
 The runner image is built from `runner/Dockerfile`, whose base is
-`python:3.13.15-slim-bookworm`, pinned by digest. A rebuild at a given commit
-therefore produces the same toolchain. The image carries:
+`python:3.13.15-slim-bookworm`, pinned by digest, with Node copied in from the
+official `node` image, also pinned by digest. A rebuild at a given commit
+therefore reproduces the Python and Node layers exactly. The Dockerfile also
+`apt-get install`s `git`, `curl`, and `ca-certificates` from the Debian
+bookworm archive with no version or digest pin, so those packages are not
+part of that guarantee: the archive moves under a later rebuild of the same
+commit, and the image can pick up a different `git`/`curl`/`ca-certificates`
+version with no change to the repository at all.
 
-| Tool | Version | Where it comes from |
-|---|---|---|
-| Python | 3.13.15 | the digest-pinned base image |
-| `pip`, `venv` | as shipped with that Python | the base image |
-| `git` | 2.39.5 | Debian bookworm packages |
-| Node and npm | 22 | copied from the official `node` image, also digest-pinned |
-| `curl`, `ca-certificates` | bookworm | Debian bookworm packages |
+| Tool | Version | Where it comes from | Reproducible from the commit? |
+|---|---|---|---|
+| Python | 3.13.15 | the digest-pinned base image | Yes |
+| `pip`, `venv` | as shipped with that Python | the base image | Yes |
+| Node and npm | 22 | copied from the official `node` image, also digest-pinned | Yes |
+| `git` | 2.39.5, as observed at build time | Debian bookworm packages | No |
+| `curl`, `ca-certificates` | bookworm, as observed at build time | Debian bookworm packages | No |
 
-Those pins move through Dependabot, which raises base-image bumps as pull
-requests. That is the supported way the toolchain changes: do not pin a
-different base out-of-band, and do not install a toolchain into a running
-sandbox and expect it to survive.
+In practice: an operator whose checks depend on a specific `git`, `curl`, or
+CA bundle version cannot rely on the image's commit alone to pin it, since
+those come from whatever the Debian archive serves on the day of the rebuild.
+
+Those base-image pins move through Dependabot, which raises digest bumps for
+the Python and Node base images as pull requests; it does not pin the apt-
+installed packages. That is the supported way the digest-pinned toolchain
+changes: do not pin a different base out-of-band, and do not install a
+toolchain into a running sandbox and expect it to survive.
 
 A toolchain the image does not carry is not silently unavailable — it fails
 loudly. See section 6.
