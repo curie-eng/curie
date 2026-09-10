@@ -2149,10 +2149,11 @@ prepare_connector_bundle() {
     local hosted_names
     cp "$CONNECTOR_FIXTURE" "$dir/connectors.yaml"
     # The fixture is a subset of the example's connectors. The scratch
-    # plugin.json still carries gates for connectors the fixture does not
-    # host; leaving those in place makes the owned copy fail
-    # approval_policy.gate_not_namespaced at skill up (#2423). This stage
-    # owns both files on the scratch copy.
+    # plugin.json still carries gates and toolPolicy entries for connectors
+    # the fixture does not host; leaving those in place makes the owned copy
+    # fail approval_policy.gate_not_namespaced or tool_policy.unknown_server
+    # at skill up (#2423, #2295). This stage owns both files on the scratch
+    # copy.
     hosted_names="$(mktemp)"
     awk '
         $0 == "connectors:" { inside = 1; next }
@@ -2183,6 +2184,20 @@ for gate in gates:
             continue
     kept.append(gate)
 policy["gates"] = kept
+tool_policy = data.get("toolPolicy")
+if isinstance(tool_policy, dict):
+    for key in ("allow", "approvalRequired", "deny"):
+        items = tool_policy.get(key)
+        if not isinstance(items, list):
+            continue
+        kept_items = []
+        for item in items:
+            if isinstance(item, str) and "/" in item:
+                server = item.split("/", 1)[0]
+                if server not in hosted and "*" not in server and "?" not in server:
+                    continue
+            kept_items.append(item)
+        tool_policy[key] = kept_items
 plugin_path.write_text(json.dumps(data, indent=2) + "\n")
 PY
     then

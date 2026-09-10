@@ -49,6 +49,7 @@ const UPGRADE_TOOL: &str = "self-upgrade/upgrade_self";
 // the gate without them would validate and never fire.
 const PLATFORM_UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_platform";
 const PLATFORM_UPGRADE_TOOL: &str = "self-upgrade/upgrade_platform";
+const LATEST_RELEASE_TOOL: &str = "self-upgrade/latest_release";
 // The platform-upgrade objects this installer renders. Names are fixed rather
 // than configurable: the connector is told the CronJob's name through its own
 // env, and two places free to disagree is how a tool ends up refusing every call
@@ -1974,6 +1975,13 @@ fn runtime_connector_declaration(
     ))
 }
 
+fn is_self_upgrade_policy_entry(entry: &serde_json::Value) -> bool {
+    let Some(name) = entry.as_str() else {
+        return false;
+    };
+    matches!(name.split_once('/'), Some(("self-upgrade", _)))
+}
+
 fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u8>> {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(source).context("parsing embedded SRE bot plugin.json")?;
@@ -1999,13 +2007,16 @@ fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u
         .get_mut("allow")
         .and_then(serde_json::Value::as_array_mut)
         .context("embedded SRE bot toolPolicy.allow must be an array")?;
-    for tool in [UPGRADE_TOOL, PLATFORM_UPGRADE_TOOL] {
+    for tool in [UPGRADE_TOOL, PLATFORM_UPGRADE_TOOL, LATEST_RELEASE_TOOL] {
         if !allow.iter().any(|entry| entry.as_str() == Some(tool)) {
             bail!("embedded SRE bot toolPolicy.allow must contain {tool}");
         }
     }
     if !upgrade_enabled {
-        allow.retain(|entry| !matches!(entry.as_str(), Some(UPGRADE_TOOL | PLATFORM_UPGRADE_TOOL)));
+        // Default install strips connectors.self-upgrade. Any leftover
+        // self-upgrade/* allow entry fails the bundle validator with
+        // tool_policy.unknown_server, which is how latest_release escaped #2404.
+        allow.retain(|entry| !is_self_upgrade_policy_entry(entry));
     }
     // Keep exactly the gates and tool-policy entries whose connectors survived.
     // Either kind of reference to a stripped connector fails bundle validation;
@@ -2362,9 +2373,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
         assert!(parsed.get("approvalPolicy").is_none());
         let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
-        assert!(!allow
-            .iter()
-            .any(|tool| { matches!(tool.as_str(), Some(UPGRADE_TOOL | PLATFORM_UPGRADE_TOOL)) }));
+        assert!(!allow.iter().any(is_self_upgrade_policy_entry));
     }
 
     #[test]
@@ -2411,6 +2420,14 @@ mod tests {
             .map(|gate| gate["gate"].as_str().unwrap())
             .collect();
         assert_eq!(gates, vec![UPGRADE_GATE, PLATFORM_UPGRADE_GATE]);
+        let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
+        assert!(allow
+            .iter()
+            .any(|tool| tool.as_str() == Some(LATEST_RELEASE_TOOL)));
+        assert!(allow.iter().any(|tool| tool.as_str() == Some(UPGRADE_TOOL)));
+        assert!(allow
+            .iter()
+            .any(|tool| tool.as_str() == Some(PLATFORM_UPGRADE_TOOL)));
     }
 
     #[test]
@@ -2678,16 +2695,19 @@ mod tests {
         );
         assert_eq!(parsed["toolPolicy"]["deny"], source["toolPolicy"]["deny"]);
         let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
-        assert_eq!(
-            allow.len(),
-            source["toolPolicy"]["allow"].as_array().unwrap().len() - 2
-        );
-        assert!(allow
+        let source_allow = source["toolPolicy"]["allow"].as_array().unwrap();
+        let stripped = source_allow
             .iter()
-            .all(|tool| { !matches!(tool.as_str(), Some(UPGRADE_TOOL | PLATFORM_UPGRADE_TOOL)) }));
+            .filter(|tool| is_self_upgrade_policy_entry(tool))
+            .count();
+        assert_eq!(allow.len(), source_allow.len() - stripped);
+        assert!(!allow.iter().any(is_self_upgrade_policy_entry));
         assert!(allow
             .iter()
             .any(|tool| tool.as_str() == Some("kubernetes/pods_list")));
+        assert!(allow
+            .iter()
+            .any(|tool| tool.as_str() == Some("grafana/query_loki_logs")));
     }
 
     #[test]
