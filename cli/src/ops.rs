@@ -703,6 +703,8 @@ pub fn model_credential_env() -> Result<Option<String>> {
 /// The helm value key that pins the sandbox runner model in the chart.
 const RUNNER_MODEL_KEY: &str = "agentSandbox.runner.model";
 
+pub(crate) const INFERENCE_DEPLOY_KEY: &str = "inference.deploy";
+pub(crate) const INFERENCE_MODEL_KEY: &str = "inference.model";
 pub(crate) const INFERENCE_PERSISTENCE_ENABLED_KEY: &str = "inference.persistence.enabled";
 pub(crate) const INFERENCE_PULL_MODEL_KEY: &str = "inference.pullModel";
 
@@ -2069,9 +2071,10 @@ fn helm_set_string_entries(expression: &str) -> Vec<(String, String)> {
 /// Carry the runner identity recorded by a prior real model install into a
 /// plain rerun. Explicit inputs replace their recorded family.
 ///
-/// The family is `agentSandbox.runner.model` plus the credential trio (the
-/// inline value and its external-Secret reference pair). `cluster up` is a FULL
-/// helm upgrade rather than `--reuse-values`, so any member this run does not
+/// The family is `agentSandbox.runner.model`, the credential trio (the inline
+/// value and its external-Secret reference pair), and the in-cluster inference
+/// pair (`inference.deploy` / `inference.model`). `cluster up` is a FULL helm
+/// upgrade rather than `--reuse-values`, so any member this run does not
 /// re-supply falls back to the chart default and the release forgets it.
 ///
 /// `--local-model` and `--credentials` each SUPPLY a replacement for the
@@ -2154,6 +2157,59 @@ fn resolve_preserved_runner_identity_values(
     if opts.local_model.is_none() && opts.model.is_none() && !overridden.contains(RUNNER_MODEL_KEY)
     {
         opts.model = preserved_value(existing, RUNNER_MODEL_KEY);
+    }
+
+    resolve_preserved_inference_values(opts, existing, operator_sets);
+}
+
+/// Carry a recorded in-cluster inference install into a later plain `cluster up`.
+///
+/// `--local-model` writes `inference.deploy=true` and `inference.model` for that
+/// one run, and blanks the credential reference because it SUPPLIES a
+/// replacement family. Unlike `--credentials`, those inference values were not
+/// themselves a preserved family, so a following plain `up` fell back to the
+/// chart default `inference.deploy: false` and the release had no model source
+/// at all (#2510). Re-supply the recorded inference configuration the same way
+/// [`resolve_preserved_gvisor_mode_value`] re-supplies a recorded posture.
+///
+/// `--credentials` still replaces this family: an explicit inline credential is
+/// the durable replacement, so inference is not re-supplied. `--fake-model`
+/// must not re-supply a truthy `inference.deploy` either -- the chart renders
+/// `CURIE_FAKE_MODEL` off `fakeModel AND NOT inference.deploy`, and carrying
+/// deploy forward would make the diagnostic run a real local-model install
+/// (#2469). An operator `--set` owns its key and always wins. Recorded sibling
+/// keys (`inference.model`, pull policy, persistence size) travel with deploy
+/// so a later full upgrade cannot shrink a PVC or drop the selected model.
+fn resolve_preserved_inference_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    if opts.fake_model || opts.local_model.is_some() || opts.credentials.is_some() {
+        return;
+    }
+    let overridden = operator_set_keys(operator_sets);
+    if overridden.contains(INFERENCE_DEPLOY_KEY) {
+        return;
+    }
+    let Some(existing) = existing else {
+        return;
+    };
+    if !crate::doctor::helm_truthy(existing.pointer("/inference/deploy")) {
+        return;
+    }
+    opts.set.push(format!("{INFERENCE_DEPLOY_KEY}=true"));
+    let mut recorded = BTreeMap::new();
+    crate::installation::flatten_values(existing, "", &mut recorded);
+    for (key, value) in recorded {
+        if key == INFERENCE_DEPLOY_KEY
+            || !key_is_or_descends_from(&key, "inference")
+            || overridden.contains(&key)
+            || value.is_empty()
+        {
+            continue;
+        }
+        opts.set.push(format!("{key}={value}"));
     }
 }
 
@@ -4491,8 +4547,8 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
         plan.set("langfuse.web.service.type", "NodePort");
     }
     if let Some(model) = &o.local_model {
-        plan.set("inference.deploy", "true");
-        plan.set("inference.model", model);
+        plan.set(INFERENCE_DEPLOY_KEY, "true");
+        plan.set(INFERENCE_MODEL_KEY, model);
     }
     if model_credential_source_is_set(o) {
         plan.set(FAKE_MODEL_KEY, "false");
@@ -13943,19 +13999,36 @@ mod tests {
     fn recorded_by_helm(opts: &UpOpts) -> serde_json::Value {
         let mut values = serde_json::json!({});
         let planned = up_value_plan(opts).effective_values();
-        let supplied = planned
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .chain(opts.secrets.iter().cloned());
-        for (key, value) in supplied {
-            let parts: Vec<_> = key.split('.').collect();
-            let mut current = &mut values;
-            for part in &parts[..parts.len() - 1] {
-                current = &mut current[*part];
-            }
-            current[*parts.last().unwrap()] = value.into();
+        for (key, value) in planned {
+            set_recorded_helm_value(&mut values, &key, helm_set_leaf(&value));
+        }
+        // Secrets stay strings even when the value is the word "true"/"false".
+        for (key, value) in &opts.secrets {
+            set_recorded_helm_value(&mut values, key, value.as_str().into());
         }
         values
+    }
+
+    /// Helm `--set KEY=true` records a JSON boolean, not the string "true".
+    fn helm_set_leaf(value: &str) -> serde_json::Value {
+        match value {
+            "true" => serde_json::json!(true),
+            "false" => serde_json::json!(false),
+            other => other.into(),
+        }
+    }
+
+    fn set_recorded_helm_value(
+        values: &mut serde_json::Value,
+        key: &str,
+        value: serde_json::Value,
+    ) {
+        let parts: Vec<_> = key.split('.').collect();
+        let mut current = values;
+        for part in &parts[..parts.len() - 1] {
+            current = &mut current[*part];
+        }
+        current[*parts.last().unwrap()] = value;
     }
 
     fn secret_for<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
@@ -17091,6 +17164,267 @@ mod tests {
             secret_for(&opts, MODEL_CREDENTIAL_KEY),
             None,
             "the operator cleared the credential; --fake-model must not resurrect it"
+        );
+    }
+
+    /// Chart defaults for the two keys the sandbox template branches on, so a
+    /// test can assert the EFFECTIVE runner model source (what the pod boots),
+    /// not only that a helm `--set` was emitted. `cluster up` reads user-supplied
+    /// values rather than `--all`, so a key this run did not re-supply is absent
+    /// from the record and the chart default applies.
+    fn chart_default_model_values() -> serde_json::Value {
+        serde_json::json!({
+            "agentSandbox": {"runner": {"fakeModel": true, "model": "claude-sonnet-5"}},
+            "inference": {"deploy": false, "model": "qwen3:4b"}
+        })
+    }
+
+    fn overlay_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+        match (base, overlay) {
+            (serde_json::Value::Object(base_map), serde_json::Value::Object(over_map)) => {
+                for (key, value) in over_map {
+                    overlay_json(
+                        base_map
+                            .entry(key.clone())
+                            .or_insert(serde_json::Value::Null),
+                        value,
+                    );
+                }
+            }
+            (base, overlay) => *base = overlay.clone(),
+        }
+    }
+
+    fn effective_runner_values(recorded: &serde_json::Value) -> serde_json::Value {
+        let mut values = chart_default_model_values();
+        overlay_json(&mut values, recorded);
+        values
+    }
+
+    fn effective_runner_model(
+        recorded: &serde_json::Value,
+    ) -> Option<(String, crate::doctor::ReleaseModelKey)> {
+        crate::doctor::runner_model_from_values(&effective_runner_values(recorded))
+    }
+
+    fn effective_runner_is_fake(recorded: &serde_json::Value) -> bool {
+        crate::doctor::release_fake_model(&effective_runner_values(recorded))
+    }
+
+    /// #2510: `--local-model` over `existing`, then the plain `up` that follows,
+    /// driven through what the local-model run would ACTUALLY leave behind.
+    fn local_then_plain_up(dev: bool, existing: &serde_json::Value) -> (UpOpts, UpOpts) {
+        let mut input = completed_dev_up(
+            None,
+            vec![
+                "inference.pullModel=false".into(),
+                "inference.persistence.enabled=true".into(),
+                "inference.persistence.size=40Gi".into(),
+            ],
+        );
+        input.dev = dev;
+        input.local_model = Some("qwen3:4b".into());
+        let local =
+            complete_up_opts_without_runner_egress(input, Some(existing), None, false).unwrap();
+        let recorded = recorded_by_helm(&local);
+        let mut plain = completed_dev_up(None, vec![]);
+        plain.dev = dev;
+        let plain =
+            complete_up_opts_without_runner_egress(plain, Some(&recorded), None, false).unwrap();
+        (local, plain)
+    }
+
+    /// #2510: `--local-model` over a recorded BYO credential reference leaves a
+    /// durable inference source. A following plain `up` still boots that local
+    /// model with no operator re-supply -- the replacement #2459/#2469 left
+    /// undurable.
+    #[test]
+    fn local_model_then_plain_up_preserves_inference_over_a_recorded_reference() {
+        let existing =
+            runner_identity_fixture(None, None, Some(("acme-credentials", "credentials-custom")));
+        for dev in [false, true] {
+            let (local, plain) = local_then_plain_up(dev, &existing);
+
+            assert_eq!(
+                secret_for(&local, "agentSandbox.runner.credentialsExistingSecret"),
+                Some(""),
+                "dev={dev}: --local-model still replaces the credential family"
+            );
+            let recorded = recorded_by_helm(&local);
+            assert_eq!(
+                planned(&local, INFERENCE_DEPLOY_KEY).as_deref(),
+                Some("true"),
+                "dev={dev}: --local-model must write inference.deploy"
+            );
+            assert_eq!(
+                planned(&local, INFERENCE_MODEL_KEY).as_deref(),
+                Some("qwen3:4b")
+            );
+            assert_eq!(
+                effective_runner_model(&recorded),
+                Some((
+                    "qwen3:4b".to_string(),
+                    crate::doctor::ReleaseModelKey::Inference
+                )),
+                "dev={dev}: the local-model run's effective source is inference, not helm values alone"
+            );
+            assert!(
+                !effective_runner_is_fake(&recorded),
+                "dev={dev}: a truthy inference.deploy must not boot the fake model"
+            );
+
+            let recovered = recorded_by_helm(&plain);
+            assert_eq!(
+                planned(&plain, INFERENCE_DEPLOY_KEY).as_deref(),
+                Some("true"),
+                "dev={dev}: the plain up after --local-model must re-supply inference.deploy"
+            );
+            assert_eq!(
+                planned(&plain, INFERENCE_MODEL_KEY).as_deref(),
+                Some("qwen3:4b"),
+                "dev={dev}: the plain up after --local-model must re-supply inference.model"
+            );
+            assert_eq!(
+                planned(&plain, INFERENCE_PULL_MODEL_KEY).as_deref(),
+                Some("false"),
+                "dev={dev}: the selected asset policy must travel with the inference family"
+            );
+            assert_eq!(
+                planned(&plain, INFERENCE_PERSISTENCE_ENABLED_KEY).as_deref(),
+                Some("true"),
+                "dev={dev}: durable inference storage must stay enabled"
+            );
+            assert_eq!(
+                planned(&plain, "inference.persistence.size").as_deref(),
+                Some("40Gi"),
+                "dev={dev}: a recorded PVC size must not shrink back to the chart default"
+            );
+            assert_eq!(
+                effective_runner_model(&recovered),
+                Some((
+                    "qwen3:4b".to_string(),
+                    crate::doctor::ReleaseModelKey::Inference
+                )),
+                "dev={dev}: the plain up must still boot the in-cluster model"
+            );
+            assert!(
+                !effective_runner_is_fake(&recovered),
+                "dev={dev}: recovering inference must not fall back to the fake model"
+            );
+            assert_ne!(
+                secret_for(&plain, "agentSandbox.runner.credentialsExistingSecret"),
+                Some("acme-credentials"),
+                "dev={dev}: the blanked reference must not come back on the plain up"
+            );
+        }
+    }
+
+    /// #2510: `--credentials` still replaces its recorded family. After
+    /// `--local-model`, an explicit inline credential is the durable
+    /// replacement and inference is not re-supplied, so the chart does not keep
+    /// ignoring the credential behind a leftover `inference.deploy=true`.
+    #[test]
+    fn explicit_credentials_replace_a_recorded_local_model_install() {
+        let existing =
+            runner_identity_fixture(None, None, Some(("acme-credentials", "credentials-custom")));
+        let (local, _) = local_then_plain_up(true, &existing);
+        let recorded = recorded_by_helm(&local);
+
+        let mut input = completed_dev_up(None, vec![]);
+        input.credentials = Some("sk-explicit".into());
+        let opts =
+            complete_up_opts_without_runner_egress(input, Some(&recorded), None, false).unwrap();
+
+        assert_eq!(opts.credentials.as_deref(), Some("sk-explicit"));
+        assert_eq!(
+            planned(&opts, INFERENCE_DEPLOY_KEY),
+            None,
+            "--credentials must not re-supply inference.deploy; the inline credential is the replacement"
+        );
+        assert_ne!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
+            Some("acme-credentials"),
+            "--credentials must not resurrect the obsolete BYO reference"
+        );
+        let recovered = recorded_by_helm(&opts);
+        assert_eq!(
+            planned(&opts, FAKE_MODEL_KEY).as_deref(),
+            Some("false"),
+            "an explicit credential still selects the real model"
+        );
+        assert!(
+            !effective_runner_is_fake(&recovered),
+            "the credential replacement must not boot the fake model"
+        );
+        assert_ne!(
+            effective_runner_model(&recovered).map(|(_, key)| key),
+            Some(crate::doctor::ReleaseModelKey::Inference),
+            "inference must not remain the effective source after --credentials"
+        );
+    }
+
+    /// #2510: an operator `--set` owns the inference keys outright.
+    #[test]
+    fn operator_set_wins_over_recorded_inference() {
+        let existing = serde_json::json!({
+            "inference": {"deploy": true, "model": "qwen3:4b", "pullModel": false}
+        });
+        let opts = completed_dev_up(Some(&existing), vec!["inference.deploy=false".into()]);
+        assert_eq!(
+            planned(&opts, INFERENCE_DEPLOY_KEY).as_deref(),
+            Some("false"),
+            "the operator set inference.deploy, so the CLI must not resurrect true"
+        );
+        assert_eq!(
+            planned(&opts, INFERENCE_MODEL_KEY),
+            None,
+            "a cleared deploy is not an inference install; do not re-supply the model"
+        );
+        let recovered = recorded_by_helm(&opts);
+        assert_ne!(
+            effective_runner_model(&recovered).map(|(_, key)| key),
+            Some(crate::doctor::ReleaseModelKey::Inference),
+            "--set inference.deploy=false must not keep the in-cluster model in force"
+        );
+    }
+
+    /// #2510: a fresh install never invents an in-cluster inference source.
+    #[test]
+    fn fresh_install_does_not_invent_inference() {
+        let opts = completed_dev_up(None, vec![]);
+        assert_eq!(planned(&opts, INFERENCE_DEPLOY_KEY), None);
+        assert_eq!(planned(&opts, INFERENCE_MODEL_KEY), None);
+        let recorded = recorded_by_helm(&opts);
+        assert!(
+            effective_runner_is_fake(&recorded),
+            "a fresh install without a model source must keep the chart's fake runner"
+        );
+        assert_ne!(
+            effective_runner_model(&recorded).map(|(_, key)| key),
+            Some(crate::doctor::ReleaseModelKey::Inference)
+        );
+    }
+
+    /// #2510: `--fake-model` still does not re-supply inference.deploy, so the
+    /// diagnostic run stays fake even over a recorded local-model install.
+    #[test]
+    fn fake_model_does_not_re_supply_recorded_inference() {
+        let existing = serde_json::json!({
+            "inference": {"deploy": true, "model": "qwen3:4b"}
+        });
+        let mut input = completed_dev_up(None, vec![]);
+        input.fake_model = true;
+        let opts =
+            complete_up_opts_without_runner_egress(input, Some(&existing), None, false).unwrap();
+        assert_eq!(
+            planned(&opts, INFERENCE_DEPLOY_KEY),
+            None,
+            "--fake-model must not carry inference.deploy; the chart would then skip the fake runner"
+        );
+        assert_eq!(planned(&opts, FAKE_MODEL_KEY), None);
+        assert!(
+            effective_runner_is_fake(&recorded_by_helm(&opts)),
+            "--fake-model over a recorded local-model install must still boot the fake runner"
         );
     }
 
