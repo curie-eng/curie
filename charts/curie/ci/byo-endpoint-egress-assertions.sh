@@ -126,7 +126,6 @@ API_BASE_URL=https://api.example.net
 declare -a DEPLOY_GATE_EXEMPTIONS=(
   "security-networkpolicy.yaml:inference=an external inference endpoint is the model API, already governed by the operator's security.networkPolicy.allowedEgress model allowlist, which is the intended mechanism there"
   "mail-adapter.yaml:mailAdapter=this is the whole-template deploy gate for the mail adapter itself, not an egress carve-out: with mailAdapter.deploy false there is no adapter pod, no policy, and no destination to bring your own"
-  "mail-adapter.yaml:otelCollector=deliberate, documented asymmetry. The mail adapter is the only first-party workload with its own egress policy, so with otelCollector.deploy false and an external otelCollector.endpoint the chart invents no broad allow for an address it cannot know; the operator applies an additional egress policy selecting the adapter's labels, because NetworkPolicies union rather than intersect. Written up in charts/curie/README.md -- search for \"asymmetric\" in the mail adapter section"
 )
 
 fail() {

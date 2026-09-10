@@ -146,7 +146,17 @@ list order or an exact string comparison.
   {{- $otelPort = include "curie.mailAdapter.otelEgressPort" . | trim }}
 {{- else }}
   {{- if .Values.mailAdapter.otelEgress.httpsCidrs }}
+  {{- /* Not-external covers two unrelated releases, and one remedy for both
+       mis-diagnoses one of them: an empty effective endpoint (telemetry
+       disabled, or deploy=false with no endpoint) has no in-chart collector at
+       all -- curie.otel.validate forbids telemetryDisabled with deploy=true --
+       so telling that operator a pod-selector rule covers their export names a
+       rule that was never rendered. Each case gets its own true remedy. */}}
+  {{- if include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim }}
   {{- fail "mailAdapter.otelEgress.httpsCidrs is set, but the key is only read when this release's effective OTLP endpoint is external. This release exports to its own in-chart collector, and egress to it is governed by the rendered pod-selector rule -- these CIDRs would be silently ignored, leaving an operator believing a peer exists. Clear mailAdapter.otelEgress.httpsCidrs, or point the release at an external collector with otelCollector.deploy=false and otelCollector.endpoint." }}
+  {{- else }}
+  {{- fail "mailAdapter.otelEgress.httpsCidrs is set, but this release exports nothing at all: its effective OTLP endpoint is empty, so there is no collector -- in-chart or external -- for these CIDRs to reach, and no peer to declare. They would be silently ignored. Clear mailAdapter.otelEgress.httpsCidrs, or configure a collector to export to (otelCollector.deploy=true, or otelCollector.deploy=false with otelCollector.endpoint set) and declare its narrow IP range here." }}
+  {{- end }}
   {{- end }}
 {{- end }}
 {{/*
@@ -443,7 +453,14 @@ spec:
       ports:
         - { protocol: TCP, port: {{ .Values.otelCollector.service.grpcPort }} }
         - { protocol: TCP, port: {{ .Values.otelCollector.service.httpPort }} }
-    {{- end }}
+    {{- else }}
+    {{- /* The external peer is the ELSE of the in-chart gate, not a sibling
+         `if`: as siblings the #2317 class guard read this file as a .deploy
+         carve-out with no BYO branch and needed an exemption, so deleting the
+         rule below would have restored the silent drop with the suite still
+         green. The inner gate keeps the two peers mutually exclusive -- a
+         release that exports nowhere (empty effective endpoint) lands here and
+         correctly renders neither. */}}
     {{- if $otelExternal }}
     # An external collector has no in-chart pod labels to select, and
     # NetworkPolicy cannot resolve its DNS name, so the operator declares its
@@ -457,5 +474,6 @@ spec:
         {{- end }}
       ports:
         - { protocol: TCP, port: {{ $otelPort | int }} }
+    {{- end }}
     {{- end }}
 {{- end }}

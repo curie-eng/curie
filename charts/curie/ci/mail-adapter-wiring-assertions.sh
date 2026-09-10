@@ -1716,4 +1716,66 @@ python3 "$OTEL_EGRESS_PY" "$otel_disabled_dir" no 3 203.0.113.0/24 \
 python3 "$OTLP_IPBLOCK_PY" "$otel_disabled_dir" none - - 203.0.113.0/24 \
   || fail "with telemetry disabled the adapter exports nothing, so it must be granted no OTLP ipBlock peer at all; see the message above"
 
-echo "OK: mail-adapter chart wiring and build-path render assertions passed (23 assertions)"
+# 23l: a bracketed IPv6 endpoint WITH a port. Port extraction used to be
+#      skipped whenever the host contained "[", which left the URL port unseen,
+#      fell through to the https scheme default, and opened 443 while the SDK
+#      dialled 4318 -- a peer that looks configured and drops every export. The
+#      rule must be on 4318.
+otlp_v6_port_dir="$(render otlp-v6-port "${ON[@]}" "${CREDS[@]}" \
+  --set-string 'otelCollector.endpoint=https://[2001:db8::1]:4318' \
+  --set otelCollector.deploy=false \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set-string 'mailAdapter.otelEgress.httpsCidrs[0]=2001:db8::1/128')"
+python3 "$OTLP_IPBLOCK_PY" "$otlp_v6_port_dir" rule 2001:db8::1/128 4318 203.0.113.0/24 \
+  || fail "a bracketed IPv6 OTLP endpoint that names a port must open THAT port, not the https scheme default; see the message above"
+
+# 23m: the same bracketed IPv6 endpoint with a DISAGREEING explicit port. The
+#      bracket skip also disabled the mismatch refusal, so this shape used to
+#      render silently. It must refuse, exactly as 23g does for a DNS host.
+assert_render_fails_naming_both \
+  "bracketed IPv6 endpoint port disagreeing with mailAdapter.otelEgress.port" \
+  "4318" \
+  "443" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set-string 'otelCollector.endpoint=https://[2001:db8::1]:4318' \
+  --set otelCollector.deploy=false \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set-string mailAdapter.otelEgress.port=443 \
+  --set-string 'mailAdapter.otelEgress.httpsCidrs[0]=2001:db8::1/128'
+
+# 23n: a URL that omits its port still has a determined dial port. The mismatch
+#      check used to compare the explicit key against a ":port" SUBSTRING, so a
+#      portless https:// endpoint plus port=4318 passed unchallenged and opened
+#      4318 while the exporter connected to 443. Compare against the resolved
+#      dial port instead, and name both numbers.
+assert_render_fails_naming_both \
+  "explicit port against a portless https endpoint dialled on its scheme default" \
+  "4318" \
+  "443" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set-string mailAdapter.otelEgress.port=4318 \
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32'
+
+# 23o: a stale CIDR left behind on a release that exports NOTHING. Both the
+#      in-chart and the disabled release are "not external", but only one of
+#      them has a pod-selector rule; curie.otel.validate forbids
+#      telemetryDisabled with deploy=true, so quoting that rule here names a
+#      rule that was never rendered. The remedy must say nothing is exported.
+assert_render_fails_named \
+  "telemetryDisabled with a stale mailAdapter.otelEgress.httpsCidrs" \
+  "exports nothing at all" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.telemetryDisabled=true \
+  --set otelCollector.deploy=false \
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32'
+
+echo "OK: mail-adapter chart wiring and build-path render assertions passed (27 assertions)"

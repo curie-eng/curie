@@ -1264,23 +1264,38 @@ true
 {{- $parsed := urlParse $endpoint -}}
 {{- $hostPort := $parsed.host | default "" -}}
 {{- $scheme := lower ($parsed.scheme | default "") -}}
-{{- $urlPort := "" -}}
-{{- if not (contains "[" $hostPort) -}}
-{{- $urlPort = trimPrefix ":" (regexFind ":[0-9]+$" $hostPort) -}}
+{{/* A bracketed IPv6 host is NOT skipped here, which is the opposite of
+     curie.endpoint.host: that helper leaves brackets intact because such a host
+     is never in-chart Service DNS, whereas this helper must still find the
+     port. ":[0-9]+$" is safe on a literal address because a bare bracketed host
+     ends in "]" -- only a real port can follow the closing bracket, so a hextet
+     is never mistaken for one. Skipping brackets instead left $urlPort empty,
+     fell through to the scheme default, and opened 443 while the SDK dialled
+     the port the URL actually named. */}}
+{{- $urlPort := trimPrefix ":" (regexFind ":[0-9]+$" $hostPort) -}}
+{{/* The port the SDK will actually dial, whether or not the URL writes it: a
+     portless https:// endpoint is dialled on 443 just as definitely as an
+     explicit :4318. The explicit key is compared against THIS, not against the
+     presence of a ":port" substring -- otherwise an explicit 4318 beside a
+     portless https:// URL passed unchallenged and rendered a 4318 peer for a
+     443 dial. */}}
+{{- $dialPort := $urlPort -}}
+{{- if not $dialPort -}}
+{{- if eq $scheme "https" -}}
+{{- $dialPort = "443" -}}
+{{- else if eq $scheme "http" -}}
+{{- $dialPort = "80" -}}
+{{- end -}}
 {{- end -}}
 {{- $explicit := trim (printf "%v" (.Values.mailAdapter.otelEgress.port | default "")) -}}
 {{- $port := "" -}}
 {{- if $explicit -}}
-{{- if and $urlPort (regexMatch "^[0-9]+$" $explicit) (ne (int $explicit) (int $urlPort)) -}}
-{{- fail (printf "mailAdapter.otelEgress.port is %s but the resolved OTLP endpoint %s already names port %s. Set one of them, or make them agree: opening %s while the collector listens on %s renders a peer that looks configured and still drops every export." $explicit $endpoint $urlPort $explicit $urlPort) -}}
+{{- if and $dialPort (regexMatch "^[0-9]+$" $explicit) (ne (int $explicit) (int $dialPort)) -}}
+{{- fail (printf "mailAdapter.otelEgress.port is %s but the OTLP endpoint %s is dialed on port %s (the port its URL names, or the scheme default when the URL names none). Set one of them, or make them agree: opening %s while the exporter connects to %s renders a peer that looks configured and still drops every export." $explicit $endpoint $dialPort $explicit $dialPort) -}}
 {{- end -}}
 {{- $port = $explicit -}}
-{{- else if $urlPort -}}
-{{- $port = $urlPort -}}
-{{- else if eq $scheme "https" -}}
-{{- $port = "443" -}}
-{{- else if eq $scheme "http" -}}
-{{- $port = "80" -}}
+{{- else -}}
+{{- $port = $dialPort -}}
 {{- end -}}
 {{- if or (not (regexMatch "^[0-9]+$" $port)) (lt (int $port) 1) (gt (int $port) 65535) -}}
 {{- fail (printf "mailAdapter.otelEgress.port must be an integer from 1 through 65535, or empty to derive it from the resolved OTLP endpoint %s" $endpoint) -}}
