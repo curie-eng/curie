@@ -317,3 +317,42 @@ async fn cluster_status_reports_phase_and_known_good() {
     assert_eq!(view.known_good_version.as_deref(), Some("0.8.6"));
     assert_eq!(view.target_version.as_deref(), Some("0.9.0"));
 }
+
+// T18 (R8) -- CHARACTERIZATION, not a requirement. This pins the CURRENT
+// behaviour of the in-progress checkpoint guard INCLUDING its gap: it refuses a
+// second run only when that run targets a DIFFERENT version, and lets a second
+// run at the SAME target proceed straight into mutation. `curie cluster upgrade`
+// has no ownership fence; see FU-1 and the `docs/operations.md` note. If a fence
+// lands, this test SHOULD fail and be replaced by the fence's own test.
+#[tokio::test]
+async fn concurrent_upgrade_is_not_fenced_characterization() {
+    let mut host = FakeUpgradeHost::installed("0.8.6").interrupt_after(UpgradePhase::Plan);
+    let err = run_lifecycle(opts("0.9.0"), &mut host)
+        .await
+        .expect_err("first run interrupted, leaving an in-progress checkpoint");
+    assert!(format!("{err:#}").contains("interrupted"));
+    host.clear_interrupt();
+
+    let err = run_lifecycle(opts("0.9.1"), &mut host)
+        .await
+        .expect_err("a different target is refused while one is in progress");
+    assert!(
+        format!("{err:#}").contains("already in progress"),
+        "{err:#}"
+    );
+    assert_eq!(
+        host.mutate_calls, 0,
+        "the refused run must not have mutated"
+    );
+
+    // The gap: nothing fences a second run at the same target.
+    let out = run_lifecycle(opts("0.9.0"), &mut host)
+        .await
+        .expect("same-target second run is NOT fenced today");
+    let json = output_json(&out);
+    assert_eq!(json["status"], "succeeded", "{json}");
+    assert_eq!(
+        host.mutate_calls, 1,
+        "an unfenced same-target run proceeds into mutation"
+    );
+}

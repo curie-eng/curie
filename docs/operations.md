@@ -260,31 +260,78 @@ upgrade phase and the last known-good version.
 ### `curie cluster upgrade`
 
 ```bash
+# source checkout: --chart defaults to the local charts/curie path
 curie cluster upgrade --to 0.9.0
+
+# local chart file (e.g. a downloaded release archive): same metadata-read
+# refusal path as a local directory
+curie cluster upgrade --to 0.9.0 --chart ./curie-0.9.0.tgz
+
+# resolvable ref: the command adds --version internally, do not pass it
+curie cluster upgrade --to 0.9.0 --chart oci://<your-registry>/curie
 ```
+
+The chart and `--to` must agree. `--chart` defaults to the literal local
+path `charts/curie` -- this verb never resolves a release build the way
+`cluster up` does (issue #2593) -- so on a source checkout `--to` must
+equal that chart's current version or the command refuses at Validate,
+before any mutation. A released binary has no `charts/curie` beside it
+and must pass `--chart` explicitly (issue #2593). Helm silently ignores
+`--version` on a local directory or file chart, so for that case the
+command reads the chart's own metadata instead of passing `--version`.
+For a chart ref Helm resolves itself (a repo or OCI ref), the command
+passes `--version <to>` internally and lets Helm enforce it; there is no
+`--version` operator flag.
 
 | Flag | What it does |
 |---|---|
 | `--to <version>` | Target Curie version. Required. |
 | `--chart` | Chart path or ref override. |
 | `--yes` | Skip the confirmation prompt. |
-| `--dry-run` | Print the redacted plan and exit without mutating. |
+| `--dry-run` | Print the redacted plan and exit without mutating. Both pre-mutation checks (the local chart's declared version, and the retained-configuration migration) are read-only, so a dry run runs them and the plan names any refusal the real run would hit at Validate. |
 
 One resumable lifecycle: inspect and plan, validate configuration and
-compatibility, drain accepted work, checkpoint, migrate once, apply, wait
-for exact convergence, run a target-version canary, then record the new
-known-good version. The command chooses the values overlay; do not pass
-`--reuse-values` or `--reset-then-reuse-values`.
+refuse on an ambiguous migration conflict, drain accepted work, checkpoint,
+apply, wait for exact convergence, run a target-version canary, then record
+the new known-good version. There is no separate migration step in the
+command: configuration migration happens at Validate, and schema migration
+is the chart's pre-upgrade Job, which Apply fires. The command chooses the
+values overlay; do not pass `--reuse-values` or `--reset-then-reuse-values`.
+Configuration migration to the current schema happens at Validate, before
+any mutation; database/application schema-compatibility checking is not
+wired into this command yet (tracked as issue #2588) -- the pre-upgrade
+migration Job remains the database's authority. The `migrate` phase is a
+resumable checkpoint boundary only; it performs no migration of its own.
+
+The redacted plan names the configuration schema version the upgrade migrates
+from and to (`config schema: <from> -> <to>`). It never carries credential
+values. The plan's `helm upgrade` line is generated from the same chart
+resolution and the same `--version` decision the command executes, so it names
+the chart that will actually be applied (`charts/curie` unless `--chart` says
+otherwise; this verb does not resolve a release artifact, issue #2593) and
+shows `--version <to>` exactly when a resolvable ref makes it a real pin.
+
+After Apply, the command re-reads the installed Helm revision and fails
+rather than reporting success if it is not the target version; the canary
+re-reads it again. Convergence (image digests, controller generations,
+replica counts, healthy hooks, the drained-queue gate, and the retained
+manifest comparison) is observed the same way `curie cluster up` observes
+it, not assumed.
 
 `--json` reports the current phase, the last known-good version, whether
 the previous version is still serving, and at most one fail-forward
 command. Success is refused unless convergence is exact and the canary
 passed. Re-run the same command to resume after an interruption.
 
-This composes configuration migration (issue 2299) and schema
-compatibility (issue 2300) rather than adding Helm special cases. The
-pre-upgrade drain is the existing worker gate (issue 2010): a resume
-after a completed drain does not drain accepted work again.
+This composes configuration migration (issue 2299) with the drain gate
+(issue 2010): a resume after a completed drain does not drain accepted
+work again.
+
+**Not fenced.** This command does not prevent concurrent upgrades. The
+in-progress checkpoint refuses a second run only when it targets a
+different version, and only when the checkpoint read wins the race; a
+concurrent raw `helm upgrade`, or a second `curie cluster upgrade` from
+another host, is not prevented (issue #2589).
 
 ### `curie cluster down`
 
