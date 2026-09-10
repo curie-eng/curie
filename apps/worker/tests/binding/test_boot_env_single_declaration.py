@@ -89,6 +89,15 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
     {
         # The worker service's own settings (WorkerConfig validation_alias), read
         # from the WORKER's env at worker startup. Never a sandbox boot key.
+        # The inbound-attachment lane's operator envelope (#2567): the per-file
+        # size cap and the reference/retention TTLs, read from the WORKER's env
+        # by WorkerConfig at startup and consumed by AttachmentCoordinator.
+        # Never injected into a sandbox claim -- the only attachment name that
+        # crosses into a claim is CURIE_ATTACHMENTS_REF, classified below beside
+        # CURIE_WORKSPACE_REF for the same reason.
+        "CURIE_ATTACHMENT_MAX_FILE_BYTES",
+        "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
+        "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
         "CURIE_BOOTING_TEXT",
         "CURIE_CONSUMER_GROUP",
         "CURIE_CONSUMER_CAPABILITY_TTL_MS",
