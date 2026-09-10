@@ -142,6 +142,26 @@ def test_awaiting_approval_wire_value_and_final_round_trip() -> None:
     # summary to None -- the additive-change guarantee.
     legacy = Final.model_validate({"type": "final", "text": "ok", "status": "done"})
     assert legacy.approval_summary is None
+    assert legacy.approval_display is None
+
+
+def test_awaiting_approval_display_is_optional_and_round_trips() -> None:
+    """#2565: a rendered human sentence rides beside the machine summary.
+
+    Omitted on older producers (default None). Present, it round-trips and does
+    not replace approval_summary.
+    """
+
+    final = Final(
+        text="Requesting sign-off",
+        status=SessionStatus.AWAITING_APPROVAL,
+        approval_summary="Tool call awaiting approval: Bash {\"command\": \"ls\"}",
+        approval_display="Run ls. Approve?",
+    )
+    wire = final.model_dump(mode="json")
+    assert wire["approval_display"] == "Run ls. Approve?"
+    assert wire["approval_summary"].startswith("Tool call awaiting approval:")
+    assert Final.model_validate(wire) == final
 
 
 # --- What a side-effecting call reports (ADR-0117) -----------------------------

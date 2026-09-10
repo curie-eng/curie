@@ -75,7 +75,7 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
   made and once when its result arrives, joined on `call_id` (ADR-0117)
 
 **Version gate (strict producer, tolerant consumer).** Your producer emits its
-**exact build `PROTOCOL_VERSION`** (currently `0.4.4`) on every outbound event and
+**exact build `PROTOCOL_VERSION`** (currently `0.4.5`) on every outbound event and
 constructs strictly -- an unknown field is an error at construction, catching your
 mistakes at the source. A **consumer** decoding the wire is tolerant the other way:
 it accepts any version compatible with its own build (`major.minor` match under

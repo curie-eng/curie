@@ -373,6 +373,9 @@ pub fn scaffold_from_spec(dir: &Path, spec: &AgentSpec) -> Result<Vec<PathBuf>> 
                 if g.grantable_via_policy {
                     gate.insert("grantableViaPolicy".into(), serde_json::json!(true));
                 }
+                if let Some(summary) = &g.summary {
+                    gate.insert("summary".into(), serde_json::json!(summary));
+                }
                 Value::Object(gate)
             })
             .collect();

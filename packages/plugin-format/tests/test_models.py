@@ -113,6 +113,27 @@ def test_approval_gate_grantable_via_policy_field() -> None:
     assert ApprovalGate.model_validate(dumped).grantableViaPolicy is True
 
 
+def test_approval_gate_summary_template_field() -> None:
+    """A bundle-authored human template round-trips on ApprovalGate (#2565).
+
+    Absent -> None so an old manifest keeps today's machine-string card.
+    """
+
+    gate = ApprovalGate.model_validate(
+        {
+            "gate": "Bash",
+            "route": "managers",
+            "summary": "Run {command}: {files|count} files. Approve?",
+        }
+    )
+    assert gate.summary == "Run {command}: {files|count} files. Approve?"
+    gate2 = ApprovalGate.model_validate({"gate": "Bash", "route": "managers"})
+    assert gate2.summary is None
+    dumped = gate.model_dump()
+    assert dumped["summary"] == "Run {command}: {files|count} files. Approve?"
+    assert ApprovalGate.model_validate(dumped).summary == gate.summary
+
+
 def test_tool_policy_parses_a_full_declaration_and_defaults_its_collections() -> None:
     """The ``toolPolicy`` model round-trips, and its three collections default to empty.
 

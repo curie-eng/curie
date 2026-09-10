@@ -172,4 +172,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0140 | [Curie supports one model harness until a second one exists](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) | Draft |
 | 0142 | [Database compatibility is a release contract; migrations run in one upgrade phase](0142-database-compatibility-windows-and-a-single-upgrade-phase.md) | Accepted |
 | 0143 | [A coding thread owns one fenced pull request lineage](0143-thread-owned-pull-request-lineage.md) | Accepted |
+| 0151 | [A permission-gate card shows a bundle-authored sentence; the machine summary stays the audit record](0151-bundle-authored-human-approval-summary.md) | Draft |
 <!-- END GENERATED: adr-index -->

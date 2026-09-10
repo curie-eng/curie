@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.4.4";
+pub const PROTOCOL_VERSION: &str = "0.4.5";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -373,6 +373,8 @@ pub enum OutboundEvent {
         #[serde(default)]
         approval_granted_tool: Option<String>,
         #[serde(default)]
+        approval_display: Option<String>,
+        #[serde(default)]
         input_tokens: Option<i64>,
         #[serde(default)]
         output_tokens: Option<i64>,
@@ -418,6 +420,7 @@ mod tests {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_display: None,
             input_tokens: None,
             output_tokens: None,
         };
@@ -436,6 +439,7 @@ mod tests {
             approval_route: Some("managers".to_string()),
             approval_gate_kind: Some("policy".to_string()),
             approval_granted_tool: None,
+            approval_display: None,
             input_tokens: None,
             output_tokens: None,
         };
@@ -491,13 +495,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.4.5","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.4.6","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.4.4","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.4.5","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

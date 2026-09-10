@@ -23,6 +23,11 @@ from .archive import (
     check_archive_bounds,
     safe_extract,
 )
+from .gate_summary import (
+    RESERVED_PERMISSION_PREFIX,
+    check_gate_summary_template,
+    render_gate_summary,
+)
 from .manifest import MANIFEST_LOCATIONS, resolve_manifest
 from .models import (
     ApprovalGate,
@@ -81,6 +86,9 @@ __all__ = [
     "ApprovalGate",
     "ToolPolicy",
     "grantable_routes",
+    "RESERVED_PERMISSION_PREFIX",
+    "check_gate_summary_template",
+    "render_gate_summary",
     "declared_mcp_server_names",
     "connector_server_names",
     "connector_tool_prefix",

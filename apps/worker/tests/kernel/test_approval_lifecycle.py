@@ -149,6 +149,20 @@ def _awaiting_script(summary: str) -> list:
     ]
 
 
+def _awaiting_script_with_display(summary: str, display: str) -> list:
+    return [
+        TextDelta(text="Requesting sign-off"),
+        Final(
+            text="Requesting sign-off",
+            status=AWAITING,
+            approval_summary=summary,
+            approval_display=display,
+            approval_gate_kind="permission",
+            approval_granted_tool="Bash",
+        ),
+    ]
+
+
 class _LineageFenceRunner:
     def __init__(self, status: dict[str, object]) -> None:
         self._status = status
@@ -1756,6 +1770,45 @@ def test_awaiting_approval_creates_record_and_suspends(make_harness) -> None:
             assert "Awaiting approval (appr-1)" in h.sink.last_text
             assert "Give ACME a 20% discount" in h.sink.last_text
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_templated_display_reaches_the_notice_and_card_not_the_record(
+    make_harness,
+) -> None:
+    """#2565: the sentence is what a person reads; the record keeps the machine string."""
+
+    sentence = "File FY26Q1: 11 workbooks into Approved, 25 cells going out blank. Approve?"
+    machine = (
+        "Tool call awaiting approval: mcp__plugin_demo_files__approve_batch "
+        '{"expected": {"a.xlsx": "aaa"}}'
+    )
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script_with_display(machine, sentence)
+            ev = _qevent("please file", event_id="ev-appr-display")
+            await h.kernel.process_event(ev)
+
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].summary == machine
+
+            assert h.sink.last_text is not None
+            notice_lines = [
+                line
+                for line in h.sink.last_text.splitlines()
+                if line.startswith("Awaiting approval (")
+            ]
+            assert notice_lines == [f"Awaiting approval (appr-1): {sentence}"]
+            assert machine not in h.sink.last_text
+
+            assert h.sink.posts
+            card_message = h.sink.posts[0][1]
+            assert card_message.text == sentence
+            assert isinstance(card_message.interaction, ConfirmIntent)
+            assert card_message.interaction.prompt == sentence
 
     asyncio.run(go())
 

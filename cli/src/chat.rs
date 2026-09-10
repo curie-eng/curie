@@ -920,6 +920,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_approval_id_reads_a_human_sentence_tail() {
+        // #2565: a bundle-authored sentence replaces the machine JSON in the
+        // notice tail. The parser still only needs the UUID head.
+        let id = "44c2cc21-7b0a-4f3e-9c1d-aaaaaaaaaaaa";
+        let text = format!(
+            "Awaiting approval ({id}): File FY26Q1: 11 workbooks into Approved, \
+             25 cells going out blank. Approve?\n\
+             The session is paused and will resume once an authorized member \
+             resolves this request."
+        );
+        assert_eq!(parse_approval_id(&text).as_deref(), Some(id));
+    }
+
+    #[test]
     fn parse_approval_id_survives_the_base_prefix() {
         // The real shape when a prior answer exists: `f"{base}\n\n{notice}"`
         // (kernel.py:929). The id must still be recovered after the prefix.

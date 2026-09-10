@@ -61,6 +61,13 @@ in code now:
   fields (ADR-0036) and are persisted as the `gate_kind`/`granted_tool` columns on the
   `Approval` record (migration `0015_approval_gate_provenance`). They replace the old
   summary-prefix sniff as the durable source of grant provenance — see the #430 bullet below.
+  A further optional `Final` field, `approval_display` (#2565, Draft ADR-0151), carries the
+  human sentence a bundle-authored `approvalPolicy.gates[].summary` template rendered. It is
+  additive (ACI patch 0.4.5). The worker uses `approval_display or approval_summary` for the
+  Slack card, the awaiting-approval notice (`Awaiting approval (<id>): ...`), and the
+  resolved card; `Approval.summary` stays the machine `summarize_tool_call` string so the
+  `gate_kind IS NULL` prefix fallback and the audit record are unchanged. A gate without a
+  template leaves `approval_display` unset, which is today's bytes.
 - **The lifecycle (landed, #244; pager advertisement narrowed, #1444).** A skill raises a
   policy gate through the runner's in-process `mcp__curie__request_approval` tool
   (`runner/src/curie_runner/approval.py`) when that tool is present. The runner advertises

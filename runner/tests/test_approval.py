@@ -134,6 +134,110 @@ def test_genuine_permission_gate_summary_keeps_reserved_prefix() -> None:
     summary = summarize_tool_call("Bash", {"command": "rm -rf /tmp/x"})
     assert summary.startswith(APPROVAL_SUMMARY_PREFIX)
     assert guard_reserved_summary(summary) != summary
+    from plugin_format.gate_summary import RESERVED_PERMISSION_PREFIX
+
+    assert RESERVED_PERMISSION_PREFIX == APPROVAL_SUMMARY_PREFIX
+
+
+def test_summarize_tool_call_is_byte_stable_without_a_template() -> None:
+    # #2565: a gate that declares no template must keep today's machine string.
+    summary = summarize_tool_call(
+        "mcp__plugin_demo_files__approve_batch",
+        {"expected": {"a.xlsx": "aaa", "b.xlsx": "bbb"}, "going_out_blank": ["I35"]},
+    )
+    assert summary == (
+        APPROVAL_SUMMARY_PREFIX
+        + "mcp__plugin_demo_files__approve_batch "
+        + json.dumps(
+            {"expected": {"a.xlsx": "aaa", "b.xlsx": "bbb"}, "going_out_blank": ["I35"]},
+            sort_keys=True,
+        )
+    )
+
+
+def test_block_renders_a_declared_template_as_pending_display() -> None:
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}),
+        route_by_tool={"Bash": "managers"},
+        summary_by_tool={
+            "Bash": "Run {command}: {files|count} files. Approve?",
+        },
+    )
+    gate.block("Bash", {"command": "ls", "files": ["a", "b"]})
+    assert gate.pending_summary == summarize_tool_call(
+        "Bash", {"command": "ls", "files": ["a", "b"]}
+    )
+    assert gate.pending_summary.startswith(APPROVAL_SUMMARY_PREFIX)
+    assert gate.pending_display == "Run ls: 2 files. Approve?"
+
+
+def test_block_falls_back_to_machine_string_when_the_template_cannot_render() -> None:
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}),
+        route_by_tool={"Bash": "managers"},
+        summary_by_tool={"Bash": "Run {missing}. Approve?"},
+    )
+    tool_input = {"command": "ls"}
+    gate.block("Bash", tool_input)
+    assert gate.pending_display is None
+    assert gate.pending_summary == summarize_tool_call("Bash", tool_input)
+
+
+def test_block_without_a_template_leaves_pending_display_unset() -> None:
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}),
+        route_by_tool={"Bash": "managers"},
+    )
+    tool_input = {"command": "ls"}
+    gate.block("Bash", tool_input)
+    assert gate.pending_display is None
+    assert gate.pending_summary == summarize_tool_call("Bash", tool_input)
+
+
+def test_resolve_approval_policy_carries_summary_templates(tmp_path) -> None:
+    bundle = _write_manifest(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "demo",
+                "approvalPolicy": {
+                    "gates": [
+                        {
+                            "gate": "Bash",
+                            "route": "managers",
+                            "summary": "Run {command}. Approve?",
+                        }
+                    ]
+                },
+            }
+        ),
+    )
+    resolution = resolve_approval_policy(bundle)
+    assert resolution.summary_by_tool == {"Bash": "Run {command}. Approve?"}
+
+
+def test_resolve_approval_policy_last_gate_without_template_clears_it(tmp_path) -> None:
+    bundle = _write_manifest(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "demo",
+                "approvalPolicy": {
+                    "gates": [
+                        {
+                            "gate": "Bash",
+                            "route": "managers",
+                            "summary": "Run {command}. Approve?",
+                        },
+                        {"gate": "Bash", "route": "managers"},
+                    ]
+                },
+            }
+        ),
+    )
+    resolution = resolve_approval_policy(bundle)
+    assert resolution.route_by_tool == {"Bash": "managers"}
+    assert resolution.summary_by_tool == {}
 
 
 # --- session override ------------------------------------------------------------
