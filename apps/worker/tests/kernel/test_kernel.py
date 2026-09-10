@@ -1182,6 +1182,34 @@ def test_budget_exceeded_escalates_without_retry(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_connector_capability_failed_done_posts_diagnosis_not_escalate(
+    make_harness,
+) -> None:
+    # #2519: the runner short-circuits with ErrorEvent + DONE so the diagnosis
+    # reaches the message caller without a kernel.py change. Classified-failure
+    # would be overwritten by the escalate copy. This pins the DONE fork.
+    async def go() -> None:
+        async with make_harness() as h:
+            diagnosis = (
+                "declared connector 'github' failed MCP capability probe: "
+                "credential GITHUB_TOKEN expanded empty. Connector tools are unavailable."
+            )
+            h.runner.default_script = [
+                ErrorEvent(
+                    message=diagnosis, classification="connector-capability-failed"
+                ),
+                Final(text=diagnosis, status=DONE),
+            ]
+            await h.kernel.process_event(_qevent("go"))
+
+            assert h.runner.opened == ["go"]
+            assert h.sink.last_text == diagnosis
+            assert "Flagging for a human" not in diagnosis
+            assert "human" not in (h.sink.last_text or "").lower()
+
+    asyncio.run(go())
+
+
 def test_retries_are_bounded_then_escalate(make_harness) -> None:
     async def go() -> None:
         async with make_harness(max_attempts=3) as h:

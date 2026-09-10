@@ -44,6 +44,7 @@ from .adapter import ModelSession, PartialMessageBoundary, StreamedToolUseBounda
 from .approval import PUBLISH_TOOL_NAME, ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import NullTranscriptStore, TranscriptStore, TurnRecord
+from .mcp_tool_capability import ConnectorCapabilityFailure
 from .memory import (
     ConsolidationResult,
     MemoryRecord,
@@ -96,6 +97,11 @@ FALSE_COMPLETION_CLASSIFICATION = "false-completion"
 # error+final pair, because a publication request that produced no approval
 # record must never finalize looking like a clean turn.
 PUBLICATION_UNRECORDED_CLASSIFICATION = "publication-unrecorded"
+# Declared-connector capability/auth failure (#2519). Distinct from a model
+# credential rejection: the session can still boot, but the connector's tools
+# are not available. Rides ErrorEvent.classification; the Final is DONE so the
+# worker posts the diagnosis text instead of overwriting it with escalate copy.
+CONNECTOR_CAPABILITY_FAILED = "connector-capability-failed"
 
 
 def _is_auth_rejection(message: object) -> bool:
@@ -195,6 +201,7 @@ class SessionRunner:
         approval_resumed_kind: str | None = None,
         approval_decision: str | None = None,
         false_completion_check: bool = False,
+        connector_failures: tuple[ConnectorCapabilityFailure, ...] = (),
     ) -> None:
         self._factory = session_factory
         self._ceiling = ceiling
@@ -228,6 +235,10 @@ class SessionRunner:
         # Opt-in, observe-only false-completion check (#517): warn when a turn
         # ends DONE with a substantive answer but zero tool calls. Off by default.
         self._false_completion_check = false_completion_check
+        # Declared-connector probe/expansion failures (#2519). Empty means the
+        # model runs as usual. Non-empty short-circuits every turn before query
+        # so the agent cannot answer from memory with the connector's tools gone.
+        self._connector_failures = connector_failures
 
         self._session: ModelSession | None = None
         # One turn consumes the SDK generator at a time. This MUST be a
@@ -542,13 +553,26 @@ class SessionRunner:
                     parent=parent,
                 ) as gen:
                     try:
-                        async for line in self._drive_turn(event, state, tracker, gen):
-                            if isinstance(parse_ndjson_line(line), Final):
-                                # The terminal decision is authoritative once the
-                                # Final reaches the consumer, even if it closes
-                                # without requesting the generator's next item.
-                                metric_outcome = self._metric_outcome(tracker)
-                            yield line
+                        if self._connector_failures:
+                            message = " ".join(
+                                failure.caller_message()
+                                for failure in self._connector_failures
+                            )
+                            state.final_text = message
+                            for line in self._connector_capability_halt_lines(gen, message):
+                                if isinstance(parse_ndjson_line(line), Final):
+                                    metric_outcome = self._metric_outcome(tracker)
+                                yield line
+                        else:
+                            async for line in self._drive_turn(
+                                event, state, tracker, gen
+                            ):
+                                if isinstance(parse_ndjson_line(line), Final):
+                                    # The terminal decision is authoritative once the
+                                    # Final reaches the consumer, even if it closes
+                                    # without requesting the generator's next item.
+                                    metric_outcome = self._metric_outcome(tracker)
+                                yield line
                         logger.info(
                             "turn end session=%s status=%s duration_ms=%d",
                             self._session_id,
@@ -1297,6 +1321,44 @@ class SessionRunner:
                     status=SessionStatus.CLASSIFIED_FAILURE,
                 )
             ),
+        ]
+
+    def _connector_capability_halt_lines(
+        self, gen: _GenerationSpan, message: str
+    ) -> list[str]:
+        """ErrorEvent + DONE so the diagnosis reaches the message caller (#2519).
+
+        Does not query the model. Final is DONE, not classified-failure: the
+        worker's escalate path would replace the connector and credential names
+        with a generic human-flag. completed_without_result keeps the OTel span
+        from being marked abandoned. Logs names only, never values.
+        """
+
+        logger.error(
+            "declared connector capability failed session=%s connectors=%s credentials=%s",
+            self._session_id,
+            ",".join(failure.connector for failure in self._connector_failures),
+            ",".join(
+                name
+                for failure in self._connector_failures
+                for name in failure.credential_names
+            ),
+        )
+        self._turn_open = False
+        self._status = SessionStatus.DONE
+        gen.finish_turn(
+            interrupt_requested=False,
+            classified_failure=False,
+            completed_without_result=True,
+        )
+        return [
+            to_ndjson_line(
+                ErrorEvent(
+                    message=message,
+                    classification=CONNECTOR_CAPABILITY_FAILED,
+                )
+            ),
+            to_ndjson_line(Final(text=message, status=SessionStatus.DONE)),
         ]
 
     def _auth_halt_lines(self) -> list[str]:

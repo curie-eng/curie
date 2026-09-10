@@ -10,7 +10,8 @@ from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUse
 from curie_runner import RunTracer, SideEffectClassifier, build_options
 from curie_runner import session as session_module
 from curie_runner.fake import FakeModelSession, default_turn
-from curie_runner.session import SessionRunner
+from curie_runner.mcp_tool_capability import ConnectorCapabilityFailure
+from curie_runner.session import CONNECTOR_CAPABILITY_FAILED, SessionRunner
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -1373,3 +1374,104 @@ def test_steer_reaches_live_session() -> None:
 
     anyio.run(go)
     assert fake.queries == ["first", "steered follow-up"]
+
+
+def _connector_failure() -> ConnectorCapabilityFailure:
+    return ConnectorCapabilityFailure(
+        connector="github",
+        credential_names=("GITHUB_TOKEN",),
+        reason="empty_expansion",
+    )
+
+
+def test_declared_connector_failure_short_circuits_every_turn_before_query(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    planted = "ghp-must-not-appear-PLACEHOLDER"
+    fake = FakeModelSession(default_turn)
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+        connector_failures=(_connector_failure(),),
+    )
+
+    async def go() -> tuple[list, list]:
+        await runner.start()
+        first = parse_ndjson(
+            "".join(
+                [
+                    line
+                    async for line in runner.run_inbound(
+                        Event(type="message", text="go", user="U", ts="1")
+                    )
+                ]
+            )
+        )
+        second = parse_ndjson(
+            "".join(
+                [
+                    line
+                    async for line in runner.run_inbound(
+                        Event(type="message", text="again", user="U", ts="2")
+                    )
+                ]
+            )
+        )
+        return first, second
+
+    with caplog.at_level(logging.ERROR, logger="curie_runner.session"):
+        first, second = anyio.run(go)
+
+    assert fake.queries == []
+    for events in (first, second):
+        assert [e.type for e in events] == ["error", "final"]
+        assert events[0].classification == CONNECTOR_CAPABILITY_FAILED
+        assert events[0].message == _connector_failure().caller_message()
+        assert events[-1].status == SessionStatus.DONE
+        assert events[-1].text == _connector_failure().caller_message()
+        assert planted not in events[0].message
+        assert planted not in events[-1].text
+    assert any(
+        record.levelno == logging.ERROR
+        and "github" in record.getMessage()
+        and "GITHUB_TOKEN" in record.getMessage()
+        and planted not in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_declared_connector_failure_does_not_abandon_the_otel_span() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    fake = FakeModelSession(default_turn)
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+        connector_failures=(_connector_failure(),),
+    )
+
+    async def go() -> None:
+        await runner.start()
+        async for _line in runner.run_inbound(Event(type="message", text="go", user="U", ts="1")):
+            pass
+        await runner.close()
+
+    anyio.run(go)
+    root = _span_named(list(exporter.get_finished_spans()), "agent.run")[0]
+    assert root.attributes["curie.terminal.cause"] == "completed"
+    assert root.attributes["curie.terminal.status"] == "succeeded"
+    assert fake.queries == []
+
+
+def test_healthy_connector_still_queries_the_model() -> None:
+    runner, fake = _runner()
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+    assert fake.queries == ["go"]
+    assert events[-1].status == SessionStatus.DONE
