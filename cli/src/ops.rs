@@ -2057,8 +2057,33 @@ fn helm_set_string_entries(expression: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Carry the runner configuration recorded by a prior real model install into
-/// a plain rerun. Explicit inputs replace their recorded family.
+/// Carry the runner identity recorded by a prior real model install into a
+/// plain rerun. Explicit inputs replace their recorded family.
+///
+/// The family is `agentSandbox.runner.model` plus the credential trio (the
+/// inline value and its external-Secret reference pair). `cluster up` is a FULL
+/// helm upgrade rather than `--reuse-values`, so any member this run does not
+/// re-supply falls back to the chart default and the release forgets it.
+///
+/// `--local-model` and `--credentials` each SUPPLY a replacement for the
+/// credential family, so clearing the recorded reference is the documented rule
+/// above: an explicit input replaces its recorded family. `--model` likewise
+/// replaces the recorded model id.
+///
+/// `--fake-model` supplies nothing. It suppresses the model for ONE run; it is
+/// not an instruction to forget the release configuration, and treating it as
+/// one destroyed the operator's model selection and BYO wiring as a side effect
+/// of a temporary, offline, diagnostic switch, with no recovery path -- the
+/// next plain `up` faithfully preserved the blank (#2459 for the reference,
+/// #2469 for the model id and the inline credential). Preserving costs a
+/// mounted, unused credential on the warm pod; destroying costs configuration
+/// nobody can recover. Ambiguity keeps the recorded value.
+///
+/// Carrying the family forward under `--fake-model` is only safe because
+/// neither `agentSandbox.runner.model` nor a PRESERVED credential pins
+/// `fakeModel=false` -- see [`model_credential_source_is_set`]. The chart
+/// renders `CURIE_FAKE_MODEL=1` off `fakeModel` alone, so the effective runner
+/// stays fake while the recorded identity survives.
 fn resolve_preserved_runner_identity_values(
     opts: &mut UpOpts,
     existing: Option<&serde_json::Value>,
@@ -2081,37 +2106,43 @@ fn resolve_preserved_runner_identity_values(
 
     let mut references =
         resolve_credential_values(existing, operator_sets, MODEL_CREDENTIAL_REFERENCE_KEYS);
-    // `--local-model` and `--credentials` each SUPPLY a replacement for the
-    // credential family, so clearing the recorded reference is the documented
-    // rule above: an explicit input replaces its recorded family.
-    //
-    // `--fake-model` supplies nothing. It suppresses the model for this run, and
-    // clearing on it destroyed the operator's BYO Secret wiring as a side effect
-    // of a temporary, offline, diagnostic switch. `cluster up` is a FULL upgrade
-    // rather than `--reuse-values`, so the blank was recorded and the next plain
-    // `up` preserved the blank: the ordinary sequence `up --fake-model` (take the
-    // model out of the picture) then `up` (put it back) silently did not put it
-    // back, and nothing said so (#2459). Preserving costs a mounted, unused
-    // credential on the warm pod; destroying costs a reference nobody can
-    // recover. Ambiguity keeps the recorded value.
     if opts.local_model.is_some() || opts.credentials.is_some() {
         for (_, value) in &mut references {
             value.clear();
         }
     }
     opts.secrets.extend(references);
+    // `--local-model` still SUPPLIES a replacement family, so it keeps dropping
+    // the recorded inline value exactly as before; only the supplies-nothing
+    // `--fake-model` carries it forward.
+    let preserve_inline_credential = opts.fake_model && opts.local_model.is_none();
     if opts.credentials.is_none() {
+        // A recorded inline credential normally comes back through
+        // `opts.credentials` in the block above. Under `--fake-model` that block
+        // is deliberately skipped, because `opts.credentials.is_some()` IS a
+        // credential source and would pin `fakeModel=false` off the very value
+        // this run carried forward (the #2459 trap). Route the recorded value
+        // through the preserved-secrets lane instead: it reaches Helm as a
+        // masked `DiffParticipation::Preserve` secret file, so the release keeps
+        // it and the next plain `up` restores it into `opts.credentials` --
+        // while this run's runner still renders fake (#2469).
+        //
+        // Outside `--fake-model` only the EMPTY records travel here: a cleared
+        // inline value has to be re-supplied explicitly so an obsolete source is
+        // reset rather than silently left behind.
         opts.secrets.extend(
             resolve_credential_values(existing, operator_sets, &[MODEL_CREDENTIAL_KEY])
                 .into_iter()
-                .filter(|(_, value)| value.is_empty()),
+                .filter(|(_, value)| value.is_empty() || preserve_inline_credential),
         );
     }
 
-    if !opts.fake_model
-        && opts.local_model.is_none()
-        && opts.model.is_none()
-        && !overridden.contains(RUNNER_MODEL_KEY)
+    // No `!opts.fake_model` here: `opts.model` only ever sets
+    // `agentSandbox.runner.model`, never `fakeModel`, so preserving the recorded
+    // model id under `--fake-model` keeps the run fake and keeps the operator's
+    // selection recoverable (#2469). `--fake-model --model X` is already a
+    // supported combination for the same reason.
+    if opts.local_model.is_none() && opts.model.is_none() && !overridden.contains(RUNNER_MODEL_KEY)
     {
         opts.model = preserved_value(existing, RUNNER_MODEL_KEY);
     }
@@ -4428,6 +4459,10 @@ fn model_credential_source_is_set(opts: &UpOpts) -> bool {
         // they did before: an operator naming a credential secret and asking
         // for a fake model in one command is a contradiction, and which side
         // wins there is not this fix's decision to change.
+        // A preserved INLINE credential rides in `opts.secrets` under
+        // `MODEL_CREDENTIAL_KEY` (#2469) and is deliberately not read here at
+        // all: like the preserved reference below, it is a value this run
+        // carried forward rather than one anybody supplied for it.
         || (!opts.fake_model
             && opts.secrets.iter().any(|(key, value)| {
                 key == MODEL_CREDENTIAL_REFERENCE_KEYS[0] && !value.is_empty()
@@ -16523,6 +16558,265 @@ mod tests {
                 .map(String::as_str),
             Some("false"),
             "an explicitly set credential reference still selects the real model"
+        );
+    }
+
+    /// #2469: build a release record holding some subset of the runner identity
+    /// family, so each test names only the members it is about.
+    fn runner_identity_fixture(
+        model: Option<&str>,
+        inline: Option<&str>,
+        reference: Option<(&str, &str)>,
+    ) -> serde_json::Value {
+        let mut runner = serde_json::json!({});
+        if let Some(model) = model {
+            runner["model"] = model.into();
+        }
+        if let Some(inline) = inline {
+            runner["credentials"] = inline.into();
+        }
+        if let Some((secret, key)) = reference {
+            runner["credentialsExistingSecret"] = secret.into();
+            runner["credentialsExistingSecretKey"] = key.into();
+        }
+        serde_json::json!({ "agentSandbox": { "runner": runner } })
+    }
+
+    /// #2469: run a `--fake-model` up over `existing`, then the plain `up` that
+    /// follows it, driven through what the fake run would ACTUALLY leave behind.
+    /// `cluster up` is a full upgrade, so re-reading the fixture instead would
+    /// pass even if the plan dropped the preserved values on the way out.
+    fn fake_then_plain_up(dev: bool, existing: &serde_json::Value) -> (UpOpts, UpOpts) {
+        let mut input = completed_dev_up(None, vec![]);
+        input.dev = dev;
+        input.fake_model = true;
+        let fake =
+            complete_up_opts_without_runner_egress(input, Some(existing), None, false).unwrap();
+        let recorded = recorded_by_helm(&fake);
+        let mut plain = completed_dev_up(None, vec![]);
+        plain.dev = dev;
+        let plain =
+            complete_up_opts_without_runner_egress(plain, Some(&recorded), None, false).unwrap();
+        (fake, plain)
+    }
+
+    fn planned(opts: &UpOpts, key: &str) -> Option<String> {
+        up_value_plan(opts).effective_values().get(key).cloned()
+    }
+
+    /// #2469: `--fake-model` supplies no model id, so it must not consume the
+    /// recorded one. The model alone names no credential, so the fake run stays
+    /// fake and the next plain `up` still has the operator's selection.
+    #[test]
+    fn fake_model_preserves_a_recorded_runner_model() {
+        let existing = runner_identity_fixture(Some("z-ai/glm-5.2"), None, None);
+        for dev in [false, true] {
+            let (fake, plain) = fake_then_plain_up(dev, &existing);
+
+            assert_eq!(
+                recorded_by_helm(&fake)["agentSandbox"]["runner"]["model"],
+                serde_json::json!("z-ai/glm-5.2"),
+                "dev={dev}: the model id must reach Helm, not merely survive in opts"
+            );
+            assert_eq!(
+                planned(&fake, FAKE_MODEL_KEY),
+                None,
+                "dev={dev}: a preserved model id names no credential, so the run stays fake"
+            );
+            assert_eq!(
+                plain.model.as_deref(),
+                Some("z-ai/glm-5.2"),
+                "dev={dev}: the plain up after the fake one recovers the selection"
+            );
+            assert_eq!(
+                planned(&plain, RUNNER_MODEL_KEY).as_deref(),
+                Some("z-ai/glm-5.2")
+            );
+        }
+    }
+
+    /// #2469: an inline credential travels through the PRESERVED secrets lane
+    /// under `--fake-model`. Putting it back in `opts.credentials` would make
+    /// `up_value_plan` pin `fakeModel=false` off the value the run just carried
+    /// forward, which is the #2459 trap in its inline form.
+    #[test]
+    fn fake_model_preserves_a_recorded_inline_credential() {
+        let existing = runner_identity_fixture(None, Some("sk-recorded"), None);
+        for dev in [false, true] {
+            let (fake, plain) = fake_then_plain_up(dev, &existing);
+
+            assert!(
+                fake.credentials.is_none(),
+                "dev={dev}: an inline credential in opts.credentials would select the real model"
+            );
+            assert_eq!(secret_for(&fake, MODEL_CREDENTIAL_KEY), Some("sk-recorded"));
+            assert_eq!(
+                recorded_by_helm(&fake)["agentSandbox"]["runner"]["credentials"],
+                serde_json::json!("sk-recorded"),
+                "dev={dev}: the credential must reach Helm, not merely survive in opts"
+            );
+            assert_eq!(
+                planned(&fake, FAKE_MODEL_KEY),
+                None,
+                "dev={dev}: --fake-model must not pin fakeModel=false off the value it preserved"
+            );
+
+            assert_eq!(
+                plain.credentials.as_deref(),
+                Some("sk-recorded"),
+                "dev={dev}: the plain up after the fake one recovers the credential"
+            );
+            assert_eq!(
+                planned(&plain, FAKE_MODEL_KEY).as_deref(),
+                Some("false"),
+                "dev={dev}: recovering the credential restores the real model selection"
+            );
+        }
+    }
+
+    /// #2469: the whole family survives together. A model id with no credential
+    /// is a half-configured release, so preserving one member and dropping the
+    /// other would still leave the operator without a recovery path.
+    #[test]
+    fn fake_model_preserves_a_recorded_model_and_inline_credential() {
+        let existing = runner_identity_fixture(Some("z-ai/glm-5.2"), Some("sk-recorded"), None);
+        let (fake, plain) = fake_then_plain_up(true, &existing);
+
+        let recorded = recorded_by_helm(&fake);
+        assert_eq!(
+            recorded["agentSandbox"]["runner"]["model"],
+            serde_json::json!("z-ai/glm-5.2")
+        );
+        assert_eq!(
+            recorded["agentSandbox"]["runner"]["credentials"],
+            serde_json::json!("sk-recorded")
+        );
+        assert_eq!(planned(&fake, FAKE_MODEL_KEY), None);
+
+        assert_eq!(plain.model.as_deref(), Some("z-ai/glm-5.2"));
+        assert_eq!(plain.credentials.as_deref(), Some("sk-recorded"));
+        assert_eq!(planned(&plain, FAKE_MODEL_KEY).as_deref(), Some("false"));
+    }
+
+    /// #2469: the model id rides alongside the #2459 external-Secret reference.
+    /// An external source suppresses any recorded inline copy, so the reference
+    /// pair -- not an inline value -- is what has to come back.
+    #[test]
+    fn fake_model_preserves_a_recorded_model_and_credential_reference() {
+        let existing = runner_identity_fixture(
+            Some("z-ai/glm-5.2"),
+            None,
+            Some(("acme-credentials", "credentials-custom")),
+        );
+        let (fake, plain) = fake_then_plain_up(true, &existing);
+
+        let recorded = recorded_by_helm(&fake);
+        assert_eq!(
+            recorded["agentSandbox"]["runner"]["model"],
+            serde_json::json!("z-ai/glm-5.2")
+        );
+        assert_eq!(
+            recorded["agentSandbox"]["runner"]["credentialsExistingSecret"],
+            serde_json::json!("acme-credentials")
+        );
+        assert_eq!(
+            recorded["agentSandbox"]["runner"]["credentialsExistingSecretKey"],
+            serde_json::json!("credentials-custom")
+        );
+        assert_eq!(planned(&fake, FAKE_MODEL_KEY), None);
+
+        assert_eq!(plain.model.as_deref(), Some("z-ai/glm-5.2"));
+        assert_eq!(
+            secret_for(&plain, "agentSandbox.runner.credentialsExistingSecret"),
+            Some("acme-credentials")
+        );
+        assert_eq!(planned(&plain, FAKE_MODEL_KEY).as_deref(), Some("false"));
+    }
+
+    /// #2469: preservation is the AMBIGUOUS case only. An input that supplies a
+    /// replacement still replaces its recorded family, under `--fake-model` as
+    /// everywhere else.
+    #[test]
+    fn explicit_inputs_still_replace_the_recorded_runner_identity_under_fake_model() {
+        let existing = runner_identity_fixture(
+            Some("z-ai/glm-5.2"),
+            Some("sk-recorded"),
+            Some(("acme-credentials", "credentials-custom")),
+        );
+
+        let mut input = completed_dev_up(None, vec![]);
+        input.fake_model = true;
+        input.model = Some("anthropic/claude-opus".into());
+        let opts =
+            complete_up_opts_without_runner_egress(input, Some(&existing), None, false).unwrap();
+        assert_eq!(
+            planned(&opts, RUNNER_MODEL_KEY).as_deref(),
+            Some("anthropic/claude-opus"),
+            "--model supplies a replacement, so it wins over the recorded id"
+        );
+
+        let mut input = completed_dev_up(None, vec![]);
+        input.fake_model = true;
+        input.credentials = Some("sk-explicit".into());
+        let opts =
+            complete_up_opts_without_runner_egress(input, Some(&existing), None, false).unwrap();
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
+            Some(""),
+            "an explicit inline credential still clears the obsolete reference"
+        );
+
+        // #2510 owns `--local-model`; this only pins the behavior as it stands
+        // so the #2469 change is visibly not touching it.
+        let mut input = completed_dev_up(None, vec![]);
+        input.fake_model = true;
+        input.local_model = Some("qwen3".into());
+        let opts =
+            complete_up_opts_without_runner_egress(input, Some(&existing), None, false).unwrap();
+        assert_eq!(
+            opts.model, None,
+            "--local-model still replaces the model family"
+        );
+        // The fixture records a `credentialsExistingSecret`, so the external
+        // reference is the active source and `resolve_credential_values`
+        // emits an explicit empty for the inline key: an explicit clear, not a
+        // dropped value. Pre-existing behavior, unchanged by #2469.
+        assert_eq!(
+            secret_for(&opts, MODEL_CREDENTIAL_KEY),
+            Some(""),
+            "--local-model still replaces the credential family, clearing the stale inline copy"
+        );
+    }
+
+    /// #2469: an operator `--set` owns its key outright. The CLI supplies
+    /// nothing for a key the operator named, including to clear it.
+    #[test]
+    fn operator_sets_still_own_the_runner_identity_keys_under_fake_model() {
+        let existing = runner_identity_fixture(Some("z-ai/glm-5.2"), Some("sk-recorded"), None);
+
+        let mut input = completed_dev_up(
+            None,
+            vec![
+                "agentSandbox.runner.model=operator/pick".into(),
+                "agentSandbox.runner.credentials=".into(),
+            ],
+        );
+        input.fake_model = true;
+        let opts =
+            complete_up_opts_without_runner_egress(input, Some(&existing), None, false).unwrap();
+
+        assert_eq!(
+            opts.model, None,
+            "the operator set the model, so the CLI supplies nothing"
+        );
+        assert_eq!(
+            planned(&opts, RUNNER_MODEL_KEY).as_deref(),
+            Some("operator/pick")
+        );
+        assert_eq!(
+            secret_for(&opts, MODEL_CREDENTIAL_KEY),
+            None,
+            "the operator cleared the credential; --fake-model must not resurrect it"
         );
     }
 
