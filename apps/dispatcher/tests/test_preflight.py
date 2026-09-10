@@ -44,6 +44,7 @@ from curie_dispatcher.preflight import (
     check_slack_channel_capabilities,
 )
 from slack_sdk.errors import SlackApiError
+from slack_sdk.web import WebClient
 from slack_sdk.web.slack_response import SlackResponse
 
 from .conftest import _black_hole_api
@@ -57,11 +58,25 @@ MISSING_SCOPE_MESSAGE = (
     "scope channels:read. Add channels:read under OAuth & Permissions > Bot "
     "Token Scopes, then reinstall the app to the workspace."
 )
+MISSING_FILES_READ_MESSAGE = (
+    "Slack channel capability preflight failed: bot token is missing required "
+    "scope files:read. Add files:read under OAuth & Permissions > Bot Token "
+    "Scopes, then reinstall the app to the workspace."
+)
 SLACK_TIMEOUT_MESSAGE = (
     "Slack channel capability preflight failed: could not attempt every "
     "configured destination within the bounded startup budget. Check Slack "
     "API availability and retry."
 )
+FILES_LIST_OK: dict[str, object] = {
+    # Slack documents a successful `files.list` as `{"ok": true, "files": [...]}`
+    # with `paging`; an empty array is a documented answer for a workspace that
+    # holds no files, which is why the probe can never depend on one existing:
+    # https://docs.slack.dev/reference/methods/files.list
+    "ok": True,
+    "files": [],
+    "paging": {"count": 1, "total": 0, "page": 1, "pages": 0},
+}
 
 
 @contextmanager
@@ -189,11 +204,18 @@ class _RecordingSlackClient:
         side_effect: Exception | None = None,
         list_side_effect: Exception | None = None,
         list_response: object | None = None,
+        files_side_effect: Exception | None = None,
+        files_response: object | None = None,
     ) -> None:
         self.channels: list[str] = []
         self.list_calls: list[dict[str, object]] = []
+        self.files_calls: list[dict[str, object]] = []
         self.side_effect = side_effect
         self.list_side_effect = list_side_effect
+        self.files_side_effect = files_side_effect
+        self.files_response = (
+            dict(FILES_LIST_OK) if files_response is None else files_response
+        )
         self.list_response = (
             {
                 "ok": True,
@@ -222,6 +244,23 @@ class _RecordingSlackClient:
             raise self.list_side_effect
         return self.list_response
 
+    def files_list(self, *, count: int, **unexpected: object) -> object:
+        """The `files:read` probe boundary (#2567).
+
+        `count` is declared required and keyword-only, and anything else is
+        captured into `unexpected` and recorded, because the page-size argument
+        this method takes is the load-bearing detail: `files.list` predates
+        Slack's cursor pagination and pages with `count`/`page`, while
+        `slack_sdk`'s `WebClient.files_list` types only `count` and would
+        forward a `limit=` into its `**kwargs` -- sending an undocumented
+        argument and quietly fetching the 100-file default page instead of one.
+        https://docs.slack.dev/reference/methods/files.list
+        """
+        self.files_calls.append({"count": count, **unexpected})
+        if self.files_side_effect is not None:
+            raise self.files_side_effect
+        return self.files_response
+
     def conversations_info(self, *, channel: str) -> Any:
         self.channels.append(channel)
         if self.side_effect is not None:
@@ -245,10 +284,30 @@ class _FakeClock:
 class _AdvancingSlackClient(_RecordingSlackClient):
     """Successful Slack fake whose calls consume a deterministic budget."""
 
-    def __init__(self, *, clock: _FakeClock, seconds_per_call: float) -> None:
+    def __init__(
+        self,
+        *,
+        clock: _FakeClock,
+        seconds_per_call: float,
+        list_seconds: float = 0.0,
+    ) -> None:
         super().__init__()
         self._clock = clock
         self._seconds_per_call = seconds_per_call
+        self._list_seconds = list_seconds
+
+    def conversations_list(
+        self,
+        *,
+        types: str,
+        exclude_archived: bool,
+        limit: int,
+    ) -> object:
+        response = super().conversations_list(
+            types=types, exclude_archived=exclude_archived, limit=limit
+        )
+        self._clock.sleep(self._list_seconds)
+        return response
 
     def conversations_info(self, *, channel: str) -> dict[str, Any]:
         response = super().conversations_info(channel=channel)
@@ -576,6 +635,7 @@ def test_slack_preflight_discovers_all_destinations_deduplicates_and_logs_count(
     messages = [record.getMessage() for record in caplog.records]
     assert messages == [
         "Slack channel capability preflight public-channel capability verified; "
+        "attachment download capability verified; "
         "checked 3 configured destinations; unverified 0"
     ]
     logged = " ".join(messages)
@@ -609,6 +669,7 @@ def test_slack_preflight_empty_destination_set_still_checks_public_capability(
     assert slack.channels == []
     assert [record.getMessage() for record in caplog.records] == [
         "Slack channel capability preflight public-channel capability verified; "
+        "attachment download capability verified; "
         "checked 0 configured destinations; unverified 0"
     ]
 
@@ -872,6 +933,7 @@ def test_slack_preflight_nondefinitive_failures_warn_aggregately_and_continue(
     messages = [record.getMessage() for record in caplog.records]
     assert messages == [
         "Slack channel capability preflight public-channel capability verified; "
+        "attachment download capability verified; "
         "checked 0 configured destinations; unverified 1"
     ]
     logged = " ".join(messages)
@@ -919,6 +981,7 @@ def test_malformed_falsey_conversations_list_response_is_unverified_and_redacted
     messages = [record.getMessage() for record in caplog.records]
     assert messages == [
         "Slack channel capability preflight public-channel capability unverified; "
+        "attachment download capability verified; "
         "checked 1 configured destinations; unverified 0"
     ]
     logged = " ".join(messages)
@@ -997,6 +1060,7 @@ def test_slack_preflight_malformed_success_is_nonfatal_unverified_and_redacted(
     messages = [record.getMessage() for record in caplog.records]
     assert messages == [
         "Slack channel capability preflight public-channel capability verified; "
+        "attachment download capability verified; "
         "checked 0 configured destinations; unverified 1"
     ]
     logged = " ".join(messages)
@@ -1299,6 +1363,7 @@ def test_production_provider_error_uses_silent_sdk_logger_and_safe_aggregate(
     ]
     assert app_messages == [
         "Slack channel capability preflight public-channel capability unverified; "
+        "attachment download capability unverified; "
         "checked 0 configured destinations; unverified 0"
     ]
     emitted = " ".join(record.getMessage() for record in caplog.records)
@@ -1395,6 +1460,648 @@ def test_slack_public_capability_scope_error_has_exact_redacted_recovery(
         "hostile-request-id-sentinel",
     ):
         assert private_value not in emitted
+
+
+def _one_slack_agent_api() -> httpx.Client:
+    """The discovery seam answering with a single Slack-bound destination."""
+    return _client(
+        lambda _request: httpx.Response(
+            200,
+            json=[
+                _agent(
+                    channels=[{"kind": "slack", "address": CHANNEL_A}],
+                    approval_routes=None,
+                )
+            ],
+        )
+    )
+
+
+def test_files_read_recovery_message_is_the_shipped_constant() -> None:
+    """Pin the recovery text to the module's own constant, not a paraphrase.
+
+    The message is the whole product of this gate: an operator reads it out of
+    a CrashLoopBackOff log and reinstalls. A test that only matched a substring
+    would let the reinstall step be dropped, which is the one instruction a
+    workspace with a stale bot-token grant actually needs.
+    """
+    from curie_dispatcher import preflight
+
+    assert preflight._MISSING_FILES_READ_MESSAGE == MISSING_FILES_READ_MESSAGE
+    # The two recoveries stay separate so each names exactly one scope; an
+    # operator missing only files:read must not be handed a list to guess from.
+    assert preflight._MISSING_CHANNELS_READ_MESSAGE == MISSING_SCOPE_MESSAGE
+    assert MISSING_FILES_READ_MESSAGE != MISSING_SCOPE_MESSAGE
+    assert "channels:read" not in MISSING_FILES_READ_MESSAGE
+
+
+def test_slack_preflight_with_files_read_passes_and_logs_a_clean_summary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC: a token holding files:read boots, with no refusal and no warning.
+
+    Slack documents `files.list` as requiring the `files:read` scope and
+    answering `{"ok": true, "files": [...]}`; the probe names no file, so an
+    empty array on a fresh workspace is a full pass:
+    https://docs.slack.dev/reference/methods/files.list
+    https://docs.slack.dev/reference/scopes/files.read/
+    """
+    slack = _RecordingSlackClient()
+    logger = logging.getLogger("test-slack-preflight-files-read-verified")
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        check_slack_channel_capabilities(
+            _config(),
+            logger=logger,
+            web_client=slack,
+            api_client=_one_slack_agent_api(),
+        )
+
+    assert slack.files_calls == [{"count": 1}]
+    assert slack.channels == [CHANNEL_A]
+    records = [record for record in caplog.records if record.name == logger.name]
+    assert [record.getMessage() for record in records] == [
+        "Slack channel capability preflight public-channel capability verified; "
+        "attachment download capability verified; "
+        "checked 1 configured destinations; unverified 0"
+    ]
+    # INFO, not WARNING: a verified files:read probe must not raise the level of
+    # the summary line on an otherwise clean stack, or the level stops meaning
+    # anything for the nondefinitive case below.
+    assert [record.levelno for record in records] == [logging.INFO]
+
+
+def test_slack_preflight_missing_files_read_scope_has_exact_redacted_recovery(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A definitive missing_scope on the files probe is boot-fatal and precise.
+
+    Slack's `files.list` error table documents `missing_scope` for a token that
+    lacks the necessary scope. It is unambiguous for this probe in a way it is
+    not on `conversations.info`: the request carries no channel and no type
+    filter, so `files:read` is the only scope it can be missing:
+    https://docs.slack.dev/reference/methods/files.list/#errors
+    """
+    raw_message = "hostile-files-sdk-message-sentinel"
+    response = SlackResponse(
+        client=None,
+        http_verb="GET",
+        api_url="https://slack.com/api/files.list",
+        req_args={"params": {"count": 1}},
+        data={
+            "ok": False,
+            "error": "missing_scope",
+            "provided": "chat:write",
+            "detail": "hostile-files-response-body-sentinel",
+        },
+        headers={"X-Slack-Req-Id": "hostile-files-request-id-sentinel"},
+        status_code=200,
+    )
+    slack = _RecordingSlackClient(
+        files_side_effect=SlackApiError(raw_message, response)
+    )
+    logger = logging.getLogger("test-slack-preflight-files-missing-scope")
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        with pytest.raises(SlackChannelPreflightError) as excinfo:
+            check_slack_channel_capabilities(
+                _config(slack_bot_token="hostile-bot-token-sentinel"),
+                logger=logger,
+                web_client=slack,
+                api_client=_one_slack_agent_api(),
+            )
+
+    assert str(excinfo.value) == MISSING_FILES_READ_MESSAGE
+    # The refusal has to carry both halves an operator acts on: the scope name
+    # and the fact that a reinstall is what refreshes an existing grant.
+    assert "files:read" in str(excinfo.value)
+    assert "reinstall the app to the workspace" in str(excinfo.value)
+    # Definitive means terminal before the per-destination loop: a token that
+    # cannot fetch an upload's bytes is not a stack worth wiring up.
+    assert slack.files_calls == [{"count": 1}]
+    assert slack.channels == []
+    emitted = " ".join(
+        [str(excinfo.value), *(record.getMessage() for record in caplog.records)]
+    )
+    for private_value in (
+        "hostile-bot-token-sentinel",
+        CHANNEL_A,
+        raw_message,
+        "missing_scope",
+        "chat:write",
+        "hostile-files-response-body-sentinel",
+        "hostile-files-request-id-sentinel",
+    ):
+        assert private_value not in emitted
+
+
+@pytest.mark.parametrize(
+    ("files_side_effect", "files_response", "private_values"),
+    [
+        pytest.param(
+            RuntimeError("hostile-files-transport-sentinel"),
+            None,
+            ("hostile-files-transport-sentinel",),
+            id="transport-error",
+        ),
+        pytest.param(
+            TimeoutError("hostile-files-timeout-sentinel"),
+            None,
+            ("hostile-files-timeout-sentinel",),
+            id="timeout",
+        ),
+        pytest.param(
+            SlackApiError(
+                "hostile-files-rate-sdk-message-sentinel",
+                {
+                    "ok": False,
+                    "error": "ratelimited",
+                    "retry_after": "hostile-files-retry-after-sentinel",
+                },
+            ),
+            None,
+            (
+                "hostile-files-rate-sdk-message-sentinel",
+                "ratelimited",
+                "hostile-files-retry-after-sentinel",
+            ),
+            id="unexpected-error-code",
+        ),
+        pytest.param(
+            SlackApiError(
+                "hostile-files-org-sdk-message-sentinel",
+                {
+                    "ok": False,
+                    "error": "org_login_required",
+                    "detail": "hostile-files-org-body-sentinel",
+                },
+            ),
+            None,
+            (
+                "hostile-files-org-sdk-message-sentinel",
+                "org_login_required",
+                "hostile-files-org-body-sentinel",
+            ),
+            id="org-token-refusal",
+        ),
+        pytest.param(
+            None,
+            {
+                "ok": True,
+                "files": "hostile-files-nonarray-sentinel",
+                "detail": "hostile-files-shape-body-sentinel",
+            },
+            (
+                "hostile-files-nonarray-sentinel",
+                "hostile-files-shape-body-sentinel",
+            ),
+            id="malformed-success-shape",
+        ),
+        pytest.param(None, {"ok": False}, (), id="ok-false"),
+    ],
+)
+def test_nondefinitive_files_probe_warns_without_refusing_or_passing_silently(
+    files_side_effect: Exception | None,
+    files_response: object | None,
+    private_values: tuple[str, ...],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Anything but missing_scope stays nondefinitive: warn, do not refuse.
+
+    Read off the implementation rather than assumed: only `missing_scope`
+    raises. Every other outcome sets the probe's status to `unverified`, which
+    routes the summary line through `logger.warning` instead of `logger.info`
+    *and* makes that line name the attachment capability as the degraded one.
+    The destination counters stay unchanged, because they are about destinations
+    and the destination was still probed.
+
+    Warning rather than refusing is deliberate: refusing would let a rate limit
+    or a transport blip crash-loop a stack whose other capabilities check out,
+    which is exactly what the ambiguous per-destination outcomes are already
+    forbidden from doing. But the raised level alone was not enough (#2567) --
+    it said "one of these checks is off" while the text spoke only about the
+    channels probe, so an operator debugging a dropped attachment found nothing
+    about attachments in the line. The text now carries that answer, and this
+    test pins the text, not just the level.
+
+    Slack documents `ratelimited` and `org_login_required` among `files.list`
+    errors; neither says anything definite about the token's scopes:
+    https://docs.slack.dev/reference/methods/files.list/#errors
+    """
+    slack = _RecordingSlackClient(
+        files_side_effect=files_side_effect,
+        files_response=files_response,
+    )
+    logger = logging.getLogger("test-slack-preflight-files-nondefinitive")
+
+    # No pytest.raises: a nondefinitive probe is not boot-fatal, so an
+    # exception escaping here is the failure.
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        check_slack_channel_capabilities(
+            _config(slack_bot_token="hostile-bot-token-sentinel"),
+            logger=logger,
+            web_client=slack,
+            api_client=_one_slack_agent_api(),
+        )
+
+    records = [record for record in caplog.records if record.name == logger.name]
+    # Not a silent pass: the one summary line is emitted at WARNING.
+    assert [record.levelno for record in records] == [logging.WARNING]
+    # ...and not a level-only signal either: the text names WHICH probe came
+    # back degraded. The destination counters are unchanged -- they are about
+    # destinations, and the destination was still probed rather than skipped.
+    assert [record.getMessage() for record in records] == [
+        "Slack channel capability preflight public-channel capability verified; "
+        "attachment download capability unverified; "
+        "checked 1 configured destinations; unverified 0"
+    ]
+    (summary,) = [record.getMessage() for record in records]
+    assert "attachment download capability unverified" in summary, (
+        "a degraded files:read probe must be NAMED in the summary text, not "
+        "signalled only by the record's level (#2567)"
+    )
+    assert "attachment download capability verified" not in summary
+    assert slack.channels == [CHANNEL_A]
+    logged = " ".join(record.getMessage() for record in records)
+    for private_value in (
+        "hostile-bot-token-sentinel",
+        CHANNEL_A,
+        *private_values,
+    ):
+        assert private_value not in logged
+
+
+def test_a_client_predating_the_files_probe_is_unverified_not_fatal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A seam that has no `files.list` at all is nondefinitive, not a refusal.
+
+    Every Slack fake in this suite predating #2567 has exactly this shape, and
+    so does any out-of-tree caller holding the older `SlackChannelClient`
+    protocol. The attribute lookup raises `AttributeError`, which the probe's
+    broad `except Exception` must absorb into `unverified` -- the same treatment
+    a transport fault gets -- rather than turning a stale double or an older
+    caller into a boot failure. As with any other degraded files probe, the
+    summary must SAY so rather than leaving the raised level to imply it
+    (#2567): "attachment download capability unverified" is the only thing that
+    distinguishes this boot from a clean one in an operator's log.
+    """
+
+    class _PreProbeSlackClient:
+        """The pre-#2567 provider surface: no `files.list` on the object."""
+
+        def __init__(self) -> None:
+            self.channels: list[str] = []
+            self.list_calls: list[dict[str, object]] = []
+
+        def conversations_list(
+            self,
+            *,
+            types: str,
+            exclude_archived: bool,
+            limit: int,
+        ) -> object:
+            self.list_calls.append(
+                {
+                    "types": types,
+                    "exclude_archived": exclude_archived,
+                    "limit": limit,
+                }
+            )
+            return {"ok": True, "channels": []}
+
+        def conversations_info(self, *, channel: str) -> object:
+            self.channels.append(channel)
+            return {"ok": True, "channel": {"id": channel}}
+
+    slack = _PreProbeSlackClient()
+    assert not hasattr(slack, "files_list")
+    logger = logging.getLogger("test-slack-preflight-files-probe-absent")
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        check_slack_channel_capabilities(
+            _config(),
+            logger=logger,
+            web_client=slack,
+            api_client=_one_slack_agent_api(),
+        )
+
+    assert slack.channels == [CHANNEL_A]
+    records = [record for record in caplog.records if record.name == logger.name]
+    assert [record.getMessage() for record in records] == [
+        "Slack channel capability preflight public-channel capability verified; "
+        "attachment download capability unverified; "
+        "checked 1 configured destinations; unverified 0"
+    ]
+    (summary,) = [record.getMessage() for record in records]
+    assert "attachment download capability unverified" in summary, (
+        "a seam with no files.list is a degraded probe, and the summary text "
+        "must name it as one rather than only raising the level (#2567)"
+    )
+    assert "attachment download capability verified" not in summary
+    assert [record.levelno for record in records] == [logging.WARNING]
+
+
+def test_verified_and_degraded_files_probes_log_different_summary_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The differential guard: `files_status` must be VISIBLE in the summary.
+
+    Every other assertion in this file pins one summary line at a time, so a
+    change that dropped `files_status` back out of the format string would be
+    one mechanical find-and-replace away from a green suite. This runs the same
+    stack twice, varying ONLY the files probe's answer, and demands the two
+    summary lines differ.
+
+    That is the #2567 defect restated as a test. A message that stopped
+    reporting the attachment capability -- or that formatted
+    `capability_status` into both slots -- makes these two runs produce
+    byte-identical text, distinguishable only by log level, and fails here.
+    """
+
+    def summary_record(
+        slack: _RecordingSlackClient, logger_name: str
+    ) -> logging.LogRecord:
+        logger = logging.getLogger(logger_name)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=logger.name):
+            check_slack_channel_capabilities(
+                _config(),
+                logger=logger,
+                web_client=slack,
+                api_client=_one_slack_agent_api(),
+            )
+        (record,) = [
+            record for record in caplog.records if record.name == logger.name
+        ]
+        return record
+
+    verified = summary_record(
+        _RecordingSlackClient(),
+        "test-files-probe-differential-verified",
+    )
+    # `ratelimited` is a documented, nondefinitive `files.list` error: it
+    # degrades the probe without refusing boot, so both runs reach the summary.
+    degraded = summary_record(
+        _RecordingSlackClient(
+            files_side_effect=SlackApiError(
+                "hostile-files-differential-sdk-message-sentinel",
+                {"ok": False, "error": "ratelimited"},
+            )
+        ),
+        "test-files-probe-differential-degraded",
+    )
+
+    assert verified.getMessage() != degraded.getMessage(), (
+        "a verified and a degraded files:read probe must produce different "
+        "summary TEXT; identical text means the message has stopped reporting "
+        "the attachment download capability (#2567)"
+    )
+    # The difference is exactly the attachment slot. The channels probe and both
+    # destination counters were identical across the two runs, so substituting
+    # that one status must turn one line into the other -- which also catches a
+    # message that reported the files status into the public-channel slot.
+    assert "attachment download capability verified" in verified.getMessage()
+    assert "attachment download capability unverified" in degraded.getMessage()
+    assert (
+        verified.getMessage().replace(
+            "attachment download capability verified",
+            "attachment download capability unverified",
+        )
+        == degraded.getMessage()
+    )
+    # The level contract still holds, so this cannot be satisfied by text at the
+    # cost of the signal the previous author established.
+    assert (verified.levelno, degraded.levelno) == (logging.INFO, logging.WARNING)
+    for private_value in (
+        "hostile-files-differential-sdk-message-sentinel",
+        "ratelimited",
+        CHANNEL_A,
+    ):
+        assert private_value not in degraded.getMessage()
+
+
+def test_unattempted_files_probe_refuses_rather_than_reading_as_a_pass() -> None:
+    """A scope check the budget never reached is a refusal, not a pass.
+
+    The distinction this pins: *nondefinitive* (the probe answered ambiguously)
+    warns, while *unattempted* (the aggregate deadline expired before the probe
+    could run) is terminal, per the module docstring. Without the deadline check
+    between the two capability probes, an exhausted budget would fall through to
+    the destination loop and an absent files:read check would read as clean.
+    """
+    clock = _FakeClock()
+    slack = _AdvancingSlackClient(clock=clock, seconds_per_call=1.0, list_seconds=2.0)
+    logger = logging.getLogger("test-slack-preflight-files-unattempted")
+
+    with pytest.raises(SlackChannelPreflightError) as excinfo:
+        check_slack_channel_capabilities(
+            _config(api_preflight_timeout_s=2.0),
+            logger=logger,
+            web_client=slack,
+            api_client=_one_slack_agent_api(),
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+    assert str(excinfo.value) == SLACK_TIMEOUT_MESSAGE
+    assert slack.list_calls == [
+        {"types": "public_channel", "exclude_archived": True, "limit": 1}
+    ]
+    assert slack.files_calls == []
+    assert slack.channels == []
+
+
+def test_production_files_probe_is_bounded_to_one_file_and_reuses_the_client(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The probe fetches ONE file, via `count`, on the capability client.
+
+    This is the load-bearing argument-name test. `files.list` predates Slack's
+    cursor pagination and pages with `count`/`page`, not `limit`, and
+    `slack_sdk`'s `WebClient.files_list` types `count` as keyword-only while
+    passing anything else through `**kwargs` straight into the request body. So
+    a `limit=1` would not fail: it would send an argument the method does not
+    document, `count` would fall back to Slack's default, and the boot gate
+    would quietly pull a 100-file page on every dispatcher start. This asserts
+    the recorded kwargs are exactly `{"count": 1}`, so reintroducing `limit`
+    fails here whether it replaces `count` or rides alongside it:
+    https://docs.slack.dev/reference/methods/files.list
+
+    It runs at the production `WebClient` seam so the assertion is on the real
+    call site, and pins that the files probe reuses the capability client rather
+    than opening a second provider connection -- both are the same
+    workspace-level question, already bounded by the same remaining budget.
+    """
+    from curie_dispatcher import preflight
+
+    constructor_calls: list[dict[str, Any]] = []
+    files_calls: list[dict[str, object]] = []
+    capability_calls: list[dict[str, object]] = []
+
+    class RecordingProductionClient:
+        def conversations_list(
+            self,
+            *,
+            types: str,
+            exclude_archived: bool,
+            limit: int,
+        ) -> dict[str, Any]:
+            capability_calls.append(
+                {
+                    "types": types,
+                    "exclude_archived": exclude_archived,
+                    "limit": limit,
+                }
+            )
+            return {
+                "ok": True,
+                "channels": [],
+                "response_metadata": {"next_cursor": ""},
+            }
+
+        def files_list(self, *, count: int, **unexpected: object) -> dict[str, Any]:
+            files_calls.append({"count": count, **unexpected})
+            return dict(FILES_LIST_OK)
+
+        def conversations_info(self, *, channel: str) -> dict[str, Any]:
+            raise AssertionError(f"unexpected destination call for {channel}")
+
+    def construct_web_client(**kwargs: Any) -> RecordingProductionClient:
+        constructor_calls.append(kwargs)
+        return RecordingProductionClient()
+
+    monkeypatch.setattr(preflight, "WebClient", construct_web_client)
+    logger = logging.getLogger("test-production-files-probe-bounded")
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        check_slack_channel_capabilities(
+            _config(slack_bot_token="hostile-bot-token-sentinel"),
+            logger=logger,
+            api_client=_client(lambda _request: httpx.Response(200, json=[])),
+        )
+
+    assert files_calls == [{"count": 1}]
+    assert capability_calls == [
+        {"types": "public_channel", "exclude_archived": True, "limit": 1}
+    ]
+    # One provider client for both workspace-level scope questions: per-client
+    # construction exists to stop one hung *destination* borrowing another's
+    # share of the budget, not to scale with the number of scopes probed.
+    assert len(constructor_calls) == 1
+    assert constructor_calls[0]["retry_handlers"] == []
+    assert isinstance(constructor_calls[0]["timeout"], int)
+    records = [record for record in caplog.records if record.name == logger.name]
+    assert [record.levelno for record in records] == [logging.INFO]
+    assert "hostile-bot-token-sentinel" not in " ".join(
+        record.getMessage() for record in records
+    )
+
+
+def test_files_probe_matches_the_slack_sdk_files_list_signature() -> None:
+    """`count` is really the argument slack_sdk types; `limit` is really not.
+
+    The fakes above are only as good as their fidelity to the SDK, so this
+    checks the claim against the installed `slack_sdk` rather than against a
+    comment. `count` is a declared keyword-only parameter of
+    `WebClient.files_list`; `limit` is not declared at all and would be
+    absorbed by the method's `**kwargs`, which is the silent-100-files failure
+    the probe's `count=1` avoids.
+    """
+    import inspect
+
+    parameters = inspect.signature(WebClient.files_list).parameters
+    assert "count" in parameters
+    assert parameters["count"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "limit" not in parameters
+    assert any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ), (
+        "files_list no longer swallows unknown kwargs; the count-vs-limit trap "
+        "this probe guards against may have changed shape"
+    )
+
+
+def test_new_files_probe_leaves_the_channels_read_gate_unchanged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression guard: adding the files probe did not move the first gate.
+
+    A definitive `channels:read` refusal must still short-circuit before the
+    files probe runs, and must still carry the channels:read recovery -- not the
+    files:read one, and not both.
+    """
+    slack = _RecordingSlackClient(
+        list_side_effect=SlackApiError(
+            "hostile-channels-sdk-message-sentinel",
+            {"ok": False, "error": "missing_scope", "needed": "channels:read"},
+        )
+    )
+    logger = logging.getLogger("test-channels-read-gate-unchanged")
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        with pytest.raises(SlackChannelPreflightError) as excinfo:
+            check_slack_channel_capabilities(
+                _config(),
+                logger=logger,
+                web_client=slack,
+                api_client=_one_slack_agent_api(),
+            )
+
+    assert str(excinfo.value) == MISSING_SCOPE_MESSAGE
+    assert "files:read" not in str(excinfo.value)
+    assert slack.list_calls == [
+        {"types": "public_channel", "exclude_archived": True, "limit": 1}
+    ]
+    assert slack.files_calls == []
+    assert slack.channels == []
+
+
+def test_channels_read_unverified_path_is_unchanged_by_a_verified_files_probe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A nondefinitive channels:read outcome still only warns, files probe or not."""
+    slack = _RecordingSlackClient(
+        list_side_effect=SlackApiError(
+            "hostile-channels-rate-sentinel",
+            {"ok": False, "error": "ratelimited"},
+        )
+    )
+    logger = logging.getLogger("test-channels-read-unverified-unchanged")
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        check_slack_channel_capabilities(
+            _config(),
+            logger=logger,
+            web_client=slack,
+            api_client=_one_slack_agent_api(),
+        )
+
+    assert slack.files_calls == [{"count": 1}]
+    records = [record for record in caplog.records if record.name == logger.name]
+    assert [record.getMessage() for record in records] == [
+        "Slack channel capability preflight public-channel capability unverified; "
+        "attachment download capability verified; "
+        "checked 1 configured destinations; unverified 0"
+    ]
+    assert [record.levelno for record in records] == [logging.WARNING]
+
+
+def test_slack_manifest_declares_the_files_read_probe_scope() -> None:
+    """The installable manifest must grant the scope the new boot gate probes.
+
+    A gate that refuses on a scope the shipped manifest never asks for would
+    fail every fresh install, so the manifest and the probe move together.
+    """
+    manifest = yaml.safe_load(
+        (Path(__file__).parents[1] / "slack-app-manifest.yaml").read_text()
+    )
+
+    bot_scopes = manifest["oauth_config"]["scopes"]["bot"]
+    assert "files:read" in bot_scopes
+    assert "channels:read" in bot_scopes
 
 
 def test_slack_manifest_declares_the_preflight_scope() -> None:

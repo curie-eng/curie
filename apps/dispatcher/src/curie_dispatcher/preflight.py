@@ -363,7 +363,9 @@ def check_slack_channel_capabilities(
     its ``missing_scope`` is unambiguous because the request carries no channel
     and no type filter. Ambiguous capability and destination outcomes are
     counted as unverified; a nondefinitive ``files:read`` probe raises the
-    summary line's level without changing its text.
+    summary line's level AND names itself in its text, so an operator chasing a
+    dropped attachment finds the attachment probe in the line rather than a
+    warning that reads clean (#2567).
     Production builds a no-retry client for each provider call, with its integer
     timeout capped by both the remaining aggregate budget and the dispatcher's
     two-second Slack policy. If time expires before the capability probe or every
@@ -537,18 +539,23 @@ def check_slack_channel_capabilities(
         checked += 1
 
     # A nondefinitive `files:read` probe raises the level without changing the
-    # line: the definitive answer already refused above, so what is left to say
-    # here is only "one of these checks did not come back clean", which is what
-    # the level says. The counters stay about destinations.
+    # line: the definitive answer already refused above. What is left to say is
+    # WHICH check did not come back clean, and each probe therefore names its own
+    # status. Reporting only the level, or only the channels probe's status, made a
+    # degraded `files:read` probe surface as a warning whose text read clean --
+    # an operator debugging a dropped attachment would have found nothing about
+    # attachments in it (#2567). The counters stay about destinations.
     log = (
         logger.warning
         if capability_status == "unverified" or files_status == "unverified" or unverified
         else logger.info
     )
     log(
-        "Slack channel capability preflight public-channel capability %s; checked "
+        "Slack channel capability preflight public-channel capability %s; "
+        "attachment download capability %s; checked "
         "%d configured destinations; unverified %d",
         capability_status,
+        files_status,
         checked,
         unverified,
     )
