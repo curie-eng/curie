@@ -1107,6 +1107,35 @@ before contacting Valkey.
 {{- end -}}
 {{- end -}}
 
+{{/* TCP port a URL actually dials. Same urlParse plus :[0-9]+$ plus
+     scheme-default pattern as curie.mailAdapter.otelEgressPort: the URL
+     port wins; else https => 443, http => 80. Empty scheme and no
+     explicit port emit empty -- do not invent 4318. Does not fail. */}}
+{{- define "curie.endpoint.dialPort" -}}
+{{- $raw := trim . -}}
+{{- if $raw -}}
+{{- $parsed := urlParse $raw -}}
+{{- $hostPort := $parsed.host | default "" -}}
+{{- $scheme := lower ($parsed.scheme | default "") -}}
+{{/* A bracketed IPv6 host is NOT skipped here, which is the opposite of
+     curie.endpoint.host: that helper leaves brackets intact because such a host
+     is never in-chart Service DNS, whereas this helper must still find the
+     port. ":[0-9]+$" is safe on a literal address because a bare bracketed host
+     ends in "]" -- only a real port can follow the closing bracket, so a hextet
+     is never mistaken for one. Skipping brackets instead left $urlPort empty,
+     fell through to the scheme default, and opened 443 while the SDK dialled
+     the port the URL actually named. */}}
+{{- $urlPort := trimPrefix ":" (regexFind ":[0-9]+$" $hostPort) -}}
+{{- if $urlPort -}}
+{{- $urlPort -}}
+{{- else if eq $scheme "https" -}}
+443
+{{- else if eq $scheme "http" -}}
+80
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{/* True when host is this release's Service DNS for component (api or
      otel-collector), including the usual cluster.local FQDNs. */}}
 {{- define "curie.host.inChartService" -}}
