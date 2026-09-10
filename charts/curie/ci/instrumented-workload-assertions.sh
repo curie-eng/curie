@@ -74,6 +74,11 @@ EXTERNAL_COLLECTOR_SET=(
   --set 'otelCollector.egress[0].cidr=192.0.2.40/32'
   --set 'otelCollector.egress[0].ports[0].protocol=TCP'
   --set 'otelCollector.egress[0].ports[0].port=4318'
+  # The mail adapter is the only first-party workload with an egress
+  # NetworkPolicy, so pairing it with a BYO collector endpoint needs a
+  # declared peer here too, or the chart refuses the render (#2361). This
+  # suite is about telemetry env wiring, not egress, hence the aside.
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32'
 )
 
 render() {
