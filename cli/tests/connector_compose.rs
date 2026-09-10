@@ -1083,6 +1083,16 @@ fn the_overlay_is_written_under_the_bundles_state_directory() {
         "{argv:?}"
     );
     assert!(argv.iter().any(|t| t == "--wait"), "{argv:?}");
+    let wait_timeout = argv
+        .iter()
+        .position(|token| token == "--wait-timeout")
+        .and_then(|index| argv.get(index + 1));
+    assert_eq!(
+        wait_timeout.map(String::as_str),
+        Some("60"),
+        "Compose --wait only has a finite connector-start deadline when its timeout is explicit: \
+         {argv:?}"
+    );
 }
 
 // ─── The overlay file holds references, the child env holds the values ───────

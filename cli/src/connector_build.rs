@@ -1438,6 +1438,8 @@ pub fn compose_up_command(
             "up".into(),
             "-d".into(),
             "--wait".into(),
+            "--wait-timeout".into(),
+            "60".into(),
         ],
     )
     .with_secret_env(
@@ -1445,6 +1447,32 @@ pub fn compose_up_command(
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
+    )
+}
+
+/// Resolve the actual container IDs for one generated Compose service.
+///
+/// Compose derives container names from its project, service, and replica, so
+/// callers must not treat the service name as a Docker container name. `--all`
+/// keeps an immediately exited connector visible to the readiness waiter.
+pub(crate) fn compose_service_ids_command(
+    overlay: &Path,
+    project: &str,
+    service: &str,
+) -> crate::ops::OpsCommand {
+    plain_command(
+        "docker",
+        vec![
+            "compose".into(),
+            "-p".into(),
+            project.to_string(),
+            "-f".into(),
+            overlay.display().to_string(),
+            "ps".into(),
+            "--all".into(),
+            "-q".into(),
+            service.to_string(),
+        ],
     )
 }
 

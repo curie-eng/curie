@@ -232,6 +232,285 @@ pub async fn docker_capture_with_env(
     ))
 }
 
+/// The complete startup window shared by every connector that one command
+/// starts. Keeping it here prevents one boot with multiple connectors from
+/// granting each container a separate sixty second wait.
+pub(crate) const CONNECTOR_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The bounded window for resolving the actual Docker IDs of local Compose
+/// connector services after `compose up` completes. It is separate from the
+/// final readiness observation because resolution scales with connector count.
+pub(crate) const CONNECTOR_ID_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The read-only final readiness observation window after local Compose IDs
+/// have resolved. It confirms successful starts without extending the startup
+/// window, and a failed Compose start remains failed even when this pass finds
+/// ready containers.
+pub(crate) const CONNECTOR_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
+
+const CONNECTOR_STABLE_RUNNING_FOR: Duration = Duration::from_secs(2);
+const CONNECTOR_INSPECT_FORMAT: &str = "{{.State.Status}}\t{{.State.Running}}\t{{.State.Restarting}}\t{{.State.ExitCode}}\t{{.RestartCount}}\t{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}";
+
+#[derive(Debug)]
+struct ConnectorRuntimeState {
+    status: String,
+    running: bool,
+    restarting: bool,
+    exit_code: i32,
+    restart_count: u64,
+    health: Option<String>,
+}
+
+#[derive(Default)]
+struct ConnectorWaitState {
+    restart_count: Option<u64>,
+    running_since: Option<Instant>,
+}
+
+fn connector_readiness_error(message: String) -> anyhow::Error {
+    let remedy = "check the connector configuration and logs, then retry".to_string();
+    let source = anyhow::Error::from(
+        crate::exit::CliError::failure(message.clone()).with_fix(remedy.clone()),
+    );
+    crate::exit::operator_context(source, message, Some(remedy))
+}
+
+fn connector_readiness_failure(container: &str, reason: &str) -> anyhow::Error {
+    connector_readiness_error(format!(
+        "connector '{container}' failed to become ready: {reason}"
+    ))
+}
+
+fn connector_readiness_failures(containers: &[String], reason: &str) -> anyhow::Error {
+    if containers.len() == 1 {
+        return connector_readiness_failure(&containers[0], reason);
+    }
+    let names = if containers.is_empty() {
+        "connector".to_string()
+    } else {
+        containers
+            .iter()
+            .map(|container| format!("'{container}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    connector_readiness_error(format!(
+        "connectors {names} failed to become ready: {reason}"
+    ))
+}
+
+/// Preserve a failed Compose outcome even when its short diagnostic pass finds
+/// only ready containers, such as when a pre-existing container survived a
+/// failed update.
+pub(crate) fn connector_compose_start_failure(containers: &[String]) -> anyhow::Error {
+    let names = containers
+        .iter()
+        .map(|container| format!("'{container}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    connector_readiness_error(format!(
+        "Docker Compose startup did not complete successfully for declared connectors: {names}"
+    ))
+}
+
+fn connector_readiness_timeout(
+    containers: &[(String, String)],
+    last_pending: &[String],
+) -> anyhow::Error {
+    let pending = if last_pending.is_empty() {
+        containers
+            .iter()
+            .map(|(display_name, _)| display_name.clone())
+            .collect::<Vec<_>>()
+    } else {
+        last_pending.to_vec()
+    };
+    connector_readiness_failures(
+        &pending,
+        "timed out waiting for readiness before the deadline",
+    )
+}
+
+async fn inspect_connector_runtime_state(
+    display_name: &str,
+    inspect_ref: &str,
+    deadline: Instant,
+) -> Result<Option<ConnectorRuntimeState>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining == Duration::ZERO {
+        return Ok(None);
+    }
+    let command = crate::connector_build::plain_command(
+        "docker",
+        vec![
+            "inspect".into(),
+            "--format".into(),
+            CONNECTOR_INSPECT_FORMAT.into(),
+            inspect_ref.to_string(),
+        ],
+    );
+    let captured = match tokio::time::timeout(remaining, crate::ops::run_capture(&command)).await {
+        Ok(captured) => captured,
+        Err(_) => return Ok(None),
+    };
+    let (ok, stdout, _stderr) = captured.map_err(|_| {
+        connector_readiness_failure(display_name, "Docker could not inspect its readiness state")
+    })?;
+    if !ok {
+        return Err(connector_readiness_failure(
+            display_name,
+            "Docker could not inspect its readiness state",
+        ));
+    }
+
+    let mut fields = stdout.trim().split('\t');
+    let status = fields.next().map(str::to_string);
+    let running = fields.next().and_then(|field| field.parse::<bool>().ok());
+    let restarting = fields.next().and_then(|field| field.parse::<bool>().ok());
+    let exit_code = fields.next().and_then(|field| field.parse::<i32>().ok());
+    let restart_count = fields.next().and_then(|field| field.parse::<u64>().ok());
+    let health = fields.next().map(str::to_string);
+    if fields.next().is_some()
+        || status.is_none()
+        || running.is_none()
+        || restarting.is_none()
+        || exit_code.is_none()
+        || restart_count.is_none()
+        || health.is_none()
+    {
+        return Err(connector_readiness_failure(
+            display_name,
+            "Docker returned an unreadable readiness state",
+        ));
+    }
+
+    Ok(Some(ConnectorRuntimeState {
+        status: status.expect("validated above"),
+        running: running.expect("validated above"),
+        restarting: restarting.expect("validated above"),
+        exit_code: exit_code.expect("validated above"),
+        restart_count: restart_count.expect("validated above"),
+        health: match health.expect("validated above").as_str() {
+            "none" => None,
+            value => Some(value.to_string()),
+        },
+    }))
+}
+
+/// Wait for every named connector started by one command to prove process
+/// readiness. Health checked containers require Docker's `healthy` state;
+/// containers without a health check must stay running continuously for two
+/// seconds. The deadline covers every inspect subprocess, which is killed if
+/// the timed-out future is dropped by `ops::run_capture`.
+pub(crate) async fn wait_for_connectors_ready(
+    containers: &[(String, String)],
+    deadline: Instant,
+) -> Result<()> {
+    if containers.is_empty() {
+        return Ok(());
+    }
+    let mut states: Vec<ConnectorWaitState> = (0..containers.len())
+        .map(|_| ConnectorWaitState::default())
+        .collect();
+    let mut last_pending: Vec<String> = containers
+        .iter()
+        .map(|(display_name, _)| display_name.clone())
+        .collect();
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(connector_readiness_timeout(containers, &last_pending));
+        }
+
+        let mut all_ready = true;
+        let mut observed_pending = Vec::new();
+        for ((display_name, inspect_ref), wait_state) in containers.iter().zip(states.iter_mut()) {
+            if inspect_ref.is_empty() {
+                return Err(connector_readiness_failure(
+                    display_name,
+                    "its container was not created",
+                ));
+            }
+
+            let Some(state) =
+                inspect_connector_runtime_state(display_name, inspect_ref, deadline).await?
+            else {
+                return Err(connector_readiness_timeout(containers, &last_pending));
+            };
+            if let Some(previous) = wait_state.restart_count {
+                if previous != state.restart_count {
+                    return Err(connector_readiness_failure(
+                        display_name,
+                        "its restart count changed during startup",
+                    ));
+                }
+            } else {
+                wait_state.restart_count = Some(state.restart_count);
+            }
+
+            if state.restarting || state.status == "restarting" {
+                return Err(connector_readiness_failure(
+                    display_name,
+                    "it is restarting during startup",
+                ));
+            }
+            if matches!(state.status.as_str(), "exited" | "dead") {
+                return Err(connector_readiness_failure(
+                    display_name,
+                    &format!("it exited with code {}", state.exit_code),
+                ));
+            }
+            if state.health.as_deref() == Some("unhealthy") {
+                return Err(connector_readiness_failure(
+                    display_name,
+                    "its health check reported unhealthy",
+                ));
+            }
+
+            match state.health.as_deref() {
+                Some("healthy") if state.running => {
+                    wait_state.running_since = None;
+                }
+                Some("starting") | Some("healthy") => {
+                    all_ready = false;
+                    observed_pending.push(display_name.clone());
+                    wait_state.running_since = None;
+                }
+                Some(_) => {
+                    return Err(connector_readiness_failure(
+                        display_name,
+                        "its health check returned an unknown state",
+                    ));
+                }
+                None if state.running => {
+                    let running_since = wait_state.running_since.get_or_insert_with(Instant::now);
+                    if running_since.elapsed() < CONNECTOR_STABLE_RUNNING_FOR {
+                        all_ready = false;
+                        observed_pending.push(display_name.clone());
+                    }
+                }
+                None => {
+                    all_ready = false;
+                    observed_pending.push(display_name.clone());
+                    wait_state.running_since = None;
+                }
+            }
+        }
+
+        if all_ready {
+            return Ok(());
+        }
+
+        last_pending = observed_pending;
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining == Duration::ZERO {
+            return Err(connector_readiness_timeout(containers, &last_pending));
+        }
+        tokio::time::sleep(Duration::from_millis(200).min(remaining)).await;
+    }
+}
+
 /// Create a docker network. Returns `Ok(true)` when this call created it and
 /// `Ok(false)` when the network already existed, so the caller only claims
 /// ownership (and thus teardown responsibility) for networks it actually made.
