@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any, cast
@@ -250,21 +251,55 @@ def test_runner_turn_records_declared_metrics_through_configured_provider() -> N
 
 
 class _SlowProvider:
+    """Fake provider that records the exact boundaries of each drain call.
+
+    The recorded ("call", "enter"/"exit") pairs are what let the test prove
+    ordering: post-#2362 one worker owns a provider and runs force_flush to
+    completion *before* shutdown, so the two calls can never interleave.
+    """
+
     def __init__(self) -> None:
-        self.calls: list[str] = []
+        self._lock = threading.Lock()
+        # Appended from the per-provider drain worker; the test thread reads it
+        # only after shutdown_done, but the lock keeps the invariant local.
+        self.calls: list[tuple[str, str]] = []
+        self.flush_timeouts: list[int] = []
+        self.shutdown_done = threading.Event()
+
+    def _record(self, call: str, phase: str) -> None:
+        with self._lock:
+            self.calls.append((call, phase))
 
     def force_flush(self, *, timeout_millis: int) -> bool:
-        self.calls.append(f"flush:{timeout_millis}")
+        self._record("force_flush", "enter")
+        with self._lock:
+            self.flush_timeouts.append(timeout_millis)
         time.sleep(0.2)
+        self._record("force_flush", "exit")
         return False
 
     def shutdown(self) -> None:
-        self.calls.append("shutdown")
-        time.sleep(0.2)
+        self._record("shutdown", "enter")
+        try:
+            time.sleep(0.2)
+            self._record("shutdown", "exit")
+        finally:
+            # Set unconditionally: a raising provider must not wedge the suite
+            # on the bounded waits below.
+            self.shutdown_done.set()
 
 
 def test_runner_signal_provider_flush_and_shutdown_are_wall_clock_bounded() -> None:
-    """A stuck OTLP exporter cannot hold runner process teardown indefinitely."""
+    """A stuck OTLP exporter cannot hold runner process teardown indefinitely.
+
+    Post-#2362 this pins the sequential-drain contract: one shared wall-clock
+    deadline for the whole call, each provider flushed with the *remaining*
+    budget, and shutdown never overlapping that provider's flush. The previous
+    version of this test asserted "shutdown" was already recorded the instant
+    ServiceTelemetry.shutdown returned, which only held because a second thread
+    called shutdown() while force_flush was still in flight — the race #2362
+    removed. The bound below is unchanged and still strict.
+    """
 
     trace_provider = _SlowProvider()
     log_provider = _SlowProvider()
@@ -279,7 +314,26 @@ def test_runner_signal_provider_flush_and_shutdown_are_wall_clock_bounded() -> N
     telemetry.shutdown(timeout_millis=20)
     elapsed = time.monotonic() - started
 
+    # Load-bearing: a 20ms budget must not turn into the providers' 0.2s sleeps.
     assert elapsed < 0.3
     for provider in (trace_provider, log_provider, meter_provider):
-        assert "flush:20" in provider.calls
-        assert "shutdown" in provider.calls
+        # Exactly one flush per provider, with a bounded slice of the shared
+        # deadline. The exact integer is a scheduling artifact (thread-start
+        # latency eats a millisecond or two), so pin the magnitude, not a
+        # value. The lower bound is inclusive of 0: under load, thread-start
+        # latency can consume the entire 20ms budget before the worker
+        # computes its remaining share, legitimately flooring it at 0 -- a
+        # strict `0 <` would assert scheduler luck rather than the contract.
+        assert len(provider.flush_timeouts) == 1
+        assert 0 <= provider.flush_timeouts[0] <= 20
+    # The workers are daemons that outlive the bounded join, so wait for each to
+    # finish its own flush-then-shutdown sequence before judging ordering.
+    for provider in (trace_provider, log_provider, meter_provider):
+        assert provider.shutdown_done.wait(2.0)
+    for provider in (trace_provider, log_provider, meter_provider):
+        assert provider.calls == [
+            ("force_flush", "enter"),
+            ("force_flush", "exit"),
+            ("shutdown", "enter"),
+            ("shutdown", "exit"),
+        ]
