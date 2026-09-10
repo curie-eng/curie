@@ -100,8 +100,14 @@ load?" without a model turn. It
 validates the bundle via the frozen `load_plugins`, then builds a real
 `ClaudeSDKClient` and `connect()`s (no query), polls `get_mcp_status()` until the
 bundle's own servers settle, and compares the **declared** servers against the
-plugin-owned **registered** ones. It reads `CURIE_PLUGIN_DIR` (and optional
-`CURIE_CHECK_TIMEOUT_S`, default 30); it forwards and reads **no** credential.
+plugin-owned **registered** ones. `declared` is the union of the MCP-config
+servers (`plugin.json` `mcpServers` and a bare `.mcp.json`) and the bundle's
+`connectors.yaml` connectors, each name counted once; the check mounts the
+connector forms this tier can actually reach (a remote `url:` and a hosted
+connector's `unhosted_url:` fallback), so those are genuinely exercised, while
+a purely hosted connector is declared but not exercisable here. It reads
+`CURIE_PLUGIN_DIR` (and optional `CURIE_CHECK_TIMEOUT_S`, default 30); it
+forwards and reads **no** credential.
 
 ```bash
 CURIE_PLUGIN_DIR=/plugin python -m curie_runner.check
@@ -112,7 +118,8 @@ and exits with the verdict code:
 
 - `0` green: every declared MCP server registered connected with at least one tool
 - `1` red: a declared server failed to load (never registered, connected with zero
-  tools, `failed`/`needs-auth`/`pending` at the deadline, or the init timed out)
+  tools, `failed`/`needs-auth`/`pending` at the deadline, or the init timed out),
+  including a declared `connectors.yaml` connector this tier cannot host
 - `2` invalid_bundle: the bundle fails `plugin_format` validation or the plugin dir
   is missing
 
