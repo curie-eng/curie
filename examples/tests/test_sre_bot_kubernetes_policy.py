@@ -86,10 +86,14 @@ def test_every_pinned_core_tool_is_classified_exactly_once() -> None:
         for entry in policy["approvalRequired"]
     }
     assert kubernetes_allow == READ_TOOLS
-    assert other_allow == {
-        "self-upgrade/upgrade_self",
-        "self-upgrade/upgrade_platform",
+    surface = json.loads((BUNDLE / "supported-surface.json").read_text())
+    expected_other = {
+        f"{name}/{tool}"
+        for name, spec in surface["connectors"].items()
+        if name != "kubernetes"
+        for tool in spec["tools"]
     }
+    assert other_allow == expected_other
     assert approval == MUTATING_TOOLS
     assert not (kubernetes_allow & approval)
     assert policy["deny"] == []

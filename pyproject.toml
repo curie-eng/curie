@@ -186,6 +186,7 @@ testpaths = [
     "tools/p0-closes-ci/tests",
     "tools/ci-release-target-parity/tests",
     "tools/restore-drill/tests",
+    "tools/sre-contract/tests",
 ]
 
 [tool.ruff]
@@ -203,6 +204,7 @@ select = ["E", "F", "I", "UP", "B"]
 # I001 included; only the frozen tests are exempt from import-block formatting.
 "tools/doclint/tests/**" = ["I001"]
 "tools/restore-drill/tests/**" = ["E402"]
+"tools/sre-contract/tests/**" = ["E402"]
 
 [tool.mypy]
 python_version = "3.13"
