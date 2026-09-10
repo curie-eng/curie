@@ -10,15 +10,77 @@ use serde_json::Value;
 
 use super::{plain, run_capture, CommonOpts, OpsCommand};
 
+/// Which convergence property an observed issue actually disproves.
+///
+/// `cluster upgrade` reports named sub-flags (`images`, `generations`, ...) and
+/// must not derive them by substring-matching reason text, which would flip a
+/// gate to green on a reworded message. Every issue therefore carries the facet
+/// the observing code genuinely inspected.
+///
+/// `Replicas` and `Unavailable` are separate: a workload can be mid-rollout
+/// (`updated != desired`) while `unavailableReplicas` is genuinely `0`, so
+/// deriving one from the other reports a value the observer never saw.
+///
+/// `Rollout` is the honest home for issues that no named property covers: a
+/// stalled rollout, a crash-looping or terminating container, an undeployed
+/// revision, an empty target manifest, a StatefulSet mid-revision, or a Helm
+/// revision that moved under the observation. It fails `exact` without lying
+/// about which specific property was disproved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Facet {
+    Image,
+    Generation,
+    Replicas,
+    Unavailable,
+    Manifest,
+    Hook,
+    Drain,
+    Rollout,
+}
+
+/// The #2010 worker drain gate, by the hook names
+/// `charts/curie/templates/worker-upgrade-drain.yaml` renders (the pre-upgrade
+/// quiesce Job and its post-upgrade release). A refusal there means accepted
+/// work had not settled when the roll began, which `cluster upgrade` reports
+/// separately from every other hook.
+fn hook_facet(name: &str) -> Facet {
+    if name.ends_with("-upgrade-drain") || name.ends_with("-upgrade-drain-release") {
+        Facet::Drain
+    } else {
+        Facet::Hook
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Observation {
     pub issues: Vec<String>,
+    /// The same issues, each tagged with the property it disproves. Written
+    /// only by [`Observation::issue`] alongside `issues`, so the two cannot
+    /// drift apart.
+    pub facets: Vec<(Facet, String)>,
     pub terminal: bool,
 }
 
 impl Observation {
-    fn issue(&mut self, resource: &str, reason: impl std::fmt::Display) {
-        self.issues.push(format!("{resource}: {reason}"));
+    fn issue(&mut self, facet: Facet, resource: &str, reason: impl std::fmt::Display) {
+        let text = format!("{resource}: {reason}");
+        self.facets.push((facet, text.clone()));
+        self.issues.push(text);
+    }
+
+    /// One issue that disproves several facets at once, recorded as a single
+    /// operator-visible line so the facet tagging cannot duplicate output.
+    fn issue_multi(&mut self, facets: &[Facet], resource: &str, reason: impl std::fmt::Display) {
+        let text = format!("{resource}: {reason}");
+        for facet in facets {
+            self.facets.push((*facet, text.clone()));
+        }
+        self.issues.push(text);
+    }
+
+    /// True when nothing observed disproves `facet`.
+    pub fn holds(&self, facet: Facet) -> bool {
+        !self.facets.iter().any(|(observed, _)| *observed == facet)
     }
 }
 
@@ -269,7 +331,7 @@ fn pod_reasons(pod: &Value, result: &mut Observation) {
     let name = text(pod, "/metadata/name");
     let pod_reason = text(pod, "/status/reason");
     if !pod_reason.is_empty() && pod_reason != "Completed" {
-        result.issue(name, reason(pod_reason));
+        result.issue(Facet::Rollout, name, reason(pod_reason));
     }
     for (field, init) in [
         ("/status/initContainerStatuses", true),
@@ -282,11 +344,12 @@ fn pod_reasons(pod: &Value, result: &mut Observation) {
                 text(container, "/name")
             );
             if let Some(waiting) = container.pointer("/state/waiting") {
-                result.issue(&id, reason(text(waiting, "/reason")));
+                result.issue(Facet::Rollout, &id, reason(text(waiting, "/reason")));
             }
             if let Some(terminated) = container.pointer("/state/terminated") {
                 if !init || count(terminated, "/exitCode") != 0 {
                     result.issue(
+                        Facet::Rollout,
                         &id,
                         format!(
                             "{} (exit {})",
@@ -330,7 +393,11 @@ fn compare_containers(
                     normalize_image(text(item, "/image")) != normalize_image(image)
                 })
             {
-                result.issue(id, format!("container {name} does not match target image"));
+                result.issue(
+                    Facet::Image,
+                    id,
+                    format!("container {name} does not match target image"),
+                );
             }
             if !pod {
                 continue;
@@ -356,7 +423,16 @@ fn compare_containers(
                     }
                 });
             if !valid {
+                // A container whose image already matches the target but is not
+                // ready is a stalled rollout (CrashLoopBackOff, failed probe),
+                // not an image mismatch. Tagging it `Image` would report
+                // `images: false` about an image that is in fact correct.
                 result.issue(
+                    if image_matches {
+                        Facet::Rollout
+                    } else {
+                        Facet::Image
+                    },
                     id,
                     if !image_matches && status.is_some_and(|status| needs_node_identity(image, status)) {
                         format!("container {name} tagged alias has no unique same-node image binding; inspect the serving Node image inventory or select a digest-pinned target image")
@@ -383,7 +459,11 @@ fn compare_containers(
                     status.get("ready").and_then(Value::as_bool) != Some(true)
                         || status.pointer("/state/running").is_none()
                 }) {
-                    result.issue(id, "admission-injected container is not ready");
+                    result.issue(
+                        Facet::Rollout,
+                        id,
+                        "admission-injected container is not ready",
+                    );
                 }
             }
         }
@@ -408,7 +488,11 @@ fn workload(
                 .pointer("/status/observedGeneration")
                 .and_then(Value::as_u64)
     {
-        result.issue(id, "target generation has not been observed");
+        result.issue(
+            Facet::Generation,
+            id,
+            "target generation has not been observed",
+        );
     }
     let desired = if kind == "DaemonSet" {
         count(actual, "/status/desiredNumberScheduled")
@@ -433,8 +517,16 @@ fn workload(
             count(actual, "/status/unavailableReplicas"),
         )
     };
-    if updated != desired || ready != desired || total != desired || unavailable != 0 {
-        result.issue(id, format!("replicas desired={desired} updated={updated} ready={ready} total={total} unavailable={unavailable}"));
+    let counts_off = updated != desired || ready != desired || total != desired;
+    if counts_off || unavailable != 0 {
+        let mut facets = Vec::new();
+        if counts_off {
+            facets.push(Facet::Replicas);
+        }
+        if unavailable != 0 {
+            facets.push(Facet::Unavailable);
+        }
+        result.issue_multi(&facets, id, format!("replicas desired={desired} updated={updated} ready={ready} total={total} unavailable={unavailable}"));
     }
     if kind == "StatefulSet"
         && desired > 0
@@ -442,6 +534,7 @@ fn workload(
             || text(actual, "/status/currentRevision") != text(actual, "/status/updateRevision"))
     {
         result.issue(
+            Facet::Rollout,
             id,
             "StatefulSet current revision does not match target revision",
         );
@@ -451,12 +544,12 @@ fn workload(
             && text(condition, "/status") == "False"
             && text(condition, "/reason") == "ProgressDeadlineExceeded"
         {
-            result.issue(id, "ProgressDeadlineExceeded");
+            result.issue(Facet::Rollout, id, "ProgressDeadlineExceeded");
             result.terminal = true;
         }
     }
     if expected.pointer("/spec/selector") != actual.pointer("/spec/selector") {
-        result.issue(id, "workload selector differs from target");
+        result.issue(Facet::Manifest, id, "workload selector differs from target");
     }
     compare_containers(expected, actual, false, nodes, result);
     let pods: Vec<_> = items
@@ -465,6 +558,7 @@ fn workload(
         .collect();
     if pods.len() as u64 != desired {
         result.issue(
+            Facet::Replicas,
             id,
             format!(
                 "selected pods={} desired={desired}; surplus or missing target replicas",
@@ -479,6 +573,7 @@ fn workload(
                 .is_some_and(|value| !value.is_null())
         {
             result.issue(
+                Facet::Rollout,
                 text(pod, "/metadata/name"),
                 "target pod is not steadily running",
             );
@@ -497,7 +592,11 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
         .context("Helm release has no verifiable revision")?;
     let mut result = Observation::default();
     if text(&status, "/info/status") != "deployed" {
-        result.issue("Helm release", "latest revision is not deployed");
+        result.issue(
+            Facet::Rollout,
+            "Helm release",
+            "latest revision is not deployed",
+        );
         result.terminal = true;
     }
     let manifest = capture(
@@ -517,6 +616,7 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
     }
     if expected.is_empty() {
         result.issue(
+            Facet::Rollout,
             "Helm release",
             "target manifest contains no managed workloads",
         );
@@ -538,7 +638,8 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
             continue;
         }
         if text(hook, "/last_run/phase") == "Failed" {
-            result.issue(text(hook, "/name"), "Helm hook failed");
+            let name = text(hook, "/name");
+            result.issue(hook_facet(name), name, "Helm hook failed");
             result.terminal = true;
         }
         if text(hook, "/kind") == "Job" {
@@ -611,7 +712,11 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
         }) {
             workload(object, actual, items, &nodes, &mut result);
         } else {
-            result.issue(text(object, "/metadata/name"), "target workload is absent");
+            result.issue(
+                Facet::Manifest,
+                text(object, "/metadata/name"),
+                "target workload is absent",
+            );
         }
     }
     for hook in array(&status, "/hooks") {
@@ -635,10 +740,8 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
         {
             for condition in array(job, "/status/conditions") {
                 if text(condition, "/type") == "Failed" && text(condition, "/status") == "True" {
-                    result.issue(
-                        text(job, "/metadata/name"),
-                        reason(text(condition, "/reason")),
-                    );
+                    let name = text(job, "/metadata/name");
+                    result.issue(hook_facet(name), name, reason(text(condition, "/reason")));
                     result.terminal = true;
                 }
             }
@@ -649,6 +752,7 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
         || final_status.pointer("/info/status") != status.pointer("/info/status")
     {
         result.issue(
+            Facet::Rollout,
             "Helm release",
             "revision changed during convergence observation",
         );
@@ -707,6 +811,69 @@ pub(super) async fn wait(opts: &CommonOpts) -> Result<()> {
             return Err(crate::exit::CliError::failure(format!("target release has not converged: {}", result.issues.join("; "))).with_fix("run `curie cluster status` to inspect the failed rollout; correct the target configuration and rerun `curie cluster up`").into());
         }
         last_issues = result.issues;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Like [`wait`], but hands the caller the final [`Observation`] instead of an
+/// error, so a caller that owes the operator a structured verdict (the
+/// `cluster upgrade` Converge phase, which must still emit its convergence
+/// payload, its failing phase and one fail-forward path) keeps the facts
+/// instead of losing them to `?`.
+///
+/// Deliberately does not touch [`wait`]: `up.rs` depends on its exact failure
+/// message and its "rerun `curie cluster up`" fix string.
+///
+/// A read that fails outright, or a rollout that never settles, comes back as a
+/// terminal observation rather than an `Err` — an unreadable cluster has not
+/// converged, and that is a verdict, not a crash.
+/// Every facet, for the one case where nothing at all could be observed.
+const UNOBSERVED: [Facet; 8] = [
+    Facet::Image,
+    Facet::Generation,
+    Facet::Replicas,
+    Facet::Unavailable,
+    Facet::Manifest,
+    Facet::Hook,
+    Facet::Drain,
+    Facet::Rollout,
+];
+
+pub(super) async fn wait_for_observation(opts: &CommonOpts) -> Observation {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let mut carried = Observation::default();
+    loop {
+        let observed = tokio::time::timeout_at(deadline, observe(opts))
+            .await
+            .context("post-Helm convergence timed out after 300 seconds")
+            .and_then(|result| result);
+        let result = match observed {
+            Ok(result) => result,
+            Err(error) => {
+                // The observation could not be made, so NO named property was
+                // determined. `holds` is closed-world, so leaving the facets
+                // untagged would report images/generations/replicas/... as
+                // observed-true off a read that never happened. Tag every facet
+                // with the one failure, and keep any facet an earlier pass had
+                // already genuinely disproved.
+                let mut result = carried;
+                let fix = crate::exit::classify(&error).1;
+                let detail = match fix {
+                    Some(fix) => format!("{error:#}; {fix}"),
+                    None => format!("{error:#}"),
+                };
+                result.issue_multi(&UNOBSERVED, "Helm release", detail);
+                result.terminal = true;
+                return result;
+            }
+        };
+        if result.issues.is_empty()
+            || result.terminal
+            || tokio::time::Instant::now() + Duration::from_secs(2) >= deadline
+        {
+            return result;
+        }
+        carried = result;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }

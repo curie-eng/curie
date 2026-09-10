@@ -276,7 +276,7 @@ for key, name in HOOK_NAMES.items():
 if program == "helm":
     if args[0] == "status":
         if scenario["status_missing_before"] and not upgraded:
-            print(f'Error: release: not found', file=sys.stderr)
+            print('Error: release: not found', file=sys.stderr)
             sys.exit(1)
         if "json" in args:
             emit(
@@ -287,7 +287,7 @@ if program == "helm":
                     "hooks": hooks,
                 }
             )
-        print(f"STATUS: deployed\nREVISION: 2")
+        print("STATUS: deployed\nREVISION: 2")
         sys.exit(0)
     if args[:2] == ["get", "values"]:
         applied_values = captured("values", ".yaml")

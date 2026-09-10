@@ -416,8 +416,9 @@ impl UpgradeDriver for FakeUpgradeHost {
     fn load_record(&self) -> Option<UpgradeRecord> {
         self.record.clone()
     }
-    fn store_record(&mut self, record: UpgradeRecord) {
+    fn store_record(&mut self, record: UpgradeRecord) -> Result<()> {
         self.record = Some(record);
+        Ok(())
     }
     fn secret(&self) -> Option<&str> {
         self.secret.as_deref()
@@ -438,7 +439,7 @@ impl UpgradeDriver for FakeUpgradeHost {
         self.set_current(Some(to.to_string()));
         Ok(())
     }
-    fn observe_convergence(&self) -> Result<Convergence> {
+    fn observe_convergence(&self) -> Result<ConvergenceVerdict> {
         let mut conv = Convergence::exact_ok();
         if !self.converge_exact {
             conv.exact = false;
@@ -448,7 +449,7 @@ impl UpgradeDriver for FakeUpgradeHost {
             conv.exact = false;
             conv.manifest_matches = false;
         }
-        Ok(conv)
+        Ok(conv.into())
     }
     fn run_canary(&self) -> Result<Canary> {
         Ok(Canary {
@@ -503,7 +504,7 @@ fn plan_lines(opts: &UpgradeOpts, from: Option<&str>, secret: Option<&str>) -> V
         .unwrap_or_else(|| format!("curie-{}", opts.to));
     let mut lines = vec![
         format!("phase plan: {from} -> {}", opts.to),
-        "phase validate: configuration overlay and schema compatibility".into(),
+        "phase validate: configuration overlay migration and pre-mutation refusals".into(),
         "phase drain: worker upgrade drain gate (issue 2010)".into(),
         "phase checkpoint: persist recoverable release state".into(),
         "phase migrate: one controlled schema migration".into(),
@@ -558,6 +559,17 @@ fn completed_output(
     }
 }
 
+/// Bound a fail-forward reason: the observer can report one line per unhealthy
+/// container, and the operator needs a reason, not a log dump.
+fn truncate_reason(detail: &str) -> String {
+    const LIMIT: usize = 600;
+    if detail.chars().count() <= LIMIT {
+        return detail.to_string();
+    }
+    let kept: String = detail.chars().take(LIMIT).collect();
+    format!("{kept}... (truncated; run `curie cluster status` for the full observation)")
+}
+
 fn fail_forward_for(opts: &UpgradeOpts, previous_serving: bool, reason: &str) -> FailForward {
     if previous_serving {
         FailForward {
@@ -584,7 +596,9 @@ trait UpgradeDriver {
     fn known_good(&self) -> Option<String>;
     fn set_known_good(&mut self, version: Option<String>);
     fn load_record(&self) -> Option<UpgradeRecord>;
-    fn store_record(&mut self, record: UpgradeRecord);
+    /// Persisting the checkpoint is part of the phase, not a side effect: a
+    /// lost checkpoint means the next run cannot resume (R5).
+    fn store_record(&mut self, record: UpgradeRecord) -> Result<()>;
     fn secret(&self) -> Option<&str> {
         None
     }
@@ -594,15 +608,27 @@ trait UpgradeDriver {
             None => text.to_string(),
         }
     }
+    /// A pre-mutation refusal carrying its own operator-facing detail, checked
+    /// before the two boolean gates below. [`LiveHost`] answers it; only
+    /// [`FakeUpgradeHost`] relies on the boolean defaults.
+    fn validate_refusal(&self) -> Option<String> {
+        None
+    }
     fn refuse_config(&self) -> bool {
         false
     }
     fn refuse_schema(&self) -> bool {
         false
     }
+    /// A fresh read of the version the release actually reports. Defaults to
+    /// the driver's own bookkeeping; [`LiveHost`] re-reads Helm so Commit
+    /// stamps known-good from a post-condition, never from the request.
+    fn observed_version(&self) -> Option<String> {
+        self.current()
+    }
     fn drain_once(&mut self) -> Result<bool>;
     fn apply_target(&mut self, to: &str) -> Result<()>;
-    fn observe_convergence(&self) -> Result<Convergence>;
+    fn observe_convergence(&self) -> Result<ConvergenceVerdict>;
     fn run_canary(&self) -> Result<Canary>;
     fn serving_previous(&self) -> bool;
     fn interrupt_after(&self) -> Option<UpgradePhase> {
@@ -683,19 +709,19 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             )
         {
             record.completed.push(phase);
-            host.store_record(record.clone());
+            host.store_record(record.clone())?;
             continue;
         }
         if phase == UpgradePhase::Drain && from.is_none() {
             record.completed.push(phase);
-            host.store_record(record.clone());
+            host.store_record(record.clone())?;
             continue;
         }
 
         match execute_phase(phase, &opts, host, &mut record)? {
             PhaseOutcome::Continue => {
                 record.completed.push(phase);
-                host.store_record(record.clone());
+                host.store_record(record.clone())?;
                 if host.interrupt_after() == Some(phase) {
                     bail!("interrupted after durable phase {}", phase.as_str());
                 }
@@ -710,7 +736,16 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
                         &format!("upgrade failed during {}", phase.as_str()),
                     ));
                 }
-                host.store_record(record.clone());
+                // Ruling 8.4: the phase failure is the verdict the operator
+                // must act on. A lost checkpoint here must travel beside it,
+                // never replace it -- raising with `?` would drop the
+                // structured output, the convergence payload and fail-forward.
+                if let Err(error) = host.store_record(record.clone()) {
+                    if let Some(forward) = record.fail_forward.as_mut() {
+                        forward.reason =
+                            format!("{}; {}", forward.reason, host.redact(&format!("{error:#}")));
+                    }
+                }
                 return Ok(completed_output(&record, previous, Some(phase)));
             }
         }
@@ -719,7 +754,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
     record.status = "succeeded".into();
     record.known_good_version = Some(opts.to.clone());
     host.set_known_good(Some(opts.to.clone()));
-    host.store_record(record.clone());
+    host.store_record(record.clone())?;
     Ok(completed_output(&record, true, None))
 }
 
@@ -740,6 +775,9 @@ fn execute_phase<H: UpgradeDriver>(
     match phase {
         UpgradePhase::Plan => Ok(PhaseOutcome::Continue),
         UpgradePhase::Validate => {
+            if let Some(detail) = host.validate_refusal() {
+                bail!("{detail}");
+            }
             if host.refuse_config() {
                 bail!("configuration compatibility check refused the overlay before mutation");
             }
@@ -770,9 +808,21 @@ fn execute_phase<H: UpgradeDriver>(
             Ok(PhaseOutcome::Continue)
         }
         UpgradePhase::Converge => {
-            let conv = host.observe_convergence()?;
-            record.convergence = Some(conv.clone());
-            if !conv.exact {
+            let verdict = host.observe_convergence()?;
+            record.convergence = Some(verdict.convergence.clone());
+            if !verdict.convergence.exact {
+                // Carry the observer's own text (including an unreadable
+                // cluster's recovery hint) instead of letting the generic
+                // "upgrade failed during converge" replace it.
+                if !verdict.issues.is_empty() {
+                    let detail = host.redact(&verdict.issues.join("; "));
+                    let detail = truncate_reason(&detail);
+                    record.fail_forward = Some(fail_forward_for(
+                        opts,
+                        host.serving_previous(),
+                        &format!("upgrade failed during converge: {detail}"),
+                    ));
+                }
                 return Ok(PhaseOutcome::Failed);
             }
             Ok(PhaseOutcome::Continue)
@@ -791,10 +841,72 @@ fn execute_phase<H: UpgradeDriver>(
             {
                 return Ok(PhaseOutcome::Failed);
             }
-            host.set_known_good(Some(opts.to.clone()));
-            record.known_good_version = Some(opts.to.clone());
+            // Ruling 8.11: known-good is a claim about what the cluster is
+            // serving, so it is stamped from a post-condition read of the
+            // release, never from the requested string.
+            let observed = host.observed_version();
+            if observed.as_deref() != Some(opts.to.as_str()) {
+                let previous = host.serving_previous();
+                record.fail_forward = Some(fail_forward_for(
+                    opts,
+                    previous,
+                    &format!(
+                        "the release reports {} at commit, not the requested {}",
+                        observed.as_deref().unwrap_or("no version"),
+                        opts.to
+                    ),
+                ));
+                return Ok(PhaseOutcome::Failed);
+            }
+            host.set_known_good(observed.clone());
+            record.known_good_version = observed;
             Ok(PhaseOutcome::Continue)
         }
+    }
+}
+
+/// A Converge verdict: the reported sub-flags plus the observer's own issue
+/// text. The text is not part of the `--json` convergence payload; it is what
+/// the Converge phase puts in `fail_forward.reason` so an actionable recovery
+/// string from the observer reaches the operator instead of being replaced by
+/// the generic "upgrade failed during converge".
+pub struct ConvergenceVerdict {
+    pub convergence: Convergence,
+    pub issues: Vec<String>,
+}
+
+impl From<Convergence> for ConvergenceVerdict {
+    fn from(convergence: Convergence) -> Self {
+        Self {
+            convergence,
+            issues: Vec::new(),
+        }
+    }
+}
+
+/// Map one convergence observation onto the reported sub-flags. Every field
+/// comes from a facet the observer genuinely determined; none is a literal.
+fn convergence_from(observation: &super::convergence::Observation) -> Convergence {
+    use super::convergence::Facet;
+    let replicas = observation.holds(Facet::Replicas);
+    Convergence {
+        // `exact` is the whole verdict: any issue at all, including a
+        // Rollout-facet one that no named flag covers, means not converged.
+        exact: observation.issues.is_empty() && !observation.terminal,
+        images: observation.holds(Facet::Image),
+        generations: observation.holds(Facet::Generation),
+        replicas,
+        // Its own facet, not an alias of `replicas`: a workload can be
+        // mid-rollout while `unavailableReplicas` is genuinely 0, and the
+        // --json contract presents these as independent observations.
+        unavailable_zero: observation.holds(Facet::Unavailable),
+        hooks_healthy: observation.holds(Facet::Hook),
+        // Ruling 13: the #2010 drain gate is a Helm pre-upgrade hook Job that
+        // fires during Apply, so Converge is the only phase that can see its
+        // verdict. `record.drain_completed` is the exactly-once flag, not a
+        // convergence fact, and is deliberately not consulted.
+        queues_drained: observation.holds(Facet::Drain),
+        manifest_matches: observation.holds(Facet::Manifest),
     }
 }
 
@@ -808,13 +920,141 @@ struct LiveHost {
     known_good: Option<String>,
     record: Option<UpgradeRecord>,
     secret: Option<String>,
+    /// The migrated retained overlay Apply hands Helm via `-f`, computed ONCE
+    /// before the lifecycle runs (Ruling 8.8): `refuse_config` takes `&self`,
+    /// and the overlay Apply applies must be the overlay Validate approved.
+    overlay: Option<String>,
+    /// Why the configuration migration refused, if it did (#2299, R7).
+    config_refusal: Option<String>,
+    /// Why the chart cannot install `--to`, if it cannot (Ruling 2, R1).
+    chart_refusal: Option<String>,
+}
+
+/// Ruling 2: Helm SILENTLY IGNORES `--version` for a local directory or
+/// packaged chart file -- it renders the chart on disk and says nothing. A
+/// `--version` there would be a pin that does nothing while looking like one,
+/// so a local chart is pinned by refusing before mutation when its own
+/// metadata is not `--to`, and only a ref Helm must resolve carries the flag.
+fn local_chart(chart: &str) -> bool {
+    std::path::Path::new(chart).exists()
 }
 
 impl LiveHost {
+    fn new(opts: UpgradeOpts) -> Self {
+        Self {
+            opts,
+            current: None,
+            known_good: None,
+            record: None,
+            secret: None,
+            overlay: None,
+            config_refusal: None,
+            chart_refusal: None,
+        }
+    }
+
     fn run(&self, cmd: &OpsCommand) -> Result<(bool, String, String)> {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(run_capture(cmd)))
     }
 
+    fn chart_ref(&self) -> String {
+        self.opts
+            .chart
+            .clone()
+            .unwrap_or_else(|| "charts/curie".to_string())
+    }
+
+    /// The version a LOCAL chart declares for itself. `None` for a ref Helm
+    /// resolves, which `--version` pins instead.
+    fn declared_chart_version(&self, chart: &str) -> Result<Option<String>> {
+        if !local_chart(chart) {
+            return Ok(None);
+        }
+        let cmd = OpsCommand::new(
+            "helm",
+            vec![plain("show"), plain("chart"), plain(chart.to_string())],
+        );
+        let (ok, out, err) = self.run(&cmd)?;
+        if !ok {
+            bail!("could not read chart metadata for {chart}: {}", err.trim());
+        }
+        let doc: serde_json::Value =
+            serde_norway::from_str(&out).context("chart metadata is malformed")?;
+        Ok(match doc.get("version") {
+            Some(serde_json::Value::String(version)) => Some(version.clone()),
+            Some(serde_json::Value::Number(version)) => Some(version.to_string()),
+            _ => None,
+        })
+    }
+
+    /// R1: the pre-mutation half of the target pin, for a local chart only.
+    fn chart_pin_refusal(&self) -> Option<String> {
+        let chart = self.chart_ref();
+        if !local_chart(&chart) {
+            return None;
+        }
+        let to = &self.opts.to;
+        match self.declared_chart_version(&chart) {
+            Ok(Some(version)) if version == *to => None,
+            Ok(Some(version)) => Some(format!(
+                "chart {chart} declares version {version}, so it cannot install the requested {to}; \
+                 point --chart at a chart whose version is {to}, or upgrade --to {version}"
+            )),
+            Ok(None) => Some(format!(
+                "chart {chart} declares no version, so --to {to} cannot be pinned"
+            )),
+            Err(error) => Some(format!("{error:#}")),
+        }
+    }
+
+    /// R7: read the retained overlay, migrate it (#2299) and keep the result.
+    /// `Ok(None)` means nothing was retained -- a first install.
+    fn retained_overlay(&self) -> Result<Option<String>> {
+        let values_cmd = OpsCommand::new(
+            "helm",
+            vec![
+                plain("get"),
+                plain("values"),
+                plain(&self.opts.common.release),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-o"),
+                plain("yaml"),
+            ],
+        );
+        let (ok, out, err) = self.run(&values_cmd)?;
+        if !ok {
+            // Fail closed exactly like `cluster up` (`up.rs`
+            // `helm_release_is_absent`): only Helm positively reporting that the
+            // release does not exist means "nothing retained". Any other stderr
+            // that merely mentions "not found" leaves the release state unknown,
+            // and treating it as absent would run `helm upgrade` with no `-f`,
+            // silently dropping every retained operator value.
+            if super::verbs::failure_reason(&err) != "Error: release: not found" {
+                bail!("could not read retained helm values: {}", err.trim());
+            }
+            return Ok(None);
+        }
+        if out.trim().is_empty() {
+            return Ok(None);
+        }
+        let values: serde_json::Value =
+            serde_norway::from_str(&out).context("retained helm values are malformed")?;
+        // Unlike `up.rs`, the installed chart version is known here, so
+        // `infer_schema_version` is not guessing when the overlay predates
+        // `config.schemaVersion`.
+        let outcome =
+            crate::config_migrate::migrate_installed_config(values, self.current.as_deref())?;
+        Ok(Some(
+            serde_norway::to_string(&outcome.values)
+                .context("could not serialize the migrated overlay")?,
+        ))
+    }
+
+    /// The chart version the release reports. `scripts/check-version-consistency.sh`
+    /// is required on every PR and release and asserts Chart.yaml `version` ==
+    /// `appVersion` == the CLI version, so this one field is the whole answer
+    /// and no appVersion branch is needed (driver Ruling 1).
     fn inspect_version(&self) -> Option<String> {
         let cmd = OpsCommand::new(
             "helm",
@@ -902,46 +1142,28 @@ impl LiveHost {
     }
 
     fn helm_upgrade(&self, to: &str) -> Result<()> {
-        let chart = self
-            .opts
-            .chart
-            .clone()
-            .unwrap_or_else(|| "charts/curie".to_string());
-        let values_cmd = OpsCommand::new(
-            "helm",
-            vec![
-                plain("get"),
-                plain("values"),
-                plain(&self.opts.common.release),
-                plain("-n"),
-                plain(&self.opts.common.namespace),
-                plain("-o"),
-                plain("yaml"),
-            ],
-        );
-        let tmp = tempfile::NamedTempFile::new().context("upgrade values tempfile")?;
-        let (ok, out, err) = self.run(&values_cmd)?;
-        if ok && !out.trim().is_empty() {
-            std::fs::write(tmp.path(), out)?;
-        } else if !ok {
-            let missing = err.to_lowercase();
-            if !missing.contains("not found") && !missing.contains("release: not found") {
-                bail!("could not read retained helm values: {}", err.trim());
-            }
-        }
+        let chart = self.chart_ref();
         let mut args = vec![
             plain("upgrade"),
             plain(&self.opts.common.release),
-            plain(chart),
+            plain(chart.clone()),
             plain("-n"),
             plain(&self.opts.common.namespace),
             plain("--wait"),
         ];
+        if !local_chart(&chart) {
+            // A ref Helm resolves IS pinned by `--version`; a local path is
+            // pinned by `chart_pin_refusal` before this ever runs.
+            args.push(plain("--version"));
+            args.push(plain(to));
+        }
         if self.current.is_none() {
             args.push(plain("--install"));
             args.push(plain("--create-namespace"));
         }
-        if tmp.path().exists() && tmp.path().metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+        let tmp = tempfile::NamedTempFile::new().context("upgrade values tempfile")?;
+        if let Some(overlay) = &self.overlay {
+            std::fs::write(tmp.path(), overlay)?;
             args.push(plain("-f"));
             args.push(plain(tmp.path().to_string_lossy().into_owned()));
         }
@@ -953,64 +1175,30 @@ impl LiveHost {
         Ok(())
     }
 
-    fn live_convergence(&self) -> Result<Convergence> {
-        let cmd = OpsCommand::new(
-            "kubectl",
-            vec![
-                plain("get"),
-                plain("deploy,sts,ds"),
-                plain("-n"),
-                plain(&self.opts.common.namespace),
-                plain("-o"),
-                plain("json"),
-            ],
-        );
-        let (ok, out, err) = self.run(&cmd)?;
-        if !ok {
-            bail!("could not read workload status: {}", err.trim());
-        }
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::json!({}));
-        let items = v
-            .get("items")
-            .and_then(|i| i.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut replicas_ok = !items.is_empty();
-        let mut unavailable_zero = true;
-        for item in &items {
-            let status = item.get("status").cloned().unwrap_or(serde_json::json!({}));
-            let spec = item.get("spec").cloned().unwrap_or(serde_json::json!({}));
-            let desired = spec.get("replicas").and_then(|n| n.as_u64()).unwrap_or(1);
-            let ready = status
-                .get("readyReplicas")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0);
-            let updated = status
-                .get("updatedReplicas")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(ready);
-            let unavailable = status
-                .get("unavailableReplicas")
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0);
-            if ready != desired || updated != desired {
-                replicas_ok = false;
-            }
-            if unavailable != 0 {
-                unavailable_zero = false;
-            }
-        }
-        let mut conv = Convergence::exact_ok();
-        conv.replicas = replicas_ok;
-        conv.unavailable_zero = unavailable_zero;
-        conv.exact = conv.replicas && conv.unavailable_zero && conv.manifest_matches;
-        Ok(conv)
+    /// R3: the integrated observer answers this, not a hand-rolled
+    /// `kubectl get deploy,sts,ds` read. `super::convergence` compares live
+    /// containers, generations, replicas, selectors and Helm hooks against
+    /// Helm's own retained target manifest; every sub-flag below is derived
+    /// from the facet that observation genuinely disproved.
+    fn live_convergence(&self) -> Result<ConvergenceVerdict> {
+        let observation = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(super::convergence::wait_for_observation(&self.opts.common))
+        });
+        Ok(ConvergenceVerdict {
+            convergence: convergence_from(&observation),
+            issues: observation.issues.clone(),
+        })
     }
 
     fn live_canary(&self) -> Result<Canary> {
-        let conv = self.live_convergence()?;
+        // R4: re-read here. Apply already set `current` from its own
+        // post-condition read, so comparing against `current` would be a
+        // self-comparison, and the release can move between the two phases.
+        // Convergence is not re-observed: the Converge phase has already
+        // failed the run unless it was exact.
         Ok(Canary {
-            passed: conv.exact && self.current.as_deref() == Some(self.opts.to.as_str()),
+            passed: self.inspect_version().as_deref() == Some(self.opts.to.as_str()),
         })
     }
 
@@ -1050,19 +1238,43 @@ impl UpgradeDriver for LiveHost {
     fn load_record(&self) -> Option<UpgradeRecord> {
         self.record.clone()
     }
-    fn store_record(&mut self, record: UpgradeRecord) {
+    fn store_record(&mut self, record: UpgradeRecord) -> Result<()> {
         self.record = Some(record.clone());
-        let _ = self.persist_record(&record);
+        self.persist_record(&record)
+    }
+    fn validate_refusal(&self) -> Option<String> {
+        self.chart_refusal
+            .clone()
+            .or_else(|| self.config_refusal.clone())
+    }
+    fn refuse_config(&self) -> bool {
+        self.config_refusal.is_some()
+    }
+    fn observed_version(&self) -> Option<String> {
+        self.inspect_version()
     }
     fn drain_once(&mut self) -> Result<bool> {
         self.live_drain()
     }
     fn apply_target(&mut self, to: &str) -> Result<()> {
         self.helm_upgrade(to)?;
-        self.set_current(Some(to.to_string()));
-        Ok(())
+        // R2: what the release reports, not what was requested, is what was
+        // installed. Helm can exit 0 on a revision that never moved.
+        let observed = self.inspect_version();
+        match observed.as_deref() {
+            Some(version) if version == to => {
+                self.set_current(observed);
+                Ok(())
+            }
+            Some(version) => bail!(
+                "helm upgrade to {to} reported success, but the release still reports {version}"
+            ),
+            None => {
+                bail!("helm upgrade to {to} reported success, but the release reports no version")
+            }
+        }
     }
-    fn observe_convergence(&self) -> Result<Convergence> {
+    fn observe_convergence(&self) -> Result<ConvergenceVerdict> {
         self.live_convergence()
     }
     fn run_canary(&self) -> Result<Canary> {
@@ -1081,13 +1293,7 @@ impl UpgradeDriver for LiveHost {
 pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
     if opts.common.dry_run {
         require_on_path("helm").ok();
-        let mut live = LiveHost {
-            opts: opts.clone(),
-            current: None,
-            known_good: None,
-            record: None,
-            secret: None,
-        };
+        let mut live = LiveHost::new(opts.clone());
         live.current = live.inspect_version();
         live.known_good = live.current.clone();
         return run_lifecycle_inner(opts, &mut live).await;
@@ -1105,13 +1311,7 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         bail!("upgrade aborted");
     }
 
-    let mut live = LiveHost {
-        opts: opts.clone(),
-        current: None,
-        known_good: None,
-        record: None,
-        secret: None,
-    };
+    let mut live = LiveHost::new(opts.clone());
     live.current = live.inspect_version();
     live.record = live.load_record();
     live.known_good = live
@@ -1119,6 +1319,13 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         .as_ref()
         .and_then(|r| r.known_good_version.clone())
         .or_else(|| live.current.clone());
+    // Both pre-mutation refusals are computed ONCE, here, before any phase
+    // runs (Ruling 8.8). Apply then hands Helm exactly this overlay.
+    live.chart_refusal = live.chart_pin_refusal();
+    match live.retained_overlay() {
+        Ok(overlay) => live.overlay = overlay,
+        Err(error) => live.config_refusal = Some(format!("{error:#}")),
+    }
     run_lifecycle_inner(opts, &mut live).await
 }
 

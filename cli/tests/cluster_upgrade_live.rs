@@ -52,7 +52,11 @@ impl Fixture {
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         if let Some(retained) = retained {
-            fs::write(temp.path().join("retained.json"), retained).unwrap();
+            fs::write(
+                temp.path().join("retained.json"),
+                strip_annotation(retained),
+            )
+            .unwrap();
         }
         Self(temp)
     }
@@ -191,6 +195,44 @@ impl Fixture {
             .pop()
             .unwrap_or_else(|| panic!("no checkpoint record was ever persisted"))
     }
+}
+
+/// Drop the `_fixture` block the committed overlays carry.
+///
+/// It is harness annotation -- provenance prose naming the released chart and
+/// the migration class under test -- not Helm values, and `config_migrate.rs`
+/// removes it the same way before migrating. A real release never retains it,
+/// so feeding it to the fake `helm get values` would put prose (including the
+/// very env-var names these tests assert are gone) into the `-f` payload and
+/// make whole-file assertions lie in both directions.
+fn strip_annotation(retained: &str) -> String {
+    match serde_json::from_str::<Value>(retained) {
+        Ok(Value::Object(mut map)) => {
+            map.remove("_fixture");
+            serde_json::to_string(&Value::Object(map)).unwrap()
+        }
+        _ => retained.to_owned(),
+    }
+}
+
+/// The `-f` document helm was handed, parsed. Helm values are YAML, and JSON is
+/// YAML, so this reads whichever the migration emits. Structural assertions
+/// beat substring ones here: `extraEnv` promotion has to be judged on the list
+/// itself, not on whether a name appears anywhere in the file.
+fn values_doc(raw: &str) -> Value {
+    serde_norway::from_str(raw).unwrap_or_else(|error| panic!("values payload ({error}): {raw}"))
+}
+
+/// Every `name` across all four `extraEnv` lists the migration walks.
+fn extra_env_names(values: &Value) -> Vec<String> {
+    ["worker", "api", "dispatcher"]
+        .iter()
+        .map(|owner| format!("/{owner}/extraEnv"))
+        .chain(std::iter::once("/agentSandbox/runner/extraEnv".to_string()))
+        .filter_map(|pointer| values.pointer(&pointer)?.as_array())
+        .flatten()
+        .filter_map(|entry| entry.get("name")?.as_str().map(ToOwned::to_owned))
+        .collect()
 }
 
 fn stdout(output: &Output) -> String {
@@ -715,21 +757,22 @@ fn retained_values_are_migrated_before_helm_sees_them() {
         stdout(&output),
         stderr(&output)
     );
-    let values = fixture.values(1);
-    assert!(
-        values.contains("runnerTotalTimeoutSeconds"),
-        "legacy extraEnv must become the first-class key: {values}"
+    let values = values_doc(&fixture.values(1));
+    assert_eq!(
+        values.pointer("/worker/runnerTotalTimeoutSeconds"),
+        Some(&serde_json::json!(120)),
+        "legacy extraEnv must become the first-class key, carrying the operator's own value: {values}"
     );
     assert!(
-        !values.contains("CURIE_RUNNER_TOTAL_TIMEOUT_S"),
-        "the migrated extraEnv entry must not survive: {values}"
+        !extra_env_names(&values).contains(&"CURIE_RUNNER_TOTAL_TIMEOUT_S".to_string()),
+        "the promoted entry must be gone from every extraEnv list: {values}"
     );
     assert!(
-        values.contains("PROVIDER_BASE_URL"),
+        extra_env_names(&values).contains(&"PROVIDER_BASE_URL".to_string()),
         "an unrelated operator override must survive the merge: {values}"
     );
     assert!(
-        values.contains("schemaVersion"),
+        values.pointer("/config/schemaVersion").is_some(),
         "the migrated overlay must persist the configuration schema version: {values}"
     );
 }
@@ -740,13 +783,19 @@ fn retained_values_are_migrated_before_helm_sees_them() {
 fn external_secret_references_survive_byte_for_byte() {
     let fixture = Fixture::new(Some(V084));
     fixture.local("healthy");
-    let values = fixture.values(1);
-    assert!(
-        values.contains("acme-slack") && values.contains("botTokenExistingSecretKey"),
-        "the external Secret name and key must survive unchanged: {values}"
+    let values = values_doc(&fixture.values(1));
+    assert_eq!(
+        values.pointer("/dispatcher/slack/botTokenExistingSecret"),
+        Some(&Value::String("acme-slack".into())),
+        "the external Secret name must survive byte-for-byte: {values}"
+    );
+    assert_eq!(
+        values.pointer("/dispatcher/slack/botTokenExistingSecretKey"),
+        Some(&Value::String("botToken".into())),
+        "the external Secret key must survive byte-for-byte: {values}"
     );
     assert!(
-        !values.contains(SLACK_TOKEN),
+        !fixture.values(1).contains(SLACK_TOKEN),
         "an inline credential must never be restored beside its Secret ref: {values}"
     );
 }
@@ -767,7 +816,9 @@ fn resumed_upgrade_remigrates_its_own_output_without_change() {
     let first = fixture.local("healthy");
     let once = fixture.values(1);
     assert!(
-        once.contains("runnerTotalTimeoutSeconds"),
+        values_doc(&once)
+            .pointer("/worker/runnerTotalTimeoutSeconds")
+            .is_some(),
         "the first run must actually have migrated something: {once} / {}",
         stderr(&first)
     );
