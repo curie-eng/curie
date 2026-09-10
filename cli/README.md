@@ -731,6 +731,7 @@ release binary has no dev scripts.
 | `curie dev emit-parity` | `bash cli/scripts/check-emit-parity.sh` -- assert a `CliOutput::to_json` that hand-projects a mirror struct into a `json!` literal covers that struct's fields, one hop downstream of `field-parity` (#699). |
 | `curie dev wire-tolerance` | `bash scripts/check-wire-tolerance.sh` -- assert every direct `ClassName.model_validate*(...)` call on an `_AciModel` subclass threads `READER_CONTEXT` or is a declared exception (#625). |
 | `curie dev restore-drill` | `bash cli/scripts/restore-drill.sh` -- bounded synthetic restore of postgres, bundles, mail SQLite, and Valkey from a disposable compose install onto a distinct target (#2427). `--check-backup` is the completeness guard; `--negative` omits a required component and expects refusal. Not an RPO/RTO claim or a production backup product. |
+| `curie dev upgrade-drill` | `bash cli/scripts/upgrade-drill.sh` -- isolated retained-upgrade drill (#2426): published v0.8.6 CLI/chart/images on a task-owned kind install, candidate CLI upgrade, drain/apply interrupt recovery, leftover-hook non-quiesce, compatible rollback that serves a new turn, and incompatible 0.8.4 schema rollback refused before Helm mutates. `--also-predecessor` adds the published v0.8.7 happy path. Refuses the permanent soak. Live provider/channel rows fail closed when credential references are absent. |
 
 Use `curie dev verify-fix-pin <CHANGE> <SELECTOR>` from a source checkout to
 verify a fix commit or pull request. `<CHANGE>` accepts a committed change
