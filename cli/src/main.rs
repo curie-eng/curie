@@ -2919,6 +2919,27 @@ async fn main() {
         std::process::exit(curie::exit::ExitClass::Usage.code());
     }
 
+    if let Some(err) = curie::message::reject_agent_named_message(&args) {
+        // Clap's default extra-positional error fires before `Ui` exists, so
+        // this intercept has to emit the ADR-0021 `{error, fix}` payload (and
+        // the human Error:/Fix: pair) itself. `--json` is global and may sit
+        // anywhere in argv.
+        let json = args.iter().any(|arg| arg == "--json");
+        let (class, fix) = curie::exit::classify(&err);
+        if json {
+            let payload = curie::exit::error_json(&err);
+            if let Ok(line) = serde_json::to_string(&payload) {
+                println!("{line}");
+            }
+        } else {
+            eprintln!("Error: {err}");
+            if let Some(fix) = fix {
+                eprintln!("Fix: {fix}");
+            }
+        }
+        std::process::exit(class.code());
+    }
+
     let cli = Cli::parse();
     ui::init(Ui::from_process(cli.color, cli.debug, cli.quiet, cli.json));
     // main never returns Err (which would give anyhow's default exit 1 and skip

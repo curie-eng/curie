@@ -142,6 +142,142 @@ fn resolve_supplied_credential(raw: &str, env_value: Option<String>) -> String {
         .unwrap_or_default()
 }
 
+/// Flags on `local message` / `cluster message` that consume a following value.
+/// Keep in sync with the clap declarations in `main.rs`; a new value-taking
+/// flag added there must be added here or a `--flag <value>` pair is counted
+/// as a positional and the two-positional trap fires on a valid invocation.
+const MESSAGE_VALUE_FLAGS: &[&str] = &[
+    "--channel",
+    "--thread",
+    "--namespace",
+    "--release",
+    "--chart",
+    "--listen-host",
+    "--listen-port",
+    "--valkey-local-port",
+    "--valkey-password",
+    "--api-local-port",
+    "--api-key",
+    "--user",
+    "--stream",
+    "--timeout-secs",
+    "--api-url",
+    "--color",
+];
+
+/// Boolean flags that may appear on the message verbs, including globals.
+const MESSAGE_BOOL_FLAGS: &[&str] = &[
+    "--continue",
+    "--dry-run",
+    "--json",
+    "--debug",
+    "--quiet",
+    "-q",
+    "--help",
+    "-h",
+    "--version",
+    "-V",
+];
+
+/// Detect the two-positional `local|cluster message <agent> <text>` shape
+/// copied from sibling verbs that take `<AGENT>` first (#2498).
+///
+/// Returns a usage error naming the existing `--channel` routing model. Does
+/// not invent an agent-name routing API.
+pub fn reject_agent_named_message(args: &[String]) -> Option<anyhow::Error> {
+    let rest = skip_global_flags(args);
+    let tier = rest.first().map(String::as_str)?;
+    if tier != "local" && tier != "cluster" {
+        return None;
+    }
+    // Globals (`--json`, `--debug`, ...) may sit between the target and the
+    // verb because they are `global = true` on `Cli`.
+    let after_tier = skip_global_flags(&rest[1..]);
+    if after_tier.first().map(String::as_str) != Some("message") {
+        return None;
+    }
+    if message_positional_count(&after_tier[1..]) < 2 {
+        return None;
+    }
+    let verb = format!("{tier} message");
+    let siblings = format!("`{tier} versions`, `{tier} kill`, and `{tier} delete`");
+    Some(anyhow::Error::from(
+        crate::exit::CliError::usage(format!(
+            "`curie {verb}` does not take an agent name. The two-positional form \
+             <AGENT> <TEXT> is the shape of {siblings}, not this verb."
+        ))
+        .with_fix(format!(
+            "Pass only the message text. Route with `--channel <CHANNEL>`, or omit \
+             `--channel` when exactly one channel is bound. Example: `curie {verb} \
+             'Who are you?'`"
+        )),
+    ))
+}
+
+/// Skip the `global = true` flags on `Cli` (debug, quiet, color, json) so the
+/// subcommand token is the first remaining argument. Keep in sync with
+/// `retired::retired_hint` plus `--json`.
+fn skip_global_flags(args: &[String]) -> &[String] {
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--debug" | "-q" | "--quiet" | "--json" => {
+                index += 1;
+            }
+            "--color" => {
+                index += 1;
+                if index < args.len() && !args[index].starts_with('-') {
+                    index += 1;
+                }
+            }
+            token if token.starts_with("--color=") => {
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+    &args[index..]
+}
+
+fn message_positional_count(args: &[String]) -> usize {
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while index < args.len() {
+        let token = args[index].as_str();
+        if token == "--" {
+            return count + args.len().saturating_sub(index + 1);
+        }
+        if let Some(rest) = token.strip_prefix("--") {
+            if rest.contains('=') {
+                index += 1;
+                continue;
+            }
+            if MESSAGE_VALUE_FLAGS.contains(&token) {
+                index += 1;
+                if index < args.len() && !args[index].starts_with('-') {
+                    index += 1;
+                }
+                continue;
+            }
+            if MESSAGE_BOOL_FLAGS.contains(&token) {
+                index += 1;
+                continue;
+            }
+            // Unknown long option: leave it as a flag so clap still owns
+            // unknown-flag errors when only one text token remains.
+            index += 1;
+            continue;
+        }
+        if matches!(token, "-q" | "-h" | "-V") {
+            index += 1;
+            continue;
+        }
+        count += 1;
+        index += 1;
+    }
+    count
+}
+
 /// Resolve one cluster-tier credential: an explicit flag/env value wins,
 /// otherwise read it from the release (issue #786).
 ///
@@ -7499,5 +7635,83 @@ mod tests {
             "{err:#}"
         );
         assert!(format!("{err:#}").contains("greets-the-usr"), "{err:#}");
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn reject_agent_named_message_fires_on_the_issue_2498_argv() {
+        let err = reject_agent_named_message(&argv(&[
+            "cluster",
+            "message",
+            "acme-bot",
+            "Who are you? Reply with the plugin name.",
+            "--namespace",
+            "curie",
+            "--release",
+            "curie",
+        ]))
+        .expect("two positionals must be a usage error");
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        let shown = format!("{err:#}");
+        assert!(shown.contains("does not take an agent name"), "{shown}");
+        assert!(shown.contains("<AGENT>"), "{shown}");
+        let fix = fix.expect("fix must name --channel");
+        assert!(fix.contains("--channel"), "{fix}");
+        assert!(fix.contains("exactly one channel"), "{fix}");
+    }
+
+    #[test]
+    fn reject_agent_named_message_ignores_single_text_continue_and_channel() {
+        for parts in [
+            &["cluster", "message", "Who are you?"][..],
+            &["cluster", "message", "--continue", "what's 2 + 2?"],
+            &[
+                "cluster",
+                "message",
+                "--channel",
+                "C0EXAMPLE1",
+                "Who are you?",
+            ],
+            &["local", "message", "Who are you?", "--dry-run"],
+            &["cluster", "versions", "acme-bot"],
+            &["cluster", "versions", "acme-bot", "extra"],
+            &["skill", "message", "acme-bot", "Who are you?"],
+        ] {
+            assert_eq!(
+                reject_agent_named_message(&argv(parts)).map(|err| format!("{err:#}")),
+                None,
+                "must not reject {parts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_agent_named_message_sees_json_before_the_verb() {
+        let err = reject_agent_named_message(&argv(&[
+            "--json",
+            "local",
+            "message",
+            "acme-bot",
+            "Who are you?",
+        ]))
+        .expect("global --json must not hide the two-positional trap");
+        assert!(format!("{err:#}").contains("local message"), "{err:#}");
+    }
+
+    #[test]
+    fn reject_agent_named_message_sees_json_between_target_and_verb() {
+        let err = reject_agent_named_message(&argv(&[
+            "cluster",
+            "--json",
+            "message",
+            "acme-bot",
+            "Who are you?",
+        ]))
+        .expect("global --json between target and verb must not hide the trap");
+        assert!(format!("{err:#}").contains("cluster message"), "{err:#}");
     }
 }
