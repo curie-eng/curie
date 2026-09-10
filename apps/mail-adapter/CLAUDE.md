@@ -50,6 +50,9 @@ the enforceable-rule summary.
 - **Admission is bounded before state or body allocation.** At the pending or
   state-byte cap, leave provider mail unclaimed and unmodified so later capacity
   can recover it. Never evict an unresolved delivery merely to admit a newer one.
+  Terminal `completion_events` (`delivered=1` or `deleted=1`) are compacted
+  oldest-first under the derived cap; unresolved and leased completion rows are
+  never evicted to make room.
 - **Logs carry no raw mail PII.** Do not log sender addresses, subjects, bodies,
   provider message/thread ids, or reply text. Use a one-way correlation token
   and a reason/state label so operators can join retries without copying mail

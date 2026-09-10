@@ -133,7 +133,7 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_MAIL_MAX_PENDING_DELIVERIES` | `1000` | maximum unresolved inbound deliveries admitted to SQLite; capacity refusal leaves provider mail recoverable |
 | `CURIE_MAIL_MAX_BODY_BYTES` | `1048576` | maximum provider message body read or stored, in bytes |
 | `CURIE_MAIL_MAX_REPLY_BYTES` | `1048576` | maximum accumulated outbound reply, in bytes |
-| `CURIE_MAIL_MAX_STATE_BYTES` | `268435456` | maximum SQLite page budget; size the volume above this for the WAL and filesystem overhead |
+| `CURIE_MAIL_MAX_STATE_BYTES` | `268435456` | maximum SQLite page budget; size the volume above this for the WAL and filesystem overhead. Terminal `completion_events` rows (`delivered=1` or `deleted=1`, not both-required) are compacted oldest-first under the same derived ceiling as terminal receipts (at most 4096, and at most one quarter of the page budget). Unresolved and leased completion rows are never evicted to admit newer mail. A late duplicate whose row was evicted and whose provider marker is gone resends; keep the cap above the worker's 7-day completion retention if that duplicate must not fire |
 | `CURIE_MAIL_ALLOWED_SENDERS` | "" | the allow-list above. Required while ingress is enabled |
 
 ### Boot gates
@@ -248,6 +248,19 @@ instead of deleting state to make an old image boot.
 There is no selective erase command. For complete erasure, stop the adapter,
 delete its PVC and every snapshot/backup, and start with a new claim, accepting
 that the next start is a first boot and primes the current inbox.
+
+A file already larger than `CURIE_MAIL_MAX_STATE_BYTES` (typically after
+lowering the cap; `PRAGMA max_page_count` already clamps organic growth) refuses
+to boot. Deleting rows does not shrink `st_size`. Recover an offline copy with
+no manual SQL, then swap it in while the adapter is stopped:
+
+```bash
+python -m curie_mail_adapter recover --state /path/to/copy.sqlite3
+```
+
+Do not point recover at a live writer. The command compacts terminal
+completions, VACUUMs the copy, and exits 0 only when the file is under the byte
+budget.
 
 ## Run it
 
