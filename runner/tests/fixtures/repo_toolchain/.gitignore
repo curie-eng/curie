@@ -1,0 +1,4 @@
+.venv/
+.wheels/
+__pycache__/
+*.pyc

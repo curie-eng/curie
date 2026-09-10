@@ -191,7 +191,13 @@ testpaths = [
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-extend-exclude = ["prototypes"]
+# runner/tests/fixtures/repo_toolchain stands in for a FOREIGN repository that a
+# managed sandbox checks out. Its formatting, its pinned dependency and its
+# deliberately seeded defect belong to that repository's own fictional owner, so
+# holding it to this repository's lint rules would be wrong twice over: it would
+# make the stand-in unrepresentative, and ruff would "fix" the very defect the
+# red -> green -> red proof observes.
+extend-exclude = ["prototypes", "runner/tests/fixtures/repo_toolchain"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
