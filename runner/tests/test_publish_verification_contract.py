@@ -11,6 +11,13 @@ coder operates in an arbitrary target repository, so the contract must make it
 run that repository's documented check and report the observable result
 in-thread. The publication instruction is the final boundary; verification
 language after it would be too late to guide the coder.
+
+The assertions below are deliberately **sentence-scoped**: each rule-bearing
+regex uses ``[^.]`` spans so it cannot be satisfied by a neighbouring sentence.
+An earlier revision used loose cross-sentence spans (``.{0,140}``), and a
+mutation sweep showed three rules were not actually pinned -- deleting them left
+the test green because an adjacent sentence supplied the matched words. The
+mutation classes each assertion must kill are named alongside it.
 """
 
 import re
@@ -49,33 +56,51 @@ def test_publication_description_requires_a_reported_verification_first() -> Non
         verification_text,
         flags=re.IGNORECASE,
     ), "the repository command must explicitly run from /workspace"
+    # Kills: weakening the reporting triple to fewer than all three fields.
     assert re.search(
-        r"exact command.{0,60}exit status.{0,60}result",
+        r"exact command[^.]{0,60}exit status[^.]{0,60}result",
         verification_text,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=re.IGNORECASE,
     ), "the command, its exit status, and its result must all be reported"
     assert "thread" in verification_text.casefold()
 
+    # Kills: dropping the negation ("...report that and do publish"). The span
+    # is sentence-local so the neighbouring failure sentence cannot supply the
+    # missing "do not publish".
     assert re.search(
         r"cannot\s+identify\s+or\s+run\s+an?\s+appropriate\s+command"
-        r".{0,120}(?:do\s+not|must\s+not|never)\s+publish",
+        r"[^.]{0,80}(?:do\s+not|must\s+not|never)\s+publish",
         verification_text,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=re.IGNORECASE,
     ), "inability to identify or run a command must prevent publication"
+    # Kills: replacing the whole failure rule with a softer one ("If the command
+    # fails, note it."). Sentence-local, so the cannot-identify sentence and the
+    # artifacts sentence cannot stand in for it.
     assert re.search(
-        r"(?:fail(?:s|ed|ure|ing)?|non[- ]zero).{0,140}"
+        r"(?:fail(?:s|ed|ure|ing)?|non[- ]zero)[^.]{0,80}"
         r"(?:do not|must not|never)\s+publish",
         verification_text,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=re.IGNORECASE,
     ), "a failed verification must prevent publication"
+    # Kills: dropping the unrequested-artifact prohibition.
     assert re.search(
         r"verification\s+generates\s+artifacts?"
-        r".{0,140}(?:do\s+not|must\s+not|never)\s+publish\s+unrequested\s+artifacts?",
+        r"[^.]{0,80}(?:do\s+not|must\s+not|never)\s+publish\s+unrequested\s+artifacts?",
         verification_text,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=re.IGNORECASE,
     ), "verification artifacts must not publish unrequested artifacts"
+    # Kills: generalising the cleanup route away from the repository's own
+    # documented procedure ("use a cleanup procedure when one exists and ..."),
+    # and dropping the only-what-this-verification-created restriction. Both
+    # clauses live in one sentence, so they are pinned by one sentence-local
+    # regex rather than two independent word searches.
     assert re.search(
+        r"use\s+the\s+repository(?:'s)?\s+documented\s+cleanup\s+procedure"
+        r"\s+when\s+one\s+exists[^.]{0,120}"
         r"only\s+artifacts?\s+this\s+verification\s+created",
         verification_text,
         flags=re.IGNORECASE,
-    ), "cleanup must not remove requested or unrelated work"
+    ), (
+        "cleanup must go through the repository's own documented procedure and "
+        "must not remove requested or unrelated work"
+    )
