@@ -925,6 +925,27 @@ class WorkerConfig(BaseSettings):
     workspace_max_concurrent_clones: int = Field(
         default=2, gt=0, validation_alias="CURIE_WORKSPACE_MAX_CONCURRENT_CLONES"
     )
+    # The inbound-attachment lane's resource envelope (#2567). These are the
+    # operator's handles on ``AttachmentLimits``, whose own defaults these
+    # literals mirror -- the chart templates the same three numbers into the
+    # worker's env AND into the sandbox's attachments-init size cap, so the two
+    # sides are compared by apps/worker/tests/test_config.py and by
+    # charts/curie/ci/attachment-init-assertions.sh rather than trusted to stay
+    # aligned. Every bound is gt=0 for the reason AttachmentLimits refuses a
+    # zero: a zero cap silently read as "unlimited" is how a bounded ingestion
+    # path stops being bounded, and a zero TTL mints an already-expired
+    # capability.
+    attachment_max_file_bytes: int = Field(
+        default=32 * 1024 * 1024,
+        gt=0,
+        validation_alias="CURIE_ATTACHMENT_MAX_FILE_BYTES",
+    )
+    attachment_reference_ttl_seconds: int = Field(
+        default=300, gt=0, validation_alias="CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS"
+    )
+    attachment_retention_ttl_seconds: int = Field(
+        default=3600, gt=0, validation_alias="CURIE_ATTACHMENT_RETENTION_TTL_SECONDS"
+    )
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
     publication_enabled: bool = Field(

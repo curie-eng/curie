@@ -17,6 +17,8 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+import yaml
+from curie_worker.attachments import AttachmentLimits
 from curie_worker.config import WorkerConfig
 from pydantic import AliasChoices, ValidationError
 
@@ -1283,3 +1285,92 @@ def test_deliberately_blank_installation_id_keeps_the_legacy_key(
     assert config.installation_id == ""
     assert config.upgrade_revision == 9
     assert config.upgrade_quiesce_key() == "test:standalone:upgrade:quiesce"
+
+
+# --- the inbound attachment lane's resource envelope (#2567, S4) -----------
+#
+# The lane's own defaults live in ``AttachmentLimits``; these fields are how an
+# operator moves them. They are asserted AGAINST that dataclass rather than
+# against literals, because two independently written copies of "32 MiB" is
+# exactly how a chart override silently stops matching the code it configures.
+
+
+def test_attachment_fields_default_to_the_lanes_own_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+
+    config = WorkerConfig()
+    default = AttachmentLimits()
+
+    assert config.attachment_max_file_bytes == default.max_file_bytes
+    assert config.attachment_reference_ttl_seconds == default.reference_ttl_seconds
+    assert config.attachment_retention_ttl_seconds == default.retention_ttl_seconds
+
+
+def test_attachment_fields_read_only_their_curie_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chart templates these as first-class env; a name drift here means an
+    operator's --set silently does nothing. The bare field names are set to
+    decoy values so ``populate_by_name`` cannot satisfy the assertions."""
+    _clear_all_config_env(monkeypatch)
+    for name in (
+        "ATTACHMENT_MAX_FILE_BYTES",
+        "ATTACHMENT_REFERENCE_TTL_SECONDS",
+        "ATTACHMENT_RETENTION_TTL_SECONDS",
+    ):
+        monkeypatch.setenv(name, "999999")
+    monkeypatch.setenv("CURIE_ATTACHMENT_MAX_FILE_BYTES", "8388608")
+    monkeypatch.setenv("CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS", "120")
+    monkeypatch.setenv("CURIE_ATTACHMENT_RETENTION_TTL_SECONDS", "900")
+
+    config = WorkerConfig()
+
+    assert config.attachment_max_file_bytes == 8388608
+    assert config.attachment_reference_ttl_seconds == 120
+    assert config.attachment_retention_ttl_seconds == 900
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"attachment_max_file_bytes": 0},
+        {"attachment_max_file_bytes": -1},
+        {"attachment_reference_ttl_seconds": 0},
+        {"attachment_retention_ttl_seconds": 0},
+    ],
+)
+def test_a_non_positive_attachment_bound_is_refused_not_read_as_unlimited(
+    overrides: dict[str, object],
+) -> None:
+    # Same reason ``AttachmentLimits.__post_init__`` refuses it: a zero cap that
+    # silently means "unlimited" is how a bounded ingestion path stops being
+    # bounded, and a zero TTL mints a capability that is already expired.
+    with pytest.raises(ValidationError):
+        WorkerConfig.model_validate(overrides)
+
+
+def test_the_chart_defaults_match_the_worker_defaults() -> None:
+    """The cross-language seam AGENTS.md names: two languages, one envelope.
+
+    The chart templates ``worker.attachments.*`` into the worker's env AND into
+    the ``attachments-init`` size cap, so a chart default that drifts from the
+    Python default changes behaviour for every install that overrides nothing --
+    and drifts the pod's cap away from the worker's, which
+    ``charts/curie/ci/attachment-init-assertions.sh`` reads from the other end.
+
+    Resolved from this file's location, not the working directory, so it holds
+    whether pytest runs from the repo root or from apps/worker.
+    """
+
+    repo_root = Path(__file__).resolve().parents[3]
+    values = yaml.safe_load((repo_root / "charts" / "curie" / "values.yaml").read_text())
+    chart = values["worker"]["attachments"]
+    # The declared defaults, read off the model rather than an instance, so an
+    # ambient CURIE_ATTACHMENT_* in the shell cannot decide what this compares.
+    fields = WorkerConfig.model_fields
+
+    assert chart["maxFileBytes"] == fields["attachment_max_file_bytes"].default
+    assert chart["referenceTtlSeconds"] == fields["attachment_reference_ttl_seconds"].default
+    assert chart["retentionTtlSeconds"] == fields["attachment_retention_ttl_seconds"].default
