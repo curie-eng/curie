@@ -4618,12 +4618,13 @@ async fn prepare_deploy_with_commit_sha(
     // bundle or resolved values, so a declared-but-unbound policy fails fast
     // without doing any of that work.
     // The NAMES this deploy will actually bind into the agent sandbox: the
-    // explicit `--secret` flags, plus every env-var secret the bundle's hosted
-    // connectors declare (#2503). Curie resolves those itself, so a
+    // explicit `--secret` flags, plus the Bearer secret each hosted connector
+    // names (#2503, #2559). Curie resolves those itself, so a
     // plugin.json-declared name that connectors.yaml already auto-binds is not
     // a gap and must not be diffed against the flags alone -- the #464 gate
     // below would otherwise refuse a deploy that needs no flag. A manifest
-    // secret nothing binds still fails, unchanged.
+    // secret nothing binds still fails, unchanged. Extra `secrets:` names stay
+    // on the connector pod.
     let connector_env_secret_names =
         crate::connector_build::hosted_env_secret_names(&connector_decl);
     // Automatic delivery of connectors.yaml secrets exists only for

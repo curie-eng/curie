@@ -79,6 +79,11 @@ pub struct ConnectorSpecDecl {
     // -- both --
     #[serde(default)]
     pub secrets: Vec<SecretDecl>,
+    /// The env-var name the derived `Authorization: Bearer ${NAME}` header
+    /// expands. Optional; a single `secrets:` entry is that name. See
+    /// [`bearer_secret_name`].
+    #[serde(default)]
+    pub bearer_secret: Option<String>,
     #[serde(default)]
     pub sealed_secrets: BTreeMap<String, String>,
     #[serde(default)]
@@ -135,6 +140,7 @@ impl Default for ConnectorSpecDecl {
             url: None,
             headers: BTreeMap::new(),
             secrets: Vec::new(),
+            bearer_secret: None,
             sealed_secrets: BTreeMap::new(),
             secret_files: BTreeMap::new(),
         }
@@ -1639,7 +1645,25 @@ pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
     names.into_iter().collect()
 }
 
-/// The secret NAMES a hosted connector's SANDBOX must also receive (#2503).
+/// The secret name the derived `Authorization: Bearer ${NAME}` header expands.
+///
+/// Mirrors `plugin_format.ConnectorSpec.bearer_secret_name`: an explicit
+/// `bearer_secret` wins; a single declared secret is that name; two or more
+/// without an explicit name is None (the Python validator refuses that
+/// document rather than picking `secrets[0]`).
+pub fn bearer_secret_name(spec: &ConnectorSpecDecl) -> Option<String> {
+    if let Some(name) = &spec.bearer_secret {
+        return Some(name.clone());
+    }
+    let names = declared_secret_names(spec);
+    if names.len() == 1 {
+        Some(names[0].clone())
+    } else {
+        None
+    }
+}
+
+/// The secret NAMES a hosted connector's SANDBOX must also receive (#2503, #2559).
 ///
 /// These are the names the derived `Authorization: Bearer ${NAME}` header on
 /// the mounted `.mcp.json` entry expands from: the expansion happens in the
@@ -1653,6 +1677,8 @@ pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
 ///   `unhosted_url:` override still points at that same connector's image
 ///   declaration, so it stays in scope; a pure `url:` remote is the MCP
 ///   client's own config and is not.
+/// - Only the Bearer name ([`bearer_secret_name`]), never every declared
+///   secret. Extra names stay on the connector pod.
 /// - `SecretDecl::Name` only. A `SecretDecl::Ref` names a Secret someone else
 ///   provisioned, which ADR-0090 keeps out of the deploy path entirely -- no
 ///   value for it exists here to bind.
@@ -1666,10 +1692,15 @@ pub fn hosted_env_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
         if spec.image.is_none() && spec.build.is_none() {
             continue;
         }
-        for declared in &spec.secrets {
-            if let SecretDecl::Name(name) = declared {
-                names.insert(name.clone());
-            }
+        let Some(bearer) = bearer_secret_name(spec) else {
+            continue;
+        };
+        if spec
+            .secrets
+            .iter()
+            .any(|declared| matches!(declared, SecretDecl::Name(name) if *name == bearer))
+        {
+            names.insert(bearer);
         }
     }
     names.into_iter().collect()
@@ -1798,6 +1829,7 @@ connectors:
       - name: B
         from_secret: s
         key: k
+    bearer_secret: A
     secret_files:
       C: /x
 "#,
@@ -1854,6 +1886,7 @@ connectors:
     secrets:
       - SHARED
       - ZETA_ONLY
+    bearer_secret: SHARED
   alpha:
     build:
       context: ./alpha
@@ -1862,16 +1895,10 @@ connectors:
     secrets:
       - SHARED
       - ALPHA_ONLY
+    bearer_secret: SHARED
 "#,
         );
-        assert_eq!(
-            hosted_env_secret_names(&decl),
-            vec![
-                "ALPHA_ONLY".to_string(),
-                "SHARED".to_string(),
-                "ZETA_ONLY".to_string(),
-            ]
-        );
+        assert_eq!(hosted_env_secret_names(&decl), vec!["SHARED".to_string()]);
     }
 
     #[test]
@@ -1882,5 +1909,42 @@ connectors:
         let loaded = load(dir.path()).expect("a bundle with no connectors.yaml loads as empty");
         assert!(hosted_env_secret_names(&loaded).is_empty());
         assert!(hosted_env_secret_names(&ConnectorsFileDecl::default()).is_empty());
+    }
+
+    #[test]
+    fn multiple_secrets_without_bearer_secret_bind_nothing() {
+        // #2559: two bare names and no bearer_secret used to bind both, while
+        // only secrets[0] was the Bearer. Bind nothing until the header name
+        // is explicit; validate_connectors refuses this document on the
+        // Python side.
+        let decl = decl(
+            r#"
+connectors:
+  gh:
+    image: ghcr.io/example/gh:1
+    secrets:
+      - POD_ONLY
+      - PAT
+"#,
+        );
+        assert!(hosted_env_secret_names(&decl).is_empty());
+    }
+
+    #[test]
+    fn bearer_secret_binds_only_that_name() {
+        // Extra declared names stay on the connector pod (hosted_secret_names
+        // / secretKeyRef). The sandbox only receives the header's name.
+        let decl = decl(
+            r#"
+connectors:
+  gh:
+    image: ghcr.io/example/gh:1
+    secrets:
+      - POD_ONLY
+      - PAT
+    bearer_secret: PAT
+"#,
+        );
+        assert_eq!(hosted_env_secret_names(&decl), vec!["PAT".to_string()]);
     }
 }

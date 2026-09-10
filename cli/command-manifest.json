@@ -1540,7 +1540,7 @@
             },
             {
               "global": false,
-              "help": "Bind a per-agent connector secret by NAME (ADR-0009, #429). The value is resolved from your environment or the host secret vault (`curie secrets set <NAME>`) and sent to the platform, which stores it on the agent so the worker forwards it into the sandbox for a bundle's authed MCP server. The value never appears in argv. Repeatable. A hosted connector's own declared `secrets:` names are bound automatically (from the value this deploy already resolved for the connector) so its derived Bearer header expands; this flag is for names beyond that (#2503)",
+              "help": "Bind a per-agent connector secret by NAME (ADR-0009, #429). The value is resolved from your environment or the host secret vault (`curie secrets set <NAME>`) and sent to the platform, which stores it on the agent so the worker forwards it into the sandbox for a bundle's authed MCP server. The value never appears in argv. Repeatable. A hosted connector's Bearer secret (`bearer_secret`, or its single `secrets:` name) is bound automatically (from the value this deploy already resolved for the connector) so the runner can expand the derived header and drop the name from the sandbox env; this flag is for names beyond that (#2503, #2559)",
               "id": "secret",
               "long": "secret",
               "positional": false,

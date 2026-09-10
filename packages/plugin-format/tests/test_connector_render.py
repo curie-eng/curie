@@ -1477,8 +1477,9 @@ def test_the_dns_corpus_covers_the_truncation_branch() -> None:
 # <PAT>` on every request, and an unauthenticated `GET /mcp` is a 401. Until
 # now the hosted entry carried a URL and nothing else, so the probe failed and
 # the agent simply listed no `mcp__github__*` tools -- a silent no-tools, not
-# an error. The header is DERIVED from the first declared secret for the same
-# reason the URL is derived (ADR-0086): the author writes neither.
+# an error. The header is DERIVED from ``bearer_secret`` (or the single
+# declared secret) for the same reason the URL is derived (ADR-0086): the
+# author writes neither.
 # --------------------------------------------------------------------------- #
 GITHUB = ConnectorSpec(
     image="ghcr.io/github/github-mcp-server:v0.20.1",
@@ -1545,3 +1546,31 @@ def test_only_the_placeholder_is_emitted_never_a_resolved_value(
     # anything that logs the rendered entry.
     monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "ghp_sentinel")
     assert "ghp_sentinel" not in json.dumps(_github_entry())
+
+
+def test_bearer_secret_names_the_header_when_several_secrets_are_declared() -> None:
+    # #2559: secrets[0] was the Bearer only because it came first. A hosted
+    # connector that also declares a pod-side credential must name the header
+    # secret, or the sandbox would bind the wrong name (or every name).
+    spec = ConnectorSpec(
+        image="ghcr.io/github/github-mcp-server:v0.20.1",
+        secrets=["POD_ONLY", "GITHUB_PERSONAL_ACCESS_TOKEN"],
+        bearer_secret="GITHUB_PERSONAL_ACCESS_TOKEN",
+    )
+    assert _github_entry(spec)["headers"] == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
+
+
+def test_a_single_declared_secret_still_derives_the_header_without_bearer_secret() -> None:
+    # The github-mcp-server shape. Requiring the new field on every existing
+    # one-secret bundle would be a break for no security gain: there is only
+    # one name that could be the Bearer.
+    spec = ConnectorSpec(
+        image="ghcr.io/github/github-mcp-server:v0.20.1",
+        secrets=["GITHUB_PERSONAL_ACCESS_TOKEN"],
+    )
+    assert spec.bearer_secret is None
+    assert _github_entry(spec)["headers"] == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
