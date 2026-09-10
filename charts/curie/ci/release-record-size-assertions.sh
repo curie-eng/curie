@@ -61,12 +61,38 @@ manifest = open(os.path.join(tmp, "manifest.yaml"), "rb").read()
 # Mirror how helm builds the record it stores: chart files base64-encoded
 # inside the release JSON alongside the rendered manifest, gzipped, then
 # base64-encoded into the Secret's data value.
+#
+# This is a model, not helm's own serializer, so it is deliberately built to
+# err high -- a budget guard that underestimates is worthless. It differs
+# from helm in two places, and both are accounted for:
+#
+#   OVER by ~110 KB. helm stores values as a parsed map, dropping comments;
+#   this counts values.yaml raw, which is 84% comments. That inflates the
+#   estimate, so comment growth can trip the budget early. Safe direction,
+#   and the remedy (trim comments, or raise the budget deliberately) is the
+#   same conversation the guard exists to start.
+#
+#   UNDER by the rendered NOTES, which helm keeps in info.notes. Rendering
+#   NOTES needs an API server (`helm install --dry-run=client` still dials
+#   one), so CI cannot produce it. Instead, allow for it: charge the record a
+#   second copy of the NOTES.txt template source. The rendered output is that
+#   template with its conditional branches resolved, so a whole extra copy is
+#   a generous ceiling for it.
+notes_allowance = next(
+    (d for n, d in files.items() if n.endswith("templates/NOTES.txt")), b""
+)
+if not notes_allowance:
+    raise SystemExit(
+        "templates/NOTES.txt is not in the packaged chart, so the rendered "
+        "NOTES this model allows for cannot be bounded; update this script."
+    )
+
 release = {
     "chart": {"files": [
         {"name": n, "data": base64.b64encode(d).decode()} for n, d in files.items()
     ]},
     "manifest": manifest.decode("utf-8", "replace"),
-    "info": {},
+    "info": {"notes": notes_allowance.decode("utf-8", "replace")},
     "config": {},
 }
 buf = io.BytesIO()
