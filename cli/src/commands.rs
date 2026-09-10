@@ -2233,6 +2233,10 @@ pub async fn start(opts: StartOpts) -> Result<()> {
                 if let Some(ollama) = &ollama_container {
                     let _ = docker::remove_container(ollama).await;
                 }
+                // The label teardown has removed every started connector, so
+                // this unrecorded boot can now release the snapshot that no
+                // later `skill down` can discover.
+                let _ = crate::bundle::remove_snapshot(&snapshot.dir, &plugin_dir);
                 return Err(err.context("starting the bundle's connectors"));
             }
         }
@@ -11154,6 +11158,45 @@ pub fn connectors_needing_rebuild(
 // The local tier's connector bring-up
 // ---------------------------------------------------------------------------
 
+/// Resolve each generated Compose service to its actual Docker container IDs.
+///
+/// The overlay's service names are not Docker container names: Compose adds its
+/// project and replica components. An empty result remains a named readiness
+/// target so the shared waiter can report which connector Compose did not
+/// create, rather than leaking Compose output or assuming a container name.
+async fn compose_connector_readiness_targets(
+    overlay: &Path,
+    project: &str,
+    connectors: &[(String, String)],
+    deadline: Instant,
+) -> Vec<(String, String)> {
+    let mut targets = Vec::new();
+    for (connector, service) in connectors {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining == Duration::ZERO {
+            targets.push((connector.clone(), String::new()));
+            continue;
+        }
+        let command =
+            crate::connector_build::compose_service_ids_command(overlay, project, service);
+        let ids = match tokio::time::timeout(remaining, crate::ops::run_capture(&command)).await {
+            Ok(Ok((true, stdout, _))) => stdout
+                .lines()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if ids.is_empty() {
+            targets.push((connector.clone(), String::new()));
+        } else {
+            targets.extend(ids.into_iter().map(|id| (connector.clone(), id)));
+        }
+    }
+    targets
+}
+
 /// Reconcile this agent's connector containers against the deployed bundle, then
 /// generate the connector compose overlay and bring the declared set up.
 ///
@@ -11210,6 +11253,16 @@ pub async fn bring_up_local(
         return Ok(());
     }
 
+    let connector_services: Vec<(String, String)> = hosted
+        .iter()
+        .map(|(connector, _)| {
+            (
+                connector.to_string(),
+                cb::object_name(&identity.release, &identity.agent, connector.as_str()),
+            )
+        })
+        .collect();
+
     let mut secret_values = std::collections::BTreeMap::new();
     for (connector, spec) in &hosted {
         for name in cb::declared_secret_names(spec) {
@@ -11242,11 +11295,56 @@ pub async fn bring_up_local(
     // where `${NAME}` in the file above expands from -- never through the file,
     // never through argv, and masked in anything printed.
     let command = cb::compose_up_command(&path, project, &secret_values);
-    let (ok, _out, err) = crate::ops::run_capture(&command)
-        .await
-        .context("starting the bundle's connectors")?;
-    if !ok {
-        bail!("starting the bundle's connectors failed: {}", err.trim());
+    // Compose itself retains its 60-second readiness limit. The client gets a
+    // separate five-second allowance for Compose process creation and polling
+    // overhead. The bounded ID lookup and fresh final readiness observation
+    // below make the local readiness stage at most 80 seconds; the shared
+    // skill-tier readiness budget remains 60 seconds.
+    let compose_client_deadline =
+        Instant::now() + docker::CONNECTOR_START_TIMEOUT + docker::CONNECTOR_DIAGNOSTIC_TIMEOUT;
+    let activation_context = "the API deployment was activated and was not rolled back, but starting the bundle's connectors failed";
+    let compose_succeeded = match tokio::time::timeout(
+        compose_client_deadline.saturating_duration_since(Instant::now()),
+        crate::ops::run_capture(&command),
+    )
+    .await
+    {
+        // `compose up --wait` can identify an exited or unhealthy service, but
+        // its text is not a stable connector diagnostic. The shared Docker
+        // waiter below reads the owned service IDs and reports the named reason
+        // without exposing Compose, container, or health check logs.
+        Ok(Ok((ok, _out, _err))) => ok,
+        Err(_) => false,
+        Ok(Err(err)) => return Err(err).context(activation_context),
+    };
+    // Compose can return ready at the end of its own 60-second readiness
+    // limit. Resolve the declared keys to actual Docker IDs in a separately
+    // bounded window so that work cannot consume the five-second readiness
+    // observation a no-health connector needs to prove uninterrupted running.
+    let resolution_deadline = Instant::now() + docker::CONNECTOR_ID_RESOLUTION_TIMEOUT;
+    let readiness_targets = compose_connector_readiness_targets(
+        &path,
+        project,
+        &connector_services,
+        resolution_deadline,
+    )
+    .await;
+    // Start this fresh clock only after every ID lookup has completed. This
+    // never turns a failed Compose invocation into success.
+    let diagnostic_deadline = Instant::now() + docker::CONNECTOR_DIAGNOSTIC_TIMEOUT;
+    let mut readiness =
+        docker::wait_for_connectors_ready(&readiness_targets, diagnostic_deadline).await;
+    if !compose_succeeded && readiness.is_ok() {
+        let connector_keys = connector_services
+            .iter()
+            .map(|(connector, _)| connector.clone())
+            .collect::<Vec<_>>();
+        readiness = Err(docker::connector_compose_start_failure(&connector_keys));
+    }
+    if let Err(err) = readiness {
+        let (_, remedy) = crate::exit::classify(&err);
+        let message = format!("{activation_context}: {err}");
+        return Err(crate::exit::operator_context(err, message, remedy));
     }
     Ok(())
 }
@@ -11349,7 +11447,9 @@ async fn start_skill_connectors(
         version: cb::LOCK_VERSION,
         connectors: std::collections::BTreeMap::new(),
     });
+    let readiness_deadline = Instant::now() + docker::CONNECTOR_START_TIMEOUT;
     let mut started = Vec::new();
+    let mut readiness_targets = Vec::new();
     for (connector, image) in skill_connector_plan(decl, &lock)? {
         let connector = connector.as_str();
         let spec = decl
@@ -11381,7 +11481,9 @@ async fn start_skill_connectors(
         docker::docker_with_env(&start.run_args(), &start.docker_env)
             .await
             .with_context(|| format!("starting connector '{connector}'"))?;
+        readiness_targets.push((connector.to_string(), start.container_name.clone()));
         started.push(start.container_name);
     }
+    docker::wait_for_connectors_ready(&readiness_targets, readiness_deadline).await?;
     Ok(started)
 }
