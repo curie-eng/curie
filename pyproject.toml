@@ -164,6 +164,11 @@ testpaths = [
     "apps/api/tests",
     "apps/dispatcher/tests",
     "apps/mail-adapter/tests",
+    # The Discord adapter's tests sat in no collection root above, and the
+    # string "discord" appears in no .github/workflows file, so they ran
+    # nowhere in CI (#2358). A telemetry test in a suite CI never collects is
+    # a falsely-claimed proof, so the listing is part of the fix, not tidying.
+    "adapters/discord/tests",
     "apps/worker/tests",
     "runner/tests",
     "compose/tests",
