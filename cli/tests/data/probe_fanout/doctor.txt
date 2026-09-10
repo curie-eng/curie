@@ -11,7 +11,7 @@ ok    Completion delivery        completion outbox: state empty; count 0; inflig
 --    Slack                      no tokens recorded; reachable with `curie cluster message`
 MISS  Clone credential           none — a private repo cannot be cloned, so git-push deploys will fail
       → curie cluster github-app --namespace curie --release curie --app-id <id> --private-key ./key.pem
-ok    Webhook exposure           NodePort 30800
+ok    Push delivery              NodePort 30800 — Curie does not create the GitHub webhook, so this is an exposed API, not a confirmed push path
 --    Repo binding               platform API not reached — could not discover it from the release; pass --api-url/--api-key to include this
 
 No bundle here. Start with `curie init my-agent`.

@@ -102,6 +102,7 @@ fn run_git(git: &Path, cwd: &Path, args: &[&str]) -> String {
 #[cfg(unix)]
 async fn run_command_deploy(server: &MockServer, plugin_dir: &Path) -> commands::DeployOutput {
     commands::deploy(DeployOpts {
+        delivery: None,
         tier: commands::DeployTier::Local,
         agent: None,
         target: None,

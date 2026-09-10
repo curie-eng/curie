@@ -176,6 +176,16 @@ pub struct Facts {
     /// mechanism the chart knows about is in place -- which is NOT proof it is
     /// unreachable, since a load balancer or tunnel in front is invisible here.
     pub api_exposure: Option<String>,
+    /// `api.commitPollIntervalSeconds` off this release's COMPUTED helm values.
+    /// COMPUTED, never user-supplied: the chart default is `0`, so a supplied
+    /// read returns null for BOTH "polling off" and "never set" and cannot tell
+    /// them apart -- the #1950 defect shape exactly. `None` means the key was
+    /// not observed, which is a discovery outcome, not an interval of zero.
+    pub commit_poll_interval_seconds: Option<f64>,
+    /// Why the delivery observation failed, when it did. `Some` forces the
+    /// delivery check to skip rather than judge: doctor states what it saw, and
+    /// a values read that did not answer saw nothing.
+    pub delivery_discovery_failure: Option<String>,
     pub mail_channels: Vec<crate::mail_channel::Report>,
     pub completion_outbox: Option<crate::completion_outbox::Report>,
 }
@@ -363,6 +373,21 @@ fn target(f: &Facts) -> (&str, &str) {
 /// drifts a flag at a time; each site appends only what is its own.
 fn targeted(subcommand: &str, namespace: &str, release: &str) -> String {
     format!("curie cluster {subcommand} --namespace {namespace} --release {release}")
+}
+
+/// The polling alternative appended to doctor's `webhook_recovery` fix.
+///
+/// `targeted_up` is the caller's ALREADY-GUARDED `cluster up` base -- targeting
+/// and, since #2496, the sandbox egress allowlist. This alternative is itself a
+/// full `cluster up`, so it drops every value nothing re-supplies exactly like
+/// the ingress command does; taking the guarded base as input keeps one guard
+/// governing both commands instead of leaving this one silently unprotected.
+/// This function stays pure and adds only the polling key.
+pub fn polling_fix_suffix(targeted_up: &str) -> String {
+    format!(
+        "   (or, for a private install with no public ingress, arm commit polling instead: \
+         {targeted_up} --set api.commitPollIntervalSeconds=60)"
+    )
 }
 
 /// The recovery command for a missing cluster release. Provider egress follows
@@ -700,9 +725,10 @@ fn release_fake_model_clause(f: &Facts, in_force: &ModelSource) -> &'static str 
     }
 }
 
-/// The exposure fix, which is a full `cluster up` and therefore drops every
-/// value nothing re-supplies -- including the sandbox's egress allowlist, which
-/// is how following doctor's advice sealed a working release's model path.
+/// The delivery fix. BOTH arms of it -- expose an ingress, or arm the poller --
+/// are a full `cluster up` and therefore drop every value nothing re-supplies,
+/// including the sandbox's egress allowlist, which is how following doctor's
+/// advice sealed a working release's model path.
 ///
 /// The allowlist is reproduced in full or not at all. `ops::up_value_plan`
 /// rewrites every `--allow-web-egress` CIDR as exactly one TCP/443 rule, so a
@@ -710,24 +736,91 @@ fn release_fake_model_clause(f: &Facts, in_force: &ModelSource) -> &'static str 
 /// entries outright; both NARROW a live NetworkPolicy, and a caveat is read
 /// after the policy is already broken. There is deliberately no middle branch.
 fn webhook_recovery(f: &Facts, namespace: &str, release: &str) -> String {
-    let mut command = targeted("up", namespace, release);
-    command.push_str(" --set api.ingress.enabled=true --set api.ingress.host=<host>");
-    if f.sandbox_egress_is_reproducible {
-        // `--allow-web-egress` rather than `--allow-egress-host`: a CIDR read
-        // back off a release cannot be reversed to a provider name, and
-        // ADR-0114 errors when an explicit provider list omits the detected one.
-        for cidr in &f.sandbox_egress_cidrs {
-            command.push_str(&format!(" --allow-web-egress {cidr}"));
+    // The guard is decided ONCE and then applied to every command this fix
+    // hands out (#2496). It used to guard the ingress command and then append a
+    // polling alternative built from a fresh, unguarded `targeted("up", ..)` --
+    // a second full `cluster up` carrying neither the re-supplied allowlist nor
+    // the hazard warning, so following the private-install advice repeated the
+    // very failure the guard exists to prevent.
+    //
+    // `--allow-web-egress` rather than `--allow-egress-host`: a CIDR read back
+    // off a release cannot be reversed to a provider name, and ADR-0114 errors
+    // when an explicit provider list omits the detected one.
+    let guarded_up = {
+        let mut base = targeted("up", namespace, release);
+        if f.sandbox_egress_is_reproducible {
+            for cidr in &f.sandbox_egress_cidrs {
+                base.push_str(&format!(" --allow-web-egress {cidr}"));
+            }
         }
-    } else {
+        base
+    };
+
+    // The no-webhook path #1239 shipped: an ingress-only fix is unusable advice
+    // for a private install, which is the reported half of #2496. Both commands
+    // are built from `guarded_up`, so neither can drift out from under the
+    // allowlist decision above.
+    let mut command = format!(
+        "{guarded_up} --set api.ingress.enabled=true --set api.ingress.host=<host>{}",
+        polling_fix_suffix(&guarded_up)
+    );
+
+    // One warning for the whole fix, emitted last so it is read after both
+    // commands rather than in the middle of them. A caveat is read after the
+    // policy is already broken, which is why the reproducible arm re-supplies
+    // the rules instead: there is deliberately no middle branch.
+    if !f.sandbox_egress_is_reproducible {
         command.push_str(&format!(
-            "   (WARNING: this release records a sandbox egress allowlist this command \
-             cannot reproduce; running it as-is would narrow the policy. Read it first \
+            "   (WARNING: this release records a sandbox egress allowlist these commands \
+             cannot reproduce; running either as-is would narrow the policy. Read it first \
              with `helm get values {release} -n {namespace}` and re-supply those rules \
              deliberately.)"
         ));
     }
     command
+}
+
+/// The `webhook` check, now answering DELIVERY rather than exposure (#2496).
+///
+/// The id is deliberately unchanged: a new one would have to be threaded
+/// through four skipped-list loops, `summary` and the ready logic, for a check
+/// that answers the same operator question ("will a push reach this install?")
+/// -- five drift surfaces for a rename. The rule itself is stated once, in
+/// `crate::delivery`, so this check and `cluster deploy`'s line cannot disagree
+/// the way ingress-only advice and #1239's poller already did.
+fn delivery_check(f: &Facts, namespace: &str, release: &str) -> Check {
+    let assessed = crate::delivery::assess(&crate::delivery::DeliveryFacts {
+        exposure: f.api_exposure.clone(),
+        poll_interval_seconds: f.commit_poll_interval_seconds,
+        discovery_failure: f.delivery_discovery_failure.clone(),
+    });
+    // Every operator-facing sentence comes from `crate::delivery` (#2496).
+    // Doctor decides only what it alone knows: which case is OK, which is a
+    // MISS, which is a skip, and what command recovers it.
+    let detail = crate::delivery::render_detail(&assessed);
+    match assessed {
+        // Exposure has more than one shape, and asserting otherwise cries wolf
+        // on a working install: sre-bot serves its webhook on a NodePort with
+        // no ingress at all, and an early version of this check called that
+        // broken. A doctor that is wrong about a working setup is worse than no
+        // doctor, because it teaches people to ignore it. So this stays OK --
+        // it carries the unverified caveat in the detail instead.
+        crate::delivery::Delivery::ExposedUnverified { .. } => {
+            ok("webhook", "Push delivery", detail)
+        }
+        // Same argument in the other direction: an armed poller IS a delivery
+        // path, so a private install with one is not missing anything.
+        crate::delivery::Delivery::Polling { .. } => ok("webhook", "Push delivery", detail),
+        crate::delivery::Delivery::NotArmed => missing(
+            "webhook",
+            "Push delivery",
+            detail,
+            webhook_recovery(f, namespace, release),
+        ),
+        // A read that did not answer is skipped, never judged, and carries no
+        // fix: doctor must not hand out a command for a state nobody observed.
+        crate::delivery::Delivery::Unknown { .. } => skipped("webhook", "Push delivery", detail),
+    }
 }
 
 /// Judge caller-supplied facts without adding an observation the caller did
@@ -864,7 +957,7 @@ fn evaluate_with_worker_claims(
             ("release", "Curie release"),
             ("slack", "Slack"),
             ("clone-credential", "Clone credential"),
-            ("webhook", "Webhook exposure"),
+            ("webhook", "Push delivery"),
             ("repo-binding", "Repo binding"),
             ("completion-outbox", "Completion delivery"),
         ] {
@@ -965,7 +1058,7 @@ fn evaluate_with_worker_claims(
         for (id, title) in [
             ("slack", "Slack"),
             ("clone-credential", "Clone credential"),
-            ("webhook", "Webhook exposure"),
+            ("webhook", "Push delivery"),
             ("repo-binding", "Repo binding"),
             ("completion-outbox", "Completion delivery"),
         ] {
@@ -1095,21 +1188,9 @@ fn evaluate_with_worker_claims(
         ),
     });
 
-    // Exposure has more than one shape, and asserting otherwise cries wolf on a
-    // working install: sre-bot serves its webhook on a NodePort with no ingress
-    // at all, and an early version of this check called that broken. A doctor
-    // that is wrong about a working setup is worse than no doctor, because it
-    // teaches people to ignore it.
-    out.push(match &f.api_exposure {
-        Some(how) => ok("webhook", "Webhook exposure", how.clone()),
-        None => missing(
-            "webhook",
-            "Webhook exposure",
-            "no ingress and no NodePort — if a load balancer or tunnel fronts the API, \
-             this check cannot see it and you can ignore this",
-            webhook_recovery(f, namespace, release),
-        ),
-    });
+    // Delivery, not exposure (#2496): the rule lives in `crate::delivery` and
+    // is stated exactly once, so this row and `cluster deploy`'s line agree.
+    out.push(delivery_check(f, namespace, release));
 
     // The binding decides whether a push reaches this agent at all. A push for
     // an agent with none matches nothing and is answered `ignored` -- nothing is
@@ -1239,10 +1320,37 @@ pub fn summary(checks: &[Check]) -> String {
                 `curie cluster message`."
             .to_string();
     }
-    if !has("clone-credential") || !has("webhook") || state("repo-binding") == Some(State::Missing)
+    if !has("clone-credential")
+        || state("webhook") == Some(State::Missing)
+        || state("repo-binding") == Some(State::Missing)
     {
         return "Answering in Slack. Git-push deploys are not wired yet -- see the \
                 missing items above."
+            .to_string();
+    }
+    // A SKIPPED delivery row is not a missing one (#2496). `!has("webhook")`
+    // used to cover both, so an install whose computed-values read failed got
+    // the same "not wired yet" verdict as one that really is unarmed -- a
+    // positive absence claim built on an observation that never happened, which
+    // is the exact conflation this check was rewritten to remove.
+    if state("webhook") == Some(State::NotApplicable) {
+        return "Answering in Slack. Whether git-push deploys are wired could not be \
+                checked -- see the Push delivery line above."
+            .to_string();
+    }
+    // The one `Ok` that must not read as wired. `ExposedUnverified` stays `Ok`
+    // on purpose (crying wolf at a working NodePort install is what taught
+    // operators to ignore this check), but Curie never creates the GitHub
+    // webhook, so exposure alone is not a delivery path and `Fully wired: ...
+    // git-push deploys` would be exactly the promise from public exposure alone
+    // that #2496 forbids. Hedged the same way the `repo-binding` skip is.
+    if checks.iter().any(|c| {
+        c.id == "webhook"
+            && c.detail
+                .contains(crate::delivery::EXPOSED_UNVERIFIED_MARKER)
+    }) {
+        return "Answering in Slack. Git-push deploys are unverified -- see the Push \
+                delivery line above."
             .to_string();
     }
     // repo-binding reads NotApplicable only when the platform API was never
@@ -1586,6 +1694,11 @@ mod tests {
                     slack_bot_token: true,
                     clone_credential: Some("github app".into()),
                     api_exposure: Some("NodePort 30799".into()),
+                    // An ARMED delivery path, not just exposure (#2496):
+                    // exposure alone now reads as unverified, since Curie never
+                    // creates the GitHub webhook. Polling is the path Curie
+                    // itself drives, so this is the shape that earns the verdict.
+                    commit_poll_interval_seconds: Some(60.0),
                     agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
                     ..laptop()
                 },
@@ -2777,6 +2890,11 @@ mod tests {
     #[test]
     fn deploys_verified_tracks_repo_binding_ok() {
         let bound = Facts {
+            // An ARMED delivery path, not just exposure (#2496): exposure
+            // alone now reads as unverified, so this fixture needs the
+            // poller too or `deploys_verified` would stay false for a
+            // reason unrelated to the repo binding this test is about.
+            commit_poll_interval_seconds: Some(60.0),
             agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
             ..wired()
         };
@@ -2786,9 +2904,15 @@ mod tests {
         };
         assert_eq!(bound_out.to_json()["deploys_verified"], json!(true));
 
+        let unread_facts = Facts {
+            // Delivery armed here too (#2496), so the `false` below is
+            // isolated to the unread repo binding, not to a missing poller.
+            commit_poll_interval_seconds: Some(60.0),
+            ..wired()
+        };
         let unread = DoctorOutput {
-            checks: evaluate(&wired()),
-            summary: summary(&evaluate(&wired())),
+            checks: evaluate(&unread_facts),
+            summary: summary(&evaluate(&unread_facts)),
         };
         assert_eq!(unread.to_json()["deploys_verified"], json!(false));
         assert_eq!(
@@ -2799,6 +2923,9 @@ mod tests {
         );
 
         let empty = Facts {
+            // Delivery armed here too (#2496), so the `false` below is
+            // isolated to the empty agent list, not to a missing poller.
+            commit_poll_interval_seconds: Some(60.0),
             agents: Some(vec![]),
             ..wired()
         };
@@ -2836,10 +2963,19 @@ mod tests {
         };
         let checks = evaluate(&f);
         assert_eq!(find(&checks, "webhook").state, State::Ok);
+        // Still `Ok` -- calling a working NodePort install broken is the
+        // cry-wolf this check refuses. But the one-line verdict no longer reads
+        // exposure as wired (#2496): Curie never creates the GitHub webhook, so
+        // `Fully wired: ... git-push deploys` off exposure alone was a delivery
+        // promise nothing had observed, contradicting this row's own detail.
+        let summary = summary(&checks);
         assert!(
-            summary(&checks).contains("Fully wired"),
-            "{}",
-            summary(&checks)
+            !summary.contains("Fully wired"),
+            "exposure alone must not read as fully wired, got {summary}"
+        );
+        assert!(
+            summary.contains("Git-push deploys are unverified"),
+            "an exposed-but-unverified install must be hedged, got {summary}"
         );
     }
 
@@ -3703,7 +3839,7 @@ esac
     }
 
     /// The issue's §4 symptom, asserted as the operator sees it: an install
-    /// whose ingress is already on printed `MISS  Webhook exposure`, because
+    /// whose ingress is already on printed `MISS  Push delivery`, because
     /// `--set-string api.ingress.enabled=true` and a quoted values-file entry
     /// both record a STRING and the read was `as_bool()`-only. Asserted through
     /// the exposure string and the check state, not through the predicate --
@@ -4729,6 +4865,62 @@ fn api_exposure_from_values(
     nodeport.map(|port| format!("NodePort {port}"))
 }
 
+/// Observe this release's push-delivery facts for the DEPLOY path (#2496).
+///
+/// `cluster deploy` needs the same answer `curie doctor` gives, so it calls the
+/// same readers rather than growing a second exposure rule -- a second rule is
+/// exactly the drift that produced this bug, and the trap it walks into is the
+/// chart's `api.service.nodePort`, which is populated on a ClusterIP-only
+/// install where nothing is exposed at all. Exposure is therefore
+/// [`api_exposure_from_values`] (ingress enabled) else a probe of the LIVE
+/// Service, never a values key.
+///
+/// One helm read for both facts, off COMPUTED values: `commitPollIntervalSeconds`
+/// needs them (#1950), and the ingress flag is present there too. A read that
+/// fails, or a release helm says does not exist, becomes `discovery_failure` --
+/// never a "not armed" verdict about a release nobody could see.
+pub async fn observe_delivery(o: &crate::ops::CommonOpts) -> crate::delivery::DeliveryFacts {
+    let computed = match crate::ops::fetch_release_computed_values(o).await {
+        Ok(Some(computed)) => computed,
+        Ok(None) | Err(_) => {
+            return crate::delivery::DeliveryFacts {
+                discovery_failure: Some(
+                    "could not read this release's computed Helm values".to_string(),
+                ),
+                ..Default::default()
+            };
+        }
+    };
+    // Before anything is judged: a document that answered but is unreadable at
+    // this key is a failed observation, not an unarmed install (#2496). Helm
+    // can answer `null` for an empty body, which `fetch_helm_values` passes
+    // through as a SUCCESSFUL read, so "the call returned Ok" is not the same
+    // question as "the interval was observed".
+    let poll = match crate::delivery::read_poll_interval(&computed) {
+        crate::delivery::PollReading::Unreadable => {
+            return crate::delivery::DeliveryFacts {
+                discovery_failure: Some(crate::delivery::UNREADABLE_INTERVAL_REASON.to_string()),
+                ..Default::default()
+            };
+        }
+        crate::delivery::PollReading::Absent => None,
+        crate::delivery::PollReading::Observed(seconds) => Some(seconds),
+    };
+    // Ingress first, and only then the kubectl round-trip: a deploy pays for
+    // this observation, so the probe is skipped whenever ingress already
+    // answered -- the same order `cluster_facts` uses, for the same reason.
+    let mut exposure = api_exposure_from_values(&computed, None);
+    if exposure.is_none() {
+        exposure =
+            api_exposure_from_values(&computed, api_nodeport(&o.namespace, &o.release).await);
+    }
+    crate::delivery::DeliveryFacts {
+        exposure,
+        poll_interval_seconds: poll,
+        discovery_failure: None,
+    }
+}
+
 /// The recorded sandbox egress allowlist, and whether `cluster up` can re-supply
 /// it exactly.
 ///
@@ -4925,8 +5117,10 @@ async fn gather_with_worker_claims(
     // so an operator who never set a model has nothing to read there and the
     // chart default the sandboxes boot is invisible -- the #1950 defect.
     // `--all` returns the computed values. The two stay apart because switching
-    // slack_configured, api.ingress.* or clone_credential onto computed values
-    // would silently change three unrelated checks. The deploy/sts listing is
+    // slack_configured, the sandbox egress allowlist or clone_credential onto
+    // computed values would silently change three unrelated checks. Exposure is
+    // no longer among them: #2496 moved it to the computed read so doctor and
+    // `cluster deploy` cannot disagree about it. The deploy/sts listing is
     // the serving-set observation (#2349) and does not consume either values
     // read. Worker selection is the #2374 claim probe and likewise independent.
     //
@@ -4944,6 +5138,7 @@ async fn gather_with_worker_claims(
     // Failed values reads must not claim that the mail adapter is disabled.
     f.mail_channels = vec![crate::mail_channel::unavailable(namespace, release)];
     let mut mail_enabled = false;
+    let mut api_values_needing_nodeport = None;
     if let Ok(Some(computed)) = computed {
         f.mail_channels.clear();
         mail_enabled = helm_truthy(
@@ -4960,14 +5155,30 @@ async fn gather_with_worker_claims(
         // Off the SAME read, never a third helm call: whether that id is the
         // one the pod actually boots.
         f.model_release_fake = release_fake_model(&computed);
-    }
-
-    let mut api_values_needing_nodeport = None;
-    if let Ok(Some(values)) = values {
-        // Presence only, both of them: socket mode needs the pair, and reading
-        // one while reporting both is what made a half-wired release read as Ok.
-        f.slack_bot_token = scalar_at(&values, &["dispatcher", "slack", "botToken"]).is_some();
-        f.slack_app_token = scalar_at(&values, &["dispatcher", "slack", "appToken"]).is_some();
+        // COMPUTED, not supplied (#1950): this key's chart default is `0`, so
+        // the supplied read cannot distinguish "polling off" from "never set".
+        // Three outcomes, not two (#2496): a document that came back but is
+        // unreadable at this key is a failed OBSERVATION and joins the other
+        // discovery failures below, because "not armed" about a value nobody
+        // could read is the same conflation this check exists to remove.
+        match crate::delivery::read_poll_interval(&computed) {
+            crate::delivery::PollReading::Unreadable => {
+                f.delivery_discovery_failure =
+                    Some(crate::delivery::UNREADABLE_INTERVAL_REASON.to_string());
+            }
+            crate::delivery::PollReading::Absent => f.commit_poll_interval_seconds = None,
+            crate::delivery::PollReading::Observed(seconds) => {
+                f.commit_poll_interval_seconds = Some(seconds);
+            }
+        }
+        // COMPUTED for the same #1950 reason the interval is, and now for a
+        // second one (#2496): `cluster deploy`'s `observe_delivery` already
+        // reads exposure off the computed values, so leaving doctor on the
+        // operator-SUPPLIED read let a chart-default ingress the values file
+        // never lists print `ExposedUnverified` on deploy and `NotArmed` here.
+        // One rule over one set of facts means one READER too, and computed is
+        // strictly the superset -- it is what the pods actually get.
+        //
         // Ask the single decision function first with no NodePort. A `Some`
         // means ingress already answered and the probe would only be discarded,
         // so the kubectl round-trip is skipped on the wired path -- doctor is
@@ -4975,17 +5186,34 @@ async fn gather_with_worker_claims(
         // decision itself still lives in exactly one place; deciding it here
         // too, to skip the read, is how a helper stays right while the report
         // goes wrong.
-        f.api_exposure = api_exposure_from_values(&values, None);
+        f.api_exposure = api_exposure_from_values(&computed, None);
+        if f.api_exposure.is_none() {
+            api_values_needing_nodeport = Some(computed);
+        }
+    } else {
+        // A read that failed, or a release helm says does not exist, is a
+        // discovery outcome -- NOT an unarmed install. Collapsing the two would
+        // report a verdict about something nobody could observe.
+        f.delivery_discovery_failure =
+            Some("could not read this release's computed Helm values".to_string());
+    }
+
+    if let Ok(Some(values)) = values {
+        // Presence only, both of them: socket mode needs the pair, and reading
+        // one while reporting both is what made a half-wired release read as Ok.
+        f.slack_bot_token = scalar_at(&values, &["dispatcher", "slack", "botToken"]).is_some();
+        f.slack_app_token = scalar_at(&values, &["dispatcher", "slack", "appToken"]).is_some();
         f.clone_credential = clone_credential_from_values(&values);
+        // Deliberately still the SUPPLIED read: the webhook fix may only
+        // re-supply rules an operator actually set, and a computed read would
+        // fold chart defaults into a `cluster up` presented as a faithful
+        // reproduction of this release's policy.
         (f.sandbox_egress_cidrs, f.sandbox_egress_is_reproducible) =
             sandbox_egress_from_values(&values);
-        if f.api_exposure.is_none() {
-            api_values_needing_nodeport = Some(values);
-        }
     }
 
     // These reads consume the preceding stage: mail observation needs the
-    // computed deploy gate, NodePort discovery needs the supplied ingress
+    // computed deploy gate, NodePort discovery needs the computed ingress
     // values, and worker exec needs the selected pod. Run them together so no
     // independent subprocess waits behind another.
     let needs_api_nodeport = api_values_needing_nodeport.is_some();
@@ -5118,10 +5346,22 @@ impl crate::ui::CliOutput for DoctorOutput {
         serde_json::json!({
             "summary": self.summary,
             "ready": self.checks.iter().all(|c| c.state != State::Missing),
+            // Binding is necessary but not sufficient (#2496): a bound agent
+            // behind an exposed-but-unverified API has no observed path that
+            // carries a push, and `deploys_verified: true` there is the same
+            // delivery promise from public exposure alone that the summary line
+            // no longer makes. `ready` is deliberately left alone -- it is the
+            // "nothing is MISSING" roll-up over every check, and the delivery
+            // row stays `Ok` on purpose.
             "deploys_verified": self
                 .checks
                 .iter()
-                .any(|c| c.id == "repo-binding" && c.state == State::Ok),
+                .any(|c| c.id == "repo-binding" && c.state == State::Ok)
+                && self.checks.iter().any(|c| {
+                    c.id == "webhook"
+                        && c.state == State::Ok
+                        && !c.detail.contains(crate::delivery::EXPOSED_UNVERIFIED_MARKER)
+                }),
             "checks": self.checks,
             "guidance": guidance(&self.checks),
         })

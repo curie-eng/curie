@@ -1360,6 +1360,10 @@ async fn deploy_embedded_sre_bot(
     );
     commands::deploy_with_commit_sha(
         DeployOpts {
+            // This installer binds no repository (`repo: None`), so there is
+            // no binding to make a push-delivery claim about, and delivery is
+            // not assessed (#2496).
+            delivery: None,
             agent: None,
             target: None,
             plugin_dir: bundle_dir.to_path_buf(),

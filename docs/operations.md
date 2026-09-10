@@ -389,10 +389,21 @@ nothing's been deployed yet, `curie cluster message` will say so plainly.
 ### Automatically, with git-flow
 
 Beyond `curie cluster deploy`, a bundle can also deploy automatically on
-every `git push`. Four things need to be true for a push to actually
+every `git push`. There are two delivery paths, and only one needs to be
+armed: an inbound GitHub webhook (items 2 and 3 below), or commit polling
+(`api.commitPollIntervalSeconds`, shipped in #1239), where the API pulls
+the repo itself and neither item applies. Polling is the path for a
+private or ClusterIP-only install that cannot receive an inbound webhook
+at all. `curie cluster deploy --repo` and `curie doctor` (the `Push
+delivery` check) now tell you which of these, if any, is actually armed
+for a given agent -- configuration evidence, not proof a push has
+deployed.
+
+Four things need to be true for a push over the webhook path to actually
 promote:
 
-1. **The agent's repo is set.** The webhook resolves which agent a push
+1. **The agent's repo is set.** (This applies to both delivery paths --
+   commit polling still needs to know which repo to pull.) The webhook resolves which agent a push
    belongs to by matching the payload's `repo.full_name` (owner/name)
    against that agent's `repo_full_name`. This field is set when the
    agent is created (`curie <tier> deploy --repo owner/name`, or the

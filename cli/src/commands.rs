@@ -1216,6 +1216,8 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
     let plugin_dir = resolve_agent_folder(folder)?;
     let api_url = opts.api_url.clone();
     let result = deploy(DeployOpts {
+        // Local tier: there is no release to read, so delivery is not assessed.
+        delivery: None,
         plugin_dir,
         // deploy_named is the multi-agent-folder path: the folder IS the agent
         // identity there, so there is nothing to override.
@@ -4339,6 +4341,14 @@ pub fn resolve_cases_path(
 }
 
 pub struct DeployOpts {
+    /// What was observed about this release's push-delivery paths (#2496).
+    ///
+    /// `None` means delivery was NOT assessed -- the local tier, which has no
+    /// release to read -- and prints nothing at all. Deliberately distinct from
+    /// `Some(Delivery::Unknown)`, which means assessed and undetermined and
+    /// still speaks: collapsing the two would recreate the very conflation this
+    /// ticket exists to remove.
+    pub delivery: Option<crate::delivery::Delivery>,
     /// Deploy under this agent name instead of the manifest's.
     ///
     /// One repository is otherwise structurally one agent (#1166): the name
@@ -4512,6 +4522,9 @@ pub fn normalize_deploy_api_key(api_key: Option<String>) -> Option<String> {
 }
 
 pub struct PreparedDeploy {
+    /// See [`DeployOpts::delivery`]. Carried, not re-observed: the assessment
+    /// belongs to the caller that has a namespace/release.
+    delivery: Option<crate::delivery::Delivery>,
     client: ApiClient,
     outcome: crate::api::PreparedDeployOutcome,
     plugin_name: String,
@@ -4809,6 +4822,7 @@ async fn prepare_deploy_with_commit_sha(
     };
 
     Ok(PreparedDeploy {
+        delivery: opts.delivery,
         client,
         outcome,
         plugin_name,
@@ -4893,6 +4907,7 @@ fn routing_warning(check: &RoutingCheck) -> String {
 pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
     let ui = crate::ui::ui();
     let PreparedDeploy {
+        delivery,
         client,
         outcome,
         plugin_name,
@@ -4933,9 +4948,10 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         .as_deref()
         .filter(|want| outcome.agent.repo_full_name.as_deref() == Some(*want));
     if let Some(repo) = bound_repo {
-        ui.note(&format!(
-            "repo binding: git-flow pushes to {repo} deploy this agent"
-        ));
+        // A binding FACT, not a delivery promise (#2496). Binding is observed;
+        // whether a push reaches this install is a separate, unobserved fact
+        // that the delivery line below answers from the release's own values.
+        ui.note(&crate::delivery::bind_note(repo));
         // ...unless they no longer route anywhere (#1221). Migration 0018
         // (ADR-0091) dropped the unique index on `repo_full_name`, so a SECOND
         // agent may bind the same repository -- and with no declared targets
@@ -4956,6 +4972,22 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         {
             if !check.resolvable {
                 ui.warn(&routing_warning(&check));
+            }
+        }
+
+        // Delivery last, because it is the operator's action item: binding fact,
+        // then routing (#1221), then whether a push has any observed path here.
+        // Inside the `bound_repo` block on purpose -- a declined `--repo` binds
+        // nothing, so there is no binding to make a delivery claim about.
+        //
+        // Advisory in every direction, exactly as #1221's check above: it states
+        // only what was observed locally, never mutates helm, and never changes
+        // the exit code. A deploy that already succeeded is not soured by it.
+        if let Some(line) = crate::delivery::render_optional(delivery.as_ref()) {
+            if line.warning {
+                ui.warn(&line.text);
+            } else {
+                ui.note(&line.text);
             }
         }
     }
@@ -8682,6 +8714,7 @@ mod tests {
             Some("curie-api-1   curie-api:dev   curie-api   Up 8 seconds (health: starting)"),
         );
         let opts = super::DeployOpts {
+            delivery: None,
             agent: None,
             target: None,
             plugin_dir: dir.path().to_path_buf(),
@@ -8803,6 +8836,7 @@ mod tests {
         scaffold_with_secrets(dir.path(), "test-agent", &["GITHUB_PERSONAL_ACCESS_TOKEN"]);
 
         let opts = super::DeployOpts {
+            delivery: None,
             agent: None,
             target: None,
             plugin_dir: dir.path().to_path_buf(),
@@ -8848,6 +8882,7 @@ mod tests {
         );
 
         let opts = super::DeployOpts {
+            delivery: None,
             agent: None,
             target: None,
             plugin_dir: dir.path().to_path_buf(),
@@ -8890,6 +8925,7 @@ mod tests {
         );
 
         let opts = super::DeployOpts {
+            delivery: None,
             agent: None,
             target: None,
             plugin_dir: dir.path().to_path_buf(),
@@ -8924,6 +8960,7 @@ mod tests {
         scaffold_with_secrets(dir.path(), "test-agent", &["GITHUB_PERSONAL_ACCESS_TOKEN"]);
 
         let opts = super::DeployOpts {
+            delivery: None,
             agent: None,
             target: None,
             plugin_dir: dir.path().to_path_buf(),

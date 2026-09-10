@@ -17,6 +17,7 @@ pub mod completion_outbox;
 pub mod connector_build;
 pub mod connectors;
 pub mod credcheck;
+pub mod delivery;
 pub mod discover;
 pub mod docker;
 pub mod doctor;

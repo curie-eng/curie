@@ -1888,6 +1888,12 @@ fn doctor_output_validates() {
         mail_channels: vec![],
         completion_outbox: None,
         api_exposure: None,
+        // #2496: nothing was observed about push delivery, matching the
+        // pre-existing `api_exposure: None` above -- keeps `webhook` reading
+        // NotArmed/Missing, which the fixture's "two Missing checks" comment
+        // below still describes.
+        commit_poll_interval_seconds: None,
+        delivery_discovery_failure: None,
         agents: Some(vec![("bot".to_string(), None)]),
     };
     let checks = curie::doctor::evaluate(&facts);
@@ -1962,6 +1968,12 @@ fn doctor_ready_tracks_the_checks() {
         mail_channels: vec![],
         completion_outbox: None,
         api_exposure: Some("NodePort 30799".to_string()),
+        // #2496: a release that was read, with polling off -- honest
+        // alongside the NodePort exposure above, and `assess` still resolves
+        // to the same Ok webhook state via exposure (poll precedence is
+        // moot at 0.0), so `ready` stays true.
+        commit_poll_interval_seconds: Some(0.0),
+        delivery_discovery_failure: None,
         agents: Some(vec![("bot".to_string(), Some("acme/bot".to_string()))]),
     };
     let checks = curie::doctor::evaluate(&facts);
@@ -1976,10 +1988,17 @@ fn doctor_ready_tracks_the_checks() {
         serde_json::Value::Bool(true),
         "a fully wired report is ready: {json}"
     );
+    // #2496: binding is necessary but not sufficient. This install is exposed on
+    // a NodePort with polling off, and Curie never creates the GitHub webhook,
+    // so nothing observed carries a push -- `deploys_verified: true` here was a
+    // delivery promise from public exposure alone. `ready` still holds: the
+    // delivery row is deliberately `Ok` (crying wolf at a working NodePort
+    // install is what teaches operators to ignore doctor), so no check is
+    // MISSING, which is the only thing `ready` claims.
     assert_eq!(
         json["deploys_verified"],
-        serde_json::Value::Bool(true),
-        "all-bound agents mean git-push deploys were verified: {json}"
+        serde_json::Value::Bool(false),
+        "exposure without a webhook or poller is not a verified deploy path: {json}"
     );
 }
 

@@ -314,6 +314,7 @@ fn a_local_daemon_lock_deploys_locally_and_is_refused_at_cluster() {
 #[test]
 fn deploy_opts_carries_an_explicit_tier() {
     let opts = DeployOpts {
+        delivery: None,
         agent: None,
         target: None,
         plugin_dir: plugin_dir(),

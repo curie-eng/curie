@@ -3643,6 +3643,10 @@ async fn run(command: Option<Command>) -> Result<()> {
             } => {
                 let local_api_url = api_url.clone();
                 let result = commands::deploy(DeployOpts {
+                    // The local tier has no release to read delivery off, so it
+                    // is not assessed and says nothing -- distinct from an
+                    // assessed-but-undetermined `Some(Unknown)` (#2496).
+                    delivery: None,
                     plugin_dir,
                     agent,
                     target,
@@ -4455,12 +4459,42 @@ async fn run(command: Option<Command>) -> Result<()> {
                     vec![target]
                 };
 
+                // ONE observation for the whole invocation (#2496). The release
+                // is the same for every `--all-targets` entry, so assessing per
+                // target would be N helm subprocesses for one answer. Read
+                // before activation and printed after: an operator who edits
+                // helm values mid-deploy sees a stale line, and `curie doctor`
+                // is the authority on the current state.
+                // Only a deploy that BINDS a repository can make a delivery
+                // claim, and the line is printed inside that same block, so a
+                // deploy without `--repo` must not pay for the helm read.
+                let delivery = match &repo {
+                    None => None,
+                    Some(_) => Some(curie::delivery::assess(
+                        &curie::doctor::observe_delivery(&ops::CommonOpts {
+                            namespace: namespace.clone(),
+                            release: release.clone(),
+                            dry_run: false,
+                        })
+                        .await,
+                    )),
+                };
+
                 if all_targets {
                     let first_target = targets
                         .first()
                         .cloned()
                         .flatten()
                         .expect("all target entries always have a target name");
+                    // Deliberately NOT joined with the delivery observation
+                    // above (#2496). Awaiting the bind here keeps a bind failure
+                    // isolated: nothing else is in flight when it returns `Err`.
+                    // Joining them lets a bind failure overlap the still-running
+                    // helm subprocess of `observe_delivery`, and `connectors::run`
+                    // is not `kill_on_drop`, so cancelling the parent in that
+                    // window leaks a `kubectl` child that sequential ordering
+                    // would never have spawned. The wall-clock saving is not
+                    // worth either.
                     let connector_target =
                         match curie::connectors::bind_current_cluster(&namespace, &release).await {
                             Ok(target) => target,
@@ -4495,6 +4529,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     for target in targets {
                         let target = target.expect("all target entries always have a target name");
                         let prepared_deploy = match commands::prepare_deploy(DeployOpts {
+                            delivery: delivery.clone(),
                             plugin_dir: plugin_dir.clone(),
                             agent: agent.clone(),
                             target: Some(target.clone()),
@@ -4607,6 +4642,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         .next()
                         .expect("the target list is never empty");
                     let deployed = commands::deploy(DeployOpts {
+                        delivery,
                         plugin_dir: plugin_dir.clone(),
                         agent: agent.clone(),
                         target,
