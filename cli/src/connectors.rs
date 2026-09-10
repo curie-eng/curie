@@ -294,6 +294,111 @@ pub fn as_list_document(manifests: &[Value]) -> Result<String> {
     serde_json::to_string(&doc).context("serializing connector manifests")
 }
 
+/// Whether an mcp_entry URL names this Deployment's Service.
+///
+/// Same host match #2350 uses for rollout wait (`connector_workloads`): the
+/// Service DNS is `<deployment>.<namespace>.svc.cluster.local`. Sibling: share
+/// this helper with #2350 when that PR merges. Do not treat a missing match as
+/// a capability-probe failure (#2519).
+fn url_names_deployment(url: &str, deployment: &str) -> bool {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    let host = hostport.rsplit('@').next().unwrap_or(hostport);
+    let host = host.split(':').next().unwrap_or(host);
+    host == deployment || host.starts_with(&format!("{deployment}."))
+}
+
+fn mcp_join_prefix(release: &str, agent: &str) -> String {
+    format!("{release}-{agent}-mcp-")
+}
+
+/// Hosted Deployments whose Service is not in `mcp_entries` (#2352).
+///
+/// This is the mounted-*declaration* check, not tool-surface discovery: a
+/// matching URL means Curie derived the MCP entry the runner will inject.
+/// Empty Bearer expansion and probe failure stay #2519. Hosted *readiness*
+/// (rollout) stays #2350. A hosted connector with a matching entry must not
+/// warn: that is the shipped 0.8.6+ mount path, not the 0.8.5 silence.
+pub fn hosted_unmounted_connectors(
+    manifests: &[Value],
+    mcp_entries: &BTreeMap<String, Value>,
+    release: &str,
+    agent: &str,
+) -> Vec<String> {
+    let prefix = mcp_join_prefix(release, agent);
+    let mut names = Vec::new();
+    for obj in manifests {
+        if obj.get("kind").and_then(Value::as_str) != Some("Deployment") {
+            continue;
+        }
+        let Some(name) = obj
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if mcp_entries.iter().any(|(_, entry)| {
+            entry
+                .get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| url_names_deployment(url, name))
+        }) {
+            continue;
+        }
+        let connector = name.strip_prefix(&prefix).unwrap_or(name);
+        names.push(connector.to_string());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Loud warning for connectors that were hosted but not declared mounted.
+pub fn hosted_unmounted_warning(names: &[String]) -> Option<String> {
+    match names {
+        [] => None,
+        [one] => Some(format!(
+            "connector {one} was hosted but not mounted into the agent's MCP declaration"
+        )),
+        many => Some(format!(
+            "connectors {} were hosted but not mounted into the agent's MCP declaration",
+            many.join(", ")
+        )),
+    }
+}
+
+/// Human deploy report: warnings first, then URL notes for mounted entries.
+pub fn connector_report_lines(synced: &ConnectorSync) -> (Vec<String>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut notes = Vec::new();
+    if let Some(msg) = hosted_unmounted_warning(&synced.hosted_unmounted) {
+        warnings.push(msg);
+    }
+    for (name, url) in &synced.urls {
+        if synced.hosted_unmounted.iter().any(|n| n == name) {
+            continue;
+        }
+        notes.push(format!("connector {name}: {url}"));
+    }
+    (warnings, notes)
+}
+
+/// Emit the deploy-time hosted vs mounted-declaration report.
+pub fn report_connector_sync(synced: &ConnectorSync) {
+    let ui = crate::ui::ui();
+    let (warnings, notes) = connector_report_lines(synced);
+    for msg in warnings {
+        ui.warn(&msg);
+    }
+    for msg in notes {
+        ui.note(&msg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +699,12 @@ pub struct ConnectorSync {
     pub written_keys: Vec<String>,
     /// Live Secret keys this deploy is replacing. Names only, never values.
     pub replaced_keys: Vec<String>,
+    /// Hosted Deployments with no matching mcp_entry URL (#2352).
+    ///
+    /// Declaration-layer only: not rollout readiness (#2350) and not MCP
+    /// capability discovery (#2519). Empty means every hosted connector was
+    /// declared mounted.
+    pub hosted_unmounted: Vec<String>,
 }
 
 /// Discover the release's rendered app name (the chart's nameOverride).
@@ -727,6 +838,11 @@ impl PreparedConnectorSync {
             .map(|(key, source)| format!("{key}: {source}"))
             .collect()
     }
+
+    /// Hosted connectors with no matching mcp_entry, recorded at prepare.
+    pub fn hosted_unmounted(&self) -> &[String] {
+        &self.result.hosted_unmounted
+    }
 }
 
 /// Discover the current kubeconfig's cluster identity.
@@ -795,6 +911,12 @@ pub fn prepare(
 
     let mut result = ConnectorSync {
         written_keys: secret_keys.clone(),
+        hosted_unmounted: hosted_unmounted_connectors(
+            manifests,
+            mcp_entries,
+            &target.release,
+            agent_name,
+        ),
         ..Default::default()
     };
     for (name, entry) in mcp_entries {
@@ -925,10 +1047,7 @@ pub async fn sync_deployed_version(
     )?
     .bind_target(target)?;
     let synced = sync(prepared).await?;
-    let ui = crate::ui::ui();
-    for (name, url) in &synced.urls {
-        ui.note(&format!("connector {name}: {url}"));
-    }
+    report_connector_sync(&synced);
     Ok(())
 }
 

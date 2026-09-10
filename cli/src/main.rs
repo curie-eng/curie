@@ -406,10 +406,7 @@ async fn apply_connectors(
     prepared: curie::connectors::PreparedConnectorSync,
 ) -> anyhow::Result<()> {
     let synced = curie::connectors::sync(prepared).await?;
-    let ui = curie::ui::ui();
-    for (name, url) in &synced.urls {
-        ui.note(&format!("connector {name}: {url}"));
-    }
+    curie::connectors::report_connector_sync(&synced);
     Ok(())
 }
 
