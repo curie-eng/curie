@@ -1501,6 +1501,11 @@ assert_worker_api byo curie https://byo-api.example chart -f "$WORKER_API_BYO"
 
 WORKER_API_OVERRIDE="$TMP/worker_api_override.yaml"
 cat > "$WORKER_API_OVERRIDE" <<'EOF'
+api:
+  # Rail 1 keys on the effective runner API URL (#2367); extraEnv below is external.
+  egress:
+    - cidr: 192.0.2.41/32
+      ports: [{ protocol: TCP, port: 9000 }]
 dispatcher:
   apiBaseUrl: https://byo-api.example
 worker:

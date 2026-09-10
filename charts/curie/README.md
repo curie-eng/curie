@@ -220,10 +220,19 @@ egress. The in-chart `runner-allow-api` policy selects this release's API pods,
 so it does not render, and NetworkPolicy has no hostname peer to derive from
 `dispatcher.apiBaseUrl`. Set `api.egress` to the endpoint's CIDRs (`{cidr,
 ports}` entries, same shape as the allowlist); the chart requires it at render
-whenever `dispatcher.apiBaseUrl` names an external API, because the failure it
-prevents is silent — agents boot with no
+whenever the URL the runner actually dials is external -- `api.deploy: false`,
+or `api.deploy: true` with `dispatcher.apiBaseUrl` / worker `extraEnv`
+`CURIE_API_URL` / `CURIE_RUNNER_API_URL` pointing off-cluster -- because the
+failure it prevents is silent: agents boot with no
 prior memory and no thread transcript, `remember` writes never persist, and the
 only symptom is a warning line inside the sandbox.
+`security.networkPolicy.allowedEgress` remains the documented legacy allow for
+the inverse (`deploy: true` + external URL) so an install that already has a
+non-empty model allowlist keeps rendering. The chart cannot prove those CIDRs
+cover the hostname; `api.egress` is the dedicated one-peer key. The same effective-endpoint rule applies to the collector:
+`otelCollector.egress` is required when the runner's OTLP URL is external,
+including an `agentSandbox.runner.extraEnv` `OTEL_EXPORTER_OTLP_ENDPOINT`
+override while the in-chart collector is still deployed.
 `mailAdapter.apiEgress.httpsCidrs` above is the same idea for the mail adapter
 pod: one BYO peer, declared explicitly, per pod that has an egress policy.
 
@@ -1070,11 +1079,13 @@ where the model API and MCP endpoints live (`{cidr, ports}` entries). An unset
 allowlist never means allow-all. The BYO in-chart peers are not on that list
 either, because each names one endpoint rather than a class of destinations: set
 `rustfs.egress` (and `rustfs.stsEgress` on the key-free path) so the sandbox
-bundle-fetch can reach S3 and STS, `otelCollector.egress` when
-`otelCollector.deploy: false` points the runner at an external collector, and
-`api.egress` when `api.deploy: false` points it at an external API. Each is
-required at render on its BYO path, so the install fails loudly instead of
-shipping a sandbox holding an address it can never reach. See **Key-free object
+bundle-fetch can reach S3 and STS, `otelCollector.egress` when the runner's
+OTLP URL is external, and `api.egress` when the runner's API URL is external.
+Each is required at render on that effective-endpoint path, so the install
+fails loudly instead of shipping a sandbox holding an address it can never
+reach. `deploy: false` is the common BYO shape; the same requirement fires
+when the in-chart pod is still deployed but `dispatcher.apiBaseUrl` or a
+supported extraEnv override points the runner elsewhere. See **Key-free object
 store auth** above.
 
 **The controller does not get a second vote on egress (#765, ADR-0067).**

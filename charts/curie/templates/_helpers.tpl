@@ -1062,6 +1062,167 @@ before contacting Valkey.
 {{ include "curie.env.apiKey" . }}
 {{- end -}}
 
+{{/* Literal extraEnv value for one name, or the sentinel __valueFrom__ when
+     the entry exists without a string value. Empty when the name is absent.
+     A present empty value is the sentinel __empty__: worker.yaml treats name
+     presence as an override, so Rail 1 must not fall through to the in-chart
+     URL. valueFrom cannot be proven in-cluster at render. */}}
+{{- define "curie.extraEnv.lookup" -}}
+{{- $found := "" -}}
+{{- range (.env | default list) -}}
+{{- if eq .name $.name -}}
+{{- if and (hasKey . "value") (kindIs "string" .value) -}}
+{{- if eq (trim .value) "" -}}
+{{- $found = "__empty__" -}}
+{{- else -}}
+{{- $found = .value -}}
+{{- end -}}
+{{- else if hasKey . "value" -}}
+{{- $found = printf "%v" .value -}}
+{{- else -}}
+{{- $found = "__valueFrom__" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $found -}}
+{{- end -}}
+
+{{/* Hostname of a URL, port stripped for host:port. Bracketed IPv6 is left
+     intact; those hosts are never this chart's in-cluster Service DNS. A
+     host:port with no scheme (sprig urlParse leaves host empty) is treated
+     as the raw string so curie-api:8000 still matches the in-chart Service. */}}
+{{- define "curie.endpoint.host" -}}
+{{- $raw := trim . -}}
+{{- if $raw -}}
+{{- $parsed := urlParse $raw -}}
+{{- $host := $parsed.host | default "" -}}
+{{- if not $host -}}
+{{- $host = $raw -}}
+{{- end -}}
+{{- if contains "[" $host -}}
+{{- $host -}}
+{{- else -}}
+{{- regexReplaceAll ":[0-9]+$" $host "" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* True when host is this release's Service DNS for component (api or
+     otel-collector), including the usual cluster.local FQDNs. */}}
+{{- define "curie.host.inChartService" -}}
+{{- $fullname := include "curie.fullname" .root -}}
+{{- $ns := .root.Release.Namespace -}}
+{{- $svc := printf "%s-%s" $fullname .component -}}
+{{- $h := lower (trim .host) -}}
+{{- if or (eq $h $svc) (eq $h (printf "%s.%s" $svc $ns)) (eq $h (printf "%s.%s.svc" $svc $ns)) (eq $h (printf "%s.%s.svc.cluster.local" $svc $ns)) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* API URL a spawned runner actually dials (#2367). worker.extraEnv
+     CURIE_RUNNER_API_URL wins, then CURIE_API_URL, then dispatcher.apiBaseUrl
+     / the in-chart API Service. Matches apps/worker runner_facing_api_base_url. */}}
+{{- define "curie.runner.effectiveApiUrl" -}}
+{{- $runner := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_RUNNER_API_URL") | trim -}}
+{{- $api := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_API_URL") | trim -}}
+{{- if $runner -}}
+{{- $runner -}}
+{{- else if $api -}}
+{{- $api -}}
+{{- else -}}
+{{- include "curie.api.url" (dict "root" . "baseUrl" .Values.dispatcher.apiBaseUrl) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.runner.effectiveApiSource" -}}
+{{- $runner := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_RUNNER_API_URL") | trim -}}
+{{- $api := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_API_URL") | trim -}}
+{{- if $runner -}}
+worker.extraEnv CURIE_RUNNER_API_URL
+{{- else if $api -}}
+worker.extraEnv CURIE_API_URL
+{{- else if trim (printf "%v" (.Values.dispatcher.apiBaseUrl | default "")) -}}
+dispatcher.apiBaseUrl
+{{- else -}}
+the in-chart API Service
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.runner.apiIsExternal" -}}
+{{- $url := include "curie.runner.effectiveApiUrl" . | trim -}}
+{{- if or (eq $url "__valueFrom__") (eq $url "__empty__") -}}
+true
+{{- else if empty $url -}}
+{{- else if include "curie.host.inChartService" (dict "root" . "host" (include "curie.endpoint.host" $url) "component" "api") -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* True when the operator overrode the runner-facing API URL, including an
+     in-chart Service DNS leftover. The deploy-false BYO gate uses this so
+     api.deploy false plus dispatcher.apiBaseUrl=http://<release>-api still
+     requires api.egress (#2317), while empty apiBaseUrl with no extraEnv
+     still dead-ends at dispatcher boot. */}}
+{{- define "curie.runner.apiOverrideSet" -}}
+{{- $base := trim (printf "%v" (.Values.dispatcher.apiBaseUrl | default "")) -}}
+{{- $runner := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_RUNNER_API_URL") | trim -}}
+{{- $api := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_API_URL") | trim -}}
+{{- if or $base $runner $api -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* OTLP URL the runner sandbox actually dials (#2367). Signal-specific
+     extraEnv (traces, then metrics, then logs) wins over the generic
+     OTEL_EXPORTER_OTLP_ENDPOINT, then the chart-owned curie.otel.endpoint. */}}
+{{- define "curie.runner.effectiveOtlpEndpoint" -}}
+{{- $traces := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") | trim -}}
+{{- $metrics := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") | trim -}}
+{{- $logs := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") | trim -}}
+{{- $generic := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_ENDPOINT") | trim -}}
+{{- if $traces -}}
+{{- $traces -}}
+{{- else if $metrics -}}
+{{- $metrics -}}
+{{- else if $logs -}}
+{{- $logs -}}
+{{- else if $generic -}}
+{{- $generic -}}
+{{- else -}}
+{{- include "curie.otel.endpoint" . | trim -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.runner.effectiveOtlpSource" -}}
+{{- $traces := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") | trim -}}
+{{- $metrics := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") | trim -}}
+{{- $logs := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") | trim -}}
+{{- $generic := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_ENDPOINT") | trim -}}
+{{- if $traces -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+{{- else if $metrics -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+{{- else if $logs -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
+{{- else if $generic -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_ENDPOINT
+{{- else -}}
+curie.otel.endpoint
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.runner.otlpIsExternal" -}}
+{{- $url := include "curie.runner.effectiveOtlpEndpoint" . | trim -}}
+{{- if or (eq $url "__valueFrom__") (eq $url "__empty__") -}}
+true
+{{- else if empty $url -}}
+{{- else if include "curie.host.inChartService" (dict "root" . "host" (include "curie.endpoint.host" $url) "component" "otel-collector") -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{/* Coalesce the worker's chart-managed egress credentials and the first-party
      mail adapter's chart-managed paired credential. The chart Secret and the
      worker rollout checksum must use this same rendered JSON so a rotation
