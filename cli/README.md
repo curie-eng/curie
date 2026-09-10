@@ -726,6 +726,7 @@ release binary has no dev scripts.
 | `curie dev e2e` | `bash cli/scripts/e2e.sh` -- the scripted CLI end-to-end test. |
 | `curie dev e2e-ladder` | `bash cli/scripts/e2e-ladder.sh` -- the cold-start parity ladder (skill, local, cluster rungs). |
 | `curie dev recovery-drill` | `bash cli/scripts/recovery-drill.sh` -- isolated worker/runner recovery drills (#2425): worker death, runner death, timeout follow-up, Valkey outage, API restart. Refuses the permanent soak. |
+| `curie dev lease-expiry-cluster-proof` | `bash cli/scripts/lease-expiry-cluster-proof.sh` -- disposable two-worker cluster pin for #2453/#2433: default 900000 reclaim backstop, three concurrent test Slack mentions, in-place placeholder edits, XPENDING increments, no-lease control, SIGKILL takeover. Refuses the permanent soak. Never shortens the backstop. |
 | `curie dev field-parity` | `bash cli/scripts/check-field-parity.sh` -- assert CLI `api.rs` mirror structs cover their platform API model fields (#691), and CLI `commands.rs`/`spec.rs` mirror structs cover the frozen `packages/plugin-format` schema's fields (#701). |
 | `curie dev emit-parity` | `bash cli/scripts/check-emit-parity.sh` -- assert a `CliOutput::to_json` that hand-projects a mirror struct into a `json!` literal covers that struct's fields, one hop downstream of `field-parity` (#699). |
 | `curie dev wire-tolerance` | `bash scripts/check-wire-tolerance.sh` -- assert every direct `ClassName.model_validate*(...)` call on an `_AciModel` subclass threads `READER_CONTEXT` or is a declared exception (#625). |

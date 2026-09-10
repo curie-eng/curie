@@ -1067,6 +1067,23 @@ enum DevAction {
         #[arg(long)]
         force: bool,
     },
+    /// Disposable two-worker cluster proof for lease-expiry reclaim (#2453,
+    /// `bash cli/scripts/lease-expiry-cluster-proof.sh`): default
+    /// `reclaim_min_idle_ms` 900000, three concurrent test Slack mentions, in-place
+    /// placeholder edits, XPENDING delivery increments, the no-lease 900 s
+    /// backstop control, and SIGKILL takeover. Refuses the permanent soak.
+    /// Checkout-only. Never shortens the backstop.
+    LeaseExpiryClusterProof {
+        /// Allow recreating a leftover task-owned kind cluster of the same name.
+        #[arg(long)]
+        force: bool,
+        /// Leave the kind cluster and Helm release running after the proof.
+        #[arg(long)]
+        keep: bool,
+        /// Guard checks only: soak refusal, default backstop, missing Slack.
+        #[arg(long)]
+        self_test: bool,
+    },
     /// Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points
     /// at, not merely that its NetworkPolicies are applied (#1153,
     /// `bash scripts/check-netpol-enforcement.sh`). Structured as a
@@ -3088,6 +3105,26 @@ async fn run(command: Option<Command>) -> Result<()> {
                     args.push("--json");
                 }
                 commands::dev_script("cli/scripts/recovery-drill.sh", &args).await
+            }
+            DevAction::LeaseExpiryClusterProof {
+                force,
+                keep,
+                self_test,
+            } => {
+                let mut args: Vec<&str> = Vec::new();
+                if force {
+                    args.push("--force");
+                }
+                if keep {
+                    args.push("--keep");
+                }
+                if self_test {
+                    args.push("--self-test");
+                }
+                if ui::ui().json() {
+                    args.push("--json");
+                }
+                commands::dev_script("cli/scripts/lease-expiry-cluster-proof.sh", &args).await
             }
             DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
             DevAction::PluginCompat => {
@@ -5832,6 +5869,38 @@ mod tests {
                 assert!(force);
             }
             _ => panic!("expected recovery-drill"),
+        }
+        let cli = Cli::try_parse_from(["curie", "dev", "lease-expiry-cluster-proof"])
+            .expect("dev lease-expiry-cluster-proof should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::LeaseExpiryClusterProof { .. }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "curie",
+            "dev",
+            "lease-expiry-cluster-proof",
+            "--force",
+            "--keep",
+            "--self-test",
+        ])
+        .expect("dev lease-expiry-cluster-proof flags should parse");
+        match cli.command {
+            Some(Command::Dev {
+                action:
+                    DevAction::LeaseExpiryClusterProof {
+                        force,
+                        keep,
+                        self_test,
+                    },
+            }) => {
+                assert!(force);
+                assert!(keep);
+                assert!(self_test);
+            }
+            _ => panic!("expected lease-expiry-cluster-proof"),
         }
     }
 

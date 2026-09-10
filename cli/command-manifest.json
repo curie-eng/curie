@@ -5514,6 +5514,49 @@
           "name": "recovery-drill"
         },
         {
+          "about": "Disposable two-worker cluster proof for lease-expiry reclaim (#2453, `bash cli/scripts/lease-expiry-cluster-proof.sh`): default `reclaim_min_idle_ms` 900000, three concurrent test Slack mentions, in-place placeholder edits, XPENDING delivery increments, the no-lease 900 s backstop control, and SIGKILL takeover. Refuses the permanent soak. Checkout-only. Never shortens the backstop",
+          "args": [
+            {
+              "global": false,
+              "help": "Allow recreating a leftover task-owned kind cluster of the same name",
+              "id": "force",
+              "long": "force",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Leave the kind cluster and Helm release running after the proof",
+              "id": "keep",
+              "long": "keep",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Guard checks only: soak refusal, default backstop, missing Slack",
+              "id": "self_test",
+              "long": "self-test",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "lease-expiry-cluster-proof"
+        },
+        {
           "about": "Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points at, not merely that its NetworkPolicies are applied (#1153, `bash scripts/check-netpol-enforcement.sh`). Structured as a non-vacuity check: it proves a DENIED direction is genuinely blocked before trusting any allowed one, so a CNI that ignores NetworkPolicy (kindnet, minikube's default) FAILS rather than passing green",
           "hidden": false,
           "name": "netpol-check"
