@@ -564,7 +564,27 @@ def _pull_request_only(step: dict[str, Any]) -> bool:
     return bool(PR_CONDITION.search(_string(step, "if")))
 
 
-def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() -> None:
+def _fix_pin_job() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    document = _load_ci()
+    jobs = document.get("jobs")
+    assert isinstance(jobs, dict), "ci.yaml must declare jobs"
+    job = jobs.get("fix-pin")
+    assert isinstance(job, dict), "ci.yaml must retain the fix-pin job"
+    steps = job.get("steps")
+    assert isinstance(steps, list), "the fix pin job must retain steps"
+    return job, [step for step in steps if isinstance(step, dict)]
+
+
+def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it() -> None:
+    """The suite and the gate are both required, and no longer in series.
+
+    They were one job. #2230 measured that job as the whole critical path, and
+    the gate sat behind the suite it does not depend on: a cold 251s cargo
+    build plus a 127s verification appended after 1048s of pytest. This asserts
+    the split, in both directions. The Python job must still be the unskippable
+    required suite, and it must no longer carry the gate; the gate must be its
+    own unskippable required job.
+    """
     document = _load_ci()
     trigger = _workflow_trigger(document)
     pull_request = trigger.get("pull_request")
@@ -582,13 +602,14 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
     assert job.get("name") == "Python (ruff + mypy + pytest)"
     assert "needs" not in job, "the required Python check must not be skippable"
 
-    # A job-level permissions block replaces the workflow-level one, so the job
-    # must grant both the checkout scope and the Issues scope the gate reads
-    # closed issue labels with.
     permissions = job.get("permissions")
     assert isinstance(permissions, dict), "the Python job must declare job level permissions"
     assert permissions.get("contents") == "read"
-    assert permissions.get("issues") == "read"
+    # The Issues scope followed the gate out. It was only ever there so the gate
+    # could read closed issue labels, and the suite has no use for it.
+    assert "issues" not in permissions, (
+        "the Python job must not keep the Issues scope the fix pin gate took with it"
+    )
 
     checkout_index = _single_step_index(
         steps,
@@ -612,9 +633,9 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
         "shared database migration",
     )
     # Matched on the prefix, not on equality. What this assertion is for is that
-    # the normal suite runs, unfiltered, before the gate; reporting flags like
-    # --durations do not bear on that, and pinning the exact string made a
-    # profiling flag look like a contract change.
+    # the normal suite runs, unfiltered; reporting flags like --durations do not
+    # bear on that, and pinning the exact string made a profiling flag look like
+    # a contract change.
     pytest_index = _single_step_index(
         steps,
         lambda step: _string(step, "run").strip().startswith("uv run pytest -q"),
@@ -628,12 +649,80 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
         "the Python suite must run unfiltered: only reporting flags may be added "
         f"to `uv run pytest -q`, got {pytest_command!r}"
     )
+    assert stack_index < migration_index < pytest_index
+
+    # The half that keeps the win. Nothing about the gate may drift back into
+    # the job whose length is the critical path.
+    assert not any(_is_fix_pin_gate(step) for step in steps), (
+        "the fix pin gate must not run inside the Python job again"
+    )
+    assert not any(_is_fix_pin_probe(step) for step in steps), (
+        "the fix pin probe must not run inside the Python job again"
+    )
+    assert not any(
+        "cargo" in _string(step, "run") for step in steps
+    ), "the Python job must not build Rust behind the suite"
+
+    diagnostic_index = _single_step_index(
+        steps,
+        lambda step: "docker compose -f compose.dev.yaml logs" in _string(step, "run"),
+        "failure stack diagnostic",
+    )
+    diagnostic_if = _string(steps[diagnostic_index], "if")
+    assert "failure()" in diagnostic_if
+    assert "steps.python-runtime.outputs.pytest == 'true'" in diagnostic_if
+    assert pytest_index < diagnostic_index
+
+
+def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
+    """Everything the gate needs must be in the job that now runs it."""
+    job, steps = _fix_pin_job()
+    assert "needs" not in job, "the required fix pin check must not be skippable"
+    assert _pull_request_only(job), (
+        "only a pull request carries the body this gate reads, so the job is "
+        "pull-request only and its steps no longer each repeat that condition"
+    )
+
+    permissions = job.get("permissions")
+    assert isinstance(permissions, dict), "the fix pin job must declare job level permissions"
+    assert permissions.get("contents") == "read"
+    assert permissions.get("issues") == "read", (
+        "the gate reads the labels of the closed issues a pull request names"
+    )
+
+    checkout = steps[
+        _single_step_index(
+            steps,
+            lambda step: _string(step, "uses") == "actions/checkout@v7",
+            "fix pin checkout",
+        )
+    ]
+    checkout_with = checkout.get("with")
+    assert isinstance(checkout_with, dict)
+    # verify-fix-pin.sh resolves HEAD and adds a detached worktree at it, and
+    # the gate diffs against the base.
+    assert checkout_with.get("fetch-depth") == 0
+    assert checkout_with.get("persist-credentials") is False
+
     probe_index = _single_step_index(steps, _is_fix_pin_probe, "fix pin cargo probe")
     gate_index = _single_step_index(steps, _is_fix_pin_gate, "fix pin caller")
-    gate = steps[gate_index]
-    assert _pull_request_only(gate), "the verifier must not run for pushes"
-    assert stack_index < migration_index < pytest_index < gate_index
 
+    probe = steps[probe_index]
+    assert probe.get("id") == "fix-pin-curie"
+    assert not _string(probe, "if"), (
+        "the probe must run for every pull request, including bodies with no "
+        "live selector; gating it on its own output would skip the decision"
+    )
+    assert shlex.split(_string(probe, "run")) == [
+        "python3",
+        "tools/fix-pin-ci/check.py",
+        "--event",
+        "$GITHUB_EVENT_PATH",
+        "--needs-curie",
+    ]
+    assert '--event "$GITHUB_EVENT_PATH"' in _string(probe, "run")
+
+    gate = steps[gate_index]
     gate_environment = gate.get("env")
     assert isinstance(gate_environment, dict)
     assert gate_environment.get("CARGO_TARGET_DIR") == "${{ github.workspace }}/cli/target"
@@ -650,21 +739,6 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
     ]
     assert '--event "$GITHUB_EVENT_PATH"' in _string(gate, "run")
 
-    probe = steps[probe_index]
-    assert _string(probe, "if") == "github.event_name == 'pull_request'", (
-        "the cargo probe must run for every pull request, including bodies with "
-        "no live selector; gating it on its own output would skip the decision"
-    )
-    assert probe.get("id") == "fix-pin-curie"
-    assert shlex.split(_string(probe, "run")) == [
-        "python3",
-        "tools/fix-pin-ci/check.py",
-        "--event",
-        "$GITHUB_EVENT_PATH",
-        "--needs-curie",
-    ]
-    assert '--event "$GITHUB_EVENT_PATH"' in _string(probe, "run")
-
     release_build_index = _single_step_index(
         steps,
         lambda step: _string(step, "run").strip()
@@ -678,19 +752,48 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
         and (step.get("with") or {}).get("version") == "v3.16.4",
         "pinned Helm setup",
     )
-    for index in (release_build_index, helm_index):
-        assert _pull_request_only(steps[index]), "selector tooling must not affect push runs"
-        assert pytest_index < index < gate_index
-    assert pytest_index < probe_index < release_build_index < helm_index < gate_index
+    assert probe_index < release_build_index < helm_index < gate_index
+
+    # The build stays direct. A `rust` selector makes verify-fix-pin.sh run
+    # `cargo test` out of CARGO_TARGET_DIR, so this build warms the directory
+    # the verification then compiles in; swapping it for rust-build's artifact
+    # would leave that selector to compile from cold.
     assert not any(
         _string(step, "uses") == "Swatinem/rust-cache@v2" for step in steps
-    ), "the Python job must build directly without a Cargo cache dependency"
+    ), "the fix pin job must build directly without a Cargo cache dependency"
     assert not any(
-        _string(step, "uses") == "actions/download-artifact@v8" for step in steps
-    ), "the Python job must not download its curie binary"
+        _string(step, "uses").startswith("actions/download-artifact") for step in steps
+    ), "the fix pin job must not download its curie binary"
     assert not any(
         "chmod +x cli/target/release/curie" in _string(step, "run") for step in steps
     ), "the direct Cargo build creates the executable"
+
+    # Inside the Python job the gate inherited a booted stack. A `python`
+    # selector naming an integration test dials Postgres and Valkey through
+    # `uv run pytest <selector>`, so the split job has to boot its own or those
+    # selectors fail for the environment rather than for the pin.
+    sync_index = _single_step_index(
+        steps,
+        lambda step: _string(step, "run").strip() == "uv sync",
+        "workspace sync",
+    )
+    stack_index = _single_step_index(
+        steps,
+        lambda step: "docker compose -f compose.dev.yaml up -d" in _string(step, "run"),
+        "dev stack startup",
+    )
+    migration_index = _single_step_index(
+        steps,
+        lambda step: "uv run alembic upgrade head" in _string(step, "run"),
+        "shared database migration",
+    )
+    assert sync_index < probe_index
+    assert helm_index < stack_index < migration_index < gate_index
+    for index in (stack_index, migration_index):
+        assert CARGO_NEEDED_GUARD in _string(steps[index], "if"), (
+            "a body with no live selector never reaches the verifier, so it "
+            "must not pay for a compose stack either"
+        )
 
     diagnostic_index = _single_step_index(
         steps,
@@ -699,7 +802,7 @@ def test_ci_keeps_the_required_python_status_and_calls_fix_pin_after_pytest() ->
     )
     diagnostic_if = _string(steps[diagnostic_index], "if")
     assert "failure()" in diagnostic_if
-    assert "steps.python-runtime.outputs.pytest == 'true'" in diagnostic_if
+    assert CARGO_NEEDED_GUARD in diagnostic_if
     assert gate_index < diagnostic_index
 
 
@@ -721,8 +824,7 @@ def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> No
     reuse `_declaration` so a commented example cannot trigger the build, and
     a live `Fix pin: <selector>` line still cannot skip it.
     """
-    document = _load_ci()
-    _, steps = _python_job(document)
+    job, steps = _fix_pin_job()
 
     probe = steps[_single_step_index(steps, _is_fix_pin_probe, "fix pin cargo probe")]
     assert probe.get("id") == "fix-pin-curie"
@@ -742,7 +844,11 @@ def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> No
     ):
         step = steps[_single_step_index(steps, predicate, description)]
         condition = _string(step, "if")
-        assert PR_CONDITION.search(condition), f"{description} must stay pull-request only"
+        # The job carries the pull-request condition now, so the steps state
+        # only what is theirs: the parser's answer.
+        assert _pull_request_only(job), (
+            f"{description} must stay pull-request only"
+        )
         assert CARGO_NEEDED_GUARD in condition, (
             f"{description} must build only when the parser says the binary "
             f"is needed: {condition!r}"
