@@ -60,6 +60,14 @@ from plugin_format import (
     DEFAULT_MAX_UNCOMPRESSED_BYTES,
 )
 
+from ..attachments import (
+    ATTACHMENTS_MOUNT_PATH,
+    ATTACHMENTS_REF_ENV,
+    AttachmentLimits,
+    AttachmentResolutionError,
+    AttachmentTooLargeError,
+    decode_attachment_refs,
+)
 from ..binding import (
     BASE_URL_ENV,
     BUNDLE_REF_ENV,
@@ -86,6 +94,22 @@ from .types import (
     SandboxView,
     filter_agent_child_env,
 )
+
+#: Per-object read deadline when redeeming an attachment capability. A local
+#: constant rather than an AttachmentLimits field: the reference already
+#: expires, the size cap already bounds the transfer, and widening the operator
+#: envelope for a value nobody asked to tune would add a knob and a chart value
+#: that mean nothing to them.
+_ATTACHMENT_FETCH_TIMEOUT_S = 30.0
+
+
+class _NoAttachments(Exception):
+    """The claim carried a reference that decoded to zero files.
+
+    Not an error: a turn whose attachment list is empty must produce exactly
+    today's container spec, with no mount and no staged directory, so the empty
+    case is indistinguishable from a turn that never carried the key at all.
+    """
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +147,20 @@ _OAUTH_TOKEN_PREFIX = "sk-ant-oat"
 # explicitly, the bundle ref named a RustFS object the worker already fetched
 # (the runner never fetches), and the credential is forwarded by name (never as
 # a value in the argv).
-_WORKER_OWNED_ENV = frozenset({BUNDLE_REF_ENV, PLUGIN_DIR_ENV, "CURIE_SANDBOX_ID", CREDENTIALS_ENV})
+_WORKER_OWNED_ENV = frozenset(
+    {
+        BUNDLE_REF_ENV,
+        PLUGIN_DIR_ENV,
+        "CURIE_SANDBOX_ID",
+        CREDENTIALS_ENV,
+        # The attachment capability is redeemed HERE, by this driver, exactly as
+        # the bundle ref is. Forwarding it would hand the sandbox a live signed
+        # url it has no reason to hold; Kubernetes scopes the same key to its
+        # init container and keeps it off the runner, and the two substrates
+        # must not disagree about what the agent can reach.
+        ATTACHMENTS_REF_ENV,
+    }
+)
 
 
 def _parse_created(raw: str) -> datetime | None:
@@ -274,6 +311,7 @@ class DockerSandboxClient:
         bundle_max_compression_ratio: float = DEFAULT_MAX_COMPRESSION_RATIO,
         bundle_max_members: int = DEFAULT_MAX_MEMBERS,
         workspace_limits: WorkspaceLimits | None = None,
+        attachment_limits: AttachmentLimits | None = None,
     ) -> None:
         self._image = image
         self._bundles = bundle_store
@@ -300,6 +338,10 @@ class DockerSandboxClient:
         self._bundle_dirs: dict[str, str] = {}
         self._workspace_dirs: dict[str, str] = {}
         self._workspace_limits = workspace_limits or WorkspaceLimits()
+        # Per-container host dir holding the redeemed attachments, cleaned on
+        # delete exactly as the bundle and workspace dirs are.
+        self._attachment_dirs: dict[str, str] = {}
+        self._attachment_limits = attachment_limits or AttachmentLimits()
 
     # -- claim lifecycle ------------------------------------------------------
 
@@ -352,6 +394,24 @@ class DockerSandboxClient:
                 self._cleanup_bundle(name)
                 raise
             args += ["-v", f"{root}:{WORKSPACE_MOUNT_PATH}:rw"]
+        # Attachments: same reason as the bundle above -- no init containers
+        # here, so this driver redeems the signed reference itself. Kubernetes
+        # does this in `attachments-init`; without the equivalent, `curie local
+        # up` and `curie skill` would park the bytes and hand the agent nothing,
+        # which is a fabricated empty result at those tiers (ADR-0041) and the
+        # very silent loss #2567 exists to close. Read-only: an attachment is an
+        # input a person sent, not a scratch space.
+        if env.get(ATTACHMENTS_REF_ENV):
+            try:
+                root = self._prepare_attachments(name, env[ATTACHMENTS_REF_ENV])
+            except _NoAttachments:
+                pass
+            except Exception:
+                self._cleanup_workspace(name)
+                self._cleanup_bundle(name)
+                raise
+            else:
+                args += ["-v", f"{root}:{ATTACHMENTS_MOUNT_PATH}:ro"]
 
         args += [
             "-e",
@@ -415,6 +475,7 @@ class DockerSandboxClient:
             # A failed boot must not leak staged claim data.
             self._cleanup_bundle(name)
             self._cleanup_workspace(name)
+            self._cleanup_attachments(name)
             raise
 
     def get_claim(self, name: str) -> ClaimView | None:
@@ -443,6 +504,7 @@ class DockerSandboxClient:
         self._docker(["rm", "-f", name], check=False)
         self._cleanup_bundle(name)
         self._cleanup_workspace(name)
+        self._cleanup_attachments(name)
 
     def list_claims(self, *, label_selector: str) -> list[ClaimView]:
         out = self._docker(
@@ -596,6 +658,87 @@ class DockerSandboxClient:
 
     def _cleanup_workspace(self, name: str) -> None:
         tmp = self._workspace_dirs.pop(name, None)
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _prepare_attachments(self, name: str, encoded_refs: str) -> str:
+        """Redeem the signed references and materialize a read-only mount root.
+
+        The Kubernetes twin of this is the ``attachments-init`` container, and
+        the refusals are deliberately the same set: ``decode_attachment_refs``
+        has already rejected a non-HTTP(S) url and a digest that is not real
+        hex, and what is left to refuse here is an expired capability, a file
+        that outgrows the cap mid-stream, a digest that does not match the bytes
+        that arrived, and a name that would land outside the mount root.
+
+        All or nothing, matching ``AttachmentCoordinator.resolve``: a partial set
+        is indistinguishable to the agent from a complete one, so one refusal
+        discards the whole directory rather than mounting the survivors.
+        """
+
+        refs = decode_attachment_refs(encoded_refs)
+        if not refs:
+            raise _NoAttachments
+        tmp = tempfile.mkdtemp(prefix="curie-attachments-")
+        root = Path(tmp) / "attachments"
+        root.mkdir(mode=0o755)
+        try:
+            for ref in refs:
+                if ref.expires_in_seconds <= 0:
+                    raise AttachmentResolutionError(
+                        "attachments-fetch",
+                        f"reference for {ref.name!r} expired",
+                    )
+                # Refused before the join, not after: `Path("   ").name` is
+                # `"   "`, and `Path("..").name` is `""`, so a containment check
+                # alone would let a blank file through or silently target the
+                # root itself. The init container makes the same refusal.
+                leaf = Path(ref.name.strip()).name.strip()
+                if not leaf or leaf in {".", ".."}:
+                    raise AttachmentResolutionError(
+                        "attachments-fetch",
+                        f"name {ref.name!r} is unusable as a filename",
+                    )
+                destination = root / leaf
+                if destination.resolve().parent != root.resolve():
+                    raise AttachmentResolutionError(
+                        "attachments-fetch",
+                        f"name {ref.name!r} escapes the mount root",
+                    )
+                digest = hashlib.sha256()
+                total = 0
+                request = urllib.request.Request(ref.url, method="GET")
+                with (
+                    urllib.request.urlopen(
+                        request, timeout=_ATTACHMENT_FETCH_TIMEOUT_S
+                    ) as response,
+                    destination.open("wb") as output,
+                ):
+                    while chunk := response.read(self._attachment_limits.read_chunk_bytes):
+                        total += len(chunk)
+                        if total > self._attachment_limits.max_file_bytes:
+                            raise AttachmentTooLargeError(
+                                ref.name, self._attachment_limits.max_file_bytes
+                            )
+                        digest.update(chunk)
+                        output.write(chunk)
+                if digest.hexdigest() != ref.sha256:
+                    raise AttachmentResolutionError(
+                        "attachments-fetch",
+                        f"{ref.name!r} digest mismatch",
+                    )
+                # The runner runs as uid 1000 and the mount is read-only, so the
+                # bytes only need to be readable; unlike the workspace they are
+                # never written back.
+                os.chmod(destination, 0o644)
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        self._attachment_dirs[name] = tmp
+        return str(root)
+
+    def _cleanup_attachments(self, name: str) -> None:
+        tmp = self._attachment_dirs.pop(name, None)
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
 

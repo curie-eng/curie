@@ -77,6 +77,16 @@ ATTACHMENT_LEDGER_PREFIX = "_attachments"
 # init container only.
 ATTACHMENTS_REF_ENV = "CURIE_ATTACHMENTS_REF"
 
+#: Where a resolved attachment lands inside the sandbox, on EVERY substrate.
+#: Kubernetes reaches it through an init container and a mounted emptyDir;
+#: Docker bind-mounts it directly. The runner probes this same path
+#: (``curie_runner.__main__.ATTACHMENTS_DIR``) and the chart mounts its volume
+#: there, so the three must agree -- a substrate that materialized files
+#: somewhere else would leave the agent probing an empty directory and reporting
+#: no attachment for a file that did arrive, which is the silent loss #2567
+#: exists to close.
+ATTACHMENTS_MOUNT_PATH = "/attachments"
+
 # Where the channel's file metadata is looked up. Only Slack today; the id in
 # ``Attachment`` is the channel's own file id, so resolving it is the port's
 # job, not this module's.

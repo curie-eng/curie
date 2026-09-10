@@ -302,6 +302,12 @@ def _sandbox_client(
             bundle_max_compression_ratio=config.bundle_max_compression_ratio,
             bundle_max_members=config.bundle_max_members,
             workspace_limits=_workspace_limits(config),
+            # The same operator envelope the Kubernetes lane gets. Without it
+            # this substrate would redeem attachment capabilities under library
+            # defaults while the cluster used the configured caps -- the two
+            # tiers disagreeing on how big a file may be is the kind of skew
+            # that only shows up as a refusal in one place and not the other.
+            attachment_limits=_attachment_limits(config),
         )
         # Prewarm the runner image once at startup so the first claim window is
         # not gated on a cold pull. Best-effort inside ensure_image.
