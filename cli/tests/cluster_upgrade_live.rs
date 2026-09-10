@@ -860,3 +860,142 @@ fn upgrade_output_contains_no_credential_value() {
         );
     }
 }
+
+// T14 -- pins `generations` to an observed controller generation. The live
+// Deployment's `status.observedGeneration` lags `metadata.generation`; images,
+// replicas, hooks and selectors all agree, so a hardcoded `generations: true`
+// (or a `generations` bound to any other facet) fails here.
+#[test]
+fn stale_generation_fails_only_the_generations_facet() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("stale-generation");
+    let json = json(&output);
+    observed_for_real(&fixture);
+    only_false(&json, &["generations"]);
+    assert_eq!(json["status"], "failed", "{json}");
+    assert_eq!(json["phase"], "converge", "{json}");
+}
+
+// T15 -- pins `replicas`, and pins that it is NOT `unavailable_zero`.
+// `updatedReplicas` lags desired while `unavailableReplicas` is genuinely 0,
+// so `replicas` must be false and `unavailable_zero` must stay true. A
+// hardcoded `replicas: true`, or the old `unavailable_zero: replicas` alias,
+// fails on one half or the other.
+#[test]
+fn replica_count_mismatch_fails_only_the_replicas_facet() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("stale-replicas");
+    let json = json(&output);
+    observed_for_real(&fixture);
+    only_false(&json, &["replicas"]);
+    assert_eq!(json["status"], "failed", "{json}");
+    assert_eq!(json["phase"], "converge", "{json}");
+}
+
+// T16 -- the mirror of T15 and the reason `unavailable_zero` is its own facet:
+// updated == ready == total == desired, but one replica is unavailable.
+// `replicas` stays true and `unavailable_zero` alone goes false, so neither
+// flag can be a literal or an alias of the other.
+#[test]
+fn unavailable_replicas_fail_only_the_unavailable_facet() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("unavailable-replicas");
+    let json = json(&output);
+    observed_for_real(&fixture);
+    only_false(&json, &["unavailable_zero"]);
+    assert_eq!(json["status"], "failed", "{json}");
+    assert_eq!(json["phase"], "converge", "{json}");
+}
+
+// T17 -- an observation that could not be MADE determines NO named property.
+// The workloads read exits non-zero (a command failure, not a terminal
+// cluster condition), so every named sub-flag must read false -- `holds` is
+// closed-world, and leaving the facets untagged would report seven observed
+// truths off a read that never happened. The read's own error text, not the
+// generic converge message, must reach `fail_forward.reason`.
+#[test]
+fn an_unmakeable_observation_determines_no_facet() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("workloads-unreadable");
+    let json = json(&output);
+    only_false(&json, &FACETS);
+    assert_eq!(json["status"], "failed", "{json}");
+    assert_eq!(json["phase"], "converge", "{json}");
+    let reason = json["fail_forward"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no fail_forward reason: {json}"));
+    assert!(
+        reason.contains("read target workloads and pods"),
+        "the failed read must be named, not replaced by the generic converge message: {reason}"
+    );
+    assert!(
+        reason.contains("inspect Helm/Kubernetes access and retry"),
+        "the observer's recovery hint must survive into fail_forward: {reason}"
+    );
+}
+
+// T18 -- F4: `helm get values` failing with stderr that merely CONTAINS
+// "not found" (here a missing namespace) leaves the retained overlay unknown,
+// not absent. Proceeding would run `helm upgrade` with no `-f` and silently
+// drop every retained operator value, so this must fail closed before any
+// mutation.
+#[test]
+fn an_unreadable_retained_overlay_fails_closed() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("values-read-fails");
+    assert!(
+        !output.status.success(),
+        "an unknown retained overlay must not report success: {}",
+        stdout(&output)
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "nothing may be mutated while the retained values are unknown: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        visible(&output).contains("retained helm values"),
+        "the refusal must name the unreadable retained values: {}",
+        visible(&output)
+    );
+}
+
+// T19 -- R7: the overlay is read ONCE, before the lifecycle, and Apply hands
+// helm that stored document. The fake serves a DIFFERENT values document on
+// every `helm get values` after the first, so a re-read inside Apply would
+// visibly swap the payload. Both halves are asserted: the `-f` document is the
+// one read at Validate, and `helm get values` appears exactly once in the argv
+// log.
+#[test]
+fn the_overlay_is_read_once_and_apply_uses_the_stored_one() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("values-drift");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "Apply must run for this to prove anything: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let values = fixture.values(1);
+    let names = extra_env_names(&values_doc(&values));
+    assert!(
+        names.contains(&"FIRST_READ_ONLY".to_string()),
+        "helm must be handed the overlay read at Validate: {values}"
+    );
+    assert!(
+        !names.contains(&"SECOND_READ_MUST_NOT_WIN".to_string()),
+        "a second `helm get values` must not be the source of the -f payload: {values}"
+    );
+    let reads = fixture
+        .argv()
+        .into_iter()
+        .filter(|call| call.len() >= 3 && call[..3] == ["helm", "get", "values"])
+        .count();
+    assert_eq!(
+        reads,
+        1,
+        "the retained overlay must be read exactly once: {:?}",
+        fixture.argv()
+    );
+}

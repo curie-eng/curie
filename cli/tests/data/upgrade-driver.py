@@ -60,6 +60,15 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #   target            image tag the rendered target manifest asks for
 #   show_chart        version `helm show chart <local path>` reports
 #   ready/updated/unavailable  replica counts on the live Deployment
+#   generation_drift  live `status.observedGeneration` lags `metadata.generation`
+#   workloads_fail    the `kubectl get <WORKLOADS>` read exits non-zero, so the
+#                     observation cannot be MADE at all (distinct from a
+#                     terminal condition, which is an observation with a verdict)
+#   values_fail       `helm get values` exits non-zero with stderr that merely
+#                     CONTAINS "not found" -- the release state is unknown, not
+#                     positively absent
+#   values_drift      the SECOND and later `helm get values` return a different
+#                     document, so a re-read anywhere after Validate is visible
 #   failed_hook       ""                    both pre-upgrade hooks succeed
 #                     "upgrade-drain"       the #2010 drain gate Job fails
 #                     "schema-migrate"      a NON-drain pre-upgrade hook fails
@@ -87,6 +96,10 @@ BASE = {
     "unavailable": 0,
     "failed_hook": "",
     "status_missing_before": False,
+    "generation_drift": False,
+    "workloads_fail": False,
+    "values_fail": False,
+    "values_drift": False,
     "selector_drift": False,
     "terminal": False,
     "apply_fails": False,
@@ -118,6 +131,27 @@ SCENARIOS = {
     # that can see its verdict.
     "failed-drain-hook": {"failed_hook": "upgrade-drain"},
     "selector-drift": {"selector_drift": True, "terminal": True},
+    # `observedGeneration` lags `generation`: the controller has not yet acted
+    # on the target spec. Images, replicas, hooks and selectors all agree, so
+    # `generations` is the only sub-flag that may go false.
+    "stale-generation": {"generation_drift": True, "terminal": True},
+    # `updatedReplicas` lags `desired` while `unavailableReplicas` is 0: the
+    # replica facet is false and the unavailable facet is NOT, which is only
+    # expressible because the two are observed separately.
+    "stale-replicas": {"updated": 0, "terminal": True},
+    # The mirror image: updated == ready == total == desired, but a replica is
+    # unavailable. `replicas` stays true and `unavailable_zero` alone goes
+    # false, so neither flag can be an alias of the other.
+    "unavailable-replicas": {"unavailable": 1, "terminal": True},
+    # The workloads read itself fails. No observation can be MADE, so no named
+    # facet was determined -- every one must read false, and the read's own
+    # error text must reach the operator.
+    "workloads-unreadable": {"workloads_fail": True},
+    # `helm get values` fails with stderr that merely contains "not found".
+    # The retained overlay is UNKNOWN, not empty.
+    "values-read-fails": {"values_fail": True},
+    # A second `helm get values` would return a different document.
+    "values-drift": {"values_drift": True},
     # Every checkpoint write fails, starting with the first one before any
     # mutation.
     "persist-fails": {"apply_fails": "always"},
@@ -200,7 +234,7 @@ live = copy.deepcopy(expected)
 live["metadata"]["generation"] = 3
 live["spec"]["template"]["spec"]["containers"][0]["image"] = image
 live["status"] = {
-    "observedGeneration": 3,
+    "observedGeneration": 2 if scenario["generation_drift"] else 3,
     "replicas": 1,
     "readyReplicas": scenario["ready"],
     "updatedReplicas": scenario["updated"],
@@ -242,6 +276,18 @@ pod = {
 # Both are always present; only `failed_hook` decides which one refused. A
 # fixture that published just one hook could not tell the drain facet apart
 # from the general hook facet.
+# The two documents the `values-drift` scenario serves, distinguished by an
+# extraEnv entry the migration carries through untouched. Only the FIRST is a
+# legitimate input: it is what Validate read and migrated.
+FIRST_VALUES = {
+    "config": {"schemaVersion": "0.8.4"},
+    "api": {"extraEnv": [{"name": "FIRST_READ_ONLY", "value": "1"}]},
+}
+DRIFTED_VALUES = {
+    "config": {"schemaVersion": "0.8.4"},
+    "api": {"extraEnv": [{"name": "SECOND_READ_MUST_NOT_WIN", "value": "1"}]},
+}
+
 HOOK_NAMES = {
     "upgrade-drain": f"{RELEASE}-upgrade-drain",
     "schema-migrate": f"{RELEASE}-schema-migrate",
@@ -290,6 +336,13 @@ if program == "helm":
         print("STATUS: deployed\nREVISION: 2")
         sys.exit(0)
     if args[:2] == ["get", "values"]:
+        if scenario["values_fail"]:
+            print('Error from server (NotFound): namespaces "ns" not found', file=sys.stderr)
+            sys.exit(1)
+        if scenario["values_drift"]:
+            reads = sum(1 for call in previous if call[:3] == ["helm", "get", "values"])
+            print(json.dumps(DRIFTED_VALUES if reads else FIRST_VALUES))
+            sys.exit(0)
         applied_values = captured("values", ".yaml")
         if applied_values:
             # The release retains the overlay it was last handed. A second run
@@ -321,6 +374,9 @@ if program == "helm":
         sys.exit(0)
 
 if program == "kubectl":
+    if scenario["workloads_fail"] and args[:3] == ["get", WORKLOADS, "-n"]:
+        print("Error from server (Forbidden): workloads is forbidden", file=sys.stderr)
+        sys.exit(1)
     if args[0] == "apply":
         manifest = flag_value("-f")
         if manifest:
