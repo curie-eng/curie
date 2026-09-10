@@ -1,6 +1,6 @@
 [package]
 name = "curie"
-version = "0.8.7"
+version = "0.8.8"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
 
