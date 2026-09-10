@@ -300,6 +300,18 @@ case " $* " in
         printf '%s\n' 'curie'
         exit 0
         ;;
+    *" get replicasets "*)
+        printf '%s\n' '{"apiVersion":"v1","kind":"List","items":[]}'
+        exit 0
+        ;;
+    *" get pods "*)
+        printf '%s\n' '{"apiVersion":"v1","kind":"List","items":[]}'
+        exit 0
+        ;;
+    *" get deployment "*" -o json"*)
+        printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"generation":1},"spec":{"replicas":1},"status":{"observedGeneration":1,"replicas":1,"updatedReplicas":1,"readyReplicas":1,"availableReplicas":1}}'
+        exit 0
+        ;;
     *" delete deployment,service,networkpolicy,secret "*)
         exit 0
         ;;
