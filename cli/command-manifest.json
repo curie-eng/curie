@@ -5577,6 +5577,72 @@
           "name": "lease-expiry-cluster-proof"
         },
         {
+          "about": "Isolated retained-upgrade and interrupted-upgrade recovery drill (#2426, `bash cli/scripts/upgrade-drill.sh`): published v0.8.6 CLI/chart/images on a task-owned kind install, candidate CLI upgrade, drain/apply interrupt recovery, leftover-hook non-quiesce, compatible rollback that serves a new turn, and incompatible 0.8.4 schema rollback refused before Helm mutates. Refuses the permanent soak. Checkout-only. Live provider/channel rows fail closed when credential references are absent",
+          "args": [
+            {
+              "default_values": [
+                "all"
+              ],
+              "global": false,
+              "help": "Scenario to run, or `all` (0.8.6 baseline matrix)",
+              "id": "scenario",
+              "long": "scenario",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Also run the published v0.8.7 predecessor happy-path (latest stable when it differs from the required 0.8.6 baseline)",
+              "id": "also_predecessor",
+              "long": "also-predecessor",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Recreate a leftover task-owned kind cluster of the same name",
+              "id": "force",
+              "long": "force",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Leave the kind cluster and Helm release running after the drill",
+              "id": "keep",
+              "long": "keep",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Guard checks only: soak refusal, checksum pins, missing live creds",
+              "id": "self_test",
+              "long": "self-test",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "upgrade-drill"
+        },
+        {
           "about": "Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points at, not merely that its NetworkPolicies are applied (#1153, `bash scripts/check-netpol-enforcement.sh`). Structured as a non-vacuity check: it proves a DENIED direction is genuinely blocked before trusting any allowed one, so a CNI that ignores NetworkPolicy (kindnet, minikube's default) FAILS rather than passing green",
           "hidden": false,
           "name": "netpol-check"

@@ -1081,6 +1081,31 @@ enum DevAction {
         #[arg(long)]
         self_test: bool,
     },
+    /// Isolated retained-upgrade and interrupted-upgrade recovery drill (#2426,
+    /// `bash cli/scripts/upgrade-drill.sh`): published v0.8.6 CLI/chart/images
+    /// on a task-owned kind install, candidate CLI upgrade, drain/apply
+    /// interrupt recovery, leftover-hook non-quiesce, compatible rollback that
+    /// serves a new turn, and incompatible 0.8.4 schema rollback refused before
+    /// Helm mutates. Refuses the permanent soak. Checkout-only. Live
+    /// provider/channel rows fail closed when credential references are absent.
+    UpgradeDrill {
+        /// Scenario to run, or `all` (0.8.6 baseline matrix).
+        #[arg(long, default_value = "all")]
+        scenario: String,
+        /// Also run the published v0.8.7 predecessor happy-path (latest stable
+        /// when it differs from the required 0.8.6 baseline).
+        #[arg(long)]
+        also_predecessor: bool,
+        /// Recreate a leftover task-owned kind cluster of the same name.
+        #[arg(long)]
+        force: bool,
+        /// Leave the kind cluster and Helm release running after the drill.
+        #[arg(long)]
+        keep: bool,
+        /// Guard checks only: soak refusal, checksum pins, missing live creds.
+        #[arg(long)]
+        self_test: bool,
+    },
     /// Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points
     /// at, not merely that its NetworkPolicies are applied (#1153,
     /// `bash scripts/check-netpol-enforcement.sh`). Structured as a
@@ -3160,6 +3185,31 @@ async fn run(command: Option<Command>) -> Result<()> {
                     args.push("--json");
                 }
                 commands::dev_script("cli/scripts/lease-expiry-cluster-proof.sh", &args).await
+            }
+            DevAction::UpgradeDrill {
+                scenario,
+                also_predecessor,
+                force,
+                keep,
+                self_test,
+            } => {
+                let mut args: Vec<&str> = vec!["--scenario", scenario.as_str()];
+                if also_predecessor {
+                    args.push("--also-predecessor");
+                }
+                if force {
+                    args.push("--force");
+                }
+                if keep {
+                    args.push("--keep");
+                }
+                if self_test {
+                    args.push("--self-test");
+                }
+                if ui::ui().json() {
+                    args.push("--json");
+                }
+                commands::dev_script("cli/scripts/upgrade-drill.sh", &args).await
             }
             DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
             DevAction::PluginCompat => {
@@ -5976,6 +6026,45 @@ mod tests {
                 assert!(self_test);
             }
             _ => panic!("expected lease-expiry-cluster-proof"),
+        }
+        let cli = Cli::try_parse_from(["curie", "dev", "upgrade-drill"])
+            .expect("dev upgrade-drill should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::UpgradeDrill { .. }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "curie",
+            "dev",
+            "upgrade-drill",
+            "--scenario",
+            "incompatible-rollback",
+            "--also-predecessor",
+            "--force",
+            "--keep",
+            "--self-test",
+        ])
+        .expect("dev upgrade-drill flags should parse");
+        match cli.command {
+            Some(Command::Dev {
+                action:
+                    DevAction::UpgradeDrill {
+                        scenario,
+                        also_predecessor,
+                        force,
+                        keep,
+                        self_test,
+                    },
+            }) => {
+                assert_eq!(scenario, "incompatible-rollback");
+                assert!(also_predecessor);
+                assert!(force);
+                assert!(keep);
+                assert!(self_test);
+            }
+            _ => panic!("expected upgrade-drill"),
         }
     }
 
