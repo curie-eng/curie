@@ -41,8 +41,11 @@
 #   6. Opting out of Rail 1 (`security.networkPolicy.enabled=false`) does not
 #      require either key: there is no fail-closed runner policy to satisfy.
 #   7. Both new keys reuse the shared `curie.objectStore.egressEntry`
-#      validator, so a default route, a metadata-covering CIDR, and a
-#      ports-less entry are each refused.
+#      validator, so a default route, a metadata-covering CIDR, a
+#      ports-less entry, a quarter-route prefix, IPv6 ULA metadata
+#      containment (including uncompressed spelling), a protocol-only
+#      ports item, and an endPort range are each refused, while a /32,
+#      /24, /128, /48, and named-port peer still render (#2368).
 #   8. Neither key is a silent no-op on the in-chart path. Setting
 #      otelCollector.egress with otelCollector.deploy=true, or api.egress with
 #      api.deploy=true, is refused at render naming the key -- the key is only
@@ -143,6 +146,7 @@ must_fail_naming() {
 
 CHECKER="$TMP/check.py"
 cat > "$CHECKER" <<'PY'
+import json
 import pathlib
 import sys
 
@@ -385,6 +389,29 @@ elif ACTION == "no-collector-policy":
         )
     print("ok: telemetry-off BYO renders with no collector egress policy of either kind")
 
+elif ACTION == "has-block":
+    policy_name, cidr, ports_json = sys.argv[3], sys.argv[4], sys.argv[5]
+    expected_ports = json.loads(ports_json)
+    policy = named(docs, policy_name)
+    if policy is None:
+        die(f"missing NetworkPolicy/{policy_name}")
+    matches = [
+        (block_cidr, ports, excepts)
+        for block_cidr, ports, excepts in ip_blocks(policy)
+        if block_cidr == cidr
+    ]
+    if not matches:
+        die(
+            f"{policy_name} has no ipBlock {cidr}; "
+            f"blocks={ip_blocks(policy)!r}"
+        )
+    for block_cidr, ports, excepts in matches:
+        if ports != expected_ports:
+            die(f"{cidr} ports are {ports!r}, expected {expected_ports!r}")
+        if excepts:
+            die(f"{cidr} must not except anything on a narrow allow; got {excepts}")
+    print(f"ok: {policy_name} allows {cidr} with {expected_ports}")
+
 else:
     die(f"unknown action {ACTION!r}")
 PY
@@ -560,7 +587,26 @@ EOF
   fi
 }
 
+must_render_block() {
+  local label="$1"
+  local policy_name="$2"
+  local cidr="$3"
+  local ports_json="$4"
+  local values="$5"
+  local out
+  out="$(render_dir "${label// /_}" --values "$values")" \
+    || fail "${label} must render"
+  python3 "$CHECKER" "$out" has-block "$policy_name" "$cidr" "$ports_json" \
+    || fail "${label} did not render ipBlock ${cidr} with ports ${ports_json}"
+}
+
 for KEY in otelCollector.egress api.egress; do
+  if [[ "$KEY" == "otelCollector.egress" ]]; then
+    POLICY_NAME="$COLLECTOR_BYO_POLICY"
+  else
+    POLICY_NAME="$API_BYO_POLICY"
+  fi
+
   DEFAULT_ROUTE_ENTRY=$'    - cidr: 0.0.0.0/0\n      ports: [{ protocol: TCP, port: 443 }]'
   IMDS_ENTRY=$'    - cidr: 169.254.0.0/16\n      ports: [{ protocol: TCP, port: 443 }]'
   NO_PORTS_ENTRY=$'    - cidr: 192.0.2.30/32'
@@ -573,6 +619,55 @@ for KEY in otelCollector.egress api.egress; do
 
   write_entry_values "$TMP/entry-no-ports.yaml" "$KEY" "$NO_PORTS_ENTRY"
   must_fail_naming "ports-missing ${KEY}" "ports" "$TMP/entry-no-ports.yaml"
+
+  write_entry_values "$TMP/entry-quarter-route.yaml" "$KEY" \
+    $'    - cidr: 64.0.0.0/2\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "quarter-route ${KEY}" "IPv4 /8, IPv6 /32" "$TMP/entry-quarter-route.yaml"
+
+  write_entry_values "$TMP/entry-ula8.yaml" "$KEY" \
+    $'    - cidr: fd00::/8\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "ipv6-ula-8 ${KEY}" "169.254.169.254" "$TMP/entry-ula8.yaml"
+
+  write_entry_values "$TMP/entry-ula7.yaml" "$KEY" \
+    $'    - cidr: fc00::/7\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "ipv6-ula-7 ${KEY}" "169.254.169.254" "$TMP/entry-ula7.yaml"
+
+  write_entry_values "$TMP/entry-ula-uncompressed.yaml" "$KEY" \
+    $'    - cidr: fd00:0ec2::/48\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "ipv6-ula-uncompressed ${KEY}" "169.254.169.254" "$TMP/entry-ula-uncompressed.yaml"
+
+  write_entry_values "$TMP/entry-protocol-only.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP }]'
+  must_fail_naming "protocol-only ${KEY}" "each ports item must set port" "$TMP/entry-protocol-only.yaml"
+
+  write_entry_values "$TMP/entry-endport.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP, port: 1, endPort: 65535 }]'
+  must_fail_naming "endport ${KEY}" "endPort" "$TMP/entry-endport.yaml"
+
+  write_entry_values "$TMP/entry-p1.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_render_block "narrow-v4-32 ${KEY}" "$POLICY_NAME" "192.0.2.30/32" \
+    '[{"protocol": "TCP", "port": 443}]' "$TMP/entry-p1.yaml"
+
+  write_entry_values "$TMP/entry-p2.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.0/24\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_render_block "narrow-v4-24 ${KEY}" "$POLICY_NAME" "192.0.2.0/24" \
+    '[{"protocol": "TCP", "port": 443}]' "$TMP/entry-p2.yaml"
+
+  write_entry_values "$TMP/entry-p3.yaml" "$KEY" \
+    $'    - cidr: 2001:db8::10/128\n      ports: [{ protocol: TCP, port: 4318 }]'
+  must_render_block "narrow-v6-128 ${KEY}" "$POLICY_NAME" "2001:db8::10/128" \
+    '[{"protocol": "TCP", "port": 4318}]' "$TMP/entry-p3.yaml"
+
+  write_entry_values "$TMP/entry-p4.yaml" "$KEY" \
+    $'    - cidr: 2001:db8::/48\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_render_block "narrow-v6-48 ${KEY}" "$POLICY_NAME" "2001:db8::/48" \
+    '[{"protocol": "TCP", "port": 443}]' "$TMP/entry-p4.yaml"
+
+  write_entry_values "$TMP/entry-p5.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP, port: https }]'
+  must_render_block "named-port ${KEY}" "$POLICY_NAME" "192.0.2.30/32" \
+    '[{"protocol": "TCP", "port": "https"}]' "$TMP/entry-p5.yaml"
 done
 
 echo "=== Assertion 10: otelCollector.egress with deploy=true is refused at render, naming the key ==="

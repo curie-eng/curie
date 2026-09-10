@@ -678,9 +678,11 @@ rustfs:
   # NetworkPolicy cannot target a DNS name, so rustfs.host is not enough.
   # Empty (the default) keeps fail-closed: a BYO install with Rail 1 on and
   # bundle-fetch or workspace enabled is refused at render until these CIDRs
-  # are set. Each entry must set cidr and ports. Default routes and CIDRs that
-  # reach 169.254.169.254 are refused: this is a store-endpoint list, not a
-  # second model allowlist. On EKS the tight form is VPC interface endpoints
+  # are set. Each entry must set cidr and a concrete port (not protocol-only,
+  # not endPort). Default routes, IPv4 prefixes shorter than /8, IPv6 prefixes
+  # shorter than /32, and CIDRs that reach 169.254.169.254 or fd00:ec2::254
+  # are refused: this is a store-endpoint list, not a second model allowlist.
+  # On EKS the tight form is VPC interface endpoints
   # for s3 (and sts on the key-free path) with private DNS enabled, which
   # turns each requirement into a /32 rather than an AWS public service CIDR
   # range. See the chart README, "Key-free object store auth".
@@ -831,9 +833,10 @@ otelCollector:
   # render rather than silently ignored. Empty (the
   # default) keeps fail-closed: otherwise the install is green, every other
   # workload's traces flow, and only the sandbox's spans are silently dropped.
-  # Each entry must set cidr and ports. Default routes and CIDRs that reach
-  # 169.254.169.254 are refused: this is one collector endpoint, not a second
-  # model allowlist.
+  # Each entry must set cidr and a concrete port (not protocol-only, not
+  # endPort). Default routes, IPv4 prefixes shorter than /8, IPv6 prefixes
+  # shorter than /32, and CIDRs that reach 169.254.169.254 or fd00:ec2::254
+  # are refused: this is one collector endpoint, not a second model allowlist.
   egress: []
   #  - cidr: 192.0.2.10/32
   #    ports: [{ protocol: TCP, port: 4318 }]
@@ -1005,9 +1008,11 @@ api:
   # still deployed stays governed by security.networkPolicy.allowedEgress.
   # Empty (the default) keeps fail-closed: otherwise the install is green and
   # agents boot with no memory and no thread history, with only a warning line
-  # inside the sandbox to show for it. Each entry must set cidr and ports.
-  # Default routes and CIDRs that reach 169.254.169.254 are refused: this is
-  # one API endpoint, not a second model allowlist.
+  # inside the sandbox to show for it. Each entry must set cidr and a concrete
+  # port (not protocol-only, not endPort). Default routes, IPv4 prefixes
+  # shorter than /8, IPv6 prefixes shorter than /32, and CIDRs that reach
+  # 169.254.169.254 or fd00:ec2::254 are refused: this is one API endpoint,
+  # not a second model allowlist.
   # mailAdapter.apiEgress.httpsCidrs is the same idea for the mail adapter pod.
   egress: []
   #  - cidr: 192.0.2.11/32

@@ -861,8 +861,10 @@ turn. The chart now refuses that shape at render: `rustfs.egress` must cover
 the object-store endpoint, and on this key-free path `rustfs.stsEgress` must
 cover STS (`AssumeRoleWithWebIdentity`). Both are `{cidr, ports}` entries like
 `allowedEgress`. Do not put a DNS name here; NetworkPolicy has no hostname
-peer. A default route or a CIDR that reaches `169.254.169.254` is refused:
-these lists are store endpoints, not a second model allowlist.
+peer. A default route, an IPv4 prefix shorter than `/8`, an IPv6 prefix
+shorter than `/32`, a ports item with only `protocol` or with `endPort`, or a
+CIDR that reaches `169.254.169.254` or `fd00:ec2::254` is refused: these lists
+are store endpoints, not a second model allowlist.
 
 On EKS, create VPC **interface** endpoints for `s3` and `sts` in the cluster
 VPC with private DNS enabled, then put each endpoint's ENI address in as a

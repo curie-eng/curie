@@ -7,6 +7,136 @@ Pack an IPv4 dotted-quad into a 32-bit integer, e.g. "169.254.169.254" ->
 {{- add (mul (int64 (index $o 0)) 16777216) (mul (int64 (index $o 1)) 65536) (mul (int64 (index $o 2)) 256) (int64 (index $o 3)) -}}
 {{- end -}}
 {{- /*
+Parse one IPv6 hextet (1-4 hex digits) to an integer. Empty on invalid input
+so callers can skip rather than fail: syntax validation is a separate slice.
+*/ -}}
+{{- define "curie.hexToInt" -}}
+{{- $s := lower (trim .) -}}
+{{- $n := 0 -}}
+{{- $ok := true -}}
+{{- $digits := dict "0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9 "a" 10 "b" 11 "c" 12 "d" 13 "e" 14 "f" 15 -}}
+{{- if or (eq $s "") (gt (len $s) 4) -}}
+{{- $ok = false -}}
+{{- end -}}
+{{- range $c := regexFindAll "." $s -1 -}}
+  {{- if hasKey $digits $c -}}
+    {{- $n = add (mul $n 16) (index $digits $c) -}}
+  {{- else -}}
+    {{- $ok = false -}}
+  {{- end -}}
+{{- end -}}
+{{- if $ok -}}{{- $n -}}{{- end -}}
+{{- end -}}
+{{- /*
+Expand an IPv6 address to eight decimal hextets joined by commas, or "" when
+the address cannot be expanded. Accepts one `::` compression and leading-zero
+hextets so fd00:0ec2:: and fd00:ec2:: compare equal.
+*/ -}}
+{{- define "curie.ipv6Hextets" -}}
+{{- $ip := trim . -}}
+{{- $compressed := splitList "::" $ip -}}
+{{- if le (len $compressed) 2 -}}
+  {{- $left := list -}}
+  {{- $right := list -}}
+  {{- $leftSide := index $compressed 0 -}}
+  {{- if ne $leftSide "" -}}
+    {{- range splitList ":" $leftSide -}}
+      {{- $left = append $left . -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if eq (len $compressed) 2 -}}
+    {{- $rightSide := index $compressed 1 -}}
+    {{- if ne $rightSide "" -}}
+      {{- range splitList ":" $rightSide -}}
+        {{- $right = append $right . -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- $total := add (len $left) (len $right) -}}
+  {{- $ok := true -}}
+  {{- if and (eq (len $compressed) 1) (ne $total 8) -}}{{- $ok = false -}}{{- end -}}
+  {{- if and (eq (len $compressed) 2) (gt $total 7) -}}{{- $ok = false -}}{{- end -}}
+  {{- if $ok -}}
+    {{- $zeros := 0 -}}
+    {{- if eq (len $compressed) 2 -}}
+      {{- $zeros = sub 8 $total -}}
+    {{- end -}}
+    {{- $all := $left -}}
+    {{- range until ($zeros | int) -}}
+      {{- $all = append $all "0" -}}
+    {{- end -}}
+    {{- range $right -}}
+      {{- $all = append $all . -}}
+    {{- end -}}
+    {{- if eq (len $all) 8 -}}
+      {{- $nums := list -}}
+      {{- $valid := true -}}
+      {{- range $all -}}
+        {{- $n := include "curie.hexToInt" . | trim -}}
+        {{- if eq $n "" -}}
+          {{- $valid = false -}}
+        {{- else -}}
+          {{- $nums = append $nums $n -}}
+        {{- end -}}
+      {{- end -}}
+      {{- if $valid -}}
+        {{- join "," $nums -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+Return "true" when the CIDR contains 169.254.169.254 or fd00:ec2::254,
+including the exact host and IPv6 spellings such as fd00:0ec2::/48.
+IPv6 comparison is hextet-normalised; unparseable addresses return "".
+*/ -}}
+{{- define "curie.cidrContainsMetadata" -}}
+{{- $parts := splitList "/" . -}}
+{{- if eq (len $parts) 2 -}}
+{{- $ip := index $parts 0 -}}
+{{- $prefixText := index $parts 1 -}}
+{{- if regexMatch "^(0|[1-9][0-9]{0,2})$" $prefixText -}}
+{{- $prefix := int $prefixText -}}
+{{- if contains ":" $ip -}}
+  {{- if le $prefix 128 -}}
+    {{- $hextets := include "curie.ipv6Hextets" $ip | trim -}}
+    {{- if $hextets -}}
+      {{- $got := splitList "," $hextets -}}
+      {{- $imds := list 64768 3778 0 0 0 0 0 596 -}}
+      {{- $contained := true -}}
+      {{- range $i, $h := $got -}}
+        {{- $bitsBefore := mul $i 16 -}}
+        {{- if and $contained (lt $bitsBefore $prefix) -}}
+          {{- $bitsThis := sub $prefix $bitsBefore -}}
+          {{- if gt $bitsThis 16 -}}{{- $bitsThis = 16 -}}{{- end -}}
+          {{- $shift := sub 16 $bitsThis -}}
+          {{- $div := 1 -}}
+          {{- range until ($shift | int) -}}{{- $div = mul $div 2 -}}{{- end -}}
+          {{- $a := div (int $h) $div -}}
+          {{- $b := div (int (index $imds $i)) $div -}}
+          {{- if ne $a $b -}}{{- $contained = false -}}{{- end -}}
+        {{- end -}}
+      {{- end -}}
+      {{- if $contained -}}true{{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- else -}}
+  {{- if and (ge $prefix 0) (le $prefix 32) (regexMatch "^[0-9.]+$" $ip) -}}
+    {{- $octets := splitList "." $ip -}}
+    {{- if eq (len $octets) 4 -}}
+      {{- $meta := include "curie.ipv4ToInt" "169.254.169.254" | int64 -}}
+      {{- $net := include "curie.ipv4ToInt" $ip | int64 -}}
+      {{- $block := int64 1 -}}
+      {{- range until (sub 32 $prefix | int) -}}{{- $block = mul $block 2 -}}{{- end -}}
+      {{- if eq (div $meta $block) (div $net $block) -}}true{{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- /*
 Given an allowedEgress CIDR string, return the metadata/link-local `except`
 entry that must be carved back out of it, or "" when the CIDR cannot reach the
 cloud metadata endpoint. NetworkPolicy allows are additive, so a broad allow
@@ -20,17 +150,21 @@ stay a STRICT subset (169.254.0.0/16 for prefix <16, the /32 host for 16..<32,
 and nothing for an exact /32 host allow, which is a deliberate operator choice).
 
 IPv4 containment is computed exactly (top `prefix` bits of 169.254.169.254 vs the
-network). IPv6 covers the realistic broad cases -- ::/0 and the AWS IMDS ULA
-prefix fd00:ec2::/nn -- and carves out fd00:ec2::254; full IPv6 range math is not
-attempted (documented assumption). Operators can always override with an explicit
-per-entry `except:` list, which wins over this auto carve-out.
+network). IPv6 containment is hextet-normalised against fd00:ec2::254, so
+::/0, fc00::/7, fd00::/8, and fd00:0ec2::/48 all carve out fd00:ec2::254/128.
+An exact /128 of that host emits nothing (any except would equal cidr). This
+carve-out is live for security.networkPolicy.allowedEgress; the four BYO
+one-peer lists refuse the same CIDRs in curie.objectStore.egressEntry before
+render, so the auto-except branch is not a second defence on those keys.
+Operators can always override with an explicit per-entry `except:` list, which
+wins over this auto carve-out.
 */ -}}
 {{- define "curie.metadataExcept" -}}
 {{- $parts := splitList "/" . -}}
 {{- $ip := index $parts 0 -}}
 {{- $prefix := index $parts 1 | int -}}
 {{- if contains ":" $ip -}}
-  {{- if or (eq $prefix 0) (and (hasPrefix "fd00:ec2:" $ip) (le $prefix 32)) -}}fd00:ec2::254/128{{- end -}}
+  {{- if and (lt $prefix 128) (eq (include "curie.cidrContainsMetadata" . | trim) "true") -}}fd00:ec2::254/128{{- end -}}
 {{- else -}}
   {{- $meta := include "curie.ipv4ToInt" "169.254.169.254" | int64 -}}
   {{- $net := include "curie.ipv4ToInt" $ip | int64 -}}
@@ -49,10 +183,14 @@ per-entry `except:` list, which wins over this auto carve-out.
 {{/*
 Validate one BYO endpoint egress entry (rustfs.egress, rustfs.stsEgress,
 otelCollector.egress, api.egress). Each of those lists names ONE external peer
-the runner must reach, not the model allowlist: a default route or a CIDR that
-reaches the cloud metadata address would additively re-open the prompt-injectable
-runner. Require cidr + ports, refuse prefix 0/1, and refuse any CIDR that
-contains 169.254.169.254 or fd00:ec2::254.
+the runner must reach, not the model allowlist. Require cidr + a ports list,
+refuse prefix 0/1 as a default route, refuse any CIDR that contains
+169.254.169.254 or fd00:ec2::254 (IPv6 hextet-normalised), refuse IPv4 prefixes
+shorter than /8 and IPv6 prefixes shorter than /32 (a floor against a
+route-shaped entry, not a claim of one-host narrowness), and require each
+ports item to set a concrete port with no endPort. The auto-except branch in
+curie.egress.ipBlockRules remains live for allowedEgress; these four lists
+never reach it because this validator refuses the CIDRs that would populate it.
 */}}
 {{- define "curie.objectStore.egressEntry" -}}
 {{- $key := .key -}}
@@ -76,9 +214,38 @@ contains 169.254.169.254 or fd00:ec2::254.
 {{- if le $prefix 1 -}}
 {{- fail (printf "%s entry %q is a default or equivalently broad route; use a VPC interface endpoint /32 or the narrowest prefix that reaches this one endpoint, not a default route" $key $cidr) -}}
 {{- end -}}
-{{- $auto := include "curie.metadataExcept" $cidr | trim -}}
-{{- if or $auto (eq $ip "169.254.169.254") (hasPrefix "fd00:ec2:" $ip) -}}
-{{- fail (printf "%s entry %q must not cover the cloud metadata endpoint 169.254.169.254" $key $cidr) -}}
+{{- if eq (include "curie.cidrContainsMetadata" $cidr | trim) "true" -}}
+{{- fail (printf "%s entry %q must not cover the cloud metadata endpoint 169.254.169.254 or fd00:ec2::254" $key $cidr) -}}
+{{- end -}}
+{{- if contains ":" $ip -}}
+  {{- if lt $prefix 32 -}}
+  {{- fail (printf "%s entry %q is broader than the per-family floor (IPv4 /8, IPv6 /32); use a VPC interface endpoint /32 or the narrowest prefix that reaches this one endpoint, not a route-shaped range" $key $cidr) -}}
+  {{- end -}}
+{{- else -}}
+  {{- if lt $prefix 8 -}}
+  {{- fail (printf "%s entry %q is broader than the per-family floor (IPv4 /8, IPv6 /32); use a VPC interface endpoint /32 or the narrowest prefix that reaches this one endpoint, not a route-shaped range" $key $cidr) -}}
+  {{- end -}}
+{{- end -}}
+{{- range $item := .entry.ports -}}
+  {{- if not (kindIs "map" $item) -}}
+  {{- fail (printf "%s entry %q each ports item must set port; a protocol without port matches every port on the CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- if hasKey $item "endPort" -}}
+  {{- fail (printf "%s entry %q ports items must not set endPort; name one port, not a range" $key $cidr) -}}
+  {{- end -}}
+  {{- if not (hasKey $item "port") -}}
+  {{- fail (printf "%s entry %q each ports item must set port; a protocol without port matches every port on the CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- $portText := trim (printf "%v" $item.port) -}}
+  {{- if or (eq $portText "") (eq $portText "<nil>") -}}
+  {{- fail (printf "%s entry %q each ports item must set port; a protocol without port matches every port on the CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- if regexMatch "^[0-9]+$" $portText -}}
+    {{- $portNum := int $portText -}}
+    {{- if or (lt $portNum 1) (gt $portNum 65535) -}}
+    {{- fail (printf "%s entry %q port must be an integer from 1 through 65535 or a named port" $key $cidr) -}}
+    {{- end -}}
+  {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if and .Values.agentSandbox.deploy .Values.security.networkPolicy.enabled }}
