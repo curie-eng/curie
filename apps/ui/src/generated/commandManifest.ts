@@ -2537,6 +2537,18 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Adopt a pre-existing namespace that already has its own labels or objects. Without this, such a namespace is refused. The adoption is recorded on the namespace (curietech.ai/adopted-by, adopted-in, and the adopted-at/adopted-labels/adopted-contents annotations), and an adopted namespace is RETAINED by cluster down rather than deleted, so your pre-existing objects are never swept. It never adopts the shared agent-sandbox-system namespace or a terminating one, and it never admits a namespace whose contents cannot be read",
+              "id": "adopt",
+              "long": "adopt",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Force the sealed fake-model install even when CURIE_CREDENTIALS is set (dev/CI escape hatch); suppresses the fake-model warning",
               "id": "fake_model",
               "long": "fake-model",
