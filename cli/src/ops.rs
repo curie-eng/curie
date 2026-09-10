@@ -610,6 +610,11 @@ pub struct UpOpts {
     /// generating strong per-release randoms (the first-class dev escape hatch
     /// that replaces hand-passing `--set` for every secret).
     pub dev: bool,
+    /// `--adopt`: the explicit operator override for the three pre-existing
+    /// namespace refusals (#2557). It never reaches the Helm value plan --
+    /// it is consumed entirely by [`establish_primary_namespace_ownership`]
+    /// before Helm starts -- so the pure argv tests leave it `false`.
+    pub adopt: bool,
 }
 
 impl UpOpts {
@@ -5970,6 +5975,33 @@ fn ns_common(opts: &CommonOpts, ns: &str, dry_run: bool) -> CommonOpts {
 const CREATED_BY_LABEL: &str = "curietech.ai/created-by";
 const CREATED_IN_LABEL: &str = "curietech.ai/created-in";
 
+/// #2557 override ownership. An operator adoption is stamped with this pair
+/// INSTEAD of the [`CREATED_BY_LABEL`]/[`CREATED_IN_LABEL`] pair, and the
+/// difference is the whole safety property: `down_commands` selects on the
+/// created-by/created-in conjunction, so a namespace adopted under `--adopt`
+/// does not match the teardown sweep. The release is uninstalled and the
+/// namespace -- with whatever the operator already had in it -- is retained.
+/// This is the same deliberate fail-safe-toward-retention shape #1654 gave a
+/// namespace stamped by an older single-label CLI.
+const ADOPTED_BY_LABEL: &str = "curietech.ai/adopted-by";
+const ADOPTED_IN_LABEL: &str = "curietech.ai/adopted-in";
+
+/// What the override adopted, written onto the Namespace so `kubectl get
+/// namespace -o yaml` answers "who took this over, when, and over what?" long
+/// after the install output has scrolled away.
+const ADOPTED_AT_ANNOTATION: &str = "curietech.ai/adopted-at";
+const ADOPTED_LABELS_ANNOTATION: &str = "curietech.ai/adopted-labels";
+const ADOPTED_CONTENTS_ANNOTATION: &str = "curietech.ai/adopted-contents";
+
+/// Longest recorded annotation value. Kubernetes caps total metadata at 256KB
+/// and a busy namespace inventory can be long; a truncated record still names
+/// the first objects and says it was truncated.
+const ADOPTION_RECORD_LIMIT: usize = 4096;
+
+/// Appended to the three refusals `--adopt` can override, and to nothing else.
+const ADOPT_HINT: &str =
+    "; pass --adopt to adopt it anyway, recording what was adopted on the namespace";
+
 /// `kubectl get namespace <ns>` using the API's machine-readable absence
 /// contract. `--ignore-not-found` returns exit 0 plus empty stdout for an absent
 /// namespace; every nonzero result is therefore a real read failure and must
@@ -5991,6 +6023,12 @@ fn namespace_get_cmd(namespace: &str) -> OpsCommand {
 #[derive(Debug, Clone)]
 struct NamespaceRecord {
     labels: BTreeMap<String, String>,
+    /// Read so an override adoption can MERGE its record into whatever the
+    /// namespace already carries. The guarded patch rewrites the whole
+    /// annotations map, so anything not read here would be destroyed -- an
+    /// Argo CD tracking annotation, say. The uid/resourceVersion preconditions
+    /// on the same patch are what make that read-modify-write safe.
+    annotations: BTreeMap<String, String>,
     uid: String,
     resource_version: String,
     terminating: bool,
@@ -6025,6 +6063,11 @@ fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe
         Some(value) => serde_json::from_value(value.clone())
             .with_context(|| format!("Namespace `{namespace}` has malformed labels"))?,
     };
+    let annotations = match metadata.get("annotations") {
+        None | Some(serde_json::Value::Null) => BTreeMap::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .with_context(|| format!("Namespace `{namespace}` has malformed annotations"))?,
+    };
     let uid = metadata
         .get("uid")
         .and_then(serde_json::Value::as_str)
@@ -6039,6 +6082,7 @@ fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe
         .to_string();
     Ok(NamespaceProbe::Present(NamespaceRecord {
         labels,
+        annotations,
         uid,
         resource_version,
         terminating,
@@ -6324,7 +6368,16 @@ async fn verify_remote_apiservices_available(namespace: &str) -> Result<()> {
     Ok(())
 }
 
-async fn verify_namespace_is_empty(namespace: &str) -> Result<()> {
+/// Read every namespaced object in `namespace` that Kubernetes did not put
+/// there itself, as the rendered `Kind (n): names` detail. `None` means the
+/// namespace holds nothing beyond the default ServiceAccount and root CA
+/// ConfigMap and is safely adoptable without an operator override.
+///
+/// Every READ failure here is still fatal, with or without `--adopt` (#2557).
+/// The override admits contents the operator accepts; it never admits contents
+/// nobody can see, because an unseen object cannot be recorded in the adoption
+/// annotations that make the decision auditable afterward.
+async fn namespace_foreign_contents(namespace: &str) -> Result<Option<String>> {
     verify_remote_apiservices_available(namespace).await?;
     let (ok, discovered, err) = run_capture(&namespaced_resources_cmd()).await?;
     if !ok {
@@ -6378,34 +6431,99 @@ async fn verify_namespace_is_empty(namespace: &str) -> Result<()> {
             foreign.entry(kind).or_default().push(name);
         }
     }
-    if !foreign.is_empty() {
-        let detail = foreign
+    if foreign.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        foreign
             .into_iter()
             .map(|(kind, mut names)| {
                 names.sort();
                 format!("{kind} ({}): {}", names.len(), names.join(", "))
             })
             .collect::<Vec<_>>()
-            .join("; ");
-        bail!(
-            "namespace `{namespace}` contains non-default objects and cannot be adopted: {detail}"
-        );
+            .join("; "),
+    ))
+}
+
+/// What an explicit `--adopt` run took over, in the operator's terms. Built
+/// only when the flag actually overrode a refusal; a `--adopt` run over a
+/// namespace the default guards would have adopted anyway produces `None` and
+/// takes the ordinary created-by/created-in path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdoptionOverride {
+    /// The labels the namespace carried before this run, rendered `k=v`.
+    prior_labels: String,
+    /// The non-default objects found, in [`namespace_foreign_contents`] form.
+    prior_contents: String,
+    /// RFC 3339 UTC, when the override was taken.
+    at: String,
+}
+
+/// Render one recorded field, bounded by [`ADOPTION_RECORD_LIMIT`], saying so
+/// when it had to be cut rather than silently presenting a partial list as
+/// complete.
+fn adoption_record_value(value: &str) -> String {
+    if value.is_empty() {
+        return "(none)".to_string();
     }
-    Ok(())
+    if value.len() <= ADOPTION_RECORD_LIMIT {
+        return value.to_string();
+    }
+    let mut cut = ADOPTION_RECORD_LIMIT;
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{} (truncated)", &value[..cut])
+}
+
+fn rendered_labels(labels: &BTreeMap<String, String>) -> String {
+    labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn namespace_adoption_cmd(
     namespace: &str,
     release: &str,
     record: &NamespaceRecord,
+    overridden: Option<&AdoptionOverride>,
 ) -> Result<OpsCommand> {
     let mut labels = record.labels.clone();
-    labels.insert(CREATED_BY_LABEL.to_string(), release.to_string());
-    labels.insert(CREATED_IN_LABEL.to_string(), namespace.to_string());
+    let mut annotations = record.annotations.clone();
+    match overridden {
+        None => {
+            labels.insert(CREATED_BY_LABEL.to_string(), release.to_string());
+            labels.insert(CREATED_IN_LABEL.to_string(), namespace.to_string());
+        }
+        Some(taken) => {
+            // Drop any stale or foreign created-by/created-in pair rather than
+            // leaving it half-owned: this install is the owner now, and a
+            // leftover foreign pair is exactly the cross-release delete #1654
+            // reports. The adopted-by/adopted-in pair that replaces it is
+            // deliberately NOT the sweep selector.
+            labels.remove(CREATED_BY_LABEL);
+            labels.remove(CREATED_IN_LABEL);
+            labels.insert(ADOPTED_BY_LABEL.to_string(), release.to_string());
+            labels.insert(ADOPTED_IN_LABEL.to_string(), namespace.to_string());
+            annotations.insert(ADOPTED_AT_ANNOTATION.to_string(), taken.at.clone());
+            annotations.insert(
+                ADOPTED_LABELS_ANNOTATION.to_string(),
+                adoption_record_value(&taken.prior_labels),
+            );
+            annotations.insert(
+                ADOPTED_CONTENTS_ANNOTATION.to_string(),
+                adoption_record_value(&taken.prior_contents),
+            );
+        }
+    }
     let patch = serde_json::to_string(&serde_json::json!([
         {"op": "test", "path": "/metadata/uid", "value": record.uid.clone()},
         {"op": "test", "path": "/metadata/resourceVersion", "value": record.resource_version.clone()},
         {"op": "add", "path": "/metadata/labels", "value": labels},
+        {"op": "add", "path": "/metadata/annotations", "value": annotations},
     ]))
     .context("serializing the guarded Namespace ownership patch")?;
     Ok(OpsCommand::new(
@@ -6430,7 +6548,47 @@ fn labels_allow_empty_adoption(labels: &BTreeMap<String, String>, namespace: &st
                 == Some(namespace))
 }
 
-async fn establish_primary_namespace_ownership(o: &CommonOpts) -> Result<()> {
+fn adoption_timestamp() -> Result<String> {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("formatting the adoption timestamp")
+}
+
+/// Say on the terminal exactly what the override took over. The durable record
+/// is the annotation set written by [`namespace_adoption_cmd`]; this is the
+/// operator's chance to notice it was wrong before Helm runs.
+fn announce_adoption_override(namespace: &str, taken: &AdoptionOverride) {
+    let ui = crate::ui::ui();
+    ui.warn(&format!(
+        "--adopt: took over pre-existing namespace `{namespace}` at {}",
+        taken.at
+    ));
+    ui.warn(&format!(
+        "--adopt: pre-existing labels: {}",
+        adoption_record_value(&taken.prior_labels)
+    ));
+    ui.warn(&format!(
+        "--adopt: pre-existing objects: {}",
+        adoption_record_value(&taken.prior_contents)
+    ));
+    ui.warn(&format!(
+        "--adopt: recorded on the namespace as {ADOPTED_BY_LABEL}/{ADOPTED_IN_LABEL} plus the {ADOPTED_AT_ANNOTATION}, {ADOPTED_LABELS_ANNOTATION} and {ADOPTED_CONTENTS_ANNOTATION} annotations; read it back with `kubectl get namespace {namespace} -o yaml`"
+    ));
+    ui.warn(&format!(
+        "--adopt: `curie cluster down` will uninstall the release and RETAIN namespace `{namespace}`, because an adopted namespace is not stamped with the sweep's ownership labels. Delete it yourself if you want it gone."
+    ));
+}
+
+/// Establish this install's ownership of the primary namespace before Helm.
+///
+/// `adopt` is the explicit `--adopt` operator override (#2557). It admits a
+/// pre-existing namespace past exactly three refusals -- foreign or incomplete
+/// ownership labels, foreign labels, and non-default contents -- and nothing
+/// else. A terminating namespace and the shared controller namespace still
+/// refuse with the flag present, and so does every read failure underneath.
+/// An override adoption is recorded on the object and leaves the namespace
+/// outside the `cluster down` sweep; see [`ADOPTED_BY_LABEL`].
+async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> Result<()> {
     match namespace_probe(&o.namespace).await? {
         NamespaceProbe::Absent => {
             let manifest = namespace_manifest(&o.namespace, &o.release)?;
@@ -6458,29 +6616,71 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts) -> Result<()> {
             {
                 return Ok(());
             }
-            if created_by.is_some() || created_in.is_some() {
+            // An earlier `--adopt` by this exact (release, install namespace)
+            // pair is already a recorded decision. A re-run converges without
+            // asking for the flag again and without re-stamping the record,
+            // which would overwrite the original adoption timestamp and the
+            // contents as they were when the operator accepted them.
+            if record.labels.get(ADOPTED_BY_LABEL).map(String::as_str) == Some(o.release.as_str())
+                && record.labels.get(ADOPTED_IN_LABEL).map(String::as_str)
+                    == Some(o.namespace.as_str())
+            {
+                return Ok(());
+            }
+            if (created_by.is_some() || created_in.is_some()) && !adopt {
                 let by = created_by.map(String::as_str).unwrap_or("<missing>");
                 let install = created_in.map(String::as_str).unwrap_or("<missing>");
                 bail!(
-                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it",
+                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it{ADOPT_HINT}",
                     o.namespace
                 );
             }
+            // Never overridable. The controller namespace is a cluster
+            // singleton shared by every install and keeps #707's create-only
+            // rule, so `--adopt` must fall through to this refusal rather than
+            // around it.
             if o.namespace == CONTROLLER_DEPLOYMENT_NAMESPACE {
                 bail!(
-                    "pre-existing shared controller namespace `{}` is never eligible for adoption",
+                    "pre-existing shared controller namespace `{}` is never eligible for adoption, with or without --adopt",
                     o.namespace
                 );
             }
-            if !labels_allow_empty_adoption(&record.labels, &o.namespace) {
+            let foreign_labels = !labels_allow_empty_adoption(&record.labels, &o.namespace);
+            if foreign_labels && !adopt {
                 let keys = record.labels.keys().cloned().collect::<Vec<_>>().join(", ");
                 bail!(
-                    "namespace `{}` has foreign labels ({keys}) and cannot be adopted",
+                    "namespace `{}` has foreign labels ({keys}) and cannot be adopted{ADOPT_HINT}",
                     o.namespace
                 );
             }
-            verify_namespace_is_empty(&o.namespace).await?;
-            let command = namespace_adoption_cmd(&o.namespace, &o.release, &record)?;
+            let contents = namespace_foreign_contents(&o.namespace).await?;
+            if let Some(detail) = &contents {
+                if !adopt {
+                    bail!(
+                        "namespace `{}` contains non-default objects and cannot be adopted: {detail}{ADOPT_HINT}",
+                        o.namespace
+                    );
+                }
+            }
+            // `--adopt` with nothing to override is not an adoption override:
+            // an empty, unlabelled namespace takes the ordinary owned path and
+            // stays sweepable, exactly as it does without the flag.
+            let overridden = if adopt
+                && (created_by.is_some()
+                    || created_in.is_some()
+                    || foreign_labels
+                    || contents.is_some())
+            {
+                Some(AdoptionOverride {
+                    prior_labels: rendered_labels(&record.labels),
+                    prior_contents: contents.clone().unwrap_or_default(),
+                    at: adoption_timestamp()?,
+                })
+            } else {
+                None
+            };
+            let command =
+                namespace_adoption_cmd(&o.namespace, &o.release, &record, overridden.as_ref())?;
             let (ok, _out, err) = run_capture(&command).await?;
             if !ok {
                 bail!(
@@ -6488,6 +6688,9 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts) -> Result<()> {
                     o.namespace,
                     failure_reason(&err)
                 );
+            }
+            if let Some(taken) = &overridden {
+                announce_adoption_override(&o.namespace, taken);
             }
         }
     }
@@ -7651,7 +7854,7 @@ async fn run_prepared_up(
         cmds = preview;
     } else {
         require_on_path("kubectl")?;
-        establish_primary_namespace_ownership(&opts.common).await?;
+        establish_primary_namespace_ownership(&opts.common, opts.adopt).await?;
     }
 
     // Count named provider intent on both live and dry runs, plus egress
@@ -7694,6 +7897,12 @@ async fn run_prepared_up(
             "# The Namespace manifest supplied on stdin carries {CREATED_BY_LABEL}={} and {CREATED_IN_LABEL}={}; a live run instead safely adopts an existing empty primary namespace.",
             opts.common.release, opts.common.namespace
         ));
+        if opts.adopt {
+            lines.insert(2, format!(
+                "# --adopt: a live run would also adopt an existing primary namespace that has foreign labels or non-default contents, stamp it {ADOPTED_BY_LABEL}={}/{ADOPTED_IN_LABEL}={} with a record of what it adopted, and leave it retained by `cluster down`. It never adopts `{CONTROLLER_DEPLOYMENT_NAMESPACE}` or a terminating namespace.",
+                opts.common.release, opts.common.namespace
+            ));
+        }
         lines.push("# After Helm and create-only controller namespace stamping, verify convergence for at most 300 seconds; repeat observations every 2 seconds while rollout is pending.".to_owned());
         lines.push(convergence::DRY_RUN_NOTE.to_owned());
         lines.extend(
@@ -8264,7 +8473,7 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         }));
     }
     ui.warn(&format!(
-        "this uninstalls release '{0}' in namespace '{1}', removes only that release's Helm hook Jobs, and deletes only namespaces carrying curietech.ai/created-by={0} AND curietech.ai/created-in={1}. Empty primary namespaces adopted by `cluster up` carry that pair; legacy unlabeled, foreign-content, foreign-owned, and shared controller namespaces are retained",
+        "this uninstalls release '{0}' in namespace '{1}', removes only that release's Helm hook Jobs, and deletes only namespaces carrying curietech.ai/created-by={0} AND curietech.ai/created-in={1}. Empty primary namespaces adopted by `cluster up` carry that pair; legacy unlabeled, foreign-content, foreign-owned, `--adopt`-adopted, and shared controller namespaces are retained",
         opts.common.release, opts.common.namespace
     ));
     if !opts.yes
@@ -10889,6 +11098,7 @@ mod tests {
                 secrets: vec![],
                 github_token: GithubTokenPlan::Untouched,
                 dev: true,
+                adopt: false,
             },
             Some(existing),
             None,
@@ -11070,6 +11280,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -11114,6 +11325,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: false,
                 set: vec![],
                 set_string: vec![],
@@ -11168,6 +11380,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![
@@ -11223,6 +11436,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -11272,6 +11486,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -11317,6 +11532,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
@@ -11362,6 +11578,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
                 set_string: vec![],
@@ -11408,6 +11625,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -11463,6 +11681,7 @@ mod tests {
                     chart: "charts/curie".into(),
                     secrets: vec![],
                     dev: false,
+                    adopt: false,
                     no_expose: true,
                     set: vec![],
                     set_string: vec![],
@@ -11516,6 +11735,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -11540,6 +11760,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec!["worker.replicas=2".into(), "dispatcher.deploy=false".into()],
             set_string: vec![],
@@ -11570,6 +11791,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec![],
@@ -11597,6 +11819,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -11623,6 +11846,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec![],
@@ -11758,6 +11982,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -11784,6 +12009,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -11809,6 +12035,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -11838,6 +12065,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -11863,6 +12091,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec!["agentSandbox.runner.model=z-ai/glm-5.2".into()],
             set_string: vec![],
@@ -11896,6 +12125,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec!["worker.replicas=2,agentSandbox.runner.model=glm".into()],
             allow_web_egress: vec![],
@@ -11971,6 +12201,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -12011,6 +12242,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec!["0.0.0.0/0".into()],
@@ -12046,6 +12278,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -12082,6 +12315,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec![],
@@ -12102,6 +12336,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -13534,6 +13769,7 @@ mod tests {
                 "xoxb-preserved-secret".into(),
             )],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -13740,6 +13976,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: true,
+                adopt: false,
                 no_expose: true,
                 set,
                 set_string: vec![],
@@ -14089,6 +14326,7 @@ mod tests {
                 ),
             ],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -14141,6 +14379,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: true,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -14167,6 +14406,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: true,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -14197,6 +14437,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -15303,6 +15544,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -15355,6 +15597,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -15388,6 +15631,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -15436,6 +15680,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -15814,6 +16059,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: true,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -16066,6 +16312,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: true,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec!["security.allowDevDefaults=false".into()],
@@ -16209,6 +16456,7 @@ mod tests {
                 ),
             ],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],

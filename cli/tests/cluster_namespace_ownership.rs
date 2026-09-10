@@ -68,6 +68,8 @@ def ns_json(name, record):
     metadata = {
         "name":name, "labels":record.get("labels", {}), "uid":record["uid"],
         "resourceVersion":record["resourceVersion"]}
+    if record.get("annotations"):
+        metadata["annotations"] = record["annotations"]
     if "deletionTimestamp" in record:
         metadata["deletionTimestamp"] = record["deletionTimestamp"]
     return {"apiVersion":"v1", "kind":"Namespace", "metadata":metadata}
@@ -96,9 +98,16 @@ def guarded(payload, record):
         payload, "resourceVersion", record["resourceVersion"])
 
 def desired_labels(payload):
+    # An ordinary adoption writes the created-by/created-in sweep pair; the
+    # #2557 operator override writes adopted-by/adopted-in INSTEAD, and writing
+    # both would put an operator's namespace back into the teardown sweep.
     rendered = json.dumps(payload)
-    return ("curietech.ai" in rendered and "created-by" in rendered
-            and RELEASE in rendered and "created-in" in rendered and NS in rendered)
+    owned = "created-by" in rendered and "created-in" in rendered
+    adopted = "adopted-by" in rendered and "adopted-in" in rendered
+    if owned and adopted:
+        return False
+    return ("curietech.ai" in rendered and RELEASE in rendered and NS in rendered
+            and (owned or adopted))
 
 program = pathlib.Path(sys.argv[0]).name
 if program == "helm":
@@ -210,7 +219,13 @@ if args and args[0] in ("patch", "replace") and "namespace" in args:
         fail("adoption omitted the namespace uid/resourceVersion ownership precondition")
     if state.get("version_conflict"):
         fail(f'Error from server (Conflict): Operation cannot be fulfilled on namespaces "{name}": the object has been modified')
-    record["labels"] = {"curietech.ai/created-by":RELEASE, "curietech.ai/created-in":NS}
+    for operation in payload:
+        if operation.get("op") != "add":
+            continue
+        if operation.get("path") == "/metadata/labels":
+            record["labels"] = operation["value"]
+        elif operation.get("path") == "/metadata/annotations":
+            record["annotations"] = operation["value"]
     record["resourceVersion"] = str(int(record["resourceVersion"]) + 1)
     state["adoption_guarded"] = True
     save(); print(f'namespace/{name} patched'); raise SystemExit(0)
@@ -292,6 +307,11 @@ impl Fixture {
         json!({"labels":labels, "uid":"uid-agent-ns", "resourceVersion":"17", "objects":objects})
     }
 
+    fn annotated_namespace(labels: Value, annotations: Value, objects: Value) -> Value {
+        json!({"labels":labels, "annotations":annotations, "uid":"uid-agent-ns",
+               "resourceVersion":"17", "objects":objects})
+    }
+
     fn command(&self) -> Command {
         let mut paths = vec![self.bin_dir.clone()];
         paths.extend(std::env::split_paths(
@@ -315,28 +335,35 @@ impl Fixture {
     }
 
     fn up(&self) -> Output {
-        self.command()
-            .args([
-                "--color",
-                "never",
-                "cluster",
-                "up",
-                "--chart",
-                chart(),
-                "--namespace",
-                NS,
-                "--release",
-                RELEASE,
-                "--dev",
-                "--no-expose",
-                "--fake-model",
-                "--set",
-                "agentSandbox.controller.deploy=false",
-                "--set",
-                "security.gvisor.mode=off",
-            ])
-            .output()
-            .expect("run cluster up")
+        self.up_in(NS, &[])
+    }
+
+    /// `cluster up` against `namespace` with `extra` operator flags appended,
+    /// so one fixture can drive the plain install, the `--adopt` override, and
+    /// the shared controller namespace that the override must never reach.
+    fn up_in(&self, namespace: &str, extra: &[&str]) -> Output {
+        let mut command = self.command();
+        command.args([
+            "--color",
+            "never",
+            "cluster",
+            "up",
+            "--chart",
+            chart(),
+            "--namespace",
+            namespace,
+            "--release",
+            RELEASE,
+            "--dev",
+            "--no-expose",
+            "--fake-model",
+            "--set",
+            "agentSandbox.controller.deploy=false",
+            "--set",
+            "security.gvisor.mode=off",
+        ]);
+        command.args(extra);
+        command.output().expect("run cluster up")
     }
 
     fn down(&self) -> Output {
@@ -891,4 +918,315 @@ fn failed_install_cleanup_and_empty_namespace_adoption() {
     // regressions remain independently runnable by their focused test names.
     terminating_namespace_blocks_up_but_down_still_cleans_owned_hooks();
     empty_namespace_adoption_fails_closed_on_unavailable_remote_apiservices();
+    adopt_override_records_what_it_adopted_and_stays_out_of_the_teardown_sweep();
+    adopt_override_never_reaches_the_controller_namespace_or_an_unreadable_one();
+}
+
+/// #2557: the explicit operator override for the three pre-existing namespace
+/// refusals. It admits a namespace that already has its own labels and its own
+/// objects, records what it took over on the object itself, and -- the load
+/// bearing half -- leaves that namespace OUT of the `cluster down` sweep, so
+/// the operator's pre-existing objects are never collateral of a teardown.
+#[test]
+fn adopt_override_records_what_it_adopted_and_stays_out_of_the_teardown_sweep() {
+    let occupied = json!({
+        "serviceaccounts":[{"apiVersion":"v1", "kind":"ServiceAccount",
+            "metadata":{"name":"default", "namespace":NS}}],
+        "configmaps":[{"apiVersion":"v1", "kind":"ConfigMap",
+            "metadata":{"name":"kube-root-ca.crt", "namespace":NS},
+            "data":{"ca.crt":"PLACEHOLDER CERTIFICATE"}}],
+        "secrets":[{"apiVersion":"v1", "kind":"Secret",
+            "metadata":{"name":"platform-pull-secret", "namespace":NS}}],
+        "events":[], "jobs.batch":[],
+        "deployments.apps":[{"apiVersion":"apps/v1", "kind":"Deployment",
+            "metadata":{"name":"platform-agent", "namespace":NS}}]
+    });
+    let platform_labels = json!({
+        "kubernetes.io/metadata.name": NS,
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "argocd.argoproj.io/instance": "platform"
+    });
+    let fixture = Fixture::new(
+        json!({NS: Fixture::annotated_namespace(
+            platform_labels,
+            json!({"openshift.io/description":"pre-provisioned by the platform team"}),
+            occupied
+        )}),
+        json!({}),
+        false,
+        false,
+    );
+
+    // Without the flag the refusal stands, and now names the way through.
+    let refused = fixture.up();
+    assert_blocked_before_helm(&fixture, &refused, "cannot be adopted");
+    assert!(
+        shown(&refused).contains("--adopt"),
+        "the refusal must name the override that gets past it: {}",
+        shown(&refused)
+    );
+
+    // With the flag the install proceeds (the fixture's Helm hook still fails).
+    let adopted = fixture.up_in(NS, &["--adopt"]);
+    assert!(
+        !adopted.status.success(),
+        "the fixture Helm hook must still fail after an override adoption"
+    );
+    let state = fixture.state();
+    assert_eq!(
+        state["adoption_guarded"],
+        true,
+        "the override adoption dropped the uid/resourceVersion guard: {}",
+        shown(&adopted)
+    );
+    assert_eq!(
+        state["helm_upgrades"],
+        1,
+        "the install did not continue past the override: {}",
+        shown(&adopted)
+    );
+
+    let labels = &state["namespaces"][NS]["labels"];
+    assert_eq!(
+        labels["curietech.ai/adopted-by"],
+        json!(RELEASE),
+        "override adoption did not stamp adopted-by: {labels}"
+    );
+    assert_eq!(
+        labels["curietech.ai/adopted-in"],
+        json!(NS),
+        "override adoption did not stamp adopted-in: {labels}"
+    );
+    assert!(
+        labels.get("curietech.ai/created-by").is_none()
+            && labels.get("curietech.ai/created-in").is_none(),
+        "an adopted namespace must NOT carry the sweep's ownership pair: {labels}"
+    );
+    assert_eq!(
+        labels["pod-security.kubernetes.io/enforce"],
+        json!("restricted"),
+        "override adoption destroyed a pre-existing label: {labels}"
+    );
+
+    let annotations = &state["namespaces"][NS]["annotations"];
+    assert_eq!(
+        annotations["openshift.io/description"],
+        json!("pre-provisioned by the platform team"),
+        "override adoption destroyed a pre-existing annotation: {annotations}"
+    );
+    let recorded_labels = annotations["curietech.ai/adopted-labels"]
+        .as_str()
+        .expect("override adoption must record the labels it found");
+    assert!(
+        recorded_labels.contains("pod-security.kubernetes.io/enforce=restricted")
+            && recorded_labels.contains("argocd.argoproj.io/instance=platform"),
+        "recorded labels omitted what was adopted: {recorded_labels}"
+    );
+    let recorded_contents = annotations["curietech.ai/adopted-contents"]
+        .as_str()
+        .expect("override adoption must record the objects it found");
+    assert!(
+        recorded_contents.contains("platform-pull-secret")
+            && recorded_contents.contains("platform-agent"),
+        "recorded contents omitted what was adopted: {recorded_contents}"
+    );
+    let recorded_at = annotations["curietech.ai/adopted-at"]
+        .as_str()
+        .expect("override adoption must record when it happened")
+        .to_string();
+    assert!(
+        recorded_at.starts_with("20") && recorded_at.ends_with('Z'),
+        "adopted-at is not an RFC 3339 UTC instant: {recorded_at}"
+    );
+    assert!(
+        shown(&adopted).contains("platform-pull-secret") && shown(&adopted).contains("RETAIN"),
+        "the override must say on the terminal what it took and that down retains it: {}",
+        shown(&adopted)
+    );
+
+    // A re-run needs no flag and must not rewrite the original decision.
+    let rerun = fixture.up();
+    assert!(
+        !rerun.status.success(),
+        "the fixture Helm hook must still fail"
+    );
+    let state = fixture.state();
+    assert_eq!(
+        state["helm_upgrades"],
+        2,
+        "a re-run over an already adopted namespace was refused: {}",
+        shown(&rerun)
+    );
+    assert_eq!(
+        state["namespaces"][NS]["annotations"]["curietech.ai/adopted-at"],
+        json!(recorded_at),
+        "a re-run rewrote the recorded adoption"
+    );
+
+    // #1654's legacy case: a namespace stamped by an older single-label CLI is
+    // deliberately unswept and, until now, had no supported way to complete its
+    // stamp. `--adopt` is that way, and it removes the half-pair rather than
+    // leaving the namespace half-owned -- which also means it converts a
+    // legacy namespace into a RETAINED one, so the record must say so.
+    let legacy = Fixture::new(
+        json!({NS: Fixture::namespace(
+            json!({"curietech.ai/created-by": RELEASE}),
+            Fixture::default_furniture()
+        )}),
+        json!({}),
+        false,
+        false,
+    );
+    let refused = legacy.up();
+    assert_blocked_before_helm(&legacy, &refused, "incomplete or foreign ownership labels");
+    assert!(
+        shown(&refused).contains("--adopt"),
+        "the legacy-stamp refusal must name the override: {}",
+        shown(&refused)
+    );
+    let output = legacy.up_in(NS, &["--adopt"]);
+    assert!(
+        !output.status.success(),
+        "the fixture Helm hook must still fail after adopting a legacy stamp"
+    );
+    let state = legacy.state();
+    let labels = &state["namespaces"][NS]["labels"];
+    assert!(
+        labels.get("curietech.ai/created-by").is_none(),
+        "the legacy half-pair survived the override: {labels}"
+    );
+    assert_eq!(
+        labels["curietech.ai/adopted-by"],
+        json!(RELEASE),
+        "the legacy stamp was not completed as an adoption: {labels}"
+    );
+    assert_eq!(
+        state["namespaces"][NS]["annotations"]["curietech.ai/adopted-labels"],
+        json!(format!("curietech.ai/created-by={RELEASE}")),
+        "the override did not record the legacy ownership label it removed"
+    );
+    assert!(legacy.down().status.success());
+    assert!(
+        legacy.state()["namespaces"].get(NS).is_some(),
+        "an adopted legacy namespace must be retained by down"
+    );
+
+    // The load bearing negative control: teardown must retain it and its
+    // pre-existing objects, because it never carries the sweep selector.
+    let down = fixture.down();
+    assert!(
+        down.status.success(),
+        "teardown of an adopted namespace failed: {}",
+        shown(&down)
+    );
+    let state = fixture.state();
+    assert!(
+        state["namespaces"].get(NS).is_some(),
+        "cluster down deleted an adopted namespace and the operator's objects with it"
+    );
+    assert_eq!(
+        state["namespaces"][NS]["objects"]["secrets"][0]["metadata"]["name"],
+        json!("platform-pull-secret"),
+        "the operator's pre-existing objects were swept"
+    );
+}
+
+/// #2557 negative controls. `--adopt` overrides exactly three refusals; every
+/// other refusal on this path must be byte-for-byte unchanged with the flag
+/// present.
+#[test]
+fn adopt_override_never_reaches_the_controller_namespace_or_an_unreadable_one() {
+    let empty = Fixture::default_furniture();
+
+    // The shared, cluster-singleton controller namespace: never adoptable.
+    let controller = Fixture::new(
+        json!({"agent-sandbox-system": Fixture::namespace(json!({}), empty.clone())}),
+        json!({}),
+        false,
+        false,
+    );
+    let output = controller.up_in("agent-sandbox-system", &["--adopt"]);
+    assert_blocked_before_helm(&controller, &output, "never eligible for adoption");
+    assert_eq!(
+        controller.state()["namespaces"]["agent-sandbox-system"]["labels"],
+        json!({}),
+        "--adopt mutated the shared controller namespace"
+    );
+
+    // A terminating namespace cannot hold new objects at all.
+    let mut record = Fixture::namespace(json!({}), empty.clone());
+    record["deletionTimestamp"] = json!("2026-09-10T14:30:00Z");
+    let terminating = Fixture::new(json!({NS: record}), json!({}), false, false);
+    let output = terminating.up_in(NS, &["--adopt"]);
+    assert_blocked_before_helm(&terminating, &output, "terminating");
+
+    // An unreadable inventory stays fatal: contents nobody can read are
+    // contents the adoption record cannot name.
+    let unreadable = Fixture::new(
+        json!({NS: Fixture::namespace(json!({"argocd.argoproj.io/instance":"platform"}), empty.clone())}),
+        json!({}),
+        true,
+        false,
+    );
+    let output = unreadable.up_in(NS, &["--adopt"]);
+    assert_blocked_before_helm(&unreadable, &output, "inventory forbidden");
+    assert_eq!(
+        unreadable.state()["namespaces"][NS]["labels"],
+        json!({"argocd.argoproj.io/instance":"platform"}),
+        "--adopt stamped a namespace whose contents it could not read"
+    );
+
+    // So does a concurrent modification of the namespace being adopted.
+    let conflict = Fixture::new(
+        json!({NS: Fixture::namespace(json!({"argocd.argoproj.io/instance":"platform"}), empty.clone())}),
+        json!({}),
+        false,
+        true,
+    );
+    let output = conflict.up_in(NS, &["--adopt"]);
+    assert_blocked_before_helm(&conflict, &output, "modified");
+
+    // An unavailable aggregated APIService means the inventory is incomplete.
+    let incomplete = Fixture::new(
+        json!({NS: Fixture::namespace(json!({"argocd.argoproj.io/instance":"platform"}), empty.clone())}),
+        json!({}),
+        false,
+        false,
+    );
+    incomplete.set_apiservices(
+        json!({"apiVersion":"v1", "kind":"List", "items":[remote_apiservice("False")]}),
+        false,
+    );
+    let output = incomplete.up_in(NS, &["--adopt"]);
+    assert_blocked_before_helm(&incomplete, &output, "Available");
+
+    // `--adopt` with nothing to override is not an override: an empty,
+    // unlabelled namespace still takes the ordinary owned path and therefore
+    // stays sweepable.
+    let ordinary = Fixture::new(
+        json!({NS: Fixture::namespace(json!({}), empty)}),
+        json!({}),
+        false,
+        false,
+    );
+    let output = ordinary.up_in(NS, &["--adopt"]);
+    assert!(
+        !output.status.success(),
+        "the fixture Helm hook must still fail"
+    );
+    let labels = &ordinary.state()["namespaces"][NS]["labels"];
+    assert_eq!(
+        labels["curietech.ai/created-by"],
+        json!(RELEASE),
+        "--adopt changed the ordinary empty-namespace adoption: {labels}"
+    );
+    assert!(
+        labels.get("curietech.ai/adopted-by").is_none(),
+        "--adopt recorded an override it did not take: {labels}"
+    );
+    assert!(ordinary.down().status.success());
+    assert!(
+        ordinary.state()["namespaces"].get(NS).is_none(),
+        "an ordinary owned namespace must still be swept by down"
+    );
 }
