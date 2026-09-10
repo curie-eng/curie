@@ -76,6 +76,11 @@ impl Fixture {
     }
 
     fn run(&self, scenario: &str, to: &str, chart: &str) -> Output {
+        self.run_with(scenario, to, chart, &[])
+    }
+
+    /// `run`, plus any extra flags (`--dry-run`) after the fixed argument set.
+    fn run_with(&self, scenario: &str, to: &str, chart: &str, extra: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_curie"))
             .args([
                 "--json",
@@ -91,6 +96,7 @@ impl Fixture {
                 chart,
                 "--yes",
             ])
+            .args(extra)
             .current_dir(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .parent()
@@ -998,4 +1004,99 @@ fn the_overlay_is_read_once_and_apply_uses_the_stored_one() {
         "the retained overlay must be read exactly once: {:?}",
         fixture.argv()
     );
+}
+
+/// #2301 -- `--dry-run` must plan the refusal the real run would hit. Both
+/// pre-mutation inputs are read-only, so a dry run computes them; a clean
+/// nine-phase plan for an upgrade that cannot happen is the defect.
+#[test]
+fn dry_run_plans_the_chart_refusal_without_mutating() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run_with(
+        "local-chart-mismatch",
+        "0.9.0",
+        "charts/curie",
+        &["--dry-run"],
+    );
+    let plan = json(&output)["plan"].to_string();
+    assert!(
+        plan.contains("refusal") && plan.contains("0.8.7") && plan.contains("0.9.0"),
+        "the dry-run plan must surface the Validate refusal: {plan}"
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "a dry run must mutate nothing: {:?}",
+        fixture.argv()
+    );
+}
+
+/// #2299 -- the redacted plan must carry the configuration schema version it
+/// migrates from and to, and must never carry a credential value.
+#[test]
+fn dry_run_plan_carries_the_config_schema_version() {
+    let fixture = Fixture::new(Some(V084));
+    let output = fixture.run_with("healthy", "0.9.0", "charts/curie", &["--dry-run"]);
+    let plan = json(&output)["plan"].to_string();
+    assert!(
+        plan.contains("config schema: 0.8.6 -> 0.9.0"),
+        "the plan must name the source and target configuration schema: {plan}"
+    );
+    assert!(
+        !plan.contains(SLACK_TOKEN),
+        "the plan must stay redacted: {plan}"
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "a dry run must mutate nothing: {:?}",
+        fixture.argv()
+    );
+}
+
+/// #2301 -- the printed plan's helm line must BE the command. Compares the
+/// dry-run plan's helm line against the argv the mutating run records, for a
+/// local chart (no `--version`) and a resolvable ref (`--version` in both).
+#[test]
+fn dry_run_helm_line_matches_the_recorded_upgrade_argv() {
+    for chart in ["charts/curie", "oci://example.invalid/curie"] {
+        let planner = Fixture::new(None);
+        let planned = json(&planner.run_with("healthy", "0.9.0", chart, &["--dry-run"]));
+        let line = planned["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|line| line.starts_with("helm upgrade "))
+            .unwrap_or_else(|| panic!("no helm line in {planned}"))
+            .to_string();
+
+        let mutator = Fixture::new(None);
+        let output = mutator.run("healthy", "0.9.0", chart);
+        let upgrades = mutator.helm_upgrades();
+        assert_eq!(
+            upgrades.len(),
+            1,
+            "{:?} / {}",
+            mutator.argv(),
+            stderr(&output)
+        );
+        // `--install`/`-f` are runtime-state tails; the planned line is the
+        // fixed head, and it must match that head exactly.
+        let head: Vec<String> = upgrades[0]
+            .iter()
+            .take(line.split(' ').count())
+            .cloned()
+            .collect();
+        assert_eq!(
+            line,
+            head.join(" "),
+            "planned line must be the executed command: {:?}",
+            upgrades[0]
+        );
+        let pinned = line.contains("--version 0.9.0");
+        assert_eq!(
+            pinned,
+            chart.starts_with("oci://"),
+            "--version must show exactly when passed: {line}"
+        );
+    }
 }

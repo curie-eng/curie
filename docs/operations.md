@@ -288,7 +288,7 @@ passes `--version <to>` internally and lets Helm enforce it; there is no
 | `--to <version>` | Target Curie version. Required. |
 | `--chart` | Chart path or ref override. |
 | `--yes` | Skip the confirmation prompt. |
-| `--dry-run` | Print the redacted plan and exit without mutating. |
+| `--dry-run` | Print the redacted plan and exit without mutating. Both pre-mutation checks (the local chart's declared version, and the retained-configuration migration) are read-only, so a dry run runs them and the plan names any refusal the real run would hit at Validate. |
 
 One resumable lifecycle: inspect and plan, validate configuration and
 refuse on an ambiguous migration conflict, drain accepted work, checkpoint,
@@ -300,7 +300,16 @@ values overlay; do not pass `--reuse-values` or `--reset-then-reuse-values`.
 Configuration migration to the current schema happens at Validate, before
 any mutation; database/application schema-compatibility checking is not
 wired into this command yet (tracked as issue #2588) -- the pre-upgrade
-migration Job remains the database's authority.
+migration Job remains the database's authority. The `migrate` phase is a
+resumable checkpoint boundary only; it performs no migration of its own.
+
+The redacted plan names the configuration schema version the upgrade migrates
+from and to (`config schema: <from> -> <to>`). It never carries credential
+values. The plan's `helm upgrade` line is generated from the same chart
+resolution and the same `--version` decision the command executes, so it names
+the chart that will actually be applied (`charts/curie` unless `--chart` says
+otherwise; this verb does not resolve a release artifact, issue #2593) and
+shows `--version <to>` exactly when a resolvable ref makes it a real pin.
 
 After Apply, the command re-reads the installed Helm revision and fails
 rather than reporting success if it is not the target version; the canary

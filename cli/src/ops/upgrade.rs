@@ -496,27 +496,34 @@ fn remaining_after(completed: &[UpgradePhase]) -> Vec<UpgradePhase> {
         .collect()
 }
 
-fn plan_lines(opts: &UpgradeOpts, from: Option<&str>, secret: Option<&str>) -> Vec<String> {
+fn plan_lines(
+    opts: &UpgradeOpts,
+    from: Option<&str>,
+    secret: Option<&str>,
+    schema_plan: Option<&str>,
+) -> Vec<String> {
     let from = from.unwrap_or("none");
-    let chart = opts
-        .chart
-        .clone()
-        .unwrap_or_else(|| format!("curie-{}", opts.to));
     let mut lines = vec![
         format!("phase plan: {from} -> {}", opts.to),
         "phase validate: configuration overlay migration and pre-mutation refusals".into(),
         "phase drain: worker upgrade drain gate (issue 2010)".into(),
         "phase checkpoint: persist recoverable release state".into(),
-        "phase migrate: one controlled schema migration".into(),
-        format!(
-            "helm upgrade {} {chart} -n {} --wait",
-            opts.common.release, opts.common.namespace
-        ),
+        // The chart's pre-upgrade hook Job owns schema migration and Apply
+        // fires it; this phase is only a resumable checkpoint boundary
+        // (issue 2588).
+        "phase migrate: checkpoint boundary only; the chart's pre-upgrade hook Job \
+         performs schema migration during apply"
+            .into(),
+        helm_upgrade_argv(opts, &opts.to).join(" "),
         "phase converge: exact images, generations, replicas, unavailable=0, hooks, queues, manifest"
             .into(),
         "phase canary: target-version smoke".into(),
         "phase commit: record known-good version".into(),
     ];
+    // #2299: the configuration schema version the upgrade moves from and to.
+    if let Some(schema_plan) = schema_plan {
+        lines.push(schema_plan.to_string());
+    }
     if let Some(secret) = secret {
         lines.push(format!(
             "preserved credential api.credentials={}",
@@ -602,6 +609,11 @@ trait UpgradeDriver {
     fn secret(&self) -> Option<&str> {
         None
     }
+    /// The redacted `config schema: <from> -> <to>` plan line (#2299), when a
+    /// retained configuration was read and migrated.
+    fn schema_plan(&self) -> Option<String> {
+        None
+    }
     fn redact(&self, text: &str) -> String {
         match self.secret() {
             Some(secret) => text.replace(secret, &mask_secret(secret)),
@@ -655,10 +667,21 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         bail!("--to requires a target version");
     }
     let from = host.current();
-    let plan = plan_lines(&opts, from.as_deref(), host.secret());
-    let plan: Vec<String> = plan.into_iter().map(|l| host.redact(&l)).collect();
+    let plan = plan_lines(
+        &opts,
+        from.as_deref(),
+        host.secret(),
+        host.schema_plan().as_deref(),
+    );
+    let mut plan: Vec<String> = plan.into_iter().map(|l| host.redact(&l)).collect();
 
     if opts.common.dry_run {
+        // The plan is what the command WILL do, so a dry run that computed the
+        // read-only pre-mutation checks must show the refusal the real run
+        // would hit at Validate instead of printing a clean nine-phase plan.
+        if let Some(detail) = host.validate_refusal() {
+            plan.push(host.redact(&format!("refusal at validate: {detail}")));
+        }
         return Ok(ClusterUpgradeOutput::DryRun(crate::ui::DryRunPlan {
             lines: plan,
         }));
@@ -928,6 +951,8 @@ struct LiveHost {
     config_refusal: Option<String>,
     /// Why the chart cannot install `--to`, if it cannot (Ruling 2, R1).
     chart_refusal: Option<String>,
+    /// The redacted configuration schema plan line (#2299).
+    schema_plan: Option<String>,
 }
 
 /// Ruling 2: Helm SILENTLY IGNORES `--version` for a local directory or
@@ -935,6 +960,36 @@ struct LiveHost {
 /// `--version` there would be a pin that does nothing while looking like one,
 /// so a local chart is pinned by refusing before mutation when its own
 /// metadata is not `--to`, and only a ref Helm must resolve carries the flag.
+/// The chart this verb applies. This verb never resolves a release artifact
+/// (issue #2593), so the default is the literal local path.
+fn chart_ref(opts: &UpgradeOpts) -> String {
+    opts.chart
+        .clone()
+        .unwrap_or_else(|| "charts/curie".to_string())
+}
+
+/// The `helm upgrade` argv, ONE definition shared by the plan line and the
+/// mutating call so the printed plan cannot drift from the executed command.
+/// A ref Helm resolves IS pinned by `--version`; a local path is pinned by
+/// `chart_pin_refusal` before Apply ever runs, so it deliberately carries none.
+fn helm_upgrade_argv(opts: &UpgradeOpts, to: &str) -> Vec<String> {
+    let chart = chart_ref(opts);
+    let mut argv = vec![
+        "helm".to_string(),
+        "upgrade".into(),
+        opts.common.release.clone(),
+        chart.clone(),
+        "-n".into(),
+        opts.common.namespace.clone(),
+        "--wait".into(),
+    ];
+    if !local_chart(&chart) {
+        argv.push("--version".into());
+        argv.push(to.to_string());
+    }
+    argv
+}
+
 fn local_chart(chart: &str) -> bool {
     std::path::Path::new(chart).exists()
 }
@@ -950,6 +1005,7 @@ impl LiveHost {
             overlay: None,
             config_refusal: None,
             chart_refusal: None,
+            schema_plan: None,
         }
     }
 
@@ -958,10 +1014,7 @@ impl LiveHost {
     }
 
     fn chart_ref(&self) -> String {
-        self.opts
-            .chart
-            .clone()
-            .unwrap_or_else(|| "charts/curie".to_string())
+        chart_ref(&self.opts)
     }
 
     /// The version a LOCAL chart declares for itself. `None` for a ref Helm
@@ -1007,9 +1060,24 @@ impl LiveHost {
         }
     }
 
+    /// Both pre-mutation refusals and the migrated overlay are computed ONCE,
+    /// before any phase runs (Ruling 8.8). Apply then hands Helm exactly this
+    /// overlay. Every input here is read-only, so the dry-run path runs it too.
+    fn compute_pre_mutation(&mut self) {
+        self.chart_refusal = self.chart_pin_refusal();
+        match self.retained_overlay() {
+            Ok(Some((overlay, schema_plan))) => {
+                self.overlay = Some(overlay);
+                self.schema_plan = Some(schema_plan);
+            }
+            Ok(None) => {}
+            Err(error) => self.config_refusal = Some(format!("{error:#}")),
+        }
+    }
+
     /// R7: read the retained overlay, migrate it (#2299) and keep the result.
     /// `Ok(None)` means nothing was retained -- a first install.
-    fn retained_overlay(&self) -> Result<Option<String>> {
+    fn retained_overlay(&self) -> Result<Option<(String, String)>> {
         let values_cmd = OpsCommand::new(
             "helm",
             vec![
@@ -1045,10 +1113,15 @@ impl LiveHost {
         // `config.schemaVersion`.
         let outcome =
             crate::config_migrate::migrate_installed_config(values, self.current.as_deref())?;
-        Ok(Some(
+        let schema_plan = crate::config_migrate::redacted_upgrade_plan(&outcome)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        Ok(Some((
             serde_norway::to_string(&outcome.values)
                 .context("could not serialize the migrated overlay")?,
-        ))
+            schema_plan,
+        )))
     }
 
     /// The chart version the release reports. `scripts/check-version-consistency.sh`
@@ -1142,21 +1215,11 @@ impl LiveHost {
     }
 
     fn helm_upgrade(&self, to: &str) -> Result<()> {
-        let chart = self.chart_ref();
-        let mut args = vec![
-            plain("upgrade"),
-            plain(&self.opts.common.release),
-            plain(chart.clone()),
-            plain("-n"),
-            plain(&self.opts.common.namespace),
-            plain("--wait"),
-        ];
-        if !local_chart(&chart) {
-            // A ref Helm resolves IS pinned by `--version`; a local path is
-            // pinned by `chart_pin_refusal` before this ever runs.
-            args.push(plain("--version"));
-            args.push(plain(to));
-        }
+        let mut args: Vec<_> = helm_upgrade_argv(&self.opts, to)
+            .into_iter()
+            .skip(1)
+            .map(plain)
+            .collect();
         if self.current.is_none() {
             args.push(plain("--install"));
             args.push(plain("--create-namespace"));
@@ -1242,6 +1305,9 @@ impl UpgradeDriver for LiveHost {
         self.record = Some(record.clone());
         self.persist_record(&record)
     }
+    fn schema_plan(&self) -> Option<String> {
+        self.schema_plan.clone()
+    }
     fn validate_refusal(&self) -> Option<String> {
         self.chart_refusal
             .clone()
@@ -1296,6 +1362,10 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         let mut live = LiveHost::new(opts.clone());
         live.current = live.inspect_version();
         live.known_good = live.current.clone();
+        // Both pre-mutation inputs are read-only (`helm show chart`, `helm get
+        // values`), so a dry run computes them too and plans the refusal the
+        // real run would hit rather than a plan that cannot happen (#2301).
+        live.compute_pre_mutation();
         return run_lifecycle_inner(opts, &mut live).await;
     }
 
@@ -1319,13 +1389,7 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         .as_ref()
         .and_then(|r| r.known_good_version.clone())
         .or_else(|| live.current.clone());
-    // Both pre-mutation refusals are computed ONCE, here, before any phase
-    // runs (Ruling 8.8). Apply then hands Helm exactly this overlay.
-    live.chart_refusal = live.chart_pin_refusal();
-    match live.retained_overlay() {
-        Ok(overlay) => live.overlay = overlay,
-        Err(error) => live.config_refusal = Some(format!("{error:#}")),
-    }
+    live.compute_pre_mutation();
     run_lifecycle_inner(opts, &mut live).await
 }
 
