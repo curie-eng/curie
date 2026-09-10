@@ -576,10 +576,15 @@ def test_gated_turn_that_also_hit_a_model_error_ends_classified_failure() -> Non
     assert final.status == SessionStatus.CLASSIFIED_FAILURE
     assert final.status != SessionStatus.AWAITING_APPROVAL
     assert not final.approval_summary
-    # And the failure is still reported as itself, not swallowed.
+    # And the failure is still reported as itself, not swallowed. The SDK token
+    # is constrained to unclassified; the raw token survives in the message.
+    error_events = [e for e in events if e.type == "error"]
+    assert error_events, "the model's own error frame must survive"
+    assert any(e.classification == "unclassified" for e in error_events)
+    assert all(e.classification != "server_error" for e in error_events)
     assert any(
-        e.type == "error" and e.classification == "server_error" for e in events
-    ), "the model's own error frame must survive"
+        "server_error" in getattr(e, "message", "") for e in error_events
+    ), "the raw token must survive in the ErrorEvent message"
 
 
 def test_a_done_gated_turn_still_flips_even_after_a_model_error_frame() -> None:

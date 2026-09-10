@@ -1150,6 +1150,180 @@ def test_rate_limit_retries_then_succeeds(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_unknown_classification_escalates_as_unclassified_with_event_id(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=3) as h:
+            h.runner.default_script = [
+                ErrorEvent(message="model-said-unknown", classification="unknown"),
+                Final(text="failed", status=FAIL),
+            ]
+            ev = _qevent("go", event_id="evt-unknown-cause")
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == ["go"]
+            reply = h.sink.last_text
+            assert reply == (
+                "The run failed (unclassified) after 1 attempt(s). "
+                "model-said-unknown event_id=evt-unknown-cause. "
+                "Flagging for a human."
+            )
+            assert "(unclassified)" in reply
+            assert "model-said-unknown" in reply
+            assert "event_id=evt-unknown-cause" in reply
+            assert "(unknown)" not in reply
+            assert reply.startswith("The run failed (")
+
+    asyncio.run(go())
+
+
+def test_side_effect_unknown_classification_escalates_with_detail_and_event_id(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [
+                SideEffectFlag(tool="deploy"),
+                ErrorEvent(message="boom-detail", classification="unknown"),
+                Final(text="failed", status=FAIL),
+            ]
+            ev = _qevent("do it", event_id="evt-unknown-side-effect")
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == ["do it"]
+            reply = h.sink.last_text
+            assert reply is not None
+            assert reply == (
+                "The run hit an error (unclassified) after starting an action; "
+                "not retrying automatically. boom-detail "
+                "event_id=evt-unknown-side-effect. Flagging for a human."
+            )
+            assert "(unclassified)" in reply
+            assert "boom-detail" in reply
+            assert "event_id=evt-unknown-side-effect" in reply
+            assert "human" in reply.lower()
+            assert reply.startswith("The run hit an error (")
+            assert "(unknown)" not in reply
+
+    asyncio.run(go())
+
+
+def test_sdk_rate_limit_underscore_does_not_retry(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=3) as h:
+            h.runner.default_script = [
+                ErrorEvent(
+                    message="sdk-rate-limit-underscore",
+                    classification="rate_limit",
+                ),
+                Final(text="f", status=FAIL),
+            ]
+            ev = _qevent("go", event_id="evt-rate-limit-underscore")
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == ["go"]
+            reply = h.sink.last_text
+            assert reply == (
+                "The run failed (unclassified) after 1 attempt(s). "
+                "sdk-rate-limit-underscore event_id=evt-rate-limit-underscore. "
+                "Flagging for a human."
+            )
+            assert "(unclassified)" in reply
+            assert "(rate_limit)" not in reply
+            assert "(rate-limit)" not in reply
+
+    asyncio.run(go())
+
+
+def test_platform_rate_limit_still_retries_then_succeeds(make_harness) -> None:
+    # Hyphenated sibling of test_sdk_rate_limit_underscore_does_not_retry:
+    # allowlist-constrain must not fold platform rate-limit, or retry dies.
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    ErrorEvent(message="rl", classification="rate-limit"),
+                    Final(text="f", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            await h.kernel.process_event(_qevent("go"))
+
+            assert h.runner.opened == ["go", "go"]
+            assert h.sink.last_text == "recovered"
+
+    asyncio.run(go())
+
+
+def test_empty_classification_does_not_overwrite_prior_rate_limit(make_harness) -> None:
+    # A later ErrorEvent with classification="" must not fold to unclassified
+    # and wipe a prior rate-limit, or the retry dies.
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    ErrorEvent(message="rl", classification="rate-limit"),
+                    ErrorEvent(message="empty-class", classification=""),
+                    Final(text="f", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            await h.kernel.process_event(_qevent("go"))
+
+            assert h.runner.opened == ["go", "go"]
+            assert h.sink.last_text == "recovered"
+
+    asyncio.run(go())
+
+
+def test_empty_classification_alone_defaults_to_retryable_runner_error(
+    make_harness,
+) -> None:
+    # Old fold treated "" as falsy so _finish defaulted to runner-error
+    # (retryable). Do not escalate on the first attempt.
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    ErrorEvent(message="blank-class", classification=""),
+                    Final(text="f", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            await h.kernel.process_event(_qevent("go"))
+
+            assert h.runner.opened == ["go", "go"]
+            assert h.sink.last_text == "recovered"
+
+    asyncio.run(go())
+
+
+def test_allowlisted_runner_error_escalates_with_event_id(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=1) as h:
+            h.runner.default_script = [
+                ErrorEvent(message="sandbox died", classification="runner-error"),
+                Final(text="failed", status=FAIL),
+            ]
+            ev = _qevent("go", event_id="evt-runner-error-cause")
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == ["go"]
+            reply = h.sink.last_text
+            assert reply == (
+                "The run failed (runner-error) after 1 attempt(s). "
+                "sandbox died event_id=evt-runner-error-cause. "
+                "Flagging for a human."
+            )
+            assert "(runner-error)" in reply
+            assert "sandbox died" in reply
+            assert "event_id=evt-runner-error-cause" in reply
+            assert reply.startswith("The run failed (")
+
+    asyncio.run(go())
+
+
 def test_turn_start_failure_is_retryable_not_a_stall(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
@@ -1371,7 +1545,8 @@ def test_approval_resume_capacity_retries_then_escalates(make_harness) -> None:
                 (
                     "C1",
                     "p-1",
-                    "The run failed (runner-error) after 3 attempt(s). Flagging for a human.",
+                    "The run failed (runner-error) after 3 attempt(s). "
+                    "event_id=approval-example-resolved. Flagging for a human.",
                 )
             ]
             assert h.sink.update_endpoints == [endpoint]
@@ -1389,7 +1564,7 @@ def test_claim_timeout_without_quota_retries_then_escalates(make_harness) -> Non
             claim_timeout_seconds=0.02,
         ) as h:
             h.fake_k8s.bind_ready = False
-            ev = _qevent("go")
+            ev = _qevent("go", event_id="evt-claim-timeout")
 
             await h.kernel.process_event(ev)
 
@@ -1399,7 +1574,8 @@ def test_claim_timeout_without_quota_retries_then_escalates(make_harness) -> Non
                 (
                     "C1",
                     "p-1",
-                    "The run failed (runner-error) after 3 attempt(s). Flagging for a human.",
+                    "The run failed (runner-error) after 3 attempt(s). "
+                    "event_id=evt-claim-timeout. Flagging for a human.",
                 )
             ]
             assert "sandbox capacity" not in h.sink.updates[0][2].lower()

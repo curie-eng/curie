@@ -1152,8 +1152,8 @@ def test_auth_fast_fail_survives_a_wedged_interrupt(caplog) -> None:
 
 def test_transient_model_error_is_not_fast_failed() -> None:
     # A transient AssistantMessage.error (e.g. a hard rate-limit) is NOT a
-    # credential rejection: it must flow through translation unchanged and reach
-    # the model's own terminal result, so genuine retry/backoff is preserved.
+    # credential rejection: it must not credential-reject; must reach DONE.
+    # The SDK token is constrained to unclassified rather than passed through.
     script = [
         AssistantMessage(content=[], model="m", error="rate_limit"),
         ResultMessage(
@@ -1166,7 +1166,8 @@ def test_transient_model_error_is_not_fast_failed() -> None:
 
     classifications = [getattr(e, "classification", None) for e in events]
     assert "model-credential-rejected" not in classifications
-    assert "rate_limit" in classifications  # translated, non-terminal
+    assert "unclassified" in classifications
+    assert "rate_limit" not in classifications
     assert events[-1].status == SessionStatus.DONE  # reached the model's result
     assert fake.interrupts == 0  # not aborted
 

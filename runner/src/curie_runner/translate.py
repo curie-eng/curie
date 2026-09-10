@@ -51,6 +51,30 @@ from .side_effects import SideEffectClassifier
 # is set to clear a realistic snapshot and refuse a blob.
 RESULT_MAX_BYTES = 64_000
 
+# Platform ErrorEvent.classification vocabulary. Allowlist-constrain only: do
+# not synonym-map SDK ``rate_limit`` onto platform ``rate-limit``, which would
+# make a currently non-retryable token retryable.
+PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
+    "rate-limit",
+    "runner-error",
+    "runner-timeout",
+    "workspace-error",
+    "budget-exceeded",
+    "server-error",
+    "ledger-error",
+    "model-credential-rejected",
+    "approval-not-acted",
+    "false-completion",
+    "publication-unrecorded",
+})
+UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
+
+
+def map_error_classification(raw: str | None) -> str:
+    if raw is not None and raw in PLATFORM_ERROR_CLASSIFICATIONS:
+        return raw
+    return UNCLASSIFIED_ERROR_CLASSIFICATION
+
 
 @dataclass
 class TurnState:
@@ -176,8 +200,9 @@ def _translate_assistant(
 
     error = getattr(message, "error", None)
     if error:
-        state.error_classification = error
-        events.append(ErrorEvent(message=f"model error: {error}", classification=error))
+        mapped = map_error_classification(error)
+        state.error_classification = mapped
+        events.append(ErrorEvent(message=f"model error: {error}", classification=mapped))
 
     for block in message.content:
         if isinstance(block, TextBlock):
@@ -340,8 +365,13 @@ def _translate_result(
         text = message.result or "run failed"
         events: list[OutboundEvent] = []
         if state.error_classification is None:
+            raw = subtype or "server-error"
+            mapped = map_error_classification(raw)
             events.append(
-                ErrorEvent(message=text, classification=subtype or "server-error")
+                ErrorEvent(
+                    message=text if mapped == raw else f"{text}: {raw}",
+                    classification=mapped,
+                )
             )
         events.append(Final(text=text, status=SessionStatus.CLASSIFIED_FAILURE))
         return events
