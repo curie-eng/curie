@@ -1907,6 +1907,14 @@ jobs:
       # neither reads nor disturbs the release installed above.
       - name: Mail-adapter external-collector egress enforces (not just rendered)
         run: bash scripts/check-mail-adapter-otel-egress.sh charts/curie
+      # Runner BYO egress (#2369). Render assertions prove the CIDRs land in
+      # NetworkPolicy YAML; this proves a runner-labelled pod can actually
+      # reach each declared peer (rustfs, sts, otel, api) and that an
+      # undeclared control is blocked. Same non-vacuity gate as the mail
+      # adapter check: a non-enforcing CNI FAILS, it does not skip. Own
+      # namespace, so it neither reads nor disturbs the release above.
+      - name: Runner BYO egress enforces (not just rendered)
+        run: bash scripts/check-runner-byo-egress.sh charts/curie
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       - name: Dump cluster diagnostics on failure

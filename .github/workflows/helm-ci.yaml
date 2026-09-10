@@ -300,6 +300,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/security-probe-byo-postgres-assertions.sh
 
+      # Prove Claim 1d lists BYO runner peers in BYO_RUNNER_TARGETS when the
+      # corresponding -endpoint / object-store policy would render, skips when
+      # empty, and still curls Claim 1 BLOCKED (#2369). Live reachability is
+      # scripts/check-runner-byo-egress.sh, not this render pin.
+      - name: helm render assertions (BYO runner-egress security probe)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/security-probe-byo-runner-egress-assertions.sh
+
       # Keep the chart ClickHouse default and Langfuse pin as one supported
       # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
       # the default must stay on 25.12 and AVX-required (#2210).

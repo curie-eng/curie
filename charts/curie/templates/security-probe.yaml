@@ -7,7 +7,9 @@ defaults as a `helm test`. Five claims:
   1. default-deny egress + metadata endpoint blocked, WITH a before/after control
      that proves the CNI actually enforces (not a silent false-pass). Claim 1c
      additionally proves the vendored controller is not shadow-managing its own
-     permissive NetworkPolicy alongside Rail 1's (issue #765).
+     permissive NetworkPolicy alongside Rail 1's (issue #765). Claim 1d
+     additionally proves declared BYO runner peers are reachable and an
+     undeclared control stays BLOCKED (issue #2369).
   2. cross-agent secret isolation via per-agent RBAC scoping.
   3. runner containers are non-root with a read-only rootfs.
   4. gVisor RuntimeClass enforced (reported testable / not-testable honestly;
@@ -174,6 +176,7 @@ spec:
      endpoint, and helm test would fail a correct BYO/RDS install. */}}
 {{- $dt := list -}}
 {{- $pgByo := "" -}}
+{{- $byoRunner := list -}}
 {{- if and (not .Values.postgres.deploy) .Values.postgres.host -}}
 {{- $pgByo = printf "%s:%v" .Values.postgres.host .Values.postgres.port -}}
 {{- end -}}
@@ -182,6 +185,50 @@ spec:
 {{- if .Values.rustfs.deploy }}{{- $dt = append $dt (printf "%s:%v" (include "curie.rustfs.host" .) .Values.rustfs.port) -}}{{- end }}
 {{- if .Values.clickhouse.deploy }}{{- $dt = append $dt (printf "%s:8123" (include "curie.clickhouse.host" .)) -}}{{- end }}
 {{- if .Values.valkey.deploy }}{{- $dt = append $dt (printf "%s:6379" (include "curie.valkey.host" .)) -}}{{- end }}
+{{- end -}}
+{{- if and .Values.agentSandbox.deploy .Values.security.networkPolicy.enabled -}}
+{{- $apiExternal := include "curie.runner.apiIsExternal" . | trim -}}
+{{- $otlpExternal := include "curie.runner.otlpIsExternal" . | trim -}}
+{{- $otlpEndpoint := include "curie.runner.effectiveOtlpEndpoint" . | trim -}}
+{{- if and (or .Values.agentSandbox.runner.bundleFetch.enabled .Values.agentSandbox.runner.workspace.enabled) (not .Values.rustfs.deploy) .Values.rustfs.egress -}}
+{{- $rustfsHost := include "curie.rustfs.host" . | trim -}}
+{{- if and $rustfsHost (not (contains ":" $rustfsHost)) (not (contains "[" $rustfsHost)) -}}
+{{- $byoRunner = append $byoRunner (printf "rustfs=%s:%v" $rustfsHost .Values.rustfs.port) -}}
+{{- end -}}
+{{- if and (not (include "curie.rustfs.staticCredentials" .)) .Values.rustfs.stsEgress -}}
+{{- $sts0 := index .Values.rustfs.stsEgress 0 -}}
+{{- $stsCidr := trim (printf "%v" ($sts0.cidr | default "")) -}}
+{{/* Only a /32 or /128 is a host. A /24 network address has no STS listener,
+     and the chart has no STS hostname field, so skip rather than probe .0. */}}
+{{- if or (hasSuffix "/32" $stsCidr) (hasSuffix "/128" $stsCidr) -}}
+{{- $stsIp := regexReplaceAll "/[0-9]+$" $stsCidr "" -}}
+{{- $stsPort := "" -}}
+{{- if $sts0.ports -}}
+{{- $stsPortItem := index $sts0.ports 0 -}}
+{{- $stsPort = printf "%v" ($stsPortItem.port | default "") -}}
+{{- end -}}
+{{- if and $stsIp $stsPort (not (contains ":" $stsIp)) -}}
+{{- $byoRunner = append $byoRunner (printf "sts=%s:%s" $stsIp $stsPort) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.otelCollector.egress (or (and (not .Values.otelCollector.deploy) $otlpEndpoint) $otlpExternal) -}}
+{{- $otelUrl := $otlpEndpoint -}}
+{{- $otelHost := include "curie.endpoint.host" $otelUrl | trim -}}
+{{- $otelPort := include "curie.endpoint.dialPort" $otelUrl | trim -}}
+{{- if and $otelHost $otelPort (not (contains "[" $otelHost)) (not (contains ":" $otelHost)) -}}
+{{- $byoRunner = append $byoRunner (printf "otel=%s:%s" $otelHost $otelPort) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.api.egress (or (and (not .Values.api.deploy) (include "curie.runner.apiOverrideSet" .)) $apiExternal) -}}
+{{- $apiUrl := include "curie.runner.effectiveApiUrl" . | trim -}}
+{{- $apiHost := include "curie.endpoint.host" $apiUrl | trim -}}
+{{- $apiPort := include "curie.endpoint.dialPort" $apiUrl | trim -}}
+{{- if and $apiHost $apiPort (not (contains "[" $apiHost)) (not (contains ":" $apiHost)) -}}
+{{- $byoRunner = append $byoRunner (printf "api=%s:%s" $apiHost $apiPort) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 apiVersion: batch/v1
 kind: Job
@@ -253,6 +300,11 @@ spec:
             # it (no in-cluster deny/allow pair exists for an external store).
             - name: POSTGRES_BYO_TARGET
               value: {{ $pgByo | quote }}
+            # Claim 1d (#2369): space-separated name=host:port for BYO runner
+            # peers whose -endpoint / object-store policy would render. Empty
+            # on the in-chart path (SKIP). IPv4 / hostname tokens only.
+            - name: BYO_RUNNER_TARGETS
+              value: {{ join " " $byoRunner | quote }}
             - name: DT_ALLOWED_POD
               value: {{ include "curie.fullname" . }}-dt-probe-allowed
             - name: DT_DENIED_POD
@@ -409,6 +461,41 @@ spec:
                   fail=1
                 else
                   echo "RESULT: PASS - no controller-managed NetworkPolicy '${SANDBOX_NP_NAME}' exists; Rail 1 is the only policy selecting these pods."
+                fi
+              fi
+
+              echo ""
+              echo "== Claim 1d: BYO runner declared peers reachable; undeclared control blocked (#2369) =="
+              if [ -z "$BYO_RUNNER_TARGETS" ]; then
+                echo "SKIP: no BYO runner peers declared (BYO_RUNNER_TARGETS empty); in-chart selectors still govern."
+              else
+                kubectl run "$EGRESS_POD" -n "$NS" --image="$NETSHOOT" --restart=Never \
+                  --labels="$PROBE_LABELS" \
+                  --command -- sleep 3600 >/dev/null
+                kubectl wait --for=condition=Ready "pod/$EGRESS_POD" -n "$NS" --timeout=120s >/dev/null
+                byo_fail=0
+                for spec in $BYO_RUNNER_TARGETS; do
+                  name=${spec%%=*}
+                  hp=${spec#*=}
+                  host=${hp%:*}
+                  port=${hp##*:}
+                  rc=$(kubectl exec -n "$NS" "$EGRESS_POD" -- nc -z -w5 "$host" "$port" >/dev/null 2>&1; echo $?)
+                  [ "$rc" = 0 ] && st=reachable || st=blocked
+                  echo "declared ${name} ${host}:${port} -> ${st}"
+                  if [ "$st" != reachable ]; then
+                    echo "RESULT: FAIL - declared ${name} unreachable (DNS/CIDR mismatch or wrong port)"
+                    byo_fail=1; fail=1
+                  fi
+                done
+                after_ext=$(classify "$(probe_rc "https://${BLOCKED}/")")
+                echo "undeclared control ${BLOCKED} -> ${after_ext}"
+                if [ "$after_ext" != blocked ]; then
+                  echo "RESULT: FAIL - undeclared control reachable (non-enforcing CNI)"
+                  byo_fail=1; fail=1
+                fi
+                kubectl delete pod "$EGRESS_POD" -n "$NS" --ignore-not-found >/dev/null
+                if [ "$byo_fail" = 0 ]; then
+                  echo "RESULT: PASS - declared BYO runner peers reachable; undeclared control blocked."
                 fi
               fi
 
