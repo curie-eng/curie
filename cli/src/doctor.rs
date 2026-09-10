@@ -571,7 +571,9 @@ fn resolve_model(f: &Facts) -> Option<InForceModel> {
 /// (#229) and falls through. The read ends in `as_str`, so a non-string at the
 /// path reads as absent -- safe here because the key is a string in the chart
 /// and in every `--set` form, and deliberately not widened (#1358 item 4).
-fn runner_model_from_values(values: &serde_json::Value) -> Option<(String, ReleaseModelKey)> {
+pub(crate) fn runner_model_from_values(
+    values: &serde_json::Value,
+) -> Option<(String, ReleaseModelKey)> {
     fn at(values: &serde_json::Value, path: &[&str]) -> Option<String> {
         let mut node = values;
         for key in path {
@@ -604,7 +606,7 @@ fn runner_model_from_values(values: &serde_json::Value) -> Option<(String, Relea
 /// spelled out there: a value that reaches Helm as a string still takes the
 /// template branch, and disagreeing with Helm is how doctor names a model the
 /// pod does not boot.
-fn release_fake_model(values: &serde_json::Value) -> bool {
+pub(crate) fn release_fake_model(values: &serde_json::Value) -> bool {
     let fake = values
         .get("agentSandbox")
         .and_then(|a| a.get("runner"))
