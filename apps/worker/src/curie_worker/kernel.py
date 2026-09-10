@@ -83,6 +83,7 @@ from .approvals import (
     PublicationCreateRequest,
     PublicationCreator,
 )
+from .attachments import AttachmentCoordinator
 from .behaviorpacks import (
     BehaviorPacks,
     NavPack,
@@ -828,6 +829,7 @@ class Kernel:
         config: WorkerConfig,
         binding: BindingResolver | None = None,
         workspace: WorkspaceClaimCoordinator | None = None,
+        attachments: AttachmentCoordinator | None = None,
         killswitch: KillSwitch | None = None,
         approvals: ApprovalCreator | None = None,
         publication_creator: PublicationCreator | None = None,
@@ -860,6 +862,14 @@ class Kernel:
         # fails loudly if this lane was not wired instead of booting an empty
         # directory and giving the appearance of success.
         self._workspace = workspace
+        # The inbound-attachment lane (#2567), optional on exactly the same
+        # terms as the workspace lane above: a deployment that has not wired it
+        # runs every turn unchanged rather than discovering a missing attribute.
+        # Wired, it resolves a turn's attachment refs into parked objects plus a
+        # short-lived one-object capability BEFORE the sandbox is claimed --
+        # the claim env is how that capability is delivered -- and its sibling
+        # retention ledger is swept from the same reap tick as the workspace's.
+        self._attachments = attachments
         self._killswitch = killswitch
         # The approval-record backend (#244). When absent (unwired tests, a
         # deployment without the API), an awaiting-approval run degrades to an
@@ -1726,6 +1736,28 @@ class Kernel:
                             self._workspace.finish_expired_reap,
                             candidate,
                         )
+        if self._attachments is not None:
+            # The SIBLING sweep, in this same tick and behind this same
+            # per-thread fence rather than arriving with a scheduler of its own.
+            # The lanes stay separate because the ledgers are: the workspace one
+            # is thread-ownership on the route lease, this one is "may a retry
+            # still fetch these bytes" on the retention window.
+            for parked_thread in await asyncio.to_thread(self._attachments.enumerate_expired):
+                async with self._lock.hold(self._config.lock_key(parked_thread)) as lease:
+                    parked = await asyncio.to_thread(
+                        self._attachments.begin_expired_reap,
+                        parked_thread,
+                    )
+                    if parked is not None:
+                        # Same reason as above: the object deletes can outlive
+                        # the original lease, so the final ledger delete is
+                        # fenced with a still-current token and guarded a second
+                        # time by the exact-record comparison inside `finish`.
+                        await lease.ensure_owned()
+                        await asyncio.to_thread(
+                            self._attachments.finish_expired_reap,
+                            parked,
+                        )
         return reaped
 
     async def _preflight_reclaimed_delivery(
@@ -2464,6 +2496,15 @@ class Kernel:
 
         event = self._to_event(qevent)
 
+        # Inbound attachments are resolved BEFORE the claim and merged into the
+        # boot env, because the claim env is how the minted capability is
+        # delivered: resolving after the claim would boot the sandbox and then
+        # have nowhere to put it. Deliberately outside the per-thread route lock
+        # -- these are channel downloads, and holding the lock across them would
+        # lengthen the critical section by the size of the upload.
+        if self._attachments is not None:
+            boot_env = await self._resolve_attachments(qevent, boot_env, agent_id)
+
         # Critical section: decide steer-vs-new-turn and, if new, open the turn so
         # it is active before we release the Valkey lock (rule 1: no two live
         # turns per thread across workers). Then release the order lock so the
@@ -2695,6 +2736,33 @@ class Kernel:
             # an unexpected failure after start_turn but before _consume enters
             # its response context.
             turn.close()
+
+    async def _resolve_attachments(
+        self,
+        qevent: QueuedTurn,
+        boot_env: dict[str, str] | None,
+        agent_id: uuid.UUID | None,
+    ) -> dict[str, str]:
+        """Merge this turn's resolved attachment capability into the claim env.
+
+        A turn carrying no attachments -- the overwhelming majority -- does not
+        consult the lane at all: no channel round trip, no object, and no key on
+        the claim. Not even an empty-valued one, which an init container would
+        read as "there is work here".
+        """
+
+        lane = self._attachments
+        assert lane is not None  # guarded by the caller
+        claim_env: dict[str, str] = {}
+        if qevent.attachments:
+            prepared = await asyncio.to_thread(
+                lane.resolve,
+                thread_key=_thread_key_for(qevent),
+                agent_id=str(agent_id) if agent_id is not None else None,
+                attachments=list(qevent.attachments),
+            )
+            claim_env = prepared.claim_env()
+        return {**(boot_env or {}), **claim_env}
 
     async def _route_and_start(
         self,

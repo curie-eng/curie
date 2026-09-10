@@ -146,6 +146,15 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # to consume. They are substrate-local delivery inputs, not fields read
         # by the sandbox runner and therefore not part of frozen BootEnv.
         "CURIE_WORKSPACE_REF",
+        # AttachmentCoordinator injects this exact-object handoff value into a
+        # claim for the attachments-init container to consume (#2567), on the
+        # same footing as CURIE_WORKSPACE_REF directly above: a substrate-local
+        # delivery input, not a field read by the sandbox runner, and therefore
+        # not part of frozen BootEnv. `test_k8s_attachment_claim` pins the other
+        # half of that claim -- the key is STRIPPED from the runner container --
+        # so declaring it on BootEnv would assert the opposite of what the
+        # substrate does.
+        "CURIE_ATTACHMENTS_REF",
         "CURIE_WORKSPACE_SHA256",
         # Publication-Job operator settings, read from the WORKER's env by
         # WorkerConfig and consumed by PublicationReconcileLoop and its
