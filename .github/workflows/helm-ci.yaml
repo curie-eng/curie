@@ -26,6 +26,13 @@ on:
       - "apps/api/src/curie_api/storage.py"
       - "apps/worker/src/curie_worker/config.py"
       - "apps/worker/src/curie_worker/bundle_store.py"
+      # Same obligation, second gate: the threaded bot allowlist gate (#2437)
+      # executes this file to prove the rendered value survives the REAL
+      # ThreadedBotAdmission parser. Without it here, a PR that reverts or
+      # loosens that model matches nothing in this filter, the helm job is
+      # skipped, and the gate that exists to catch exactly that revert
+      # never runs.
+      - "apps/dispatcher/src/curie_dispatcher/config.py"
       - "uv.lock"
       - "pyproject.toml"
       # The unpinned-image gate (#2319) and the Langfuse image-pin gate
@@ -584,6 +591,17 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/object-store-web-identity-assertions.sh
+
+      # Prove the first-class bot-thread allowlist (#2437) renders a value the
+      # REAL dispatcher parser accepts, not a hand-copied regex: the rendered
+      # env string is fed through curie_dispatcher.config.DispatcherConfig, so a
+      # future drift in ThreadedBotAdmission breaks this chart gate. Needs the
+      # uv workspace above, which is why it sits here rather than beside the
+      # other reserved-env assertions earlier in this job.
+      - name: helm render assertions (threaded bot allowlist)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/threaded-bot-allowlist-assertions.sh
 
       # Prove a BYO object store gets a runner egress allow for S3 (and STS on
       # the key-free path). Rail 1 is fail-closed and the in-chart rustfs pod

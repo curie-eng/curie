@@ -1184,6 +1184,11 @@ class TestHelmCiWorkflowTriggers:
         # compose.dev.yaml is here for the same reason: two chart gates (the
         # unpinned-image gate, #2319, and the Langfuse image-pin gate, #2190)
         # read it, so a compose-only unpin must still trigger this workflow.
+        # apps/dispatcher/src/curie_dispatcher/config.py is here for the same
+        # reason again: the threaded-bot-allowlist chart gate (#2437) feeds
+        # the rendered env value through the real ThreadedBotAdmission
+        # parser, so a PR that only relaxes that parser must still run this
+        # workflow.
         assert triggers["pull_request"]["paths"] == [
             "charts/curie/**",
             "examples/sre-bot/observability/**",
@@ -1193,6 +1198,7 @@ class TestHelmCiWorkflowTriggers:
             "apps/api/src/curie_api/storage.py",
             "apps/worker/src/curie_worker/config.py",
             "apps/worker/src/curie_worker/bundle_store.py",
+            "apps/dispatcher/src/curie_dispatcher/config.py",
             "uv.lock",
             "pyproject.toml",
             "compose.dev.yaml",

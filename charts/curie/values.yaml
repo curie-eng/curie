@@ -1304,9 +1304,48 @@ dispatcher:
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 256Mi }
+  # Bots allowed to mention the agent from inside a channel THREAD, as exact
+  # {channel_id, bot_id} pairs -- the same wire contract
+  # CURIE_SLACK_THREADED_BOT_ALLOWLIST has always carried, now typed and
+  # validated by the chart instead of hand-encoded JSON. Example:
+  #   threadedBotAllowlist:
+  #     - channel_id: C0EXAMPLE1
+  #       bot_id: B0EXAMPLE1
+  # There is no wildcard and no cross product: one pair admits one bot in one
+  # channel.
+  #
+  # EMPTY (the default) renders NO env at all, which is byte-identical to the
+  # behavior before this key existed and is the fail-closed production posture:
+  # every bot-authored thread mention is refused as BOT_AUTHORED_THREAD_REPLY.
+  #
+  # Entries are validated AT RENDER, not at pod start, so a typo fails
+  # `helm upgrade` rather than crash-looping the dispatcher: channel_id must
+  # match ^[CG][A-Z0-9]+$, bot_id must match ^B[A-Z0-9]+$, both must be strings,
+  # and exactly those two keys are accepted -- no more and no fewer -- because
+  # the dispatcher's ThreadedBotAdmission model is extra="forbid" and would
+  # reject anything else at boot.
+  #
+  # PRECEDENCE, in both directions. While this list is NON-EMPTY the chart owns
+  # the variable, and a dispatcher.extraEnv entry that also names
+  # CURIE_SLACK_THREADED_BOT_ALLOWLIST FAILS the render with a pointer back
+  # here; the refusal is deliberate, because silently dropping one of two
+  # authorization lists would leave the admitted set different from the one the
+  # operator wrote down. While it is EMPTY the chart owns nothing and reserves
+  # nothing, so an existing extraEnv entry keeps passing through verbatim
+  # exactly as before, across an upgrade included.
+  #
+  # Only ever allowlist a dedicated sender that does not itself respond to
+  # Curie: an allowlisted second Curie installation can loop
+  # (docs/interfaces/channel-ingress/INTERFACE.md).
+  #
+  # Declare this value in curie.yaml so a plain `curie cluster up` keeps it.
+  threadedBotAllowlist: []
   # Extra env for the dispatcher container. Full Kubernetes EnvVar entries are
-  # accepted, including valueFrom. Per-workload OTEL_EXPORTER_OTLP_* overrides
-  # still win over the chart-owned collector endpoint.
+  # accepted, including valueFrom. For CURIE_SLACK_THREADED_BOT_ALLOWLIST prefer
+  # the first-class threadedBotAllowlist above; use extraEnv for any other
+  # dispatcher override the fixed env block does not cover. Per-workload
+  # OTEL_EXPORTER_OTLP_* overrides still win over the chart-owned collector
+  # endpoint.
   extraEnv: []
   # Container securityContext (issue #67). Image runs as non-root uid 1000 (see
   # apps/dispatcher/Dockerfile). readOnlyRootFilesystem stays false -- the

@@ -87,10 +87,10 @@ for that pair. All unlisted bot/channel pairs retain the default refusal.
 Remove the pair and restart the dispatcher to revoke threaded admission.
 
 Compose forwards this variable in both dev and generated release stacks. Helm
-operators can set the same variable with `dispatcher.extraEnv`; no new chart
-value is required. Runtime Slack proof requires an installed sender app and
-live delivery; the Bolt/Valkey tests alone do not establish that Slack delivered
-or that the worker answered.
+operators should prefer the first-class `dispatcher.threadedBotAllowlist` chart
+value; `dispatcher.extraEnv` still works as well. Runtime Slack proof requires
+an installed sender app and live delivery; the Bolt/Valkey tests alone do not
+establish that Slack delivered or that the worker answered.
 
 ## The queue seam (what the worker consumes)
 
