@@ -231,6 +231,7 @@ def build_runner(
             policy_routes=resolution.route_by_tool,
             grant_tool=config.approval_grant_tool,
             grantable_by_route=resolution.grantable_by_route,
+            summary_by_tool=resolution.summary_by_tool,
             # Bundle identity so an operator mcp__<server>__<tool> shorthand
             # normalizes to its effective plugin-prefixed runtime name (#703),
             # and the connectors.yaml servers so a gate on a connector tool --

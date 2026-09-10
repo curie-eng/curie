@@ -75,6 +75,9 @@ class TurnState:
     # policy gate never carries one (Decision A), so it stays None here.
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    # Bundle-authored human sentence (#2565). None means the card uses
+    # approval_summary. Never grant provenance.
+    approval_display: str | None = None
     # Assistant text streamed during the turn, accumulated so a DONE result with
     # an empty ``result`` can still deliver the model's answer. Reasoning models
     # routed through OpenRouter (e.g. z-ai/glm-5.2) emit the answer as a TextBlock

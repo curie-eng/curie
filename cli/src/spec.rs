@@ -41,6 +41,9 @@ pub struct ApprovalGateSpec {
     /// load-bearing, a bool with a safe default may collapse absent and false.
     #[serde(default, rename = "grantableViaPolicy")]
     pub grantable_via_policy: bool,
+    /// Bundle-authored human sentence for the approval card (#2565).
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// The `approvalPolicy` a spec declares. Mirrors `plugin_format.models.ApprovalPolicy`.

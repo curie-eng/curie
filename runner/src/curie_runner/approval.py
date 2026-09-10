@@ -65,6 +65,7 @@ from plugin_format import (
     grantable_routes,
     load_tool_policy,
     parse_allowed_tools,
+    render_gate_summary,
     resolve_manifest,
 )
 
@@ -524,8 +525,9 @@ def summarize_tool_call(tool_name: str, tool_input: dict[str, Any]) -> str:
     """A one-line, human-readable statement of the blocked call.
 
     This becomes the ``approval_summary`` on the awaiting-approval final and
-    therefore the durable record's summary a human resolves against, so it
-    names the tool and a compact rendering of its input.
+    therefore the durable record's summary an auditor reads. A bundle-authored
+    ``summary`` template (#2565) may replace what a person sees on the card;
+    this machine string stays on the record either way.
     """
 
     try:
@@ -580,7 +582,9 @@ class ApprovalGate:
     required: frozenset[str] = field(default_factory=frozenset)
     route_by_tool: dict[str, str] = field(default_factory=dict)
     pending_summary: str | None = None
+    pending_display: str | None = None
     pending_route: str | None = None
+    summary_by_tool: dict[str, str] = field(default_factory=dict)
     # Durable provenance (#544, Decision C), set by ``block()`` on a permission
     # gate: ``pending_gate_kind='permission'`` and ``pending_granted_tool`` is
     # the exact tool ``can_use_tool`` denied -- the trusted, runner-held value
@@ -630,6 +634,7 @@ class ApprovalGate:
 
     def reset(self) -> None:
         self.pending_summary = None
+        self.pending_display = None
         self.pending_route = None
         self.pending_gate_kind = None
         self.pending_granted_tool = None
@@ -693,6 +698,10 @@ class ApprovalGate:
             self.publication_title = title.strip()
             self.publication_body = body
         self.pending_summary = summarize_tool_call(tool_name, tool_input)
+        template = self.summary_by_tool.get(tool_name)
+        self.pending_display = (
+            render_gate_summary(template, tool_input) if template else None
+        )
         self.pending_route = self.route_by_tool.get(tool_name)
         # Provenance for the permission gate (#544, Decision C): the tool
         # name here is the value ``can_use_tool`` itself denied -- the
@@ -1150,6 +1159,7 @@ class ApprovalPolicyResolution:
     mcp_servers: set[str] | None = None
     connector_servers: set[str] | None = None
     tool_policy: ToolPolicy | None = None
+    summary_by_tool: dict[str, str] = field(default_factory=dict)
 
 
 def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
@@ -1245,6 +1255,18 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
         for gate in policy.gates
         if gate.gate and gate.gate.strip() and gate.route and gate.route.strip()
     }
+    # Last complete declaration wins, including a later gate that OMITS
+    # summary: an earlier template must not leak onto a no-template winner
+    # (the same last-wins rule ``routes`` uses).
+    summaries: dict[str, str] = {}
+    for gate in policy.gates:
+        if not (gate.gate and gate.gate.strip() and gate.route and gate.route.strip()):
+            continue
+        tool = gate.gate.strip()
+        if gate.summary and gate.summary.strip():
+            summaries[tool] = gate.summary.strip()
+        else:
+            summaries.pop(tool, None)
     # Compare DISTINCT declared names against armed names, not counts: two
     # entries for one tool are a last-wins duplicate that validate_bundle
     # accepts, and rejecting them here would crash-loop a deploy-valid bundle.
@@ -1267,6 +1289,7 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
         mcp_servers=mcp_servers,
         connector_servers=connectors,
         tool_policy=tool_policy,
+        summary_by_tool=summaries,
     )
 
 
@@ -1288,6 +1311,7 @@ def build_approval_gate(
     policy_routes: dict[str, str],
     grant_tool: str | None = None,
     grantable_by_route: dict[str, str] | None = None,
+    summary_by_tool: dict[str, str] | None = None,
     bundle_name: str | None = None,
     mcp_servers: set[str] | None = None,
     connector_servers: set[str] | None = None,
@@ -1420,6 +1444,7 @@ def build_approval_gate(
         route_by_tool=policy_routes,
         grant_tool=safe_grant_tool,
         grantable_by_route=grantable_by_route or {},
+        summary_by_tool=summary_by_tool or {},
         tool_policy=tool_policy,
         bundle_name=bundle_name,
         mcp_servers=mcp_servers,

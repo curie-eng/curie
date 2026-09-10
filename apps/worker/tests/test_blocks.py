@@ -568,6 +568,66 @@ def test_a_settled_card_without_a_remembered_requester_omits_the_line() -> None:
     assert any("Rejected by <@U_MANAGER>" in str(b) for b in blocks)
 
 
+def test_approval_card_keeps_interpolated_markdown_literal() -> None:
+    """Consumer-path pin for #2565: to_mrkdwn must not revive a model-supplied link.
+
+    ``render_gate_summary`` strips ``[]`` so ``[Review](url)`` cannot become
+    ``<url|Review>`` when the Slack card runs ``to_mrkdwn``.
+    """
+
+    from curie_worker.blocks import approval_card
+    from plugin_format.gate_summary import render_gate_summary
+
+    rendered = render_gate_summary(
+        "Approve {title}?",
+        {"title": "[Review](https://evil.example.com)"},
+    )
+    assert rendered is not None
+    _fallback, live = approval_card(
+        approval_id="appr-1", summary=rendered, requested_by="U_AE"
+    )
+    section = live[1]["text"]["text"]
+    assert "<https://evil.example.com|" not in section
+    assert "evil.example.com|Review" not in section
+
+
+def test_resolved_card_with_a_human_sentence_puts_the_verdict_first() -> None:
+    """#2565: once the section is a sentence, fallback starts with the verdict.
+
+    The Block Kit structure is unchanged (#1084); the first line of the
+    fallback text is ``Approved by <@user>`` and the section is the sentence,
+    never the machine JSON.
+    """
+
+    from curie_worker.blocks import approval_card, resolved_approval_card
+
+    sentence = "File FY26Q1: 11 workbooks into Approved, 25 cells going out blank. Approve?"
+    machine = (
+        "Tool call awaiting approval: mcp__plugin_demo_files__approve_batch "
+        '{"expected": {"a.xlsx": "aaa"}}... (truncated)'
+    )
+    _fallback, live = approval_card(
+        approval_id="appr-1",
+        summary=sentence,
+        requested_by="U_AE",
+    )
+    assert sentence in live[1]["text"]["text"]
+    assert machine not in live[1]["text"]["text"]
+
+    text, blocks = resolved_approval_card(
+        summary=sentence,
+        requested_by="U_AE",
+        decision="approved",
+        resolver="U_MANAGER",
+        note=None,
+    )
+    assert text.splitlines()[0] == "Approved by <@U_MANAGER>"
+    assert sentence in text
+    assert machine not in text
+    assert any(sentence in str(b) for b in blocks)
+    assert not any("truncated" in str(b) for b in blocks)
+
+
 def test_approval_card_clamps_oversized_summary() -> None:
     from curie_worker.blocks import approval_card
 

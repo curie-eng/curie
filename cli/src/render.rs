@@ -156,6 +156,7 @@ mod tests {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_display: None,
             input_tokens: None,
             output_tokens: None,
         };
@@ -178,6 +179,7 @@ mod tests {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_display: None,
             input_tokens: None,
             output_tokens: None,
         };
@@ -198,6 +200,7 @@ mod tests {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_display: None,
             input_tokens: None,
             output_tokens: None,
         };

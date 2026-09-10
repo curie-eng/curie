@@ -7071,6 +7071,10 @@ struct ApprovalGateDecl {
     #[allow(dead_code)]
     #[serde(default, rename = "grantableViaPolicy")]
     grantable_via_policy: bool,
+    /// Bundle-authored human sentence for the approval card (#2565).
+    #[allow(dead_code)]
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 /// The manifest `approvalPolicy` object; mirrors `plugin_format.models.ApprovalPolicy`.
@@ -9193,6 +9197,15 @@ mod tests {
         )
         .expect("a gate with grantableViaPolicy:true parses");
         assert!(with.grantable_via_policy);
+
+        let templated: ApprovalGateDecl = serde_json::from_str(
+            r#"{"gate":"Bash","route":"managers","summary":"Run {command}. Approve?"}"#,
+        )
+        .expect("a gate with a summary template parses");
+        assert_eq!(
+            templated.summary.as_deref(),
+            Some("Run {command}. Approve?")
+        );
     }
 
     #[tokio::test]

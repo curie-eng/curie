@@ -570,6 +570,7 @@ class TurnOutcome:
     # Threaded onto the durable record. None from an older runner.
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    approval_display: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
 
@@ -637,6 +638,7 @@ class _StreamAccumulator:
     approval_route: str | None = None
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    approval_display: str | None = None
     # Call id -> the ledger record it opened. One CALL produces two ACI frames
     # (ADR-0117): the first opens a record, the second closes THAT record rather
     # than minting a second. A turn that calls the same tool twice is only
@@ -3385,6 +3387,7 @@ class Kernel:
         thread = qevent.conversation_id
         thread_key = _thread_key_for(qevent)
         summary = outcome.approval_summary or outcome.text or "Approval requested"
+        display_summary = outcome.approval_display or summary
 
         # Resolve the manifest route NAME (#247) to its workspace channel. A named
         # route that resolves to no binding escalates instead of widening (#544).
@@ -3474,6 +3477,7 @@ class Kernel:
                         "publication requires a deployment-managed repository workspace"
                     )
                 summary = _publication_approval_summary(snapshot)
+                display_summary = summary
                 published = await publication_creator.create_publication(
                     PublicationCreateRequest(
                         deployment_id=deployment_id,
@@ -3643,7 +3647,7 @@ class Kernel:
         # resumed reply (#817), so collapse the interpolated summary to one
         # logical line -- the notice is always a single clean block. The durable
         # ``Approval`` record and the Block Kit card keep the original summary.
-        notice_summary = " ".join(summary.split())
+        notice_summary = " ".join(display_summary.split())
         if is_publication:
             notice = (
                 f"Awaiting approval ({created.id}): {notice_summary}\n"
@@ -3711,11 +3715,11 @@ class Kernel:
         try:
             card_message = OutboundMessage(
                 version=MESSAGE_VERSION,
-                text=summary,
+                text=display_summary,
                 interaction=ConfirmIntent(
                     kind="confirm",
                     id=created.id,
-                    prompt=summary,
+                    prompt=display_summary,
                     confirm=Action(label="Approve", value=created.id),
                     cancel=Action(label="Reject", value=created.id),
                     # An approval decision may carry a reason (#1053). This says
@@ -3785,7 +3789,7 @@ class Kernel:
                         str(created.id),
                         channel=card_channel,
                         ts=card_ts,
-                        summary=summary,
+                        summary=display_summary,
                         endpoint=card_endpoint,
                         # The whole destination, not just the endpoint: the
                         # settle path posts to THIS card, so it must re-use the
@@ -3966,6 +3970,7 @@ class Kernel:
             acc.approval_route = frame.approval_route
             acc.approval_gate_kind = frame.approval_gate_kind
             acc.approval_granted_tool = frame.approval_granted_tool
+            acc.approval_display = frame.approval_display
 
     async def _record_action(
         self,
@@ -4032,6 +4037,7 @@ class Kernel:
                 approval_route=acc.approval_route,
                 approval_gate_kind=acc.approval_gate_kind,
                 approval_granted_tool=acc.approval_granted_tool,
+                approval_display=acc.approval_display,
             )
         # classified-failure, or the stream ended with no final at all.
         return TurnOutcome(

@@ -186,6 +186,7 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
             approval_route=state.approval_route,
             approval_gate_kind=state.approval_gate_kind,
             approval_granted_tool=state.approval_granted_tool,
+            approval_display=state.approval_display,
         )
     return final
 
@@ -1374,6 +1375,7 @@ class SessionRunner:
                 # The route could not be resolved: no approval exists, so the
                 # turn must not end awaiting-approval on it.
                 state.approval_summary = None
+                state.approval_display = None
                 state.approval_route = None
                 state.approval_gate_kind = None
             else:
@@ -1386,6 +1388,7 @@ class SessionRunner:
 
         if gate.pending_summary and not state.approval_summary:
             state.approval_summary = gate.pending_summary
+            state.approval_display = gate.pending_display
             state.approval_route = gate.pending_route
             state.approval_gate_kind = gate.pending_gate_kind
             state.approval_granted_tool = gate.pending_granted_tool

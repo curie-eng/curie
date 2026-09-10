@@ -202,6 +202,7 @@ def _gate_for(bundle: Path):
         operator_tools=None,
         policy_routes=resolution.route_by_tool,
         grantable_by_route=resolution.grantable_by_route,
+        summary_by_tool=resolution.summary_by_tool,
         bundle_name=resolution.bundle_name,
         mcp_servers=resolution.mcp_servers,
         connector_servers=resolution.connector_servers,
