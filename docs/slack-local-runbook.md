@@ -51,8 +51,9 @@ subscriptions are correct from the start.
    Token**. This `xoxb-...` value is your `SLACK_BOT_TOKEN`, used by the Web API
    to post replies. If this app was installed before `channels:read` or
    `files:read` was added, reinstall it to the workspace so the existing
-   bot-token grant is refreshed -- a stale grant is what the boot preflight
-   below refuses on.
+   bot-token grant is refreshed. A stale `channels:read` grant is what the boot
+   preflight below refuses on; a stale `files:read` grant costs you attachments
+   and a warning, not the boot.
 4. `SLACK_SIGNING_SECRET` is optional and unused in Socket Mode (kept only for
    Bolt app construction); leave it empty.
 
@@ -169,14 +170,20 @@ A second bounded call, `files.list` with `count=1`, proves `files:read` -- the
 scope the worker needs to fetch the bytes of a file someone uploads to the bot.
 It names no file, so a workspace holding no files still passes; an empty listing
 is a full pass, because the question is whether the token may ask. A
-`missing_scope` on that call is likewise boot-fatal, with its own one-scope
-recovery:
-`Slack channel capability preflight failed: bot token is missing required scope files:read. Add files:read under OAuth & Permissions > Bot Token Scopes, then reinstall the app to the workspace.`
-It refuses at boot rather than letting the worker discover it per upload,
-because the failure downstream is silent: the attachment references still reach
-the worker and the fetch is simply denied. Any other outcome from that call
-(a rate limit, a transport fault, an org-token refusal) is non-terminal and only
-raises the level of the summary line below.
+`missing_scope` on that call is definitive but, unlike `channels:read`, it is
+**not** boot-fatal. It logs its own one-scope recovery at WARNING and the stack
+starts:
+`Slack attachment capability unavailable: bot token is missing scope files:read, so inbound uploads cannot be fetched. Add files:read under OAuth & Permissions > Bot Token Scopes, then reinstall the app to the workspace. Messages are answered normally in the meantime.`
+The asymmetry is deliberate. `channels:read` is what routing itself needs, so a
+stack without it cannot answer anyone and should refuse to start. `files:read`
+only fetches an upload, so refusing to boot for it would stop every message in
+the workspace over a capability nobody had yesterday -- and would take down every
+existing installation on upgrade until an admin reinstalled the app. The bot
+keeps answering and attachments degrade instead, loudly: the summary line below
+names which probe degraded, so this is not the silent per-upload denial the
+probe exists to prevent. Any other outcome from that call (a rate limit, a
+transport fault, an org-token refusal) is likewise non-terminal and only raises
+the level of that summary line.
 The preflight logs only a safe public capability state (`verified` or
 `unverified`) and aggregate checked or unverified destination counts. Other
 capability-call failures, plus private, stale, or transient per-destination

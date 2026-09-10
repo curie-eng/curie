@@ -61,15 +61,20 @@ _MISSING_CHANNELS_READ_MESSAGE = (
     "scope channels:read. Add channels:read under OAuth & Permissions > Bot "
     "Token Scopes, then reinstall the app to the workspace."
 )
-# The same shape as the message above, for the scope that lets the worker fetch
-# an inbound attachment's bytes (#2567). It is a separate constant rather than a
-# parameterized one so each recovery names exactly one scope: an operator who
-# reinstalled for `channels:read` months ago and is now missing `files:read`
-# needs to be told the second name, not a list to guess from.
+# The attachment scope's recovery (#2567). Unlike `channels:read` above this is
+# NOT boot-fatal, and the difference is the point: `channels:read` is what
+# routing itself needs, so a stack without it cannot answer anyone, while
+# `files:read` is needed only to fetch an upload. Refusing to boot for it would
+# stop every message in a workspace over a capability nobody had yesterday --
+# and every existing installation would go down on upgrade until an admin
+# reinstalled the app. So the bot keeps answering and attachments degrade,
+# loudly: this text is logged at WARNING with the one scope to add, and the
+# summary line names the probe so the reason is not buried.
 _MISSING_FILES_READ_MESSAGE = (
-    "Slack channel capability preflight failed: bot token is missing required "
-    "scope files:read. Add files:read under OAuth & Permissions > Bot Token "
-    "Scopes, then reinstall the app to the workspace."
+    "Slack attachment capability unavailable: bot token is missing scope "
+    "files:read, so inbound uploads cannot be fetched. Add files:read under "
+    "OAuth & Permissions > Bot Token Scopes, then reinstall the app to the "
+    "workspace. Messages are answered normally in the meantime."
 )
 _AGENT_DISCOVERY_FAILURE_MESSAGE = (
     "Slack channel capability preflight failed: could not load configured "
@@ -358,10 +363,13 @@ def check_slack_channel_capabilities(
     public-channel-only ``conversations.list`` call proves ``channels:read``
     directly; its documented ``missing_scope`` and ``invalid_types`` errors are
     provider-terminal because the request fixes ``types=public_channel``. A
-    second bounded call, ``files.list`` with ``count=1``, proves ``files:read``
-    the same way; it names no file, so boot never depends on one existing, and
-    its ``missing_scope`` is unambiguous because the request carries no channel
-    and no type filter. Ambiguous capability and destination outcomes are
+    second bounded call, ``files.list`` with ``count=1``, proves ``files:read``;
+    it names no file, so boot never depends on one existing, and its
+    ``missing_scope`` is unambiguous because the request carries no channel and
+    no type filter. That answer is definitive but NOT fatal: `channels:read` is
+    what routing needs, while `files:read` only fetches an upload, so a stack
+    missing it keeps answering and loses attachments rather than refusing to
+    start and losing everything. Ambiguous capability and destination outcomes are
     counted as unverified; a nondefinitive ``files:read`` probe raises the
     summary line's level AND names itself in its text, so an operator chasing a
     dropped attachment finds the attachment probe in the line rather than a
@@ -498,8 +506,14 @@ def check_slack_channel_capabilities(
         # boot failure naming the fix and a workspace that silently drops every
         # upload until someone reads the worker's logs.
         if _slack_error_code(exc) == "missing_scope":
-            raise SlackChannelPreflightError(_MISSING_FILES_READ_MESSAGE) from None
-        files_status = "unverified"
+            # Definitive, and definitively NOT fatal: this request carries no
+            # channel and no type filter, so `files:read` is the only scope it
+            # can be missing. Name it and carry on -- see the constant above for
+            # why this one does not refuse the boot the way `channels:read` does.
+            logger.warning("%s", _MISSING_FILES_READ_MESSAGE)
+            files_status = "missing-scope"
+        else:
+            files_status = "unverified"
     except Exception:
         # Every other outcome stays nondefinitive, exactly as the destination
         # loop's are: a rate limit, a transport fault, an org-token refusal, or
@@ -547,7 +561,7 @@ def check_slack_channel_capabilities(
     # attachments in it (#2567). The counters stay about destinations.
     log = (
         logger.warning
-        if capability_status == "unverified" or files_status == "unverified" or unverified
+        if capability_status == "unverified" or files_status != "verified" or unverified
         else logger.info
     )
     log(

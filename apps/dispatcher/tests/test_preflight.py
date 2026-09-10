@@ -59,9 +59,10 @@ MISSING_SCOPE_MESSAGE = (
     "Token Scopes, then reinstall the app to the workspace."
 )
 MISSING_FILES_READ_MESSAGE = (
-    "Slack channel capability preflight failed: bot token is missing required "
-    "scope files:read. Add files:read under OAuth & Permissions > Bot Token "
-    "Scopes, then reinstall the app to the workspace."
+    "Slack attachment capability unavailable: bot token is missing scope "
+    "files:read, so inbound uploads cannot be fetched. Add files:read under "
+    "OAuth & Permissions > Bot Token Scopes, then reinstall the app to the "
+    "workspace. Messages are answered normally in the meantime."
 )
 SLACK_TIMEOUT_MESSAGE = (
     "Slack channel capability preflight failed: could not attempt every "
@@ -1534,7 +1535,7 @@ def test_slack_preflight_with_files_read_passes_and_logs_a_clean_summary(
 def test_slack_preflight_missing_files_read_scope_has_exact_redacted_recovery(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A definitive missing_scope on the files probe is boot-fatal and precise.
+    """A definitive missing_scope on the files probe degrades, never refuses.
 
     Slack's `files.list` error table documents `missing_scope` for a token that
     lacks the necessary scope. It is unambiguous for this probe in a way it is
@@ -1563,26 +1564,33 @@ def test_slack_preflight_missing_files_read_scope_has_exact_redacted_recovery(
     logger = logging.getLogger("test-slack-preflight-files-missing-scope")
 
     with caplog.at_level(logging.INFO, logger=logger.name):
-        with pytest.raises(SlackChannelPreflightError) as excinfo:
-            check_slack_channel_capabilities(
-                _config(slack_bot_token="hostile-bot-token-sentinel"),
-                logger=logger,
-                web_client=slack,
-                api_client=_one_slack_agent_api(),
-            )
+        # The load-bearing assertion is the absence of a raise. `channels:read`
+        # is what routing needs, so its absence is terminal; `files:read` only
+        # fetches an upload, and refusing to boot for it would stop every
+        # message in the workspace -- and take down every existing installation
+        # on upgrade until an admin reinstalled the app -- over a capability
+        # nobody had yesterday.
+        check_slack_channel_capabilities(
+            _config(slack_bot_token="hostile-bot-token-sentinel"),
+            logger=logger,
+            web_client=slack,
+            api_client=_one_slack_agent_api(),
+        )
 
-    assert str(excinfo.value) == MISSING_FILES_READ_MESSAGE
-    # The refusal has to carry both halves an operator acts on: the scope name
-    # and the fact that a reinstall is what refreshes an existing grant.
-    assert "files:read" in str(excinfo.value)
-    assert "reinstall the app to the workspace" in str(excinfo.value)
-    # Definitive means terminal before the per-destination loop: a token that
-    # cannot fetch an upload's bytes is not a stack worth wiring up.
+    messages = [record.getMessage() for record in caplog.records]
+    # Degraded, but never quietly: the recovery names the one scope and the
+    # reinstall step, and says the bot still answers so nobody treats it as an
+    # outage.
+    assert MISSING_FILES_READ_MESSAGE in messages
+    assert any("files:read" in m and "reinstall the app" in m for m in messages)
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+    # And the summary still names WHICH probe degraded.
+    assert any("attachment download capability missing-scope" in m for m in messages)
+    # Degrading does not skip the rest of the preflight: the destinations are
+    # still checked, which is exactly what a boot refusal used to prevent.
     assert slack.files_calls == [{"count": 1}]
-    assert slack.channels == []
-    emitted = " ".join(
-        [str(excinfo.value), *(record.getMessage() for record in caplog.records)]
-    )
+    assert slack.channels != []
+    emitted = " ".join(messages)
     for private_value in (
         "hostile-bot-token-sentinel",
         CHANNEL_A,
