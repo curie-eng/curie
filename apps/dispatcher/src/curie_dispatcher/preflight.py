@@ -18,9 +18,14 @@ health probe proves reachability; authenticated agent discovery loads the Slack
 destinations before Slack starts. The Slack phase probes destination visibility,
 but not message deliverability. Only the definitive ``missing_scope`` and
 ``invalid_types`` responses from the public-channel ``conversations.list`` probe
-receive the exact ``channels:read`` recovery. Discovery failures and aggregate
-deadline exhaustion also refuse startup; ambiguous Slack provider outcomes remain
-``unverified`` so one destination cannot crash-loop every agent.
+receive the exact ``channels:read`` recovery, and only a definitive
+``missing_scope`` from the bounded ``files.list`` probe receives the exact
+``files:read`` recovery (#2567) -- that second scope is what lets an inbound
+attachment's bytes be fetched at all, and a workspace that has not reinstalled
+since the scope was added would otherwise lose every upload silently, so it is
+checked at boot rather than discovered in a worker log. Discovery failures and
+aggregate deadline exhaustion also refuse startup; ambiguous Slack provider
+outcomes remain ``unverified`` so one destination cannot crash-loop every agent.
 
 API health retains its full configured startup budget. Once health succeeds,
 authenticated discovery and all Slack checks share one fresh aggregate budget.
@@ -55,6 +60,16 @@ _MISSING_CHANNELS_READ_MESSAGE = (
     "Slack channel capability preflight failed: bot token is missing required "
     "scope channels:read. Add channels:read under OAuth & Permissions > Bot "
     "Token Scopes, then reinstall the app to the workspace."
+)
+# The same shape as the message above, for the scope that lets the worker fetch
+# an inbound attachment's bytes (#2567). It is a separate constant rather than a
+# parameterized one so each recovery names exactly one scope: an operator who
+# reinstalled for `channels:read` months ago and is now missing `files:read`
+# needs to be told the second name, not a list to guess from.
+_MISSING_FILES_READ_MESSAGE = (
+    "Slack channel capability preflight failed: bot token is missing required "
+    "scope files:read. Add files:read under OAuth & Permissions > Bot Token "
+    "Scopes, then reinstall the app to the workspace."
 )
 _AGENT_DISCOVERY_FAILURE_MESSAGE = (
     "Slack channel capability preflight failed: could not load configured "
@@ -107,6 +122,21 @@ class SlackChannelClient(Protocol):
     ) -> Any: ...
 
     def conversations_info(self, *, channel: str) -> Any: ...
+
+    # `files.list` is the `files:read` probe (#2567). It is deliberately the
+    # whole surface for that scope: the method requires `files:read`, takes no
+    # required argument, and answers `ok` with an empty array on a workspace
+    # that holds no files, so boot never comes to depend on a particular file
+    # existing. The alternative -- `files.info` on a known id -- would make the
+    # gate unrunnable on a fresh workspace and turn a deleted file into a
+    # crash-loop. https://docs.slack.dev/reference/methods/files.list
+    #
+    # The page-size argument is `count`, not `limit`: `files.list` predates
+    # Slack's cursor pagination and pages with `count`/`page`. `slack_sdk`'s
+    # `WebClient.files_list` types `count` as keyword-only and would swallow a
+    # `limit` into `**kwargs`, sending an argument the method does not document
+    # and quietly fetching the 100-file default page instead of one.
+    def files_list(self, *, count: int) -> Any: ...
 
 
 def _safe_for_log(url: str) -> str:
@@ -267,6 +297,18 @@ def _is_conversations_list_success(response: object) -> bool:
     )
 
 
+def _is_files_list_success(response: object) -> bool:
+    """Accept only the documented successful file-listing shape.
+
+    An empty ``files`` array is a full pass: the probe proves the token may
+    *ask*, which is the scope question, and says nothing about whether the
+    workspace happens to hold a file today.
+    """
+    return _slack_response_field(response, "ok") is True and isinstance(
+        _slack_response_field(response, "files"), list
+    )
+
+
 def _is_conversations_info_success(response: object) -> bool:
     """Fail closed if a client returns a malformed success instead of raising."""
     return _slack_response_field(response, "ok") is True and isinstance(
@@ -315,8 +357,13 @@ def check_slack_channel_capabilities(
     refusal, while deterministic response-shape failures fail promptly. A bounded
     public-channel-only ``conversations.list`` call proves ``channels:read``
     directly; its documented ``missing_scope`` and ``invalid_types`` errors are
-    provider-terminal because the request fixes ``types=public_channel``.
-    Ambiguous capability and destination outcomes are counted as unverified.
+    provider-terminal because the request fixes ``types=public_channel``. A
+    second bounded call, ``files.list`` with ``count=1``, proves ``files:read``
+    the same way; it names no file, so boot never depends on one existing, and
+    its ``missing_scope`` is unambiguous because the request carries no channel
+    and no type filter. Ambiguous capability and destination outcomes are
+    counted as unverified; a nondefinitive ``files:read`` probe raises the
+    summary line's level without changing its text.
     Production builds a no-retry client for each provider call, with its integer
     timeout capped by both the remaining aggregate budget and the dispatcher's
     two-second Slack policy. If time expires before the capability probe or every
@@ -422,6 +469,45 @@ def check_slack_channel_capabilities(
         if not _is_conversations_list_success(capability_response):
             capability_status = "unverified"
 
+    # The second workspace-level scope probe, for the scope that lets an inbound
+    # attachment's bytes actually be fetched (#2567). It sits here, beside the
+    # `channels:read` probe and before the per-destination loop, because it asks
+    # the same kind of question: one bounded call about the token, not about a
+    # destination. It is gated on the same deadline for the reason the docstring
+    # gives -- an unattempted scope check must refuse rather than read as a pass.
+    #
+    # It reuses `capability_client` rather than building its own. Per-*destination*
+    # clients exist so one hung destination cannot borrow another's share of the
+    # budget; these two are the same single workspace-level question asked twice,
+    # already bounded by the same `remaining`, so a second construction would buy
+    # nothing and would make the number of provider clients a stack opens depend
+    # on how many scopes we happen to probe.
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise SlackChannelPreflightError(_SLACK_CAPABILITY_DEADLINE_MESSAGE) from None
+
+    try:
+        files_response = capability_client.files_list(count=1)
+    except SlackApiError as exc:
+        # `missing_scope` is the one provider-terminal answer, and it is
+        # unambiguous here in a way it is not on `conversations.info`: this
+        # request carries no channel and no type filter, so the only scope it
+        # can be missing is `files:read`. That is the difference between a loud
+        # boot failure naming the fix and a workspace that silently drops every
+        # upload until someone reads the worker's logs.
+        if _slack_error_code(exc) == "missing_scope":
+            raise SlackChannelPreflightError(_MISSING_FILES_READ_MESSAGE) from None
+        files_status = "unverified"
+    except Exception:
+        # Every other outcome stays nondefinitive, exactly as the destination
+        # loop's are: a rate limit, a transport fault, an org-token refusal, or
+        # an injected seam that predates this probe must not crash-loop a stack
+        # whose other capabilities check out. Provider bodies are discarded at
+        # this redaction boundary.
+        files_status = "unverified"
+    else:
+        files_status = "verified" if _is_files_list_success(files_response) else "unverified"
+
     for address in ordered_addresses:
         remaining = deadline - monotonic()
         if remaining <= 0:
@@ -450,9 +536,13 @@ def check_slack_channel_capabilities(
 
         checked += 1
 
+    # A nondefinitive `files:read` probe raises the level without changing the
+    # line: the definitive answer already refused above, so what is left to say
+    # here is only "one of these checks did not come back clean", which is what
+    # the level says. The counters stay about destinations.
     log = (
         logger.warning
-        if capability_status == "unverified" or unverified
+        if capability_status == "unverified" or files_status == "unverified" or unverified
         else logger.info
     )
     log(

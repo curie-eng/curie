@@ -155,6 +155,49 @@
       "title": "ApprovalRequest",
       "type": "object"
     },
+    "Attachment": {
+      "description": "An inbound attachment REFERENCE a turn carries: never the bytes (#2567).\n\nADR-0020's required core for a channel port names attachments alongside text,\nauthor and correlation key, so a turn has to be able to say \"a file came with\nthis\". This model is what it says it with, and it is deliberately a *pointer*\nrather than a payload.\n\n``id`` is **adapter-scoped and opaque**. It is whatever identifier the channel\nthat produced the turn uses for the file (a Slack file id today), and the only\nthing that can resolve it back to bytes is *that same adapter*. Nothing\ndownstream parses it, and nothing outside the producing adapter should try to:\ntwo channels may legitimately mint the same-looking id for different files.\n``name`` is the filename to show a person. Both are REQUIRED and have no\ndefault -- a ref with no id resolves to nothing and a ref with no name\ndescribes nothing, so either default would let a producer mint something that\nreads as present while carrying nothing actionable.\n\n``mime_type`` and ``size_bytes`` are best-effort channel metadata and default\nto ``None``. A channel that reports neither must still be able to produce a\nusable ref, so the absent case is stated as ``None`` rather than fabricated as\n``\"application/octet-stream\"`` or ``0``.\n\n**There is deliberately no url, download_url, or bytes field, and the absence\nis a decision rather than an omission.** A sandbox could not fetch a channel\nURL in this release even if the wire carried one: ADR-0075's Agent Proxy -- the\nhost-bound credential injection a container would need to authenticate such a\nfetch -- is Accepted but UNBUILT, and what is live instead is ADR-0032's\nrelease-wide CIDR egress, which is default-deny. A url on this model would\ntherefore be a promise nothing in the release can keep, and worse, it would\ninvite exactly the fetch the egress policy exists to refuse -- a reader who\nfound the field would reasonably assume it worked. Resolution is the producing\nadapter's job, through ``id``, when a resolve path is actually built.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "mime_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mime Type"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "size_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Size Bytes"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "title": "Attachment",
+      "type": "object"
+    },
     "BootEnv": {
       "description": "The full worker-to-runner boot env: the ACI session plus platform ops.\n\n``session`` COMPOSES the frozen ``SessionConfig`` rather than extending it.\nThat nesting is the ACI-vs-platform boundary: a runner token, approval\nplumbing, and a history port are Curie platform operations, not the\ninterface a third-party ACI-conformant runner implements. Inheriting would\ntell every future implementer otherwise (ADR-0049).\n\n**Multiple producers, one consumer.** The boot env is assembled by the worker\nbinding, the worker kernel's resume overlay, the substrate (chart/docker),\nand the operator; only the runner consumes it. So ``from_env`` is the single\nconsumer parse of the whole union, while rendering is per-producer: there is\ndeliberately no whole-model ``to_env`` on the wire path. ``render_worker`` is\nthe one real render surface; ``to_env`` exists for round-trip checks only.\n\n**Authority, not arity, is the invariant.** ``CURIE_SANDBOX_ID`` and\n``CURIE_RUNNER_PORT`` are substrate-authoritative: identity derives from\nthe pod name (``fieldRef: metadata.name``), and because the chart sets\n``envVarsInjectionPolicy: Overrides`` a worker write would REPLACE it and\nbreak the \"pod name IS the sandbox id\" invariant that trace stamping relies\non. ``ANTHROPIC_BASE_URL`` is also multi-producer, but there the worker is\nauthoritative and worker-wins is the intended layering: the chart branch is a\nbaked template default, the worker's value is per-agent model routing. Do not\ncollapse either producer list to a single value.",
       "properties": {
@@ -1022,8 +1065,16 @@
       "title": "OutboundEvent"
     },
     "QueuedTurn": {
-      "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.",
+      "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.",
       "properties": {
+        "attachments": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Attachment"
+          },
+          "title": "Attachments",
+          "type": "array"
+        },
         "author": {
           "title": "Author",
           "type": "string"
@@ -1356,6 +1407,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.4.2",
-  "title": "ACI Protocol v0.4.2"
+  "protocolVersion": "0.4.3",
+  "title": "ACI Protocol v0.4.3"
 }
