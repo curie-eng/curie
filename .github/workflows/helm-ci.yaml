@@ -642,6 +642,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/networkpolicy-empty-to-assertions.sh
 
+      # Prove the release record helm stores for a default install still fits
+      # the 1 MiB Kubernetes Secret ceiling, with headroom. The chart renders
+      # and lints fine right up to the byte that breaks it, and then every
+      # install fails at once with `Secret ... data: Too long`.
+      - name: helm render assertions (release record size budget)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/release-record-size-assertions.sh
+
       - name: helm template + kubeconform (values-dev overlay)
         run: |
           set -euo pipefail
