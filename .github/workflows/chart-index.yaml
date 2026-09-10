@@ -68,13 +68,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           git checkout origin/main -- release/
           python3 release/authorize.py "$RELEASE_COMMIT" \
             --repo "$GITHUB_REPOSITORY" \
             --reviewed-ref origin/main \
-            --reviewed-ref origin/next
+            --reviewed-ref origin/next \
+            --tag "$RELEASE_TAG"
 
       - name: Download every release asset
         env:

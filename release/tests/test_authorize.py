@@ -255,6 +255,7 @@ class TestAuthorize:
             REVIEWED_REFS,
             cwd=git_repo,
             required_names=TEST_REQUIRED_NAMES,
+            tag="v0.7.0-rc.5",
         )
 
     def test_commit_reachable_only_from_main_is_authorized(
@@ -326,6 +327,108 @@ class TestAuthorize:
                 cwd=git_repo,
                 required_names=TEST_REQUIRED_NAMES,
             )
+
+
+class TestTagClassAuthorization:
+    """Issue #1560: final tags require the primary reviewed ref; prereleases may use any.
+
+    The four cases are the issue's acceptance criteria. Reverting the
+    classification in `authorize()` makes `test_final_tag_on_next_only_commit_is_refused`
+    fail: that commit is reachable from `origin/next` and would authorize again.
+    """
+
+    def test_final_tag_on_next_only_commit_is_refused(self, reviewed_refs_repo):
+        git_repo, commits = reviewed_refs_repo
+
+        with pytest.raises(authorize_module.AuthorizationError) as exc_info:
+            authorize_module.authorize(
+                commits["next"],
+                CHECK_RUNS_ALL_GREEN,
+                REVIEWED_REFS,
+                cwd=git_repo,
+                required_names=TEST_REQUIRED_NAMES,
+                tag="v0.7.0",
+            )
+
+        message = str(exc_info.value)
+        assert "origin/main" in message
+        assert "merge" in message.lower()
+        assert "tag" in message.lower()
+
+    def test_prerelease_tag_on_next_only_commit_is_authorized(self, reviewed_refs_repo):
+        git_repo, commits = reviewed_refs_repo
+
+        authorize_module.authorize(
+            commits["next"],
+            CHECK_RUNS_ALL_GREEN,
+            REVIEWED_REFS,
+            cwd=git_repo,
+            required_names=TEST_REQUIRED_NAMES,
+            tag="v0.7.0-rc.5",
+        )
+
+    def test_final_tag_on_main_commit_is_authorized(self, reviewed_refs_repo):
+        git_repo, commits = reviewed_refs_repo
+
+        authorize_module.authorize(
+            commits["main"],
+            CHECK_RUNS_ALL_GREEN,
+            REVIEWED_REFS,
+            cwd=git_repo,
+            required_names=TEST_REQUIRED_NAMES,
+            tag="v0.7.0",
+        )
+
+    def test_commit_reachable_from_neither_ref_is_still_refused(
+        self, reviewed_refs_repo
+    ):
+        git_repo, commits = reviewed_refs_repo
+
+        with pytest.raises(authorize_module.AuthorizationError) as exc_info:
+            authorize_module.authorize(
+                commits["feature"],
+                CHECK_RUNS_ALL_GREEN,
+                REVIEWED_REFS,
+                cwd=git_repo,
+                required_names=TEST_REQUIRED_NAMES,
+                tag="v0.7.0",
+            )
+
+        message = str(exc_info.value)
+        assert "not reachable from any reviewed ref" in message
+        assert "origin/main" in message
+        assert "origin/next" in message
+
+    def test_omitted_tag_on_next_only_commit_is_treated_as_final(
+        self, reviewed_refs_repo
+    ):
+        git_repo, commits = reviewed_refs_repo
+
+        with pytest.raises(authorize_module.AuthorizationError) as exc_info:
+            authorize_module.authorize(
+                commits["next"],
+                CHECK_RUNS_ALL_GREEN,
+                REVIEWED_REFS,
+                cwd=git_repo,
+                required_names=TEST_REQUIRED_NAMES,
+            )
+
+        assert "origin/main" in str(exc_info.value)
+
+
+class TestClassifyReleaseTag:
+    def test_final_semver_is_final(self):
+        assert authorize_module.classify_release_tag("v0.7.0") == "final"
+
+    def test_rc_prerelease_is_prerelease(self):
+        assert authorize_module.classify_release_tag("v0.7.0-rc.5") == "prerelease"
+
+    def test_build_metadata_without_prerelease_is_final(self):
+        assert authorize_module.classify_release_tag("v0.7.0+build.1") == "final"
+
+    def test_invalid_tag_is_refused(self):
+        with pytest.raises(authorize_module.AuthorizationError, match="semver"):
+            authorize_module.classify_release_tag("vnext")
 
 
 class TestRequiredCheckAllowlist:
@@ -713,7 +816,15 @@ class TestMain:
         monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
 
         exit_code = authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
+            [
+                sha,
+                "--repo",
+                "curie-eng/curie",
+                "--reviewed-ref",
+                "main",
+                "--tag",
+                "v0.7.0",
+            ]
         )
 
         assert exit_code == 0
@@ -731,7 +842,15 @@ class TestMain:
         monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
 
         exit_code = authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
+            [
+                sha,
+                "--repo",
+                "curie-eng/curie",
+                "--reviewed-ref",
+                "main",
+                "--tag",
+                "v0.7.0",
+            ]
         )
 
         assert exit_code == 0
@@ -752,10 +871,71 @@ class TestMain:
         monkeypatch.setenv("GITHUB_RUN_ID", OTHER_RUN_ID)
 
         exit_code = authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
+            [
+                sha,
+                "--repo",
+                "curie-eng/curie",
+                "--reviewed-ref",
+                "main",
+                "--tag",
+                "v0.7.0",
+            ]
         )
 
         assert exit_code == 1
+
+    def test_main_refuses_a_final_tag_on_a_next_only_commit(
+        self, reviewed_refs_repo, monkeypatch, capsys
+    ):
+        git_repo, commits = reviewed_refs_repo
+        self._use_test_required_names(monkeypatch)
+        self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        monkeypatch.chdir(git_repo)
+        monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
+
+        exit_code = authorize_module.main(
+            [
+                commits["next"],
+                "--repo",
+                "curie-eng/curie",
+                "--reviewed-ref",
+                "origin/main",
+                "--reviewed-ref",
+                "origin/next",
+                "--tag",
+                "v0.7.0",
+            ]
+        )
+
+        assert exit_code == 1
+        err = capsys.readouterr().err
+        assert "origin/main" in err
+        assert "merge" in err.lower()
+
+    def test_main_authorizes_a_prerelease_tag_on_a_next_only_commit(
+        self, reviewed_refs_repo, monkeypatch
+    ):
+        git_repo, commits = reviewed_refs_repo
+        self._use_test_required_names(monkeypatch)
+        self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        monkeypatch.chdir(git_repo)
+        monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
+
+        exit_code = authorize_module.main(
+            [
+                commits["next"],
+                "--repo",
+                "curie-eng/curie",
+                "--reviewed-ref",
+                "origin/main",
+                "--reviewed-ref",
+                "origin/next",
+                "--tag",
+                "v0.7.0-rc.5",
+            ]
+        )
+
+        assert exit_code == 0
 
 
 class TestMainLookupFailures:
@@ -782,7 +962,15 @@ class TestMainLookupFailures:
         monkeypatch.chdir(git_repo)
         monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
         return authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
+            [
+                sha,
+                "--repo",
+                "curie-eng/curie",
+                "--reviewed-ref",
+                "main",
+                "--tag",
+                "v0.7.0",
+            ]
         )
 
     def test_gh_api_failure_refuses_with_a_message_naming_the_lookup(
@@ -1110,6 +1298,8 @@ class TestReleaseWorkflowContract:
         assert set(reviewed_ref_envs) == set(authorization_env)
         assert len(reviewed_ref_envs) == len(authorization_env) == 2
         assert {authorization_env[name] for name in reviewed_ref_envs} == {"main", "next"}
+        assert authorization_env[reviewed_ref_envs[0]] == "main"
+        assert re.search(r'--tag\s+"\$GITHUB_REF_NAME"', command)
 
         overlay = re.search(
             r"git checkout origin/\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}\s+-- release/",
