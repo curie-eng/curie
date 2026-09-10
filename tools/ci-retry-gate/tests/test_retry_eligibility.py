@@ -44,6 +44,7 @@ ACQUISITION_ACTIONS = frozenset(
 RETRY_ALLOWLIST = frozenset(
     {
         ("ci.yaml", "python", "Install uv"),
+        ("ci.yaml", "fix-pin", "Install uv"),
         ("ci.yaml", "e2e-ladder-cluster", "Create the kind cluster"),
         ("dependency-audit.yaml", "python-audit", "Install uv"),
         ("gitleaks.yaml", "gitleaks", "Pull the gitleaks image"),
@@ -160,6 +161,12 @@ SHELL_KEYWORDS = frozenset({"do", "done", "fi", "then", "else", "esac", "true", 
 RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
     {
         ("ci.yaml", "python", "Wait for Langfuse to serve"),
+        # The fix pin job boots the same dev stack as the python job,
+        # for the same reason and with the same readiness poll: Langfuse
+        # web has no compose healthcheck, so `--wait` returns while it is
+        # merely running. A readiness poll for an external service, not a
+        # retry of anything this repository builds or gates.
+        ("ci.yaml", "fix-pin", "Wait for Langfuse to serve"),
         # The candidate API has already rolled out; this only waits for the
         # temporary local port-forward to expose its external health state.
         (
