@@ -197,13 +197,27 @@ impl ClusterStub {
             .to_string(),
         )
         .unwrap();
+        // `fail.<step>` sentinel files let a test make one stubbed step exit
+        // nonzero. The stderr text matters: `helm` must not say "release: not
+        // found" (which the CLI reads as an absent release, not a failure) and
+        // must carry no connectivity marker, so it classifies as a plain
+        // failure rather than a transient.
         let script = r#"#!/bin/sh
 log="${0%/*}/calls.log"
 printf '%s %s\n' "${0##*/}" "$*" >> "$log"
+fail() { [ -f "${0%/*}/fail.$1" ]; }
 case "${0##*/}:$*" in
   helm:"get values"*)
+    if fail helm; then
+      echo "Error: query: failed to query with labels: secrets is forbidden" >&2
+      exit 1
+    fi
     cat "${0%/*}/values.json"; exit 0 ;;
   kubectl:*patch*)
+    if fail patch; then
+      echo 'Error from server (Forbidden): secrets "acme-curie" is forbidden' >&2
+      exit 1
+    fi
     patch=
     prev=
     for arg in "$@"; do
@@ -213,6 +227,10 @@ case "${0##*/}:$*" in
     if [ -n "$patch" ]; then cp "$patch" "${0%/*}/patched.json"; fi
     exit 0 ;;
   kubectl:*rollout*)
+    if fail rollout; then
+      echo 'error: no deployments found with label selector' >&2
+      exit 1
+    fi
     exit 0 ;;
   kubectl:*--raw*)
     cat "${0%/*}/status.json"; exit 0 ;;
@@ -227,6 +245,12 @@ exit 0
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         Self(temp)
+    }
+
+    /// Make the named stubbed step (`helm`, `patch`, `rollout`) exit nonzero.
+    fn failing(self, step: &str) -> Self {
+        fs::write(self.0.path().join(format!("fail.{step}")), "").unwrap();
+        self
     }
 
     fn run(&self, argv: &[&str]) -> Run {
@@ -401,4 +425,125 @@ fn show_exp_does_not_post_a_token() {
         "show-exp must not mint: {traffic:?}"
     );
     assert!(stub.patched().is_empty(), "show-exp must not patch");
+}
+
+// --- #2553: the mint is a rotation write, so ordering is the whole fix -------
+//
+// `POST /channels/token` bumps the binding's generation and signs the new one,
+// which revokes the token the adapter is currently running. There is no
+// un-mint. So every step that can fail for a reason unrelated to the token has
+// to run BEFORE the mint, and the one step that cannot (the Secret write, which
+// needs the token) has to say what it left behind when it fails.
+
+fn mint_argv(base_url: &str) -> Vec<&str> {
+    vec![
+        "--json",
+        "cluster",
+        "channel-token",
+        AGENT_NAME,
+        "--kind",
+        "email",
+        "--address",
+        INBOX,
+        "--namespace",
+        "mail-test",
+        "--release",
+        "acme",
+        "--api-url",
+        base_url,
+        "--api-key",
+        "test-key",
+    ]
+}
+
+/// The ordering pin. Helm discovery fails, so the verb must abort with the
+/// binding's generation untouched -- no mint request may reach the API at all.
+/// Against the pre-fix tree the mint runs first and this fails on the recorded
+/// POST: a working token was revoked to pay for a `helm` error.
+#[test]
+fn a_discovery_failure_burns_no_generation() {
+    let token = sample_token(EXP);
+    let server = api_for_mint(&token);
+    let stub =
+        ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}})).failing("helm");
+    let run = stub.run(&mint_argv(&server.base_url));
+    assert_ne!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    let traffic = server
+        .recorded()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect::<Vec<_>>();
+    assert!(
+        !traffic.iter().any(|t| t.contains("/channels/token")),
+        "a failure the verb could have hit before minting must not revoke the \
+         installed token: {traffic:?}"
+    );
+    assert!(stub.patched().is_empty(), "nothing may be written");
+}
+
+/// The complement: on the happy path the discovery calls still happen, and they
+/// happen before the mint. Without this a "fix" that simply dropped the Helm
+/// read would satisfy the test above while silently losing
+/// `channelTokenExistingSecret` targeting.
+#[test]
+fn discovery_runs_before_the_mint_on_the_happy_path() {
+    let token = sample_token(EXP);
+    let server = api_for_mint(&token);
+    let stub = ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}}));
+    let run = stub.run(&mint_argv(&server.base_url));
+    assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    let calls = stub.calls();
+    let helm_at = calls
+        .find("helm get values")
+        .unwrap_or_else(|| panic!("helm read: {calls}"));
+    let patch_at = calls
+        .find("patch secret")
+        .unwrap_or_else(|| panic!("patch: {calls}"));
+    assert!(helm_at < patch_at, "{calls}");
+}
+
+/// The window that cannot be closed by ordering: the write needs the token, so
+/// a failed write leaves a revoked token installed. The operator must be told
+/// that in the message, not left reading a `kubectl` error about a Secret.
+#[test]
+fn a_failed_secret_write_reports_the_revoked_token() {
+    let token = sample_token(EXP);
+    let server = api_for_mint(&token);
+    let stub =
+        ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}})).failing("patch");
+    let run = stub.run(&mint_argv(&server.base_url));
+    assert_ne!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    let value: serde_json::Value = serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}; {}", run.stdout));
+    let error = value["error"].as_str().unwrap_or_default();
+    assert!(error.contains("revoked"), "{value}");
+    assert!(error.contains("email:ops@example.com"), "{value}");
+    let fix = value["fix"].as_str().unwrap_or_default();
+    assert!(fix.contains("re-run"), "{value}");
+    assert!(!run.stdout.contains(&token), "{}", run.stdout);
+    assert!(!run.stderr.contains(&token), "{}", run.stderr);
+}
+
+/// Past the write the state is milder -- the token IS installed, the adapter
+/// just has not reloaded -- and reporting it as a revocation would send the
+/// operator to mint again, revoking the token they just installed.
+#[test]
+fn a_failed_rollout_says_installed_not_revoked() {
+    let token = sample_token(EXP);
+    let server = api_for_mint(&token);
+    let stub =
+        ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}})).failing("rollout");
+    let run = stub.run(&mint_argv(&server.base_url));
+    assert_ne!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    let value: serde_json::Value = serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}; {}", run.stdout));
+    let error = value["error"].as_str().unwrap_or_default();
+    assert!(error.contains("was written"), "{value}");
+    let fix = value["fix"].as_str().unwrap_or_default();
+    assert!(fix.contains("rollout restart"), "{value}");
+    assert!(
+        fix.contains("do not mint another one"),
+        "the recovery is a restart, never a second mint: {value}"
+    );
+    assert!(stub.patched().contains(&token), "the write did succeed");
 }

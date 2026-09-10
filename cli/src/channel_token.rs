@@ -179,6 +179,16 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
     }
     let ui = crate::ui::ui();
     let cl = ui.checklist();
+    // Resolve the Secret BEFORE minting. The mint is a rotation write: the API
+    // bumps the binding's generation and signs the new value, so the token the
+    // adapter is currently holding is revoked the moment that request returns
+    // (#2379). There is no un-mint. Every step that can fail for a reason
+    // unrelated to the token -- an expired kubeconfig, a misnamed release, a
+    // `--namespace` typo, an API-server blip -- therefore has to run while
+    // failing is still free, or a failed recovery attempt turns a scheduled
+    // expiry into an outage (#2553).
+    let values = fetch_release_computed_values(&opts.common).await?;
+    let (secret_name, secret_key) = live_token_secret(&opts.common, values.as_ref()).await;
     let mint_step = cl.step(&format!("minting channel token for {kind}:{address}"));
     let token = match client.mint_channel_token(&kind, &address, ttl_s).await {
         Ok(token) => {
@@ -192,30 +202,39 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
     };
     let exp = token_exp(&token)?;
     let expires_at = format_exp(exp);
-    let values = fetch_release_computed_values(&opts.common).await?;
-    let (secret_name, secret_key) = live_token_secret(&opts.common, values.as_ref()).await;
     let patch = serde_json::json!({ "stringData": { &secret_key: token } });
+    // The one step that structurally cannot precede the mint: it writes the
+    // token. If it fails the install IS worse off than before the command ran,
+    // and the operator has to be told that rather than left reading a bare
+    // kubectl error about a Secret.
     run_step(
         &cl,
         &format!("writing {secret_name}/{secret_key}"),
         "written",
         &patch_command(&opts.common, &secret_name, &secret_key, patch),
     )
-    .await?;
-    run_step(
-        &cl,
-        "rolling mail adapter",
-        "restarted",
-        &rollout_restart_command(&opts.common),
-    )
-    .await?;
-    run_step(
-        &cl,
-        "waiting for mail adapter",
-        "ready",
-        &rollout_status_command(&opts.common),
-    )
-    .await?;
+    .await
+    .map_err(|err| revoked_without_install(err, &opts, &kind, &address, &secret_name))?;
+    // Past the patch the new token is installed and the old one's revocation is
+    // no longer a surprise -- the adapter simply has not reloaded yet. A rollout
+    // failure is a restart away from resolved, so it must NOT be reported as a
+    // revocation.
+    for (label, ok_detail, cmd) in [
+        (
+            "rolling mail adapter",
+            "restarted",
+            rollout_restart_command(&opts.common),
+        ),
+        (
+            "waiting for mail adapter",
+            "ready",
+            rollout_status_command(&opts.common),
+        ),
+    ] {
+        run_step(&cl, label, ok_detail, &cmd)
+            .await
+            .map_err(|err| installed_but_not_loaded(err, &opts))?;
+    }
     Ok(ChannelTokenOutput::Minted {
         agent: agent.name,
         kind,
@@ -225,6 +244,66 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
         secret_name,
         secret_key,
     })
+}
+
+/// The mint succeeded and the Secret write did not: the adapter is still
+/// holding a token this very command revoked. Name that state, because the
+/// underlying `kubectl` error describes a Secret and says nothing about a
+/// channel that has just stopped accepting mail.
+///
+fn revoked_without_install(
+    err: anyhow::Error,
+    opts: &ChannelTokenOpts,
+    kind: &str,
+    address: &str,
+    secret_name: &str,
+) -> anyhow::Error {
+    let message = format!(
+        "the channel token for {kind}:{address} was minted but could not be written to secret \
+         {secret_name} in namespace {}: that mint already revoked the token the mail adapter is \
+         running, so this binding refuses inbound mail until a token is installed",
+        opts.common.namespace
+    );
+    let fix = format!(
+        "grant access to secret {secret_name} (or point --release/--namespace at the install that \
+         owns it) and re-run `curie cluster channel-token {}`; every re-run mints a fresh token, \
+         so retrying costs nothing",
+        opts.agent
+    );
+    wrap(err, message, fix)
+}
+
+/// The Secret holds the new token; only the restart did not complete. Milder
+/// than [`revoked_without_install`] and deliberately worded so the two cannot
+/// be confused: here the recovery is a restart, not another mint.
+fn installed_but_not_loaded(err: anyhow::Error, opts: &ChannelTokenOpts) -> anyhow::Error {
+    let message = format!(
+        "the new channel token was written, but the mail adapter in namespace {} did not restart \
+         onto it and is still running the token this mint revoked",
+        opts.common.namespace
+    );
+    let fix = format!(
+        "restart it with `kubectl -n {} rollout restart deployment -l {}`; the new token is \
+         already installed, so do not mint another one",
+        opts.common.namespace,
+        adapter_selector(&opts.common.release)
+    );
+    wrap(err, message, fix)
+}
+
+/// Attach one `{message, fix}` pair to both operator surfaces at once, the way
+/// [`Ui::failed_report`](crate::ui::Ui::failed_report) does: the explicit JSON
+/// payload is what `--json` emits, and the operator context is what the
+/// terminal's `Error:`/`Fix:` pair reads. Wrapping with a bare
+/// [`CliError`](crate::exit::CliError) instead would reach only the JSON half,
+/// and a bare operator context only the human half.
+fn wrap(err: anyhow::Error, message: String, fix: String) -> anyhow::Error {
+    let payload = serde_json::json!({ "error": message, "fix": fix });
+    crate::exit::operator_context(
+        crate::exit::with_json_payload(err, payload),
+        message,
+        Some(fix),
+    )
 }
 
 async fn show_exp(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput> {
