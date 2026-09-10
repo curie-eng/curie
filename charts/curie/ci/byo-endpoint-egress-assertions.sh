@@ -1246,5 +1246,16 @@ if ! helm template "$RELEASE" "$CHART" --namespace "$NAMESPACE" \
 fi
 echo "ok: opting out of Rail 1 does not require api.egress for an external apiBaseUrl"
 
+echo "=== Assertion 28: helm package does not ship ci/ test scripts into the release Secret ==="
+PKG_DIR="$TMP/helm-pkg"
+mkdir -p "$PKG_DIR"
+helm package "$CHART" -d "$PKG_DIR" >/dev/null
+PKG_TGZ="$(find "$PKG_DIR" -maxdepth 1 -name '*.tgz' -print)"
+[ -n "$PKG_TGZ" ] || fail "helm package wrote no tgz"
+if tar -tzf "$PKG_TGZ" | grep -q '/ci/'; then
+  fail "helm package still contains ci/ test scripts; add ci/ to charts/curie/.helmignore so the release Secret stays under 1MiB"
+fi
+echo "ok: helm package excludes ci/"
+
 echo
 echo "PASS: BYO collector and API egress are required and rendered as runner NetworkPolicies; the in-chart carve-outs are unchanged; the effective runner-facing endpoint fails closed without a declared peer; and no .deploy carve-out lacks a BYO branch."
