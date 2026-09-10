@@ -125,7 +125,7 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_CHANNEL_TOKEN` | "" | the scoped `chn` token, sent as `X-API-Key` on ingress. Required |
 | `CURIE_EGRESS_SECRET` | "" | shared secret the platform presents on `X-Curie-Adapter-Secret`. Required |
 | `ADAPTER_INGRESS_ENABLED` | `true` | gates the poller only, never the egress server |
-| `CURIE_MAIL_POLL_INTERVAL_SECONDS` | `5.0` | seconds between listings; must be greater than zero. A transport failure or 429 arms bounded exponential backoff on top, up to 60s, reset by the next successful listing |
+| `CURIE_MAIL_POLL_INTERVAL_SECONDS` | `5.0` | seconds between listings; must be greater than zero. A transport failure or any 4xx refusal arms bounded exponential backoff on top, up to 60s; a successful 200 listing resets it, while 5xx responses retain their existing semantics and neither arm nor clear an already armed delay |
 | `CURIE_MAIL_INGRESS_ATTEMPTS` | `3` | short in-process attempts for transport ambiguity and retryable status; durable retry continues after this budget |
 | `CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS` | `2.0` | base delay between those attempts; 429 may extend it with `Retry-After` |
 | `CURIE_MAIL_PORT` | `8080` | port the egress server binds |
