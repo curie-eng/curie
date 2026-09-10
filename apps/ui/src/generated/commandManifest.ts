@@ -2718,6 +2718,14 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Assert the live Alembic revision instead of reading it from the API pod. The schema-window check still runs against this value. Use when every API replica is unexecutable (CrashLoopBackOff, Init, ImagePullBackOff)",
+              "id": "live_schema_revision",
+              "long": "live-schema-revision",
+              "positional": false,
+              "required": false
+            },
+            {
               "default_values": [
                 "curie"
               ],

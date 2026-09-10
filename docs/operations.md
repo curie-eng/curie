@@ -300,6 +300,7 @@ curie cluster rollback
 |---|---|
 | `--revision <n>` | Roll back to this exact revision instead of the newest safe one. |
 | `--allow-failed-revision` | Permit a `--revision` that Helm never finished applying. |
+| `--live-schema-revision <rev>` | Assert the live Alembic revision instead of reading it from the API pod. The schema-window check still runs against this value. |
 | `--yes` | Skip the confirmation prompt. |
 | `--dry-run` | Print the commands that would run and exit. |
 
@@ -328,6 +329,13 @@ the running API pod and refuses a target whose declared schema range does not
 include it, before Helm mutates the release. The refusal names the
 compatibility boundary and the newest safe fail-forward application version.
 It does not print database contents or credentials. See issue #2296.
+
+When every API replica is unexecutable (CrashLoopBackOff, Init, or
+ImagePullBackOff; the ordinary reason to roll back), that probe cannot run.
+`--live-schema-revision <rev>` lets the operator assert the live Alembic
+revision (the output of `alembic current` against the release database) so the
+schema-window check still runs without a live API pod. An incompatible target
+is still refused. This is not a way to skip the window. See issue #2558.
 
 If you know which revision you want, `--revision <n>` takes it. A revision that
 isn't in the history is refused, and so is one Helm never finished applying --

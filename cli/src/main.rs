@@ -2139,6 +2139,12 @@ enum ClusterAction {
         /// this flag alone would otherwise be a silent no-op.
         #[arg(long, requires = "revision")]
         allow_failed_revision: bool,
+        /// Assert the live Alembic revision instead of reading it from the API
+        /// pod. The schema-window check still runs against this value. Use when
+        /// every API replica is unexecutable (CrashLoopBackOff, Init,
+        /// ImagePullBackOff).
+        #[arg(long, value_name = "REV")]
+        live_schema_revision: Option<String>,
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
@@ -3932,6 +3938,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             ClusterAction::Rollback {
                 revision,
                 allow_failed_revision,
+                live_schema_revision,
                 namespace,
                 release,
                 yes,
@@ -3947,6 +3954,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     allow_failed_revision,
                     yes,
                     disable_schema_gate: false,
+                    live_schema_revision,
                 })
                 .await?,
             ),

@@ -46,6 +46,7 @@ fn rollback_opts() -> RollbackOpts {
         allow_failed_revision: false,
         yes: true,
         disable_schema_gate: false,
+        live_schema_revision: None,
     }
 }
 
