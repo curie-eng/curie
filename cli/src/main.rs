@@ -2026,6 +2026,16 @@ enum ClusterAction {
         /// Keep the UI and Langfuse services ClusterIP instead of NodePort.
         #[arg(long)]
         no_expose: bool,
+        /// Adopt a pre-existing namespace that already has its own labels or
+        /// objects. Without this, such a namespace is refused. The adoption is
+        /// recorded on the namespace (curietech.ai/adopted-by, adopted-in, and
+        /// the adopted-at/adopted-labels/adopted-contents annotations), and an
+        /// adopted namespace is RETAINED by cluster down rather than deleted,
+        /// so your pre-existing objects are never swept. It never adopts the
+        /// shared agent-sandbox-system namespace or a terminating one, and it
+        /// never admits a namespace whose contents cannot be read.
+        #[arg(long)]
+        adopt: bool,
         /// Force the sealed fake-model install even when CURIE_CREDENTIALS
         /// is set (dev/CI escape hatch); suppresses the fake-model warning.
         #[arg(long)]
@@ -3845,6 +3855,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 release,
                 chart,
                 no_expose,
+                adopt,
                 fake_model,
                 model,
                 local_model,
@@ -3905,6 +3916,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             // the pure builder starts clean.
                             github_token: ops::GithubTokenPlan::Untouched,
                             dev,
+                            adopt,
                         },
                         github_token,
                         clear_github_token,

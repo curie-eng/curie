@@ -149,6 +149,7 @@ that release's retained values.
 | `-f <compose>` | Override a resolved local-dev artifact path. |
 | `--image <ref>` | Override a resolved image reference. |
 | `--no-expose` | Keep the UI and Langfuse ClusterIP-only instead of exposing them on node ports. |
+| `--adopt` | Install into a pre-existing namespace that already has its own labels or its own objects. Without it, such a namespace is refused. See [Adopting a pre-existing namespace](#adopting-a-pre-existing-namespace). |
 | `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. The interactive check accepts Anthropic `sk-ant-`, OpenRouter `sk-or-`, Zhipu `id.secret`, and bare `sk-` shapes for Moonshot or DeepSeek. The first two prefixes select one provider and infer its egress when no provider flag is present. Other shapes do not identify a provider. Present credentials install live through masked `--set` machinery, so `--dry-run` never prints them. An absent credential uses fake mode on a fresh install and preserves the recorded model configuration on a rerun. |
 | `--fake-model` | Explicitly downgrade to fake mode, even when a credential is present or a rerun has recorded live model configuration. |
 | `--github-token <token>` (or `CURIE_GITHUB_TOKEN`) | The Curie API's own GitHub credential, for cloning a PRIVATE repo during a git-flow bundle deploy and for posting the eval commit status. Goes to helm through a private mode-0600 values file, never a command-line argument, so it never appears in the helm command, the printed plan, or that plan's JSON. Prefer the environment variable: a token typed after the flag still sits in `curie`'s own argv, so it still reaches your shell history and `ps`. Omitting both on a later `cluster up` preserves whatever the release already has. Errors if combined with `--set api.githubToken=`. |
@@ -158,6 +159,69 @@ that release's retained values.
 
 A downloaded release binary needs no repo checkout; the chart resolves from
 the version-pinned release asset by default.
+
+#### Adopting a pre-existing namespace
+
+`cluster up` creates its namespace, and stamps what it created with
+`curietech.ai/created-by=<release>` and `curietech.ai/created-in=<namespace>`.
+`cluster down` deletes namespaces by exactly that label pair, so the stamp is
+what makes a teardown safe: it can only delete what this install made.
+
+That is also why a namespace which already exists is refused rather than
+adopted. Adopting someone else's namespace would stamp it, and a later
+`cluster down` would then delete it along with whatever was already inside.
+`cluster up` therefore refuses a pre-existing namespace that has its own labels,
+its own ownership labels, or any object beyond the two Kubernetes puts there
+itself (the `default` ServiceAccount and the `kube-root-ca.crt` ConfigMap).
+
+On a cluster where the namespace is pre-provisioned -- with a quota, a
+NetworkPolicy, a Pod Security label, an Argo CD tracking label, or a pull
+secret -- that refusal is the normal case, and deleting the namespace to get
+past it is worse than the thing the refusal is protecting against. `--adopt` is
+the supported way through:
+
+```bash
+curie cluster up --namespace platform-curie --adopt
+```
+
+**What it records.** The adoption is written onto the Namespace, not just to the
+terminal, so it can be read back long afterward:
+
+```bash
+kubectl get namespace platform-curie -o yaml
+```
+
+| Key | What it holds |
+|---|---|
+| `curietech.ai/adopted-by` (label) | The release that adopted the namespace. |
+| `curietech.ai/adopted-in` (label) | The install namespace of that release. |
+| `curietech.ai/adopted-at` (annotation) | When the adoption happened, RFC 3339 UTC. |
+| `curietech.ai/adopted-labels` (annotation) | The labels the namespace already carried. |
+| `curietech.ai/adopted-contents` (annotation) | The non-default objects that were already in it. |
+
+Pre-existing labels and annotations are preserved; the adoption record is merged
+into them. A very long inventory is truncated, and says so.
+
+**An adopted namespace is retained, not deleted.** `curietech.ai/adopted-by` and
+`curietech.ai/adopted-in` are deliberately *not* the pair `cluster down` selects
+on. A later `curie cluster down` uninstalls the release and leaves the namespace
+and everything in it in place. Delete it yourself when you want it gone. A
+namespace `cluster up` created itself is unaffected and is still swept.
+
+**What `--adopt` does not do.**
+
+- It never adopts the shared `agent-sandbox-system` controller namespace. That
+  namespace is a cluster singleton shared by every install on the cluster.
+- It never adopts a terminating namespace, which cannot accept new objects.
+- It never weakens a read. If the namespace, the namespaced API inventory, or an
+  aggregated `APIService` cannot be read completely, or the namespace is modified
+  concurrently, the install still fails closed -- contents that cannot be read
+  cannot be recorded.
+- Passing it when nothing needed overriding changes nothing: an empty, unlabelled
+  namespace is adopted the ordinary way and stays sweepable by `cluster down`.
+
+A re-run does not need the flag again. `cluster up` recognises a namespace this
+same release already adopted and converges without rewriting the original record.
 
 **Provider-native runtime configuration.** Zhipu, Moonshot, and DeepSeek need
 their matching documented `CURIE_MODEL_BASE_URL` in worker runtime configuration,
