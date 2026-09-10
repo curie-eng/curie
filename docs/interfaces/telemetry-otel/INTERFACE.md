@@ -75,7 +75,7 @@ than an open bag of `gen_ai.*` names.
 - The metric catalog in `packages/telemetry/schema/metrics.json` is the committed
   contract for operational counters, histograms, and gauges across turn, queue,
   thread-lock, sandbox, runner RPC, approval, completion-outbox, reply, HTTP,
-  background-loop, and eval work. `record_metric`
+  background-loop, eval work, and supervised-task restarts. `record_metric`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, agent, or

@@ -740,7 +740,15 @@ class PublicationReconcileLoop:
                 # error escaped. Publication mutation remains terminal and is
                 # never repeated because a reply transport is unavailable.
                 logger.exception("publication result delivery failed")
-            work = await self._store.claim_next()
+            try:
+                work = await self._store.claim_next()
+            except Exception as exc:
+                logger.exception(
+                    "publication claim_next failed cause=%s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
             if work is not None:
                 try:
                     await self._reconciler.reconcile(work)
