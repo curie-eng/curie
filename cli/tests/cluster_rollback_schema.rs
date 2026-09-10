@@ -27,6 +27,17 @@ fn v087_accepts_0039_and_refuses_an_unknown_newer_revision() {
     assert!(!live_in_window("0040", &window));
 }
 
+/// Release v0.8.8 carries the same Alembic head as v0.8.7. Pin both the
+/// accepted live head and the fail-closed boundary for an unknown successor.
+#[test]
+fn v088_accepts_0039_and_refuses_an_unknown_newer_revision() {
+    let window = window_for("0.8.8").expect("0.8.8 is catalogued");
+    assert_eq!(window.schema_min, "0001");
+    assert_eq!(window.schema_head, "0039");
+    assert!(live_in_window("0039", &window));
+    assert!(!live_in_window("0040", &window));
+}
+
 fn write_exec(dir: &Path, name: &str, body: &str) {
     let path = dir.join(name);
     fs::write(&path, body).expect("write fake executable");
