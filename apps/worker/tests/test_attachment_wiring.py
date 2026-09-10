@@ -96,9 +96,18 @@ def built(monkeypatch: pytest.MonkeyPatch) -> Any:
     # See _NoS3Client: a real client construction here leaks a cached ambient
     # credential into every later test that reads the provider chain.
     monkeypatch.setattr(boto3, "client", lambda *_args, **_kwargs: _NoS3Client())
-    # The one call in build() that reaches outside the process: it constructs a
-    # KubernetesSandboxClient, which loads a kubeconfig at __init__.
+    # The calls in build() that reach outside the process, both of which load a
+    # kubeconfig at __init__ and so must be stubbed for this to be hermetic.
+    # A developer box usually HAS a kubeconfig, which is why leaving either of
+    # these live passes locally and fails in CI with "Invalid kube-config file"
+    # -- a machine-shaped green, and exactly how this test first shipped broken.
     monkeypatch.setattr(run, "_sandbox_client", lambda config, env, sub: object())
+    # `_build_publication_loop` constructs a KubernetesPublicationCluster; its
+    # own docstring says it is built at boot precisely so a bad kubeconfig fails
+    # here. `None` is a value it legitimately returns when publication is off,
+    # so stubbing it changes nothing this test asserts -- the attachment lane is
+    # built from config and Slack credentials, never from the publication path.
+    monkeypatch.setattr(run, "_build_publication_loop", lambda *_a, **_k: None)
 
     def _build(**config_overrides: Any) -> dict[str, Any]:
         _KernelSpy.instances.clear()
