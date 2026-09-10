@@ -172,4 +172,10 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0140 | [Curie supports one model harness until a second one exists](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) | Draft |
 | 0142 | [Database compatibility is a release contract; migrations run in one upgrade phase](0142-database-compatibility-windows-and-a-single-upgrade-phase.md) | Accepted |
 | 0143 | [A coding thread owns one fenced pull request lineage](0143-thread-owned-pull-request-lineage.md) | Accepted |
+| 0145 | [A labelled issue is a backlog item and the stream is its queue](0145-a-labelled-issue-is-a-backlog-item-and-the-stream-is-its-queue.md) | Draft |
+| 0146 | [For a headless lane, at capacity means wait, not reply](0146-headless-capacity-is-a-wait-not-a-reply.md) | Draft |
+| 0147 | [Publication approval is a per-agent operator policy, not a platform constant](0147-publication-approval-is-a-per-agent-operator-policy.md) | Draft |
+| 0148 | [One ticket is one pull request, and assembly is a later decision](0148-one-ticket-is-one-pull-request.md) | Draft |
+| 0149 | [Curie pins a model per agent and the provider does the routing](0149-curie-pins-a-model-and-the-provider-routes.md) | Draft |
+| 0150 | [Whether the work was right is the bundle's question, not the platform's](0150-per-task-verification-is-bundle-behaviour.md) | Draft |
 <!-- END GENERATED: adr-index -->
