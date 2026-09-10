@@ -1118,3 +1118,69 @@ async def test_cleanup_retries_beyond_result_cap_before_result_outbox_ack(
     assert PUBLICATION_ID in store.delivered
     assert cluster.terminals_cleaned
     assert PR_URL in replies.events[0][0].text
+
+
+async def test_claim_next_failure_names_the_cause_and_still_escapes(
+    publication: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    reconciler, store, *_ = _loop(publication)
+
+    async def boom() -> None:
+        raise RuntimeError("publication claim CAS was lost")
+
+    store.claim_next = boom
+    supervisor = publication.PublicationReconcileLoop(
+        store=store,
+        reconciler=reconciler,
+        interval_seconds=0.01,
+    )
+    shutdown = asyncio.Event()
+    with caplog.at_level(logging.ERROR, logger="curie_worker.publication_loop"):
+        with pytest.raises(RuntimeError, match="publication claim CAS was lost"):
+            await supervisor.run_forever(shutdown)
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "publication claim_next failed" in message
+        and "RuntimeError" in message
+        and "publication claim CAS was lost" in message
+        for message in messages
+    )
+
+
+async def test_idle_publication_loop_does_not_page(
+    publication: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    reconciler, store, *_ = _loop(publication)
+    shutdown = asyncio.Event()
+    claims = {"n": 0}
+    original = store.claim_next
+
+    async def idle_claim() -> None:
+        claims["n"] += 1
+        return await original()
+
+    store.claim_next = idle_claim
+
+    async def stop_after_one_interval() -> None:
+        while claims["n"] < 1:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.02)
+        shutdown.set()
+
+    supervisor = publication.PublicationReconcileLoop(
+        store=store,
+        reconciler=reconciler,
+        interval_seconds=0.01,
+    )
+    with caplog.at_level(logging.ERROR):
+        await asyncio.wait_for(
+            asyncio.gather(
+                supervisor.run_forever(shutdown),
+                stop_after_one_interval(),
+            ),
+            timeout=2,
+        )
+    assert claims["n"] >= 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("claim_next failed" in message for message in messages)
+    assert not any("crashed; restarting" in message for message in messages)

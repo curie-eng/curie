@@ -262,6 +262,19 @@ _EVAL_ATTRIBUTES = {
     "source": ["eval"],
     "outcome": ["success", "failure", "plumbing"],
 }
+_SUPERVISED_RESTART_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "operation": [
+        "runs",
+        "killswitch",
+        "evals",
+        "heartbeat",
+        "connectors",
+        "publications",
+        "other",
+    ],
+    "outcome": ["restart"],
+}
 
 
 _METRICS: dict[str, dict[str, Any]] = {
@@ -407,6 +420,13 @@ _METRICS: dict[str, dict[str, Any]] = {
     ),
     "curie.eval.process": _definition(
         "counter", "{job}", "Eval processing outcomes.", True, _EVAL_ATTRIBUTES
+    ),
+    "curie.worker.supervised.restart": _definition(
+        "counter",
+        "{restart}",
+        "In-process supervised worker task restarts.",
+        True,
+        _SUPERVISED_RESTART_ATTRIBUTES,
     ),
 }
 

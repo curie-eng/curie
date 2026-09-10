@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 import redis
 from aci_protocol.s3 import build_s3_client
-from curie_telemetry import bootstrap_service_telemetry
+from curie_telemetry import bootstrap_service_telemetry, record_metric
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -483,6 +483,18 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     )
 
 
+_SUPERVISED_OPERATIONS = frozenset(
+    {
+        "runs",
+        "killswitch",
+        "evals",
+        "heartbeat",
+        "connectors",
+        "publications",
+    }
+)
+
+
 async def _supervise(
     name: str,
     factory: Callable[[], Awaitable[None]],
@@ -503,15 +515,36 @@ async def _supervise(
 
     ``factory`` is a thunk (e.g. a bound ``run`` method) so each restart gets a
     fresh coroutine; ``run()`` is re-entrant (group creation is BUSYGROUP-safe).
+    Unknown task names map to catalog ``other`` so a test or new loop cannot
+    crash the supervisor by emitting an undeclared operation.
     """
     while not shutdown.is_set():
         try:
             await factory()
             return
-        except Exception:
+        except Exception as exc:
             if shutdown.is_set():
                 return
-            logger.exception("worker task %s crashed; restarting", name)
+            logger.exception(
+                "worker task %s crashed; restarting cause=%s: %s",
+                name,
+                type(exc).__name__,
+                exc,
+            )
+            try:
+                record_metric(
+                    "curie.worker.supervised.restart",
+                    1,
+                    attributes={
+                        "service.name": "curie-worker",
+                        "operation": (
+                            name if name in _SUPERVISED_OPERATIONS else "other"
+                        ),
+                        "outcome": "restart",
+                    },
+                )
+            except Exception:
+                logger.exception("worker task %s restart metric failed", name)
             try:
                 await asyncio.wait_for(shutdown.wait(), timeout=restart_backoff_s)
             except TimeoutError:

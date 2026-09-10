@@ -1302,6 +1302,30 @@
         ]
       },
       "cardinality_bound": 3
+    },
+    "curie.worker.supervised.restart": {
+      "type": "counter",
+      "unit": "{restart}",
+      "description": "In-process supervised worker task restarts.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "operation": [
+          "runs",
+          "killswitch",
+          "evals",
+          "heartbeat",
+          "connectors",
+          "publications",
+          "other"
+        ],
+        "outcome": [
+          "restart"
+        ]
+      },
+      "cardinality_bound": 7
     }
   }
 }
