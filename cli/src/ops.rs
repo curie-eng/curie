@@ -8469,7 +8469,7 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         }));
     }
     ui.warn(&format!(
-        "this uninstalls release '{0}' in namespace '{1}', removes only that release's Helm hook Jobs, and deletes only namespaces carrying curietech.ai/created-by={0} AND curietech.ai/created-in={1}. Empty primary namespaces adopted by `cluster up` carry that pair; legacy unlabeled, foreign-content, foreign-owned, and shared controller namespaces are retained",
+        "this uninstalls release '{0}' in namespace '{1}', removes only that release's Helm hook Jobs, and deletes only namespaces carrying curietech.ai/created-by={0} AND curietech.ai/created-in={1}. Empty primary namespaces adopted by `cluster up` carry that pair; legacy unlabeled, foreign-content, foreign-owned, `--adopt`-adopted, and shared controller namespaces are retained",
         opts.common.release, opts.common.namespace
     ));
     if !opts.yes

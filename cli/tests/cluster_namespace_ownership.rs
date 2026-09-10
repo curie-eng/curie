@@ -1063,6 +1063,54 @@ fn adopt_override_records_what_it_adopted_and_stays_out_of_the_teardown_sweep() 
         "a re-run rewrote the recorded adoption"
     );
 
+    // #1654's legacy case: a namespace stamped by an older single-label CLI is
+    // deliberately unswept and, until now, had no supported way to complete its
+    // stamp. `--adopt` is that way, and it removes the half-pair rather than
+    // leaving the namespace half-owned -- which also means it converts a
+    // legacy namespace into a RETAINED one, so the record must say so.
+    let legacy = Fixture::new(
+        json!({NS: Fixture::namespace(
+            json!({"curietech.ai/created-by": RELEASE}),
+            Fixture::default_furniture()
+        )}),
+        json!({}),
+        false,
+        false,
+    );
+    let refused = legacy.up();
+    assert_blocked_before_helm(&legacy, &refused, "incomplete or foreign ownership labels");
+    assert!(
+        shown(&refused).contains("--adopt"),
+        "the legacy-stamp refusal must name the override: {}",
+        shown(&refused)
+    );
+    let output = legacy.up_in(NS, &["--adopt"]);
+    assert!(
+        !output.status.success(),
+        "the fixture Helm hook must still fail after adopting a legacy stamp"
+    );
+    let state = legacy.state();
+    let labels = &state["namespaces"][NS]["labels"];
+    assert!(
+        labels.get("curietech.ai/created-by").is_none(),
+        "the legacy half-pair survived the override: {labels}"
+    );
+    assert_eq!(
+        labels["curietech.ai/adopted-by"],
+        json!(RELEASE),
+        "the legacy stamp was not completed as an adoption: {labels}"
+    );
+    assert_eq!(
+        state["namespaces"][NS]["annotations"]["curietech.ai/adopted-labels"],
+        json!(format!("curietech.ai/created-by={RELEASE}")),
+        "the override did not record the legacy ownership label it removed"
+    );
+    assert!(legacy.down().status.success());
+    assert!(
+        legacy.state()["namespaces"].get(NS).is_some(),
+        "an adopted legacy namespace must be retained by down"
+    );
+
     // The load bearing negative control: teardown must retain it and its
     // pre-existing objects, because it never carries the sweep selector.
     let down = fixture.down();
