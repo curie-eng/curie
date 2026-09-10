@@ -81,10 +81,18 @@ component and rail detail in `charts/curie/README.md`.
   `_HEADERS` from the `otelCollector` block and calls `curie.otel.validate`, so
   adding it is what puts a workload inside chart-owned, validated telemetry, and
   omitting it is what leaves one outside. `grep -n 'curie.env.otel'
-  charts/curie/templates/` is the authoritative membership answer at any commit;
+  charts/curie/templates/` is the source-side membership answer at any commit;
   at the time of writing it selects `api.yaml`, `dispatcher.yaml`, `worker.yaml`,
   `agent-sandbox.yaml` (the runner) and `mail-adapter.yaml`. Adding a workload
-  means adding the include. Configuring the same three variables through that
+  means adding the include. The CI half is
+  `ci/instrumented-workload-assertions.sh` (#2360): it enumerates first-party
+  workloads from rendered chart-owned images (`ghcr.io/curie-eng/curie-*` and
+  single-component `curie-*` names), includes the runner SandboxTemplate,
+  classifies bootstrap/hooks/prewarm/UI as exemptions rather than skipping
+  them, and fails when a previously unknown first-party workload has no
+  `OTEL_EXPORTER_OTLP_ENDPOINT` or when that env is stripped from an existing
+  one. A sixth Deployment is therefore rejected instead of silently omitted
+  from an allowlist. Configuring the same three variables through that
   workload's `extraEnv` instead does **not** satisfy the
   `security.checkDefaultCredentials` production gate: each workload would then
   carry its own copy of the destination, so any one of them can drift from the

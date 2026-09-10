@@ -231,6 +231,17 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-durability-assertions.sh
 
+      # Prove every first-party chart workload carries the shared OTLP env
+      # (#2360). Membership is derived from rendered chart-owned images, not a
+      # named allowlist, so a sixth Deployment is rejected rather than skipped.
+      # Optional mail, the runner SandboxTemplate, collector-on vs external
+      # endpoint, and the two mutation controls (unknown-without-OTLP, stripped
+      # OTLP) live in this script rather than the durability suite.
+      - name: helm render assertions (instrumented first-party workloads)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/instrumented-workload-assertions.sh
+
       - name: helm render assertions (SRE bot observability stack)
         run: |
           set -euo pipefail
