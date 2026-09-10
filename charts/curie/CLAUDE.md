@@ -134,8 +134,10 @@ component and rail detail in `charts/curie/README.md`.
   everything a pod holding three credentials can talk to -- read the rules in
   `templates/mail-adapter.yaml` for the current set rather than trusting a count
   here. As written today they are DNS, this release's API pods, those
-  `agentmail.httpsCidrs` on TCP 443, and -- only while `otelCollector.deploy` is
-  true -- this release's OTel Collector on its gRPC and HTTP ports. With
+  `agentmail.httpsCidrs` on TCP 443, and exactly one collector peer: while
+  `otelCollector.deploy` is true, this release's OTel Collector on its gRPC and
+  HTTP ports; otherwise the declared `mailAdapter.otelEgress.httpsCidrs` as an
+  external ipBlock on `mailAdapter.otelEgress.port`. With
   `api.deploy` false, `mailAdapter.apiEgress.httpsCidrs` and `.port` replace the
   API pod selector with an explicit narrow BYO-API peer. Because this is the
   only first-party service with an egress policy at all, it is also the only one

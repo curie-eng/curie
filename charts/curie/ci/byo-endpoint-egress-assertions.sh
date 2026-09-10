@@ -116,8 +116,9 @@ API_BASE_URL=https://api.example.net
 # Each entry is `<template-basename>:<component>=reason`. The key is the FILE as
 # well as the component, because the same component gates a carve-out in more
 # than one NetworkPolicy template with different justifications (otelCollector
-# is both an in-chart runner peer and an in-chart mail-adapter peer, and only
-# one of those two is exempt).
+# is both an in-chart runner peer and an in-chart mail-adapter peer; neither is
+# exempt today -- the mail-adapter row was removed once #2361 gave that carve-out
+# a real BYO branch of its own).
 #
 # An exemption says: this in-chart `.deploy` carve-out deliberately has no BYO
 # `{{- else }}` branch, and here is why the external form of that destination is
