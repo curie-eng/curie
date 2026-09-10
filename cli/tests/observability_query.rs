@@ -1357,14 +1357,101 @@ fn series_span_is_validated_against_the_point_cap_before_dispatch() {
     assert_eq!(output.status.code(), Some(1));
     assert_only_error_fix(&one_stdout_object(&output));
 
+    // Compact ±HHMM is API-accepted (datetime.fromisoformat) and must not
+    // skip the pre-dispatch cap (code review).
+    let output = query(
+        "local",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1970-01-01T00:00:00+0000",
+            "--end",
+            "2026-01-01T00:00:00+0000",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_only_error_fix(&one_stdout_object(&output));
+
+    // Sibling path: the same query function serves cluster. At-cap still
+    // dispatches; over-cap still does not.
+    let output = query(
+        "cluster",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1970-01-01T00:00:00Z",
+            "--end",
+            "2026-01-01T00:00:00Z",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "cluster over-cap span must refuse before dispatch\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_only_error_fix(&one_stdout_object(&output));
+    let output = query(
+        "cluster",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1970-01-01T00:00:00Z",
+            "--end",
+            "1970-02-11T16:00:00Z",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_success(&output, "cluster at-cap hourly span dispatches");
+    let output = query(
+        "cluster",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1970-01-01T00:00:00Z",
+            "--end",
+            "1970-02-11T17:00:00Z",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_only_error_fix(&one_stdout_object(&output));
+
     let series_calls = server
         .recorded()
         .iter()
         .filter(|request| request.path.starts_with("/observability/metrics/series?"))
         .count();
     assert_eq!(
-        series_calls, 1,
-        "only the at-cap span may reach the API; every over-cap refusal precedes dispatch"
+        series_calls, 2,
+        "only the at-cap span may reach the API at each tier; every over-cap refusal precedes dispatch"
     );
 }
 

@@ -656,6 +656,21 @@ fn parse_api_timestamp(raw: &str) -> Option<time::OffsetDateTime> {
                 normalized.insert_str(offset_start, ":00");
             }
         }
+        // Python 3.11+ datetime.fromisoformat accepts a compact ±HHMM offset
+        // (no colon). RFC 3339 does not, so an over-cap span in that form
+        // would skip the pre-dispatch cap and still execute upstream (#1948
+        // code review). Insert the colon so the estimate sees the same window.
+        let bytes = normalized.as_bytes();
+        if let Some(sign_at) = bytes[11.min(bytes.len())..]
+            .iter()
+            .position(|byte| *byte == b'+' || *byte == b'-')
+            .map(|index| 11 + index)
+        {
+            let offset = &normalized[sign_at + 1..];
+            if offset.len() == 4 && offset.as_bytes().iter().all(|byte| byte.is_ascii_digit()) {
+                normalized.insert(sign_at + 3, ':');
+            }
+        }
         let bytes = normalized.as_bytes();
         // Nothing after byte 10 can carry an offset when the value is this
         // short, and slicing past the end would panic on an arbitrary
@@ -3079,6 +3094,7 @@ mod tests {
             ("1970-01-01T00:00:00", "2026-01-01T00:00:00"),
             ("1970-01-01T00:00Z", "2026-01-01T00:00Z"),
             ("1970-01-01T00:00+00:00", "2026-01-01T00:00+00:00"),
+            ("1970-01-01T00:00:00+0000", "2026-01-01T00:00:00+0000"),
         ] {
             let error = prevalidate_series_span("hour", Some(start), Some(end))
                 .expect_err("a 56 year hourly window must be refused in every API-accepted form");
