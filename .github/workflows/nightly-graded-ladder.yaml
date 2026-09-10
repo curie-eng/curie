@@ -324,7 +324,7 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@v5.0.1
         with:
           version: v3.16.4
       # GHA-layer-cached builds via a named buildx builder that is NOT made the
@@ -402,7 +402,7 @@ jobs:
       # node container sits on; its gateway is the host address the in-cluster
       # worker reaches the reply stub through, resolved below.
       - name: Create the kind cluster
-        uses: helm/kind-action@v1.14.0
+        uses: helm/kind-action@v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
