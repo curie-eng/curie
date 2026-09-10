@@ -496,8 +496,16 @@ fn metrics_preserve_complete_summary_and_series_dtos_and_filters() {
     let series = metric_series();
     let summary_body = serde_json::to_string(&summary).unwrap();
     let series_body = serde_json::to_string(&series).unwrap();
+    let agents = serde_json::to_string(&json!([
+        {"id": AGENT_ID, "name": "acme-bot", "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}], "memory": false}
+    ]))
+    .unwrap();
     let server = serve(move |request| {
-        if request.method == "GET" && request.path.starts_with("/observability/metrics/summary?") {
+        if request.method == "GET" && request.path == "/agents" {
+            Response::json(200, &agents)
+        } else if request.method == "GET"
+            && request.path.starts_with("/observability/metrics/summary?")
+        {
             Response::json(200, &summary_body)
         } else if request.method == "GET"
             && request.path.starts_with("/observability/metrics/series?")
@@ -559,12 +567,29 @@ fn metrics_preserve_complete_summary_and_series_dtos_and_filters() {
     }
 
     let recorded = server.recorded();
-    assert_eq!(recorded.len(), 4, "summary and series read once per tier");
+    assert_eq!(
+        recorded.len(),
+        8,
+        "agent lookup plus summary and series per tier"
+    );
     for request in &recorded {
         assert_eq!(request.header("x-api-key"), Some(TEST_API_KEY));
+    }
+    for request in recorded
+        .iter()
+        .filter(|request| request.path.starts_with("/observability/metrics/"))
+    {
         assert!(request.path.contains("start=2026-08-22T00%3A00%3A00Z"));
         assert!(request.path.contains("end=2026-08-23T00%3A00%3A00Z"));
-        assert!(request.path.contains("agent=acme-bot"));
+        // The name resolves to the agent's id and travels as the API's
+        // documented trace-name token (apps/api/src/curie_api/metrics.py::
+        // agent_trace_filter), never as the human-readable name.
+        assert!(
+            request.path.contains(&format!("agent=agent-{AGENT_ID}")),
+            "path: {}",
+            request.path
+        );
+        assert!(!request.path.contains("agent=acme-bot"));
     }
     for request in recorded
         .iter()
@@ -897,6 +922,449 @@ fn observability_api_errors_keep_specific_recovery_guidance() {
             .unwrap()
             .contains("narrow --start/--end"),
         "the typed bound's recovery must survive classification: {oversized_value}"
+    );
+}
+
+#[test]
+fn runs_refuse_an_empty_or_whitespace_agent_id_before_http() {
+    // #1948 AC1: a present-but-empty --agent-id is not an absent one. Forwarded
+    // verbatim it reaches FastAPI as agent_id=, which the API treats as no
+    // filter, and the "scoped" export silently returns every agent's traces.
+    let server = serve(|_| Response::json(500, r#"{"detail":"must not be called"}"#));
+    for tier in ["local", "cluster"] {
+        for raw in ["", "   "] {
+            let output = query(tier, &["runs", "--agent-id", raw], &server, true, false);
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{tier} --agent-id {raw:?} must be a usage refusal\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value = one_stdout_object(&output);
+            assert_only_error_fix(&value);
+            let error = value["error"].as_str().unwrap();
+            assert!(
+                error.contains("--agent-id"),
+                "the error must name the offending flag: {value}"
+            );
+            let fix = value["fix"].as_str().unwrap();
+            assert!(
+                fix.contains("agent id"),
+                "the fix must name what a usable --agent-id value is: {value}"
+            );
+        }
+    }
+    assert!(
+        server.recorded().is_empty(),
+        "an empty scope must be refused before any HTTP request is made"
+    );
+}
+
+#[test]
+fn metrics_agent_name_resolves_to_the_documented_trace_filter_token() {
+    // #1948 AC2: production trace names carry agent-<agent_id> (the runner
+    // names every trace curie-run:agent-<agent_id>-thread-<ts>), so the API's
+    // `agent` filter is a trace-name contains token agent-<agent_id>
+    // (apps/api/src/curie_api/metrics.py::agent_trace_filter). Forwarding the
+    // human-readable name matched nothing and read as zeroes. The mock below
+    // returns nonzero data ONLY for the resolved token, so the filter value
+    // the CLI actually sends decides the result: on pre-fix code this test
+    // reads the zero payloads and fails.
+    let agents = serde_json::to_string(&json!([
+        {"id": AGENT_ID, "name": "acme-bot", "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}], "memory": false},
+        {"id": "22222222-2222-2222-2222-222222222222", "name": "other-agent", "channels": [{"kind": "slack", "address": "C0EXAMPLE2"}], "memory": false}
+    ]))
+    .unwrap();
+    let token = format!("agent-{AGENT_ID}");
+    let summary_hit = json!({
+        "start": START, "end": END, "runs": 7, "latency_p95_ms": 125.5,
+        "tokens": 987, "cost_usd": 0.5, "cost_known": true, "error_rate": 0.125
+    });
+    let summary_zero = json!({
+        "start": START, "end": END, "runs": 0, "latency_p95_ms": 0.0,
+        "tokens": 0, "cost_usd": 0.0, "cost_known": true, "error_rate": 0.0
+    });
+    let series_hit = json!({
+        "metric": "runs", "granularity": "day", "start": START, "end": END,
+        "points": [{"ts": START, "value": 3.0}]
+    });
+    let series_zero = json!({
+        "metric": "runs", "granularity": "day", "start": START, "end": END,
+        "points": [{"ts": START, "value": 0.0}]
+    });
+    let summary_hit_body = serde_json::to_string(&summary_hit).unwrap();
+    let summary_zero_body = serde_json::to_string(&summary_zero).unwrap();
+    let series_hit_body = serde_json::to_string(&series_hit).unwrap();
+    let series_zero_body = serde_json::to_string(&series_zero).unwrap();
+    let server = serve(move |request| {
+        if request.method == "GET" && request.path == "/agents" {
+            Response::json(200, &agents)
+        } else if request.method == "GET"
+            && request.path.starts_with("/observability/metrics/summary?")
+        {
+            if request.path.contains(&format!("agent={token}")) {
+                Response::json(200, &summary_hit_body)
+            } else {
+                Response::json(200, &summary_zero_body)
+            }
+        } else if request.method == "GET"
+            && request.path.starts_with("/observability/metrics/series?")
+        {
+            if request.path.contains(&format!("agent={token}")) {
+                Response::json(200, &series_hit_body)
+            } else {
+                Response::json(200, &series_zero_body)
+            }
+        } else {
+            Response::json(500, r#"{"detail":"unexpected test request"}"#)
+        }
+    });
+
+    for tier in ["local", "cluster"] {
+        // The documented human name resolves to the agent's id and is sent as
+        // the API's trace-name token, not as the raw name.
+        let output = query(
+            tier,
+            &["metrics", "--agent", "acme-bot"],
+            &server,
+            true,
+            false,
+        );
+        let value = assert_success(&output, &format!("{tier} metrics --agent by name"));
+        assert_schema("observability-metrics.schema.json", &value);
+        assert_eq!(
+            value["runs"], 7,
+            "a named agent's metrics must come back nonzero: {value}"
+        );
+
+        let output = query(
+            tier,
+            &[
+                "metrics", "--metric", "runs", "--agent", "acme-bot", "--start", START, "--end",
+                END,
+            ],
+            &server,
+            true,
+            false,
+        );
+        let value = assert_success(&output, &format!("{tier} metrics series --agent by name"));
+        assert_eq!(
+            value["points"][0]["value"], 3.0,
+            "a named agent's series must come back nonzero: {value}"
+        );
+
+        // Passing the agent id directly keeps working and normalizes to the
+        // same documented token.
+        let output = query(
+            tier,
+            &["metrics", "--agent", AGENT_ID],
+            &server,
+            true,
+            false,
+        );
+        let value = assert_success(&output, &format!("{tier} metrics --agent by id"));
+        assert_eq!(
+            value["runs"], 7,
+            "an id-valued --agent resolves too: {value}"
+        );
+    }
+
+    let recorded = server.recorded();
+    let lookups = recorded
+        .iter()
+        .filter(|request| request.path == "/agents")
+        .count();
+    assert_eq!(
+        lookups, 6,
+        "every --agent query resolves the name through one agent-list lookup"
+    );
+    for request in recorded
+        .iter()
+        .filter(|request| request.path.starts_with("/observability/metrics/"))
+    {
+        assert!(
+            request.path.contains(&format!("agent=agent-{AGENT_ID}")),
+            "the outgoing filter must be the documented trace-name token: {}",
+            request.path
+        );
+        assert!(
+            !request.path.contains("agent=acme-bot"),
+            "the human name must never be forwarded as the filter value: {}",
+            request.path
+        );
+    }
+}
+
+#[test]
+fn metrics_refuse_an_unknown_agent_and_an_empty_agent_value() {
+    // #1948 AC2, refusal half: --agent must resolve to a real platform agent,
+    // and a present-but-empty value is refused without a lookup, mirroring the
+    // runs --agent-id refusal so both flags answer the same falsey class.
+    let agents = serde_json::to_string(&json!([
+        {"id": "22222222-2222-2222-2222-222222222222", "name": "other-agent", "channels": [{"kind": "slack", "address": "C0EXAMPLE2"}], "memory": false}
+    ]))
+    .unwrap();
+    let server = serve(move |request| {
+        if request.method == "GET" && request.path == "/agents" {
+            Response::json(200, &agents)
+        } else {
+            Response::json(500, r#"{"detail":"unexpected test request"}"#)
+        }
+    });
+
+    let output = query(
+        "local",
+        &["metrics", "--agent", "acme-bot"],
+        &server,
+        true,
+        false,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unresolvable agent name must be a usage refusal\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value = one_stdout_object(&output);
+    assert_only_error_fix(&value);
+    assert!(
+        value["error"].as_str().unwrap().contains("acme-bot"),
+        "the error must name the unresolvable value: {value}"
+    );
+    let fix = value["fix"].as_str().unwrap();
+    assert!(
+        fix.contains("name") && fix.contains("agent id"),
+        "the fix must name what --agent accepts: {value}"
+    );
+
+    for raw in ["", "   "] {
+        let output = query("local", &["metrics", "--agent", raw], &server, true, false);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "--agent {raw:?} must be a usage refusal\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_only_error_fix(&one_stdout_object(&output));
+    }
+    let lookups = server
+        .recorded()
+        .iter()
+        .filter(|request| request.path == "/agents")
+        .count();
+    assert_eq!(
+        lookups, 1,
+        "only the unknown-name case may consult the agent list; the empty refusals precede it"
+    );
+    assert!(
+        !server
+            .recorded()
+            .iter()
+            .any(|request| request.path.starts_with("/observability/metrics/")),
+        "no metrics query is dispatched for a refused --agent"
+    );
+}
+
+#[test]
+fn series_span_is_validated_against_the_point_cap_before_dispatch() {
+    // #1948 AC3: the 1,000-point series cap must be enforced before the
+    // upstream request, because the backend has already paid for the query by
+    // the time the response is buffered. The boundary control proves the guard
+    // is the point cap itself: exactly 1,000 hour buckets dispatch, 1,001 do
+    // not.
+    let series = json!({
+        "metric": "runs", "granularity": "hour", "start": START, "end": END,
+        "points": [{"ts": START, "value": 1.0}]
+    });
+    let body = serde_json::to_string(&series).unwrap();
+    let server = serve(move |request| {
+        if request.method == "GET" && request.path.starts_with("/observability/metrics/series?") {
+            Response::json(200, &body)
+        } else {
+            Response::json(500, r#"{"detail":"unexpected test request"}"#)
+        }
+    });
+
+    // The issue's repro shape: an hourly 1970 to 2026 window.
+    let output = query(
+        "local",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1970-01-01T00:00:00Z",
+            "--end",
+            "2026-01-01T00:00:00Z",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an over-cap span is a runtime failure, the same class the post-hoc bound used\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value = one_stdout_object(&output);
+    assert_only_error_fix(&value);
+    assert!(
+        value["fix"]
+            .as_str()
+            .unwrap()
+            .contains("narrow --start/--end"),
+        "the pre-dispatch refusal keeps the typed bound's recovery: {value}"
+    );
+    assert!(
+        !value["error"].as_str().unwrap().contains("500"),
+        "the refusal is the CLI's own guard, not the server's answer: {value}"
+    );
+
+    // Boundary: exactly 1,000 hour buckets is at the cap, not above it.
+    // 1970-01-01T00:00:00Z + 1000h = 1970-02-11T16:00:00Z.
+    let output = query(
+        "local",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1970-01-01T00:00:00Z",
+            "--end",
+            "1970-02-11T16:00:00Z",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_success(&output, "at-cap hourly span dispatches");
+
+    // One bucket over the boundary is refused again.
+    let output = query(
+        "local",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1970-01-01T00:00:00Z",
+            "--end",
+            "1970-02-11T17:00:00Z",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_only_error_fix(&one_stdout_object(&output));
+
+    // A --start with no --end is unbounded server-side (the API defaults end to
+    // now), so the CLI validates that shape against now as well.
+    let output = query(
+        "local",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1970-01-01T00:00:00Z",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_only_error_fix(&one_stdout_object(&output));
+
+    // A fractional-second end past the cap boundary opens the boundary's
+    // bucket, so it is refused on the consumer path too (round 3).
+    let output = query(
+        "local",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1970-01-01T00:00:00Z",
+            "--end",
+            "1970-02-11T16:00:00.500Z",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_only_error_fix(&one_stdout_object(&output));
+
+    // A fractional pre-epoch start floors down at nanosecond precision, so
+    // this cap-length window touches 1,001 buckets (round 5).
+    let output = query(
+        "local",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1969-12-31T23:59:59.500Z",
+            "--end",
+            "1970-02-11T16:00:00Z",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_only_error_fix(&one_stdout_object(&output));
+
+    // The API's fromisoformat accepts date-only values the strict RFC 3339
+    // parser rejects, so the guard parses them too instead of forwarding the
+    // span unprevalidated (scope review). The same applies to an
+    // offset-bearing minute-truncated timestamp.
+    let output = query(
+        "local",
+        &[
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+            "1970-01-01T00:00Z",
+            "--end",
+            "2026-01-01T00:00Z",
+        ],
+        &server,
+        true,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_only_error_fix(&one_stdout_object(&output));
+
+    let series_calls = server
+        .recorded()
+        .iter()
+        .filter(|request| request.path.starts_with("/observability/metrics/series?"))
+        .count();
+    assert_eq!(
+        series_calls, 1,
+        "only the at-cap span may reach the API; every over-cap refusal precedes dispatch"
     );
 }
 
