@@ -60,6 +60,7 @@ dev = [
     "curie-wire-tolerance-gate",
     "curie-test-support",
     "pytest>=8.3",
+    "pytest-xdist>=3.6",
     "ruff>=0.16.2",
     "mypy>=2.3.0",
     "import-linter>=2.0",
