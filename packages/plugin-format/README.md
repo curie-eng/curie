@@ -57,8 +57,10 @@ Pydantic models mirroring the Claude Code shapes:
   is a separate not-yet-built seam (see `docs/interfaces/triggers/INTERFACE.md`),
   so this is validation only today.
 - `ApprovalPolicy` / `ApprovalGate` (the manifest `approvalPolicy` field, #273):
-  `{gates: [{gate, route}]}` — each gate names a pause point and the approval
-  route that decides it; both are required. **Deploy-time validation** rejects a
+  `{gates: [{gate, route, grantableViaPolicy, summary}]}` — each gate names a pause
+  point and the approval route that decides it; both `gate` and `route` are
+  required. Optional `summary` (#2565) is a bundle-authored sentence template
+  rendered onto the approval card. **Deploy-time validation** rejects a
   malformed policy or a gate missing `gate`/`route`. It also rejects a gate whose
   (whitespace-stripped) name starts with `mcp__` but is not a live,
   fully-namespaced tool name for a server the bundle declares

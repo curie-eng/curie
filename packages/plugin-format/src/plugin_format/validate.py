@@ -31,6 +31,7 @@ from .connector_lock import (
 )
 from .connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from .deploy_targets import validate_deploy_targets
+from .gate_summary import check_gate_summary_template
 from .manifest import resolve_manifest
 from .models import (
     _TRIGGER_TYPES,
@@ -938,6 +939,10 @@ def _validate_approval_policy(
         # looks built-in on the raw string would arm a mis-namespaced tool at
         # runtime and silently never fire (#453).
         stripped_gate = gate.gate.strip()
+        if gate.summary is not None:
+            summary_err = check_gate_summary_template(gate.summary)
+            if summary_err is not None:
+                c.error("approval_policy.summary_invalid", summary_err, loc)
         if expected_prefixes is None or not stripped_gate.startswith("mcp__"):
             continue
 

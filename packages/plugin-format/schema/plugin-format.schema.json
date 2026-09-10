@@ -2,7 +2,7 @@
   "$defs": {
     "ApprovalGate": {
       "additionalProperties": true,
-      "description": "One approval gate declaration: a gate point plus the route it sends to.\n\n``gate`` names the point at which the agent pauses for approval (e.g. a tool\nclass or lifecycle point); ``route`` names the approval route that decides.\nBoth are required \u2014 an incomplete gate is rejected at deploy.\n``grantableViaPolicy`` is the operator opt-in (#558): when true, a policy-gate\napproval on this gate's route MAY mint a one-shot grant for the manifest tool\n``gate`` names; default false preserves #544's policy-never-grants behavior.",
+      "description": "One approval gate declaration: a gate point plus the route it sends to.\n\n``gate`` names the point at which the agent pauses for approval (e.g. a tool\nclass or lifecycle point); ``route`` names the approval route that decides.\nBoth are required \u2014 an incomplete gate is rejected at deploy.\n``grantableViaPolicy`` is the operator opt-in (#558): when true, a policy-gate\napproval on this gate's route MAY mint a one-shot grant for the manifest tool\n``gate`` names; default false preserves #544's policy-never-grants behavior.\n``summary`` is an optional bundle-authored sentence template (#2565) rendered\nfrom the blocked call's arguments onto the approval card and notice. Absent,\nthe platform keeps the machine ``summarize_tool_call`` string.",
       "properties": {
         "gate": {
           "title": "Gate",
@@ -16,6 +16,18 @@
         "route": {
           "title": "Route",
           "type": "string"
+        },
+        "summary": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Summary"
         }
       },
       "required": [

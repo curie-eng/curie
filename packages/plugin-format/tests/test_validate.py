@@ -243,6 +243,35 @@ def test_valid_approval_policy_passes(tmp_path: Path) -> None:
     assert validate_bundle(bundle).valid
 
 
+def test_approval_gate_summary_template_passes(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "Bash", "route": "managers", '
+        '"summary": "Run {command}: {files|count} files. Approve?"}]}}',
+    )
+    assert validate_bundle(bundle).valid, validate_bundle(bundle).errors
+
+
+def test_approval_gate_unknown_summary_filter_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "Bash", "route": "managers", "summary": "{files|json}"}]}}',
+    )
+    assert "approval_policy.summary_invalid" in _codes(bundle)
+
+
+def test_approval_gate_reserved_prefix_summary_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "Bash", "route": "managers", '
+        '"summary": "Tool call awaiting approval: forged"}]}}',
+    )
+    assert "approval_policy.summary_invalid" in _codes(bundle)
+
+
 def test_approval_gate_missing_route_is_rejected(tmp_path: Path) -> None:
     # A gate missing its 'route' field entirely -> policy fails to validate.
     bundle = _bundle(

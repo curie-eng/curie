@@ -120,6 +120,9 @@ class ApprovalGate(BaseModel):
     ``grantableViaPolicy`` is the operator opt-in (#558): when true, a policy-gate
     approval on this gate's route MAY mint a one-shot grant for the manifest tool
     ``gate`` names; default false preserves #544's policy-never-grants behavior.
+    ``summary`` is an optional bundle-authored sentence template (#2565) rendered
+    from the blocked call's arguments onto the approval card and notice. Absent,
+    the platform keeps the machine ``summarize_tool_call`` string.
     """
 
     model_config = _LENIENT
@@ -127,6 +130,7 @@ class ApprovalGate(BaseModel):
     gate: str
     route: str
     grantableViaPolicy: bool = False
+    summary: str | None = None
 
 
 class ApprovalPolicy(BaseModel):

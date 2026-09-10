@@ -840,8 +840,20 @@
       "type": "object"
     },
     "Final": {
-      "description": "The terminal response event, carrying the session status.\n\n``approval_summary`` accompanies an ``awaiting-approval`` status (ADR-0010):\nthe human-readable statement of what needs approval, captured from the\nrun's approval request so the platform can persist it on the durable\n``Approval`` record and show it to the approver. ``approval_route`` names\nthe approval route the request targets (#247): declared in the bundle\nmanifest's ``approvalPolicy`` (versioned with the agent), bound to a\nworkspace channel per deployment by the worker. Both ``None`` on every\nother status; ``approval_route`` also ``None`` when the request named no\nroute (the platform falls back to the requesting channel).\n\n``approval_gate_kind`` records which gate produced the request (#544):\n``'permission'`` when the runner's tool-permission gate denied a real tool\ncall, ``'policy'`` when the model asked for a business-decision approval.\nIt is the durable provenance the worker branches on instead of sniffing the\nsummary prefix. ``approval_granted_tool`` carries the tool name the\npermission gate denied -- the trusted ``can_use_tool`` value the resume-turn\ngrant is bound to -- and is only ever set for ``approval_gate_kind =\n'permission'``; a policy gate never authorizes a tool, so it stays ``None``.\nBoth ``None`` on every other status, and ``None`` from an older runner that\npredates these fields (the worker falls back to the prefix parse then).\n\n``input_tokens``/``output_tokens`` carry the turn's model token usage when\nthe harness reported it (#390): the runner stamps them from the SDK result's\n``usage`` so a consumer can attribute a dollar cost to the turn (model\npricing lives with the consumer, not on the wire). Both ``None`` when usage\nwas unavailable -- the fake-model path, a provider that reports no usage, or\nan older runner that predates these fields -- so a consumer computing cost\nleaves it unknown rather than counting the turn as free. Additive optional\nscalars: a tolerant consumer decoding an older producer's ``final`` simply\nsees them absent.",
+      "description": "The terminal response event, carrying the session status.\n\n``approval_summary`` accompanies an ``awaiting-approval`` status (ADR-0010):\nthe human-readable statement of what needs approval, captured from the\nrun's approval request so the platform can persist it on the durable\n``Approval`` record and show it to the approver. ``approval_route`` names\nthe approval route the request targets (#247): declared in the bundle\nmanifest's ``approvalPolicy`` (versioned with the agent), bound to a\nworkspace channel per deployment by the worker. Both ``None`` on every\nother status; ``approval_route`` also ``None`` when the request named no\nroute (the platform falls back to the requesting channel).\n\n``approval_gate_kind`` records which gate produced the request (#544):\n``'permission'`` when the runner's tool-permission gate denied a real tool\ncall, ``'policy'`` when the model asked for a business-decision approval.\nIt is the durable provenance the worker branches on instead of sniffing the\nsummary prefix. ``approval_granted_tool`` carries the tool name the\npermission gate denied -- the trusted ``can_use_tool`` value the resume-turn\ngrant is bound to -- and is only ever set for ``approval_gate_kind =\n'permission'``; a policy gate never authorizes a tool, so it stays ``None``.\nBoth ``None`` on every other status, and ``None`` from an older runner that\npredates these fields (the worker falls back to the prefix parse then).\n\n``approval_display`` is the optional human sentence a bundle-authored\npermission-gate template rendered (#2565). ``None`` means the card and\nnotice use ``approval_summary`` (today's machine string). It is never the\ngrant-provenance signal; that stays ``approval_gate_kind`` /\n``approval_granted_tool``. Additive optional scalar: a tolerant consumer\ndecoding an older producer's ``final`` simply sees it absent.\n\n``input_tokens``/``output_tokens`` carry the turn's model token usage when\nthe harness reported it (#390): the runner stamps them from the SDK result's\n``usage`` so a consumer can attribute a dollar cost to the turn (model\npricing lives with the consumer, not on the wire). Both ``None`` when usage\nwas unavailable -- the fake-model path, a provider that reports no usage, or\nan older runner that predates these fields -- so a consumer computing cost\nleaves it unknown rather than counting the turn as free. Additive optional\nscalars: a tolerant consumer decoding an older producer's ``final`` simply\nsees them absent.",
       "properties": {
+        "approval_display": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Approval Display"
+        },
         "approval_gate_kind": {
           "anyOf": [
             {
@@ -1396,6 +1408,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.4.4",
-  "title": "ACI Protocol v0.4.4"
+  "protocolVersion": "0.4.5",
+  "title": "ACI Protocol v0.4.5"
 }
