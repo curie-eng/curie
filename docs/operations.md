@@ -722,6 +722,7 @@ mailAdapter:
 | `mailAdapter.agentmail.apiKeyExistingSecret` / `apiKeyExistingSecretKey` | Source the AgentMail API key from an operator-managed Secret instead of the chart Secret (default key `mailAgentmailApiKey`). |
 | `mailAdapter.agentmail.httpsCidrs` | Required provider/proxy destination CIDRs on TCP 443. The mail pod's egress policy otherwise allows only DNS and this release's API pods. |
 | `mailAdapter.apiEgress.httpsCidrs` / `port` | Required narrow destination peers when `api.deploy=false`; default port `8000`. Ignored for the in-chart API, whose pod selector and service port are used instead. |
+| `mailAdapter.otelEgress.httpsCidrs` / `port` | Required narrow destination peers when the release's effective OTLP endpoint is external (`otelCollector.deploy=false` with `otelCollector.endpoint` set); the render is refused without it. `port` is optional and derives from the endpoint URL. Ignored for the in-chart collector, whose pod selector is used instead. |
 | `mailAdapter.persistence.size` / `storageClass` | Chart-managed RWO SQLite PVC. The default size is `1Gi`; empty storage class inherits `global.storageClass` and then the cluster default. |
 | `mailAdapter.persistence.existingClaim` | Mount an existing same-namespace RWO Filesystem PVC instead of rendering one. An install/upgrade hook checks the exact claim before replacing the pod. |
 

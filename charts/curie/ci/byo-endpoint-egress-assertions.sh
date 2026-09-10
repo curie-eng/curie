@@ -116,8 +116,9 @@ API_BASE_URL=https://api.example.net
 # Each entry is `<template-basename>:<component>=reason`. The key is the FILE as
 # well as the component, because the same component gates a carve-out in more
 # than one NetworkPolicy template with different justifications (otelCollector
-# is both an in-chart runner peer and an in-chart mail-adapter peer, and only
-# one of those two is exempt).
+# is both an in-chart runner peer and an in-chart mail-adapter peer; neither is
+# exempt today -- the mail-adapter row was removed once #2361 gave that carve-out
+# a real BYO branch of its own).
 #
 # An exemption says: this in-chart `.deploy` carve-out deliberately has no BYO
 # `{{- else }}` branch, and here is why the external form of that destination is
@@ -126,7 +127,6 @@ API_BASE_URL=https://api.example.net
 declare -a DEPLOY_GATE_EXEMPTIONS=(
   "security-networkpolicy.yaml:inference=an external inference endpoint is the model API, already governed by the operator's security.networkPolicy.allowedEgress model allowlist, which is the intended mechanism there"
   "mail-adapter.yaml:mailAdapter=this is the whole-template deploy gate for the mail adapter itself, not an egress carve-out: with mailAdapter.deploy false there is no adapter pod, no policy, and no destination to bring your own"
-  "mail-adapter.yaml:otelCollector=deliberate, documented asymmetry. The mail adapter is the only first-party workload with its own egress policy, so with otelCollector.deploy false and an external otelCollector.endpoint the chart invents no broad allow for an address it cannot know; the operator applies an additional egress policy selecting the adapter's labels, because NetworkPolicies union rather than intersect. Written up in charts/curie/README.md -- search for \"asymmetric\" in the mail adapter section"
 )
 
 fail() {

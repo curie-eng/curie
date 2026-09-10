@@ -74,6 +74,13 @@
 #      otelCollector.deploy is true. The adapter is the ONLY first-party service
 #      with an egress-restricting policy, so OTLP env without this peer exports
 #      into a dropped connection while every render still looks green.
+#   23 An EXTERNAL OTLP endpoint fails closed. The adapter's effective endpoint
+#      is curie.otel.endpoint, so when that is not this release's in-chart
+#      Collector the render REFUSES unless mailAdapter.otelEgress.httpsCidrs
+#      declares a narrow peer, which then renders as one ipBlock rule on the
+#      port derived from the endpoint URL. Overbroad peers, a port contradicting
+#      the URL, and a stale key set while the in-chart Collector is deployed all
+#      refuse; otelCollector.telemetryDisabled=true remains the escape hatch.
 #
 # NOTE ON `--output-dir`: copied deliberately from
 # dispatcher-api-wiring-assertions.sh. In this environment `helm template` into a
@@ -1164,7 +1171,8 @@ otel_external_dir="$(render otel-external "${ON[@]}" "${CREDS[@]}" \
   --set otelCollector.endpoint=https://otel.example.com:4318 \
   --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
   --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
-  --set 'otelCollector.egress[0].ports[0].port=4318')"
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32')"
 assert_env_value "$otel_external_dir" OTEL_EXPORTER_OTLP_ENDPOINT "https://otel.example.com:4318" \
   "otelCollector.endpoint must render verbatim on the adapter, exactly as it does on the other instrumented workloads."
 assert_env_value "$otel_external_dir" OTEL_EXPORTER_OTLP_PROTOCOL "http/protobuf" \
@@ -1346,12 +1354,428 @@ python3 "$OTEL_EGRESS_PY" "$on_dir" yes 4 203.0.113.0/24 \
 # never deployed.
 python3 "$OTEL_EGRESS_PY" "$otel_disabled_dir" no 3 203.0.113.0/24 \
   || fail "with the chart collector not deployed, the mail adapter's egress policy is not back to its three original rules; see the message above"
-python3 "$OTEL_EGRESS_PY" "$otel_external_dir" no 3 203.0.113.0/24 \
-  || fail "an EXTERNAL otelCollector.endpoint must not synthesize an in-cluster collector peer; that destination is an IP the chart cannot know (see the template comment and README)"
+# Under the #2361 contract this render must ALSO declare its own OTLP peer, so
+# the count is four: DNS, the API peer, AgentMail, and the declared external
+# collector ipBlock. The intent of the assertion is unchanged -- the external
+# collector must be reached as an operator-declared IP peer and must never be
+# synthesized as an in-cluster podSelector peer for a Collector pod that
+# otelCollector.deploy=false says does not exist.
+python3 "$OTEL_EGRESS_PY" "$otel_external_dir" no 4 203.0.113.0/24 \
+  || fail "an EXTERNAL otelCollector.endpoint must not synthesize an in-cluster collector peer; that destination is an IP the chart cannot know, and it must arrive as the declared mailAdapter.otelEgress ipBlock rule instead"
 
 # The BYO-API render assertion 17 already exercises: the collector peer must
 # coexist with the explicit BYO API CIDR rule rather than replacing it.
 python3 "$OTEL_EGRESS_PY" "$byo_api_dir" yes 4 198.51.100.0/24 \
   || fail "with api.deploy=false the collector peer and the BYO API CIDR rule do not coexist; see the message above"
 
-echo "OK: mail-adapter chart wiring and build-path render assertions passed (22 assertions)"
+# ---------------------------------------------------------------------------
+# 23: an EXTERNAL OTLP collector endpoint fails closed (#2361). The adapter is
+#     the only first-party workload with an egress-restricting policy, and it
+#     deliberately has no `mailAdapter.extraEnv`, so its effective OTLP endpoint
+#     IS `curie.otel.endpoint`. When that endpoint is not this release's in-chart
+#     Collector, the policy has no peer for it and every span, metric and log is
+#     dropped by the pod's own rail while `helm template` stays green and the
+#     rendered env still looks perfect -- exactly the silent-hole shape the
+#     adjacent mailAdapter.apiEgress gate already refuses. These assertions pin
+#     the reversal of that documented drop: refuse rather than document.
+#
+#     Read structurally, never by grep. The OTLP peer is an ipBlock rule in a
+#     policy that ALREADY carries ipBlock rules (AgentMail on 443, and a BYO API
+#     on its own port), so a line reader cannot tell which rule it is looking at
+#     and would happily accept an OTLP "peer" that is really the AgentMail rule.
+#
+#     Every render below that pairs otelCollector.deploy=false with a non-empty
+#     otelCollector.endpoint ALSO sets otelCollector.egress. That is not this
+#     section's own gate: it is the pre-existing, unrelated #2317 runner-sandbox
+#     refusal at templates/security-networkpolicy.yaml:386, which fires on that
+#     exact combination and fails the render before the mail-adapter path under
+#     test is ever reached. Without it these renders die on the runner's fail
+#     closed message instead of exercising (or refusing for) the mail-adapter
+#     reason this section asserts. Do not drop these flags as copy-paste noise.
+# ---------------------------------------------------------------------------
+OTLP_IPBLOCK_PY="$TMP/mail-otlp-ipblock.py"
+cat > "$OTLP_IPBLOCK_PY" <<'PY'
+"""Assert the mail adapter's EXTERNAL-OTLP ipBlock rule, structurally.
+
+argv: <rendered-dir> <expect: rule|none> <expected-cidrs-csv|-> <expected-port|->
+      <known-non-otlp-cidrs-csv>
+
+The last argument is what makes this reader honest. The mail adapter's egress
+policy legitimately carries other ipBlock rules (AgentMail on TCP 443, and, when
+api.deploy is false, the BYO API peer on its configured port). Those are named
+explicitly and excluded; whatever ipBlock rule is LEFT is the OTLP rule. That way
+a template which "renders an OTLP peer" by accidentally widening the AgentMail
+rule fails here instead of passing.
+"""
+import pathlib
+import sys
+
+import yaml
+
+rendered, expect = sys.argv[1], sys.argv[2]
+expected_cidrs = (
+    {c for c in sys.argv[3].split(",") if c} if sys.argv[3] != "-" else set()
+)
+expected_port = int(sys.argv[4]) if sys.argv[4] != "-" else None
+known_other = {c for c in sys.argv[5].split(",") if c} if len(sys.argv) > 5 else set()
+
+policies = [
+    doc
+    for path in pathlib.Path(rendered).rglob("*.yaml")
+    for doc in yaml.safe_load_all(path.read_text())
+    if isinstance(doc, dict)
+    and doc.get("kind") == "NetworkPolicy"
+    and doc.get("spec", {}).get("podSelector", {}).get("matchLabels", {}).get(
+        "app.kubernetes.io/component"
+    )
+    == "mail-adapter"
+]
+if len(policies) != 1:
+    raise SystemExit(
+        f"expected exactly ONE NetworkPolicy selecting the mail adapter, found "
+        f"{len(policies)}. Decision 3 keeps a single policy object for this "
+        "credential-bearing pod so an auditor reads one object to see every "
+        "destination it may reach; a second object hides half the answer."
+    )
+egress = policies[0].get("spec", {}).get("egress") or []
+
+ipblock_rules = []
+for rule in egress:
+    peers = rule.get("to") or []
+    if not peers or not all(peer.get("ipBlock") for peer in peers):
+        continue
+    cidrs = {peer["ipBlock"].get("cidr") for peer in peers}
+    ipblock_rules.append((cidrs, rule.get("ports") or []))
+
+candidates = [(c, p) for c, p in ipblock_rules if not c <= known_other]
+
+if expect == "none":
+    if candidates:
+        raise SystemExit(
+            f"an OTLP ipBlock rule rendered where none may exist: {candidates!r} "
+            f"(known non-OTLP CIDRs were {sorted(known_other)!r}). Either the "
+            "in-chart Collector is deployed -- in which case the peer must be the "
+            "pod-selector rule, not an IP the chart cannot know -- or telemetry is "
+            "disabled, in which case the adapter exports nothing and must be "
+            "granted nothing."
+        )
+elif expect == "rule":
+    if len(candidates) != 1:
+        raise SystemExit(
+            f"expected exactly ONE external-OTLP ipBlock rule, found "
+            f"{len(candidates)}: {candidates!r} (known non-OTLP CIDRs were "
+            f"{sorted(known_other)!r}). Zero means the operator declared "
+            "mailAdapter.otelEgress.httpsCidrs and the chart silently ignored it, "
+            "leaving the export dropped; more than one means the rule set is "
+            "widening past the single declared destination."
+        )
+    cidrs, ports = candidates[0]
+    if cidrs != expected_cidrs:
+        raise SystemExit(
+            f"the external-OTLP rule reaches {sorted(cidrs)!r}, expected exactly "
+            f"{sorted(expected_cidrs)!r}. A peer that is broader than what the "
+            "operator declared is a new egress escape hatch on the pod that holds "
+            "the channel token, the egress secret and the AgentMail API key."
+        )
+    want_ports = [{"protocol": "TCP", "port": expected_port}]
+    if ports != want_ports:
+        raise SystemExit(
+            f"the external-OTLP rule opens {ports!r}, expected {want_ports!r}. The "
+            "port is derived from the resolved endpoint URL (explicit port, else "
+            "443 for https and 80 for http); getting it wrong renders a peer that "
+            "looks configured and still drops every export."
+        )
+else:
+    raise SystemExit(f"bad expect argument {expect!r}")
+PY
+
+# Zero-policy reader for the adapter-off case. `render` already proves the exit
+# code; this proves the render is NOT empty, so "no mail-adapter policy" cannot
+# pass because nothing rendered at all.
+NO_MAIL_POLICY_PY="$TMP/mail-no-policy.py"
+cat > "$NO_MAIL_POLICY_PY" <<'PY'
+"""Assert zero mail-adapter NetworkPolicies in a NON-EMPTY render.
+
+argv: <rendered-dir>
+"""
+import pathlib
+import sys
+
+import yaml
+
+docs = [
+    doc
+    for path in pathlib.Path(sys.argv[1]).rglob("*.yaml")
+    for doc in yaml.safe_load_all(path.read_text())
+    if isinstance(doc, dict)
+]
+if len(docs) < 5:
+    raise SystemExit(
+        f"the render produced only {len(docs)} object(s); the absence assertion "
+        "below would pass because nothing rendered, not because the gate is "
+        "correctly scoped to mailAdapter.deploy."
+    )
+mail = [
+    doc
+    for doc in docs
+    if doc.get("kind") == "NetworkPolicy"
+    and doc.get("spec", {}).get("podSelector", {}).get("matchLabels", {}).get(
+        "app.kubernetes.io/component"
+    )
+    == "mail-adapter"
+]
+if mail:
+    raise SystemExit(
+        f"mailAdapter.deploy is false but {len(mail)} mail-adapter NetworkPolicy "
+        "object(s) rendered. The OTLP gate must live entirely inside the adapter's "
+        "own conditional: an operator who never asked for the mail adapter must "
+        "never be asked for its collector CIDRs, and must never receive a policy "
+        "selecting pods that do not exist."
+    )
+PY
+
+# Two-substring variant of assert_render_fails_named. The port-mismatch and
+# endpoint-naming failures are only useful if the message names BOTH halves of
+# the contradiction; a message that says "port mismatch" without printing the
+# two ports sends the operator back to the values file to guess.
+assert_render_fails_naming_both() {
+  # $1 label, $2 first required substring, $3 second required substring,
+  # remaining helm args.
+  local label="$1" first="$2" second="$3" output rc
+  shift 3
+  set +e
+  output="$(helm template "$RELEASE" "$CHART" "$@" 2>&1)"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] \
+    || fail "$label rendered successfully; this configuration must fail closed"
+  case "$output" in
+    *"$first"*) : ;;
+    *) fail "$label failed without naming '$first'; an operator cannot act on a message that omits it. Output was: $output" ;;
+  esac
+  case "$output" in
+    *"$second"*) : ;;
+    *) fail "$label failed without naming '$second'; an operator cannot act on a message that omits it. Output was: $output" ;;
+  esac
+}
+
+# 23a: the adapter is off. No policy, no demand for CIDRs, and a real render
+#      behind the absence check.
+otlp_adapter_off_dir="$(render otlp-adapter-off \
+  --set mailAdapter.deploy=false \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318')"
+python3 "$NO_MAIL_POLICY_PY" "$otlp_adapter_off_dir" \
+  || fail "with mailAdapter.deploy=false an external collector endpoint must render cleanly and produce no mail-adapter policy; see the message above"
+
+# 23b: the default, in-chart collector path is UNCHANGED. Assertion 22 above
+#      already pinned the pod-selector peer and the rule count; what is added
+#      here is that the chart did not ALSO invent an ipBlock for a collector it
+#      can select by label. Two peers for one destination is a widening.
+python3 "$OTLP_IPBLOCK_PY" "$on_dir" none - - 203.0.113.0/24 \
+  || fail "the default in-chart collector render grew an OTLP ipBlock peer; the in-chart Collector is selectable by pod label and must never be reached by a hardcoded address as well"
+
+# 23c: the key is read ONLY when the endpoint is external. A stale
+#      mailAdapter.otelEgress.httpsCidrs left behind after an operator moved
+#      back to the in-chart collector must be surfaced, not silently ignored --
+#      the same refusal #2367 applies to the runner's override keys. Silently
+#      ignored config is how an operator comes to believe a peer exists.
+assert_render_fails_named \
+  "in-chart collector WITH mailAdapter.otelEgress.httpsCidrs set" \
+  "mailAdapter.otelEgress.httpsCidrs" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32'
+
+# 23d: the headline gate. An external endpoint with no declared peer must refuse
+#      and must name the RESOLVED endpoint, so the operator learns which address
+#      needs a CIDR rather than being told a key is missing in the abstract.
+assert_render_fails_naming_both \
+  "external otelCollector.endpoint with no mailAdapter.otelEgress.httpsCidrs" \
+  "mailAdapter.otelEgress.httpsCidrs" \
+  "https://otel.example.com:4318" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318'
+
+# 23e: the positive path. Four rules, an ipBlock peer on the port derived from
+#      the URL, NO synthesized in-cluster collector peer (the chart cannot know
+#      that pod exists), and the AgentMail rule still intact beside it.
+otlp_external_ok_dir="$(render otlp-external-ok "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32')"
+python3 "$OTEL_EGRESS_PY" "$otlp_external_ok_dir" no 4 203.0.113.0/24 \
+  || fail "a declared external OTLP peer must add a FOURTH rule without synthesizing an in-cluster collector podSelector peer, and must not displace the AgentMail rule; see the message above"
+python3 "$OTLP_IPBLOCK_PY" "$otlp_external_ok_dir" rule 192.0.2.40/32 4318 203.0.113.0/24 \
+  || fail "the declared external OTLP peer did not render as a narrow ipBlock rule on the endpoint's port; see the message above"
+
+# 23f: overbroad peers are refused by the SAME narrow-CIDR guard the AgentMail
+#      and BYO API lists use. A /0 or a /1 half of the address space on this pod
+#      is HTTPS-everywhere for a workload holding three live credentials, and
+#      "it is only for telemetry" is not a smaller blast radius.
+assert_render_fails_named \
+  "default-route OTLP peer" \
+  "mailAdapter.otelEgress.httpsCidrs" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set-string 'mailAdapter.otelEgress.httpsCidrs[0]=0.0.0.0/0'
+assert_render_fails_named \
+  "/1 half-of-the-internet OTLP peer" \
+  "mailAdapter.otelEgress.httpsCidrs" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set-string 'mailAdapter.otelEgress.httpsCidrs[0]=128.0.0.0/1'
+
+# 23g: an explicit port that CONTRADICTS the endpoint URL must refuse rather
+#      than pick a winner. Whichever the chart chose silently, one of the two
+#      operator statements would be quietly discarded -- and if the URL loses,
+#      the rendered policy opens a port the collector is not listening on.
+assert_render_fails_naming_both \
+  "mailAdapter.otelEgress.port disagreeing with the endpoint URL port" \
+  "4318" \
+  "443" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set-string mailAdapter.otelEgress.port=443 \
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32'
+
+# 23h: an explicit port that AGREES is not a contradiction. The refusal above
+#      must be a mismatch check, not a ban on ever setting the key.
+otlp_port_agree_dir="$(render otlp-port-agree "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set-string mailAdapter.otelEgress.port=4318 \
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32')"
+python3 "$OTLP_IPBLOCK_PY" "$otlp_port_agree_dir" rule 192.0.2.40/32 4318 203.0.113.0/24 \
+  || fail "an explicit mailAdapter.otelEgress.port that AGREES with the endpoint URL must render that port; see the message above"
+
+# 23i: no explicit port anywhere. The scheme default (443 for https) is the only
+#      port the collector can be on, and guessing 4318 there renders a peer that
+#      drops every export.
+#
+#      The otelCollector.egress port below (4318) is the UNRELATED runner-sandbox
+#      peer required by the #2317 gate, not the mail adapter's derived port --
+#      the mail adapter's own peer is asserted separately below to be 443 (the
+#      https scheme default). Do not read this 4318 as this assertion's target.
+otlp_scheme_port_dir="$(render otlp-scheme-port "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32')"
+python3 "$OTLP_IPBLOCK_PY" "$otlp_scheme_port_dir" rule 192.0.2.40/32 443 203.0.113.0/24 \
+  || fail "an endpoint with no explicit port must derive the scheme default (443 for https); see the message above"
+
+# 23j: the leftover-Service-DNS shape. `otelCollector.deploy=false` with an
+#      endpoint that still names this release's collector Service is the most
+#      dangerous case, because the host LOOKS in-chart while no such pod exists.
+#      The gate must key off the EFFECTIVE endpoint plus deploy, not the
+#      hostname, exactly as #2367 does for the runner.
+assert_render_fails_named \
+  "in-chart Service DNS left behind with otelCollector.deploy=false" \
+  "mailAdapter.otelEgress.httpsCidrs" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=http://curie-otel-collector:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318'
+
+# 23k: the documented escape hatch. telemetryDisabled resolves the endpoint to
+#      empty, so there is nothing to reach and nothing to declare -- three rules
+#      and no ipBlock beyond AgentMail. This is the answer the failure message
+#      offers an operator who genuinely wants an unobservable adapter, so it has
+#      to keep working.
+python3 "$OTEL_EGRESS_PY" "$otel_disabled_dir" no 3 203.0.113.0/24 \
+  || fail "otelCollector.telemetryDisabled=true must remain a complete escape from the OTLP peer requirement, at three rules; see the message above"
+python3 "$OTLP_IPBLOCK_PY" "$otel_disabled_dir" none - - 203.0.113.0/24 \
+  || fail "with telemetry disabled the adapter exports nothing, so it must be granted no OTLP ipBlock peer at all; see the message above"
+
+# 23l: a bracketed IPv6 endpoint WITH a port. Port extraction used to be
+#      skipped whenever the host contained "[", which left the URL port unseen,
+#      fell through to the https scheme default, and opened 443 while the SDK
+#      dialled 4318 -- a peer that looks configured and drops every export. The
+#      rule must be on 4318.
+otlp_v6_port_dir="$(render otlp-v6-port "${ON[@]}" "${CREDS[@]}" \
+  --set-string 'otelCollector.endpoint=https://[2001:db8::1]:4318' \
+  --set otelCollector.deploy=false \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set-string 'mailAdapter.otelEgress.httpsCidrs[0]=2001:db8::1/128')"
+python3 "$OTLP_IPBLOCK_PY" "$otlp_v6_port_dir" rule 2001:db8::1/128 4318 203.0.113.0/24 \
+  || fail "a bracketed IPv6 OTLP endpoint that names a port must open THAT port, not the https scheme default; see the message above"
+
+# 23m: the same bracketed IPv6 endpoint with a DISAGREEING explicit port. The
+#      bracket skip also disabled the mismatch refusal, so this shape used to
+#      render silently. It must refuse, exactly as 23g does for a DNS host.
+assert_render_fails_naming_both \
+  "bracketed IPv6 endpoint port disagreeing with mailAdapter.otelEgress.port" \
+  "4318" \
+  "443" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set-string 'otelCollector.endpoint=https://[2001:db8::1]:4318' \
+  --set otelCollector.deploy=false \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set-string mailAdapter.otelEgress.port=443 \
+  --set-string 'mailAdapter.otelEgress.httpsCidrs[0]=2001:db8::1/128'
+
+# 23n: a URL that omits its port still has a determined dial port. The mismatch
+#      check used to compare the explicit key against a ":port" SUBSTRING, so a
+#      portless https:// endpoint plus port=4318 passed unchallenged and opened
+#      4318 while the exporter connected to 443. Compare against the resolved
+#      dial port instead, and name both numbers.
+assert_render_fails_naming_both \
+  "explicit port against a portless https endpoint dialled on its scheme default" \
+  "4318" \
+  "443" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.deploy=false \
+  --set otelCollector.endpoint=https://otel.example.com \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
+  --set-string mailAdapter.otelEgress.port=4318 \
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32'
+
+# 23o: a stale CIDR left behind on a release that exports NOTHING. Both the
+#      in-chart and the disabled release are "not external", but only one of
+#      them has a pod-selector rule; curie.otel.validate forbids
+#      telemetryDisabled with deploy=true, so quoting that rule here names a
+#      rule that was never rendered. The remedy must say nothing is exported.
+assert_render_fails_named \
+  "telemetryDisabled with a stale mailAdapter.otelEgress.httpsCidrs" \
+  "exports nothing at all" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set otelCollector.telemetryDisabled=true \
+  --set otelCollector.deploy=false \
+  --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32'
+
+echo "OK: mail-adapter chart wiring and build-path render assertions passed (27 assertions)"

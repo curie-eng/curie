@@ -224,9 +224,9 @@ and names that verb as the fix. No platform signing key is given to the adapter.
   (`otelCollector.deploy=true`) the chart both sets the OTLP env and opens the
   adapter's egress policy to the collector. With `otelCollector.deploy=false`
   and an external `otelCollector.endpoint`, the env is set but the adapter's own
-  egress policy has no peer for that address, so the operator must apply an
-  additional egress policy selecting the adapter or the exports are silently
-  dropped -- see the mail-adapter section of `charts/curie/README.md`. What is
+  egress policy has no peer for that address, so the chart requires
+  `mailAdapter.otelEgress.httpsCidrs` and refuses the render without it -- see
+  the mail-adapter section of `charts/curie/README.md`. What is
   exported is log records: the adapter authors no spans of its own yet, so a
   trace search for it comes back empty even on a healthy export path.
 

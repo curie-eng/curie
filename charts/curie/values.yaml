@@ -816,10 +816,18 @@ otelCollector:
   #
   # One asymmetry an operator hits here: the mail adapter is the only
   # first-party service with its own egress NetworkPolicy, and that policy has
-  # no peer for an external endpoint (an address the chart cannot know). An
-  # install using this key with mailAdapter.deploy true needs an operator-
-  # supplied egress policy selecting the adapter, or its exports are dropped
-  # while every other workload's succeed.
+  # no peer for an external endpoint (an address the chart cannot know). With
+  # mailAdapter.deploy true, setting this key to an external endpoint (or
+  # leaving deploy false with the in-chart Service named here) now REQUIRES
+  # mailAdapter.otelEgress.httpsCidrs -- the render is refused without it,
+  # rather than silently dropping the adapter's exports. Upgrade note: a
+  # currently-green install with mailAdapter.deploy=true,
+  # otelCollector.deploy=false and an external endpoint becomes un-renderable
+  # until mailAdapter.otelEgress.httpsCidrs is set; an operator who previously
+  # worked around this by hand-applying an extra NetworkPolicy for the adapter
+  # will hit that refusal on the next helm upgrade. The break is intentional
+  # (fail-closed). Set otelCollector.telemetryDisabled=true to deliberately
+  # accept an unobservable release instead.
   endpoint: ""
   # Runner sandbox egress to an external collector endpoint (#2317, #2367).
   # Rail 1 is fail-closed. The in-chart runner-allow-collector policy selects
@@ -1392,6 +1400,21 @@ mailAdapter:
   apiEgress:
     httpsCidrs: []
     port: 8000
+  # NetworkPolicy peer for the collector this release exports to. This block is
+  # ignored while that effective OTLP endpoint is this release's own in-chart
+  # collector, which the policy selects by pod label; setting it then fails the
+  # render rather than being silently ignored. When the endpoint is external
+  # (otelCollector.deploy=false with an otelCollector.endpoint, including one
+  # that still names the in-chart Service), at least one narrow CIDR is
+  # required -- the adapter is the only first-party workload under an egress
+  # policy, so without a peer its telemetry is dropped by its own rail. Entries
+  # go through the same narrow-CIDR rule as the AgentMail and BYO-API lists, so
+  # default routes and /1 halves are refused. An empty port derives from the
+  # endpoint URL (its explicit port, else 443 for https and 80 for http); an
+  # explicit port that disagrees with the URL fails the render.
+  otelEgress:
+    httpsCidrs: []
+    port: ""
   image:
     repository: ghcr.io/curie-eng/curie-mail-adapter
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.

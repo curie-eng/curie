@@ -1893,6 +1893,20 @@ jobs:
         env:
           CURIE_BIN: cli/target/release/curie
         run: bash scripts/check-netpol-enforcement.sh curie curie curie
+      # The mail adapter's own egress rail (#2361). It is the only first-party
+      # workload the chart gives an egress NetworkPolicy at all, so it is the
+      # only one that can silently drop its own OTLP export: with
+      # otelCollector.deploy false and an external endpoint, the export leaves
+      # the cluster through a single ipBlock peer the operator declared. That is
+      # exactly the kind of rule a render assertion cannot prove -- an applied
+      # but unenforced NetworkPolicy renders identically to a correct one, and a
+      # rule on the wrong port looks perfectly right in YAML while dropping
+      # every span. This runs on the same enforcing Calico cluster and is a
+      # non-vacuity check of its own: it proves an UNDECLARED peer is blocked
+      # before it trusts the declared one. It uses its own namespace, so it
+      # neither reads nor disturbs the release installed above.
+      - name: Mail-adapter external-collector egress enforces (not just rendered)
+        run: bash scripts/check-mail-adapter-otel-egress.sh charts/curie
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       - name: Dump cluster diagnostics on failure

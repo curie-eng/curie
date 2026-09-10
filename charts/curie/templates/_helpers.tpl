@@ -1223,6 +1223,86 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/* OTLP URL the mail adapter actually dials (#2361). The adapter passes
+     curie.env.otel an EMPTY extraEnv list on purpose -- there is no
+     mailAdapter.extraEnv key, so this pod cannot be repointed independently --
+     which makes its effective endpoint exactly curie.otel.endpoint. That is
+     written as its own named helper anyway: the reason is then recorded next to
+     the runner's equivalent, and if a mailAdapter.extraEnv surface is ever
+     accepted there is one place to teach it rather than a bare
+     curie.otel.endpoint include scattered through the template. */}}
+{{- define "curie.mailAdapter.effectiveOtlpEndpoint" -}}
+{{- include "curie.otel.endpoint" . | trim -}}
+{{- end -}}
+
+{{/* True when the adapter's effective endpoint is one the rendered in-chart
+     collector peer does NOT cover (#2361). Deliberately keyed off deploy AND
+     the host, not the host alone: otelCollector.deploy=false with an endpoint
+     that still names this release's collector Service is the dangerous leftover
+     shape -- the host looks in-chart while no such pod exists, so the
+     pod-selector rule the adapter would otherwise get selects nothing. Empty
+     endpoint (telemetry disabled, or no-endpoint mode) exports nothing and is
+     therefore not external: it needs no peer at all. */}}
+{{- define "curie.mailAdapter.otlpIsExternal" -}}
+{{- $url := include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim -}}
+{{- if empty $url -}}
+{{- else if and .Values.otelCollector.deploy (include "curie.host.inChartService" (dict "root" . "host" (include "curie.endpoint.host" $url) "component" "otel-collector")) -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* TCP port the adapter's external-OTLP ipBlock rule opens (#2361).
+     Precedence: an explicit mailAdapter.otelEgress.port, else the port the
+     endpoint URL names, else the scheme default. A rule on the wrong port looks
+     configured and still drops every export, so a disagreement between the two
+     operator statements is refused rather than resolved by picking a winner --
+     whichever lost would have been discarded silently. Only meaningful, and
+     only included, on the external path. */}}
+{{- define "curie.mailAdapter.otelEgressPort" -}}
+{{- $endpoint := include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim -}}
+{{- $parsed := urlParse $endpoint -}}
+{{- $hostPort := $parsed.host | default "" -}}
+{{- $scheme := lower ($parsed.scheme | default "") -}}
+{{/* A bracketed IPv6 host is NOT skipped here, which is the opposite of
+     curie.endpoint.host: that helper leaves brackets intact because such a host
+     is never in-chart Service DNS, whereas this helper must still find the
+     port. ":[0-9]+$" is safe on a literal address because a bare bracketed host
+     ends in "]" -- only a real port can follow the closing bracket, so a hextet
+     is never mistaken for one. Skipping brackets instead left $urlPort empty,
+     fell through to the scheme default, and opened 443 while the SDK dialled
+     the port the URL actually named. */}}
+{{- $urlPort := trimPrefix ":" (regexFind ":[0-9]+$" $hostPort) -}}
+{{/* The port the SDK will actually dial, whether or not the URL writes it: a
+     portless https:// endpoint is dialled on 443 just as definitely as an
+     explicit :4318. The explicit key is compared against THIS, not against the
+     presence of a ":port" substring -- otherwise an explicit 4318 beside a
+     portless https:// URL passed unchallenged and rendered a 4318 peer for a
+     443 dial. */}}
+{{- $dialPort := $urlPort -}}
+{{- if not $dialPort -}}
+{{- if eq $scheme "https" -}}
+{{- $dialPort = "443" -}}
+{{- else if eq $scheme "http" -}}
+{{- $dialPort = "80" -}}
+{{- end -}}
+{{- end -}}
+{{- $explicit := trim (printf "%v" (.Values.mailAdapter.otelEgress.port | default "")) -}}
+{{- $port := "" -}}
+{{- if $explicit -}}
+{{- if and $dialPort (regexMatch "^[0-9]+$" $explicit) (ne (int $explicit) (int $dialPort)) -}}
+{{- fail (printf "mailAdapter.otelEgress.port is %s but the OTLP endpoint %s is dialed on port %s (the port its URL names, or the scheme default when the URL names none). Set one of them, or make them agree: opening %s while the exporter connects to %s renders a peer that looks configured and still drops every export." $explicit $endpoint $dialPort $explicit $dialPort) -}}
+{{- end -}}
+{{- $port = $explicit -}}
+{{- else -}}
+{{- $port = $dialPort -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[0-9]+$" $port)) (lt (int $port) 1) (gt (int $port) 65535) -}}
+{{- fail (printf "mailAdapter.otelEgress.port must be an integer from 1 through 65535, or empty to derive it from the resolved OTLP endpoint %s" $endpoint) -}}
+{{- end -}}
+{{- $port -}}
+{{- end -}}
+
 {{/* Coalesce the worker's chart-managed egress credentials and the first-party
      mail adapter's chart-managed paired credential. The chart Secret and the
      worker rollout checksum must use this same rendered JSON so a rotation

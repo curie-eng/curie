@@ -134,16 +134,18 @@ component and rail detail in `charts/curie/README.md`.
   everything a pod holding three credentials can talk to -- read the rules in
   `templates/mail-adapter.yaml` for the current set rather than trusting a count
   here. As written today they are DNS, this release's API pods, those
-  `agentmail.httpsCidrs` on TCP 443, and -- only while `otelCollector.deploy` is
-  true -- this release's OTel Collector on its gRPC and HTTP ports. With
+  `agentmail.httpsCidrs` on TCP 443, and exactly one collector peer: while
+  `otelCollector.deploy` is true, this release's OTel Collector on its gRPC and
+  HTTP ports; otherwise the declared `mailAdapter.otelEgress.httpsCidrs` as an
+  external ipBlock on `mailAdapter.otelEgress.port`. With
   `api.deploy` false, `mailAdapter.apiEgress.httpsCidrs` and `.port` replace the
   API pod selector with an explicit narrow BYO-API peer. Because this is the
   only first-party service with an egress policy at all, it is also the only one
   whose OTLP export can be dropped by its own rail: with `otelCollector.deploy`
   false and an external `otelCollector.endpoint`, this policy has no peer for
-  that address, and the fix is an operator-supplied additional egress policy
-  selecting the adapter (NetworkPolicies union), not a broad allow in the chart
-  for an address the chart cannot know. It never selects a runner sandbox and
+  that address, so the chart requires `mailAdapter.otelEgress.httpsCidrs` and
+  refuses the render without it, rather than a broad allow in the chart for an
+  address the chart cannot know. It never selects a runner sandbox and
   never allows the Kubernetes API. The runtime pod mounts no ServiceAccount
   token and has no RBAC. Prefix-0 and prefix-1 routes fail render, including
   split default routes. Do not turn provider DNS into a broad CIDR or add a
