@@ -212,6 +212,10 @@ case "${0##*/}:$*" in
       echo "Error: query: failed to query with labels: secrets is forbidden" >&2
       exit 1
     fi
+    if fail helm-absent; then
+      echo "Error: release: not found" >&2
+      exit 1
+    fi
     cat "${0%/*}/values.json"; exit 0 ;;
   kubectl:*patch*)
     if fail patch; then
@@ -247,6 +251,10 @@ exit 0
         Self(temp)
     }
 
+    fn dir(&self) -> &std::path::Path {
+        self.0.path()
+    }
+
     /// Make the named stubbed step (`helm`, `patch`, `rollout`) exit nonzero.
     fn failing(self, step: &str) -> Self {
         fs::write(self.0.path().join(format!("fail.{step}")), "").unwrap();
@@ -279,14 +287,33 @@ exit 0
 }
 
 fn api_for_mint(token: &str) -> MockServer {
+    api_logging_to(token, None)
+}
+
+/// The mint is HTTP, so it leaves no trace in the stub's `calls.log` and an
+/// ordering assertion over that log alone cannot see it. Given the stub's
+/// directory the mock appends its own line, putting the mint and the shell-outs
+/// on one ordered timeline -- which is what "discovery happens before the mint"
+/// actually needs to be pinned against.
+fn api_logging_to(token: &str, log_dir: Option<&std::path::Path>) -> MockServer {
     let token = token.to_string();
     let agent = agent_json();
+    let log = log_dir.map(|dir| dir.join("calls.log"));
     serve(move |req| {
         let (m, p) = (req.method.as_str(), req.path.as_str());
         match (m, p) {
             ("GET", "/agents") => Response::json(200, &format!("[{agent}]")),
             ("GET", p) if p == format!("/agents/{AGENT_ID}") => Response::json(200, &agent),
             ("POST", "/channels/token") => {
+                if let Some(path) = log.as_ref() {
+                    use std::io::Write;
+                    let mut f = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .unwrap();
+                    writeln!(f, "api POST /channels/token").unwrap();
+                }
                 Response::json(200, &format!(r#"{{"token":"{token}"}}"#))
             }
             _ => Response::json(404, r#"{"detail":"not found"}"#),
@@ -481,25 +508,88 @@ fn a_discovery_failure_burns_no_generation() {
     assert!(stub.patched().is_empty(), "nothing may be written");
 }
 
-/// The complement: on the happy path the discovery calls still happen, and they
-/// happen before the mint. Without this a "fix" that simply dropped the Helm
-/// read would satisfy the test above while silently losing
-/// `channelTokenExistingSecret` targeting.
+/// The positive ordering pin, on the happy path where every step runs. The mock
+/// logs the mint into the same file as the shell-outs, so this asserts
+/// helm-read < mint < patch on one timeline. Reverting the reorder puts the
+/// mint first and fails here; deleting the Helm read outright (which would
+/// silently lose `channelTokenExistingSecret` targeting) fails here too.
 #[test]
 fn discovery_runs_before_the_mint_on_the_happy_path() {
     let token = sample_token(EXP);
-    let server = api_for_mint(&token);
     let stub = ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}}));
+    let server = api_logging_to(&token, Some(stub.dir()));
     let run = stub.run(&mint_argv(&server.base_url));
     assert_eq!(run.code, 0, "{} {}", run.stdout, run.stderr);
     let calls = stub.calls();
-    let helm_at = calls
-        .find("helm get values")
-        .unwrap_or_else(|| panic!("helm read: {calls}"));
-    let patch_at = calls
-        .find("patch secret")
-        .unwrap_or_else(|| panic!("patch: {calls}"));
-    assert!(helm_at < patch_at, "{calls}");
+    let at = |needle: &str| {
+        calls
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing from: {calls}"))
+    };
+    assert!(
+        at("helm get values") < at("api POST /channels/token"),
+        "{calls}"
+    );
+    assert!(
+        at("api POST /channels/token") < at("patch secret"),
+        "{calls}"
+    );
+}
+
+/// Helm positively reporting the release absent is the `--namespace`/`--release`
+/// typo case named in the issue, and it is NOT a generic error: the shared Helm
+/// read maps it to `Ok(None)`. Falling through would mint against the live
+/// binding -- the mint is keyed by kind:address, not by the Helm release -- and
+/// revoke a healthy adapter's token to pay for a typo.
+#[test]
+fn an_absent_release_refuses_before_minting() {
+    let token = sample_token(EXP);
+    let stub = ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}}))
+        .failing("helm-absent");
+    let server = api_logging_to(&token, Some(stub.dir()));
+    let run = stub.run(&mint_argv(&server.base_url));
+    assert_ne!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    let traffic = server
+        .recorded()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect::<Vec<_>>();
+    assert!(
+        !traffic.iter().any(|t| t.contains("/channels/token")),
+        "a typo must not revoke the running token: {traffic:?}"
+    );
+    let value: serde_json::Value = serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}; {}", run.stdout));
+    let error = value["error"].as_str().unwrap_or_default();
+    assert!(error.contains("no Helm release"), "{value}");
+    let fix = value["fix"].as_str().unwrap_or_default();
+    assert!(fix.contains("--namespace/--release"), "{value}");
+    assert!(
+        fix.contains("No token was minted"),
+        "the operator must be told their adapter is untouched: {value}"
+    );
+    assert!(stub.patched().is_empty(), "nothing may be written");
+}
+
+/// The decode sits between the mint and the write, so it shares their state: the
+/// generation is already burned and nothing is installed. A bare "retry" there
+/// sends the operator into a second mint without telling them the channel is
+/// already dead.
+#[test]
+fn an_undecodable_token_reports_the_revoked_token() {
+    let stub = ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}}));
+    let server = api_for_mint("chn.not-base64.SIG");
+    let run = stub.run(&mint_argv(&server.base_url));
+    assert_ne!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    let value: serde_json::Value = serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}; {}", run.stdout));
+    let error = value["error"].as_str().unwrap_or_default();
+    assert!(error.contains("revoked"), "{value}");
+    assert!(error.contains("never installed"), "{value}");
+    assert!(
+        stub.patched().is_empty(),
+        "an unreadable token is not written"
+    );
 }
 
 /// The window that cannot be closed by ordering: the write needs the token, so
@@ -542,8 +632,20 @@ fn a_failed_rollout_says_installed_not_revoked() {
     let fix = value["fix"].as_str().unwrap_or_default();
     assert!(fix.contains("rollout restart"), "{value}");
     assert!(
+        fix.contains("get deployment"),
+        "a restart that just failed is not a diagnosis on its own: {value}"
+    );
+    assert!(
         fix.contains("do not mint another one"),
         "the recovery is a restart, never a second mint: {value}"
     );
+    // The word itself, not just the meaning: an operator skimming for "revoked"
+    // on this failure mints again and retires the token just written.
+    assert!(
+        !error.contains("revoked") && !fix.contains("revoked"),
+        "the milder state must not read as the revocation message: {value}"
+    );
     assert!(stub.patched().contains(&token), "the write did succeed");
+    assert!(!run.stdout.contains(&token), "{}", run.stdout);
+    assert!(!run.stderr.contains(&token), "{}", run.stderr);
 }

@@ -188,7 +188,26 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
     // failing is still free, or a failed recovery attempt turns a scheduled
     // expiry into an outage (#2553).
     let values = fetch_release_computed_values(&opts.common).await?;
-    let (secret_name, secret_key) = live_token_secret(&opts.common, values.as_ref()).await;
+    // `Ok(None)` is Helm positively reporting the release does not exist, which
+    // every other caller treats as "nothing configured yet". Here it is a
+    // refusal: this verb patches a Secret the chart rendered and rolls a
+    // Deployment the chart owns, so an absent release means `--namespace` or
+    // `--release` names an install that is not there. Falling through would
+    // mint against the live binding -- the mint is keyed by kind:address, not by
+    // the Helm release -- and revoke a working adapter's token to pay for a typo.
+    let Some(values) = values else {
+        return Err(crate::exit::CliError::failure(format!(
+            "no Helm release {} exists in namespace {}, so there is no mail adapter Secret to \
+             write a channel token to",
+            opts.common.release, opts.common.namespace
+        ))
+        .with_fix(
+            "name the install that has the adapter with --namespace/--release; `helm list -A` \
+             shows them. No token was minted, so the adapter's current token is untouched",
+        )
+        .into());
+    };
+    let (secret_name, secret_key) = live_token_secret(&opts.common, Some(&values)).await;
     let mint_step = cl.step(&format!("minting channel token for {kind}:{address}"));
     let token = match client.mint_channel_token(&kind, &address, ttl_s).await {
         Ok(token) => {
@@ -200,13 +219,20 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
             return Err(err);
         }
     };
-    let exp = token_exp(&token)?;
+    // Everything from here to the end of the write shares one state on failure:
+    // minted, nothing installed, the adapter's token already revoked. The decode
+    // is part of it -- a token this CLI cannot read is one it will not write --
+    // so it carries the same message rather than the bare "retry" that would
+    // send the operator into a second mint without telling them the first one
+    // already killed the channel.
+    let exp = token_exp(&token)
+        .map_err(|err| revoked_without_install(err, &opts, &kind, &address, &secret_name))?;
     let expires_at = format_exp(exp);
     let patch = serde_json::json!({ "stringData": { &secret_key: token } });
-    // The one step that structurally cannot precede the mint: it writes the
-    // token. If it fails the install IS worse off than before the command ran,
-    // and the operator has to be told that rather than left reading a bare
-    // kubectl error about a Secret.
+    // The write needs the token, so it cannot precede the mint. Some of what it
+    // can fail on could still be probed beforehand -- whether the Secret exists,
+    // whether we may patch it -- which is #2561; what is left here is the part
+    // that cannot be probed away.
     run_step(
         &cl,
         &format!("writing {secret_name}/{secret_key}"),
@@ -215,10 +241,10 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
     )
     .await
     .map_err(|err| revoked_without_install(err, &opts, &kind, &address, &secret_name))?;
-    // Past the patch the new token is installed and the old one's revocation is
-    // no longer a surprise -- the adapter simply has not reloaded yet. A rollout
-    // failure is a restart away from resolved, so it must NOT be reported as a
-    // revocation.
+    // Past the write the new token is installed and the adapter has merely not
+    // reloaded. This message must not read as the one above: an operator who
+    // takes a rollout failure for a revocation mints again and revokes the token
+    // they just installed. It therefore avoids the word entirely.
     for (label, ok_detail, cmd) in [
         (
             "rolling mail adapter",
@@ -259,15 +285,15 @@ fn revoked_without_install(
     secret_name: &str,
 ) -> anyhow::Error {
     let message = format!(
-        "the channel token for {kind}:{address} was minted but could not be written to secret \
-         {secret_name} in namespace {}: that mint already revoked the token the mail adapter is \
-         running, so this binding refuses inbound mail until a token is installed",
+        "the channel token for {kind}:{address} was minted but never installed: that mint already \
+         revoked the token the mail adapter is running, so this binding refuses inbound mail \
+         until a token reaches secret {secret_name} in namespace {}",
         opts.common.namespace
     );
     let fix = format!(
         "grant access to secret {secret_name} (or point --release/--namespace at the install that \
-         owns it) and re-run `curie cluster channel-token {}`; every re-run mints a fresh token, \
-         so retrying costs nothing",
+         owns it) and re-run `curie cluster channel-token {}`; a re-run mints a fresh token and \
+         the failed attempt consumed nothing, but mail is dropped until it succeeds",
         opts.agent
     );
     wrap(err, message, fix)
@@ -278,13 +304,16 @@ fn revoked_without_install(
 /// be confused: here the recovery is a restart, not another mint.
 fn installed_but_not_loaded(err: anyhow::Error, opts: &ChannelTokenOpts) -> anyhow::Error {
     let message = format!(
-        "the new channel token was written, but the mail adapter in namespace {} did not restart \
-         onto it and is still running the token this mint revoked",
+        "the new channel token was written to the Secret, but the mail adapter in namespace {} \
+         did not restart onto it and is still running the token this mint replaced",
         opts.common.namespace
     );
     let fix = format!(
-        "restart it with `kubectl -n {} rollout restart deployment -l {}`; the new token is \
-         already installed, so do not mint another one",
+        "confirm the adapter is deployed -- `kubectl -n {} get deployment -l {}` -- then restart \
+         it with `kubectl -n {} rollout restart deployment -l {}`. The new token is already \
+         installed, so do not mint another one; that would retire the token just written",
+        opts.common.namespace,
+        adapter_selector(&opts.common.release),
         opts.common.namespace,
         adapter_selector(&opts.common.release)
     );
