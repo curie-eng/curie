@@ -313,6 +313,50 @@ RETRYABLE_CLASSIFICATIONS = frozenset(
     {"rate-limit", "runner-error", "runner-timeout", "workspace-error"}
 )
 
+# Platform ErrorEvent.classification vocabulary. Allowlist-constrain only: do
+# not synonym-map SDK ``rate_limit`` onto platform ``rate-limit``, which would
+# make a currently non-retryable token retryable.
+PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
+    "rate-limit",
+    "runner-error",
+    "runner-timeout",
+    "workspace-error",
+    "budget-exceeded",
+    "server-error",
+    "ledger-error",
+    "model-credential-rejected",
+    "approval-not-acted",
+    "false-completion",
+    "publication-unrecorded",
+})
+UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
+
+_ESCALATION_DETAIL_MAX = 300
+
+
+def map_error_classification(raw: str | None) -> str:
+    if raw is not None and raw in PLATFORM_ERROR_CLASSIFICATIONS:
+        return raw
+    return UNCLASSIFIED_ERROR_CLASSIFICATION
+
+
+def _escalation_text(
+    qevent: QueuedTurn,
+    *,
+    lead: str,
+    detail: str | None,
+) -> str:
+    clipped = (detail or "").strip()
+    if len(clipped) > _ESCALATION_DETAIL_MAX:
+        clipped = clipped[:_ESCALATION_DETAIL_MAX]
+    extra = (
+        f"{clipped} event_id={qevent.event_id}."
+        if clipped
+        else f"event_id={qevent.event_id}."
+    )
+    return f"{lead} {extra} Flagging for a human."
+
+
 # The floor of remaining DELIVERY budget below which a fresh attempt is not
 # started (ADR-0131). The runner cannot claim a sandbox, open a turn and stream a
 # final in a couple of seconds, so an attempt started under this floor is
@@ -546,6 +590,7 @@ class TurnOutcome:
     terminal_ok: bool
     saw_side_effect: bool = False
     classification: str | None = None
+    error_message: str | None = None
     text: str = ""
     status: SessionStatus | None = None
     steered: bool = False
@@ -608,6 +653,7 @@ class _StreamAccumulator:
     text_parts: list[str] = field(default_factory=list)
     saw_side_effect: bool = False
     classification: str | None = None
+    error_message: str | None = None
     status: SessionStatus | None = None
     final_text: str | None = None
     approval_summary: str | None = None
@@ -1548,11 +1594,18 @@ class Kernel:
                     return
 
                 if outcome.saw_side_effect:
+                    token = map_error_classification(outcome.classification)
                     await self._escalate(
                         qevent,
                         route,
-                        f"The run hit an error ({outcome.classification or 'unknown'}) after "
-                        "starting an action; not retrying automatically. Flagging for a human.",
+                        _escalation_text(
+                            qevent,
+                            lead=(
+                                f"The run hit an error ({token}) after starting an action; "
+                                "not retrying automatically."
+                            ),
+                            detail=outcome.error_message,
+                        ),
                     )
                     await self._complete(
                         qevent,
@@ -1565,11 +1618,17 @@ class Kernel:
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
                 if not retryable or attempt >= self._config.max_attempts:
+                    token = map_error_classification(outcome.classification)
                     await self._escalate(
                         qevent,
                         route,
-                        f"The run failed ({outcome.classification or 'unknown'}) after "
-                        f"{attempt} attempt(s). Flagging for a human.",
+                        _escalation_text(
+                            qevent,
+                            lead=(
+                                f"The run failed ({token}) after {attempt} attempt(s)."
+                            ),
+                            detail=outcome.error_message,
+                        ),
                     )
                     await self._complete(
                         qevent,
@@ -3582,6 +3641,7 @@ class Kernel:
                 terminal_ok=False,
                 saw_side_effect=acc.saw_side_effect,
                 classification=classification,
+                error_message=acc.error_message,
                 text=acc.rendered(),
             )
         except ActionBackendError as exc:
@@ -3597,6 +3657,7 @@ class Kernel:
                 terminal_ok=False,
                 saw_side_effect=acc.saw_side_effect,
                 classification="ledger-error",
+                error_message=acc.error_message,
                 text=acc.rendered(),
             )
 
@@ -3626,7 +3687,9 @@ class Kernel:
             await self._markers.mark_side_effect(qevent.event_id)
             await self._record_action(frame, acc, qevent, agent_id)
         elif isinstance(frame, ErrorEvent):
-            acc.classification = frame.classification or acc.classification
+            if frame.classification:
+                acc.classification = map_error_classification(frame.classification)
+            acc.error_message = frame.message or acc.error_message
         elif isinstance(frame, Final):
             acc.status = frame.status
             acc.final_text = frame.text
@@ -3706,6 +3769,7 @@ class Kernel:
             terminal_ok=False,
             saw_side_effect=acc.saw_side_effect,
             classification=acc.classification or "runner-error",
+            error_message=acc.error_message,
             text=acc.rendered(),
             status=acc.status,
         )
