@@ -1772,10 +1772,11 @@ enum LocalAction {
         /// secrets set <NAME>`) and sent to the platform, which stores it on the
         /// agent so the worker forwards it into the sandbox for a bundle's authed
         /// MCP server. The value never appears in argv. Repeatable. A hosted
-        /// connector's own declared `secrets:` names are bound automatically
-        /// (from the value this deploy already resolved for the connector) so
-        /// its derived Bearer header expands; this flag is for names beyond
-        /// that (#2503).
+        /// connector's Bearer secret (`bearer_secret`, or its single `secrets:`
+        /// name) is bound automatically (from the value this deploy already
+        /// resolved for the connector) so the runner can expand the derived
+        /// header and drop the name from the sandbox env; this flag is for names
+        /// beyond that (#2503, #2559).
         #[arg(long = "secret", value_name = "NAME")]
         secret: Vec<String>,
     },
@@ -4417,10 +4418,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // The list comes from the API, not a Rust YAML parse: ADR-0089
                 // keeps exactly one parser for this file, and a second could
                 // disagree with it about where a deploy lands.
-                // The env-var secrets this bundle's hosted connectors declare
-                // (#2503). Read once here, from the same connectors.yaml the
-                // deploy packs, so both cluster paths bind the sandbox with the
-                // names whose `${NAME}` the derived Bearer header expands.
+                // The Bearer secret names this bundle's hosted connectors
+                // declare (#2503, #2559). Read once here, from the same
+                // connectors.yaml the deploy packs, so both cluster paths bind
+                // the sandbox with only the name the derived header expands.
                 let connector_env_secret_names = curie::connector_build::hosted_env_secret_names(
                     &curie::connector_build::load(&plugin_dir)?,
                 );
@@ -4666,9 +4667,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                     // are the CONNECTOR's, resolved locally and written straight to
                     // a K8s Secret, which is a different path from the sandbox
                     // secret delivery #440 tracks. The connector's own declared
-                    // secret NAMES are bound into the sandbox too (#2503),
-                    // unioned with the explicit `--secret` set, so a hosted
-                    // connector's derived Bearer header expands in the sandbox.
+                    // Bearer name is bound into the sandbox too (#2503, #2559),
+                    // unioned with the explicit `--secret` set, so the runner
+                    // can expand the derived header and then drop the name.
                     // Resolved before binding, applied after it.
                     let prepared_connectors = prepare_cluster_connectors(
                         &api_url,

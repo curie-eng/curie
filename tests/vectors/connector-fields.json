@@ -3,6 +3,7 @@
   "models": {
     "ConnectorSpec": [
       "args",
+      "bearer_secret",
       "build",
       "env",
       "headers",

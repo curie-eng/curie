@@ -37,7 +37,12 @@ from .approval import (
     resolve_approval_policy,
 )
 from .config import RunnerConfig
-from .connectors import build_mcp_servers, derive_mcp_servers
+from .connectors import (
+    build_mcp_servers,
+    derive_mcp_servers,
+    drop_connector_secret_names,
+    materialize_hosted_bearer_headers,
+)
 from .fake import FakeModelSession
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
@@ -242,6 +247,13 @@ def build_runner(
         agent=config.connector_agent,
         namespace=config.connector_namespace,
     )
+    # Expand hosted Bearer ${NAME} headers in memory and drop NAME so Bash
+    # cannot read the PAT from the process env (#2559). The on-disk catalog
+    # keeps the placeholder; derive_mcp_servers never sees a value.
+    spawn_env = sdk_env if sdk_env is not None else os.environ
+    dropped = materialize_hosted_bearer_headers(derived_mcp_servers, spawn_env)
+    if spawn_env is not os.environ:
+        drop_connector_secret_names(os.environ, dropped)
 
     # A configured permission gate is already positive evidence that the
     # session carries an actionable approval boundary. Publication is excluded:

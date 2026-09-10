@@ -699,3 +699,99 @@ def test_the_mounted_hosted_server_carries_the_declared_credential(tmp_path: Pat
     # sandbox environment, so nothing resolved is written to disk here.
     servers = derive_mcp_servers(_bundle(tmp_path, GITHUB), **SCOPE)
     assert servers["github"]["headers"] == _BEARER
+
+
+def test_materialize_expands_the_bearer_and_drops_it_from_env() -> None:
+    # #2559: the derived catalog keeps the placeholder (derive_mcp_servers
+    # above); the runner expands in memory and unsets the name so Bash cannot
+    # read the PAT. The value must not appear in os.environ or the SDK spawn
+    # env after this call, and must not be logged.
+    from aci_protocol import BootEnv
+    from curie_runner.connectors import materialize_hosted_bearer_headers
+
+    marker = BootEnv.env_key("connector_secret_keys")
+    servers = {
+        "github": {
+            "type": "http",
+            "url": "http://example.svc/mcp",
+            "headers": {"Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"},
+        }
+    }
+    env = {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_sentinel",
+        "STDIO_ONLY": "keep-me",
+        marker: "GITHUB_PERSONAL_ACCESS_TOKEN,STDIO_ONLY",
+    }
+    dropped = materialize_hosted_bearer_headers(servers, env)
+    assert dropped == frozenset({"GITHUB_PERSONAL_ACCESS_TOKEN"})
+    assert servers["github"]["headers"]["Authorization"] == "Bearer ghp_sentinel"
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in env
+    assert env["STDIO_ONLY"] == "keep-me"
+    assert env[marker] == "STDIO_ONLY"
+
+
+def test_materialize_leaves_a_missing_bearer_as_the_placeholder() -> None:
+    # A SecretRef / unset value still expands empty today (#2519). Dropping a
+    # name that was never in env would hide that gap; leave the placeholder.
+    from curie_runner.connectors import materialize_hosted_bearer_headers
+
+    servers = {
+        "github": {
+            "type": "http",
+            "headers": {"Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"},
+        }
+    }
+    env = {"STDIO_ONLY": "keep-me"}
+    dropped = materialize_hosted_bearer_headers(servers, env)
+    assert dropped == frozenset()
+    assert servers["github"]["headers"] == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
+    assert env == {"STDIO_ONLY": "keep-me"}
+
+
+def test_materialize_does_not_drop_an_unrelated_secret() -> None:
+    # ADR-0009 stdio / remote ${VAR} secrets stay in env for the MCP client.
+    from curie_runner.connectors import materialize_hosted_bearer_headers
+
+    servers = {
+        "github": {
+            "type": "http",
+            "headers": {"Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"},
+        }
+    }
+    env = {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_sentinel",
+        "STDIO_TOKEN": "stdio-secret",
+    }
+    materialize_hosted_bearer_headers(servers, env)
+    assert env["STDIO_TOKEN"] == "stdio-secret"
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in env
+
+
+def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Wiring pin for #2559: materialize runs on the SDK spawn env inside
+    # build_runner, so a PAT that arrived as a connector secret is gone before
+    # the session (and Bash) starts, while the in-memory MCP header is expanded.
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    config = _config_for(
+        _bundle(tmp_path, GITHUB), release="curie", agent="acme-dev", namespace="curie"
+    )
+    spawn = {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_sentinel",
+        "STDIO_TOKEN": "keep-me",
+    }
+
+    async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        return McpToolCapabilityProbe(complete=True, has_potential_write_tool=False, tool_count=0)
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    session = build_runner(config, fake_model=False, sdk_env=spawn)._factory()
+    assert isinstance(session, _CapturedSession)
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
+    assert spawn["STDIO_TOKEN"] == "keep-me"
+    github = session.options.mcp_servers["github"]
+    assert github["headers"]["Authorization"] == "Bearer ghp_sentinel"

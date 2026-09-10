@@ -81,11 +81,13 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
   [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector
   with `secrets:` declared, the rendered `.mcp.json` entry derives
-  `headers.Authorization: Bearer ${<first declared secret>}` -- the author still writes no `headers:`
-  on a hosted connector (`connectors.hosted_has_headers`) -- and `cluster deploy` binds that secret
-  name into the sandbox alongside any explicit `--secret` so the placeholder expands (#2503; a
+  `headers.Authorization: Bearer ${<bearer_secret, or the single declared secret>}` -- the author still writes no `headers:`
+  on a hosted connector (`connectors.hosted_has_headers`) -- and `cluster deploy` binds only that
+  Bearer name into the sandbox alongside any explicit `--secret` so the runner can expand the
+  placeholder at boot and then drop the name from the process env (#2503, #2559; a
   `SecretRef` value does not reach the sandbox under ADR-0090, and the `url` fallback used by tiers
-  below cluster derives no header, both tracked as follow-ups). Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
+  below cluster derives no header, both tracked as follow-ups). A hosted connector with several
+  secrets and no `bearer_secret` is `connectors.bearer_secret_required`. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
   `connectors.duplicate_server`, `connectors.build_context_escapes`,

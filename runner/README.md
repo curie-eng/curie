@@ -72,6 +72,15 @@ readinessProbe hits `/healthz`).
   still-permitted shell tool (e.g. `Bash`) can reach the same HTTP state API
   directly. Naming `Bash` alongside the state tools closes that path today;
   removing the token itself needs a code change, not a config knob.
+  Hosted-connector Bearer secrets are a different class (#2559): the runner
+  expands `Authorization: Bearer ${NAME}` into the in-memory MCP catalog at
+  boot and drops `NAME` from the process environment (and from
+  `CURIE_CONNECTOR_SECRET_KEYS`) before the session accepts turns, so `Bash`
+  cannot read the PAT. The on-disk catalog keeps the placeholder. Residual:
+  kubelet / `docker -e` still injects the value onto the container until the
+  runner process unsets it. ADR-0009 `--secret` names that are not a hosted
+  Bearer stay in the environment, because stdio / remote MCP clients still
+  expand `${VAR}` there.
 
 ## Build and smoke
 
