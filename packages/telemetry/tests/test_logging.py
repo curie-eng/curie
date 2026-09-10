@@ -15,6 +15,26 @@ from opentelemetry.sdk._logs.export import (
 )
 from opentelemetry.sdk.trace import TracerProvider
 
+_FAKE_DISCORD_BOT_TOKEN = (
+    "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
+)
+_FAKE_DISCORD_BOT_AUTHORIZATION = (
+    "Authorization: Bot " + _FAKE_DISCORD_BOT_TOKEN
+)
+_FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT = (
+    "DISCORD_BOT_TOKEN=" + _FAKE_DISCORD_BOT_TOKEN
+)
+_DISCORD_VECTOR_EXPECTATIONS = {
+    _FAKE_DISCORD_BOT_AUTHORIZATION: (
+        "discord_bot_authorization",
+        "Authorization: Bot ",
+    ),
+    _FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT: (
+        "discord_bot_token_assignment",
+        "DISCORD_BOT_TOKEN=",
+    ),
+}
+
 _SECRET_VECTORS = (
     "sk-" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000",
     "AKIA" + "EXAMPLEFAKEKEY0000",
@@ -40,6 +60,8 @@ _SECRET_VECTORS = (
     "CURIE_CHANNEL_TOKEN=" + "FAKEFAKEFAKEHEADERVALUE0000",
     "CURIE_EGRESS_SECRET=" + "FAKEFAKEFAKEEGRESS0000",
     "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000",
+    _FAKE_DISCORD_BOT_AUTHORIZATION,
+    _FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT,
 )
 
 
@@ -303,12 +325,26 @@ def test_args_style_service_log_is_correlated_redacted_and_preserved_on_stderr(
         assert stderr_record["severity"] == "ERROR"
         assert stderr_record["trace_id"] == f"{expected_trace_id:032x}"
         assert stderr_record["span_id"] == f"{expected_span_id:016x}"
+        assert "runner request failed value=" in stderr_record["message"]
         assert redaction_probe not in stderr_record["message"]
         assert "[REDACTED:" in stderr_record["message"]
+        discord_expectation = _DISCORD_VECTOR_EXPECTATIONS.get(redaction_probe)
+        if discord_expectation is not None:
+            rule_name, carrier = discord_expectation
+            assert _FAKE_DISCORD_BOT_TOKEN not in stderr_record["message"]
+            assert f"[REDACTED:{rule_name}]" in stderr_record["message"]
+            assert carrier in stderr_record["message"]
 
         (exported,) = exporter.get_finished_logs()
-        assert redaction_probe not in _body(exported)
-        assert "[REDACTED:" in _body(exported)
+        exported_body = _body(exported)
+        assert "runner request failed value=" in exported_body
+        assert redaction_probe not in exported_body
+        assert "[REDACTED:" in exported_body
+        if discord_expectation is not None:
+            rule_name, carrier = discord_expectation
+            assert _FAKE_DISCORD_BOT_TOKEN not in exported_body
+            assert f"[REDACTED:{rule_name}]" in exported_body
+            assert carrier in exported_body
         assert _trace_ids(exported) == (expected_trace_id, expected_span_id)
     finally:
         logger.handlers[:] = original_handlers
