@@ -1392,6 +1392,21 @@ mailAdapter:
   apiEgress:
     httpsCidrs: []
     port: 8000
+  # NetworkPolicy peer for the collector this release exports to. This block is
+  # ignored while that effective OTLP endpoint is this release's own in-chart
+  # collector, which the policy selects by pod label; setting it then fails the
+  # render rather than being silently ignored. When the endpoint is external
+  # (otelCollector.deploy=false with an otelCollector.endpoint, including one
+  # that still names the in-chart Service), at least one narrow CIDR is
+  # required -- the adapter is the only first-party workload under an egress
+  # policy, so without a peer its telemetry is dropped by its own rail. Entries
+  # go through the same narrow-CIDR rule as the AgentMail and BYO-API lists, so
+  # default routes and /1 halves are refused. An empty port derives from the
+  # endpoint URL (its explicit port, else 443 for https and 80 for http); an
+  # explicit port that disagrees with the URL fails the render.
+  otelEgress:
+    httpsCidrs: []
+    port: ""
   image:
     repository: ghcr.io/curie-eng/curie-mail-adapter
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.

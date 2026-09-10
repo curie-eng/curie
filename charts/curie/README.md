@@ -445,24 +445,27 @@ root filesystem remains read-only; only the state mount and an `emptyDir` at
 `/tmp` are writable. Enabling it also requires an explicit
 `mailAdapter.agentmail.httpsCidrs` list. One egress-only NetworkPolicy then
 allows DNS, this release's API pods, those provider/proxy CIDRs on TCP 443, and
--- while `otelCollector.deploy=true` -- this release's OTel Collector on its
-gRPC and HTTP ports, so the adapter's OTLP export is not dropped by its own
-rail. When `api.deploy=false`, the in-chart API selector is replaced by the
+-- when the release exports to its own in-chart collector -- that Collector on
+its gRPC and HTTP ports, or else the required `mailAdapter.otelEgress.httpsCidrs`
+peers for an external collector, so the adapter's OTLP export is not dropped by
+its own rail. When `api.deploy=false`, the in-chart API selector is replaced by the
 required `mailAdapter.apiEgress.httpsCidrs` peers on
 `mailAdapter.apiEgress.port`; the chart does not infer IPs from `apiBaseUrl`.
 The policy has no Kubernetes API carve-out and never selects runner sandboxes.
 
 The adapter is the only first-party workload with an egress-restricting
-NetworkPolicy, which makes one telemetry configuration asymmetric. With
-`otelCollector.deploy=false` and an external `otelCollector.endpoint`, api,
-dispatcher and worker export normally because nothing restricts their egress,
-while the adapter's exports are dropped: its policy has no peer for an address
-the chart cannot know, and the chart deliberately invents no broad allow for
-one. Because NetworkPolicies union rather than intersect, the fix needs no chart
-change -- apply an additional egress policy in the release namespace selecting
-the adapter's labels (`app.kubernetes.io/component: mail-adapter` plus the
-release's instance label) with a `to:` for the external collector. Everything
-else about the rail, including the AgentMail CIDRs, keeps working unchanged. See
+NetworkPolicy, so it is the only one whose OTLP export its own rail can drop
+while api, dispatcher and worker keep exporting from the same rendered env. That
+case therefore fails closed rather than shipping silently: when the release's
+effective OTLP endpoint is not this release's in-chart collector -- including an
+`otelCollector.endpoint` that still names the in-chart Service with
+`otelCollector.deploy=false` -- the render is refused until
+`mailAdapter.otelEgress.httpsCidrs` names the collector's narrow range (or a
+controlled egress proxy's), on `mailAdapter.otelEgress.port` or the port derived
+from the endpoint URL. The chart infers no IPs from the endpoint and invents no
+broad allow. Set `otelCollector.telemetryDisabled=true` to deliberately accept
+an unobservable release. Everything else about the rail, including the AgentMail
+CIDRs, keeps working unchanged. See
 [`docs/operations.md`](../../docs/operations.md#connecting-email) for the
 mode-0600 credential workflow, retention, erase, and recovery procedure.
 
@@ -1299,7 +1302,8 @@ to install only the control plane + backing stores without the runner substrate.
   alone gets it nowhere: `otelCollector.egress` must name the collector's CIDRs
   or the default-deny drops every sandbox span while api, dispatcher and worker
   keep exporting normally. The chart requires it at render rather than letting
-  that asymmetry ship silently.
+  that asymmetry ship silently. The mail adapter has the same requirement for
+  its own policy, under `mailAdapter.otelEgress.httpsCidrs` (above).
 
 ## Deploying without inbound access
 

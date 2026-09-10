@@ -1223,6 +1223,71 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/* OTLP URL the mail adapter actually dials (#2361). The adapter passes
+     curie.env.otel an EMPTY extraEnv list on purpose -- there is no
+     mailAdapter.extraEnv key, so this pod cannot be repointed independently --
+     which makes its effective endpoint exactly curie.otel.endpoint. That is
+     written as its own named helper anyway: the reason is then recorded next to
+     the runner's equivalent, and if a mailAdapter.extraEnv surface is ever
+     accepted there is one place to teach it rather than a bare
+     curie.otel.endpoint include scattered through the template. */}}
+{{- define "curie.mailAdapter.effectiveOtlpEndpoint" -}}
+{{- include "curie.otel.endpoint" . | trim -}}
+{{- end -}}
+
+{{/* True when the adapter's effective endpoint is one the rendered in-chart
+     collector peer does NOT cover (#2361). Deliberately keyed off deploy AND
+     the host, not the host alone: otelCollector.deploy=false with an endpoint
+     that still names this release's collector Service is the dangerous leftover
+     shape -- the host looks in-chart while no such pod exists, so the
+     pod-selector rule the adapter would otherwise get selects nothing. Empty
+     endpoint (telemetry disabled, or no-endpoint mode) exports nothing and is
+     therefore not external: it needs no peer at all. */}}
+{{- define "curie.mailAdapter.otlpIsExternal" -}}
+{{- $url := include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim -}}
+{{- if empty $url -}}
+{{- else if and .Values.otelCollector.deploy (include "curie.host.inChartService" (dict "root" . "host" (include "curie.endpoint.host" $url) "component" "otel-collector")) -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* TCP port the adapter's external-OTLP ipBlock rule opens (#2361).
+     Precedence: an explicit mailAdapter.otelEgress.port, else the port the
+     endpoint URL names, else the scheme default. A rule on the wrong port looks
+     configured and still drops every export, so a disagreement between the two
+     operator statements is refused rather than resolved by picking a winner --
+     whichever lost would have been discarded silently. Only meaningful, and
+     only included, on the external path. */}}
+{{- define "curie.mailAdapter.otelEgressPort" -}}
+{{- $endpoint := include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim -}}
+{{- $parsed := urlParse $endpoint -}}
+{{- $hostPort := $parsed.host | default "" -}}
+{{- $scheme := lower ($parsed.scheme | default "") -}}
+{{- $urlPort := "" -}}
+{{- if not (contains "[" $hostPort) -}}
+{{- $urlPort = trimPrefix ":" (regexFind ":[0-9]+$" $hostPort) -}}
+{{- end -}}
+{{- $explicit := trim (printf "%v" (.Values.mailAdapter.otelEgress.port | default "")) -}}
+{{- $port := "" -}}
+{{- if $explicit -}}
+{{- if and $urlPort (regexMatch "^[0-9]+$" $explicit) (ne (int $explicit) (int $urlPort)) -}}
+{{- fail (printf "mailAdapter.otelEgress.port is %s but the resolved OTLP endpoint %s already names port %s. Set one of them, or make them agree: opening %s while the collector listens on %s renders a peer that looks configured and still drops every export." $explicit $endpoint $urlPort $explicit $urlPort) -}}
+{{- end -}}
+{{- $port = $explicit -}}
+{{- else if $urlPort -}}
+{{- $port = $urlPort -}}
+{{- else if eq $scheme "https" -}}
+{{- $port = "443" -}}
+{{- else if eq $scheme "http" -}}
+{{- $port = "80" -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[0-9]+$" $port)) (lt (int $port) 1) (gt (int $port) 65535) -}}
+{{- fail (printf "mailAdapter.otelEgress.port must be an integer from 1 through 65535, or empty to derive it from the resolved OTLP endpoint %s" $endpoint) -}}
+{{- end -}}
+{{- $port -}}
+{{- end -}}
+
 {{/* Coalesce the worker's chart-managed egress credentials and the first-party
      mail adapter's chart-managed paired credential. The chart Secret and the
      worker rollout checksum must use this same rendered JSON so a rotation

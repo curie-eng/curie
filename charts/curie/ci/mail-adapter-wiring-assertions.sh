@@ -1383,6 +1383,15 @@ python3 "$OTEL_EGRESS_PY" "$byo_api_dir" yes 4 198.51.100.0/24 \
 #     policy that ALREADY carries ipBlock rules (AgentMail on 443, and a BYO API
 #     on its own port), so a line reader cannot tell which rule it is looking at
 #     and would happily accept an OTLP "peer" that is really the AgentMail rule.
+#
+#     Every render below that pairs otelCollector.deploy=false with a non-empty
+#     otelCollector.endpoint ALSO sets otelCollector.egress. That is not this
+#     section's own gate: it is the pre-existing, unrelated #2317 runner-sandbox
+#     refusal at templates/security-networkpolicy.yaml:386, which fires on that
+#     exact combination and fails the render before the mail-adapter path under
+#     test is ever reached. Without it these renders die on the runner's fail
+#     closed message instead of exercising (or refusing for) the mail-adapter
+#     reason this section asserts. Do not drop these flags as copy-paste noise.
 # ---------------------------------------------------------------------------
 OTLP_IPBLOCK_PY="$TMP/mail-otlp-ipblock.py"
 cat > "$OTLP_IPBLOCK_PY" <<'PY'
@@ -1555,7 +1564,10 @@ assert_render_fails_naming_both() {
 otlp_adapter_off_dir="$(render otlp-adapter-off \
   --set mailAdapter.deploy=false \
   --set otelCollector.deploy=false \
-  --set otelCollector.endpoint=https://otel.example.com:4318)"
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318')"
 python3 "$NO_MAIL_POLICY_PY" "$otlp_adapter_off_dir" \
   || fail "with mailAdapter.deploy=false an external collector endpoint must render cleanly and produce no mail-adapter policy; see the message above"
 
@@ -1586,7 +1598,10 @@ assert_render_fails_naming_both \
   "https://otel.example.com:4318" \
   "${ON[@]}" "${CREDS[@]}" \
   --set otelCollector.deploy=false \
-  --set otelCollector.endpoint=https://otel.example.com:4318
+  --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318'
 
 # 23e: the positive path. Four rules, an ipBlock peer on the port derived from
 #      the URL, NO synthesized in-cluster collector peer (the chart cannot know
@@ -1594,6 +1609,9 @@ assert_render_fails_naming_both \
 otlp_external_ok_dir="$(render otlp-external-ok "${ON[@]}" "${CREDS[@]}" \
   --set otelCollector.deploy=false \
   --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
   --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32')"
 python3 "$OTEL_EGRESS_PY" "$otlp_external_ok_dir" no 4 203.0.113.0/24 \
   || fail "a declared external OTLP peer must add a FOURTH rule without synthesizing an in-cluster collector podSelector peer, and must not displace the AgentMail rule; see the message above"
@@ -1610,6 +1628,9 @@ assert_render_fails_named \
   "${ON[@]}" "${CREDS[@]}" \
   --set otelCollector.deploy=false \
   --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
   --set-string 'mailAdapter.otelEgress.httpsCidrs[0]=0.0.0.0/0'
 assert_render_fails_named \
   "/1 half-of-the-internet OTLP peer" \
@@ -1617,6 +1638,9 @@ assert_render_fails_named \
   "${ON[@]}" "${CREDS[@]}" \
   --set otelCollector.deploy=false \
   --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
   --set-string 'mailAdapter.otelEgress.httpsCidrs[0]=128.0.0.0/1'
 
 # 23g: an explicit port that CONTRADICTS the endpoint URL must refuse rather
@@ -1630,6 +1654,9 @@ assert_render_fails_naming_both \
   "${ON[@]}" "${CREDS[@]}" \
   --set otelCollector.deploy=false \
   --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
   --set-string mailAdapter.otelEgress.port=443 \
   --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32'
 
@@ -1638,6 +1665,9 @@ assert_render_fails_naming_both \
 otlp_port_agree_dir="$(render otlp-port-agree "${ON[@]}" "${CREDS[@]}" \
   --set otelCollector.deploy=false \
   --set otelCollector.endpoint=https://otel.example.com:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
   --set-string mailAdapter.otelEgress.port=4318 \
   --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32')"
 python3 "$OTLP_IPBLOCK_PY" "$otlp_port_agree_dir" rule 192.0.2.40/32 4318 203.0.113.0/24 \
@@ -1646,9 +1676,17 @@ python3 "$OTLP_IPBLOCK_PY" "$otlp_port_agree_dir" rule 192.0.2.40/32 4318 203.0.
 # 23i: no explicit port anywhere. The scheme default (443 for https) is the only
 #      port the collector can be on, and guessing 4318 there renders a peer that
 #      drops every export.
+#
+#      The otelCollector.egress port below (4318) is the UNRELATED runner-sandbox
+#      peer required by the #2317 gate, not the mail adapter's derived port --
+#      the mail adapter's own peer is asserted separately below to be 443 (the
+#      https scheme default). Do not read this 4318 as this assertion's target.
 otlp_scheme_port_dir="$(render otlp-scheme-port "${ON[@]}" "${CREDS[@]}" \
   --set otelCollector.deploy=false \
   --set otelCollector.endpoint=https://otel.example.com \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318' \
   --set 'mailAdapter.otelEgress.httpsCidrs[0]=192.0.2.40/32')"
 python3 "$OTLP_IPBLOCK_PY" "$otlp_scheme_port_dir" rule 192.0.2.40/32 443 203.0.113.0/24 \
   || fail "an endpoint with no explicit port must derive the scheme default (443 for https); see the message above"
@@ -1663,7 +1701,10 @@ assert_render_fails_named \
   "mailAdapter.otelEgress.httpsCidrs" \
   "${ON[@]}" "${CREDS[@]}" \
   --set otelCollector.deploy=false \
-  --set otelCollector.endpoint=http://curie-otel-collector:4318
+  --set otelCollector.endpoint=http://curie-otel-collector:4318 \
+  --set 'otelCollector.egress[0].cidr=192.0.2.40/32' \
+  --set 'otelCollector.egress[0].ports[0].protocol=TCP' \
+  --set 'otelCollector.egress[0].ports[0].port=4318'
 
 # 23k: the documented escape hatch. telemetryDisabled resolves the endpoint to
 #      empty, so there is nothing to reach and nothing to declare -- three rules
