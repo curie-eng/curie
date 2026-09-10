@@ -44,11 +44,27 @@ def _test_id(case: ElementTree.Element) -> str:
     return f"{case.get('classname', '')}::{name}"
 
 
-def _failures(report: Path) -> set[str]:
-    """Every test in one attempt that failed or errored.
+def _is_collection_error(case: ElementTree.Element) -> bool:
+    """A worker that never got as far as running tests.
 
-    A skip is not a failure and a passing rerun does not erase one: this is the
-    per-attempt set that the union is built from.
+    When xdist workers disagree about what was collected, pytest refuses the
+    whole run and writes one entry per worker with no source file, named for
+    the worker rather than for a test. Counting those as failing tests is how
+    this tool first reported a total collection refusal as "4 flaky tests"
+    called `::gw0` through `::gw3`, which is precisely the misreading #2230
+    warned about: it makes a suite that never ran look like a suite with a
+    handful of loose tests.
+    """
+    return case.get("file") is None and case.find("error") is not None
+
+
+def _failures(report: Path) -> tuple[set[str], list[str]]:
+    """One attempt's failing tests, and the collection errors that voided it.
+
+    A skip is not a failure and a passing rerun does not erase one: the first
+    element is the per-attempt set that the union is built from. The second is
+    non-empty only when the attempt never ran, in which case its empty failure
+    set means "no evidence", not "nothing went wrong".
     """
     try:
         tree = ElementTree.parse(report)
@@ -56,10 +72,14 @@ def _failures(report: Path) -> set[str]:
         raise ValueError(f"{report} is not parsable JUnit XML: {error}") from error
 
     failed: set[str] = set()
+    collection_errors: list[str] = []
     for case in tree.iter("testcase"):
+        if _is_collection_error(case):
+            collection_errors.append(case.get("name", "?"))
+            continue
         if case.find("failure") is not None or case.find("error") is not None:
             failed.add(_test_id(case))
-    return failed
+    return failed, collection_errors
 
 
 def characterise(reports: list[Path]) -> dict[str, Any]:
@@ -67,18 +87,27 @@ def characterise(reports: list[Path]) -> dict[str, Any]:
         raise ValueError("no JUnit XML reports were found, so nothing can be characterised")
 
     counts: dict[str, int] = defaultdict(int)
+    never_ran = 0
     for report in sorted(reports):
-        for test in _failures(report):
+        failed, collection_errors = _failures(report)
+        if collection_errors:
+            never_ran += 1
+            continue
+        for test in failed:
             counts[test] += 1
 
     attempts = len(reports)
-    # Most failures first, then by node id, so a rerun of the same data prints
-    # the same report and a diff between two characterisations is readable.
+    ran = attempts - never_ran
+    # The denominator is the attempts that actually ran. Dividing by every
+    # attempt would report a test that failed both of the two usable runs as
+    # 2/20, which reads as rare when it is in fact universal.
     ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     return {
         "attempts": attempts,
+        "ran": ran,
+        "never_ran": never_ran,
         "flaky": [
-            {"test": test, "failed": count, "of": attempts}
+            {"test": test, "failed": count, "of": ran}
             for test, count in ranked
         ],
     }
@@ -86,13 +115,32 @@ def characterise(reports: list[Path]) -> dict[str, Any]:
 
 def _render(result: dict[str, Any]) -> str:
     attempts = result["attempts"]
+    ran = result["ran"]
+    never_ran = result["never_ran"]
     flaky = result["flaky"]
-    if not flaky:
-        return f"No test failed in any of the {attempts} attempts."
 
-    lines = [f"{len(flaky)} test(s) failed in at least one of {attempts} attempts:", ""]
+    lines: list[str] = []
+    if never_ran:
+        lines += [
+            f"{never_ran} of {attempts} attempts never ran the suite: the workers "
+            "disagreed about what was collected, so pytest refused the run.",
+            "",
+            "That is a determinism defect in the test ids themselves, not "
+            "contention between tests, and it has to be fixed before any "
+            "statement about parallel flakiness means anything.",
+            "",
+        ]
+    if not ran:
+        lines.append("No attempt produced a usable result.")
+        return "\n".join(lines)
+
+    if not flaky:
+        lines.append(f"No test failed in any of the {ran} attempts that ran.")
+        return "\n".join(lines)
+
+    lines += [f"{len(flaky)} test(s) failed in at least one of {ran} attempts that ran:", ""]
     for entry in flaky:
-        lines.append(f"  {entry['failed']:>3}/{attempts}  {entry['test']}")
+        lines.append(f"  {entry['failed']:>3}/{ran}  {entry['test']}")
     return "\n".join(lines)
 
 

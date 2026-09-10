@@ -100,6 +100,67 @@ def test_a_clean_sweep_reports_nothing(tmp_path: Path) -> None:
     assert "No test failed" in module._render(result)
 
 
+COLLECTION_ERROR = (
+    '<testcase classname="" name="gw0"><error message="Different tests were '
+    'collected between gw0 and gw3"/></testcase>'
+)
+
+
+def test_a_refused_run_is_not_reported_as_flaky_tests(tmp_path: Path) -> None:
+    """The regression that produced this code path.
+
+    Run 34541967865 failed all 20 attempts at collection, and the first version
+    of this tool rendered that as "4 test(s) failed", named `::gw0` through
+    `::gw3`. A total refusal to run read as a handful of loose tests, which is
+    the exact misreading #2230 cautions against.
+    """
+    module = _module()
+    _report(tmp_path, "attempt-1.xml", COLLECTION_ERROR)
+    _report(tmp_path, "attempt-2.xml", COLLECTION_ERROR)
+
+    result = module.characterise(sorted(tmp_path.glob("*.xml")))
+
+    assert result["never_ran"] == 2
+    assert result["ran"] == 0
+    assert result["flaky"] == []
+    rendered = module._render(result)
+    assert "never ran the suite" in rendered
+    assert "No attempt produced a usable result." in rendered
+
+
+def test_the_rate_divides_by_the_attempts_that_actually_ran(tmp_path: Path) -> None:
+    """A test failing both usable runs is 2/2, not 2/4.
+
+    Dividing by every attempt would print 2/4 for a test that failed every run
+    that got far enough to have an opinion, and 50% reads as flaky where 100%
+    reads as broken.
+    """
+    module = _module()
+    _report(tmp_path, "attempt-1.xml", FAILING)
+    _report(tmp_path, "attempt-2.xml", FAILING)
+    _report(tmp_path, "attempt-3.xml", COLLECTION_ERROR)
+    _report(tmp_path, "attempt-4.xml", COLLECTION_ERROR)
+
+    result = module.characterise(sorted(tmp_path.glob("*.xml")))
+
+    assert result["attempts"] == 4
+    assert result["ran"] == 2
+    assert result["flaky"] == [
+        {"test": "apps/api/tests/test_a.py::test_flaky", "failed": 2, "of": 2}
+    ]
+
+
+def test_a_real_test_error_still_counts(tmp_path: Path) -> None:
+    """Only a fileless error is a collection error; a real test's error counts."""
+    module = _module()
+    _report(tmp_path, "attempt-1.xml", ERRORING)
+
+    result = module.characterise(sorted(tmp_path.glob("*.xml")))
+
+    assert result["never_ran"] == 0
+    assert result["flaky"][0]["test"] == "apps/api/tests/test_b.py::test_errored"
+
+
 def test_no_reports_is_an_error_not_an_empty_answer(tmp_path: Path) -> None:
     """Zero uploads means the run broke, and must not read as "parallelism is safe"."""
     module = _module()
