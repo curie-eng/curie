@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from curie_api.config import get_settings
 from curie_api.schema_compat import (
     KIND_CONTRACT,
@@ -37,7 +38,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
-HEAD = "0041"
+CONTRACT = "0041"
 PREV = "0040"
 
 
@@ -45,6 +46,15 @@ def _alembic_config() -> Config:
     cfg = Config()
     cfg.set_main_option("script_location", str(ALEMBIC_DIR))
     return cfg
+
+
+def _migration_head() -> str:
+    heads = ScriptDirectory.from_config(_alembic_config()).get_heads()
+    assert len(heads) == 1, f"expected one migration head, found {heads}"
+    return heads[0]
+
+
+HEAD = _migration_head()
 
 
 def _sql(sql: str, params: dict[str, Any] | None = None) -> list[Any]:
@@ -78,27 +88,29 @@ def _exec(sql: str, params: dict[str, Any] | None = None) -> None:
 
 def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
-    assert window.schema_min == HEAD
+    assert window.schema_min == CONTRACT
     assert window.schema_head == HEAD
     kinds = load_kinds()
-    assert kinds[HEAD] == KIND_CONTRACT
+    assert kinds[CONTRACT] == KIND_CONTRACT
+    if HEAD != CONTRACT:
+        assert kinds[HEAD] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
 
 def test_planner_refuses_0041_contract_without_forward_only() -> None:
-    window = AppWindow(schema_min=HEAD, schema_head=HEAD)
-    kinds = {PREV: KIND_EXPAND, HEAD: KIND_CONTRACT}
+    window = AppWindow(schema_min=CONTRACT, schema_head=CONTRACT)
+    kinds = {PREV: KIND_EXPAND, CONTRACT: KIND_CONTRACT}
     decision = plan_upgrade(
         current_revision=PREV,
         window=window,
         kinds=kinds,
-        pending=(HEAD,),
+        pending=(CONTRACT,),
         forward_only=False,
     )
     assert decision.action == "refuse"
     assert decision.rollback_compatible is False
-    assert decision.pending[0].revision == HEAD
+    assert decision.pending[0].revision == CONTRACT
     assert decision.pending[0].kind == KIND_CONTRACT
     assert "forward-only" in decision.reason.lower()
 
@@ -135,13 +147,13 @@ def test_planner_applies_irreversible_only_with_forward_only() -> None:
 
 
 def test_empty_database_install_does_not_refuse_historical_irreversible() -> None:
-    window = AppWindow(schema_min=HEAD, schema_head=HEAD)
+    window = AppWindow(schema_min=CONTRACT, schema_head=CONTRACT)
     kinds = load_kinds()
     decision = plan_upgrade(
         current_revision=None,
         window=window,
         kinds=kinds,
-        pending=(HEAD,),
+        pending=(CONTRACT,),
         forward_only=False,
     )
     assert decision.action == "apply"
@@ -149,11 +161,11 @@ def test_empty_database_install_does_not_refuse_historical_irreversible() -> Non
 
 
 def test_already_at_head_is_noop() -> None:
-    window = AppWindow(schema_min=HEAD, schema_head=HEAD)
+    window = AppWindow(schema_min=CONTRACT, schema_head=HEAD)
     decision = plan_upgrade(
         current_revision=HEAD,
         window=window,
-        kinds={HEAD: KIND_CONTRACT},
+        kinds=load_kinds(),
         pending=(),
         forward_only=False,
     )
@@ -172,22 +184,23 @@ def test_assert_servable_refuses_below_min(isolated_migration_db: None) -> None:
 
 
 def test_n_minus_one_can_serve_an_unknown_newer_expand() -> None:
-    future_expand = "0042"
-    window = AppWindow(schema_min=HEAD, schema_head=HEAD)
-    known = {HEAD, PREV}
+    future_expand = "future-expand"
+    window = AppWindow(schema_min=CONTRACT, schema_head=HEAD)
+    known = {HEAD, CONTRACT, PREV}
     assert can_serve(future_expand, window, known) is True
     assert can_serve(HEAD, window, known) is True
+    assert can_serve(CONTRACT, window, known) is True
     assert can_serve(PREV, window, known) is False
     assert can_serve(None, window, known) is False
 
 
 def test_decision_json_is_redacted() -> None:
-    window = AppWindow(schema_min=HEAD, schema_head=HEAD)
+    window = AppWindow(schema_min=CONTRACT, schema_head=CONTRACT)
     decision = plan_upgrade(
         current_revision=PREV,
         window=window,
-        kinds={HEAD: KIND_CONTRACT},
-        pending=(HEAD,),
+        kinds={CONTRACT: KIND_CONTRACT},
+        pending=(CONTRACT,),
         forward_only=True,
     )
     payload = json.dumps(render_decision(decision))
@@ -196,7 +209,7 @@ def test_decision_json_is_redacted() -> None:
     assert "password" not in lowered
     assert "database_url" not in lowered
     assert PREV in payload
-    assert HEAD in payload
+    assert CONTRACT in payload
 
 
 def test_0041_contract_requires_forward_only_and_closes_n_minus_one_window(
@@ -255,11 +268,11 @@ def test_0041_contract_requires_forward_only_and_closes_n_minus_one_window(
     )
     assert pubs, "0041 contract column must exist after upgrade"
 
-    # Red-on-revert: min=head=0041 closes the application rollback window.
+    # Red-on-revert: 0041 remains the minimum after later expand migrations.
     n = load_window()
-    assert n.schema_min == HEAD
+    assert n.schema_min == CONTRACT
     assert n.schema_head == HEAD
-    assert can_serve(PREV, n, {PREV, HEAD}) is False
+    assert can_serve(PREV, n, {PREV, CONTRACT, HEAD}) is False
 
 
 def test_crash_retry_does_not_double_apply(
@@ -279,42 +292,43 @@ def test_crash_retry_does_not_double_apply(
         "applied_at timestamptz not null default now())"
     )
 
+    # Synthetic names cannot collide with future production migration numbers.
     alembic_copy = tmp_path / "alembic"
     shutil.copytree(ALEMBIC_DIR, alembic_copy)
     versions = alembic_copy / "versions"
-    (versions / "0042_compat_first.py").write_text(
-        '''
-revision = "0042"
-down_revision = "0041"
+    (versions / "compat_probe_first_compat_first.py").write_text(
+        f'''
+revision = "compat_probe_first"
+down_revision = {HEAD!r}
 
 def upgrade():
     from alembic import op
     op.execute(
-        "INSERT INTO curie.compat_probe (rev) VALUES ('0042')"
+        "INSERT INTO curie.compat_probe (rev) VALUES ('compat_probe_first')"
     )
 
 def downgrade():
     from alembic import op
-    op.execute("DELETE FROM curie.compat_probe WHERE rev = '0042'")
+    op.execute("DELETE FROM curie.compat_probe WHERE rev = 'compat_probe_first'")
 '''
     )
-    (versions / "0043_compat_second.py").write_text(
+    (versions / "compat_probe_second_compat_second.py").write_text(
         '''
 import os
-revision = "0043"
-down_revision = "0042"
+revision = "compat_probe_second"
+down_revision = "compat_probe_first"
 
 def upgrade():
     from alembic import op
     if os.environ.get("CURIE_COMPAT_PROBE_CRASH") == "1":
-        raise RuntimeError("injected crash after 0042")
+        raise RuntimeError("injected crash after compat_probe_first")
     op.execute(
-        "INSERT INTO curie.compat_probe (rev) VALUES ('0043')"
+        "INSERT INTO curie.compat_probe (rev) VALUES ('compat_probe_second')"
     )
 
 def downgrade():
     from alembic import op
-    op.execute("DELETE FROM curie.compat_probe WHERE rev = '0043'")
+    op.execute("DELETE FROM curie.compat_probe WHERE rev = 'compat_probe_second'")
 '''
     )
     probe_cfg = Config()
@@ -326,45 +340,45 @@ def downgrade():
             apply_upgrade(
                 forward_only=False,
                 alembic_config=probe_cfg,
-                window=AppWindow(schema_min=HEAD, schema_head="0043"),
+                window=AppWindow(schema_min=HEAD, schema_head="compat_probe_second"),
                 kinds={
                     **load_kinds(),
-                    "0042": KIND_EXPAND,
-                    "0043": KIND_EXPAND,
+                    "compat_probe_first": KIND_EXPAND,
+                    "compat_probe_second": KIND_EXPAND,
                 },
             )
     finally:
         os.environ.pop("CURIE_COMPAT_PROBE_CRASH", None)
 
-    assert current_revision() == "0042"
+    assert current_revision() == "compat_probe_first"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0042"]
+    assert [r[0] for r in rows] == ["compat_probe_first"]
 
     outcome = apply_upgrade(
         forward_only=False,
         alembic_config=probe_cfg,
-        window=AppWindow(schema_min=HEAD, schema_head="0043"),
+        window=AppWindow(schema_min=HEAD, schema_head="compat_probe_second"),
         kinds={
             **load_kinds(),
-            "0042": KIND_EXPAND,
-            "0043": KIND_EXPAND,
+            "compat_probe_first": KIND_EXPAND,
+            "compat_probe_second": KIND_EXPAND,
         },
     )
     assert outcome.outcome == "applied"
-    assert current_revision() == "0043"
+    assert current_revision() == "compat_probe_second"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0042", "0043"]
+    assert [r[0] for r in rows] == ["compat_probe_first", "compat_probe_second"]
 
     again = apply_upgrade(
         forward_only=False,
         alembic_config=probe_cfg,
-        window=AppWindow(schema_min=HEAD, schema_head="0043"),
+        window=AppWindow(schema_min=HEAD, schema_head="compat_probe_second"),
         kinds={
             **load_kinds(),
-            "0042": KIND_EXPAND,
-            "0043": KIND_EXPAND,
+            "compat_probe_first": KIND_EXPAND,
+            "compat_probe_second": KIND_EXPAND,
         },
     )
     assert again.action == "noop"
     rows = _sql("SELECT rev FROM curie.compat_probe ORDER BY rev")
-    assert [r[0] for r in rows] == ["0042", "0043"]
+    assert [r[0] for r in rows] == ["compat_probe_first", "compat_probe_second"]
