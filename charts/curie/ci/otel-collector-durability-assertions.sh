@@ -119,6 +119,11 @@ YAML
 cat > "$TMP/external-otel-workload-env.yaml" <<'YAML'
 otelCollector:
   deploy: false
+  # Rail 1 keys on the effective runner OTLP URL (#2367); extraEnv below is
+  # external, so the dedicated peer is required even with no chart-owned endpoint.
+  egress:
+    - cidr: 192.0.2.40/32
+      ports: [{ protocol: TCP, port: 4318 }]
 dispatcher:
   deploy: true
   slack:
@@ -144,6 +149,12 @@ agentSandbox:
 YAML
 
 cat > "$TMP/internal-runner-otel-override.yaml" <<'YAML'
+otelCollector:
+  # In-chart collector stays deployed; runner extraEnv points OTLP elsewhere.
+  # Rail 1 requires the dedicated peer (#2367).
+  egress:
+    - cidr: 192.0.2.40/32
+      ports: [{ protocol: TCP, port: 4318 }]
 dispatcher:
   deploy: true
   slack:
@@ -319,11 +330,69 @@ expect_render_failure() {
   fi
 }
 
+cat > "$TMP/prometheus-remote-write.yaml" <<'YAML'
+otelCollector:
+  extraExporters:
+    prometheusremotewrite/soak:
+      endpoint: http://prometheus-server.example.com/api/v1/write
+      tls:
+        insecure: true
+      retry_on_failure:
+        enabled: true
+        initial_interval: 1s
+        max_interval: 5s
+        max_elapsed_time: 30s
+      remote_write_queue:
+        enabled: true
+        queue_size: 8
+        num_consumers: 1
+  extraMetricPipelineExporters: [prometheusremotewrite/soak]
+YAML
+
+cat > "$TMP/prometheus-remote-write-sending-queue.yaml" <<'YAML'
+otelCollector:
+  extraExporters:
+    prometheusremotewrite/soak:
+      endpoint: http://prometheus-server.example.com/api/v1/write
+      retry_on_failure:
+        enabled: true
+        initial_interval: 1s
+        max_interval: 5s
+        max_elapsed_time: 30s
+      sending_queue:
+        enabled: true
+        storage: file_storage
+        queue_size: 8
+  extraMetricPipelineExporters: [prometheusremotewrite/soak]
+YAML
+
+render "$TMP/prometheus-remote-write.yaml.out" -f "$TMP/prometheus-remote-write.yaml"
+python3 - "$TMP/prometheus-remote-write.yaml.out" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+docs = [doc for doc in yaml.safe_load_all(Path(sys.argv[1]).read_text()) if doc]
+config = None
+for doc in docs:
+    if doc.get("kind") == "ConfigMap" and "collector-config.yaml" in (doc.get("data") or {}):
+        config = yaml.safe_load(doc["data"]["collector-config.yaml"])
+        break
+assert config is not None
+exporter = config["exporters"]["prometheusremotewrite/soak"]
+assert "sending_queue" not in exporter
+assert exporter["remote_write_queue"]["enabled"] is True
+assert "prometheusremotewrite/soak" in config["service"]["pipelines"]["metrics"]["exporters"]
+print("PASS: prometheusremotewrite extra exporter uses remote_write_queue")
+PY
+
 # A pipeline may never name a component the rendered config does not define.
 expect_render_failure missing-log-exporter otlphttp/missing \
   --set 'otelCollector.extraLogPipelineExporters[0]=otlphttp/missing'
 expect_render_failure missing-metric-exporter otlphttp/missing \
   --set 'otelCollector.extraMetricPipelineExporters[0]=otlphttp/missing'
+expect_render_failure prometheus-remote-write-sending-queue 'must use remote_write_queue, not sending_queue' \
+  -f "$TMP/prometheus-remote-write-sending-queue.yaml"
 
 # The ConfigMap must never receive a literal credential header, and chart-owned
 # exporters cannot be overridden through the otherwise extensible map. The
@@ -593,9 +662,12 @@ def quantity_is_finite(value):
 def workload_containers(path):
     """Return the api/dispatcher/worker Deployments and the runner SandboxTemplate container, by role.
 
-    Not the authoritative instrumented set: the mail adapter also carries the
-    shared OTLP env and is pinned in ci/mail-adapter-wiring-assertions.sh. It
-    cannot appear here because these renders never set mailAdapter.deploy.
+    Not the authoritative instrumented set. ci/instrumented-workload-assertions.sh
+    enumerates first-party workloads from rendered chart-owned images and is
+    the gate that fails when a new workload omits OTEL_EXPORTER_OTLP_ENDPOINT
+    (#2360). The mail adapter also carries the shared OTLP env and is pinned
+    in ci/mail-adapter-wiring-assertions.sh. It cannot appear here because
+    these renders never set mailAdapter.deploy.
     """
     selected = {}
     for doc in documents(path):

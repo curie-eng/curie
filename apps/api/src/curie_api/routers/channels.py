@@ -4,8 +4,9 @@ Two endpoints, and every request/response model they use lives here rather than
 in ``schemas.py``:
 
 - ``POST /channels/token`` (platform key only) mints a ``chn`` token over a
-  binding ROW's id plus its current generation, so an ingress adapter holds a
-  credential scoped to exactly one binding instead of the platform key.
+  binding ROW's id plus a bumped generation, so an ingress adapter holds a
+  credential scoped to exactly one binding instead of the platform key, and a
+  remint revokes the token it replaces.
 - ``POST /channels/turns`` (platform key OR a ``chn`` token) enqueues a
   ``QueuedTurn`` for the binding named in the BODY.
 
@@ -116,7 +117,8 @@ class ChannelTokenRequest(ChannelBinding):
     # An hour by default; a week is the ceiling. The TTL and the generation are
     # the only two things standing in for the revocation list phase 2
     # deliberately does not build, so an unbounded lifetime would remove one of
-    # them.
+    # them. Minting itself is a rotation write: it bumps generation so a remint
+    # revokes the token it replaces (#2379).
     ttl_s: int = Field(default=3600, gt=0, le=604800)
 
 
@@ -257,12 +259,23 @@ async def mint_channel_token(
     defeat both the TTL and the generation -- the only two things standing in for
     a revocation list.
 
-    The token claims the ROW's id and its CURRENT generation, so it dies both
-    when the pair is deleted and recreated (a new row id) and when the binding is
-    re-pointed or merely re-asserted (a bumped generation).
+    The token claims the ROW's id and the generation this mint stamps. Minting
+    is a rotation write: it bumps the row under `FOR UPDATE` and signs the NEW
+    value, so a remint revokes the token it replaces (#2379). The token also
+    dies when the pair is deleted and recreated (a new row id) and when the
+    binding is re-pointed or merely re-asserted (another bump).
     """
 
-    row = await _resolve_binding(session, data.kind, data.address)
+    # Locked, not the unlocked `_resolve_binding` the ingress uses: two concurrent
+    # mints that both read N and both write N+1 would stamp the same generation
+    # on two tokens, and neither rotation would revoke the other. `populate_existing`
+    # is the same load-bearing choice as `crud.lock_agent_bindings`.
+    row: AgentChannel | None = await session.scalar(
+        select(AgentChannel)
+        .where(AgentChannel.kind == data.kind, AgentChannel.address == data.address)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if row is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
@@ -274,6 +287,7 @@ async def mint_channel_token(
         # rather than as a fail-closed escalation mid-turn, in the worker, far
         # from the request that caused it. `ingest_turn` raises the same refusal.
         raise _unroutable(data.kind, data.address)
+    row.generation += 1
     token = channel_token.mint(
         get_settings().api_key,
         channel_id=str(row.id),
@@ -281,6 +295,7 @@ async def mint_channel_token(
         scope=CHANNEL_ENQUEUE_SCOPE,
         exp=int(time.time()) + data.ttl_s,
     )
+    await session.commit()
     return ChannelTokenOut(token=token)
 
 
@@ -451,13 +466,14 @@ async def ingest_turn(
     owner = f"pending:{secrets.token_hex(16)}"
 
     # The generation, re-read at the LAST moment before the claim. The row above
-    # was loaded at the top of the request, and `update_channel_binding` bumps the
-    # generation on a rebind, so a credential revoked mid-request would otherwise
-    # still enqueue against the binding it no longer names. Re-reading here
-    # narrows that race from the whole request to the gap below; it does NOT
-    # close it -- a rebind committing between this SELECT and the XADD still
-    # lands, and closing that honestly needs a row lock held across the enqueue,
-    # which phase 2 does not take (FU: revocation list).
+    # was loaded at the top of the request, and both a rebind
+    # (`update_channel_binding`) and a remint (`mint_channel_token`) bump the
+    # generation, so a credential revoked mid-request would otherwise still
+    # enqueue against the binding it no longer names. Re-reading here narrows
+    # that race from the whole request to the gap below; it does NOT close it --
+    # a bump committing between this SELECT and the XADD still lands, and
+    # closing that honestly needs a row lock held across the enqueue, which
+    # phase 2 does not take (FU: revocation list).
     if claims is not None:
         current_generation = await session.scalar(
             select(AgentChannel.generation).where(AgentChannel.id == row.id)

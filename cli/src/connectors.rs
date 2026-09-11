@@ -13,12 +13,19 @@
 //! on the next deploy. Without that, a deleted connector leaves a pod running
 //! with a credential mounted and nothing referencing it -- the kind of leak
 //! nobody notices because nothing breaks.
+//!
+//! Apply success is not connector health (#2350). After apply+prune, each
+//! hosted Deployment is waited on until Ready or a terminal pod reason, bounded
+//! by [`CONNECTOR_ROLLOUT_DEADLINE`]. A failed wait is nonzero and does not
+//! roll the agent or version back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -73,6 +80,605 @@ pub fn apply_args(namespace: &str) -> Vec<String> {
         "-f".into(),
         "-".into(),
     ]
+}
+
+/// Shared with `comms` rollout status: other kubectl rollouts wait 120s.
+/// Connector deploy uses that bound once for every connector Deployment.
+pub const CONNECTOR_ROLLOUT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Last-log excerpt is a diagnostic, not a dump. kubectl `--tail` matches this.
+pub const LAST_LOG_TAIL_LINES: usize = 20;
+
+/// Last-log excerpt character cap after redaction.
+pub const LAST_LOG_MAX_CHARS: usize = 2048;
+
+/// A hosted connector Deployment that `cluster deploy` must see become Ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorWorkload {
+    pub connector: String,
+    pub deployment: String,
+}
+
+/// Observed rollout state. Kubernetes `message` fields never enter this value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RolloutObservation {
+    Ready,
+    Pending,
+    Failed {
+        reason: &'static str,
+        pod: Option<String>,
+    },
+}
+
+/// `kubectl rollout status` argv. Kept so the wait bound stays the comms 120s.
+pub fn rollout_status_args(namespace: &str, deployment: &str, timeout: Duration) -> Vec<String> {
+    vec![
+        "kubectl".into(),
+        "-n".into(),
+        namespace.into(),
+        "rollout".into(),
+        "status".into(),
+        format!("deployment/{deployment}"),
+        format!("--timeout={}s", timeout.as_secs().max(1)),
+    ]
+}
+
+pub fn deployment_get_args(namespace: &str, deployment: &str) -> Vec<String> {
+    vec![
+        "kubectl".into(),
+        "-n".into(),
+        namespace.into(),
+        "get".into(),
+        "deployment".into(),
+        deployment.into(),
+        "-o".into(),
+        "json".into(),
+    ]
+}
+
+pub fn pods_get_args(namespace: &str, deployment: &str) -> Vec<String> {
+    vec![
+        "kubectl".into(),
+        "-n".into(),
+        namespace.into(),
+        "get".into(),
+        "pods".into(),
+        "-l".into(),
+        format!("app.kubernetes.io/name={deployment}"),
+        "-o".into(),
+        "json".into(),
+    ]
+}
+
+pub fn replicasets_get_args(namespace: &str, deployment: &str) -> Vec<String> {
+    vec![
+        "kubectl".into(),
+        "-n".into(),
+        namespace.into(),
+        "get".into(),
+        "replicasets".into(),
+        "-l".into(),
+        format!("app.kubernetes.io/name={deployment}"),
+        "-o".into(),
+        "json".into(),
+    ]
+}
+
+pub fn last_log_args(namespace: &str, pod: &str, previous: bool) -> Vec<String> {
+    let mut args = vec![
+        "kubectl".into(),
+        "-n".into(),
+        namespace.into(),
+        "logs".into(),
+        pod.into(),
+        format!("--tail={LAST_LOG_TAIL_LINES}"),
+    ];
+    if previous {
+        args.push("--previous".into());
+    }
+    args
+}
+
+/// Time left on the command deadline. `None` means the wait must fail closed.
+pub fn remaining_timeout(deadline: Instant, now: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|d| *d > Duration::ZERO)
+}
+
+/// Hosted Deployments to wait on. Remote URL-only entries have no Deployment.
+pub fn connector_workloads(
+    manifests: &[Value],
+    urls: &BTreeMap<String, Value>,
+) -> Vec<ConnectorWorkload> {
+    let mut workloads = Vec::new();
+    for obj in manifests {
+        if obj.get("kind").and_then(Value::as_str) != Some("Deployment") {
+            continue;
+        }
+        let Some(name) = obj
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let connector = urls
+            .iter()
+            .find_map(|(connector, entry)| {
+                let url = entry.get("url").and_then(Value::as_str)?;
+                url_names_deployment(url, name).then_some(connector.clone())
+            })
+            .unwrap_or_else(|| name.to_string());
+        workloads.push(ConnectorWorkload {
+            connector,
+            deployment: name.to_string(),
+        });
+    }
+    workloads
+}
+
+fn terminal_reason(value: &str) -> Option<&'static str> {
+    match value {
+        "CrashLoopBackOff" => Some("CrashLoopBackOff"),
+        "ImagePullBackOff" => Some("ImagePullBackOff"),
+        "ErrImagePull" => Some("ErrImagePull"),
+        "InvalidImageName" => Some("InvalidImageName"),
+        "CreateContainerConfigError" => Some("CreateContainerConfigError"),
+        "CreateContainerError" => Some("CreateContainerError"),
+        "RunContainerError" => Some("RunContainerError"),
+        "OOMKilled" => Some("OOMKilled"),
+        "Error" => Some("Error"),
+        "Evicted" => Some("Evicted"),
+        "ContainerCannotRun" => Some("ContainerCannotRun"),
+        "BackoffLimitExceeded" => Some("BackoffLimitExceeded"),
+        "DeadlineExceeded" => Some("DeadlineExceeded"),
+        "ProgressDeadlineExceeded" => Some("ProgressDeadlineExceeded"),
+        _ => None,
+    }
+}
+
+fn replicaset_revision(rs: &Value) -> u64 {
+    rs.pointer("/metadata/annotations")
+        .and_then(Value::as_object)
+        .and_then(|annotations| annotations.get("deployment.kubernetes.io/revision"))
+        .and_then(Value::as_str)
+        .and_then(|revision| revision.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Template hash of the newest ReplicaSet, so fail-fast ignores superseded pods.
+pub fn current_template_hash(replicasets: &[Value]) -> Option<String> {
+    replicasets
+        .iter()
+        .max_by_key(|rs| replicaset_revision(rs))
+        .and_then(|rs| {
+            rs.pointer("/metadata/labels/pod-template-hash")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn pod_is_current(pod: &Value, current_hash: Option<&str>) -> bool {
+    if pod
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return false;
+    }
+    let Some(hash) = current_hash else {
+        return true;
+    };
+    pod.pointer("/metadata/labels/pod-template-hash")
+        .and_then(Value::as_str)
+        == Some(hash)
+}
+
+fn pod_terminal_failure(pod: &Value) -> Option<RolloutObservation> {
+    let name = pod
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    for field in ["/status/containerStatuses", "/status/initContainerStatuses"] {
+        let Some(list) = pod.pointer(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for container in list {
+            for pointer in ["/state/waiting/reason", "/state/terminated/reason"] {
+                if let Some(reason) = container
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .and_then(terminal_reason)
+                {
+                    return Some(RolloutObservation::Failed {
+                        reason,
+                        pod: name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+fn deployment_progress_deadline(deployment: &Value) -> Option<RolloutObservation> {
+    let generation = deployment
+        .pointer("/metadata/generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let observed = deployment
+        .pointer("/status/observedGeneration")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if generation > 0 && observed < generation {
+        return None;
+    }
+    let conditions = deployment
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)?;
+    for cond in conditions {
+        if cond.get("type").and_then(Value::as_str) == Some("Progressing")
+            && cond.get("reason").and_then(Value::as_str) == Some("ProgressDeadlineExceeded")
+        {
+            return Some(RolloutObservation::Failed {
+                reason: "ProgressDeadlineExceeded",
+                pod: None,
+            });
+        }
+    }
+    None
+}
+
+/// Classify a Deployment plus its pods. Message fields are ignored.
+///
+/// `current_hash` is the newest ReplicaSet `pod-template-hash`. Terminal pod
+/// reasons are taken only from that revision, so a crashlooping predecessor
+/// cannot fail a corrective rollout. Ready requires the current generation to
+/// be observed and updated, not merely leftover readyReplicas from old pods.
+pub fn observe_rollout(
+    deployment: &Value,
+    pods: &[Value],
+    current_hash: Option<&str>,
+) -> RolloutObservation {
+    for pod in pods.iter().filter(|pod| pod_is_current(pod, current_hash)) {
+        if let Some(failed) = pod_terminal_failure(pod) {
+            return failed;
+        }
+    }
+    if let Some(failed) = deployment_progress_deadline(deployment) {
+        return failed;
+    }
+    let generation = deployment
+        .pointer("/metadata/generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let observed = deployment
+        .pointer("/status/observedGeneration")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let wanted = deployment
+        .pointer("/spec/replicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let updated = deployment
+        .pointer("/status/updatedReplicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let ready = deployment
+        .pointer("/status/readyReplicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let available = deployment
+        .pointer("/status/availableReplicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = deployment
+        .pointer("/status/replicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // kubectl rollout status: updatedReplicas and availableReplicas meet spec,
+    // and no extra old replicas remain (status.replicas <= updatedReplicas).
+    if wanted > 0
+        && observed >= generation
+        && updated >= wanted
+        && ready >= wanted
+        && available >= wanted
+        && total <= updated
+    {
+        RolloutObservation::Ready
+    } else {
+        RolloutObservation::Pending
+    }
+}
+
+/// Bound and redact a pod log excerpt. Secret values are replaced first.
+pub fn redact_last_log(text: &str, secret_values: &BTreeMap<String, String>) -> String {
+    let mut out = text.to_string();
+    let mut values: Vec<&String> = secret_values
+        .values()
+        .filter(|value| !value.is_empty())
+        .collect();
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    for value in values {
+        out = out.replace(value, "[REDACTED]");
+    }
+    static PATTERNS: OnceLock<[Regex; 3]> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            Regex::new(r"(?i)(authorization:\s*bearer\s+)\S+").expect("bearer regex"),
+            Regex::new(r"(?i)((?:api[_-]?key|secret|token|password)\s*[=:]\s*)\S+")
+                .expect("assignment regex"),
+            Regex::new(r#"(?i)("(?:api[_-]?key|secret|token|password)"\s*:\s*")[^"]*"#)
+                .expect("json field regex"),
+        ]
+    });
+    for re in patterns {
+        out = re.replace_all(&out, "${1}[REDACTED]").into_owned();
+    }
+    out = crate::schema_window::redact_probe_text(&out);
+    let lines: Vec<&str> = out.lines().collect();
+    let clipped = if lines.len() > LAST_LOG_TAIL_LINES {
+        lines[lines.len() - LAST_LOG_TAIL_LINES..].join("\n")
+    } else {
+        out.trim_end().to_string()
+    };
+    let mut bounded: String = clipped.chars().take(LAST_LOG_MAX_CHARS).collect();
+    if clipped.chars().count() > LAST_LOG_MAX_CHARS {
+        bounded.push_str("\n...");
+    }
+    bounded
+}
+
+fn excerpt_or_omit(text: &str, secret_values: &BTreeMap<String, String>) -> Option<String> {
+    let redacted = redact_last_log(text, secret_values);
+    if secret_values
+        .values()
+        .any(|value| !value.is_empty() && redacted.contains(value))
+    {
+        return None;
+    }
+    if redacted.trim().is_empty() {
+        None
+    } else {
+        Some(redacted)
+    }
+}
+
+/// Nonzero connector rollout failure. Names the connector and the recovery command.
+pub fn rollout_failure(
+    connector: &str,
+    namespace: &str,
+    deployment: &str,
+    reason: &str,
+    excerpt: Option<&str>,
+) -> anyhow::Error {
+    let mut message = format!("connector {connector} did not become ready ({reason})");
+    if let Some(excerpt) = excerpt.map(str::trim).filter(|excerpt| !excerpt.is_empty()) {
+        message.push_str("\nlast log:\n");
+        message.push_str(excerpt);
+    }
+    anyhow::Error::from(
+        crate::exit::CliError::failure(message).with_fix(format!(
+            "inspect with `kubectl -n {namespace} logs deploy/{deployment} --tail=50`, then fix connectors.yaml and re-run `curie cluster deploy`. The agent/version may already exist; this is not a healthy connector deploy and was not rolled back."
+        )),
+    )
+}
+
+async fn run_bounded(
+    argv: &[String],
+    stdin: Option<&str>,
+    budget: Duration,
+) -> Result<(bool, String, String)> {
+    match tokio::time::timeout(budget.max(Duration::from_millis(50)), run(argv, stdin)).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("kubectl timed out after {}s", budget.as_secs()),
+    }
+}
+
+fn timed_out(err: &anyhow::Error) -> bool {
+    err.to_string().contains("kubectl timed out")
+}
+
+async fn kubectl_list(
+    target: &ClusterTarget,
+    argv: &[String],
+    workload: &ConnectorWorkload,
+    namespace: &str,
+    deadline: Instant,
+) -> Result<Option<Value>> {
+    let Some(budget) = remaining_timeout(deadline, Instant::now()) else {
+        return Err(rollout_failure(
+            &workload.connector,
+            namespace,
+            &workload.deployment,
+            "timeout",
+            None,
+        ));
+    };
+    match run_bounded(
+        &target.args(argv),
+        None,
+        budget.min(Duration::from_secs(10)),
+    )
+    .await
+    {
+        Ok((true, out, _)) => Ok(serde_json::from_str(&out).ok()),
+        Ok((false, _, err)) if err.contains("NotFound") || err.contains("not found") => Ok(None),
+        Ok((false, _, _)) => Err(rollout_failure(
+            &workload.connector,
+            namespace,
+            &workload.deployment,
+            "observe",
+            None,
+        )),
+        Err(err) if timed_out(&err) => Err(rollout_failure(
+            &workload.connector,
+            namespace,
+            &workload.deployment,
+            "timeout",
+            None,
+        )),
+        Err(_) => Err(rollout_failure(
+            &workload.connector,
+            namespace,
+            &workload.deployment,
+            "observe",
+            None,
+        )),
+    }
+}
+
+fn list_items(doc: Option<Value>) -> Vec<Value> {
+    doc.and_then(|list| list.get("items").cloned())
+        .and_then(|items| items.as_array().cloned())
+        .unwrap_or_default()
+}
+
+async fn observe_one(
+    target: &ClusterTarget,
+    namespace: &str,
+    workload: &ConnectorWorkload,
+    deadline: Instant,
+) -> Result<RolloutObservation> {
+    let Some(deployment) = kubectl_list(
+        target,
+        &deployment_get_args(namespace, &workload.deployment),
+        workload,
+        namespace,
+        deadline,
+    )
+    .await?
+    else {
+        return Ok(RolloutObservation::Pending);
+    };
+    let replicasets = list_items(
+        kubectl_list(
+            target,
+            &replicasets_get_args(namespace, &workload.deployment),
+            workload,
+            namespace,
+            deadline,
+        )
+        .await?,
+    );
+    let current_hash = current_template_hash(&replicasets);
+    let pods = list_items(
+        kubectl_list(
+            target,
+            &pods_get_args(namespace, &workload.deployment),
+            workload,
+            namespace,
+            deadline,
+        )
+        .await?,
+    );
+    Ok(observe_rollout(&deployment, &pods, current_hash.as_deref()))
+}
+
+async fn last_log_excerpt(
+    target: &ClusterTarget,
+    namespace: &str,
+    pod: &str,
+    secret_values: &BTreeMap<String, String>,
+    deadline: Instant,
+) -> Option<String> {
+    let budget = remaining_timeout(deadline, Instant::now())?;
+    let current = run_bounded(
+        &target.args(&last_log_args(namespace, pod, false)),
+        None,
+        budget.min(Duration::from_secs(10)),
+    )
+    .await
+    .ok();
+    let raw = match current {
+        Some((true, out, _)) if !out.trim().is_empty() => out,
+        _ => {
+            let budget = remaining_timeout(deadline, Instant::now())?;
+            let previous = run_bounded(
+                &target.args(&last_log_args(namespace, pod, true)),
+                None,
+                budget.min(Duration::from_secs(10)),
+            )
+            .await
+            .ok()?;
+            if !previous.0 || previous.1.trim().is_empty() {
+                return None;
+            }
+            previous.1
+        }
+    };
+    excerpt_or_omit(&raw, secret_values)
+}
+
+/// Wait until every hosted connector Deployment is Ready, or fail named.
+pub async fn wait_for_connector_rollouts(
+    target: &ClusterTarget,
+    namespace: &str,
+    workloads: &[ConnectorWorkload],
+    secret_values: &BTreeMap<String, String>,
+    deadline: Instant,
+) -> Result<()> {
+    if workloads.is_empty() {
+        return Ok(());
+    }
+    let ui = crate::ui::ui();
+    let remaining_s = remaining_timeout(deadline, Instant::now())
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    ui.note(&format!(
+        "waiting for {} connector rollout(s), deadline {remaining_s}s",
+        workloads.len()
+    ));
+    let mut pending: Vec<ConnectorWorkload> = workloads.to_vec();
+    loop {
+        if remaining_timeout(deadline, Instant::now()).is_none() {
+            let first = &pending[0];
+            return Err(rollout_failure(
+                &first.connector,
+                namespace,
+                &first.deployment,
+                "timeout",
+                None,
+            ));
+        }
+        let mut still = Vec::new();
+        for workload in pending {
+            match observe_one(target, namespace, &workload, deadline).await? {
+                RolloutObservation::Ready => {
+                    ui.note(&format!("connector {}: ready", workload.connector));
+                }
+                RolloutObservation::Pending => still.push(workload),
+                RolloutObservation::Failed { reason, pod } => {
+                    let excerpt = match pod {
+                        Some(pod) => {
+                            last_log_excerpt(target, namespace, &pod, secret_values, deadline).await
+                        }
+                        None => None,
+                    };
+                    return Err(rollout_failure(
+                        &workload.connector,
+                        namespace,
+                        &workload.deployment,
+                        reason,
+                        excerpt.as_deref(),
+                    ));
+                }
+            }
+        }
+        if still.is_empty() {
+            return Ok(());
+        }
+        pending = still;
+        let Some(remaining) = remaining_timeout(deadline, Instant::now()) else {
+            continue;
+        };
+        tokio::time::sleep(remaining.min(Duration::from_secs(2))).await;
+    }
 }
 
 /// `kubectl delete` argv for owned objects of `kind` that are no longer declared.
@@ -294,6 +900,111 @@ pub fn as_list_document(manifests: &[Value]) -> Result<String> {
     serde_json::to_string(&doc).context("serializing connector manifests")
 }
 
+/// Whether an mcp_entry URL names this Deployment's Service.
+///
+/// Same host match the rollout wait uses (`connector_workloads`): the
+/// Service DNS is `<deployment>.<namespace>.svc.cluster.local`. Shared by
+/// #2350 and #2352. Do not treat a missing match as a capability-probe
+/// failure (#2519).
+fn url_names_deployment(url: &str, deployment: &str) -> bool {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    let host = hostport.rsplit('@').next().unwrap_or(hostport);
+    let host = host.split(':').next().unwrap_or(host);
+    host == deployment || host.starts_with(&format!("{deployment}."))
+}
+
+fn mcp_join_prefix(release: &str, agent: &str) -> String {
+    format!("{release}-{agent}-mcp-")
+}
+
+/// Hosted Deployments whose Service is not in `mcp_entries` (#2352).
+///
+/// This is the mounted-*declaration* check, not tool-surface discovery: a
+/// matching URL means Curie derived the MCP entry the runner will inject.
+/// Empty Bearer expansion and probe failure stay #2519. Hosted *readiness*
+/// (rollout) stays #2350. A hosted connector with a matching entry must not
+/// warn: that is the shipped 0.8.6+ mount path, not the 0.8.5 silence.
+pub fn hosted_unmounted_connectors(
+    manifests: &[Value],
+    mcp_entries: &BTreeMap<String, Value>,
+    release: &str,
+    agent: &str,
+) -> Vec<String> {
+    let prefix = mcp_join_prefix(release, agent);
+    let mut names = Vec::new();
+    for obj in manifests {
+        if obj.get("kind").and_then(Value::as_str) != Some("Deployment") {
+            continue;
+        }
+        let Some(name) = obj
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if mcp_entries.iter().any(|(_, entry)| {
+            entry
+                .get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| url_names_deployment(url, name))
+        }) {
+            continue;
+        }
+        let connector = name.strip_prefix(&prefix).unwrap_or(name);
+        names.push(connector.to_string());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Loud warning for connectors that were hosted but not declared mounted.
+pub fn hosted_unmounted_warning(names: &[String]) -> Option<String> {
+    match names {
+        [] => None,
+        [one] => Some(format!(
+            "connector {one} was hosted but not mounted into the agent's MCP declaration"
+        )),
+        many => Some(format!(
+            "connectors {} were hosted but not mounted into the agent's MCP declaration",
+            many.join(", ")
+        )),
+    }
+}
+
+/// Human deploy report: warnings first, then URL notes for mounted entries.
+pub fn connector_report_lines(synced: &ConnectorSync) -> (Vec<String>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut notes = Vec::new();
+    if let Some(msg) = hosted_unmounted_warning(&synced.hosted_unmounted) {
+        warnings.push(msg);
+    }
+    for (name, url) in &synced.urls {
+        if synced.hosted_unmounted.iter().any(|n| n == name) {
+            continue;
+        }
+        notes.push(format!("connector {name}: {url}"));
+    }
+    (warnings, notes)
+}
+
+/// Emit the deploy-time hosted vs mounted-declaration report.
+pub fn report_connector_sync(synced: &ConnectorSync) {
+    let ui = crate::ui::ui();
+    let (warnings, notes) = connector_report_lines(synced);
+    for msg in warnings {
+        ui.warn(&msg);
+    }
+    for msg in notes {
+        ui.note(&msg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +1198,172 @@ mod tests {
         assert!(!args.iter().any(|a| a.contains("go-template")));
     }
 
+    fn deploy_status(replicas: u64, ready: u64, available: u64) -> Value {
+        json!({
+            "metadata": {"generation": 1},
+            "spec": {"replicas": replicas},
+            "status": {
+                "observedGeneration": 1,
+                "replicas": replicas,
+                "updatedReplicas": replicas,
+                "readyReplicas": ready,
+                "availableReplicas": available,
+            }
+        })
+    }
+
+    fn pod_waiting(name: &str, reason: &str) -> Value {
+        json!({
+            "metadata": {"name": name},
+            "status": {
+                "containerStatuses": [{
+                    "name": "server",
+                    "state": {"waiting": {"reason": reason, "message": "should-never-surface"}}
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn no_connectors_yield_no_workloads() {
+        assert!(connector_workloads(&[], &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn ready_replicas_are_healthy() {
+        assert_eq!(
+            observe_rollout(&deploy_status(1, 1, 1), &[], None),
+            RolloutObservation::Ready
+        );
+    }
+
+    #[test]
+    fn leftover_ready_replicas_are_not_the_new_revision() {
+        let stale = json!({
+            "metadata": {"generation": 2},
+            "spec": {"replicas": 1},
+            "status": {
+                "observedGeneration": 1,
+                "replicas": 1,
+                "updatedReplicas": 0,
+                "readyReplicas": 1,
+                "availableReplicas": 1,
+            }
+        });
+        assert_eq!(
+            observe_rollout(&stale, &[], None),
+            RolloutObservation::Pending
+        );
+    }
+
+    #[test]
+    fn overlapping_old_ready_pod_is_not_the_new_revision() {
+        let overlapping = json!({
+            "metadata": {"generation": 2},
+            "spec": {"replicas": 1},
+            "status": {
+                "observedGeneration": 2,
+                "replicas": 2,
+                "updatedReplicas": 1,
+                "readyReplicas": 1,
+                "availableReplicas": 1,
+            }
+        });
+        assert_eq!(
+            observe_rollout(
+                &overlapping,
+                &[json!({
+                    "metadata": {
+                        "name": "new-pod",
+                        "labels": {"pod-template-hash": "newhash"}
+                    },
+                    "status": {
+                        "containerStatuses": [{
+                            "name": "server",
+                            "state": {"waiting": {"reason": "ContainerCreating"}}
+                        }]
+                    }
+                })],
+                Some("newhash"),
+            ),
+            RolloutObservation::Pending
+        );
+    }
+
+    #[test]
+    fn crashloop_is_terminal() {
+        assert_eq!(
+            observe_rollout(
+                &deploy_status(1, 0, 0),
+                &[pod_waiting("mcp-github-abc", "CrashLoopBackOff")],
+                None,
+            ),
+            RolloutObservation::Failed {
+                reason: "CrashLoopBackOff",
+                pod: Some("mcp-github-abc".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn image_pull_failure_is_terminal() {
+        for reason in ["ImagePullBackOff", "ErrImagePull", "InvalidImageName"] {
+            assert_eq!(
+                observe_rollout(
+                    &deploy_status(1, 0, 0),
+                    &[pod_waiting("mcp-github-xyz", reason)],
+                    None,
+                ),
+                RolloutObservation::Failed {
+                    reason,
+                    pod: Some("mcp-github-xyz".into()),
+                },
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_failure_names_the_connector_and_recovery_command() {
+        let err = rollout_failure(
+            "github",
+            "curie",
+            "curie-acme-bot-mcp-github",
+            "CrashLoopBackOff",
+            Some("Error: unknown command \"http\" for \"server\""),
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains("connector github"), "{text}");
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Failure);
+        let fix = fix.expect("recovery command");
+        assert!(
+            fix.contains("kubectl -n curie logs deploy/curie-acme-bot-mcp-github --tail=50"),
+            "{fix}"
+        );
+    }
+
+    #[test]
+    fn last_log_redacts_secrets_and_json_fields() {
+        let mut secrets = BTreeMap::new();
+        secrets.insert("TOKEN".into(), "gho_this_is_not_a_real_token".into());
+        let redacted = redact_last_log(
+            "Authorization: Bearer gho_this_is_not_a_real_token\n{\"token\":\"sensitive-value\"}",
+            &secrets,
+        );
+        assert!(
+            !redacted.contains("gho_this_is_not_a_real_token"),
+            "{redacted}"
+        );
+        assert!(!redacted.contains("sensitive-value"), "{redacted}");
+    }
+
+    #[test]
+    fn rollout_wait_uses_the_comms_deadline() {
+        let args = rollout_status_args("curie", "dep", CONNECTOR_ROLLOUT_DEADLINE);
+        assert!(args.iter().any(|a| a == "--timeout=120s"), "{args:?}");
+    }
+
     fn with_isolated_store<T>(body: impl FnOnce() -> T) -> T {
         let _lock = crate::PROCESS_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -594,6 +1471,12 @@ pub struct ConnectorSync {
     pub written_keys: Vec<String>,
     /// Live Secret keys this deploy is replacing. Names only, never values.
     pub replaced_keys: Vec<String>,
+    /// Hosted Deployments with no matching mcp_entry URL (#2352).
+    ///
+    /// Declaration-layer only: not rollout readiness (#2350) and not MCP
+    /// capability discovery (#2519). Empty means every hosted connector was
+    /// declared mounted.
+    pub hosted_unmounted: Vec<String>,
 }
 
 /// Discover the release's rendered app name (the chart's nameOverride).
@@ -680,9 +1563,16 @@ pub struct PreparedConnectorSync {
     agent_name: String,
     keep: Vec<String>,
     apply_document: Option<String>,
+    workloads: Vec<ConnectorWorkload>,
     result: ConnectorSync,
     secret_name: Option<String>,
     secret_keys: Vec<String>,
+    /// The connector-owned secret VALUES as resolved for THIS cluster scope
+    /// (#1913). Retained so `cluster deploy` binds the sandbox with the very
+    /// same credential the connector pod receives rather than re-resolving the
+    /// name from the environment or unscoped host storage, which can differ.
+    /// Private: nothing outside this module may take ownership of a value.
+    secret_values: BTreeMap<String, String>,
     secret_sources: BTreeMap<String, String>,
     target: SecretScope,
     bound_target: Option<ClusterTarget>,
@@ -695,6 +1585,15 @@ impl PreparedConnectorSync {
         }
         self.bound_target = Some(target);
         Ok(self)
+    }
+
+    /// The connector-owned secrets, keyed by NAME, with the cluster-scoped
+    /// value already resolved for the deploy's target. Read by `cluster deploy`
+    /// to bind those names into the agent sandbox (#2503) with the scoped value
+    /// -- one cluster, one credential (#1913) -- instead of resolving the name
+    /// a second time from a possibly stale environment.
+    pub fn owned_secret_values(&self) -> &BTreeMap<String, String> {
+        &self.secret_values
     }
 
     pub fn write_intent(&self) -> Option<String> {
@@ -711,6 +1610,11 @@ impl PreparedConnectorSync {
             .iter()
             .map(|(key, source)| format!("{key}: {source}"))
             .collect()
+    }
+
+    /// Hosted connectors with no matching mcp_entry, recorded at prepare.
+    pub fn hosted_unmounted(&self) -> &[String] {
+        &self.result.hosted_unmounted
     }
 }
 
@@ -765,6 +1669,7 @@ pub fn prepare(
     let mut objects = Vec::new();
     let mut secret_name = None;
     let mut secret_keys = Vec::new();
+    let mut secret_values = BTreeMap::new();
     let mut secret_sources = BTreeMap::new();
 
     if let Some((name, keys)) = owned_secret(owned_secret_name, owned_secret_keys) {
@@ -772,12 +1677,19 @@ pub fn prepare(
         objects.push(render_secret(&name, &target.namespace, &values));
         secret_name = Some(name);
         secret_keys = keys;
+        secret_values = values;
         secret_sources = sources;
     }
     objects.extend_from_slice(manifests);
 
     let mut result = ConnectorSync {
         written_keys: secret_keys.clone(),
+        hosted_unmounted: hosted_unmounted_connectors(
+            manifests,
+            mcp_entries,
+            &target.release,
+            agent_name,
+        ),
         ..Default::default()
     };
     for (name, entry) in mcp_entries {
@@ -788,6 +1700,7 @@ pub fn prepare(
 
     let labelled = label_objects(&objects, agent_name);
     let keep = object_names(&labelled);
+    let workloads = connector_workloads(manifests, mcp_entries);
     let apply_document = if labelled.is_empty() {
         None
     } else {
@@ -799,9 +1712,11 @@ pub fn prepare(
         agent_name: agent_name.to_string(),
         keep,
         apply_document,
+        workloads,
         result,
         secret_name,
         secret_keys,
+        secret_values,
         secret_sources,
         target: target.clone(),
         bound_target: None,
@@ -819,9 +1734,11 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
         agent_name,
         keep,
         apply_document,
+        workloads,
         mut result,
         secret_name,
         secret_keys,
+        secret_values,
         secret_sources,
         target,
         bound_target,
@@ -868,6 +1785,14 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
             err.trim()
         ));
     }
+    wait_for_connector_rollouts(
+        &bound_target,
+        &namespace,
+        &workloads,
+        &secret_values,
+        Instant::now() + CONNECTOR_ROLLOUT_DEADLINE,
+    )
+    .await?;
     Ok(result)
 }
 /// Render and reconcile the connectors declared by one deployed version.
@@ -906,10 +1831,7 @@ pub async fn sync_deployed_version(
     )?
     .bind_target(target)?;
     let synced = sync(prepared).await?;
-    let ui = crate::ui::ui();
-    for (name, url) in &synced.urls {
-        ui.note(&format!("connector {name}: {url}"));
-    }
+    report_connector_sync(&synced);
     Ok(())
 }
 

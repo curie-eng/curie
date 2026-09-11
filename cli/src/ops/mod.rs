@@ -161,6 +161,7 @@ mod testsupport {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],

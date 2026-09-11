@@ -22,11 +22,10 @@ jobs:
     name: Python (ruff + mypy + pytest)
     runs-on: ubuntu-latest
     # A job-level block REPLACES the workflow-level one, so `contents: read` is
-    # repeated here. `issues: read` is what lets the fix pin gate read the
-    # labels of the closed issues a pull request names, through the Issues API.
+    # repeated here. The Issues scope that used to sit alongside it followed the
+    # fix pin gate into its own job; the suite never read issue labels.
     permissions:
       contents: read
-      issues: read
     env:
       CI_REQUIRE_VALKEY_TESTS: "1"
     steps:
@@ -212,45 +211,124 @@ jobs:
             exit 1
           fi
           echo "Python pytest selection matched $expected"
-      # Build ONLY when the declaration parser would invoke the curie binary.
-      # tools/fix-pin-ci/check.py reaches it at exactly one place, the
-      # `curie dev verify-fix-pin` call, and only once `declaration.selector` is
-      # set; `n/a`, no declaration, a near-miss marker like `Fix-pin:`, HTML
-      # comments in the pull request template, and the bug-without-declaration
-      # rejection all return before touching it.
-      #
-      # `#2228` gated cargo with `contains(..., 'Fix pin:')`. That is true for
-      # every pull request that keeps the default template, because the template
-      # embeds those exact bytes inside `<!-- -->`. The probe reuses
-      # `_declaration` so a commented example cannot trigger a cold
-      # `cargo build --release` inside the longest job on the graph, and a live
-      # selector line cannot skip it.
-      #
-      # `n/a` used to pay that extra build as a safe over-match. The parser does
-      # not invoke curie for `n/a`, so the probe reports needed=false. This
-      # stays a direct build inside the required Python status: no `needs`, no
-      # downloaded artifact, no Cargo cache.
+      - name: Dump dev stack logs on failure
+        if: ${{ failure() && steps.python-runtime.outputs.pytest == 'true' }}
+        run: docker compose -f compose.dev.yaml logs --no-color --tail=200
+
+  fix-pin:
+    name: Fix pin verification
+    runs-on: ubuntu-latest
+    # #2230 measured the Python job as the sole critical path. On run
+    # 34528877480 it was 26.4 minutes, and two of its steps were this gate: a
+    # cold 251s `cargo build --release` plus a 127s verification, both appended
+    # AFTER the 1048s pytest that neither of them depends on.
+    #
+    # #2228 stopped that build on pull requests that declare nothing. It did
+    # not stop it for the ones that do, and this repository REQUIRES a
+    # `Fix pin:` selector on every pull request closing a `bug` labelled issue,
+    # so the declaring majority still paid all 6.3 minutes in series behind the
+    # suite. Run 34528877480 is one of those: the build ran, for 251s.
+    #
+    # Nothing here is waste in itself, so this does not delete a step, it moves
+    # them off the path. They are unchanged, including the direct cargo build:
+    # a `rust` selector makes verify-fix-pin.sh run `cargo test` out of
+    # CARGO_TARGET_DIR, so that build warms the directory the verification then
+    # compiles in, and is not merely producing the binary the check invokes.
+    # Swapping it for the artifact rust-build already uploads would leave a
+    # rust selector to compile from cold, which is why it stays a direct build.
+    # The comment it carried about living "inside the required Python status"
+    # is now met by this job being its own required status.
+    #
+    # The dev stack is the one addition, and it is a correctness fix, not a
+    # speed one. verify-fix-pin.sh runs `uv run pytest <selector>` for a
+    # `python` selector; for an integration selector that dials Postgres and
+    # Valkey. Inside the Python job the stack was already up and the gate
+    # inherited it. Split out, it has to boot its own or those selectors fail
+    # for the environment rather than for the pin.
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      # `issues: read` is what lets this gate read the labels of the closed
+      # issues a pull request names, through the Issues API.
+      issues: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # verify-fix-pin.sh resolves HEAD and adds a detached worktree at it,
+          # and the gate diffs against the base, so the full history is needed.
+          fetch-depth: 0
+          persist-credentials: false
+      # Retry eligibility (#1106): this step's whole job is to ACQUIRE a
+      # third-party tool, so it may be wrapped. The verification below is this
+      # repository's own gate and is deliberately not.
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
+      # Everything below the probe is gated on it, so a pull request that
+      # declares nothing, or declares `n/a`, still costs only the probe. That
+      # is #2228's win, preserved: the parser does not reach the binary for
+      # those, so no build, no Helm, and no compose stack is paid for them.
       - name: Decide whether the current curie binary is needed
         id: fix-pin-curie
-        if: github.event_name == 'pull_request'
         run: >-
           python3 tools/fix-pin-ci/check.py
           --event "$GITHUB_EVENT_PATH"
           --needs-curie
       - name: Build the current curie binary for fix pin verification
-        if: >-
-          github.event_name == 'pull_request'
-          && steps.fix-pin-curie.outputs.needed == 'true'
+        if: steps.fix-pin-curie.outputs.needed == 'true'
         run: cargo build --release --locked --manifest-path cli/Cargo.toml
+      # A `chart` selector runs charts/curie/ci/<name>.sh, which needs Helm.
       - name: Install Helm for fix pin verification
-        if: >-
-          github.event_name == 'pull_request'
-          && steps.fix-pin-curie.outputs.needed == 'true'
+        if: steps.fix-pin-curie.outputs.needed == 'true'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
+      # Same boot as the Python job: the first `up` starts the one-shot
+      # rustfs-init alongside the long-lived services, the second `--wait`s only
+      # on the long-lived ones because `--wait` reads rustfs-init's exit(0) as a
+      # failure.
+      - name: Start dev stack
+        if: steps.fix-pin-curie.outputs.needed == 'true'
+        run: |
+          docker compose -f compose.dev.yaml up -d \
+            postgres valkey clickhouse rustfs rustfs-init \
+            langfuse-web langfuse-worker otel-collector
+          docker compose -f compose.dev.yaml up -d --wait --wait-timeout 300 \
+            postgres valkey clickhouse rustfs \
+            langfuse-web langfuse-worker otel-collector
+      - name: Wait for Langfuse to serve
+        if: steps.fix-pin-curie.outputs.needed == 'true'
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:23000/api/public/health >/dev/null 2>&1; then
+              echo "Langfuse ready after attempt ${i}"; exit 0
+            fi
+            sleep 3
+          done
+          echo "Langfuse did not become ready within 180s"; exit 1
+      # A pinned worker binding test dials the shared default database and
+      # assumes the curie schema exists, exactly as it does under the Python
+      # job, so the same migration runs here.
+      - name: Migrate the shared database
+        if: steps.fix-pin-curie.outputs.needed == 'true'
+        working-directory: apps/api
+        run: uv run alembic upgrade head
       - name: Require declared fixes to be pinned by a changed test
-        if: github.event_name == 'pull_request'
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/cli/target
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -263,7 +341,7 @@ jobs:
       # --profile full, `docker compose logs` matches no service and prints
       # nothing, so a real outage gets diagnosed with no container logs at all.
       - name: Dump dev stack logs on failure
-        if: ${{ failure() && steps.python-runtime.outputs.pytest == 'true' }}
+        if: ${{ failure() && steps.fix-pin-curie.outputs.needed == 'true' }}
         run: docker compose --profile full -f compose.dev.yaml logs --no-color --tail=200
 
   rust:
@@ -1897,6 +1975,28 @@ jobs:
         env:
           CURIE_BIN: cli/target/release/curie
         run: bash scripts/check-netpol-enforcement.sh curie curie curie
+      # The mail adapter's own egress rail (#2361). It is the only first-party
+      # workload the chart gives an egress NetworkPolicy at all, so it is the
+      # only one that can silently drop its own OTLP export: with
+      # otelCollector.deploy false and an external endpoint, the export leaves
+      # the cluster through a single ipBlock peer the operator declared. That is
+      # exactly the kind of rule a render assertion cannot prove -- an applied
+      # but unenforced NetworkPolicy renders identically to a correct one, and a
+      # rule on the wrong port looks perfectly right in YAML while dropping
+      # every span. This runs on the same enforcing Calico cluster and is a
+      # non-vacuity check of its own: it proves an UNDECLARED peer is blocked
+      # before it trusts the declared one. It uses its own namespace, so it
+      # neither reads nor disturbs the release installed above.
+      - name: Mail-adapter external-collector egress enforces (not just rendered)
+        run: bash scripts/check-mail-adapter-otel-egress.sh charts/curie
+      # Runner BYO egress (#2369). Render assertions prove the CIDRs land in
+      # NetworkPolicy YAML; this proves a runner-labelled pod can actually
+      # reach each declared peer (rustfs, sts, otel, api) and that an
+      # undeclared control is blocked. Same non-vacuity gate as the mail
+      # adapter check: a non-enforcing CNI FAILS, it does not skip. Own
+      # namespace, so it neither reads nor disturbs the release above.
+      - name: Runner BYO egress enforces (not just rendered)
+        run: bash scripts/check-runner-byo-egress.sh charts/curie
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       - name: Dump cluster diagnostics on failure

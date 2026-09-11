@@ -227,6 +227,63 @@ def test_deadline_halted_is_a_declared_terminal_turn_outcome(
         assert manifest[name]["cardinality_bound"] == 192
 
 
+def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
+    manifest = _read(_MANIFEST)["metrics"]
+    definition = manifest["curie.worker.supervised.restart"]
+    assert definition["type"] == "counter"
+    assert definition["unit"] == "{restart}"
+    assert definition["description"] == "In-process supervised worker task restarts."
+    assert definition["monotonic"] is True
+    assert definition["attributes"] == {
+        "service.name": ["curie-worker"],
+        "operation": [
+            "runs",
+            "killswitch",
+            "evals",
+            "heartbeat",
+            "connectors",
+            "publications",
+            "other",
+        ],
+        "outcome": ["restart"],
+    }
+    assert definition["cardinality_bound"] == 7
+
+
+def test_supervised_restart_metric_rejects_undeclared_operation_by_execution(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    del metrics
+    # Bounded catalog: operation is a closed supervised-task domain, not an
+    # identity label for the crashing exception or claim method.
+    record_metric(
+        "curie.worker.supervised.restart",
+        attributes={
+            "service.name": "curie-worker",
+            "operation": "publications",
+            "outcome": "restart",
+        },
+    )
+    with pytest.raises(ValueError, match="outside its declared domain"):
+        record_metric(
+            "curie.worker.supervised.restart",
+            attributes={
+                "service.name": "curie-worker",
+                "operation": "claim_next",
+                "outcome": "restart",
+            },
+        )
+    with pytest.raises(ValueError, match="outside its declared domain"):
+        record_metric(
+            "curie.worker.supervised.restart",
+            attributes={
+                "service.name": "curie-worker",
+                "operation": "publications",
+                "outcome": "crash",
+            },
+        )
+
+
 def test_record_metric_still_rejects_unknown_turn_outcome(
     metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:

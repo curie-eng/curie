@@ -33,6 +33,26 @@ def consumer_reclaim_lock_key(stream: str, group: str, consumer: str) -> str:
     return f"{stream}:consumer-reclaim-lock:{group}:{consumer}"
 
 
+class ThreadLockOwnerLiveness:
+    """Runs-group heartbeat adapter for :class:`~curie_worker.threadlock.ThreadLock`.
+
+    The kernel's per-thread lock is process-wide. Stamping it with the runs
+    consumer name and checking that consumer's alive lease is enough: eval
+    and runs share a process, so a crash drops both heartbeats together.
+    """
+
+    def __init__(self, store: ConsumerLivenessStore, *, stream: str, group: str) -> None:
+        self._store = store
+        self._stream = stream
+        self._group = group
+
+    async def is_alive(self, owner: str) -> bool:
+        return await self._store.is_alive(stream=self._stream, group=self._group, consumer=owner)
+
+    async def is_capable(self, owner: str) -> bool:
+        return await self._store.is_capable(stream=self._stream, group=self._group, consumer=owner)
+
+
 class ConsumerLivenessStore:
     """The narrow Redis string-key surface used by consumer liveness.
 

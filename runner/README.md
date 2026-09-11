@@ -80,7 +80,22 @@ hits `/healthz`); replacement authority comes only from authenticated
   the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
   (offline smoke; no model call), `CURIE_DISALLOWED_TOOLS` (optional
   comma-separated tool names removed from the session and refused even under
-  bypassPermissions; unset keeps every tool available).
+  bypassPermissions; unset keeps every tool available). This stops the named
+  tools, not the underlying capability (#2429): denying
+  `mcp__curie-state__append`/`set`/`delete` does not revoke
+  `CURIE_STATE_TOKEN`, which stays in the sandbox environment, so a
+  still-permitted shell tool (e.g. `Bash`) can reach the same HTTP state API
+  directly. Naming `Bash` alongside the state tools closes that path today;
+  removing the token itself needs a code change, not a config knob.
+  Hosted-connector Bearer secrets are a different class (#2559): the runner
+  expands `Authorization: Bearer ${NAME}` into the in-memory MCP catalog at
+  boot and drops `NAME` from the process environment (and from
+  `CURIE_CONNECTOR_SECRET_KEYS`) before the session accepts turns, so `Bash`
+  cannot read the PAT. The on-disk catalog keeps the placeholder. Residual:
+  kubelet / `docker -e` still injects the value onto the container until the
+  runner process unsets it. ADR-0009 `--secret` names that are not a hosted
+  Bearer stay in the environment, because stdio / remote MCP clients still
+  expand `${VAR}` there.
 
 ## Build and smoke
 
@@ -109,8 +124,14 @@ load?" without a model turn. It
 validates the bundle via the frozen `load_plugins`, then builds a real
 `ClaudeSDKClient` and `connect()`s (no query), polls `get_mcp_status()` until the
 bundle's own servers settle, and compares the **declared** servers against the
-plugin-owned **registered** ones. It reads `CURIE_PLUGIN_DIR` (and optional
-`CURIE_CHECK_TIMEOUT_S`, default 30); it forwards and reads **no** credential.
+plugin-owned **registered** ones. `declared` is the union of the MCP-config
+servers (`plugin.json` `mcpServers` and a bare `.mcp.json`) and the bundle's
+`connectors.yaml` connectors, each name counted once; the check mounts the
+connector forms this tier can actually reach (a remote `url:` and a hosted
+connector's `unhosted_url:` fallback), so those are genuinely exercised, while
+a purely hosted connector is declared but not exercisable here. It reads
+`CURIE_PLUGIN_DIR` (and optional `CURIE_CHECK_TIMEOUT_S`, default 30); it
+forwards and reads **no** credential.
 
 ```bash
 CURIE_PLUGIN_DIR=/plugin python -m curie_runner.check
@@ -121,7 +142,8 @@ and exits with the verdict code:
 
 - `0` green: every declared MCP server registered connected with at least one tool
 - `1` red: a declared server failed to load (never registered, connected with zero
-  tools, `failed`/`needs-auth`/`pending` at the deadline, or the init timed out)
+  tools, `failed`/`needs-auth`/`pending` at the deadline, or the init timed out),
+  including a declared `connectors.yaml` connector this tier cannot host
 - `2` invalid_bundle: the bundle fails `plugin_format` validation or the plugin dir
   is missing
 

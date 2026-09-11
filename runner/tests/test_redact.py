@@ -64,6 +64,13 @@ FAKE_JWT = "eyJ" + "hbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.FAKEFAKEFAKEFAKEFAKEFA
 FAKE_URL_WITH_TOKEN = "https://example.invalid/hook?token=" + "0000FAKEFAKEFAKEFAKE"
 FAKE_SECRET_ASSIGNMENT = "secret=" + "0000FAKEFAKEFAKEVALUE"
 FAKE_HOME_PATH = "/home/theconnman/.config/curie/settings.json"
+FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
+FAKE_X_API_KEY_HEADER = "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000"
+_FAKE_DISCORD_BOT_TOKEN = (
+    "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
+)
+FAKE_DISCORD_BOT_AUTHORIZATION = "Authorization: Bot " + _FAKE_DISCORD_BOT_TOKEN
+FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT = "DISCORD_BOT_TOKEN=" + _FAKE_DISCORD_BOT_TOKEN
 
 # The sensitive substring that must be absent from every boundary's output,
 # keyed by rule name. VECTORS is derived from this so the two cannot drift.
@@ -82,6 +89,10 @@ SECRET_LITERALS: dict[str, str] = {
     "url_secret_param": FAKE_URL_WITH_TOKEN,
     "secret_assignment": FAKE_SECRET_ASSIGNMENT,
     "home_path": FAKE_HOME_PATH,
+    "channel_token": FAKE_CHANNEL_TOKEN,
+    "x_api_key": FAKE_X_API_KEY_HEADER,
+    "discord_bot_authorization": FAKE_DISCORD_BOT_AUTHORIZATION,
+    "discord_bot_token_assignment": FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT,
 }
 
 # One frozen vector per rule: a realistic runner output line carrying that class

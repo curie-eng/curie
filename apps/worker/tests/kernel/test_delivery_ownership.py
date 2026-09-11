@@ -790,6 +790,70 @@ def test_an_already_expired_delivery_escalates_once_records_deadline_halted_and_
 
 
 
+def test_a_deadline_halted_thread_accepts_a_followup_turn(make_harness) -> None:
+    """#2425: exceeding the delivery deadline must leave the conversation usable.
+
+    The halted event settles once and does not start a runner. A later event on
+    the SAME thread opens a fresh turn and completes. Red on a halt that keeps
+    the thread lock, leaves a live turn, or makes the follow-up steer into a
+    dead session.
+
+    The negative control is the halt itself: the first event must not reach the
+    runner. The independent path is the follow-up's own event id completing.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+            h.runner.default_script = [Final(text="should-not-run", status=DONE)]
+
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(
+                    _qevent("expired", thread="deadline-follow", event_id="halted-1")
+                ),
+            )
+            entry_id, fields = await _read_one(h, h.config.consumer_name)
+            seconds, microseconds = await h.async_redis.time()
+            now_ms = int(seconds) * 1000 + int(microseconds) // 1000
+            await h.async_redis.hset(
+                h.config.delivery_state_key(
+                    h.config.stream, h.config.consumer_group, entry_id
+                ),
+                mapping={"deadline_ms": str(now_ms - 1000)},
+            )
+
+            await consumer._dispatch(entry_id, dict(fields))
+            await _settle(consumer)
+
+            assert h.runner.opened == [], (
+                "an already-expired delivery must not start a runner attempt"
+            )
+            assert await h.async_redis.exists(h.config.done_key("halted-1"))
+            assert entry_id not in await _pending_rows(h)
+
+            h.runner.default_script = [Final(text="follow-up-ok", status=DONE)]
+            follow = _qevent("follow", thread="deadline-follow", event_id="follow-1")
+            await h.kernel.process_event(follow)
+
+            assert h.runner.opened == ["follow"], h.runner.opened
+            assert h.runner.steers == [], (
+                "a follow-up after a halted turn must open a new turn, not steer"
+            )
+            assert h.sink.last_text == "follow-up-ok"
+            assert await h.async_redis.exists(h.config.done_key("follow-1"))
+            pending = await h.async_redis.scard(h.config.completions_pending_key())
+            assert int(pending) == 0, (
+                "the follow-up left owed completions on the delivery plane"
+            )
+
+    asyncio.run(go())
+
+
 # --- AC2: the lease-expiry reclaim pass ---------------------------------------
 #
 # The gap #1532 and #1971 deliberately left open: a LIVE consumer's own pending

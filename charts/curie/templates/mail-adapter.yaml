@@ -127,6 +127,38 @@ list order or an exact string comparison.
   {{- fail "mailAdapter.apiEgress.port must be an integer from 1 through 65535" }}
   {{- end }}
 {{- end }}
+{{- /* The adapter is the only first-party workload with an egress-restricting
+     policy, so it is the only one whose OTLP export its own rail can drop
+     while api/dispatcher/worker keep exporting from the same rendered env
+     (#2361). Resolve the endpoint it actually dials, and either select the
+     in-chart collector by pod label or require an operator-declared IP peer;
+     never both, and never neither. */}}
+{{- $otelCidrs := list }}
+{{- $otelExternal := include "curie.mailAdapter.otlpIsExternal" . | trim }}
+{{- $otelPort := "" }}
+{{- if $otelExternal }}
+  {{- if not .Values.mailAdapter.otelEgress.httpsCidrs }}
+  {{- fail (printf "This release's effective OTLP endpoint is %s, which is not this release's in-chart collector, so set at least one narrow mailAdapter.otelEgress.httpsCidrs entry reaching it. The mail adapter is the only first-party workload with an egress policy, so with no peer for that address its every span, metric and log is dropped by its own rail while api, dispatcher and worker keep exporting and the rendered env still looks correct. NetworkPolicy cannot target a DNS name, so the chart cannot derive this peer from the endpoint; declare the collector's narrow IP range (or that of a controlled egress proxy). To deliberately accept an unobservable release instead, set otelCollector.telemetryDisabled=true." (include "curie.mailAdapter.effectiveOtlpEndpoint" .)) }}
+  {{- end }}
+  {{- range .Values.mailAdapter.otelEgress.httpsCidrs }}
+  {{- $otelCidrs = append $otelCidrs (include "curie.mailAdapter.narrowCidr" (dict "key" "mailAdapter.otelEgress.httpsCidrs" "cidr" .) | trim) }}
+  {{- end }}
+  {{- $otelPort = include "curie.mailAdapter.otelEgressPort" . | trim }}
+{{- else }}
+  {{- if .Values.mailAdapter.otelEgress.httpsCidrs }}
+  {{- /* Not-external covers two unrelated releases, and one remedy for both
+       mis-diagnoses one of them: an empty effective endpoint (telemetry
+       disabled, or deploy=false with no endpoint) has no in-chart collector at
+       all -- curie.otel.validate forbids telemetryDisabled with deploy=true --
+       so telling that operator a pod-selector rule covers their export names a
+       rule that was never rendered. Each case gets its own true remedy. */}}
+  {{- if include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim }}
+  {{- fail "mailAdapter.otelEgress.httpsCidrs is set, but the key is only read when this release's effective OTLP endpoint is external. This release exports to its own in-chart collector, and egress to it is governed by the rendered pod-selector rule -- these CIDRs would be silently ignored, leaving an operator believing a peer exists. Clear mailAdapter.otelEgress.httpsCidrs, or point the release at an external collector with otelCollector.deploy=false and otelCollector.endpoint." }}
+  {{- else }}
+  {{- fail "mailAdapter.otelEgress.httpsCidrs is set, but this release exports nothing at all: its effective OTLP endpoint is empty, so there is no collector -- in-chart or external -- for these CIDRs to reach, and no peer to declare. They would be silently ignored. Clear mailAdapter.otelEgress.httpsCidrs, or configure a collector to export to (otelCollector.deploy=true, or otelCollector.deploy=false with otelCollector.endpoint set) and declare its narrow IP range here." }}
+  {{- end }}
+  {{- end }}
+{{- end }}
 {{/*
 The first-party email channel (#1515): the adapter polls an AgentMail inbox,
 posts each allowed message to the platform as a turn, and replies on the same
@@ -343,9 +375,12 @@ spec:
 # otelCollector.deploy is true -- this release's collector. Read the rules
 # below for the current set rather than trusting a count in prose.
 #
-# With otelCollector.deploy false and an external otelCollector.endpoint set,
-# this policy has no peer for that address and OTLP export is dropped; see
-# charts/curie/README.md for the operator remedy.
+# The collector destination is fail-closed rather than documented (#2361): when
+# the release's effective OTLP endpoint is this release's in-chart collector the
+# peer is the pod-selector rule below, and when it is anything else the operator
+# must declare mailAdapter.otelEgress.httpsCidrs or the render is refused. The
+# two are mutually exclusive; an unobservable adapter is reachable only through
+# otelCollector.telemetryDisabled=true, which leaves nothing to export.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -400,7 +435,7 @@ spec:
         {{- end }}
       ports:
         - { protocol: TCP, port: 443 }
-    {{- if .Values.otelCollector.deploy }}
+    {{- if and .Values.otelCollector.deploy (not $otelExternal) }}
     # This release's in-chart OTel Collector. The adapter is the only
     # first-party service with an egress policy, so unlike api/dispatcher/worker
     # it needs an explicit peer or every OTLP export is dropped by this rail
@@ -418,5 +453,27 @@ spec:
       ports:
         - { protocol: TCP, port: {{ .Values.otelCollector.service.grpcPort }} }
         - { protocol: TCP, port: {{ .Values.otelCollector.service.httpPort }} }
+    {{- else }}
+    {{- /* The external peer is the ELSE of the in-chart gate, not a sibling
+         `if`: as siblings the #2317 class guard read this file as a .deploy
+         carve-out with no BYO branch and needed an exemption, so deleting the
+         rule below would have restored the silent drop with the suite still
+         green. The inner gate keeps the two peers mutually exclusive -- a
+         release that exports nowhere (empty effective endpoint) lands here and
+         correctly renders neither. */}}
+    {{- if $otelExternal }}
+    # An external collector has no in-chart pod labels to select, and
+    # NetworkPolicy cannot resolve its DNS name, so the operator declares its
+    # narrow IP peer at render time -- the same shape as the BYO API rule above.
+    # One rule, on the port resolved from mailAdapter.otelEgress.port or the
+    # endpoint URL, so this stays the complete list of what the pod may reach.
+    - to:
+        {{- range $otelCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: {{ $otelPort | int }} }
+    {{- end }}
     {{- end }}
 {{- end }}

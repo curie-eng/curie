@@ -370,7 +370,8 @@ async def update_channel_binding(
     whose values are identical -- an operator re-asserting a binding is the "I
     think something is wrong with this route" gesture that should invalidate
     outstanding credentials, and guarding the bump on a value change would leave
-    that case silently valid.
+    that case silently valid. `POST /channels/token` is the sibling bump: a
+    remint increments the same counter so rotation revokes (#2379).
 
     FLUSHES rather than commits, so the caller can run it inside a SAVEPOINT:
     the unique violation this raises has to be recoverable without discarding

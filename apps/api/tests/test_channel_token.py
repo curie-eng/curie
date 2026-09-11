@@ -11,8 +11,9 @@ The claims are `{channel_id, generation, scope, exp}` (plan D5, EB-C1):
 deliberately NOT `(kind, address)`. `crud.update_channel_binding` mutates the
 binding row in place and `delete_agent` frees the pair for reuse, so a token
 claiming the pair goes live again against a NEW owner (E12). The row id plus a
-rebind counter is what makes a rebind observable to a credential minted before
-it -- and it is what makes T-C8 and T-C9 fail under the rejected design.
+rotation counter is what makes a rebind or a remint observable to a credential
+minted before it -- and it is what makes T-C8, T-C9 and #2379 fail under the
+rejected design.
 
 Pure stdlib, nothing mocked, no database. An independent reimplementation of the
 signing format pins the exact encoding rather than round-tripping the module

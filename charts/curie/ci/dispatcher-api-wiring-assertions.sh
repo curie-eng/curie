@@ -257,8 +257,15 @@ actual="$(env_value "$manifest" CURIE_API_URL)"
 [ "$actual" = "http://curie-api:9999" ] \
   || fail "api.service.port=9999: CURIE_API_URL is '$actual', expected 'http://curie-api:9999' (the port is hardcoded in the template instead of read from .Values.api.service.port)"
 
-# 3: BYO override renders verbatim (the api.deploy=false answer).
-manifest="$(render_dispatcher byo --set dispatcher.apiBaseUrl=http://byo-api.example:8080 "${TOKENS[@]}")"
+# 3: BYO override renders verbatim (the api.deploy=false answer). Rail 1
+# requires a declared peer when the runner-facing URL is external and the
+# in-chart API is still deployed (#2367); this fixture is about the env value.
+manifest="$(render_dispatcher byo \
+  --set dispatcher.apiBaseUrl=http://byo-api.example:8080 \
+  --set 'api.egress[0].cidr=192.0.2.21/32' \
+  --set 'api.egress[0].ports[0].protocol=TCP' \
+  --set 'api.egress[0].ports[0].port=8080' \
+  "${TOKENS[@]}")"
 actual="$(env_value "$manifest" CURIE_API_URL)"
 [ "$actual" = "http://byo-api.example:8080" ] \
   || fail "dispatcher.apiBaseUrl override: CURIE_API_URL is '$actual', expected the verbatim override 'http://byo-api.example:8080'"

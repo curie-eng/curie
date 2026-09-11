@@ -57,7 +57,19 @@ purpose-built upgrade path with much wider authority.
 
 For a manual install, apply `manifests/kubernetes-access.yaml`, assemble a
 kubeconfig for `sre-bot-kubernetes`, store it as the connector secret
-`K8S_KUBECONFIG`, and deploy the unchanged bundle.
+`K8S_KUBECONFIG`, bind the declared `sre-approvals` route, and deploy the
+unchanged bundle. Deploy is refused until that route is bound:
+
+```bash
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
+curie cluster approvals sre-bot --list-routes
+curie cluster deploy --plugin-dir examples/sre-bot
+```
+
+With `--observability`, the example also installs the metrics pipeline and
+reliability alerts. Follow [METRICS-ROLLOUT.md](docs/METRICS-ROLLOUT.md) for the
+staged rollout and runtime proof; rendered configuration is evidence of wiring,
+not proof that live samples or alerts reached their destination.
 
 ## Operational limits
 

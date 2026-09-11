@@ -35,10 +35,11 @@ and the one validation that proves it.
      DSN stays a plain host/port.
    - **Neon:** use the pooled or direct endpoint host, and set
      `postgres.sslMode: require` on the chart path. That renders `?ssl=require`
-     for the api and worker (SQLAlchemy + asyncpg) and `?sslmode=no-verify` for
-     Langfuse (Prisma). `no-verify` encrypts without authenticating the server
-     certificate; a `verify-full` mode needs a mounted CA bundle and is not
-     this knob.
+     for the api and worker (SQLAlchemy + asyncpg) and
+     `?sslmode=require&sslaccept=accept_invalid_certs` for Langfuse (Prisma).
+     Neither suffix authenticates the server certificate, so api, worker, and
+     Langfuse traffic is encrypted but not authenticated; a `verify-full` mode
+     needs a mounted CA bundle and is not this knob.
    - The role must own (or be able to create) the `curie` schema. Migration
      `0001_initial` issues `CREATE SCHEMA IF NOT EXISTS curie`.
 

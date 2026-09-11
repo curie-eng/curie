@@ -789,6 +789,10 @@ fn plan_installation_inner(
         secrets: vec![],
         github_token: crate::ops::GithubTokenPlan::Untouched,
         dev: false,
+        // Installation apply has no adoption surface of its own; a namespace
+        // that needs the #2557 override is adopted by an explicit
+        // `curie cluster up --adopt` first.
+        adopt: false,
     };
     crate::ops::validate_up_inputs(&up, github_token.as_deref(), false)?;
     Ok(LocalInstallationPlan {

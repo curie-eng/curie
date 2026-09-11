@@ -189,18 +189,24 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 - **Liveness string keys are another intentionally narrow adjacent dependency.**
   `ConsumerLivenessStore` uses the worker's concrete async Redis client for its
   renewable alive/capability markers and short token-checked arbitration lease;
-  generic `SET`/`EXISTS`/`DELETE` were
+  generic `SET`/`EXISTS`/`DELETE` plus the EVAL Lua in
+  `apps/worker/src/curie_worker/consumer_liveness.py::ConsumerLivenessStore.release_reclaim`
+  (token-checked `DEL`) were
   not added to `StreamBroker`. The independent marker protocol is what lets
   prompt recovery protect a live consumer whose `XINFO` idle time is high while
   retaining a 900-second fallback for a pre-marker peer.
 - **The API both writes the runs stream and reads the graveyard outside the ports.**
   Correcting an earlier claim that the API's redis only backs the kill-switch /
-  eval-queue: the approval-resume path enqueues resume turns directly onto the same
-  `curie:runs` stream via `ResumeQueue`
+  eval-queue: two off-port `curie:runs` writers sit in the API. The approval-resume
+  path enqueues resume turns via `ResumeQueue`
   (`apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`), driven both by the
   approvals router and by the expiry sweeper
-  (`apps/api/src/curie_api/sweeper.py::sweep_expired_approvals`): an `xadd` that bypasses
-  the dispatcher's `StreamPublisher` port entirely. The API also *reads* the worker's
+  (`apps/api/src/curie_api/sweeper.py::sweep_expired_approvals`). Channel and hook
+  intake enqueue via `enqueue_owned`
+  (`apps/api/src/curie_api/delivery.py::enqueue_owned`), used by
+  `apps/api/src/curie_api/routers/channels.py` and
+  `apps/api/src/curie_api/routers/hooks.py`. Both are an `xadd` (the latter inside
+  EVAL Lua) that bypasses the dispatcher's `StreamPublisher` port entirely. The API also *reads* the worker's
   `<stream>:dead` graveyard directly, with `xrevrange`/`xrange` on its own raw client:
   `apps/api/src/curie_api/graveyardwatcher.py::GraveyardWatcher` (`xrevrange` to seed the
   cursor in `seed_cursor`, `xrange` to scan in `scan_once`) and
@@ -216,8 +222,9 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   the expected resume metadata, so it skips completion-outbox rows. The API
   re-derives the graveyard name as `<stream>:dead` rather than reading the
   worker's config. The PEL writer already uses `StreamBroker.xadd`; a second
-  broker must additionally account for the off-port completion-outbox writer
-  and these two API-side readers.
+  broker must additionally account for the off-port completion-outbox writer,
+  the two off-port `curie:runs` writers (`ResumeQueue.enqueue` and
+  `enqueue_owned`), and these two API-side readers.
 - **The redis-py exception surface leaks.** The ports type the verbs but not the error
   contract: `redis.exceptions` propagate through the callers unabstracted, so a non-redis
   broker must either raise redis-py-compatible exceptions or the call sites must learn its

@@ -13,7 +13,9 @@ one: the quiesce TTL must strictly outlast the drain wait.
 The API this file pins:
 
     UpgradeDrainGate(redis: Redis, config: WorkerConfig)
-      .request_quiesce(*, ttl_s=None)     -> None   (always with an expiry)
+      .request_quiesce(*, ttl_s=None)     -> None   (always with an expiry;
+                                                     raises if the fenced write
+                                                     is refused)
       .clear_quiesce()                    -> None
       .is_quiescing()                     -> bool
       .unsettled_deliveries()             -> tuple[str, ...]  ("stream/group/entry")
@@ -350,7 +352,8 @@ def test_marker_json_fences_numeric_revisions_and_retains_same_revision_since(
             assert revision_10_raw is not None
             assert json.loads(revision_10_raw)["revision"] == 10
 
-            await gate_9.request_quiesce()
+            with pytest.raises(Exception, match="(?i)higher revision"):
+                await gate_9.request_quiesce()
             assert await client.get(key) == revision_10_raw, (
                 "numeric revision 9 replaced the newer revision 10 marker"
             )
@@ -442,6 +445,183 @@ def test_first_mixed_version_upgrade_atomically_writes_and_clears_both_keys(
 
             await gate.clear_quiesce()
             assert await client.mget(legacy_key, scoped_key) == [None, None]
+        finally:
+            await client.delete(legacy_key, scoped_key)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_run_gate_refuses_when_a_higher_revision_fences_the_quiesce_write(
+    names,
+) -> None:  # noqa: ANN001
+    """A fenced Lua write must fail the hook, not report a drain that never happened.
+
+    Chief-of-staff review 2026-09-09 finding 4 (follow-up to #2471):
+    ``_WRITE_OWNED_MARKER_LUA`` returns 0 and writes nothing when an applicable
+    key already holds a higher revision, but ``request_quiesce`` discarded that
+    result and ``await_drained`` proceeded into the settle loop. Reachable on
+    the legacy-bridge upgrade, where the shared unscoped key is in KEYS, and
+    on the standalone/Compose path, where ``_revision()`` is 0.
+    """
+
+    async def go() -> None:
+        bridge = _config(
+            names,
+            installation_id="install-fenced-write",
+            upgrade_revision=9,
+            upgrade_legacy_quiesce=True,
+        )
+        standalone = _config(names, installation_id="")
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        legacy_key = _legacy_quiesce_key(bridge)
+        scoped_key = _scoped_quiesce_key(bridge, "install-fenced-write")
+        foreign = json.dumps(
+            {"since": "2026-09-08T00:00:00+00:00", "revision": 11},
+            separators=(",", ":"),
+        )
+        try:
+            await client.delete(legacy_key, scoped_key)
+            await client.set(legacy_key, foreign, ex=30)
+
+            gate = UpgradeDrainGate(client, bridge)
+            # Match the refusal text rather than importing QuiesceWriteRefused:
+            # verify-fix-pin reverses only product files, so a new exception
+            # class would fail collection instead of failing the selected test.
+            with pytest.raises(Exception, match="(?i)higher revision"):
+                await gate.request_quiesce()
+            assert not await client.exists(scoped_key), (
+                "a fenced mixed-version write still authored the scoped marker"
+            )
+            assert await client.get(legacy_key) == foreign
+            assert await gate.is_quiescing() is False, (
+                "this installation's workers were quiesced even though the write "
+                "was refused"
+            )
+
+            with pytest.raises(Exception, match="(?i)higher revision"):
+                await gate.await_drained()
+
+            assert await run_gate(bridge, mode="drain") == 1
+            assert not await client.exists(scoped_key)
+            assert await client.get(legacy_key) == foreign
+
+            await client.delete(legacy_key, scoped_key)
+            await client.set(legacy_key, foreign, ex=30)
+            assert await run_gate(standalone, mode="drain") == 1
+            assert json.loads(await client.get(legacy_key))["revision"] == 11
+        finally:
+            await client.delete(legacy_key, scoped_key)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_mixed_version_release_clears_owned_scoped_marker_when_shared_key_is_foreign(
+    names,
+) -> None:  # noqa: ANN001
+    """A foreign marker on the shared key must not strand this install's scoped one.
+
+    Chief-of-staff review 2026-09-09 finding 4b: ``_CLEAR_OWNED_MARKER_LUA``
+    returned 0 on the first non-matching key before deleting anything, so a
+    legacy-bridge release left the installation's own scoped marker for the
+    full ``upgrade_quiesce_ttl_s``.
+    """
+
+    async def go() -> None:
+        config = _config(
+            names,
+            installation_id="install-clear-owned",
+            upgrade_revision=9,
+            upgrade_legacy_quiesce=True,
+        )
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        gate = UpgradeDrainGate(client, config)
+        legacy_key = _legacy_quiesce_key(config)
+        scoped_key = _scoped_quiesce_key(config, "install-clear-owned")
+        foreign = json.dumps(
+            {"since": "2026-09-08T00:00:00+00:00", "revision": 11},
+            separators=(",", ":"),
+        )
+        try:
+            await client.delete(legacy_key, scoped_key)
+            await gate.request_quiesce()
+            assert await client.exists(scoped_key)
+            await client.set(legacy_key, foreign, ex=30)
+
+            await gate.clear_quiesce()
+            assert not await client.exists(scoped_key), (
+                "a foreign shared-key marker stranded this installation's "
+                "owned scoped quiesce flag"
+            )
+            assert await client.get(legacy_key) == foreign, (
+                "clear_quiesce deleted a foreign higher-revision shared marker"
+            )
+        finally:
+            await client.delete(legacy_key, scoped_key)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_mixed_version_release_does_not_clear_legacy_when_scoped_holds_newer_revision(
+    names,
+) -> None:  # noqa: ANN001
+    """A delayed lower-revision release must not resume legacy workers.
+
+    The owned scoped marker is safe to delete unilaterally, but the shared
+    key is one half of the mixed-version pair. If the scoped key already
+    holds a newer revision, clearing a matching legacy key would let
+    pre-scoped replicas claim during the newer drain.
+    """
+
+    async def go() -> None:
+        config = _config(
+            names,
+            installation_id="install-clear-asymmetric",
+            upgrade_revision=9,
+            upgrade_legacy_quiesce=True,
+        )
+        client: AsyncRedis = AsyncRedis(
+            host=_VALKEY_HOST,
+            port=_VALKEY_PORT,
+            password=_VALKEY_PW or None,
+            decode_responses=True,
+        )
+        gate = UpgradeDrainGate(client, config)
+        legacy_key = _legacy_quiesce_key(config)
+        scoped_key = _scoped_quiesce_key(config, "install-clear-asymmetric")
+        newer = json.dumps(
+            {"since": "2026-09-08T00:00:00+00:00", "revision": 10},
+            separators=(",", ":"),
+        )
+        older = json.dumps(
+            {"since": "2026-09-08T00:00:00+00:00", "revision": 9},
+            separators=(",", ":"),
+        )
+        try:
+            await client.delete(legacy_key, scoped_key)
+            await client.set(scoped_key, newer, ex=30)
+            await client.set(legacy_key, older, ex=30)
+
+            await gate.clear_quiesce()
+            assert await client.get(scoped_key) == newer, (
+                "a delayed revision 9 release cleared the newer scoped marker"
+            )
+            assert await client.get(legacy_key) == older, (
+                "a delayed revision 9 release cleared the shared key while "
+                "scoped held a newer revision"
+            )
         finally:
             await client.delete(legacy_key, scoped_key)
             await client.aclose()
@@ -773,7 +953,8 @@ def test_a_lane_that_cannot_be_read_refuses_the_upgrade(names) -> None:  # noqa:
 
 def test_await_drained_quiesces_before_it_waits(names) -> None:  # noqa: ANN001
     """A wait that kept admitting new work could never terminate under load, so
-    the flag goes up first and unconditionally."""
+    the flag goes up first. A fenced write that does not take effect must not
+    proceed into that wait."""
 
     async def go() -> None:
         async with _gate(names) as (gate, config, client):

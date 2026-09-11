@@ -93,12 +93,16 @@ git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
   uv run python scripts/check-released-upgrade.py --self-test
   uv run python scripts/check-released-upgrade.py
   (cd apps/api && uv run alembic upgrade head)
-  git fetch --no-tags --depth=1 origin "$base" || true
+  git fetch --no-tags origin "$base" || true
   git show "origin/$base:packages/aci-protocol/schema/wire.lock" > "$wire_lock" 2>/dev/null || true
   uv run python -m aci_protocol.wire_lock --check-base "$wire_lock"
   uv run pytest -q
 )
 ```
+
+Linked worktrees share their repository's Git shallow metadata. Never use a
+shallow fetch in this checkout or one of its linked worktrees; if a shallow
+fetch is needed, use an independent clone instead.
 
 Occupied default ports are a reason to isolate the job, not by themselves a
 failed precondition. Preserve the existing owner and follow the instructions

@@ -71,16 +71,28 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
 - `connectors.yaml` (ADR-0086, `packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`)
   declares the MCP servers Curie should run or reach on the bundle's behalf, keyed by connector name.
   Each entry is a `packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec` in exactly
-  one of three mutually exclusive forms: hosted by reference (`image`, plus `args`/`env`/`port`),
+  one of three mutually exclusive forms: hosted by reference (`image`, plus `args`/`env`/`port`
+  and optional `unhosted_url`),
   hosted from source (`build`, ADR-0113, the same hosted form with the image sourced rather than
-  named), or remote (`url`, plus `headers`). More than one set on one connector is
+  named, also with optional `unhosted_url`), or remote (`url`, plus `headers`). More than one set on one connector is
   `connectors.ambiguous`, none set is `connectors.underspecified`. A `build` block
   (`packages/plugin-format/src/plugin_format/connectors.py::ConnectorBuild`) carries a
   bundle-relative `context`, a `dockerfile` under it, and a required non-empty `platforms` list; it
   never carries a digest, which lives only in the lock. Every entry names the credentials it needs:
-  `secrets` and `secret_files` by NAME only, never by value; `sealed_secrets` is the exception --
-  each blob IS the credential, carried by the bundle (see
-  [sealed-credential](../sealed-credential/INTERFACE.md)). Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
+  `secrets` is `list[str | SecretRef]`
+  (`packages/plugin-format/src/plugin_format/connectors.py::SecretRef`, with
+  `name` / `from_secret` / `key`) and `secret_files` is by NAME only; neither form
+  carries a value. Intake refuses any `sealed_secrets` declaration with
+  `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
+  [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector
+  with `secrets:` declared, the rendered `.mcp.json` entry derives
+  `headers.Authorization: Bearer ${<bearer_secret, or the single declared secret>}` -- the author still writes no `headers:`
+  on a hosted connector (`connectors.hosted_has_headers`) -- and `cluster deploy` binds only that
+  Bearer name into the sandbox alongside any explicit `--secret` so the runner can expand the
+  placeholder at boot and then drop the name from the process env (#2503, #2559; a
+  `SecretRef` value does not reach the sandbox under ADR-0090, and the `url` fallback used by tiers
+  below cluster derives no header, both tracked as follow-ups). A hosted connector with several
+  secrets and no `bearer_secret` is `connectors.bearer_secret_required`. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
   `connectors.duplicate_server`, `connectors.build_context_escapes`,
@@ -207,7 +219,9 @@ types.** The Pydantic models are the source of truth and a committed JSON Schema
 `packages/plugin-format/tests/test_schema_compat.py`, but there is **no generated Rust or TS** in
 the package (contrast `packages/aci-protocol/generated/`). The CLI hand-mirrors the format in
 Rust and is kept honest by `cli/plugin-format-mirrors.json` plus `curie dev field-parity`
-(`cli/scripts/check-field-parity.sh`). The TypeScript (UI) consumer remains a hand-written
+(`cli/scripts/check-field-parity.sh`). That gate only sees `schema_export` models;
+Connector* field honesty is `tests/vectors/connector-fields.json`. The TypeScript (UI)
+consumer remains a hand-written
 mirror. It also carries no `PROTOCOL_VERSION`; the
 format is pinned to the Claude Code shape and the models are lenient by design so future Claude
 Code keys still validate.

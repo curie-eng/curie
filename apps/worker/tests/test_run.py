@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -580,6 +581,175 @@ def test_crashing_supervised_task_does_not_cancel_its_siblings() -> None:
 
         assert crashes["n"] == 3
         assert sibling_ran["ok"] is True
+
+    asyncio.run(go())
+
+
+def test_supervise_emits_restart_metric_and_cause_for_publications(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded: list[tuple[str, float, dict[str, str]]] = []
+
+    def capture(
+        name: str, value: float = 1, *, attributes: Mapping[str, str] | None = None
+    ) -> None:
+        recorded.append((name, value, dict(attributes or {})))
+
+    monkeypatch.setattr(run, "record_metric", capture)
+
+    async def go() -> None:
+        shutdown = asyncio.Event()
+        calls = {"n": 0}
+
+        async def factory() -> None:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("claim cas lost")
+            shutdown.set()
+
+        with caplog.at_level(logging.ERROR, logger="curie_worker.run"):
+            await asyncio.wait_for(
+                _supervise("publications", factory, shutdown, restart_backoff_s=0),
+                timeout=2,
+            )
+
+        assert calls["n"] == 3
+        expected = {
+            "service.name": "curie-worker",
+            "operation": "publications",
+            "outcome": "restart",
+        }
+        assert recorded == [
+            ("curie.worker.supervised.restart", 1, expected),
+            ("curie.worker.supervised.restart", 1, expected),
+        ]
+        restarts = [
+            r
+            for r in caplog.records
+            if r.name == "curie_worker.run" and "crashed; restarting" in r.getMessage()
+        ]
+        assert len(restarts) == 2
+        for rec in restarts:
+            message = rec.getMessage()
+            assert "publications" in message
+            assert "RuntimeError" in message
+            assert "claim cas lost" in message
+
+    asyncio.run(go())
+
+
+def test_supervise_emits_restart_metric_for_evals(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded: list[tuple[str, float, dict[str, str]]] = []
+
+    def capture(
+        name: str, value: float = 1, *, attributes: Mapping[str, str] | None = None
+    ) -> None:
+        recorded.append((name, value, dict(attributes or {})))
+
+    monkeypatch.setattr(run, "record_metric", capture)
+
+    async def go() -> None:
+        shutdown = asyncio.Event()
+        calls = {"n": 0}
+
+        async def factory() -> None:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("eval stream closed")
+            shutdown.set()
+
+        with caplog.at_level(logging.ERROR, logger="curie_worker.run"):
+            await asyncio.wait_for(
+                _supervise("evals", factory, shutdown, restart_backoff_s=0),
+                timeout=2,
+            )
+
+        assert calls["n"] == 3
+        expected = {
+            "service.name": "curie-worker",
+            "operation": "evals",
+            "outcome": "restart",
+        }
+        assert recorded == [
+            ("curie.worker.supervised.restart", 1, expected),
+            ("curie.worker.supervised.restart", 1, expected),
+        ]
+        restarts = [
+            r
+            for r in caplog.records
+            if r.name == "curie_worker.run" and "crashed; restarting" in r.getMessage()
+        ]
+        assert len(restarts) == 2
+        for rec in restarts:
+            message = rec.getMessage()
+            assert "evals" in message
+            assert "RuntimeError" in message
+            assert "eval stream closed" in message
+
+    asyncio.run(go())
+
+
+def test_supervise_idle_heartbeat_does_not_emit_restart(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded: list[tuple[str, float, dict[str, str]]] = []
+
+    def capture(
+        name: str, value: float = 1, *, attributes: Mapping[str, str] | None = None
+    ) -> None:
+        recorded.append((name, value, dict(attributes or {})))
+
+    monkeypatch.setattr(run, "record_metric", capture)
+
+    async def go() -> None:
+        shutdown = asyncio.Event()
+
+        async def factory() -> None:
+            return None
+
+        with caplog.at_level(logging.ERROR, logger="curie_worker.run"):
+            await asyncio.wait_for(
+                _supervise("heartbeat", factory, shutdown, restart_backoff_s=0),
+                timeout=2,
+            )
+
+        assert recorded == []
+        assert not any(
+            "crashed; restarting" in r.getMessage() for r in caplog.records
+        )
+
+    asyncio.run(go())
+
+
+def test_supervise_does_not_emit_restart_metric_after_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: list[tuple[str, float, dict[str, str]]] = []
+
+    def capture(
+        name: str, value: float = 1, *, attributes: Mapping[str, str] | None = None
+    ) -> None:
+        recorded.append((name, value, dict(attributes or {})))
+
+    monkeypatch.setattr(run, "record_metric", capture)
+
+    async def go() -> None:
+        shutdown = asyncio.Event()
+        calls = {"n": 0}
+
+        async def factory() -> None:
+            calls["n"] += 1
+            shutdown.set()
+            raise ConnectionError("boom")
+
+        await asyncio.wait_for(
+            _supervise("runs", factory, shutdown, restart_backoff_s=0),
+            timeout=2,
+        )
+        assert calls["n"] == 1
+        assert recorded == []
 
     asyncio.run(go())
 

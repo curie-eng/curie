@@ -21,6 +21,11 @@
 #      different endpoint than S3). Static credentials do not.
 #   5. Opting out of Rail 1 (`security.networkPolicy.enabled=false`) does not
 #      require the BYO CIDRs: there is no fail-closed runner policy to satisfy.
+#   6. #2368: rustfs.egress and rustfs.stsEgress share curie.objectStore.egressEntry
+#      with the collector/API keys. A quarter-route prefix, an IPv6 ULA that
+#      contains fd00:ec2::254 (including uncompressed spelling), a protocol-only
+#      ports item, and an endPort range are refused; a /32, /24, /128, /48, and
+#      named-port peer still render.
 #
 # NetworkPolicy speaks CIDRs, not DNS names, so the chart cannot derive an
 # allow from rustfs.host. The values-level CIDR lists are the mechanism; the
@@ -62,6 +67,7 @@ render_dir() {
 
 CHECKER="$TMP/check.py"
 cat > "$CHECKER" <<'PY'
+import json
 import pathlib
 import sys
 
@@ -216,6 +222,29 @@ elif ACTION == "byo-static":
     if sts_cidr in cidrs:
         die("static-key BYO must not require or emit an STS allow")
     print("ok: static-key BYO render allows only the object-store CIDR")
+
+elif ACTION == "has-block":
+    policy_name, cidr, ports_json = sys.argv[3], sys.argv[4], sys.argv[5]
+    expected_ports = json.loads(ports_json)
+    policy = named(docs, policy_name)
+    if policy is None:
+        die(f"missing NetworkPolicy/{policy_name}")
+    matches = [
+        (block_cidr, ports, excepts)
+        for block_cidr, ports, excepts in ip_blocks(policy)
+        if block_cidr == cidr
+    ]
+    if not matches:
+        die(
+            f"{policy_name} has no ipBlock {cidr}; "
+            f"blocks={ip_blocks(policy)!r}"
+        )
+    for block_cidr, ports, excepts in matches:
+        if ports != expected_ports:
+            die(f"{cidr} ports are {ports!r}, expected {expected_ports!r}")
+        if excepts:
+            die(f"{cidr} must not except anything on a narrow allow; got {excepts}")
+    print(f"ok: {policy_name} allows {cidr} with {expected_ports}")
 
 else:
     die(f"unknown action {ACTION!r}")
@@ -398,6 +427,125 @@ rustfs:
     - cidr: 192.0.2.10/32
 EOF
 must_fail_naming "ports-missing rustfs.egress" "ports" "$NO_PORTS_VALUES"
+
+write_rustfs_entry_values() {
+  local path="$1"
+  local key="$2"
+  local entry="$3"
+  if [[ "$key" == "rustfs.egress" ]]; then
+    cat > "$path" <<EOF
+rustfs:
+  deploy: false
+  host: s3.example.com
+  port: 443
+  egress:
+${entry}
+EOF
+  else
+    cat > "$path" <<EOF
+rustfs:
+  deploy: false
+  host: s3.example.com
+  port: 443
+  auth:
+    accessKey: ""
+  egress:
+    - cidr: ${S3_CIDR}
+      ports: [{ protocol: TCP, port: 443 }]
+  stsEgress:
+${entry}
+api:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-api
+worker:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-worker
+agentSandbox:
+  runner:
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-runner
+EOF
+  fi
+}
+
+must_render_block() {
+  local label="$1"
+  local cidr="$2"
+  local ports_json="$3"
+  local values="$4"
+  local out
+  out="$(render_dir "${label// /_}" --values "$values")" \
+    || fail "${label} must render"
+  python3 "$CHECKER" "$out" has-block "$OBJECT_STORE_POLICY" "$cidr" "$ports_json" \
+    || fail "${label} did not render ipBlock ${cidr} with ports ${ports_json}"
+}
+
+echo "=== Assertion 10: shared validator enforces one-peer floor, IPv6 metadata, and explicit ports on both rustfs keys ==="
+for KEY in rustfs.egress rustfs.stsEgress; do
+  write_rustfs_entry_values "$TMP/${KEY}-default-route.yaml" "$KEY" \
+    $'    - cidr: 0.0.0.0/0\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "default-route ${KEY}" "$KEY" "$TMP/${KEY}-default-route.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-imds-v4.yaml" "$KEY" \
+    $'    - cidr: 169.254.0.0/16\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "metadata-covering ${KEY}" "169.254.169.254" "$TMP/${KEY}-imds-v4.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-no-ports.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32'
+  must_fail_naming "ports-missing ${KEY}" "ports" "$TMP/${KEY}-no-ports.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-quarter-route.yaml" "$KEY" \
+    $'    - cidr: 64.0.0.0/2\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "quarter-route ${KEY}" "IPv4 /8, IPv6 /32" "$TMP/${KEY}-quarter-route.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-ula8.yaml" "$KEY" \
+    $'    - cidr: fd00::/8\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "ipv6-ula-8 ${KEY}" "169.254.169.254" "$TMP/${KEY}-ula8.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-ula7.yaml" "$KEY" \
+    $'    - cidr: fc00::/7\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "ipv6-ula-7 ${KEY}" "169.254.169.254" "$TMP/${KEY}-ula7.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-ula-uncompressed.yaml" "$KEY" \
+    $'    - cidr: fd00:0ec2::/48\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "ipv6-ula-uncompressed ${KEY}" "169.254.169.254" "$TMP/${KEY}-ula-uncompressed.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-protocol-only.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP }]'
+  must_fail_naming "protocol-only ${KEY}" "each ports item must set port" "$TMP/${KEY}-protocol-only.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-endport.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP, port: 1, endPort: 65535 }]'
+  must_fail_naming "endport ${KEY}" "endPort" "$TMP/${KEY}-endport.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-p1.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_render_block "narrow-v4-32 ${KEY}" "192.0.2.30/32" \
+    '[{"protocol": "TCP", "port": 443}]' "$TMP/${KEY}-p1.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-p2.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.0/24\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_render_block "narrow-v4-24 ${KEY}" "192.0.2.0/24" \
+    '[{"protocol": "TCP", "port": 443}]' "$TMP/${KEY}-p2.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-p3.yaml" "$KEY" \
+    $'    - cidr: 2001:db8::10/128\n      ports: [{ protocol: TCP, port: 4318 }]'
+  must_render_block "narrow-v6-128 ${KEY}" "2001:db8::10/128" \
+    '[{"protocol": "TCP", "port": 4318}]' "$TMP/${KEY}-p3.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-p4.yaml" "$KEY" \
+    $'    - cidr: 2001:db8::/48\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_render_block "narrow-v6-48 ${KEY}" "2001:db8::/48" \
+    '[{"protocol": "TCP", "port": 443}]' "$TMP/${KEY}-p4.yaml"
+
+  write_rustfs_entry_values "$TMP/${KEY}-p5.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP, port: https }]'
+  must_render_block "named-port ${KEY}" "192.0.2.30/32" \
+    '[{"protocol": "TCP", "port": "https"}]' "$TMP/${KEY}-p5.yaml"
+done
 
 echo
 echo "PASS: BYO object-store egress is required and rendered as a runner NetworkPolicy; the default in-chart rustfs allow is unchanged."

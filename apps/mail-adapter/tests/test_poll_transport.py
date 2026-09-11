@@ -6,9 +6,10 @@ one. A 24h soak of the deployed adapter produced 373 identical
 `poll: list failed with status=0` warnings (#2012) — the numeric status was the
 whole record, so the outage was undiagnosable from the log, and because status 0
 reset the backoff the poller kept hammering the dead endpoint at its normal
-interval. The fix reads the structured body `agentmail.request` already builds
-and arms the existing bounded backoff for transport failures too; these tests
-pin both halves, plus the reset that must still happen on recovery.
+interval. A later soak found the same cadence problem for persistent HTTP 403
+responses (#2555). The fixes expose only bounded, locally synthesized causes and
+arm the existing bounded backoff for transport failures and HTTP refusals; these
+tests pin both halves, plus the reset that must still happen on recovery.
 """
 
 from __future__ import annotations
@@ -126,16 +127,18 @@ def test_a_long_credential_bearing_cause_is_redacted_and_truncated(
         f"the cause is unbounded at {len(cause)} characters: {cause!r}"
     )
     assert cause.endswith("..."), f"the character budget never truncated: {cause!r}"
-    assert adapter._transport_cause(500, {"error": leaked}) == "unavailable", (
-        "a status the adapter did not synthesize the body for was rendered anyway"
+    assert adapter._transport_cause(500, {"error": leaked}) == "http_500", (
+        "a nonzero status was not rendered as its bounded status-only token"
     )
 
 
-def test_a_provider_error_body_is_never_rendered_into_the_log(
+@pytest.mark.parametrize("http_status", [403, 500])
+def test_a_provider_error_body_is_replaced_by_a_bounded_status_token(
     mail: MailState,
     ingress: IngressState,
     adapter: MailAdapter,
     caplog: pytest.LogCaptureFixture,
+    http_status: int,
 ) -> None:
     """A non-200 body is provider-authored, so the adapter must not read it at all.
 
@@ -150,18 +153,111 @@ def test_a_provider_error_body_is_never_rendered_into_the_log(
     decides, and every other failure is recorded by its status code.
     """
     mail.injected_body = {"error": "Subject: payroll spreadsheet; body: SSN 123-45-6789"}
-    mail.fail_next_list = 500
+    mail.fail_next_list = http_status
 
     with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
-        status = adapter.poll_once()
+        observed_status = adapter.poll_once()
 
-    assert status == 500, f"the injected provider failure did not surface, got {status}"
-    message = _failure_record(caplog)
-    assert "cause=unavailable" in message, (
-        f"a provider-authored failure body was rendered into the log: {message!r}"
+    assert observed_status == http_status, (
+        f"the injected provider failure did not surface, got {observed_status}"
     )
+    message = _failure_record(caplog)
+    cause = message.partition("cause=")[2]
+    assert cause == f"http_{http_status}", (
+        f"the provider failure was not reduced to its status-only token: {message!r}"
+    )
+    assert len(cause) <= adapter_module.CAUSE_MAX_CHARS, f"cause is unbounded: {cause!r}"
     assert "SSN" not in message, f"mail content reached the log: {message!r}"
     assert "payroll" not in message, f"mail content reached the log: {message!r}"
+
+
+@pytest.mark.parametrize("refusal_status", [401, 403, 429])
+def test_persistent_http_refusals_back_off_then_200_resets_cadence(
+    mail: MailState,
+    ingress: IngressState,
+    make_adapter: Callable[..., MailAdapter],
+    monkeypatch: pytest.MonkeyPatch,
+    refusal_status: int,
+) -> None:
+    """Repeated HTTP refusals slow discovery; the first 200 restores cadence.
+
+    The fake's HTTP fault is one-shot, so the test re-arms it during the delay
+    that follows each refusal. Every observed status still comes from a real
+    request to the local provider server. Parametrizing 403 with a sibling auth
+    refusal and the already backed-off 429 case protects the full 4xx rule.
+    """
+    monkeypatch.setattr(adapter_module, "BACKOFF_STEP_SECONDS", 0.2)
+    monkeypatch.setattr(adapter_module, "BACKOFF_MAX_SECONDS", 0.6)
+    adapter = make_adapter(poll_interval_seconds=0.01)
+    thread = threading.Thread(target=adapter.poll_loop, daemon=True)
+    refusal_indexes: list[int] = []
+
+    try:
+        thread.start()
+        assert adapter.ready.wait(10), "prime never completed against an empty inbox"
+        for _ in range(3):
+            mail.fail_next_list = refusal_status
+            assert wait_until(lambda: mail.fail_next_list is None, timeout=5), (
+                f"the fake never served HTTP {refusal_status}"
+            )
+            refusal_indexes.append(len(mail.list_times) - 1)
+
+        recovery = refusal_indexes[-1] + 1
+        assert wait_until(lambda: len(mail.list_times) >= recovery + 3, timeout=10), (
+            "the poller never made enough successful passes to expose the 200 reset"
+        )
+    finally:
+        adapter.shutdown.set()
+        thread.join(timeout=10)
+
+    times = mail.list_times
+    assert refusal_indexes == list(range(refusal_indexes[0], refusal_indexes[0] + 3)), (
+        f"the repeated refusals were not consecutive provider calls: {refusal_indexes}"
+    )
+    waits_after_refusals = [
+        times[refusal_indexes[index] + 1] - times[refusal_indexes[index]]
+        for index in range(len(refusal_indexes))
+    ]
+    assert waits_after_refusals[1] > waits_after_refusals[0] + 0.15, (
+        f"HTTP {refusal_status} did not grow the backoff: {waits_after_refusals}"
+    )
+    assert waits_after_refusals[-1] <= 0.61 + 0.25, (
+        f"HTTP {refusal_status} grew past the bounded ceiling: {waits_after_refusals}"
+    )
+    assert times[recovery + 2] - times[recovery + 1] < 0.15, (
+        f"a 200 did not clear the HTTP {refusal_status} backoff"
+    )
+
+
+def test_a_5xx_does_not_arm_backoff(
+    mail: MailState,
+    ingress: IngressState,
+    make_adapter: Callable[..., MailAdapter],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 5xx from an unarmed poller retains its documented normal cadence."""
+    monkeypatch.setattr(adapter_module, "BACKOFF_STEP_SECONDS", 0.2)
+    adapter = make_adapter(poll_interval_seconds=0.01)
+    thread = threading.Thread(target=adapter.poll_loop, daemon=True)
+
+    try:
+        thread.start()
+        assert adapter.ready.wait(10), "prime never completed against an empty inbox"
+        mail.fail_next_list = 500
+        assert wait_until(lambda: mail.fail_next_list is None, timeout=5), (
+            "the fake never served the 500 control"
+        )
+        failed_500 = len(mail.list_times) - 1
+        assert wait_until(lambda: len(mail.list_times) >= failed_500 + 3, timeout=5), (
+            "the poller never made a pass after the 500 control"
+        )
+    finally:
+        adapter.shutdown.set()
+        thread.join(timeout=10)
+
+    assert mail.list_times[failed_500 + 1] - mail.list_times[failed_500] < 0.15, (
+        "a 5xx armed discovery backoff even though that behavior remains out of scope"
+    )
 
 
 def test_repeated_list_transport_failures_back_off_then_reset_on_recovery(

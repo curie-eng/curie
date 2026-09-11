@@ -896,6 +896,82 @@ for label, docs in (("install", curie_install_docs), ("upgrade", curie_upgrade_d
     assert trace_exporters == ["otlphttp/langfuse", "otlphttp/tempo"], (
         f"{label} production render must export traces to Langfuse and Tempo without debug"
     )
+    soak_exporter = at(config, "exporters", "prometheusremotewrite/soak")
+    assert soak_exporter.get("endpoint") == (
+        "http://prometheus-server.observability.svc.cluster.local/api/v1/write"
+    )
+    assert (soak_exporter.get("resource_to_telemetry_conversion") or {}).get("enabled") is False
+    assert at(soak_exporter, "retry_on_failure", "enabled") is True
+    assert "sending_queue" not in soak_exporter
+    assert at(soak_exporter, "remote_write_queue", "enabled") is True
+    assert 0 < int(at(soak_exporter, "remote_write_queue", "queue_size")) <= 100000
+    metric_exporters = at(config, "service", "pipelines", "metrics", "exporters")
+    assert "nop/metrics" in metric_exporters, (
+        f"{label} must keep nop/metrics; the overlay appends, it does not replace"
+    )
+    assert "prometheusremotewrite/soak" in metric_exporters, (
+        f"{label} must retain Curie metrics on prometheusremotewrite/soak"
+    )
+
+default_config = collector_config(curie_default_docs)
+assert at(default_config, "service", "pipelines", "metrics", "exporters") == ["nop/metrics"], (
+    "chart default must keep metrics on nop until an overlay adds a destination"
+)
+assert "prometheusremotewrite/soak" not in default_config.get("exporters", {}), (
+    "chart default must not ship the soak Prometheus remote-write exporter"
+)
+
+assert at(curie_values, "otelCollector", "extraMetricPipelineExporters") == [
+    "prometheusremotewrite/soak"
+]
+assert at(prometheus_values, "server", "extraArgs") == {
+    "web.enable-remote-write-receiver": ""
+}
+rendered_prom_args = [
+    argument
+    for _, _, container in containers(prometheus_docs)
+    for argument in container.get("args", [])
+]
+assert "--web.enable-remote-write-receiver" in rendered_prom_args, (
+    "Prometheus must enable the remote-write receiver in the rendered server"
+)
+
+REQUIRED_ALERTS = {
+    "CurieTurnAcceptedStale",
+    "CurieTaskFailure",
+    "CurieQueueMessageAgeHigh",
+    "CurieCompletionOutboxAgeHigh",
+    "CurieCompletionOutboxSignalAbsent",
+    "CurieReplyDeliveryRefused",
+    "CurieChannelTokenRotationFailed",
+    "CurieMailAdapterNotReady",
+    "CurieRootDiskPressure",
+    "CurieNodeMemoryHeadroomLow",
+    "CurieApplicationMetricsAbsent",
+    "CurieDuplicateNodeExporter",
+}
+alert_rules = []
+for group in at(prometheus_values, "serverFiles", "alerting_rules.yml", "groups"):
+    alert_rules.extend(group.get("rules") or [])
+alert_names = {rule["alert"] for rule in alert_rules if "alert" in rule}
+missing_alerts = sorted(REQUIRED_ALERTS - alert_names)
+assert not missing_alerts, f"prometheus-values.yaml missing alerts: {missing_alerts}"
+alert_dump = yaml.safe_dump(alert_rules).lower()
+for forbidden in (
+    "run_id", "session_id", "event.id", "user_id", "sandbox_id", "deployment_id",
+    "message_id", "password", "api_key",
+):
+    assert forbidden not in alert_dump, (
+        f"alert rules must not carry {forbidden!r} as a metric-label selector"
+    )
+assert "absent(" in next(
+    rule["expr"] for rule in alert_rules if rule.get("alert") == "CurieApplicationMetricsAbsent"
+)
+duplicate_expr = next(
+    rule["expr"] for rule in alert_rules if rule.get("alert") == "CurieDuplicateNodeExporter"
+)
+assert "count(" in duplicate_expr and "9100" in duplicate_expr and "9101" in duplicate_expr
+assert "sum(" not in duplicate_expr.replace(" ", "")
 
 default_render = Path(curie_default_path).read_text()
 assert "GRAFANA_SERVICE_ACCOUNT_TOKEN" not in default_render, (
@@ -1127,3 +1203,41 @@ assert not re.search(r"glsa_[A-Za-z0-9_-]{16,}", full_render), (
 
 print("observability stack render assertions passed")
 PY
+
+# Exercise alert firing and recovery through promtool, not just YAML presence.
+PROM_VERSION="${PROMTOOL_VERSION:-3.14.0}"
+promtool_bin="${PROMTOOL:-}"
+if [[ -z "$promtool_bin" ]] && command -v promtool >/dev/null 2>&1; then
+  promtool_bin="$(command -v promtool)"
+fi
+if [[ -z "$promtool_bin" || ! -x "$promtool_bin" ]]; then
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) fail "unsupported architecture for promtool: $arch" ;;
+  esac
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  tarball="prometheus-${PROM_VERSION}.${os}-${arch}.tar.gz"
+  curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${tarball}" \
+    | tar -xz -C "$TMP" --strip-components=1 "prometheus-${PROM_VERSION}.${os}-${arch}/promtool"
+  promtool_bin="$TMP/promtool"
+fi
+[[ -x "$promtool_bin" ]] || fail "promtool is not executable"
+
+python3 - "$ASSETS/prometheus-values.yaml" "$TMP/reliability-alerts.rules.yaml" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+values = yaml.safe_load(Path(sys.argv[1]).read_text())
+rules = values["serverFiles"]["alerting_rules.yml"]
+Path(sys.argv[2]).write_text(yaml.safe_dump(rules, sort_keys=False))
+PY
+cp "$ASSETS/reliability-alerts.test.yaml" "$TMP/reliability-alerts.test.yaml"
+(
+  cd "$TMP"
+  "$promtool_bin" check rules reliability-alerts.rules.yaml
+  "$promtool_bin" test rules reliability-alerts.test.yaml
+)
+echo "PASS: reliability alerts render, check, fire, and recover under promtool"

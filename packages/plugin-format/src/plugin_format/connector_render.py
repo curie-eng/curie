@@ -567,12 +567,47 @@ def render(
     ]
 
 
+def _derived_headers(spec: ConnectorSpec) -> dict[str, Any]:
+    """The ``Authorization`` header for a hosted connector, or ``{}``.
+
+    ``github-mcp-server``'s HTTP transport authenticates the CLIENT, so an entry
+    without ``Authorization: Bearer`` gets a 401 on the capability probe and the
+    agent silently lists no tools -- no error the author can see (#2503).
+
+    Derived, not authored, for the same reason the URL above is: under ADR-0086
+    the author writes no URL and no header, so there is nothing to get wrong.
+    The value is the ``${NAME}`` placeholder -- no secret VALUE is ever read or
+    rendered here. The name is ``spec.bearer_secret`` when set, otherwise the
+    single declared secret (the github-mcp-server shape). A hosted connector
+    with several secrets and no ``bearer_secret`` is refused at validation
+    rather than silently using ``secrets[0]`` (#2559). Remaining secrets keep
+    their pod-side ``secretKeyRef`` delivery.
+
+    With the header present, a wrong token surfaces from the tool call as
+    GitHub's ``401 Bad credentials``; a MISSING value is refused at deploy
+    (``connectors.yaml declares secret(s) with no value available``). A
+    ``SecretRef`` value never reaches the sandbox under ADR-0090, so the
+    placeholder expands empty and the runner's capability probe still only
+    logs the failure -- a known gap, tracked as a follow-up issue.
+    """
+
+    name = spec.bearer_secret_name()
+    if not name:
+        return {}
+    return {"headers": {"Authorization": f"Bearer ${{{name}}}"}}
+
+
 def unhosted_mcp_entry(spec: ConnectorSpec) -> dict[str, Any] | None:
     """The entry for a tier that cannot host this connector, or None.
 
     None is a real answer, not a failure: a hosted connector with nowhere to
     point at IS "declared but not exercisable here" (#1093). Mounting a URL that
     resolves nowhere would turn that into a connection refused mid-turn.
+
+    Unlike ``mcp_entry``, this fallback deliberately does not derive the
+    ``Authorization`` header: no non-cluster tier stages the declared secret
+    into the runner env, so there is nothing yet to derive it from (follow-up
+    issue noted in the PR).
     """
 
     if not spec.is_hosted:
@@ -589,13 +624,16 @@ def mcp_entry(
 
     For a hosted connector the URL is derived from the Service that Curie just
     created; hand-writing it is how a bundle ends up with an address that does
-    not resolve in the tier it is deployed to.
+    not resolve in the tier it is deployed to. Its ``Authorization`` header is
+    derived from ``bearer_secret`` (or the single declared secret) for the same
+    reason, so the author writes no header either -- see ``_derived_headers``.
     """
 
     if spec.is_hosted:
         return {
             "type": "http",
             "url": f"http://{service_dns(release, agent, connector, namespace)}:{spec.port}/mcp",
+            **_derived_headers(spec),
         }
     entry: dict[str, Any] = {"type": "http", "url": spec.url}
     if spec.headers:

@@ -333,7 +333,11 @@ struct ClusterAgentTarget {
 /// A bundle with no `connectors.yaml` still reaches the prune: that is the case
 /// where a connector was REMOVED, and leaving it running with a credential
 /// mounted and nothing referencing it is the leak nobody notices.
-async fn sync_connectors(
+///
+/// This half only RESOLVES: it discovers the cluster binding and renders the
+/// objects, so the caller can read the owned secret names off the prepared sync
+/// (#2503) before handing it to [`apply_connectors`].
+async fn prepare_cluster_connectors(
     api_url: &str,
     api_key: &str,
     namespace: &str,
@@ -341,7 +345,7 @@ async fn sync_connectors(
     agent_id: &str,
     agent_name: &str,
     version_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<curie::connectors::PreparedConnectorSync> {
     let target = curie::connectors::bind_current_cluster(namespace, release).await?;
     let app_name = curie::connectors::discover_app_name(&target).await?;
     let connector_version = ConnectorVersion {
@@ -349,7 +353,7 @@ async fn sync_connectors(
         agent_name,
         version_id,
     };
-    let prepared = prepare_connectors(
+    prepare_connectors(
         api_url,
         api_key,
         namespace,
@@ -358,8 +362,7 @@ async fn sync_connectors(
         connector_version,
         target,
     )
-    .await?;
-    apply_connectors(prepared).await
+    .await
 }
 
 struct ConnectorVersion<'a> {
@@ -403,10 +406,7 @@ async fn apply_connectors(
     prepared: curie::connectors::PreparedConnectorSync,
 ) -> anyhow::Result<()> {
     let synced = curie::connectors::sync(prepared).await?;
-    let ui = curie::ui::ui();
-    for (name, url) in &synced.urls {
-        ui.note(&format!("connector {name}: {url}"));
-    }
+    curie::connectors::report_connector_sync(&synced);
     Ok(())
 }
 
@@ -1055,6 +1055,67 @@ enum DevAction {
     /// Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/).
     /// Refuses when a schema changed shape without a version bump.
     SchemaBaseline,
+    /// Isolated worker/runner recovery drills (#2425,
+    /// `bash cli/scripts/recovery-drill.sh`): worker death mid-turn, runner
+    /// death, a configured deadline plus follow-up, Valkey outage, and API
+    /// restart on a task-owned local or cluster install. Refuses the permanent
+    /// soak namespace/release. Checkout-only.
+    RecoveryDrill {
+        /// `local` compose stack or a task-owned `cluster` Helm install.
+        #[arg(long, default_value = "local")]
+        surface: String,
+        /// Scenario to run, or `all`.
+        #[arg(long, default_value = "all")]
+        scenario: String,
+        /// Recovery bound in seconds after a healthy worker replacement is available.
+        #[arg(long, default_value_t = 120)]
+        bound_seconds: u32,
+        /// Allow a kube context other than `k8scratch` (cluster surface only).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Disposable two-worker cluster proof for lease-expiry reclaim (#2453,
+    /// `bash cli/scripts/lease-expiry-cluster-proof.sh`): default
+    /// `reclaim_min_idle_ms` 900000, three concurrent test Slack mentions, in-place
+    /// placeholder edits, XPENDING delivery increments, the no-lease 900 s
+    /// backstop control, and SIGKILL takeover. Refuses the permanent soak.
+    /// Checkout-only. Never shortens the backstop.
+    LeaseExpiryClusterProof {
+        /// Allow recreating a leftover task-owned kind cluster of the same name.
+        #[arg(long)]
+        force: bool,
+        /// Leave the kind cluster and Helm release running after the proof.
+        #[arg(long)]
+        keep: bool,
+        /// Guard checks only: soak refusal, default backstop, missing Slack.
+        #[arg(long)]
+        self_test: bool,
+    },
+    /// Isolated retained-upgrade and interrupted-upgrade recovery drill (#2426,
+    /// `bash cli/scripts/upgrade-drill.sh`): published v0.8.6 CLI/chart/images
+    /// on a task-owned kind install, candidate CLI upgrade, drain/apply
+    /// interrupt recovery, leftover-hook non-quiesce, compatible rollback that
+    /// serves a new turn, and incompatible 0.8.4 schema rollback refused before
+    /// Helm mutates. Refuses the permanent soak. Checkout-only. Live
+    /// provider/channel rows fail closed when credential references are absent.
+    UpgradeDrill {
+        /// Scenario to run, or `all` (0.8.6 baseline matrix).
+        #[arg(long, default_value = "all")]
+        scenario: String,
+        /// Also run the published v0.8.7 predecessor happy-path (latest stable
+        /// when it differs from the required 0.8.6 baseline).
+        #[arg(long)]
+        also_predecessor: bool,
+        /// Recreate a leftover task-owned kind cluster of the same name.
+        #[arg(long)]
+        force: bool,
+        /// Leave the kind cluster and Helm release running after the drill.
+        #[arg(long)]
+        keep: bool,
+        /// Guard checks only: soak refusal, checksum pins, missing live creds.
+        #[arg(long)]
+        self_test: bool,
+    },
     /// Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points
     /// at, not merely that its NetworkPolicies are applied (#1153,
     /// `bash scripts/check-netpol-enforcement.sh`). Structured as a
@@ -1748,7 +1809,12 @@ enum LocalAction {
         /// is resolved from your environment or the host secret vault (`curie
         /// secrets set <NAME>`) and sent to the platform, which stores it on the
         /// agent so the worker forwards it into the sandbox for a bundle's authed
-        /// MCP server. The value never appears in argv. Repeatable.
+        /// MCP server. The value never appears in argv. Repeatable. A hosted
+        /// connector's Bearer secret (`bearer_secret`, or its single `secrets:`
+        /// name) is bound automatically (from the value this deploy already
+        /// resolved for the connector) so the runner can expand the derived
+        /// header and drop the name from the sandbox env; this flag is for names
+        /// beyond that (#2503, #2559).
         #[arg(long = "secret", value_name = "NAME")]
         secret: Vec<String>,
     },
@@ -1999,6 +2065,16 @@ enum ClusterAction {
         /// Keep the UI and Langfuse services ClusterIP instead of NodePort.
         #[arg(long)]
         no_expose: bool,
+        /// Adopt a pre-existing namespace that already has its own labels or
+        /// objects. Without this, such a namespace is refused. The adoption is
+        /// recorded on the namespace (curietech.ai/adopted-by, adopted-in, and
+        /// the adopted-at/adopted-labels/adopted-contents annotations), and an
+        /// adopted namespace is RETAINED by cluster down rather than deleted,
+        /// so your pre-existing objects are never swept. It never adopts the
+        /// shared agent-sandbox-system namespace or a terminating one, and it
+        /// never admits a namespace whose contents cannot be read.
+        #[arg(long)]
+        adopt: bool,
         /// Force the sealed fake-model install even when CURIE_CREDENTIALS
         /// is set (dev/CI escape hatch); suppresses the fake-model warning.
         #[arg(long)]
@@ -2116,6 +2192,12 @@ enum ClusterAction {
         /// this flag alone would otherwise be a silent no-op.
         #[arg(long, requires = "revision")]
         allow_failed_revision: bool,
+        /// Assert the live Alembic revision instead of reading it from the API
+        /// pod. The schema-window check still runs against this value. Use when
+        /// every API replica is unexecutable (CrashLoopBackOff, Init,
+        /// ImagePullBackOff).
+        #[arg(long, value_name = "REV")]
+        live_schema_revision: Option<String>,
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
@@ -2820,14 +2902,39 @@ async fn resolve_compose_file(file: Option<String>, dry_run: bool) -> Result<Str
     materialize_artifact(resolved, dry_run, "compose").await
 }
 
+/// The sandbox connector-secret bind map for a cluster deploy (#2503).
+///
+/// Two sources, deliberately resolved differently:
+/// - an explicit `--secret NAME` keeps its existing semantics -- env first,
+///   then unscoped host storage, and a hard error when neither has it;
+/// - a hosted connector's declared name reuses the value the connector plan
+///   ALREADY resolved for this cluster scope. It is never re-resolved here: a
+///   scoped-only credential would not resolve at all, and a stale environment
+///   value would put a different credential in the sandbox than the connector
+///   pod holds. On overlap the scoped connector value therefore wins, because
+///   that is the credential the connector itself authenticates with and #1913's
+///   guarantee is one cluster, one credential.
+fn cluster_connector_bind_values(
+    explicit: &[String],
+    connector_names: &[String],
+    connector_values: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut values = curie::cluster_secrets::resolve_named_secrets(explicit)?;
+    for name in connector_names {
+        if let Some(value) = connector_values.get(name) {
+            values.insert(name.clone(), value.clone());
+        }
+    }
+    Ok(values)
+}
+
 async fn bind_cluster_connector_secrets(
     namespace: &str,
     release: &str,
     chart: Option<&str>,
     agent_name: &str,
-    secret_names: &[String],
+    secrets: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
-    let secrets = curie::cluster_secrets::resolve_named_secrets(secret_names)?;
     if secrets.is_empty() {
         return Ok(());
     }
@@ -2850,6 +2957,31 @@ async fn bind_cluster_connector_secrets(
         secrets,
     })
     .await
+}
+
+/// Bind the sandbox connector secrets for one deployed agent and then apply its
+/// prepared connector objects (#2503). The union of explicit `--secret` names
+/// and the bundle's connector-owned names is resolved against the values the
+/// connector plan already resolved for this cluster scope, bound into the
+/// per-agent Helm Secret, and only then are the connector objects applied --
+/// the one order both the single-target and `--all-targets` cluster deploy
+/// paths use.
+async fn bind_and_apply_cluster_connectors(
+    namespace: &str,
+    release: &str,
+    chart: Option<&str>,
+    agent_name: &str,
+    explicit_secrets: &[String],
+    connector_env_secret_names: &[String],
+    prepared: curie::connectors::PreparedConnectorSync,
+) -> Result<()> {
+    let bind_values = cluster_connector_bind_values(
+        explicit_secrets,
+        connector_env_secret_names,
+        prepared.owned_secret_values(),
+    )?;
+    bind_cluster_connector_secrets(namespace, release, chart, agent_name, bind_values).await?;
+    apply_connectors(prepared).await
 }
 
 async fn materialize_artifact(
@@ -2876,6 +3008,27 @@ async fn main() {
     if let Some(hint) = curie::retired_hint(&args) {
         eprintln!("{hint}");
         std::process::exit(curie::exit::ExitClass::Usage.code());
+    }
+
+    if let Some(err) = curie::message::reject_agent_named_message(&args) {
+        // Clap's default extra-positional error fires before `Ui` exists, so
+        // this intercept has to emit the ADR-0021 `{error, fix}` payload (and
+        // the human Error:/Fix: pair) itself. `--json` is global and may sit
+        // anywhere in argv.
+        let json = args.iter().any(|arg| arg == "--json");
+        let (class, fix) = curie::exit::classify(&err);
+        if json {
+            let payload = curie::exit::error_json(&err);
+            if let Ok(line) = serde_json::to_string(&payload) {
+                println!("{line}");
+            }
+        } else {
+            eprintln!("Error: {err}");
+            if let Some(fix) = fix {
+                eprintln!("Fix: {fix}");
+            }
+        }
+        std::process::exit(class.code());
     }
 
     let cli = Cli::parse();
@@ -3039,6 +3192,74 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::ChartRuntimeE2e { force } => {
                 let args: &[&str] = if force { &["--force"] } else { &[] };
                 commands::dev_script("scripts/chart-runtime-e2e.sh", args).await
+            }
+            DevAction::RecoveryDrill {
+                surface,
+                scenario,
+                bound_seconds,
+                force,
+            } => {
+                let bound = bound_seconds.to_string();
+                let mut args: Vec<&str> = vec![
+                    "--surface",
+                    surface.as_str(),
+                    "--scenario",
+                    scenario.as_str(),
+                    "--bound-seconds",
+                    bound.as_str(),
+                ];
+                if force {
+                    args.push("--force");
+                }
+                if ui::ui().json() {
+                    args.push("--json");
+                }
+                commands::dev_script("cli/scripts/recovery-drill.sh", &args).await
+            }
+            DevAction::LeaseExpiryClusterProof {
+                force,
+                keep,
+                self_test,
+            } => {
+                let mut args: Vec<&str> = Vec::new();
+                if force {
+                    args.push("--force");
+                }
+                if keep {
+                    args.push("--keep");
+                }
+                if self_test {
+                    args.push("--self-test");
+                }
+                if ui::ui().json() {
+                    args.push("--json");
+                }
+                commands::dev_script("cli/scripts/lease-expiry-cluster-proof.sh", &args).await
+            }
+            DevAction::UpgradeDrill {
+                scenario,
+                also_predecessor,
+                force,
+                keep,
+                self_test,
+            } => {
+                let mut args: Vec<&str> = vec!["--scenario", scenario.as_str()];
+                if also_predecessor {
+                    args.push("--also-predecessor");
+                }
+                if force {
+                    args.push("--force");
+                }
+                if keep {
+                    args.push("--keep");
+                }
+                if self_test {
+                    args.push("--self-test");
+                }
+                if ui::ui().json() {
+                    args.push("--json");
+                }
+                commands::dev_script("cli/scripts/upgrade-drill.sh", &args).await
             }
             DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
             DevAction::PluginCompat => {
@@ -3539,6 +3760,10 @@ async fn run(command: Option<Command>) -> Result<()> {
             } => {
                 let local_api_url = api_url.clone();
                 let result = commands::deploy(DeployOpts {
+                    // The local tier has no release to read delivery off, so it
+                    // is not assessed and says nothing -- distinct from an
+                    // assessed-but-undetermined `Some(Unknown)` (#2496).
+                    delivery: None,
                     plugin_dir,
                     agent,
                     target,
@@ -3737,6 +3962,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 release,
                 chart,
                 no_expose,
+                adopt,
                 fake_model,
                 model,
                 local_model,
@@ -3802,6 +4028,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             // the pure builder starts clean.
                             github_token: ops::GithubTokenPlan::Untouched,
                             dev,
+                            adopt,
                         },
                         github_token,
                         clear_github_token,
@@ -3828,6 +4055,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             ClusterAction::Rollback {
                 revision,
                 allow_failed_revision,
+                live_schema_revision,
                 namespace,
                 release,
                 yes,
@@ -3843,6 +4071,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     allow_failed_revision,
                     yes,
                     disable_schema_gate: false,
+                    live_schema_revision,
                 })
                 .await?,
             ),
@@ -4337,6 +4566,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // The list comes from the API, not a Rust YAML parse: ADR-0089
                 // keeps exactly one parser for this file, and a second could
                 // disagree with it about where a deploy lands.
+                // The Bearer secret names this bundle's hosted connectors
+                // declare (#2503, #2559). Read once here, from the same
+                // connectors.yaml the deploy packs, so both cluster paths bind
+                // the sandbox with only the name the derived header expands.
+                let connector_env_secret_names = curie::connector_build::hosted_env_secret_names(
+                    &curie::connector_build::load(&plugin_dir)?,
+                );
+
                 let targets: Vec<Option<String>> = if all_targets {
                     let path = plugin_dir.join("deploy.yaml");
                     let content = std::fs::read_to_string(&path).map_err(|err| {
@@ -4371,12 +4608,42 @@ async fn run(command: Option<Command>) -> Result<()> {
                     vec![target]
                 };
 
+                // ONE observation for the whole invocation (#2496). The release
+                // is the same for every `--all-targets` entry, so assessing per
+                // target would be N helm subprocesses for one answer. Read
+                // before activation and printed after: an operator who edits
+                // helm values mid-deploy sees a stale line, and `curie doctor`
+                // is the authority on the current state.
+                // Only a deploy that BINDS a repository can make a delivery
+                // claim, and the line is printed inside that same block, so a
+                // deploy without `--repo` must not pay for the helm read.
+                let delivery = match &repo {
+                    None => None,
+                    Some(_) => Some(curie::delivery::assess(
+                        &curie::doctor::observe_delivery(&ops::CommonOpts {
+                            namespace: namespace.clone(),
+                            release: release.clone(),
+                            dry_run: false,
+                        })
+                        .await,
+                    )),
+                };
+
                 if all_targets {
                     let first_target = targets
                         .first()
                         .cloned()
                         .flatten()
                         .expect("all target entries always have a target name");
+                    // Deliberately NOT joined with the delivery observation
+                    // above (#2496). Awaiting the bind here keeps a bind failure
+                    // isolated: nothing else is in flight when it returns `Err`.
+                    // Joining them lets a bind failure overlap the still-running
+                    // helm subprocess of `observe_delivery`, and `connectors::run`
+                    // is not `kill_on_drop`, so cancelling the parent in that
+                    // window leaks a `kubectl` child that sequential ordering
+                    // would never have spawned. The wall-clock saving is not
+                    // worth either.
                     let connector_target =
                         match curie::connectors::bind_current_cluster(&namespace, &release).await {
                             Ok(target) => target,
@@ -4411,6 +4678,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     for target in targets {
                         let target = target.expect("all target entries always have a target name");
                         let prepared_deploy = match commands::prepare_deploy(DeployOpts {
+                            delivery: delivery.clone(),
                             plugin_dir: plugin_dir.clone(),
                             agent: agent.clone(),
                             target: Some(target.clone()),
@@ -4485,27 +4753,23 @@ async fn run(command: Option<Command>) -> Result<()> {
                             }
                         };
 
-                        if !secret.is_empty() {
-                            if let Err(err) = bind_cluster_connector_secrets(
-                                &namespace,
-                                &release,
-                                chart.as_deref(),
-                                &deployed.agent_name,
-                                &secret,
-                            )
-                            .await
-                            {
-                                let payload = commands::all_targets_deploy_failure_json(
-                                    &target,
-                                    &completed,
-                                    Some(&deployed),
-                                    &err,
-                                );
-                                return Err(curie::exit::with_json_payload(err, payload));
-                            }
-                        }
-
-                        if let Err(err) = apply_connectors(prepared_connectors).await {
+                        // #2503: bind the connector's own declared secret
+                        // names alongside the explicit `--secret` set, with the
+                        // cluster-scoped values this plan already resolved
+                        // (#1913), so a hosted connector's derived Bearer header
+                        // expands in the sandbox. Binding precedes the apply that
+                        // consumes `prepared_connectors`.
+                        if let Err(err) = bind_and_apply_cluster_connectors(
+                            &namespace,
+                            &release,
+                            chart.as_deref(),
+                            &deployed.agent_name,
+                            &secret,
+                            &connector_env_secret_names,
+                            prepared_connectors,
+                        )
+                        .await
+                        {
                             let payload = commands::all_targets_deploy_failure_json(
                                 &target,
                                 &completed,
@@ -4514,6 +4778,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             );
                             return Err(curie::exit::with_json_payload(err, payload));
                         }
+
                         completed.push(commands::AllTargetsDeployResult {
                             target,
                             result: deployed,
@@ -4526,6 +4791,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         .next()
                         .expect("the target list is never empty");
                     let deployed = commands::deploy(DeployOpts {
+                        delivery,
                         plugin_dir: plugin_dir.clone(),
                         agent: agent.clone(),
                         target,
@@ -4543,24 +4809,17 @@ async fn run(command: Option<Command>) -> Result<()> {
                     })
                     .await?;
 
-                    if !secret.is_empty() {
-                        bind_cluster_connector_secrets(
-                            &namespace,
-                            &release,
-                            chart.as_deref(),
-                            &deployed.agent_name,
-                            &secret,
-                        )
-                        .await?;
-                    }
-
                     // Stand up whatever the bundle's connectors.yaml declares
                     // (ADR-0086, #1063). After the deploy, so the objects exist
                     // before the next turn reaches for them; the credentials here
                     // are the CONNECTOR's, resolved locally and written straight to
                     // a K8s Secret, which is a different path from the sandbox
-                    // secret delivery #440 tracks.
-                    sync_connectors(
+                    // secret delivery #440 tracks. The connector's own declared
+                    // Bearer name is bound into the sandbox too (#2503, #2559),
+                    // unioned with the explicit `--secret` set, so the runner
+                    // can expand the derived header and then drop the name.
+                    // Resolved before binding, applied after it.
+                    let prepared_connectors = prepare_cluster_connectors(
                         &api_url,
                         &api_key,
                         &namespace,
@@ -4568,6 +4827,17 @@ async fn run(command: Option<Command>) -> Result<()> {
                         &deployed.agent_id,
                         &deployed.agent_name,
                         &deployed.version_id,
+                    )
+                    .await?;
+
+                    bind_and_apply_cluster_connectors(
+                        &namespace,
+                        &release,
+                        chart.as_deref(),
+                        &deployed.agent_name,
+                        &secret,
+                        &connector_env_secret_names,
+                        prepared_connectors,
                     )
                     .await?;
                     emit(deployed)
@@ -5080,6 +5350,91 @@ mod tests {
     #[test]
     fn clap_surface_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// Serializes the `cluster_connector_bind_values` cases that mutate the
+    /// process environment, for the same reason and with the same limits as
+    /// `GITHUB_TOKEN_ENV_LOCK` below: `set_var` is not thread-safe against a
+    /// concurrent `getenv` from a test that does not take this lock. The
+    /// precedent in this crate is `cli/src/slack.rs`.
+    static BIND_VALUES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn bind_values_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        BIND_VALUES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn bind_values_binds_a_connector_secret_with_no_explicit_flag() {
+        // #2503: with zero `--secret` flags the connector's own declared name
+        // still reaches the sandbox bind map, carrying the value the connector
+        // plan already resolved for THIS cluster scope (#1913). No `--secret`
+        // means `resolve_named_secrets` iterates nothing, so neither the
+        // environment nor the host vault is consulted at all.
+        let values = super::cluster_connector_bind_values(
+            &[],
+            &["GH".to_string()],
+            &std::collections::BTreeMap::from([("GH".to_string(), "scoped".to_string())]),
+        )
+        .expect("an owned connector value needs no local resolution");
+        assert_eq!(
+            values,
+            std::collections::BTreeMap::from([("GH".to_string(), "scoped".to_string())])
+        );
+    }
+
+    #[test]
+    fn bind_values_prefers_the_scoped_connector_value_over_the_environment() {
+        // The overlap case: the operator also passed `--secret GH` and the
+        // environment holds a DIFFERENT credential. The connector pod
+        // authenticates with the cluster-scoped value, so the sandbox must get
+        // that one -- #1913 is one cluster, one credential, and a split would
+        // 401 exactly the derived Bearer header #2503 exists to make work.
+        let _guard = bind_values_env_lock();
+        let previous = std::env::var("CURIE_TEST_BIND_GH").ok();
+        std::env::set_var("CURIE_TEST_BIND_GH", "env-sentinel");
+
+        let values = super::cluster_connector_bind_values(
+            &["CURIE_TEST_BIND_GH".to_string()],
+            &["CURIE_TEST_BIND_GH".to_string()],
+            &std::collections::BTreeMap::from([(
+                "CURIE_TEST_BIND_GH".to_string(),
+                "scoped-sentinel".to_string(),
+            )]),
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("CURIE_TEST_BIND_GH", value),
+            None => std::env::remove_var("CURIE_TEST_BIND_GH"),
+        }
+
+        let values = values.expect("an env-resolvable --secret must not error");
+        assert_eq!(
+            values.get("CURIE_TEST_BIND_GH").map(String::as_str),
+            Some("scoped-sentinel"),
+            "the connector-scoped value must win over the environment value"
+        );
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn bind_values_with_nothing_to_bind_is_empty() {
+        // Baseline: no `--secret` and no connector-owned values binds nothing,
+        // preserving the pre-#2503 behavior for an ordinary bundle.
+        let values =
+            super::cluster_connector_bind_values(&[], &[], &std::collections::BTreeMap::new())
+                .expect("nothing to resolve");
+        assert!(values.is_empty());
+        // A declared connector name with no resolved value adds nothing
+        // either: the bind map never invents a value for a name.
+        let values = super::cluster_connector_bind_values(
+            &[],
+            &["GH".to_string()],
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("nothing to resolve");
+        assert!(values.is_empty());
     }
 
     #[test]
@@ -5713,6 +6068,115 @@ mod tests {
                 }
             })
         ));
+        let cli = Cli::try_parse_from(["curie", "dev", "recovery-drill"])
+            .expect("dev recovery-drill should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::RecoveryDrill { .. }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "curie",
+            "dev",
+            "recovery-drill",
+            "--surface",
+            "cluster",
+            "--scenario",
+            "worker-death",
+            "--bound-seconds",
+            "120",
+            "--force",
+        ])
+        .expect("dev recovery-drill flags should parse");
+        match cli.command {
+            Some(Command::Dev {
+                action:
+                    DevAction::RecoveryDrill {
+                        surface,
+                        scenario,
+                        bound_seconds,
+                        force,
+                    },
+            }) => {
+                assert_eq!(surface, "cluster");
+                assert_eq!(scenario, "worker-death");
+                assert_eq!(bound_seconds, 120);
+                assert!(force);
+            }
+            _ => panic!("expected recovery-drill"),
+        }
+        let cli = Cli::try_parse_from(["curie", "dev", "lease-expiry-cluster-proof"])
+            .expect("dev lease-expiry-cluster-proof should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::LeaseExpiryClusterProof { .. }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "curie",
+            "dev",
+            "lease-expiry-cluster-proof",
+            "--force",
+            "--keep",
+            "--self-test",
+        ])
+        .expect("dev lease-expiry-cluster-proof flags should parse");
+        match cli.command {
+            Some(Command::Dev {
+                action:
+                    DevAction::LeaseExpiryClusterProof {
+                        force,
+                        keep,
+                        self_test,
+                    },
+            }) => {
+                assert!(force);
+                assert!(keep);
+                assert!(self_test);
+            }
+            _ => panic!("expected lease-expiry-cluster-proof"),
+        }
+        let cli = Cli::try_parse_from(["curie", "dev", "upgrade-drill"])
+            .expect("dev upgrade-drill should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::UpgradeDrill { .. }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "curie",
+            "dev",
+            "upgrade-drill",
+            "--scenario",
+            "incompatible-rollback",
+            "--also-predecessor",
+            "--force",
+            "--keep",
+            "--self-test",
+        ])
+        .expect("dev upgrade-drill flags should parse");
+        match cli.command {
+            Some(Command::Dev {
+                action:
+                    DevAction::UpgradeDrill {
+                        scenario,
+                        also_predecessor,
+                        force,
+                        keep,
+                        self_test,
+                    },
+            }) => {
+                assert_eq!(scenario, "incompatible-rollback");
+                assert!(also_predecessor);
+                assert!(force);
+                assert!(keep);
+                assert!(self_test);
+            }
+            _ => panic!("expected upgrade-drill"),
+        }
     }
 
     // Proves the `dev` verb set is closed: an unrecognized verb must fail to

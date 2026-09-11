@@ -220,10 +220,19 @@ egress. The in-chart `runner-allow-api` policy selects this release's API pods,
 so it does not render, and NetworkPolicy has no hostname peer to derive from
 `dispatcher.apiBaseUrl`. Set `api.egress` to the endpoint's CIDRs (`{cidr,
 ports}` entries, same shape as the allowlist); the chart requires it at render
-whenever `dispatcher.apiBaseUrl` names an external API, because the failure it
-prevents is silent — agents boot with no
+whenever the URL the runner actually dials is external -- `api.deploy: false`,
+or `api.deploy: true` with `dispatcher.apiBaseUrl` / worker `extraEnv`
+`CURIE_API_URL` / `CURIE_RUNNER_API_URL` pointing off-cluster -- because the
+failure it prevents is silent: agents boot with no
 prior memory and no thread transcript, `remember` writes never persist, and the
 only symptom is a warning line inside the sandbox.
+`security.networkPolicy.allowedEgress` remains the documented legacy allow for
+the inverse (`deploy: true` + external URL) so an install that already has a
+non-empty model allowlist keeps rendering. The chart cannot prove those CIDRs
+cover the hostname; `api.egress` is the dedicated one-peer key. The same effective-endpoint rule applies to the collector:
+`otelCollector.egress` is required when the runner's OTLP URL is external,
+including an `agentSandbox.runner.extraEnv` `OTEL_EXPORTER_OTLP_ENDPOINT`
+override while the in-chart collector is still deployed.
 `mailAdapter.apiEgress.httpsCidrs` above is the same idea for the mail adapter
 pod: one BYO peer, declared explicitly, per pod that has an egress policy.
 
@@ -365,7 +374,14 @@ the traces pipeline. `extraLogPipelineExporters` and
 `extraMetricPipelineExporters` do the equivalent for the respective signal
 pipelines. Helm rejects a missing exporter or a network exporter without its
 bounded retry and persistent queue protections. The development-only `debug`
-exporter is available only when enabled.
+exporter is available only when enabled. The chart default keeps metrics on
+`nop/metrics`. The SRE-bot overlay
+(`examples/sre-bot/observability/curie-values.yaml`) appends
+`prometheusremotewrite/soak` so a Prometheus with
+`web.enable-remote-write-receiver` retains Curie series. A locally rendered
+overlay is not proof that a live Collector is exporting, and a disposable
+runtime proof is not proof the permanent soak overlay is deployed; see
+`examples/sre-bot/docs/METRICS-ROLLOUT.md`.
 
 Built-in exporter names (`otlphttp/langfuse`, `nop/logs`, `nop/metrics`, and
 `debug`) are reserved and cannot be overridden through `extraExporters`.
@@ -429,24 +445,27 @@ root filesystem remains read-only; only the state mount and an `emptyDir` at
 `/tmp` are writable. Enabling it also requires an explicit
 `mailAdapter.agentmail.httpsCidrs` list. One egress-only NetworkPolicy then
 allows DNS, this release's API pods, those provider/proxy CIDRs on TCP 443, and
--- while `otelCollector.deploy=true` -- this release's OTel Collector on its
-gRPC and HTTP ports, so the adapter's OTLP export is not dropped by its own
-rail. When `api.deploy=false`, the in-chart API selector is replaced by the
+-- when the release exports to its own in-chart collector -- that Collector on
+its gRPC and HTTP ports, or else the required `mailAdapter.otelEgress.httpsCidrs`
+peers for an external collector, so the adapter's OTLP export is not dropped by
+its own rail. When `api.deploy=false`, the in-chart API selector is replaced by the
 required `mailAdapter.apiEgress.httpsCidrs` peers on
 `mailAdapter.apiEgress.port`; the chart does not infer IPs from `apiBaseUrl`.
 The policy has no Kubernetes API carve-out and never selects runner sandboxes.
 
 The adapter is the only first-party workload with an egress-restricting
-NetworkPolicy, which makes one telemetry configuration asymmetric. With
-`otelCollector.deploy=false` and an external `otelCollector.endpoint`, api,
-dispatcher and worker export normally because nothing restricts their egress,
-while the adapter's exports are dropped: its policy has no peer for an address
-the chart cannot know, and the chart deliberately invents no broad allow for
-one. Because NetworkPolicies union rather than intersect, the fix needs no chart
-change -- apply an additional egress policy in the release namespace selecting
-the adapter's labels (`app.kubernetes.io/component: mail-adapter` plus the
-release's instance label) with a `to:` for the external collector. Everything
-else about the rail, including the AgentMail CIDRs, keeps working unchanged. See
+NetworkPolicy, so it is the only one whose OTLP export its own rail can drop
+while api, dispatcher and worker keep exporting from the same rendered env. That
+case therefore fails closed rather than shipping silently: when the release's
+effective OTLP endpoint is not this release's in-chart collector -- including an
+`otelCollector.endpoint` that still names the in-chart Service with
+`otelCollector.deploy=false` -- the render is refused until
+`mailAdapter.otelEgress.httpsCidrs` names the collector's narrow range (or a
+controlled egress proxy's), on `mailAdapter.otelEgress.port` or the port derived
+from the endpoint URL. The chart infers no IPs from the endpoint and invents no
+broad allow. Set `otelCollector.telemetryDisabled=true` to deliberately accept
+an unobservable release. Everything else about the rail, including the AgentMail
+CIDRs, keeps working unchanged. See
 [`docs/operations.md`](../../docs/operations.md#connecting-email) for the
 mode-0600 credential workflow, retention, erase, and recovery procedure.
 
@@ -547,15 +566,17 @@ A BYO Postgres that enforces TLS (RDS with `rds.force_ssl=1`, Cloud SQL, Neon)
 also needs `postgres.sslMode: require` alongside `postgres.deploy: false` and
 `postgres.host`. One helper (`curie.postgres.dsnParams`) renders the per-driver
 suffix onto every DSN: `?ssl=require` for the api and worker (SQLAlchemy +
-asyncpg) and `?sslmode=no-verify` for both Langfuse Deployments (Prisma). The
+asyncpg) and `?sslmode=require&sslaccept=accept_invalid_certs` for both Langfuse
+Deployments (Prisma). Prisma accepts only `disable|prefer|require` for
+`sslmode`; `no-verify` is not in that set and is treated as `prefer`. The
 api migrate init container lifts `ssl=` out of the DSN into the asyncpg connect
 kwarg, because asyncpg's DSN parser would otherwise forward `ssl` as a server
 setting and the API would never leave init. `postgres.sslMode: require` against
 the in-chart Postgres fails the render: that StatefulSet serves no TLS
-listener. Neither suffix verifies the server certificate, so Langfuse traffic
-is encrypted but not authenticated; a `verify-full` mode needs a mounted CA
-bundle and is a second step. Leave `sslMode` empty (the default) for the
-in-cluster store: the rendered DSNs stay suffix-free.
+listener. Neither suffix verifies the server certificate, so api, worker, and
+Langfuse traffic is encrypted but not authenticated; a `verify-full` mode needs
+a mounted CA bundle and is a second step. Leave `sslMode` empty (the default)
+for the in-cluster store: the rendered DSNs stay suffix-free.
 
 Flipping `postgres.deploy` to `false` removes the in-cluster StatefulSet and
 Service. Helm does not delete a StatefulSet PVC, so if
@@ -852,8 +873,10 @@ turn. The chart now refuses that shape at render: `rustfs.egress` must cover
 the object-store endpoint, and on this key-free path `rustfs.stsEgress` must
 cover STS (`AssumeRoleWithWebIdentity`). Both are `{cidr, ports}` entries like
 `allowedEgress`. Do not put a DNS name here; NetworkPolicy has no hostname
-peer. A default route or a CIDR that reaches `169.254.169.254` is refused:
-these lists are store endpoints, not a second model allowlist.
+peer. A default route, an IPv4 prefix shorter than `/8`, an IPv6 prefix
+shorter than `/32`, a ports item with only `protocol` or with `endPort`, or a
+CIDR that reaches `169.254.169.254` or `fd00:ec2::254` is refused: these lists
+are store endpoints, not a second model allowlist.
 
 On EKS, create VPC **interface** endpoints for `s3` and `sts` in the cluster
 VPC with private DNS enabled, then put each endpoint's ENI address in as a
@@ -1059,11 +1082,13 @@ where the model API and MCP endpoints live (`{cidr, ports}` entries). An unset
 allowlist never means allow-all. The BYO in-chart peers are not on that list
 either, because each names one endpoint rather than a class of destinations: set
 `rustfs.egress` (and `rustfs.stsEgress` on the key-free path) so the sandbox
-bundle-fetch can reach S3 and STS, `otelCollector.egress` when
-`otelCollector.deploy: false` points the runner at an external collector, and
-`api.egress` when `api.deploy: false` points it at an external API. Each is
-required at render on its BYO path, so the install fails loudly instead of
-shipping a sandbox holding an address it can never reach. See **Key-free object
+bundle-fetch can reach S3 and STS, `otelCollector.egress` when the runner's
+OTLP URL is external, and `api.egress` when the runner's API URL is external.
+Each is required at render on that effective-endpoint path, so the install
+fails loudly instead of shipping a sandbox holding an address it can never
+reach. `deploy: false` is the common BYO shape; the same requirement fires
+when the in-chart pod is still deployed but `dispatcher.apiBaseUrl` or a
+supported extraEnv override points the runner elsewhere. See **Key-free object
 store auth** above.
 
 **The controller does not get a second vote on egress (#765, ADR-0067).**
@@ -1277,7 +1302,8 @@ to install only the control plane + backing stores without the runner substrate.
   alone gets it nowhere: `otelCollector.egress` must name the collector's CIDRs
   or the default-deny drops every sandbox span while api, dispatcher and worker
   keep exporting normally. The chart requires it at render rather than letting
-  that asymmetry ship silently.
+  that asymmetry ship silently. The mail adapter has the same requirement for
+  its own policy, under `mailAdapter.otelEgress.httpsCidrs` (above).
 
 ## Deploying without inbound access
 

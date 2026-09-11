@@ -60,6 +60,7 @@ dev = [
     "curie-wire-tolerance-gate",
     "curie-test-support",
     "pytest>=8.3",
+    "pytest-xdist>=3.6",
     "ruff>=0.16.2",
     "mypy>=2.3.0",
     "import-linter>=2.0",
@@ -161,9 +162,15 @@ testpaths = [
     "packages/channel-protocol/tests",
     "packages/plugin-format/tests",
     "packages/test-support/tests",
+    "packages/telemetry/tests",
     "apps/api/tests",
     "apps/dispatcher/tests",
     "apps/mail-adapter/tests",
+    # The Discord adapter's tests sat in no collection root above, and the
+    # string "discord" appears in no .github/workflows file, so they ran
+    # nowhere in CI (#2358). A telemetry test in a suite CI never collects is
+    # a falsely-claimed proof, so the listing is part of the fix, not tidying.
+    "adapters/discord/tests",
     "apps/worker/tests",
     "runner/tests",
     "compose/tests",
@@ -180,10 +187,12 @@ testpaths = [
     "tools/ci-retry-gate/tests",
     "tools/ci-workflow-paths/tests",
     "tools/e2e-ci-selection/tests",
+    "tools/fix-pin-ci/tests",
     "tools/sdk-lock-gate/tests",
     "tools/fix-pin-ci/tests",
     "tools/close-on-next/tests",
     "tools/p0-closes-ci/tests",
+    "tools/xdist-characterise/tests",
     "tools/ci-release-target-parity/tests",
     "tools/restore-drill/tests",
     "tools/sre-contract/tests",

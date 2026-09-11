@@ -1,0 +1,151 @@
+# Draw the boundary #2230 could not draw from three samples.
+#
+# The parallelism comment on #2230 ran `uv run pytest -n 4 --dist loadfile`
+# three times on a 12 core laptop. Two attempts failed, on two DIFFERENT tests,
+# which is the worst shape a sample can have: it says a boundary exists without
+# saying where. The comment named what would fix that, and this is the first
+# item, run the suite many times and collect every test that ever fails, plus
+# the third item, do it on a CI runner rather than a laptop.
+#
+# It is deliberately not on `pull_request` or `push` to a release branch. It
+# runs the whole suite twenty times over and is an investigation, not a gate.
+# The branch pattern is the trigger so it can run before it is on a release
+# branch, since `workflow_dispatch` only offers workflows already on the
+# default branch.
+name: Xdist characterisation
+
+on:
+  push:
+    branches: ["task/xdist-characterise*"]
+
+permissions:
+  contents: read
+
+jobs:
+  attempt:
+    name: Parallel attempt ${{ matrix.attempt }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Every attempt is a sample. One that fails must not cancel the rest, or
+      # the run answers "at least one failed" instead of "here is the set".
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                  11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Retry eligibility (#1106): acquiring a third-party tool may be wrapped.
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
+      # The same stack the Python job boots, because the contention this is
+      # looking for is largely contention over it.
+      - name: Start dev stack
+        run: |
+          docker compose -f compose.dev.yaml up -d \
+            postgres valkey clickhouse rustfs rustfs-init \
+            langfuse-web langfuse-worker otel-collector
+          docker compose -f compose.dev.yaml up -d --wait --wait-timeout 300 \
+            postgres valkey clickhouse rustfs \
+            langfuse-web langfuse-worker otel-collector
+      - name: Wait for Langfuse to serve
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:23000/api/public/health >/dev/null 2>&1; then
+              echo "Langfuse ready after attempt ${i}"; exit 0
+            fi
+            sleep 3
+          done
+          echo "Langfuse did not become ready within 180s"; exit 1
+      - name: Migrate the shared database
+        working-directory: apps/api
+        run: uv run alembic upgrade head
+      - name: Record the runner's real core count
+        run: |
+          echo "nproc=$(nproc)"
+          free -g || true
+      # `-n 4` matches the runner, and `--dist loadfile` is what #2230
+      # measured, so this extends that data rather than starting a new series.
+      #
+      # A failing attempt is the measurement, and this step is deliberately NOT
+      # wrapped to hide that. `continue-on-error` on a step that runs this
+      # repository's tests is the exact pattern the retry gate exists to refuse,
+      # and it is refused here too. It is also unnecessary: pytest writes the
+      # junit file whether the suite passed or failed, the upload below is
+      # `always()`, and the aggregate job is `always()`. So a red attempt leg
+      # still contributes its data, and reads as what it is.
+      - name: Parallel suite
+        env:
+          CI_REQUIRE_VALKEY_TESTS: "1"
+        run: |
+          uv run pytest -n 4 --dist loadfile -q \
+            --junitxml "junit-${{ matrix.attempt }}.xml"
+      - name: Upload this attempt's report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ matrix.attempt }}
+          path: junit-${{ matrix.attempt }}.xml
+          if-no-files-found: warn
+
+  aggregate:
+    name: Characterisation
+    runs-on: ubuntu-latest
+    needs: attempt
+    # `attempt` legs are expected to fail; that is the data. Without always()
+    # the aggregate never runs on exactly the runs worth aggregating.
+    if: always()
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Download every attempt's report
+        uses: actions/download-artifact@v7
+        with:
+          pattern: junit-*
+          path: reports
+      - name: Union the failures across attempts
+        run: |
+          uv run python tools/xdist-characterise/aggregate.py \
+            --reports reports \
+            --json characterisation.json | tee "$GITHUB_STEP_SUMMARY"
+      - name: Upload the characterisation
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: characterisation
+          path: characterisation.json
+          if-no-files-found: error

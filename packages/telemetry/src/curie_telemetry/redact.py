@@ -58,8 +58,25 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
     ),
     RedactionRule(
         "api_key",
-        re.compile(r"\b(?:sk|xai)[-_][A-Za-z0-9_-]{16,}"),
+        # sk-/xai- are the in-tree model-key prefixes. AgentMail documents
+        # ``am_`` (https://docs.agentmail.to/knowledge-base/getting-api-key.md).
+        re.compile(r"\b(?:(?:sk|xai)[-_]|am_)[A-Za-z0-9_-]{16,}"),
         _placeholder("api_key"),
+    ),
+    RedactionRule(
+        "channel_token",
+        # Curie-minted ingress credential: ``chn.{payload}.{signature}``
+        # (``curie_api.channel_token``, prefix ``chn``). Hyphenated
+        # ``chn-{id}-{digest}`` values are event ids, not credentials.
+        re.compile(r"\bchn\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+        _placeholder("channel_token"),
+    ),
+    RedactionRule(
+        "x_api_key",
+        # Opaque header values have no unique prefix; match the header
+        # name the mail adapter and channel clients send.
+        re.compile(r"(X-API-Key:\s*)(?!\[REDACTED:)\S+", re.IGNORECASE),
+        r"\1[REDACTED:x_api_key]",
     ),
     RedactionRule(
         "aws_access_key_id",
@@ -87,12 +104,38 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         _placeholder("google_api_key"),
     ),
     RedactionRule(
-        "secret_assignment",
+        "discord_bot_authorization",
+        # Discord's API reference demonstrates bot credentials in an
+        # ``Authorization: Bot <token>`` header:
+        # https://docs.discord.com/developers/reference
         re.compile(
-            r"\b(?:secret|password|passwd|pwd|api_key|apikey|access_token|token)=\S+",
+            r"(?<![A-Za-z0-9_-])(Authorization:\s+Bot\s+)(?!\[REDACTED:)"
+            r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-]+)",
             re.IGNORECASE,
         ),
-        _placeholder("secret_assignment"),
+        r"\1[REDACTED:discord_bot_authorization]",
+    ),
+    RedactionRule(
+        "discord_bot_token_assignment",
+        re.compile(
+            r"(?<![A-Za-z0-9_])(DISCORD_BOT_TOKEN=)"
+            r"(?!\[REDACTED:)[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-]+)"
+        ),
+        r"\1[REDACTED:discord_bot_token_assignment]",
+    ),
+    RedactionRule(
+        "secret_assignment",
+        # ``\b`` does not fire before ``token`` in ``CURIE_CHANNEL_TOKEN=``
+        # because ``_`` is a word character. Require a non-alphanumeric
+        # predecessor so ``*_TOKEN=`` / ``*_SECRET=`` match while
+        # ``mytoken=`` does not. Keep the key name; drop only the value.
+        re.compile(
+            r"(?<![A-Za-z0-9])((?:secret|password|passwd|pwd|api_key|apikey|access_token|token)=)(?!\[REDACTED:)\S+",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED:secret_assignment]",
     ),
     RedactionRule(
         "home_path",

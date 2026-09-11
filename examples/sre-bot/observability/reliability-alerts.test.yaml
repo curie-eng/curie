@@ -1,0 +1,396 @@
+rule_files:
+  - reliability-alerts.rules.yaml
+
+evaluation_interval: 5m
+
+tests:
+  - name: application metrics absent fires
+    interval: 5m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieApplicationMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              component: curie-metrics
+              severity: page
+            exp_annotations:
+              summary: Curie application metrics are absent from Prometheus
+              description: >-
+                No curie_turn_accepted_total series has been retained for 10
+                minutes. Treat missing metrics as a failure, not as a quiet
+                system.
+
+  - name: application metrics recover when the series returns
+    interval: 5m
+    input_series:
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted"}'
+        values: '1+1x6'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieApplicationMetricsAbsent
+        exp_alerts: []
+
+  - name: missed canary fires after accepted turns go quiet
+    interval: 15m
+    input_series:
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted"}'
+        values: '1+1x20 21+0x680'
+    alert_rule_test:
+      - eval_time: 10h
+        alertname: CurieTurnAcceptedStale
+        exp_alerts:
+          - exp_labels:
+              component: curie-canary
+              outcome: accepted
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+
+  - name: healthy canary cadence stays quiet
+    interval: 15m
+    input_series:
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted"}'
+        values: '1+1x40'
+    alert_rule_test:
+      - eval_time: 10h
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+
+  - name: classified task failure fires
+    interval: 5m
+    input_series:
+      - series: 'curie_turn_completed_total{service_name="curie-worker",source="worker",outcome="classified_failure"}'
+        values: '0+1x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieTaskFailure
+        exp_alerts:
+          - exp_labels:
+              component: curie-task
+              outcome: classified_failure
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: A Curie turn completed as classified_failure
+              description: >-
+                curie_turn_completed_total with outcome classified_failure
+                increased in the last 15 minutes.
+
+  - name: successful completions stay quiet
+    interval: 5m
+    input_series:
+      - series: 'curie_turn_completed_total{service_name="curie-worker",source="worker",outcome="done"}'
+        values: '0+1x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieTaskFailure
+        exp_alerts: []
+
+  - name: oldest queued age fires
+    interval: 5m
+    input_series:
+      - series: 'curie_queue_message_age_seconds{service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '1200+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts:
+          - exp_labels:
+              component: curie-queue
+              outcome: pending
+              service_name: curie-worker
+              severity: page
+              source: worker
+            exp_annotations:
+              summary: Oldest queued Curie message is older than 15 minutes
+              description: >-
+                curie_queue_message_age_seconds has stayed above 900 for 10
+                minutes.
+
+  - name: fresh queue age stays quiet
+    interval: 5m
+    input_series:
+      - series: 'curie_queue_message_age_seconds{service_name="curie-worker",source="worker",outcome="pending"}'
+        values: '30+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieQueueMessageAgeHigh
+        exp_alerts: []
+
+  - name: owed completion age fires
+    interval: 5m
+    input_series:
+      - series: 'curie_completion_outbox_age_seconds{service_name="curie-worker",operation="observe",outcome="retry"}'
+        values: '600+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieCompletionOutboxAgeHigh
+        exp_alerts:
+          - exp_labels:
+              component: curie-completion
+              operation: observe
+              outcome: retry
+              service_name: curie-worker
+              severity: page
+            exp_annotations:
+              summary: An owed completion is older than five minutes
+              description: >-
+                curie_completion_outbox_age_seconds has stayed above 300 for
+                10 minutes. A drained run queue does not clear this signal.
+
+  - name: empty outbox age stays quiet
+    interval: 5m
+    input_series:
+      - series: 'curie_completion_outbox_age_seconds{service_name="curie-worker",operation="observe",outcome="retry"}'
+        values: '0+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieCompletionOutboxAgeHigh
+        exp_alerts: []
+
+  - name: missing outbox signal fires while turns flow
+    interval: 5m
+    input_series:
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted"}'
+        values: '1+1x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieCompletionOutboxSignalAbsent
+        exp_alerts:
+          - exp_labels:
+              component: curie-completion
+              severity: page
+            exp_annotations:
+              summary: Completion-outbox metrics are absent while turns flow
+              description: >-
+                Turns are being accepted, but curie_completion_outbox is
+                missing. Absent completion-delivery telemetry is a failure
+                signal.
+
+  - name: present outbox signal recovers absence
+    interval: 5m
+    input_series:
+      - series: 'curie_turn_accepted_total{service_name="curie-worker",source="worker",outcome="accepted"}'
+        values: '1+1x6'
+      - series: 'curie_completion_outbox{service_name="curie-worker",operation="observe",outcome="retry"}'
+        values: '0+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieCompletionOutboxSignalAbsent
+        exp_alerts: []
+
+  - name: repeated reply refusal fires
+    interval: 5m
+    input_series:
+      - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure"}'
+        values: '0+2x8'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CurieReplyDeliveryRefused
+        exp_alerts:
+          - exp_labels:
+              component: curie-delivery
+              operation: post
+              outcome: failure
+              role: client
+              service_name: curie-worker
+              severity: page
+            exp_annotations:
+              summary: Repeated Curie reply delivery failures
+              description: >-
+                curie_reply_delivery_total with outcome failure increased by
+                three or more in 15 minutes.
+
+  - name: isolated reply failure stays quiet
+    interval: 5m
+    input_series:
+      - series: 'curie_reply_delivery_total{service_name="curie-worker",operation="post",role="client",outcome="failure"}'
+        values: '0+0x4 1 1 1'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CurieReplyDeliveryRefused
+        exp_alerts: []
+
+  - name: token rotation 5xx fires
+    interval: 5m
+    input_series:
+      - series: 'curie_http_server_request_total{service_name="curie-api",operation="/channels/token",role="server",source="POST",outcome="5xx"}'
+        values: '0+1x8'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CurieChannelTokenRotationFailed
+        exp_alerts:
+          - exp_labels:
+              component: curie-token
+              operation: /channels/token
+              outcome: 5xx
+              role: server
+              service_name: curie-api
+              severity: page
+              source: POST
+            exp_annotations:
+              summary: Channel-token HTTP rotation returned 5xx
+              description: >-
+                curie_http_server_request_total for /channels/token with
+                outcome 5xx increased in the last hour.
+
+  - name: token rotation 2xx stays quiet
+    interval: 5m
+    input_series:
+      - series: 'curie_http_server_request_total{service_name="curie-api",operation="/channels/token",role="server",source="POST",outcome="2xx"}'
+        values: '0+1x8'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CurieChannelTokenRotationFailed
+        exp_alerts: []
+
+  - name: mail adapter unready fires
+    interval: 5m
+    input_series:
+      - series: 'kube_deployment_status_replicas_unavailable{deployment="curie-mail-adapter",namespace="curie"}'
+        values: '1+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieMailAdapterNotReady
+        exp_alerts:
+          - exp_labels:
+              component: curie-token
+              deployment: curie-mail-adapter
+              namespace: curie
+              severity: page
+            exp_annotations:
+              summary: Mail adapter replicas are unavailable
+              description: >-
+                The mail adapter Deployment has unavailable replicas. An
+                expired channel token fails /readyz and surfaces here without
+                inspecting a token value.
+
+  - name: mail adapter ready stays quiet
+    interval: 5m
+    input_series:
+      - series: 'kube_deployment_status_replicas_unavailable{deployment="curie-mail-adapter",namespace="curie"}'
+        values: '0+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieMailAdapterNotReady
+        exp_alerts: []
+
+  - name: sustained low memory headroom fires
+    interval: 5m
+    input_series:
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+        values: '8+0x6'
+      - series: 'node_memory_MemTotal_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+        values: '100+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieNodeMemoryHeadroomLow
+        exp_alerts:
+          - exp_labels:
+              component: curie-node
+              curie_source: curie-sre-bot
+              instance: k8:9101
+              severity: page
+            exp_annotations:
+              summary: Node memory headroom is below 10 percent
+              description: >-
+                A curie_source=curie-sre-bot memory series has had less than
+                10 percent available for 15 minutes.
+
+  - name: ordinary memory usage stays quiet
+    interval: 5m
+    input_series:
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+        values: '30+0x6'
+      - series: 'node_memory_MemTotal_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+        values: '100+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieNodeMemoryHeadroomLow
+        exp_alerts: []
+
+  - name: root disk pressure fires
+    interval: 5m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+        values: '10+0x6'
+      - series: 'node_filesystem_size_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+        values: '100+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieRootDiskPressure
+        exp_alerts:
+          - exp_labels:
+              component: curie-node
+              curie_source: curie-sre-bot
+              fstype: ext4
+              instance: k8:9101
+              mountpoint: /
+              severity: page
+            exp_annotations:
+              summary: Root disk has less than 20 percent free
+              description: >-
+                A curie_source=curie-sre-bot root filesystem has stayed below
+                20 percent free for 15 minutes.
+
+  - name: healthy root disk stays quiet
+    interval: 5m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+        values: '40+0x6'
+      - series: 'node_filesystem_size_bytes{curie_source="curie-sre-bot",instance="k8:9101",mountpoint="/",fstype="ext4"}'
+        values: '100+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieRootDiskPressure
+        exp_alerts: []
+
+  - name: duplicate node exporter fires
+    interval: 5m
+    input_series:
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8:9100"}'
+        values: '30+0x6'
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+        values: '30+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieDuplicateNodeExporter
+        exp_alerts:
+          - exp_labels:
+              component: curie-node
+              severity: page
+            exp_annotations:
+              summary: Both 9100 and 9101 node-exporter series are retained
+              description: >-
+                node_memory_MemAvailable_bytes with curie_source=curie-sre-bot
+                has series on :9100 and :9101. Naive sums of that set
+                double-count the node. Isolate scrape to one intended series.
+
+  - name: single intended node exporter stays quiet
+    interval: 5m
+    input_series:
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8:9101"}'
+        values: '30+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieDuplicateNodeExporter
+        exp_alerts: []
+
+  - name: one series per node on 9101 stays quiet
+    interval: 5m
+    input_series:
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8a:9101"}'
+        values: '30+0x6'
+      - series: 'node_memory_MemAvailable_bytes{curie_source="curie-sre-bot",instance="k8b:9101"}'
+        values: '30+0x6'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieDuplicateNodeExporter
+        exp_alerts: []

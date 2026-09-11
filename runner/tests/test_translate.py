@@ -184,7 +184,11 @@ def test_sdk_abort_result_is_error_then_classified_final(
 
     assert [event.type for event in events] == ["error", "final"]
     assert isinstance(events[0], ErrorEvent)
-    assert events[0].classification == "error_during_execution"
+    assert events[0].classification == "unclassified"
+    assert events[0].classification != "error_during_execution"
+    # Allowlist-constrain must not drop the raw subtype from the message.
+    assert "error_during_execution" in events[0].message
+    assert "run failed" in events[0].message
     assert isinstance(events[1], Final)
     assert events[1].status is SessionStatus.CLASSIFIED_FAILURE
 
@@ -193,7 +197,19 @@ def test_assistant_error_field_emits_error_event() -> None:
     msg = AssistantMessage(content=[], model="m", error="rate_limit")
     events = _translate(msg)
     assert [e.type for e in events] == ["error"]
-    assert events[0].classification == "rate_limit"
+    assert events[0].classification == "unclassified"
+    assert events[0].classification != "rate_limit"
+    assert "rate_limit" in events[0].message
+
+
+def test_assistant_unknown_error_is_unclassified_not_passthrough() -> None:
+    msg = AssistantMessage(content=[], model="m", error="unknown")
+    events = _translate(msg)
+    assert [e.type for e in events] == ["error"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "unclassified"
+    assert "unknown" in events[0].message
+    assert events[0].classification != "unknown"
 
 
 def test_rate_limit_rejected_maps_to_error() -> None:

@@ -149,6 +149,7 @@ that release's retained values.
 | `-f <compose>` | Override a resolved local-dev artifact path. |
 | `--image <ref>` | Override a resolved image reference. |
 | `--no-expose` | Keep the UI and Langfuse ClusterIP-only instead of exposing them on node ports. |
+| `--adopt` | Install into a pre-existing namespace that already has its own labels or its own objects. Without it, such a namespace is refused. See [Adopting a pre-existing namespace](#adopting-a-pre-existing-namespace). |
 | `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. The interactive check accepts Anthropic `sk-ant-`, OpenRouter `sk-or-`, Zhipu `id.secret`, and bare `sk-` shapes for Moonshot or DeepSeek. The first two prefixes select one provider and infer its egress when no provider flag is present. Other shapes do not identify a provider. Present credentials install live through masked `--set` machinery, so `--dry-run` never prints them. An absent credential uses fake mode on a fresh install and preserves the recorded model configuration on a rerun. |
 | `--fake-model` | Explicitly downgrade to fake mode, even when a credential is present or a rerun has recorded live model configuration. |
 | `--github-token <token>` (or `CURIE_GITHUB_TOKEN`) | The Curie API's own GitHub credential, for cloning a PRIVATE repo during a git-flow bundle deploy and for posting the eval commit status. Goes to helm through a private mode-0600 values file, never a command-line argument, so it never appears in the helm command, the printed plan, or that plan's JSON. Prefer the environment variable: a token typed after the flag still sits in `curie`'s own argv, so it still reaches your shell history and `ps`. Omitting both on a later `cluster up` preserves whatever the release already has. Errors if combined with `--set api.githubToken=`. |
@@ -159,6 +160,69 @@ that release's retained values.
 
 A downloaded release binary needs no repo checkout; the chart resolves from
 the version-pinned release asset by default.
+
+#### Adopting a pre-existing namespace
+
+`cluster up` creates its namespace, and stamps what it created with
+`curietech.ai/created-by=<release>` and `curietech.ai/created-in=<namespace>`.
+`cluster down` deletes namespaces by exactly that label pair, so the stamp is
+what makes a teardown safe: it can only delete what this install made.
+
+That is also why a namespace which already exists is refused rather than
+adopted. Adopting someone else's namespace would stamp it, and a later
+`cluster down` would then delete it along with whatever was already inside.
+`cluster up` therefore refuses a pre-existing namespace that has its own labels,
+its own ownership labels, or any object beyond the two Kubernetes puts there
+itself (the `default` ServiceAccount and the `kube-root-ca.crt` ConfigMap).
+
+On a cluster where the namespace is pre-provisioned -- with a quota, a
+NetworkPolicy, a Pod Security label, an Argo CD tracking label, or a pull
+secret -- that refusal is the normal case, and deleting the namespace to get
+past it is worse than the thing the refusal is protecting against. `--adopt` is
+the supported way through:
+
+```bash
+curie cluster up --namespace platform-curie --adopt
+```
+
+**What it records.** The adoption is written onto the Namespace, not just to the
+terminal, so it can be read back long afterward:
+
+```bash
+kubectl get namespace platform-curie -o yaml
+```
+
+| Key | What it holds |
+|---|---|
+| `curietech.ai/adopted-by` (label) | The release that adopted the namespace. |
+| `curietech.ai/adopted-in` (label) | The install namespace of that release. |
+| `curietech.ai/adopted-at` (annotation) | When the adoption happened, RFC 3339 UTC. |
+| `curietech.ai/adopted-labels` (annotation) | The labels the namespace already carried. |
+| `curietech.ai/adopted-contents` (annotation) | The non-default objects that were already in it. |
+
+Pre-existing labels and annotations are preserved; the adoption record is merged
+into them. A very long inventory is truncated, and says so.
+
+**An adopted namespace is retained, not deleted.** `curietech.ai/adopted-by` and
+`curietech.ai/adopted-in` are deliberately *not* the pair `cluster down` selects
+on. A later `curie cluster down` uninstalls the release and leaves the namespace
+and everything in it in place. Delete it yourself when you want it gone. A
+namespace `cluster up` created itself is unaffected and is still swept.
+
+**What `--adopt` does not do.**
+
+- It never adopts the shared `agent-sandbox-system` controller namespace. That
+  namespace is a cluster singleton shared by every install on the cluster.
+- It never adopts a terminating namespace, which cannot accept new objects.
+- It never weakens a read. If the namespace, the namespaced API inventory, or an
+  aggregated `APIService` cannot be read completely, or the namespace is modified
+  concurrently, the install still fails closed -- contents that cannot be read
+  cannot be recorded.
+- Passing it when nothing needed overriding changes nothing: an empty, unlabelled
+  namespace is adopted the ordinary way and stays sweepable by `cluster down`.
+
+A re-run does not need the flag again. `cluster up` recognises a namespace this
+same release already adopted and converges without rewriting the original record.
 
 **Provider-native runtime configuration.** Zhipu, Moonshot, and DeepSeek need
 their matching documented `CURIE_MODEL_BASE_URL` in worker runtime configuration,
@@ -378,6 +442,7 @@ curie cluster rollback
 |---|---|
 | `--revision <n>` | Roll back to this exact revision instead of the newest safe one. |
 | `--allow-failed-revision` | Permit a `--revision` that Helm never finished applying. |
+| `--live-schema-revision <rev>` | Assert the live Alembic revision instead of reading it from the API pod. The schema-window check still runs against this value. |
 | `--yes` | Skip the confirmation prompt. |
 | `--dry-run` | Print the commands that would run and exit. |
 
@@ -406,6 +471,13 @@ the running API pod and refuses a target whose declared schema range does not
 include it, before Helm mutates the release. The refusal names the
 compatibility boundary and the newest safe fail-forward application version.
 It does not print database contents or credentials. See issue #2296.
+
+When every API replica is unexecutable (CrashLoopBackOff, Init, or
+ImagePullBackOff; the ordinary reason to roll back), that probe cannot run.
+`--live-schema-revision <rev>` lets the operator assert the live Alembic
+revision (the output of `alembic current` against the release database) so the
+schema-window check still runs without a live API pod. An incompatible target
+is still refused. This is not a way to skip the window. See issue #2558.
 
 If you know which revision you want, `--revision <n>` takes it. A revision that
 isn't in the history is refused, and so is one Helm never finished applying --
@@ -467,10 +539,21 @@ nothing's been deployed yet, `curie cluster message` will say so plainly.
 ### Automatically, with git-flow
 
 Beyond `curie cluster deploy`, a bundle can also deploy automatically on
-every `git push`. Four things need to be true for a push to actually
+every `git push`. There are two delivery paths, and only one needs to be
+armed: an inbound GitHub webhook (items 2 and 3 below), or commit polling
+(`api.commitPollIntervalSeconds`, shipped in #1239), where the API pulls
+the repo itself and neither item applies. Polling is the path for a
+private or ClusterIP-only install that cannot receive an inbound webhook
+at all. `curie cluster deploy --repo` and `curie doctor` (the `Push
+delivery` check) now tell you which of these, if any, is actually armed
+for a given agent -- configuration evidence, not proof a push has
+deployed.
+
+Four things need to be true for a push over the webhook path to actually
 promote:
 
-1. **The agent's repo is set.** The webhook resolves which agent a push
+1. **The agent's repo is set.** (This applies to both delivery paths --
+   commit polling still needs to know which repo to pull.) The webhook resolves which agent a push
    belongs to by matching the payload's `repo.full_name` (owner/name)
    against that agent's `repo_full_name`. This field is set when the
    agent is created (`curie <tier> deploy --repo owner/name`, or the
@@ -631,7 +714,8 @@ Two platform-side steps come first, in this order:
    mints through `POST /channels/token` with the platform key, writes the token
    into the Secret the adapter actually reads (the chart Secret, or
    `mailAdapter.channelTokenExistingSecret` when that is set), rolls the adapter,
-   and prints `exp`. It never prints the token and never writes it through Helm
+   and prints `exp`. Each mint bumps the binding's generation, so a remint
+   revokes the previous token. It never prints the token and never writes it through Helm
    values, so `helm get values` cannot undo the rotation. `--show-exp` reports
    the installed token's `exp` and whether the platform still accepts it, the
    same observation `curie doctor` uses. The mint refuses with 409 for a
@@ -716,6 +800,7 @@ mailAdapter:
 | `mailAdapter.agentmail.apiKeyExistingSecret` / `apiKeyExistingSecretKey` | Source the AgentMail API key from an operator-managed Secret instead of the chart Secret (default key `mailAgentmailApiKey`). |
 | `mailAdapter.agentmail.httpsCidrs` | Required provider/proxy destination CIDRs on TCP 443. The mail pod's egress policy otherwise allows only DNS and this release's API pods. |
 | `mailAdapter.apiEgress.httpsCidrs` / `port` | Required narrow destination peers when `api.deploy=false`; default port `8000`. Ignored for the in-chart API, whose pod selector and service port are used instead. |
+| `mailAdapter.otelEgress.httpsCidrs` / `port` | Required narrow destination peers when the release's effective OTLP endpoint is external (`otelCollector.deploy=false` with `otelCollector.endpoint` set); the render is refused without it. `port` is optional and derives from the endpoint URL. Ignored for the in-chart collector, whose pod selector is used instead. |
 | `mailAdapter.persistence.size` / `storageClass` | Chart-managed RWO SQLite PVC. The default size is `1Gi`; empty storage class inherits `global.storageClass` and then the cluster default. |
 | `mailAdapter.persistence.existingClaim` | Mount an existing same-namespace RWO Filesystem PVC instead of rendering one. An install/upgrade hook checks the exact claim before replacing the pod. |
 

@@ -3,7 +3,7 @@
 ADR-0096 phase 2, Stream C. Two endpoints on a new `/channels` router:
 
 - `POST /channels/token` (platform key only) mints a `chn` token over a binding
-  row's `channel_id` + current `generation` (plan EB-C2).
+  row's `channel_id` + a bumped `generation` (plan EB-C2, #2379).
 - `POST /channels/turns` (platform key OR a `chn` token) enqueues a `QueuedTurn`
   for the binding named in the BODY. `kind` and `address` are in the body, not
   the path, because an address is an opaque routing key that may contain `@`,
@@ -118,6 +118,19 @@ def runs_stream() -> Iterator[str]:
 def channels_client(_disposable_db: Any, runs_stream: str) -> Iterator[TestClient]:
     """A TestClient whose app was built AFTER the stream override, so the
     ingress enqueue targets the isolated stream."""
+
+    with TestClient(create_app()) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def rival_client(_disposable_db: Any, runs_stream: str) -> Iterator[TestClient]:
+    """A SECOND app instance on the same Postgres.
+
+    Two apps rather than two calls on one TestClient: a concurrent mint is a
+    different process in production, and one client's portal would serialize
+    the overlap under test.
+    """
 
     with TestClient(create_app()) as test_client:
         yield test_client
@@ -255,6 +268,16 @@ def _sha16(delivery_id: str) -> str:
     return hashlib.sha256(delivery_id.encode()).hexdigest()[:16]
 
 
+def _both(first: Any, second: Any) -> tuple[Any, Any]:
+    """Run two request thunks genuinely in parallel and return both responses."""
+
+    async def run() -> list[Any]:
+        return list(await asyncio.gather(asyncio.to_thread(first), asyncio.to_thread(second)))
+
+    left, right = asyncio.run(run())
+    return left, right
+
+
 # --- POST /channels/token: minting against a binding --------------------------
 
 
@@ -262,8 +285,9 @@ def test_the_mint_binds_the_row_identity_and_its_current_generation(
     channels_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     """EB-C2. The mint resolves the `(kind, address)` pair to a binding ROW and
-    signs that row's id plus its generation -- so the token names an identity
-    that survives neither a delete-and-recreate nor a rebind (T-C8, T-C9)."""
+    signs that row's id plus the generation the mint itself stamps -- so the
+    token names an identity that survives neither a delete-and-recreate nor a
+    rebind (T-C8, T-C9) nor a later remint (#2379)."""
 
     agent_id = _bind(
         channels_client,
@@ -271,12 +295,17 @@ def test_the_mint_binds_the_row_identity_and_its_current_generation(
         name="mint-agent",
         channel=_email_channel("ops@example.test"),
     )
-    row = _binding_row(agent_id)
+    before = _binding_row(agent_id)
+    assert before["generation"] == 0
 
     token = _mint(channels_client, auth_headers, kind="email", address="ops@example.test")
+    row = _binding_row(agent_id)
 
-    # The minted token verifies against exactly this row at exactly this
-    # generation, and against nothing else.
+    # Rotation is a write: the mint bumps the counter, then signs the NEW value.
+    # Reading the row before the mint and verifying against that snapshot would
+    # pass a stamp-current implementation that leaves the previous token live.
+    assert row["generation"] == before["generation"] + 1
+
     from curie_api.channel_token import verify
 
     assert (
@@ -289,6 +318,136 @@ def test_the_mint_binds_the_row_identity_and_its_current_generation(
         )
         is True
     )
+    assert (
+        verify(
+            token,
+            get_settings().api_key,
+            channel_id=str(row["id"]),
+            generation=before["generation"],
+            scope=CHANNEL_ENQUEUE_SCOPE,
+        )
+        is False
+    )
+
+
+def test_a_second_mint_rejects_the_first_token(
+    channels_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """#2379. Rotation revokes: a remint bumps generation so the token it
+    replaces cannot enqueue.
+
+    The three 2026-09-04 mints for one email binding all carried generation 0
+    because mint stamped the row without incrementing it. After a second mint
+    the first token is 401 at ingress, with the same detail string as every
+    other credential failure, and the new token still enqueues.
+    """
+
+    agent_id = _bind(
+        channels_client,
+        auth_headers,
+        name="remint-agent",
+        channel=_email_channel("remint@example.test"),
+    )
+    first = _mint(
+        channels_client, auth_headers, kind="email", address="remint@example.test"
+    )
+    after_first = _binding_row(agent_id)
+    accepted = _post_turn(
+        channels_client, first, _turn("email", "remint@example.test")
+    )
+    assert accepted.status_code == 200, accepted.text
+
+    second = _mint(
+        channels_client, auth_headers, kind="email", address="remint@example.test"
+    )
+    after_second = _binding_row(agent_id)
+    assert after_second["generation"] == after_first["generation"] + 1
+    assert second != first
+
+    refused = _post_turn(
+        channels_client, first, _turn("email", "remint@example.test")
+    )
+    assert refused.status_code == 401, refused.text
+    assert refused.json()["detail"] == AUTH_DETAIL
+
+    still_valid = _post_turn(
+        channels_client, second, _turn("email", "remint@example.test")
+    )
+    assert still_valid.status_code == 200, still_valid.text
+
+    from curie_api.channel_token import verify_claims
+
+    first_claims = verify_claims(
+        first, get_settings().api_key, scope=CHANNEL_ENQUEUE_SCOPE
+    )
+    second_claims = verify_claims(
+        second, get_settings().api_key, scope=CHANNEL_ENQUEUE_SCOPE
+    )
+    assert first_claims is not None and second_claims is not None
+    assert first_claims.generation == after_first["generation"]
+    assert second_claims.generation == after_second["generation"]
+    assert first_claims.generation < second_claims.generation
+    assert {turn.event_id for turn in _turns_on(valkey, runs_stream)} == {
+        accepted.json()["event_id"],
+        still_valid.json()["event_id"],
+    }
+
+
+def test_two_concurrent_mints_increment_generation_once_each(
+    channels_client: TestClient,
+    rival_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """No lost update on the mint counter.
+
+    Two overlapping remints that both read N and both write N+1 would stamp the
+    same generation on two tokens, so neither rotation would revoke the other.
+    Under the row lock the increments serialize and the counter ends at start+2.
+    """
+
+    agent_id = _bind(
+        channels_client,
+        auth_headers,
+        name="concurrent-mint",
+        channel=_email_channel("concurrent-mint@example.test"),
+    )
+    start = _binding_row(agent_id)["generation"]
+
+    def _mint_on(client: TestClient) -> Any:
+        return client.post(
+            "/channels/token",
+            json={
+                "kind": "email",
+                "address": "concurrent-mint@example.test",
+                "ttl_s": 60,
+            },
+            headers=auth_headers,
+        )
+
+    first, second = _both(
+        lambda: _mint_on(channels_client), lambda: _mint_on(rival_client)
+    )
+    assert [first.status_code, second.status_code] == [200, 200], (
+        first.text,
+        second.text,
+    )
+    assert _binding_row(agent_id)["generation"] == start + 2
+
+    from curie_api.channel_token import verify_claims
+
+    gens: set[int] = set()
+    for resp in (first, second):
+        claims = verify_claims(
+            resp.json()["token"], get_settings().api_key, scope=CHANNEL_ENQUEUE_SCOPE
+        )
+        assert claims is not None
+        gens.add(claims.generation)
+    assert gens == {start + 1, start + 2}
 
 
 def test_the_mint_404s_for_a_pair_with_no_bound_agent(
@@ -875,8 +1034,10 @@ def test_the_401_matrix_is_uniform_and_never_leaks_which_half_failed(
         name="matrix-agent",
         channel=_email_channel("matrix@example.test"),
     )
-    row = _binding_row(agent_id)
     valid = _mint(channels_client, auth_headers, kind="email", address="matrix@example.test")
+    # Generation is read AFTER the mint: minting is a rotation write, so a
+    # snapshot taken beforehand is the generation the new token replaced.
+    row = _binding_row(agent_id)
 
     api_key = get_settings().api_key
     expired = mint(
