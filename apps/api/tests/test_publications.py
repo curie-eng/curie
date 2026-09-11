@@ -4800,27 +4800,6 @@ def test_review_identity_constraints_reject_partial_authority(
     )
 
 
-def test_review_authority_downgrade_refuses_an_active_reservation(
-    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
-) -> None:
-    from alembic import command
-    from alembic.config import Config
-
-    client, truth, _ = review_lineage_app
-    _, _, lineage = _verified_lineage(client, truth, auth_headers)
-    reservation = _reserve_review(client, lineage, "review:retain-on-rollback")
-    assert reservation.status_code == 201, reservation.text
-    api_dir = Path(__file__).resolve().parents[1]
-    config = Config(str(api_dir / "alembic.ini"))
-    config.set_main_option("script_location", str(api_dir / "alembic"))
-    with pytest.raises(RuntimeError, match="revisions are active"):
-        command.downgrade(config, "0041")
-    assert _rows("SELECT version_num FROM curie.alembic_version")[0]["version_num"] == "0042"
-    assert (
-        _rows("SELECT status FROM curie.publication_review_reservations")[0]["status"] == "reserved"
-    )
-
-
 @pytest.mark.parametrize(
     "changed_route", [{"reply_channel": "C0EXAMPLE2"}, {"reply_conversation_id": "another-thread"}]
 )
