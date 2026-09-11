@@ -1406,7 +1406,12 @@ async def advance_publication_lineage(
                 "publication.lineage_stale",
                 "immutable GitHub lineage identity changed",
             )
-        await _require_review_binding(session, lineage)
+        await _require_current_lineage_workspace(
+            session,
+            lineage,
+            conflict_code="publication.lineage_stale",
+            conflict_message="publication workspace or deployment is no longer authorized",
+        )
         identity_values = {
             "github_repository_id": identity.repository_id,
             "github_installation_id": identity.installation_id,
@@ -2244,21 +2249,15 @@ async def revoke_console_session(
     return row
 
 
-async def _require_review_binding(
-    session: AsyncSession, lineage: ThreadPublicationLineage
-) -> AgentChannel:
-    """Recheck original authority under the same transaction as reservation use."""
+async def _require_current_lineage_workspace(
+    session: AsyncSession,
+    lineage: ThreadPublicationLineage,
+    *,
+    conflict_code: str,
+    conflict_message: str,
+) -> None:
+    """Recheck the workspace and deployment that still authorize publication."""
 
-    binding = (
-        await session.get(
-            AgentChannel,
-            lineage.binding_id,
-            with_for_update=True,
-            populate_existing=True,
-        )
-        if lineage.binding_id
-        else None
-    )
     workspace = await session.scalar(
         select(ThreadWorkspace)
         .where(
@@ -2275,18 +2274,49 @@ async def _require_review_binding(
         populate_existing=True,
     )
     if (
+        workspace is None
+        or workspace.repo_full_name.casefold() != lineage.repo_full_name.casefold()
+        or not repository_is_allowed(
+            lineage.repo_full_name, get_settings().github_repo_allowlist
+        )
+        or deployment is None
+        or deployment.agent_id != lineage.agent_id
+        or deployment.status != "active"
+    ):
+        raise PublicationLineageConflict(
+            conflict_code,
+            conflict_message,
+        )
+
+
+async def _require_review_binding(
+    session: AsyncSession, lineage: ThreadPublicationLineage
+) -> AgentChannel:
+    """Recheck original authority under the same transaction as reservation use."""
+
+    binding = (
+        await session.get(
+            AgentChannel,
+            lineage.binding_id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+        if lineage.binding_id
+        else None
+    )
+    await _require_current_lineage_workspace(
+        session,
+        lineage,
+        conflict_code="publication.review_ineligible",
+        conflict_message="original review binding or workspace is no longer authorized",
+    )
+    if (
         binding is None
         or binding.agent_id != lineage.agent_id
         or binding.generation != lineage.binding_generation
         or not lineage.reply_conversation_id
         or scoped_conversation_id(binding.kind, binding.address, lineage.reply_conversation_id)
         != lineage.conversation_id
-        or workspace is None
-        or workspace.repo_full_name.casefold() != lineage.repo_full_name.casefold()
-        or not repository_is_allowed(lineage.repo_full_name, get_settings().github_repo_allowlist)
-        or deployment is None
-        or deployment.agent_id != lineage.agent_id
-        or deployment.status != "active"
     ):
         raise PublicationLineageConflict(
             "publication.review_ineligible",
