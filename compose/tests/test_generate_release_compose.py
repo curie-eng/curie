@@ -34,12 +34,7 @@ READINESS_DOCKERFILE_PATH = (
     REPO_ROOT / "charts" / "curie" / "ci" / "postgres-readiness-delay.Dockerfile"
 )
 READINESS_RUNTIME_SCRIPT_PATH = (
-    REPO_ROOT
-    / "charts"
-    / "curie"
-    / "ci"
-    / "runtime"
-    / "langfuse-postgres-readiness-runtime.sh"
+    REPO_ROOT / "charts" / "curie" / "ci" / "runtime" / "langfuse-postgres-readiness-runtime.sh"
 )
 
 DEV_TEXT = DEV_PATH.read_text()
@@ -183,8 +178,7 @@ def test_data_tier_pins_agree_across_artifacts():
     chart_postgres = values["postgres"]["image"]
     for label, doc in compose_docs():
         assert doc["services"]["postgres"]["image"] == chart_postgres, (
-            f"{label} postgres image must match the chart's postgres.image "
-            f"{chart_postgres!r}"
+            f"{label} postgres image must match the chart's postgres.image {chart_postgres!r}"
         )
 
     dockerfile_args = re.findall(
@@ -264,8 +258,7 @@ def test_rustfs_and_aws_bucket_bootstrap_preserve_the_s3_consumer_contract():
         assert bootstrap is not None, f"{label} must bootstrap the Langfuse bucket through RustFS"
         assert bootstrap.get("image") == "amazon/aws-cli:2.32.6"
         assert (
-            bootstrap.get("depends_on", {}).get("rustfs", {}).get("condition")
-            == "service_healthy"
+            bootstrap.get("depends_on", {}).get("rustfs", {}).get("condition") == "service_healthy"
         )
         bootstrap_command = str(bootstrap.get("entrypoint", ""))
         assert "aws " in bootstrap_command and "s3" in bootstrap_command
@@ -669,9 +662,7 @@ def test_worker_traces_to_shipped_collector_by_default():
             f"{otel_endpoint!r}, expected {expected_worker!r}; the host-network "
             "worker cannot resolve a Compose service name"
         )
-        runner_endpoint = resolve_shell_default(
-            env.get("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT")
-        )
+        runner_endpoint = resolve_shell_default(env.get("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT"))
         assert runner_endpoint == expected_runner, (
             f"{label}: runner OTLP endpoint resolves to {runner_endpoint!r}, "
             f"expected {expected_runner!r} on the isolated runner network"
@@ -718,21 +709,24 @@ def test_platform_services_export_to_shipped_collector_by_default(service_name):
         ({"OTEL_EXPORTER_OTLP_ENDPOINT": ""}, "", ""),
         (
             {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318"},
-            "http://collector.example.com:4318", "http://collector.example.com:4318",
+            "http://collector.example.com:4318",
+            "http://collector.example.com:4318",
         ),
         (
             {
                 "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318",
                 "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT": "",
             },
-            "", "http://collector.example.com:4318",
+            "",
+            "http://collector.example.com:4318",
         ),
         (
             {
                 "OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel-collector:4318",
                 "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:24318",
             },
-            "http://127.0.0.1:24318", "http://otel-collector:4318",
+            "http://127.0.0.1:24318",
+            "http://otel-collector:4318",
         ),
     ],
 )
@@ -747,16 +741,33 @@ def test_worker_endpoint_split_executes_compose_interpolation(
             for key in ("OTEL_EXPORTER_OTLP_ENDPOINT", "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT")
         }
         config = tmp_path / label
-        config.write_text(yaml.safe_dump({
-            "services": {"worker": {"image": "example-worker", "environment": selected}}
-        }))
-        clean_env = {key: value for key, value in os.environ.items() if key not in (
-            "OTEL_EXPORTER_OTLP_ENDPOINT", "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT"
-        )}
+        config.write_text(
+            yaml.safe_dump(
+                {"services": {"worker": {"image": "example-worker", "environment": selected}}}
+            )
+        )
+        clean_env = {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in ("OTEL_EXPORTER_OTLP_ENDPOINT", "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT")
+        }
         result = subprocess.run(
-            ["docker", "compose", "--env-file", "/dev/null", "-f", str(config),
-             "config", "--format", "json"],
-            env={**clean_env, **overrides}, capture_output=True, text=True, check=True,
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                "/dev/null",
+                "-f",
+                str(config),
+                "config",
+                "--format",
+                "json",
+            ],
+            env={**clean_env, **overrides},
+            capture_output=True,
+            text=True,
+            check=True,
         )
         rendered = json.loads(result.stdout)["services"]["worker"]["environment"]
         assert rendered["OTEL_EXPORTER_OTLP_ENDPOINT"] == worker_endpoint
@@ -825,12 +836,10 @@ def _assert_component_references_resolve(config, label):
 
         processors = pipeline.get("processors", [])
         assert "memory_limiter" in processors and "batch" in processors, (
-            f"{label}: {signal} pipeline must contain memory_limiter and batch; "
-            f"got {processors!r}"
+            f"{label}: {signal} pipeline must contain memory_limiter and batch; got {processors!r}"
         )
         assert processors.index("memory_limiter") < processors.index("batch"), (
-            f"{label}: {signal} pipeline must limit memory before batching; "
-            f"got {processors!r}"
+            f"{label}: {signal} pipeline must limit memory before batching; got {processors!r}"
         )
 
     extensions = config.get("extensions", {})
@@ -905,9 +914,7 @@ def test_dev_collector_receives_every_signal_with_durable_bounded_delivery():
 
     doc = yaml.safe_load(DEV_TEXT)
     collector = doc["services"]["otel-collector"]
-    volume_name = _collector_storage_mount(
-        collector, storage_directory, "compose.dev.yaml"
-    )
+    volume_name = _collector_storage_mount(collector, storage_directory, "compose.dev.yaml")
     assert volume_name in (doc.get("volumes") or {}), (
         f"compose.dev.yaml: Collector storage volume {volume_name!r} is not declared"
     )
@@ -1098,11 +1105,109 @@ def test_threaded_bot_allowlist_reaches_dev_and_generated_release_compose(raw, t
         path.write_text(content)
         result = subprocess.run(
             [
-                "docker", "compose", "--env-file", "/dev/null",
-                "--project-directory", str(REPO_ROOT), "-f", str(path),
-                "--profile", "slack", "--profile", "full", "config", "--format", "json",
+                "docker",
+                "compose",
+                "--env-file",
+                "/dev/null",
+                "--project-directory",
+                str(REPO_ROOT),
+                "-f",
+                str(path),
+                "--profile",
+                "slack",
+                "--profile",
+                "full",
+                "config",
+                "--format",
+                "json",
             ],
-            env=env, capture_output=True, text=True, check=True, timeout=30,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
         )
         dispatcher = json.loads(result.stdout)["services"]["curie-dispatcher"]
         assert dispatcher["environment"]["CURIE_SLACK_THREADED_BOT_ALLOWLIST"] == (raw or "[]")
+
+
+# --- The dev interaction harness reaches no compose service (stage 3) -------
+# `packages/test-support/src/curie_test_support/interaction/` is a dev/test-only
+# harness with a `python -m curie_test_support.interaction` entry point. It adds
+# no service, so the assertion is a complement-set one in this module's existing
+# style: NO service in either document mounts the package, carries its name in
+# env, or has its command/entrypoint redirected at the module. A service-name
+# allowlist would say nothing about a harness bolted onto an existing service.
+HARNESS_MODULE = "curie_test_support"
+HARNESS_DISTRIBUTION = "curie-test-support"
+HARNESS_PACKAGE_PATH = "packages/test-support"
+HARNESS_NEEDLES = (HARNESS_MODULE, HARNESS_DISTRIBUTION, HARNESS_PACKAGE_PATH)
+
+
+def harness_violations(doc, label):
+    """Every place a compose document would carry the dev harness into a service.
+
+    Returns a list rather than asserting, so the seeded-violation test below can
+    run this exact function against a deliberately poisoned document. A checker
+    only ever called on clean input cannot be shown to be able to fail.
+    """
+    violations = []
+
+    def hits(value):
+        text = str(value)
+        return [needle for needle in HARNESS_NEEDLES if needle in text]
+
+    for name, spec in (doc.get("services") or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        for mount in spec.get("volumes") or []:
+            if hits(mount):
+                violations.append(f"{label}: service {name} mounts the harness: {mount!r}")
+        for key, value in env_map(spec).items():
+            if hits(key) or hits(value):
+                violations.append(f"{label}: service {name} env {key}={value!r} names the harness")
+        for field in ("command", "entrypoint"):
+            value = spec.get(field)
+            if value is not None and hits(value):
+                violations.append(f"{label}: service {name} {field} runs the harness: {value!r}")
+        build = spec.get("build")
+        if isinstance(build, dict) and hits(build):
+            violations.append(f"{label}: service {name} build stage references the harness")
+    return violations
+
+
+def test_no_compose_service_carries_the_dev_interaction_harness():
+    """Neither the dev document nor the generated release document ships it.
+
+    Both are checked for the reason the OTEL and connector-scope pins above give:
+    the generator copies most of a service through untouched, so a guard on only
+    one document leaves the other free to drift.
+    """
+    for label, doc in compose_docs():
+        # Guard the guard: an empty service map would make this vacuous.
+        assert len(doc.get("services") or {}) > 5, label
+        assert harness_violations(doc, label) == []
+
+
+@pytest.mark.parametrize(
+    "shape, mutation",
+    [
+        ("volume mount", {"volumes": ["./packages/test-support:/app/packages/test-support"]}),
+        (
+            "env var",
+            {"environment": {"CURIE_HARNESS": "curie_test_support.interaction"}},
+        ),
+        ("command override", {"command": ["python", "-m", "curie_test_support.interaction"]}),
+    ],
+)
+def test_a_seeded_harness_reference_fails_the_compose_sweep(shape, mutation):
+    """Each shape the harness could arrive in is one the sweep actually catches.
+
+    Three separate injections rather than one, because a sweep that happened to
+    check only `volumes` would pass the single-shape version of this test while
+    a command override walked straight through it.
+    """
+    doc = yaml.safe_load(DEV_TEXT)
+    service = next(iter(doc["services"]))
+    doc["services"][service] = {**doc["services"][service], **mutation}
+    assert harness_violations(doc, "seeded") != [], shape
