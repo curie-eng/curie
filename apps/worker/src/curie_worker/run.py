@@ -29,6 +29,7 @@ from . import __version__
 from .actions import ActionClient
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
+from .attachments import AttachmentCoordinator, AttachmentLimits, SlackFileClient
 from .binding import BindingResolver
 from .bundle_store import BundleStore
 from .config import WorkerConfig
@@ -236,6 +237,16 @@ def _workspace_limits(config: WorkerConfig) -> WorkspaceLimits:
     )
 
 
+def _attachment_limits(config: WorkerConfig) -> AttachmentLimits:
+    """The operator-configured envelope for the inbound-attachment lane."""
+
+    return AttachmentLimits(
+        max_file_bytes=config.attachment_max_file_bytes,
+        reference_ttl_seconds=config.attachment_reference_ttl_seconds,
+        retention_ttl_seconds=config.attachment_retention_ttl_seconds,
+    )
+
+
 def _sandbox_client(
     config: WorkerConfig, env: Mapping[str, str], sub_config: SubstrateConfig
 ) -> SandboxClient:
@@ -291,6 +302,12 @@ def _sandbox_client(
             bundle_max_compression_ratio=config.bundle_max_compression_ratio,
             bundle_max_members=config.bundle_max_members,
             workspace_limits=_workspace_limits(config),
+            # The same operator envelope the Kubernetes lane gets. Without it
+            # this substrate would redeem attachment capabilities under library
+            # defaults while the cluster used the configured caps -- the two
+            # tiers disagreeing on how big a file may be is the kind of skew
+            # that only shows up as a refusal in one place and not the other.
+            attachment_limits=_attachment_limits(config),
         )
         # Prewarm the runner image once at startup so the first claim window is
         # not gated on a cold pull. Best-effort inside ensure_image.
@@ -350,6 +367,43 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         if config.workspace_enabled
         else None
     )
+    # The inbound-attachment lane (#2567). Wired only when the operator has
+    # switched the lane on AND this deployment holds the channel credential.
+    #
+    # ``attachment_enabled`` is the lane's single off switch and it ships off:
+    # off means the coordinator is never built, so no file is downloaded, no
+    # bytes are parked, no retention ledger is written and no capability is
+    # minted -- and because nothing is minted the claim carries no
+    # ``CURIE_ATTACHMENTS_REF``, so the k8s driver emits no Overrides entry
+    # naming an init container the chart did not render. The kernel treats an
+    # unwired lane as "the concept does not exist here" and leaves the turn
+    # otherwise untouched, so a message carrying files is answered exactly as
+    # v0.8.8 answers it. The chart's ``worker.attachments.enabled`` gates the
+    # sandbox half from the same value, so there is one knob and not two.
+    #
+    # The credential condition is separate and unchanged: the lane's single job
+    # is to download a referenced file with the bot token, and the kernel treats a wired lane as
+    # authoritative, so a credential-less install (compose smoke, a mail-only
+    # deployment) must keep running every turn exactly as it does today rather
+    # than failing on the first message that carries a file.
+    #
+    # It parks bytes in the PRIVATE workspace store, never the public bundle
+    # bucket -- under its own ``attachments/`` key prefix, with its retention
+    # ledger a sibling of ``_ownership/`` -- so an inbound file is reachable only
+    # through a short-lived one-object presigned URL redeemed by the sandbox's
+    # attachments-init container.
+    attachments = (
+        AttachmentCoordinator(
+            files=SlackFileClient(
+                token=config.slack_bot_token,
+                read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+            ),
+            objects=workspace_objects,
+            limits=_attachment_limits(config),
+        )
+        if config.attachment_enabled and config.slack_bot_token
+        else None
+    )
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
@@ -390,6 +444,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         config=config,
         binding=binding,
         workspace=workspace,
+        attachments=attachments,
         approvals=approval_client,
         # Publication is cluster-only in v1. A local request sees an actionable
         # refusal in the kernel before either durable row is created.

@@ -117,6 +117,47 @@ class ReplyHandle(_AciModel):
     adapter: str | None = None
 
 
+class Attachment(_AciModel):
+    """An inbound attachment REFERENCE a turn carries: never the bytes (#2567).
+
+    ADR-0020's required core for a channel port names attachments alongside text,
+    author and correlation key, so a turn has to be able to say "a file came with
+    this". This model is what it says it with, and it is deliberately a *pointer*
+    rather than a payload.
+
+    ``id`` is **adapter-scoped and opaque**. It is whatever identifier the channel
+    that produced the turn uses for the file (a Slack file id today), and the only
+    thing that can resolve it back to bytes is *that same adapter*. Nothing
+    downstream parses it, and nothing outside the producing adapter should try to:
+    two channels may legitimately mint the same-looking id for different files.
+    ``name`` is the filename to show a person. Both are REQUIRED and have no
+    default -- a ref with no id resolves to nothing and a ref with no name
+    describes nothing, so either default would let a producer mint something that
+    reads as present while carrying nothing actionable.
+
+    ``mime_type`` and ``size_bytes`` are best-effort channel metadata and default
+    to ``None``. A channel that reports neither must still be able to produce a
+    usable ref, so the absent case is stated as ``None`` rather than fabricated as
+    ``"application/octet-stream"`` or ``0``.
+
+    **There is deliberately no url, download_url, or bytes field, and the absence
+    is a decision rather than an omission.** A sandbox could not fetch a channel
+    URL in this release even if the wire carried one: ADR-0075's Agent Proxy -- the
+    host-bound credential injection a container would need to authenticate such a
+    fetch -- is Accepted but UNBUILT, and what is live instead is ADR-0032's
+    release-wide CIDR egress, which is default-deny. A url on this model would
+    therefore be a promise nothing in the release can keep, and worse, it would
+    invite exactly the fetch the egress policy exists to refuse -- a reader who
+    found the field would reasonably assume it worked. Resolution is the producing
+    adapter's job, through ``id``, when a resolve path is actually built.
+    """
+
+    id: str
+    name: str
+    mime_type: str | None = None
+    size_bytes: int | None = None
+
+
 class QueuedTurn(_AciModel):
     """A normalized inbound turn ready for the worker to route and run.
 
@@ -132,6 +173,18 @@ class QueuedTurn(_AciModel):
     site sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting
     to the non-job value is also the safe direction -- an unset ``source`` reads
     as a person's message, so a job can never be created by omission.
+
+    ``attachments`` defaults to the EMPTY LIST for the same reason and with the
+    same consequence: a pre-upgrade producer that omits the key still decodes,
+    which is what makes adding it a PATCH under this package's change-class table
+    rather than a breaking minor. The default is a compatibility affordance and
+    not a licence to omit it -- every first-party mint site that can see files
+    passes them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are
+    set explicitly. The default is the empty collection and not ``None`` so a
+    consumer can write ``for ref in turn.attachments`` with no guard; "this
+    channel reported no files" and "this producer predates the field" are
+    deliberately the same value, because nothing downstream acts differently on
+    the two.
     """
 
     event_id: str
@@ -141,3 +194,4 @@ class QueuedTurn(_AciModel):
     reply_handle: ReplyHandle
     received_at: str
     source: TurnSource = TurnSource.SLACK
+    attachments: list[Attachment] = []

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,6 +77,64 @@ from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
 
 logger = logging.getLogger("curie_runner")
 
+# Where the chart's ``attachments-init`` materializes one turn's inbound files
+# (#2567). Compiled in rather than read from the env: the presigned reference is
+# scoped to that init container precisely so the runner -- which executes
+# prompt-injectable model code -- never sees it, which leaves nothing at runtime
+# to tell this process where the volume landed. The other side of the seam is
+# ``agentSandbox.runner.attachments.mountPath`` in charts/curie/values.yaml, and
+# runner/tests/test_attachments_mount.py compares the two.
+#
+# A SIBLING of /workspace, deliberately not a directory inside it: workspace-init
+# deletes every child of its own root on entry, so an attachment under the
+# checkout could be silently eaten depending on init order, and anything that
+# survived would show up in ``git status`` and could ride into a publication diff.
+ATTACHMENTS_DIR = Path("/attachments")
+
+
+def _discover_attachments(mount: Path | None) -> tuple[Path, ...]:
+    """The files a person actually attached, as absolute paths.
+
+    A directory probe, exactly as the managed checkout is discovered: an absent
+    mount (the lane switched off) and an empty one (the ordinary "no files this
+    turn", since the chart mounts the emptyDir unconditionally) both read as no
+    attachments. Hidden entries are skipped -- ``attachments-init`` stages into
+    ``.curie-attachments-stage`` -- so its own bookkeeping is never announced to
+    the model as if a person had sent it.
+    """
+
+    if mount is None or not mount.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            child
+            for child in mount.iterdir()
+            if child.is_file() and not child.name.startswith(".")
+        )
+    )
+
+
+def format_attachment_preamble(paths: Sequence[Path]) -> str | None:
+    """Tell the model the files are there, by a path that actually resolves.
+
+    The session's cwd is the managed checkout, so a bare filename would resolve
+    to ``<workspace>/<name>`` and the read would fail. Naming a file without a
+    resolvable path is the same bug as not naming it at all, one step later.
+    """
+
+    if not paths:
+        return None
+    lines = [
+        "The message you are answering carried file attachments. They are "
+        "already on disk in this sandbox and you can open them with your "
+        "ordinary file-reading tools. Your working directory is NOT the "
+        "directory holding them, so use these absolute paths exactly as "
+        "written:",
+    ]
+    lines.extend(f"- {path}" for path in paths)
+    return "\n".join(lines)
+
+
 
 def _resolve_harness(name: str = DEFAULT_HARNESS) -> HarnessContribution:
     """Resolve the active harness's contribution manifest (ADR-0060).
@@ -112,6 +171,7 @@ def _compose_system_prompt(
     conversation_preamble: str | None = None,
     *,
     model: str | None,
+    attachment_preamble: str | None = None,
 ) -> str | None:
     """Compose the system prompt with recovered context and model identity.
 
@@ -120,10 +180,24 @@ def _compose_system_prompt(
     recovered conversation (ADR-0029), then the bundle/env system prompt. The
     configured model identity follows the bundle prompt when present. Any part
     may be absent.
+
+    This turn's inbound attachments (#2567) come last, closest to the query they
+    belong to. Absent -- the overwhelming majority of turns -- the composed
+    prompt is byte-identical to what it was before the lane existed.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
-    parts = [p for p in (memory_preamble, conversation_preamble, base, model_preamble) if p]
+    parts = [
+        p
+        for p in (
+            memory_preamble,
+            conversation_preamble,
+            base,
+            model_preamble,
+            attachment_preamble,
+        )
+        if p
+    ]
     return "\n\n".join(parts) if parts else None
 
 
@@ -139,6 +213,7 @@ def build_runner(
     mcp_capability: McpToolCapabilityProbe | None = None,
     harness: HarnessContribution | None = None,
     workspace_path: Path | None = None,
+    attachments_path: Path | None = None,
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = (),
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
@@ -169,11 +244,18 @@ def build_runner(
     # loaded from outside the sandbox, lead the system prompt so the model sees
     # learned lessons and the prior exchange as durable context. The configured
     # model identity is appended after the bundle prompt.
+    # This turn's inbound attachments (#2567): materialized by the chart's
+    # attachments-init into a mount that is a sibling of the checkout. The files
+    # are useless unless the model is TOLD about them -- an unannounced file is
+    # indistinguishable from one that never arrived, and the agent answers "I
+    # don't see an attachment" about a message that visibly carries one.
+    attachment_paths = _discover_attachments(attachments_path)
     system_prompt = _compose_system_prompt(
         system_prompt,
         memory_preamble,
         conversation_preamble,
         model=config.model,
+        attachment_preamble=format_attachment_preamble(attachment_paths),
     )
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
@@ -603,6 +685,14 @@ def _serve() -> None:
         if workspace_candidate.is_dir() and (workspace_candidate / ".git").exists()
         else None
     )
+    # A directory probe, for the same reason /workspace above is one: the
+    # presigned reference is scoped to attachments-init and never reaches this
+    # container, so the mount's presence is the only signal there is. Absent when
+    # the lane is switched off, which is ordinary rather than a boot failure.
+    attachments_candidate = ATTACHMENTS_DIR
+    attachments_path: Path | None = (
+        attachments_candidate if attachments_candidate.is_dir() else None
+    )
     runner = build_runner(
         config,
         fake_model=fake_model,
@@ -614,6 +704,7 @@ def _serve() -> None:
         mcp_capability=fetches.mcp_capability,
         harness=harness,
         workspace_path=workspace_path,
+        attachments_path=attachments_path,
         connector_failures=fetches.connector_failures,
     )
 

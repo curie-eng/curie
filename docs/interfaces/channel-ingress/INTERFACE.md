@@ -53,7 +53,10 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   a Pydantic model in the frozen ACI package with channel-neutral fields: `event_id`
   (idempotency key), `conversation_id` (the conversation/thread key routing keeps one live
   session per), `author`, `text`, `received_at`, `source` (`QueuedTurn.source`, what
-  started the turn: a person's message or a job), and `reply_handle` — a `ReplyHandle`
+  started the turn: a person's message or a job), `attachments`
+  (`QueuedTurn.attachments`, a list of `Attachment` file REFERENCES — an
+  adapter-scoped opaque `id` plus a `name`, never bytes and deliberately never a
+  url, so only the producing adapter can resolve one), and `reply_handle` — a `ReplyHandle`
   (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying the required
   `kind` and `channel` routing pair, required nullable `placeholder`, an optional
   per-turn `endpoint`, and optional `adapter` (`ReplyHandle.adapter`, the egress

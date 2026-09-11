@@ -925,6 +925,39 @@ class WorkerConfig(BaseSettings):
     workspace_max_concurrent_clones: int = Field(
         default=2, gt=0, validation_alias="CURIE_WORKSPACE_MAX_CONCURRENT_CLONES"
     )
+    # The inbound-attachment lane's resource envelope (#2567). These are the
+    # operator's handles on ``AttachmentLimits``, whose own defaults these
+    # literals mirror -- the chart templates the same three numbers into the
+    # worker's env AND into the sandbox's attachments-init size cap, so the two
+    # sides are compared by apps/worker/tests/test_config.py and by
+    # charts/curie/ci/attachment-init-assertions.sh rather than trusted to stay
+    # aligned. Every bound is gt=0 for the reason AttachmentLimits refuses a
+    # zero: a zero cap silently read as "unlimited" is how a bounded ingestion
+    # path stops being bounded, and a zero TTL mints an already-expired
+    # capability.
+    # The lane switch, OFF by default for this release. It gates the lane whole:
+    # run.py wires no AttachmentCoordinator, so nothing is downloaded, nothing
+    # is parked, no retention ledger is written and no capability is minted --
+    # and with nothing minted the claim carries no CURIE_ATTACHMENTS_REF, so
+    # sandbox/k8s.py emits no Overrides entry naming an init container the chart
+    # did not render. A message carrying files is answered exactly as it is
+    # today: text only, files ignored, no error. Mirrored by
+    # charts/curie/values.yaml worker.attachments.enabled, which also gates the
+    # sandbox half, and pinned by test_config.py.
+    attachment_enabled: bool = Field(
+        default=False, validation_alias="CURIE_ATTACHMENT_ENABLED"
+    )
+    attachment_max_file_bytes: int = Field(
+        default=32 * 1024 * 1024,
+        gt=0,
+        validation_alias="CURIE_ATTACHMENT_MAX_FILE_BYTES",
+    )
+    attachment_reference_ttl_seconds: int = Field(
+        default=300, gt=0, validation_alias="CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS"
+    )
+    attachment_retention_ttl_seconds: int = Field(
+        default=3600, gt=0, validation_alias="CURIE_ATTACHMENT_RETENTION_TTL_SECONDS"
+    )
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
     publication_enabled: bool = Field(

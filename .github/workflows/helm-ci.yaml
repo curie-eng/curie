@@ -513,6 +513,24 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/approval-principal-wiring-assertions.sh
 
+      # Prove the inbound-attachment handoff (#2567). The first script pins the
+      # shape: an attachments-init container that runs before the runner, mounts
+      # the shared volume with a sizeLimit, receives CURIE_ATTACHMENTS_REF, and
+      # keeps that key OFF the runner container. The second EXTRACTS the rendered
+      # program and runs it against a fixture HTTP server, so the refusals are
+      # proven to work rather than merely to be present: a digest mismatch, a size
+      # overrun, an expired or non-HTTP(S) reference, a malformed digest, and a
+      # filename escaping the mount each exit non-zero.
+      - name: helm render assertions (attachment init shape)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/attachment-init-assertions.sh
+
+      - name: helm render assertions (attachment init behavior)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/attachment-init-behavior-assertions.sh
+
       # Prove the mail adapter's chart wiring (issue #1515): it does not render
       # at all by default, it is told where the platform API is, it receives its
       # channel token, egress secret and AgentMail key by reference only, and it

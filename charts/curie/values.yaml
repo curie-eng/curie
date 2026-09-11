@@ -1591,6 +1591,38 @@ worker:
     bucket: curie-workspaces
     cloneVolumeSize: 4Gi
     mountPath: /var/lib/curie/workspaces
+  # Inbound channel attachments (#2567). The worker downloads a referenced file
+  # with the channel bot token, parks it in the private workspace bucket and
+  # mints a short-lived one-object read capability that the sandbox's
+  # attachments-init container redeems. These three numbers are ONE envelope
+  # expressed twice: they become the worker's CURIE_ATTACHMENT_* env AND (for
+  # maxFileBytes) the literal cap inside the rendered init-container program, so
+  # the pod can never accept what the worker refused or refuse what it accepted.
+  # apps/worker/tests/test_config.py compares them against the Python defaults
+  # and ci/attachment-init-assertions.sh compares the rendered pair.
+  attachments:
+    # THE lane switch, and it is OFF for this release. Off means off everywhere:
+    # the worker does not download a referenced file, parks no bytes, writes no
+    # retention ledger and mints no capability, and the sandbox pod renders
+    # without the attachments volume, the attachments-init container and the
+    # runner's mount -- so an inbound message carrying files is answered exactly
+    # as it is today, text only, with the files ignored and no error. Turning it
+    # on is a deliberate operator action: the Slack-side download has not been
+    # exercised against a real workspace yet, and the app must have the
+    # `files:read` scope (a missing scope degrades to a WARNING at boot, it does
+    # not refuse). Gates agentSandbox.runner.attachments too; that key is only a
+    # sandbox-side sub-gate and cannot turn the lane on by itself.
+    enabled: false
+    # Per-file ceiling, enforced while streaming in the worker (nothing is
+    # buffered past the crossing chunk) and again in the init container. A zero
+    # is refused rather than read as "unlimited".
+    maxFileBytes: 33554432
+    # How long the minted presigned one-object URL stays redeemable. It only has
+    # to outlive a sandbox boot, so keep it short.
+    referenceTtlSeconds: 300
+    # How long the parked bytes are retained so a redelivery of the same turn can
+    # still fetch them. Swept by the worker's existing reap_orphans tick.
+    retentionTtlSeconds: 3600
   publication:
     enabled: true
     # Short-lived Jobs and their scoped token Secret live outside the platform
@@ -2162,6 +2194,24 @@ agentSandbox:
       sizeLimit: 1Gi
       fetchTimeoutSeconds: 45
       extractTimeoutSeconds: 45
+    # Inbound attachments arrive the same way a workspace does: a claim-scoped,
+    # one-object signed read reference redeemed by an init container, never an
+    # object-store identity in the sandbox. The mount is a SIBLING of the
+    # workspace, deliberately not inside it -- workspace-init deletes every
+    # child of its own root on entry, and anything under the checkout would show
+    # up in `git status` and could ride into a publication diff. mountPath is a
+    # cross-language seam with curie_runner.__main__.ATTACHMENTS_DIR (compiled
+    # in, because the reference env is scoped away from the runner container so
+    # nothing at runtime can tell the runner where the volume landed);
+    # runner/tests/test_attachments_mount.py compares the two.
+    attachments:
+      enabled: true
+      mountPath: /attachments
+      # ADR-0059 decision 2: every writable emptyDir in the sandbox pod carries
+      # a ceiling, so a hostile or broken store cannot fill the node. Sized
+      # above worker.attachments.maxFileBytes x the lane's 10-file set cap.
+      sizeLimit: 512Mi
+      fetchTimeoutSeconds: 45
     # Extra env for the runner container, list of {name, value}.
     # Per-workload OTEL_EXPORTER_OTLP_* overrides still win over the
     # chart-owned collector endpoint.

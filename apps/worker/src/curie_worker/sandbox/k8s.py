@@ -18,6 +18,7 @@ from aci_protocol import BootEnv
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
+from ..attachments import ATTACHMENTS_REF_ENV
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
 from .types import (
     MANAGED_BY_LABEL,
@@ -47,6 +48,13 @@ EXT_VERSION = "v1beta1"
 BUNDLE_REF_ENV = BootEnv.env_key("bundle_ref")
 BUNDLE_INIT_CONTAINERS = ("bundle-fetch", "bundle-extract")
 WORKSPACE_INIT_CONTAINERS = ("workspace-init",)
+# The attachment lane's own init container (#2567): it redeems the minted
+# one-object capabilities and materializes the files into the emptyDir the
+# runner mounts. Named here for the same reason the two above are -- the
+# Overrides policy leaves an init container alone unless the claim entry names
+# it, so without this the container has no capability and the runner boots an
+# empty attachment dir: the file silently never arrives.
+ATTACHMENT_INIT_CONTAINERS = ("attachments-init",)
 
 # The SandboxClaim env schema is value-only (no secretKeyRef), so anything put
 # here is stored in plain text on the claim object. The model credential must NOT
@@ -264,6 +272,7 @@ class KubernetesSandboxClient:
                 CONNECTOR_SECRET_KEYS_ENV,
                 WORKSPACE_REF_ENV,
                 WORKSPACE_SHA256_ENV,
+                ATTACHMENTS_REF_ENV,
             }
             stripped.update(k for k in marker.split(",") if k)
             entries: list[dict[str, str]] = [
@@ -303,6 +312,20 @@ class KubernetesSandboxClient:
                                 "value": workspace_sha256,
                             }
                         )
+            # The attachment capability reaches ONLY its own init container. An
+            # unnamed entry would also hand the presigned URL to the model's own
+            # process -- a capability the agent has no need for and, being a
+            # plain env var, one it could echo into a channel.
+            attachments_ref = env.get(ATTACHMENTS_REF_ENV)
+            if attachments_ref is not None:
+                for container in ATTACHMENT_INIT_CONTAINERS:
+                    entries.append(
+                        {
+                            "containerName": container,
+                            "name": ATTACHMENTS_REF_ENV,
+                            "value": attachments_ref,
+                        }
+                    )
             body["spec"]["env"] = entries
         self._api.create_namespaced_custom_object(
             EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body

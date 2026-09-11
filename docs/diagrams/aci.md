@@ -107,7 +107,7 @@ regenerated and committed together it **always goes green**. It pins artifact
 *sync*; it never pinned *compatibility*. Three things carry the contract
 instead:
 
-- **Semver, not a freeze.** `PROTOCOL_VERSION` is `0.4.2`
+- **Semver, not a freeze.** `PROTOCOL_VERSION` is `0.4.3`
   ([`packages/aci-protocol/src/aci_protocol/version.py`](../../packages/aci-protocol/src/aci_protocol/version.py)),
   versioned independently of the Curie release. Under 0.x a consumer accepts
   the same `major.minor`; only a new optional field is compatible (patch), and

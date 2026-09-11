@@ -24,9 +24,9 @@ string rather than a `const`. Artifact sync is enforced by the
 schema-compat gate (`tests/test_schema_compat.py`); an unbumped wire change is
 caught by the wire-lock gate (`tests/test_wire_lock.py`).
 
-## Contract surface (v0.4.2)
+## Contract surface (v0.4.3)
 
-`PROTOCOL_VERSION = "0.4.2"` is embedded in the schema and in every outbound
+`PROTOCOL_VERSION = "0.4.3"` is embedded in the schema and in every outbound
 event.
 
 **Session setup** (`SessionConfig`, with `to_env()` / `from_env()`):

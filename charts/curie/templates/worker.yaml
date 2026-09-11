@@ -224,6 +224,23 @@ spec:
               value: {{ .Values.worker.workspace.bucket | quote }}
             - name: CURIE_WORKSPACE_SCRATCH_ROOT
               value: {{ printf "%s/worker" (trimSuffix "/" .Values.worker.workspace.mountPath) | quote }}
+            {{/*
+            The inbound-attachment envelope (#2567). `| int64` before `| quote`
+            on the byte cap on purpose: helm renders a large YAML integer
+            through a bare pipeline in scientific notation (2.68435456e+08 for
+            the workspace archive cap next door), which pydantic's int field
+            refuses outright. The init container's own literal needs no int64 --
+            python reads 3.3554432e+07 as the number -- so the two sides are
+            compared NUMERICALLY by ci/attachment-init-assertions.sh.
+            */}}
+            - name: CURIE_ATTACHMENT_ENABLED
+              value: {{ .Values.worker.attachments.enabled | quote }}
+            - name: CURIE_ATTACHMENT_MAX_FILE_BYTES
+              value: {{ .Values.worker.attachments.maxFileBytes | int64 | quote }}
+            - name: CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS
+              value: {{ .Values.worker.attachments.referenceTtlSeconds | quote }}
+            - name: CURIE_ATTACHMENT_RETENTION_TTL_SECONDS
+              value: {{ .Values.worker.attachments.retentionTtlSeconds | quote }}
             - name: CURIE_PUBLICATION_ENABLED
               value: {{ .Values.worker.publication.enabled | quote }}
             - name: CURIE_PUBLICATION_NAMESPACE
