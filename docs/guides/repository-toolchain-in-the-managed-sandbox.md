@@ -178,10 +178,11 @@ in the replayed history the replacement runner boots from.
 
 ## 3. The recipe
 
-Two profiles. **Profile A is the default**, because it is the only one that
-satisfies "only the egress this repository needs" exactly.
+Two dependency strategies. **Bundled dependencies are the default**, because
+they are the only strategy that satisfies "only the egress this repository
+needs" exactly.
 
-### Profile A — vendored dependencies, no registry egress
+### Bundled dependencies — no registry egress
 
 Stage the dependency wheels into the workspace and install from there:
 
@@ -213,7 +214,7 @@ cd /workspace && /workspace/.venv/bin/python -m unittest discover -s tests -t . 
 Use the command the repository documents, not one you invented for it. That is
 also what the publication contract requires of the coder.
 
-### Profile B — live registry
+### Live registry dependencies
 
 ```sh
 python -m venv /workspace/.venv
@@ -229,9 +230,9 @@ section 4 before choosing it.
 default**, and entries are additive: nothing reaches a package registry until an
 operator says so.
 
-Profile A needs no entry at all.
+Bundled dependencies need no entry at all.
 
-Profile B needs pip to reach **both** `pypi.org` (the index) and
+Live registry dependencies need pip to reach **both** `pypi.org` (the index) and
 `files.pythonhosted.org` (the files). The only operator lever that can carry an
 arbitrary destination is:
 
@@ -249,10 +250,39 @@ CIDRs by hand.
 records that there is no package-manager story: enforcement is CIDR-based while
 registry hosts are CDN-fronted with rotating IPs. Any CIDR range you write for
 `pypi.org` or `files.pythonhosted.org` is therefore **broader than this
-repository needs, and it will drift** as the CDN's addressing changes. Profile B
-is a known-imprecise fallback. It is not a minimal allowlist, and this guide will
-not describe it as one. The "trusted registries" preset ADR-0075 contemplates is
-not implemented; there is no such flag or chart value today.
+repository needs, and it will drift** as the CDN's addressing changes. Live
+registry egress is a known-imprecise fallback. It is not a minimal allowlist,
+and this guide will not describe it as one. The "trusted registries" preset
+ADR-0075 contemplates is not implemented; there is no such flag or chart value
+today.
+
+[ADR-0152](../adr/0152-no-cidr-trusted-registries-preset.md) proposes removing
+the standing commitment to a platform-maintained registries preset, including
+after FQDN-aware enforcement arrives. It remains **Draft**: its proposed outcome
+is not accepted, and it does not supersede accepted ADR-0075 yet.
+
+The reproducible check requires Docker, kind, kubectl, Helm, and uv. Run it from
+the repository root with a new or empty output directory:
+
+```sh
+output_dir=$(mktemp -d)
+uv run python scripts/check-registry-egress.py \
+  --output-dir "$output_dir"
+```
+
+The check creates and cleans up its own disposable kind cluster with Calico,
+renders the current chart, resolves live PyPI DNS answers into IPv4 `/32`
+TCP/443 rules, and exercises `packaging==25.0` from a fresh virtualenv. Both pip
+and a direct TCP connect run denied → admitted → revoked; the named output
+directory receives the generated manifests and result record for that run.
+
+The September 11, 2026 verification observed `[1, 0, 1]` for both controls, and
+the admitted pip phase downloaded and imported version 25.0.
+[PR #2621](https://github.com/curie-eng/curie/pull/2621) records that historical
+verification. It proved refusal and admission for the recorded address
+snapshot. A CIDR snapshot is not a domain boundary or a trusted-registries
+preset, and later DNS answers may differ. The check does not exercise a
+controller claim, workspace acquisition, model call, or publication.
 
 **Edge case worth knowing before you need it:** `curie doctor` can recommend a
 `cluster up` re-run as remediation, and a re-run applies the allowlist it is
@@ -315,7 +345,7 @@ resolved address.
 The runner image now ships `/etc/pip.conf` with `timeout = 15` and `retries = 0`,
 copied after the image's own pip installs so a flaky registry during the *build*
 still gets pip's default retries. Workspace venvs created at runtime read that
-site-wide file, so the naive Profile B command — the one an agent actually types —
+site-wide file, so the naive live-registry command — the one an agent actually types —
 fails on the first unreachable attempt instead of spending six minutes of a run
 budget discovering the same ENETUNREACH. Override with `--retries` / `PIP_RETRIES`
 when a reachable index is flaky. Released `curie-runner:0.8.7` does **not** carry
@@ -327,7 +357,7 @@ for example `poetry: not found`. It is not swallowed into a silent pass.
 
 ## 7. Applicability
 
-What the committed evidence does and does not cover.
+What the documented checks do and do not cover.
 
 | Surface | Applicability | Evidence |
 |---|---|---|
@@ -336,7 +366,7 @@ What the committed evidence does and does not cover.
 | live provider | **Not covered.** | The harness makes no model call. The recipe is about the toolchain, not the session. |
 | slack | **Not covered.** | No Slack external-integration run is included. The publication approval a Slack thread would carry is asserted statically here, not exercised. |
 | GitHub | **Boundary asserted statically.** | The credential handling in section 5 is read from the worker's workspace acquisition path and the publication tool's contract; no live human publication approval was exercised. |
-| Profile B against an enforcing NetworkPolicy | **Refusal proved; admission not.** | Under the chart's fail-closed default, a live-registry install fails truthfully (`Network is unreachable`, exit 1). Unconfigured pip on `curie-runner:0.8.7` took **~368 s**; the image now ships `/etc/pip.conf` with `retries = 0` so the same command fails on the first attempt (see section 6). That a hand-written `--allow-web-egress` CIDR then *admits* PyPI is still unproved. |
+| Live registry dependencies against an enforcing NetworkPolicy | **Admission and refusal are reproducible for a CIDR snapshot.** | Run [`scripts/check-registry-egress.py`](../../scripts/check-registry-egress.py); it tests `packaging==25.0`. A CIDR snapshot is not a domain boundary and not a trusted-registries preset. |
 | repeat in a newly acquired workspace, and after an in-place restart | **Supported and proved.** | A second, independently claimed sandbox reproduced the whole recipe from the acquired head with no state carried over, producing its own distinct commits. An in-place container restart preserved the workspace, its three-commit history, the expected head and the credential-free origin. See `ac5-cluster-evidence/`. |
 | after a pod-replacing handoff | **Proved — and it discards everything the sandbox made.** | Exercised on a kind cluster on 2026-09-11 in both shapes: the ADR-0136 cold-claim handoff, and a pod deleted under an unchanged live claim. Both re-fetched the signed archive, so the repository and its credential-free origin came back — at the **archive head**, with the in-sandbox commit, the uncommitted edits, the untracked files and the virtualenv all gone. Recorded for operators under *Nothing in the sandbox survives a pod replacement*. See `pod-replacing-handoff-evidence/`. |
 | a persistent workspace volume | **Not the answer; not supported today.** | Nothing in Curie sets `SandboxClaim.spec.volumeClaimTemplates`, and the shipped template leaves the policy at the CRD default `Disallowed`, so such a claim is refused with no pod and no PVC. With the policy flipped, the PVC does survive the pod replacement and `workspace-init` wipes it anyway. A persistent workspace would require changing that wipe. |

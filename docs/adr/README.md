@@ -174,4 +174,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0143 | [A coding thread owns one fenced pull request lineage](0143-thread-owned-pull-request-lineage.md) | Accepted |
 | 0144 | [The cluster lifecycle admits before it mutates, and its pause authority is installation-scoped](0144-the-upgrade-lifecycle-admits-before-it-mutates.md) | Draft |
 | 0151 | [A permission-gate card shows a bundle-authored sentence; the machine summary stays the audit record](0151-bundle-authored-human-approval-summary.md) | Draft |
+| 0152 | [Registry destinations are operator-declared, not a platform preset](0152-no-cidr-trusted-registries-preset.md) | Draft |
 <!-- END GENERATED: adr-index -->
