@@ -45,6 +45,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -479,6 +480,61 @@ def _materialize_fixture_clone(root: Path) -> Path:
     return workspace
 
 
+def _force_rmtree(path: Path) -> None:
+    """Delete a tree that may contain files owned by the runner image uid.
+
+    The proof containers run as uid 1000. GitHub-hosted runners are uid 1001,
+    so a host ``rmtree`` hits ``PermissionError`` on the ``.venv`` the
+    container created: tempfile tries to chmod before unlink. Delete from a
+    root container instead, mounting the parent so only this path is removed.
+    """
+
+    path = path.resolve()
+    if not path.exists():
+        return
+    completed = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "--network",
+            "none",
+            "--entrypoint",
+            "rm",
+            "-v",
+            f"{path.parent}:{path.parent}",
+            RUNNER_IMAGE,
+            "-rf",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+    if path.exists():
+        raise AssertionError(
+            f"could not delete {path} (exit {completed.returncode}): "
+            f"{completed.stdout}\n{completed.stderr}"
+        )
+
+
+@contextmanager
+def _owned_tempdir(prefix: str):
+    """A ``TemporaryDirectory`` whose container-owned contents still delete."""
+
+    tmp = tempfile.TemporaryDirectory(prefix=prefix, ignore_cleanup_errors=True)
+    try:
+        yield tmp.name
+    finally:
+        _force_rmtree(Path(tmp.name))
+        tmp.cleanup()
+
+
 # --- 1. the red -> green -> red cycle ---------------------------------------
 
 
@@ -507,7 +563,7 @@ def test_seeded_defect_fails_then_fix_passes_then_revert_fails_again(tmp_path: P
     _require_fixture()
 
     evidence = Evidence()
-    with tempfile.TemporaryDirectory(prefix="curie-2571-cycle-") as root:
+    with _owned_tempdir(prefix="curie-2571-cycle-") as root:
         workspace = _materialize_fixture_clone(Path(root))
 
         install = evidence.record(
@@ -583,7 +639,7 @@ def test_dependency_install_succeeds_under_read_only_rootfs(tmp_path: Path) -> N
     _require_fixture()
 
     evidence = Evidence()
-    with tempfile.TemporaryDirectory(prefix="curie-2571-install-") as root:
+    with _owned_tempdir(prefix="curie-2571-install-") as root:
         workspace = _materialize_fixture_clone(Path(root))
 
         install = evidence.record(
@@ -656,7 +712,7 @@ def test_venv_console_scripts_run_from_workspace_but_not_from_tmpfs(tmp_path: Pa
     _require_non_vacuous_hardening()
 
     evidence = Evidence()
-    with tempfile.TemporaryDirectory(prefix="curie-2571-noexec-") as root:
+    with _owned_tempdir(prefix="curie-2571-noexec-") as root:
         workspace = Path(root) / "ws"
         workspace.mkdir()
         os.chmod(workspace, 0o777)
@@ -723,7 +779,7 @@ def test_unreachable_registry_fails_bounded_and_truthfully(tmp_path: Path) -> No
     _require_fixture()
 
     evidence = Evidence()
-    with tempfile.TemporaryDirectory(prefix="curie-2571-registry-") as root:
+    with _owned_tempdir(prefix="curie-2571-registry-") as root:
         workspace = _materialize_fixture_clone(Path(root))
         step = evidence.record(
             _run_in_sandbox(
@@ -761,7 +817,7 @@ def test_missing_toolchain_fails_bounded_and_truthfully(tmp_path: Path) -> None:
     _require_fixture()
 
     evidence = Evidence()
-    with tempfile.TemporaryDirectory(prefix="curie-2571-toolchain-") as root:
+    with _owned_tempdir(prefix="curie-2571-toolchain-") as root:
         workspace = _materialize_fixture_clone(Path(root))
         step = evidence.record(
             _run_in_sandbox(
@@ -811,7 +867,7 @@ def test_vendored_profile_needs_no_registry_egress(tmp_path: Path) -> None:
     )
 
     evidence = Evidence()
-    with tempfile.TemporaryDirectory(prefix="curie-2571-vendored-") as root:
+    with _owned_tempdir(prefix="curie-2571-vendored-") as root:
         workspace = _materialize_fixture_clone(Path(root))
 
         install = evidence.record(
@@ -909,7 +965,7 @@ def test_live_registry_profile_installs_a_third_party_pin(tmp_path: Path) -> Non
         pytest.skip("PyPI is unreachable from the sandbox network: connectivity probe failed")
 
     evidence = Evidence()
-    with tempfile.TemporaryDirectory(prefix="curie-2571-live-") as root:
+    with _owned_tempdir(prefix="curie-2571-live-") as root:
         workspace = _materialize_fixture_clone(Path(root))
         install = evidence.record(
             _run_in_sandbox(
@@ -1085,8 +1141,8 @@ def test_fixture_tree_is_not_collected() -> None:
 def test_no_container_or_tmpdir_survives_the_harness(tmp_path: Path) -> None:
     """Catches the harness leaking the resources it owns.
 
-    Every container is ``--rm`` and every workspace lives in a
-    ``TemporaryDirectory``. This asserts both properties observably: after a
+    Every container is ``--rm`` and every workspace lives in an
+    ``_owned_tempdir``. This asserts both properties observably: after a
     round trip, no container this PROCESS actually launched (across the whole
     module, not just this test's synthetic ``true`` leg) is listed (running or
     exited), and the temporary workspace path is gone.
@@ -1103,7 +1159,7 @@ def test_no_container_or_tmpdir_survives_the_harness(tmp_path: Path) -> None:
     _require_runner_image()
     _require_non_vacuous_hardening()
 
-    with tempfile.TemporaryDirectory(prefix="curie-2571-cleanup-") as root:
+    with _owned_tempdir(prefix="curie-2571-cleanup-") as root:
         workspace = Path(root) / "ws"
         workspace.mkdir()
         os.chmod(workspace, 0o777)
@@ -1129,6 +1185,34 @@ def test_no_container_or_tmpdir_survives_the_harness(tmp_path: Path) -> None:
     )
     leaked = set(survivors) & set(_LAUNCHED_CONTAINER_NAMES)
     assert not leaked, f"containers this process actually launched survived cleanup: {leaked}"
+
+
+def test_host_can_delete_a_workspace_the_container_wrote(tmp_path: Path) -> None:
+    """Catches GHA uid 1001 failing to rmtree a uid-1000 ``.venv``.
+
+    The managed runner is uid 1000. A GitHub-hosted runner is uid 1001. Files
+    the container writes into the bind-mounted workspace are then not chmod-able
+    by the host, and tempfile cleanup raises ``PermissionError`` -- which is
+    exactly how the first required-mode CI run went red after every proof
+    assertion had already passed.
+    """
+
+    _require_runner_image()
+    _require_non_vacuous_hardening()
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    os.chmod(workspace, 0o777)
+    step = _run_in_sandbox(
+        "write-venv",
+        f"python -m venv {WORKSPACE_MOUNT_PATH}/.venv",
+        workspace=workspace,
+    )
+    assert step.exit_status == 0, f"venv creation must succeed:\n{step.output}"
+    venv = workspace / ".venv"
+    assert venv.is_dir(), "the container must have written a venv the host can see"
+    _force_rmtree(venv)
+    assert not venv.exists(), "the host must be able to delete the container-owned venv"
 
 
 # --- 10. the stdlib wheel builder, checked structurally on the host ----------
