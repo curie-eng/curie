@@ -930,7 +930,7 @@ _HONESTY_ROWS: tuple[tuple[str, str, str], ...] = (
     (
         "Profile B against an enforcing NetworkPolicy",
         r"profile\s*b.*(networkpolicy|network\s*policy|egress)",
-        r"not\s+proved|not\s+covered|open\b",
+        r"not\s+proved|not\s+covered|unproved|open\b",
     ),
     (
         "repeat in a new workspace / after restart or handoff",

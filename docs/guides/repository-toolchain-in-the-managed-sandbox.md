@@ -82,7 +82,10 @@ completely, console scripts included. So the recipe is: **make the virtualenv
 where the repository already is.**
 
 The Kubernetes sandbox driver renders those same writable paths as `emptyDir`
-volumes, which are exec-able. A `/tmp` recipe would therefore pass on a cluster
+volumes, which are exec-able. That divergence is measured, not inferred: probing
+a cluster-tier sandbox on 2026-09-11 found `/tmp`, `/home/runner` and
+`/workspace` all exec-able, and the virtualenv's console scripts ran from every
+one of them. A `/tmp` recipe would therefore pass on a cluster
 and fail on local Compose — a difference that would only ever be discovered by
 whoever ran it locally last. `/workspace` is correct on both, so it is the only
 location this guide documents.
@@ -222,12 +225,12 @@ What the committed evidence does and does not cover.
 | Surface | Applicability | Evidence |
 |---|---|---|
 | local (Docker sandbox driver) | **Supported and proved.** | The proof harness runs every step in the real runner image under the driver's own isolation flags: vendored install, the documented check red → green → red across a fix and its revert, both negative controls, and a read-only-rootfs control. |
-| cluster (Kubernetes sandbox driver) | **Applies by posture, not proved here.** | The chart renders the same writable paths (`/tmp`, `/home/runner`) as `emptyDir`, and `/workspace` is the same mounted checkout, so the venv-in-`/workspace` recipe is posture-identical. No cluster-tier run is included in this evidence. |
+| cluster (Kubernetes sandbox driver) | **Supported and proved.** | Run on a kind cluster against the released `curie-runner:0.8.7` image on 2026-09-11: two independently claimed sandboxes each installed the dependency offline and ran the documented check red → green → red. See `ac5-cluster-evidence/`. |
 | live provider | **Not covered.** | The harness makes no model call. The recipe is about the toolchain, not the session. |
 | slack | **Not covered.** | No Slack external-integration run is included. The publication approval a Slack thread would carry is asserted statically here, not exercised. |
 | GitHub | **Boundary asserted statically.** | The credential handling in section 5 is read from the worker's workspace acquisition path and the publication tool's contract; no live human publication approval was exercised. |
-| Profile B against an enforcing NetworkPolicy | **Documented, not proved.** | Proving that a hand-written `--allow-web-egress` CIDR really admits PyPI requires a cluster with an enforcing NetworkPolicy. |
-| repeat in a newly acquired workspace, and after restart/handoff | **Open.** | Not demonstrated by this evidence. Treat it as unproved rather than as working. |
+| Profile B against an enforcing NetworkPolicy | **Refusal proved; admission not.** | Under the chart's fail-closed default, a live-registry install fails truthfully (`Network is unreachable`, exit 1) — but only after **~368 s**, pip's default retry budget. That a hand-written `--allow-web-egress` CIDR then *admits* PyPI is still unproved. |
+| repeat in a newly acquired workspace, and after restart/handoff | **Supported and proved.** | A second, independently claimed sandbox reproduced the whole recipe from the acquired head with no state carried over, producing its own distinct commits. An in-place container restart preserved the workspace, its three-commit history, the expected head and the credential-free origin. A *pod-replacing* handoff is still unproved: it would discard all `emptyDir` state and re-fetch the workspace from the signed archive. |
 
 Every container the harness starts is `--rm` and every workspace it creates is a
 temporary directory; it asserts observably that neither survives the run.
