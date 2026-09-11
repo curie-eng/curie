@@ -15,11 +15,17 @@ stream -> the real worker ``Consumer`` and ``Kernel``.
 
 HONEST LABELLING -- what this module does NOT prove:
 
-    This module proves API/worker/dispatcher behavior only. The runner is the
-    existing in-process ``FakeRunner`` fake (apps/worker/tests/kernel/conftest.py)
-    and Slack is the existing ``FakeSocketClient`` + mocked ``WebClient``. It does
-    not prove real-runner or real-Slack behavior. Stage 3 connects the real
-    runner. Three smaller stand-ins sit beside them, all on the Slack/kernel
+    This module proves API/worker/dispatcher behavior only, with ONE stated
+    exception. Every journey below EXCEPT
+    ``test_d2_the_completed_journey_runs_against_the_real_runner`` drives the
+    existing in-process ``FakeRunner`` fake (apps/worker/tests/kernel/conftest.py);
+    that one test builds the REAL ``curie_runner`` through the real boot path
+    (``build_runner(config, fake_model=True)`` -> ``create_app``) and serves it
+    through ``kernel_harness(runner_app=...)``, so the frames the ledger records
+    there are production ACI frames rather than a scripted fake's. Only the MODEL
+    is faked on that path. Slack remains the existing ``FakeSocketClient`` +
+    mocked ``WebClient`` everywhere, so no test here proves real-Slack behavior.
+    Three smaller stand-ins sit beside them, all on the Slack/kernel
     edges rather than in the journey itself: ``_authorize`` (Bolt's workspace
     authorization lookup), ``JourneyRecorder`` (the action-ledger recorder) and
     ``_RecordingApprovals`` (the kernel's ``ApprovalCreator``, used only where a
@@ -53,7 +59,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -178,24 +184,126 @@ def test_the_imported_dispatcher_fakes_are_the_real_ones() -> None:
 # wrong reason.
 
 
-def test_the_isolated_pilot_stack_is_what_we_are_running_against() -> None:
-    assert os.environ.get("CI_REQUIRE_VALKEY_TESTS"), (
+def _assert_the_stack_is_deliberately_chosen_and_empty(
+    *,
+    env: Mapping[str, str],
+    frozen_valkey_port: int,
+    stream: str,
+    sync_redis: redis.Redis,
+) -> None:
+    """The module's precondition, as ONE callable so it can be proven fallible.
+
+    D4: this replaces a pair of literals (``TEST_VALKEY_PORT == "36379"`` and
+    ``VALKEY_PORT == 36379``) that pinned the module to stage 2's private compose
+    stack. Those literals made the module fail on CI (Valkey 26379) and on every
+    other developer's machine, while proving nothing the properties below do not.
+    NOTHING is weakened: each of the four original guarantees is still asserted,
+    and the "isolated" property the port number was standing in for is now
+    asserted DIRECTLY -- as an empty, per-run namespace -- rather than inferred
+    from which compose stack happens to be up.
+
+    It takes ``env`` and the frozen port as parameters rather than reading
+    globals so the two negative tests below can drive it into failure. A guard
+    that cannot be made to fail is exactly the defect being fixed here.
+    """
+
+    assert env.get("CI_REQUIRE_VALKEY_TESTS"), (
         "CI_REQUIRE_VALKEY_TESTS must be set: without it an unreachable Valkey "
-        "SKIPS instead of failing, and this module's whole claim is that the "
-        "journey actually ran."
+        "SKIPS instead of failing (#1755), and this module's whole claim is "
+        "that the journey actually ran."
     )
-    assert os.environ.get("TEST_VALKEY_PORT") == "36379", (
-        "this module must run against the isolated pilot stack's Valkey on "
-        f"36379, not {os.environ.get('TEST_VALKEY_PORT')!r}; the constants are "
-        "frozen at import (curie_test_support/valkey.py:19-21), so no fixture "
-        "can retarget the worker afterwards."
+    chosen = env.get("TEST_VALKEY_PORT")
+    assert chosen, (
+        "TEST_VALKEY_PORT is unset, so nobody CHOSE a store and the worker fell "
+        "back to the localhost:26379 default. Bring up a Curie dev stack and "
+        "export the Valkey port it publishes (the repo's compose stack, or the "
+        "isolated pilot stack) before running this module."
     )
-    assert "VALKEY_URL" not in os.environ, (
+    assert frozen_valkey_port == int(chosen), (
+        "the worker's Valkey constants are FROZEN at import "
+        "(curie_test_support/valkey.py:19-21), so a fixture that retargets "
+        "TEST_VALKEY_PORT afterwards is a silent no-op and the two halves of "
+        f"the journey would use two different stores: frozen {frozen_valkey_port!r} "
+        f"vs TEST_VALKEY_PORT {chosen!r}. This agreement -- not any particular "
+        "port number -- is the property."
+    )
+    assert "VALKEY_URL" not in env, (
         "VALKEY_URL wins outright over the host/port parts (config.py:404-406), "
         "so with it set the API would write the resume to a different store "
         "than the worker reads."
     )
-    assert VALKEY_PORT == 36379
+    # What "isolated pilot stack" actually bought, asserted rather than implied.
+    # The per-test ``names`` fixture mints a fresh uuid4 hex per test, so this is
+    # unique to THIS run even when two of these tests share a process; and the
+    # namespace being EMPTY is what stops a pre-existing entry on a shared stack
+    # from making a later assertion pass for the wrong reason.
+    prefix, _, token = stream.rpartition(":")
+    assert prefix == "test:curie:runs", (
+        f"the run's stream {stream!r} is not in this suite's per-test namespace "
+        "(apps/worker/tests/conftest.py:40-46); without that namespace two runs "
+        "on one store would read each other's entries."
+    )
+    uuid.UUID(hex=token)  # raises if the token is not a per-run uuid4 hex
+    assert sync_redis.exists(stream) == 0, (
+        f"the run's stream {stream!r} already has entries before the test wrote "
+        "anything, so every 'exactly one entry' assertion in this module could "
+        "be satisfied by somebody else's data."
+    )
+
+
+def test_the_stack_we_are_running_against_was_deliberately_chosen_and_is_empty(
+    names: dict[str, str], sync_redis: redis.Redis
+) -> None:
+    """The positive control: the real environment satisfies the guard."""
+
+    _assert_the_stack_is_deliberately_chosen_and_empty(
+        env=os.environ,
+        frozen_valkey_port=VALKEY_PORT,
+        stream=names["stream"],
+        sync_redis=sync_redis,
+    )
+
+
+def test_the_stack_guard_fails_when_the_env_disagrees_with_the_frozen_port(
+    names: dict[str, str], sync_redis: redis.Redis
+) -> None:
+    """Negative control 1: the agreement check is real.
+
+    The frozen constant is read at IMPORT of ``curie_test_support.valkey``; an
+    environment that says a different port describes a store the worker will
+    never talk to. This is the exact shape the old literal could not catch on a
+    machine whose stack simply ran elsewhere.
+    """
+
+    disagreeing = {**os.environ, "TEST_VALKEY_PORT": str(VALKEY_PORT + 1)}
+
+    with pytest.raises(AssertionError, match="FROZEN at import"):
+        _assert_the_stack_is_deliberately_chosen_and_empty(
+            env=disagreeing,
+            frozen_valkey_port=VALKEY_PORT,
+            stream=names["stream"],
+            sync_redis=sync_redis,
+        )
+
+
+def test_the_stack_guard_fails_when_the_run_namespace_is_not_empty(
+    names: dict[str, str], sync_redis: redis.Redis
+) -> None:
+    """Negative control 2: the emptiness check is real.
+
+    Seeded on the run's OWN stream, which the ``names`` fixture deletes on
+    teardown, so this test leaves nothing behind for the next one.
+    """
+
+    sync_redis.xadd(names["stream"], {"payload": "somebody else's entry"})
+
+    with pytest.raises(AssertionError, match="already has entries"):
+        _assert_the_stack_is_deliberately_chosen_and_empty(
+            env=os.environ,
+            frozen_valkey_port=VALKEY_PORT,
+            stream=names["stream"],
+            sync_redis=sync_redis,
+        )
 
 
 # --- Shared journey scaffolding ----------------------------------------------
@@ -1598,3 +1706,190 @@ def test_ac_sec3_the_composed_port_refuses_connections_after_teardown(
         # make this step vacuous, since a 404 proves the server is alive just as
         # well as a 200 does, and only the ConnectError is the claim.
         client.get(f"http://127.0.0.1:{port}/health")
+
+
+# --- D2: the completed journey, against the REAL runner ----------------------
+#
+# Everything above dials the tiny in-process ``FakeRunner`` (conftest.py:~432),
+# whose "frames" are whatever the test scripted. This block builds the REAL
+# ``curie_runner`` through its real boot path with only the MODEL faked
+# (``build_runner(config, fake_model=True)`` -> ``create_app``, the pattern
+# test_runner_client.py:23-26 and runner/tests/test_server.py:62-95 already use)
+# and serves it through the ``runner_app=`` parameter ``kernel_harness`` already
+# has (conftest.py:721, added by f57c9232 for exactly this reason). No new seam.
+
+
+def _real_runner_bundle(tmp_path: Path) -> Any:
+    """A minimal real bundle, so ``build_runner`` takes its production path.
+
+    ``RunnerConfig.from_env`` + a ``.claude-plugin/plugin.json`` manifest is the
+    real boot input; the runner compiles the bundle, wires the side-effect
+    classifier and the session loop from it. Copied in shape from
+    runner/tests/test_server.py:62-95 rather than invented here.
+    """
+
+    from curie_runner.config import RunnerConfig
+
+    plugin_dir = tmp_path / "bundle"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "journey-bot"}), encoding="utf-8"
+    )
+    return RunnerConfig.from_env(
+        {
+            "CURIE_PLUGIN_DIR": str(plugin_dir),
+            "CURIE_SESSION_ID": f"journey-{uuid.uuid4().hex[:8]}",
+            "CURIE_SANDBOX_ID": f"journey-sandbox-{uuid.uuid4().hex[:8]}",
+            "CURIE_BUDGET": '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}',
+        }
+    )
+
+
+def test_d2_the_completed_journey_runs_against_the_real_runner(
+    make_harness: Any,
+    api: Any,
+    composed_resolver_factory: Any,
+    journey_recorder: Any,
+    sync_redis: redis.Redis,
+    tmp_path: Path,
+) -> None:
+    """The AC2 happy path again, with the REAL runner behind the kernel.
+
+    Substituting ``FakeRunner`` back breaks this test in three independent
+    places, which is what makes it a real-runner proof rather than a second copy
+    of AC2:
+
+    * the ledger frame's ``tool``/``call_id`` are ``Bash``/``t1``, produced by
+      the real ``SideEffectClassifier`` over the fake MODEL's scripted tool use
+      (runner/src/curie_runner/fake.py:69-82). ``FakeRunner`` emits only the
+      frames a test scripts into ``default_script``, and this test scripts NONE;
+    * the delivered text is the real session loop's final (``all done``), again
+      unscripted here;
+    * the real ``SessionRunner`` is asserted to have run the resume turn through
+      its state machine and to have settled on the status the turn's own final
+      carried, with the turn closed. ``FakeRunner`` has no ``SessionRunner`` at
+      all, so the reference the assertions below read does not exist on that
+      path.
+
+    Every bound here is taken from ``h.config.runner_total_timeout_s`` -- the
+    same value that drives the worker's ``RunnerClient`` budget (conftest.py's
+    ``kernel_harness``) -- rather than from a fresh magic number, because the
+    real state machine is slower than the fake and #2011 makes these bounds
+    load-bearing evidence rather than padding.
+    """
+
+    from curie_runner import create_app
+    from curie_runner.__main__ import build_runner
+
+    runner = build_runner(_real_runner_bundle(tmp_path), fake_model=True)
+
+    async def go() -> None:
+        await runner.start()
+        # The fake MODEL session is the only fake in the runner. Its recorded
+        # queries are how this test proves the real turn loop ran twice.
+        session = runner._session  # noqa: SLF001 - the model seam is the assertion
+        assert session.queries == []
+
+        created = api.create_approval()
+        approval_id = created["id"]
+        card = _card(approval_id, allow_free_text=True)
+        approve = _buttons(card)[0]
+
+        async with make_harness(actions=journey_recorder, runner_app=create_app(runner)) as h:
+            bound = h.config.runner_total_timeout_s
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+
+            app, web_client = _build_dispatcher(
+                _dispatcher_config(h.config.stream),
+                sync_redis,
+                composed_resolver_factory(),
+            )
+            web_client.conversations_replies = MagicMock(  # type: ignore[method-assign]
+                return_value={"messages": [card]}
+            )
+            handler = SocketModeHandler(app, app_token="xapp-test")
+
+            handler.handle(
+                FakeSocketClient(),
+                _click(
+                    "env-real-runner-click",
+                    card=card,
+                    button=approve,
+                    user=_APPROVER,
+                    channel=_APPROVERS_CHANNEL,
+                ),
+            )
+            _wait_for(
+                lambda: bool(web_client.views_open.call_args),
+                what="the note modal to be opened after the click",
+                timeout=bound,
+            )
+            metadata = web_client.views_open.call_args.kwargs["view"]["private_metadata"]
+
+            submit = FakeSocketClient()
+            handler.handle(
+                submit,
+                _view_submission(
+                    "env-real-runner-submit",
+                    private_metadata=metadata,
+                    user=_APPROVER,
+                    note=_NOTE_TEXT,
+                ),
+            )
+            _wait_for(
+                lambda: bool(web_client.chat_update.call_args),
+                what="the resolved card to be stamped after the submission",
+                timeout=bound,
+            )
+            _drain(app, timeout=bound)
+            assert submit.ack_payload_for("env-real-runner-submit") is None
+            assert api.approval(approval_id)["status"] == "approved"
+
+            turns = await _stream_entries(h)
+            assert len(turns) == 1, turns
+            assert turns[0].event_id == resume_event_id(approval_id)
+
+            # ``all done`` is the REAL session loop's final text for the fake
+            # model's default turn; nothing in this test scripted it.
+            await _consume_the_resume(
+                h,
+                consumer=consumer,
+                event_id=turns[0].event_id,
+                expect_text="all done",
+            )
+
+            # The ledger frame came out of the real runner's own side-effect
+            # classification, not out of ``gated_call``.
+            assert len(journey_recorder.recorded) == 1, journey_recorder.recorded
+            frame = journey_recorder.recorded[0]["frame"]
+            assert frame.tool == "Bash", (
+                "the recorded frame did not come from the real runner's "
+                f"SideEffectClassifier over the fake model's scripted turn: {frame!r}"
+            )
+            assert frame.call_id == "t1"
+            assert journey_recorder.recorded[0]["event_id"] == turns[0].event_id
+
+        # The real turn state machine, after the harness has released the
+        # server: two turns went through ``SessionRunner.run_turn`` (the original
+        # mention is not part of this journey, so the queries are the resume turn
+        # and nothing else), and it came back to rest rather than being left
+        # mid-turn.
+        assert len(session.queries) == 1, session.queries
+        assert _NOTE_TEXT in session.queries[0], (
+            "the resume turn the real runner ran did not carry the approver's "
+            f"note, so the journey did not reach the model seam: {session.queries!r}"
+        )
+        # CORRECTED to the runner's real terminal state. ``IDLE_AWAITING_INPUT``
+        # was wrong about the product: ``SessionRunner`` adopts the turn's own
+        # final status (session.py:1033, ``self._status = final.status``), and
+        # the fake model's default turn ends in a ``ResultMessage`` whose final
+        # is ``DONE`` (runner/src/curie_runner/fake.py:68-84) -- the same "all
+        # done" text this test already pins above. ``IDLE_AWAITING_INPUT`` is
+        # what an INTERRUPTED or non-terminal turn settles on (session.py:1015),
+        # which this journey is not.
+        assert runner.status is SessionStatus.DONE
+        assert runner.ready is True
+        assert runner._turn_open is False  # noqa: SLF001 - the state machine is the assertion
+
+    asyncio.run(go())
