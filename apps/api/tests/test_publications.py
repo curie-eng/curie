@@ -4653,6 +4653,49 @@ def test_review_reservation_stale_version_and_binding_reassert_are_refused(
     assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0
 
 
+def test_channel_token_rotation_does_not_revoke_approved_lineage_advance(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
+) -> None:
+    """Ingress-token rotation revokes review admission, not an approved PR push."""
+
+    client, truth, _ = review_lineage_app
+    deployment, _, lineage = _verified_lineage(client, truth, auth_headers)
+    rotated = client.post(
+        "/channels/token",
+        json={"kind": "slack", "address": "C0EXAMPLE1", "ttl_s": 3600},
+        headers=auth_headers,
+    )
+    assert rotated.status_code == 200, rotated.text
+
+    denied_review = _reserve_review(client, lineage, "review:after-token-rotation")
+    assert denied_review.status_code == 409, denied_review.text
+    assert denied_review.json()["detail"]["code"] == "publication.review_ineligible"
+
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id="review-original",
+            base_sha=FIRST_REVISION_SHA,
+            dedupe_key="approved-after-token-rotation",
+        ),
+    )
+    assert _resolve(client, auth_headers, publication["approval_id"]).status_code == 200
+    truth["head_sha"] = SECOND_REVISION_SHA
+
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=lineage["version"],
+        expected_head_sha=FIRST_REVISION_SHA,
+        head_sha=SECOND_REVISION_SHA,
+    )
+
+    assert advanced.status_code == 200, advanced.text
+    assert advanced.json()["head_sha"] == SECOND_REVISION_SHA
+    assert advanced.json()["latest_revision"] == 2
+
+
 def test_review_reservation_concurrency_has_one_winner(
     review_lineage_app: tuple[TestClient, dict[str, Any], str], auth_headers: dict[str, str]
 ) -> None:
