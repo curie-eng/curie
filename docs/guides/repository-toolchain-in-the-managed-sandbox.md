@@ -90,6 +90,92 @@ and fail on local Compose — a difference that would only ever be discovered by
 whoever ran it locally last. `/workspace` is correct on both, so it is the only
 location this guide documents.
 
+### Nothing in the sandbox survives a pod replacement
+
+Read this before you have work worth losing.
+
+The recipe's writable paths are all `emptyDir` at cluster tier and tmpfs or a
+bind mount locally. None of them is storage. A restart that keeps the *pod* —
+the runner container dying and being restarted in place — preserves everything:
+the checkout, its history, the head, the origin, the virtualenv. A restart that
+replaces the **pod** preserves none of it.
+
+**On a pod replacement your workspace is reset to the head the platform
+published, and everything the sandbox produced is gone:**
+
+| | in-place container restart | pod replacement |
+|---|---|---|
+| repository present, credential-free origin | preserved | re-fetched, so present |
+| head | preserved | **reset to the archive head** |
+| commits made in the sandbox, not published | preserved | **lost** |
+| uncommitted edits and untracked files | preserved | **lost** |
+| the virtualenv, and anything under `/tmp` or `/home/runner` | preserved | **lost** |
+
+Put plainly: **uncommitted changes are lost, and so is any commit you made in
+the sandbox but never published.** Both die with the pod.
+
+This is structural, not a gap to be fixed by being careful. A replacement pod
+re-materializes `/workspace` through `workspace-init`, which fetches the signed
+archive the trusted worker built from *its own* clone of the remote. Nothing
+anywhere captures a live sandbox's `/workspace` back into an archive, so there
+is no mechanism by which in-sandbox work could survive. `workspace-init` also
+erases `/workspace` before extracting, deliberately, so that an interrupted
+extraction can never be overlaid.
+
+Three ordinary things replace the pod, and the last is the one that catches
+people out:
+
+- the late workspace handoff of ADR-0136, when a conversation acquires a
+  repository after it has already started;
+- suspend and resume — ADR-0003 suspend *is* pod deletion, and resume does not
+  bring the pod back: it retires the suspended claim and creates a fresh one at
+  the next route generation, so the replacement is visible as a new claim;
+- the pod going away beneath a claim that never changes. The claim, the route
+  and the session id all stay exactly as they were and only the pod's uid moves,
+  so nothing at claim level records that a workspace was discarded and rebuilt.
+  This is the one you will not be told about. It was exercised by deleting the
+  pod directly; an eviction, a node drain or any other rescheduling reaches the
+  same controller path, though this guide has not measured those individually.
+
+So: **the only durable place for work is publication.** `publish_changes` is not
+a nicety at the end of a task, it is the step that makes the work exist outside a
+pod. Commit early if you like, but understand that a commit is not durability
+here — an unpublished commit dies with the pod exactly as an uncommitted edit
+does.
+
+One consequence worth knowing when a sandbox will not come back: the signed
+workspace reference is short-lived (five minutes by default). A pod recreated
+after it expires cannot re-fetch at all — `workspace-init` exits non-zero with
+`workspace-fetch: signed reference expired` and the pod sits in
+`Init:CrashLoopBackOff`. That is the platform failing closed rather than serving
+a stale workspace; recovery is a fresh claim, which the worker prepares with a
+new reference.
+
+### Is a persistent workspace volume the answer?
+
+Not today, and not one flag away. `SandboxClaim.spec.volumeClaimTemplates`
+exists in the CRD, but nothing in Curie sets it, and the shipped runner
+`SandboxTemplate` leaves `volumeClaimTemplatesPolicy` at its CRD default of
+`Disallowed` — a claim that asks for a volume is refused outright with
+`VolumeClaimTemplatesError`, creating neither pod nor PVC.
+
+Allowing it does not get you a persistent workspace either. With the policy
+flipped and a PVC bound at `/workspace`, the claim binds and the sandbox comes
+up — and a pod replacement still lands on an empty-then-re-extracted workspace,
+with the PVC itself unchanged throughout (same uid, same volume).
+
+The wipe is what does it, and that is measured rather than inferred: the same
+PVC, replaced the same way but mounted into a pod carrying **no**
+`workspace-init`, keeps its contents across the replacement intact. Put the init
+container back and the contents go. Its first action is to empty `/workspace`
+before extracting, which is exactly what guarantees a partial extraction is
+never overlaid — so persisting the workspace means changing that, and trading
+away the property the wipe exists to provide.
+
+The platform's answer to durability is elsewhere and is already in the recipe:
+committed work becomes durable by publication, and conversation state survives
+in the replayed history the replacement runner boots from.
+
 ## 3. The recipe
 
 Two profiles. **Profile A is the default**, because it is the only one that
@@ -251,7 +337,17 @@ What the committed evidence does and does not cover.
 | slack | **Not covered.** | No Slack external-integration run is included. The publication approval a Slack thread would carry is asserted statically here, not exercised. |
 | GitHub | **Boundary asserted statically.** | The credential handling in section 5 is read from the worker's workspace acquisition path and the publication tool's contract; no live human publication approval was exercised. |
 | Profile B against an enforcing NetworkPolicy | **Refusal proved; admission not.** | Under the chart's fail-closed default, a live-registry install fails truthfully (`Network is unreachable`, exit 1). Unconfigured pip on `curie-runner:0.8.7` took **~368 s**; the image now ships `/etc/pip.conf` with `retries = 0` so the same command fails on the first attempt (see section 6). That a hand-written `--allow-web-egress` CIDR then *admits* PyPI is still unproved. |
-| repeat in a newly acquired workspace, and after restart/handoff | **Supported and proved.** | A second, independently claimed sandbox reproduced the whole recipe from the acquired head with no state carried over, producing its own distinct commits. An in-place container restart preserved the workspace, its three-commit history, the expected head and the credential-free origin. A *pod-replacing* handoff is still unproved: it would discard all `emptyDir` state and re-fetch the workspace from the signed archive. |
+| repeat in a newly acquired workspace, and after an in-place restart | **Supported and proved.** | A second, independently claimed sandbox reproduced the whole recipe from the acquired head with no state carried over, producing its own distinct commits. An in-place container restart preserved the workspace, its three-commit history, the expected head and the credential-free origin. See `ac5-cluster-evidence/`. |
+| after a pod-replacing handoff | **Proved — and it discards everything the sandbox made.** | Exercised on a kind cluster on 2026-09-11 in both shapes: the ADR-0136 cold-claim handoff, and a pod deleted under an unchanged live claim. Both re-fetched the signed archive, so the repository and its credential-free origin came back — at the **archive head**, with the in-sandbox commit, the uncommitted edits, the untracked files and the virtualenv all gone. Recorded for operators under *Nothing in the sandbox survives a pod replacement*. See `pod-replacing-handoff-evidence/`. |
+| a persistent workspace volume | **Not the answer; not supported today.** | Nothing in Curie sets `SandboxClaim.spec.volumeClaimTemplates`, and the shipped template leaves the policy at the CRD default `Disallowed`, so such a claim is refused with no pod and no PVC. With the policy flipped, the PVC does survive the pod replacement and `workspace-init` wipes it anyway. A persistent workspace would require changing that wipe. |
+
+The `ac5-cluster-evidence/` and `pod-replacing-handoff-evidence/` records named
+above are the raw per-run artifacts of the two cluster runs — claim manifests,
+cluster version, and the measured before/after of each case. They are kept with
+the v0.9.0 queue contract under the maintainer's local `.projects/` tree, which
+this repository does not track, so you will not find them in a checkout. What
+they support is stated in full in the rows above; the citation is there to name
+the run, not to send you looking.
 
 Every container the harness starts is `--rm` and every workspace it creates is a
 temporary directory; it asserts observably that neither survives the run.

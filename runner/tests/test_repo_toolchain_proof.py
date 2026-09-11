@@ -1085,11 +1085,88 @@ _HONESTY_ROWS: tuple[tuple[str, str, str], ...] = (
         r"not\s+proved|not\s+covered|unproved|open\b",
     ),
     (
-        "repeat in a new workspace / after restart or handoff",
-        r"(restart|handoff|hand-off)",
-        r"open\b|not\s+proved|unproved|not\s+demonstrated",
+        "a persistent workspace volume",
+        r"persistent\s+workspace\s+volume",
+        r"not\s+the\s+answer|not\s+supported|not\s+proved|unproved|open\b",
     ),
 )
+
+
+_DATA_LOSS_WARNING_TERMS: tuple[tuple[str, str], ...] = (
+    ("the pod-replacement case must be named", r"pod\s+replacement|pod-replacing"),
+    (
+        "uncommitted work must be asserted LOST, not merely mentioned",
+        r"uncommitted[^.|\n]{0,80}\b(lost|gone|discard\w*|erase\w*|wipe\w*)\b"
+        r"|\b(lost|gone|discard\w*|erase\w*|wipe\w*)\b[^.|\n]{0,80}uncommitted",
+    ),
+    (
+        "an unpublished commit must be asserted LOST too, not just uncommitted edits",
+        r"unpublished\s+commit[^.|\n]{0,80}\b(dies|lost|gone|discard\w*)\b",
+    ),
+    (
+        "publication must be named as the durable answer",
+        r"publish_changes",
+    ),
+)
+
+# A warning that says the opposite of what #2615 measured must never pass. These
+# are the shapes a softened rewrite actually takes -- "it survives", "it is
+# preserved", "it is kept" said of a pod replacement -- and each is a lie about
+# the recorded run.
+_DATA_LOSS_CONTRADICTIONS: tuple[tuple[str, str], ...] = (
+    (
+        "uncommitted work claimed to survive a replacement",
+        r"pod\s+replacement[^.|\n]{0,120}\b(preserv\w*|surviv\w*|keep\w*|kept|retain\w*)\b"
+        r"[^.|\n]{0,60}uncommitted"
+        r"|uncommitted[^.|\n]{0,80}\b(preserv\w*|surviv\w*|kept|retain\w*)\b"
+        r"[^.|\n]{0,60}pod\s+replacement",
+    ),
+    (
+        "publication declared unnecessary",
+        r"no\s+need\s+for\s+publish_changes|publish_changes\s+is\s+(not\s+)?"
+        r"(necessary|needed|required)",
+    ),
+)
+
+
+def _assert_guide_warns_about_pod_replacement_data_loss(text: str) -> None:
+    """Pin the warning that stands between an operator and losing a day's work.
+
+    Issue #2615 proved that a pod-replacing handoff resets ``/workspace`` to the
+    published head and discards every in-sandbox commit, uncommitted edit and
+    virtualenv. That finding is only worth anything if the guide keeps saying so
+    *before* the recipe an operator is about to follow. A drift test that merely
+    pinned the applicability row would stay green while the body warning was
+    deleted -- the row is read after the fact, the warning is read in time.
+
+    Pinning the *subject words* alone is not enough either, and that is the
+    sharper trap: a rewrite saying a pod replacement **preserves** uncommitted
+    work names every required term while asserting the opposite of the measured
+    result. So each term is pinned to its loss relationship, and the inverted
+    claims are rejected outright as negative controls.
+    """
+
+    body = text.split("## 3. The recipe")[0]
+    assert len(body) < len(text), "the warning must precede the recipe, not follow it"
+    lowered = body.casefold()
+    for label, pattern in _DATA_LOSS_WARNING_TERMS:
+        assert re.search(pattern, lowered), (
+            f"{label}: the pod-replacement data-loss warning must appear before "
+            "the recipe. Deleting or softening it lets an operator follow the "
+            "recipe without being told the workspace is not storage."
+        )
+    for label, pattern in _DATA_LOSS_CONTRADICTIONS:
+        assert not re.search(pattern, lowered), (
+            f"{label}: the guide now claims the opposite of what the #2615 "
+            "cluster run measured. A pod replacement re-fetches the signed "
+            "archive and discards every in-sandbox change; saying otherwise "
+            "invites exactly the data loss this warning exists to prevent."
+        )
+    assert re.search(r"in-place", lowered), (
+        "the warning must distinguish an in-place container restart (which "
+        "preserves everything) from a pod replacement (which preserves none of "
+        "it); without the contrast the reader cannot tell which one they had"
+    )
 
 
 def _assert_guide_discloses_what_is_not_proved(text: str) -> None:
@@ -1124,9 +1201,15 @@ def test_guide_documents_the_recipe_and_the_boundary() -> None:
     bounded-failure modes, the proof harness is proving something nobody is
     being told to do. And if the applicability matrix loses the rows that admit
     what is *not* proved -- the live provider, GitHub publication approval,
-    Profile B against an enforcing NetworkPolicy, and repeat-after-restart/handoff
-    -- the guide overclaims. Deleting any one of those rows, or upgrading it to a
-    proved claim, now fails.
+    Profile B against an enforcing NetworkPolicy, and the persistent workspace
+    volume -- the guide overclaims. Deleting any one of those rows, or upgrading
+    it to a proved claim, now fails.
+
+    The restart/handoff row is no longer an honesty row: issue #2615 proved the
+    pod-replacing path on a cluster. What replaces that pin is stricter, because
+    what that proof found was a way to lose work -- the guide must keep warning,
+    before the recipe, that a pod replacement discards everything the sandbox
+    made.
     """
 
     assert GUIDE.is_file(), f"the operator guide must exist at {GUIDE}"
@@ -1174,6 +1257,7 @@ def test_guide_documents_the_recipe_and_the_boundary() -> None:
         assert tier in lowered, f"the applicability matrix must cover the {tier} tier"
 
     _assert_guide_discloses_what_is_not_proved(text)
+    _assert_guide_warns_about_pod_replacement_data_loss(text)
 
     # The docs gate bans raw line-coordinate citations anywhere in the file.
     assert not re.search(r"\.(?:py|rs|toml|yaml|md)(?::\d+|#L\d+)", text), (
