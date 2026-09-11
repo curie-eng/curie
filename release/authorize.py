@@ -73,9 +73,10 @@ PASSING_CONCLUSIONS = {"success", "neutral"}
 # three language/test jobs, the generated-artifact drift checks, the
 # release-compose validation, every first-party image actually building
 # (including the worker-local overlay and the dispatcher's own import
-# smoke-test), and the two behavioral gates (eval falsifiability, the E2E
-# parity ladder) that ci.yaml's own comments describe as catching bug
-# classes no unit test does. Checks from other workflows (CodeQL, the
+# smoke-test), and the behavioral gates (eval falsifiability, the E2E
+# parity ladder, the repository-toolchain proof) that ci.yaml's own
+# comments describe as catching bug classes no unit test does. Checks
+# from other workflows (CodeQL, the
 # dependency/secret scanners, release.yaml's own jobs) are deliberately
 # excluded -- they matter, but are not what this gate is asserting about
 # *this* commit's CI.
@@ -123,6 +124,7 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build sre-bot-self-upgrade image (no push)",
         "Build worker-local overlay image (no push)",
         "Dispatcher image imports resolve",
+        "Repository toolchain proof (runner image)",
         "Eval falsifiability gate (fake model, offline)",
         "E2E parity ladder (skill + local, fake model)",
         "E2E parity ladder (local-release, fake model)",
