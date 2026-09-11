@@ -15,7 +15,11 @@ from .context import (
 from .logging import configure_service_logging
 from .metrics import configure_meter_provider, record_metric
 from .resource import build_resource, deployment_environment, service_instance_id
-from .tracing import operation_span
+from .tracing import (
+    channel_event_id_scope,
+    operation_span,
+    stamp_event_id,
+)
 
 __all__ = [
     "TRACEPARENT_STREAM_FIELD",
@@ -24,6 +28,7 @@ __all__ = [
     "build_otlp_span_exporter",
     "build_resource",
     "canonicalize_traceparent",
+    "channel_event_id_scope",
     "configure_meter_provider",
     "configure_service_logging",
     "deployment_environment",
@@ -34,4 +39,5 @@ __all__ = [
     "resolve_otlp_endpoint",
     "resolve_otlp_protocol",
     "service_instance_id",
+    "stamp_event_id",
 ]

@@ -44,6 +44,7 @@ from datetime import UTC, datetime
 from curie_dispatcher.queue import from_stream_fields
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
+    channel_event_id_scope,
     extract_trace_context,
     operation_span,
     record_metric,
@@ -365,6 +366,12 @@ class Consumer(StreamConsumer):
                         )
                         return
 
+                    # The ``curie.queue.process`` span opened before the parse,
+                    # so the id is attached post-hoc. This mutates only THIS
+                    # turn's own span, so it is safe ahead of the drain below.
+                    if qevent.event_id:
+                        span.set_attribute("event_id", qevent.event_id)
+
                     age = self._message_age_seconds(qevent.received_at)
                     for name in (
                         "curie.queue.wait.duration",
@@ -397,110 +404,121 @@ class Consumer(StreamConsumer):
                             "thread-reset drain before turn %s failed; continuing",
                             entry_id,
                         )
-                    try:
-                        if self._leases is None:
-                            # No fence configured: call the kernel EXACTLY as it
-                            # was called before ADR-0131. The base yields a
-                            # permissive sentinel so this handler body stays
-                            # uniform, but forwarding that sentinel would claim
-                            # an authority nobody holds -- and ``process_event``
-                            # keeps its lease optional for precisely this caller.
-                            await self._kernel.process_event(qevent)
-                        else:
-                            await self._kernel.process_event(qevent, lease=lease)
-                    except Exception as exc:
-                        # Leave the entry pending: the lease-expiry reclaim pass
-                        # picks it up one lease TTL after this handler released
-                        # its lease, with XAUTOCLAIM still the 15 minute backstop
-                        # behind that (#2433).
-                        if hasattr(span, "set_status"):
-                            span.set_status(StatusCode.ERROR)
-                        span.add_event(
-                            "queue.processing.failed",
-                            {"outcome": "failure", "error.class": type(exc).__name__},
-                        )
-                        record_metric(
-                            "curie.queue.process",
-                            attributes={**metric_attributes, "outcome": "failure"},
-                        )
-                        record_metric(
-                            "curie.queue.settle",
-                            attributes={**metric_attributes, "outcome": "pending"},
-                        )
-                        logger.exception("processing failed for entry %s; left pending", entry_id)
-                        # Best-effort, and belt and braces: the kernel method
-                        # already swallows its own failures, but an exception
-                        # escaping THIS branch is the #673 shape exactly, and a
-                        # notice may never change the settlement outcome of a
-                        # delivery. The return below stays unconditional.
+                    # Opened AFTER the thread-reset drain on purpose: the
+                    # drain tears down OTHER threads (release_thread opens
+                    # curie.runner.rpc, curie.thread.lock and
+                    # curie.sandbox.release, the last via asyncio.to_thread,
+                    # which COPIES this context). Opening the scope earlier
+                    # would stamp another thread's teardown with this turn's
+                    # event id -- silent wrong correlation. Do not move it up.
+                    # Likewise, do not add teardown or maintenance work for a
+                    # DIFFERENT thread inside this scope: it would be stamped
+                    # with this turn's event id and land in this request's trace.
+                    with channel_event_id_scope(qevent.event_id):
                         try:
-                            # This branch can run AFTER lease loss and sits ahead
-                            # of the pre-ACK guard below, so terminality alone is
-                            # not permission to edit. A replacement that holds the
-                            # fence now owns this thread and will speak for it;
-                            # talking over it is worse than saying nothing. On the
-                            # leaseless sentinel this never raises, so a base-only
-                            # consumer still notifies.
-                            lease.raise_if_lost()
-                            await self._kernel.notify_turn_not_started(
-                                qevent, lease=lease
+                            if self._leases is None:
+                                # No fence configured: call the kernel EXACTLY as it
+                                # was called before ADR-0131. The base yields a
+                                # permissive sentinel so this handler body stays
+                                # uniform, but forwarding that sentinel would claim
+                                # an authority nobody holds -- and ``process_event``
+                                # keeps its lease optional for precisely this caller.
+                                await self._kernel.process_event(qevent)
+                            else:
+                                await self._kernel.process_event(qevent, lease=lease)
+                        except Exception as exc:
+                            # Leave the entry pending: the lease-expiry reclaim pass
+                            # picks it up one lease TTL after this handler released
+                            # its lease, with XAUTOCLAIM still the 15 minute backstop
+                            # behind that (#2433).
+                            if hasattr(span, "set_status"):
+                                span.set_status(StatusCode.ERROR)
+                            span.add_event(
+                                "queue.processing.failed",
+                                {"outcome": "failure", "error.class": type(exc).__name__},
                             )
+                            record_metric(
+                                "curie.queue.process",
+                                attributes={**metric_attributes, "outcome": "failure"},
+                            )
+                            record_metric(
+                                "curie.queue.settle",
+                                attributes={**metric_attributes, "outcome": "pending"},
+                            )
+                            logger.exception(
+                                "processing failed for entry %s; left pending", entry_id
+                            )
+                            # Best-effort, and belt and braces: the kernel method
+                            # already swallows its own failures, but an exception
+                            # escaping THIS branch is the #673 shape exactly, and a
+                            # notice may never change the settlement outcome of a
+                            # delivery. The return below stays unconditional.
+                            try:
+                                # This branch can run AFTER lease loss and sits ahead
+                                # of the pre-ACK guard below, so terminality alone is
+                                # not permission to edit. A replacement that holds the
+                                # fence now owns this thread and will speak for it;
+                                # talking over it is worse than saying nothing. On the
+                                # leaseless sentinel this never raises, so a base-only
+                                # consumer still notifies.
+                                lease.raise_if_lost()
+                                await self._kernel.notify_turn_not_started(qevent, lease=lease)
+                            except LeaseLostError:
+                                logger.warning(
+                                    "skipping the not-started notice for entry %s: this "
+                                    "owner lost the delivery lease, and the current owner "
+                                    "speaks for the thread",
+                                    entry_id,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "not-started notice failed for entry %s",
+                                    entry_id,
+                                    exc_info=True,
+                                )
+                            return
+                        try:
+                            # A stale owner may not ACK. Checked immediately before
+                            # the ack, because the fence can move at any point during
+                            # a long turn and the ack is the irreversible one: it
+                            # takes the entry off the group, out from under the
+                            # replacement that now owns it.
+                            lease.raise_if_lost()
                         except LeaseLostError:
                             logger.warning(
-                                "skipping the not-started notice for entry %s: this "
-                                "owner lost the delivery lease, and the current owner "
-                                "speaks for the thread",
+                                "refusing to ack entry %s: this owner lost the delivery "
+                                "lease mid-turn; leaving it pending for the current owner",
                                 entry_id,
                             )
-                        except Exception:
-                            logger.warning(
-                                "not-started notice failed for entry %s",
-                                entry_id,
-                                exc_info=True,
+                            record_metric(
+                                "curie.queue.process",
+                                attributes={**metric_attributes, "outcome": "failure"},
                             )
-                        return
-                    try:
-                        # A stale owner may not ACK. Checked immediately before
-                        # the ack, because the fence can move at any point during
-                        # a long turn and the ack is the irreversible one: it
-                        # takes the entry off the group, out from under the
-                        # replacement that now owns it.
-                        lease.raise_if_lost()
-                    except LeaseLostError:
-                        logger.warning(
-                            "refusing to ack entry %s: this owner lost the delivery "
-                            "lease mid-turn; leaving it pending for the current owner",
-                            entry_id,
-                        )
+                            record_metric(
+                                "curie.queue.settle",
+                                attributes={**metric_attributes, "outcome": "pending"},
+                            )
+                            return
+                        await self._ack(entry_id)
+                        # Terminal acknowledgement: remove the delivery state as well
+                        # as the lease (the base's release drops only the lease). The
+                        # state's one-day retention is the backstop for a crash
+                        # between the ack and here, not the normal way it goes away --
+                        # without this a dead-lettered-and-redelivered event id
+                        # accumulates state keys until that TTL. Best-effort: the ack
+                        # above already happened.
+                        await self._settle_delivery_best_effort(entry_id)
+                        process_outcome = "success"
+                        span.add_event("queue.message.acked", {"outcome": "ack"})
                         record_metric(
                             "curie.queue.process",
-                            attributes={**metric_attributes, "outcome": "failure"},
+                            attributes={**metric_attributes, "outcome": "success"},
                         )
                         record_metric(
                             "curie.queue.settle",
-                            attributes={**metric_attributes, "outcome": "pending"},
+                            attributes={**metric_attributes, "outcome": "ack"},
                         )
                         return
-                    await self._ack(entry_id)
-                    # Terminal acknowledgement: remove the delivery state as well
-                    # as the lease (the base's release drops only the lease). The
-                    # state's one-day retention is the backstop for a crash
-                    # between the ack and here, not the normal way it goes away --
-                    # without this a dead-lettered-and-redelivered event id
-                    # accumulates state keys until that TTL. Best-effort: the ack
-                    # above already happened.
-                    await self._settle_delivery_best_effort(entry_id)
-                    process_outcome = "success"
-                    span.add_event("queue.message.acked", {"outcome": "ack"})
-                    record_metric(
-                        "curie.queue.process",
-                        attributes={**metric_attributes, "outcome": "success"},
-                    )
-                    record_metric(
-                        "curie.queue.settle",
-                        attributes={**metric_attributes, "outcome": "ack"},
-                    )
-                    return
         finally:
             record_metric(
                 "curie.queue.process.duration",
