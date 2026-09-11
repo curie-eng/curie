@@ -747,3 +747,28 @@ def test_an_explicit_offset_expiry_is_still_honoured() -> None:
     # The UTC default must apply only when the value carries no zone at all.
     offset = GitHubCredentials._expiry_seconds("2026-01-01T00:00:00+02:00")
     assert offset == GitHubCredentials._expiry_seconds("2025-12-31T22:00:00Z")
+
+
+def test_fresh_installation_cannot_change_during_token_mint(
+    private_key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A repository installation can disappear between discovery and mint. The
+    # exact-identity review/publication path must not inherit the clone helper's
+    # rediscovery fallback (REST installation/token endpoints documented above).
+    calls: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": 4242 if len(calls) == 1 else 4343})
+        if request.url.path == "/app/installations/4242/access_tokens":
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(
+            201, json={"token": "fixture-other-installation", "expires_at": "2999-01-01T00:00:00Z"}
+        )
+
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(handle))
+    credentials = GitHubCredentials(settings=app_settings(private_key))
+    with pytest.raises(GitHubAppError):
+        credentials.token_for_verified_installation(REPO, 4242)
+    assert calls == [f"/repos/{REPO}/installation", "/app/installations/4242/access_tokens"]

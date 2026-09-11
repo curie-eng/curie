@@ -423,6 +423,14 @@ services:
       LANGFUSE_HOST: http://langfuse-web:3000
       LANGFUSE_PUBLIC_KEY: pk-lf-curie-dev
       LANGFUSE_SECRET_KEY: sk-lf-curie-dev
+      # GitHub review-feedback ingress stays inert unless explicitly enabled.
+      # These credentials reach only the API control plane; runner sandboxes do
+      # not receive the App private key or webhook HMAC secret.
+      GITHUB_REVIEW_INGRESS_ENABLED: ${GITHUB_REVIEW_INGRESS_ENABLED:-false}
+      GITHUB_REVIEW_RECONCILER_INTERVAL_S: ${GITHUB_REVIEW_RECONCILER_INTERVAL_S:-5}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-dev-webhook-secret}
       # Approval user-group authorizers (#420) look up Slack usergroup
       # membership from the API itself, so the API reads the same bot token the
       # worker and dispatcher use. Empty by default: the Slack-free local loop

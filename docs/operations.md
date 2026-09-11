@@ -589,6 +589,69 @@ promote:
    `GITHUB_CLONE_BASE` (or the chart's `api.githubCloneBase`) if your repos
    live elsewhere, such as GitHub Enterprise Server.
 
+### Accepting review feedback from GitHub
+
+Review feedback uses the same signed `/github/webhook` endpoint, but is a
+separate, default-off GitHub App path. Set
+`api.githubReviewIngressEnabled: true` (environment
+`GITHUB_REVIEW_INGRESS_ENABLED=true`) only after all of the following are
+configured:
+
+- `api.githubReviewReconcilerIntervalSeconds` is greater than zero (environment
+  `GITHUB_REVIEW_RECONCILER_INTERVAL_S`; the default is `5`).
+- `api.githubAppId` and an App private key are present. Prefer
+  `api.githubAppExistingSecret` and `api.githubAppExistingSecretKey` for the
+  key; `api.githubAppPrivateKey` is the inline alternative.
+- `api.githubWebhookSecret` is a non-default HMAC secret and matches the secret
+  configured on the GitHub webhook.
+
+The API refuses to start with review ingress enabled when any of those settings
+is missing, the webhook secret is still the development default, or the
+reconciler interval is not positive. Leaving
+`api.githubReviewIngressEnabled: false` keeps review events inert while
+preserving the existing push-webhook behavior.
+
+If the worker uses a custom `KEY_PREFIX`, give the API the same `KEY_PREFIX` so
+review reconciliation can find its exact completion and dead-letter markers.
+The API follows the worker configuration's `KEY_PREFIX` alias;
+`CURIE_KEY_PREFIX` is ignored.
+
+Configure the App webhook with these three subscriptions, using GitHub's event
+names exactly:
+
+- **Issue comments** for `issue_comment.created` on a pull request.
+- **Pull request review comments** for `pull_request_review_comment.created`.
+- **Pull request reviews** for `pull_request_review.submitted`; Curie acts only
+  on `commented` and `changes_requested` reviews.
+
+GitHub documents the payloads under [webhook events and
+payloads](https://docs.github.com/en/webhooks/webhook-events-and-payloads).
+Give the App **Issues: Read** and **Pull requests: Read** so Curie can re-read
+the pull request, issue comment, review comment, and review. Give it
+**Administration: Read** so Curie can call GitHub's [repository-permission
+lookup](https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user).
+That lookup must freshly match the sender's immutable user ID and report
+`write` or `admin`; `author_association` by itself is not authority. Keep the
+existing trusted publisher permissions, **Contents: Read and write** and **Pull
+requests: Read and write**, because only that publisher may advance the branch
+and pull request. The App's effective Pull requests permission is therefore
+Read and write when both feedback ingestion and publication are enabled.
+
+Only publication lineages created after authority capture are eligible. The
+lineage must retain its immutable App-observed installation, repository, pull
+request, base-ref, binding generation, and bare reply-conversation facts.
+Historical lineages, PAT-backed lineages, and lineages with null authority are
+not reconstructed and remain ineligible. Every accepted event routes to that
+exact owning conversation. Immediately before a model turn, Curie rechecks the
+open pull request, exact head, installation, repository, sender identity and
+current `write`/`admin` permission, then reserves the same lineage generation.
+
+Feedback never publishes automatically. The resulting revision must request a
+new human publication approval, and the trusted publisher may add exactly one
+tested commit to the same pull request only after that approval. This path
+reports receipt and outcome in the owning conversation. GitHub status or
+comment publication for review feedback is not configured and remains a no-op.
+
 **Deploying a PRIVATE repo needs one more thing: a clone credential.**
 Without it, git-flow can only deploy a public repository. A private one
 fails with `git.archive_failed` (#1058). Supply the API's GitHub credential
