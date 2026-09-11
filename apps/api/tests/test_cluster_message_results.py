@@ -243,7 +243,16 @@ def test_platform_get_reports_an_unwritten_valid_ref_as_absent(
         "../",
         "a/b",
         "550E8400-E29B-41D4-A716-446655440000",
-        str(uuid.uuid1()),
+        # A version 1 UUID: well formed, and not the canonical form this route
+        # accepts, which is the whole point of the case.
+        #
+        # It was `str(uuid.uuid1())`, evaluated at COLLECTION time (#2235). That
+        # gave the case a different node id on every run, so no `Fix pin:`
+        # selector could ever name it, and under xdist each worker collects at
+        # its own moment and pytest refuses the mismatch outright: "Different
+        # tests were collected between gw0 and gw3". A literal proves exactly
+        # the same thing about the route and stays nameable.
+        "f81d4fae-7dec-11d0-a765-00a0c91e6bf6",
     ],
 )
 def test_noncanonical_refs_are_refused_before_any_valkey_write(
