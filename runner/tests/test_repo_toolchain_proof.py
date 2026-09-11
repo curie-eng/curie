@@ -56,6 +56,7 @@ FIXTURE_REPO = Path(__file__).resolve().parent / "fixtures" / "repo_toolchain"
 GUIDE = REPO_ROOT / "docs" / "guides" / "repository-toolchain-in-the-managed-sandbox.md"
 PIP_CONF = REPO_ROOT / "runner" / "pip.conf"
 DOCKERFILE = REPO_ROOT / "runner" / "Dockerfile"
+REGISTRY_EGRESS_CHECK = REPO_ROOT / "scripts" / "check-registry-egress.py"
 
 # --- product posture, imported rather than hardcoded -------------------------
 #
@@ -830,7 +831,7 @@ def test_default_index_blocked_egress_fails_on_the_image_retry_budget(
     _require_fixture()
 
     evidence = Evidence()
-    with tempfile.TemporaryDirectory(prefix="curie-2614-blocked-") as root:
+    with _owned_tempdir(prefix="curie-2614-blocked-") as root:
         workspace = _materialize_fixture_clone(Path(root))
         step = evidence.record(
             _run_in_sandbox(
@@ -1063,8 +1064,8 @@ def test_live_registry_profile_installs_a_third_party_pin(tmp_path: Path) -> Non
 # --- 7. the guide cannot drift away from the harness ------------------------
 
 
-# The applicability matrix's honesty rows: each is a surface this evidence does
-# NOT prove. ``subject`` matches the row's first cell; ``marker`` is the
+# The applicability matrix's remaining honesty rows: each is a surface this
+# evidence does NOT prove. ``subject`` matches the row's first cell; ``marker`` is the
 # not-proved admission the row must still carry. Matched on concept plus marker
 # rather than verbatim prose, so rewording is fine and deletion or an upgrade to
 # "proved" is not.
@@ -1078,11 +1079,6 @@ _HONESTY_ROWS: tuple[tuple[str, str, str], ...] = (
         "GitHub publication approval",
         r"github",
         r"not\s+covered|not\s+proved|open\b|asserted\s+statically|statically",
-    ),
-    (
-        "Profile B against an enforcing NetworkPolicy",
-        r"profile\s*b.*(networkpolicy|network\s*policy|egress)",
-        r"not\s+proved|not\s+covered|unproved|open\b",
     ),
     (
         "a persistent workspace volume",
@@ -1170,7 +1166,7 @@ def _assert_guide_warns_about_pod_replacement_data_loss(text: str) -> None:
 
 
 def _assert_guide_discloses_what_is_not_proved(text: str) -> None:
-    """Pin the four applicability rows that admit what the evidence does not cover.
+    """Pin the remaining applicability rows that admit unproved surfaces.
 
     Catches the unpinned-rule class: a drift test that only greps for `local`,
     `cluster` and `slack` stays green after the honesty rows are deleted, which
@@ -1192,18 +1188,57 @@ def _assert_guide_discloses_what_is_not_proved(text: str) -> None:
         )
 
 
+def _assert_live_registry_egress_contract(text: str) -> None:
+    """Pin the reproducible live-registry check and its CIDR limits."""
+
+    rows = [
+        row
+        for row in text.splitlines()
+        if row.strip().startswith("|")
+        and re.search(
+            r"live\s+registry\s+dependencies.*(networkpolicy|network\s*policy|egress)",
+            row,
+            flags=re.IGNORECASE,
+        )
+    ]
+    assert len(rows) == 1, (
+        "the applicability matrix must carry exactly one live-registry enforcing-"
+        f"NetworkPolicy row; found {rows}"
+    )
+    row = rows[0].casefold()
+    for marker in (
+        "admission and refusal",
+        "cidr snapshot",
+        "packaging==25.0",
+        "scripts/check-registry-egress.py",
+        "not a domain boundary",
+        "not a trusted-registries preset",
+    ):
+        assert marker in row, (
+            f"the live-registry row must retain its contract and limit marker {marker!r}: "
+            f"{rows[0]}"
+        )
+
+    assert REGISTRY_EGRESS_CHECK.is_file(), (
+        f"the documented live-registry check must exist at {REGISTRY_EGRESS_CHECK}"
+    )
+    assert re.search(
+        r"python\s+scripts/check-registry-egress\.py\s+\\?\s*--output-dir\b",
+        text,
+    ), "the guide must carry the runnable check command with its output directory"
+
+
 def test_guide_documents_the_recipe_and_the_boundary() -> None:
     """Catches the guide drifting from what the harness actually proves, and the
     honesty rows being quietly deleted so the guide reads as proving more.
 
     The guide is the deliverable an operator follows; if it stops naming the
-    venv location, both egress profiles, the publication boundary, or the two
+    venv location, both dependency strategies, the publication boundary, or the two
     bounded-failure modes, the proof harness is proving something nobody is
     being told to do. And if the applicability matrix loses the rows that admit
     what is *not* proved -- the live provider, GitHub publication approval,
-    Profile B against an enforcing NetworkPolicy, and the persistent workspace
-    volume -- the guide overclaims. Deleting any one of those rows, or upgrading
-    it to a proved claim, now fails.
+    and the persistent workspace volume -- the guide overclaims. Live registry
+    egress has a separate reproducible contract with explicit CIDR limits.
 
     The restart/handoff row is no longer an honesty row: issue #2615 proved the
     pod-replacing path on a cluster. What replaces that pin is stricter, because
@@ -1221,9 +1256,9 @@ def test_guide_documents_the_recipe_and_the_boundary() -> None:
         "the guide must state the sandbox posture the recipe works within"
     )
     assert "--no-index" in text and "--find-links" in text, (
-        "Profile A's vendored install command must be copy-pasteable from the guide"
+        "the bundled-dependency install command must be copy-pasteable from the guide"
     )
-    assert "--allow-web-egress" in text, "Profile B's operator lever must be named"
+    assert "--allow-web-egress" in text, "the live-registry operator lever must be named"
     assert "0075" in text, "the guide must cite ADR-0075 for the egress imprecision"
     assert "no-new-privileges" in lowered or "cap-drop" in lowered or "cap_drop" in lowered
 
@@ -1258,6 +1293,7 @@ def test_guide_documents_the_recipe_and_the_boundary() -> None:
 
     _assert_guide_discloses_what_is_not_proved(text)
     _assert_guide_warns_about_pod_replacement_data_loss(text)
+    _assert_live_registry_egress_contract(text)
 
     # The docs gate bans raw line-coordinate citations anywhere in the file.
     assert not re.search(r"\.(?:py|rs|toml|yaml|md)(?::\d+|#L\d+)", text), (
@@ -1288,6 +1324,28 @@ def test_runner_image_ships_fail_fast_pip_retries() -> None:
         "the Dockerfile must install the pip.conf at the site-wide path "
         "workspace venvs actually read"
     )
+
+
+def test_live_registry_egress_contract_rejects_material_mutations() -> None:
+    """Prove deleting the row or overstating a CIDR snapshot makes the pin red."""
+
+    text = GUIDE.read_text()
+
+    without_row = "\n".join(
+        row
+        for row in text.splitlines()
+        if "Live registry dependencies against an enforcing" not in row
+    )
+    with pytest.raises(AssertionError):
+        _assert_live_registry_egress_contract(without_row)
+
+    overclaimed = text.replace(
+        "not a domain boundary and not a trusted-registries preset",
+        "a durable domain boundary and a trusted-registries preset",
+    )
+    assert overclaimed != text, "the mutation must alter the pinned live-registry row"
+    with pytest.raises(AssertionError):
+        _assert_live_registry_egress_contract(overclaimed)
 
 
 # --- 8. the deliberately-red fixture must never enter our own suite ---------
