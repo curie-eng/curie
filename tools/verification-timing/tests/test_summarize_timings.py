@@ -410,26 +410,30 @@ def _raw_document(entry: str) -> str:
 
 
 @pytest.mark.parametrize(
-    "literal",
+    ("literal", "reason"),
     [
-        pytest.param("NaN", id="nan"),
-        pytest.param("Infinity", id="infinity"),
-        pytest.param("-Infinity", id="negative-infinity"),
-        pytest.param("1e309", id="overflows-to-inf"),
+        pytest.param("NaN", "seconds must be a finite number", id="nan"),
+        pytest.param("Infinity", "seconds must be a finite number", id="infinity"),
+        pytest.param("-Infinity", "seconds must be a finite number", id="negative-infinity"),
+        pytest.param("1e309", "seconds must be a finite number", id="overflows-to-inf"),
+        pytest.param("9" * 400, "seconds is too large to be a duration", id="unrepresentable-int"),
     ],
 )
-def test_non_finite_durations_are_rejected(tmp_path: Path, literal: str) -> None:
+def test_non_finite_durations_are_rejected(tmp_path: Path, literal: str, reason: str) -> None:
     """A duration that is not a finite real number is not a measurement."""
     module = _module()
     path = _raw_state(
         tmp_path,
         "nonfinite",
-        _raw_document(_raw_entry(f'{{"seconds": {literal}}}')),
+        _raw_document(_raw_entry(f'{{"tests": {{"seconds": {literal}}}}}')),
     )
 
     with pytest.raises(module.TimingRecordError) as excinfo:
         module.summarize(module.load_records([path]))
-    assert str(path) in str(excinfo.value)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert reason in message
+    assert "tests" in message
 
 
 def test_date_only_timestamps_are_rejected(tmp_path: Path) -> None:
@@ -576,9 +580,7 @@ def test_error_messages_still_name_the_full_path(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("field", ["tier", "command", "commit"])
 @pytest.mark.parametrize("value", [None, "", "   "])
-def test_missing_provenance_identity_is_rejected(
-    tmp_path: Path, field: str, value: object
-) -> None:
+def test_missing_provenance_identity_is_rejected(tmp_path: Path, field: str, value: object) -> None:
     """Empty identity would let unrelated candidates collapse into one duplicate group."""
     module = _module()
     entry = _entry(timings={"tests": {"seconds": 1.0}})

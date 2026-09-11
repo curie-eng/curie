@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 from collections.abc import Sequence
@@ -26,6 +27,13 @@ PHASE_FIELDS = frozenset({"seconds", "started_at", "completed_at", "count"})
 # larger means one of the two is describing a different span, and guessing which
 # one is authoritative would be exactly the invention this tool exists to refuse.
 AGREEMENT_TOLERANCE_SECONDS = 1.0
+# A timestamp with no time component is a date, not an instant. Accepting one
+# would let two identical dates subtract to a confident 0.0 seconds -- a guessed
+# midnight wearing the provenance of a real measurement.
+_TIME_COMPONENT = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
+# Identity fields. Without all three, unrelated candidates would collapse into
+# one duplicate group under a shared empty key.
+IDENTITY_FIELDS = ("tier", "command", "commit")
 
 
 class TimingRecordError(ValueError):
@@ -69,16 +77,25 @@ def _fail(source: Path, phase: str, reason: str) -> TimingRecordError:
     return TimingRecordError(f"{source}: phase '{phase}': {reason}")
 
 
-def _number(value: object) -> float | None:
+def _number(source: Path, phase: str, value: object) -> float | None:
     # bool is an int subclass; a flag is never a duration.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        # A huge JSON integer has no float representation; it is not a duration.
+        raise _fail(source, phase, "seconds is too large to be a duration") from exc
+    if not math.isfinite(number):
+        raise _fail(source, phase, "seconds must be a finite number")
+    return number
 
 
 def _timestamp(source: Path, phase: str, field: str, value: object) -> datetime:
     if not isinstance(value, str):
         raise _fail(source, phase, f"{field} must be an ISO 8601 string")
+    if not _TIME_COMPONENT.match(value):
+        raise _fail(source, phase, f"{field} must carry a time component, not a date alone")
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -88,6 +105,15 @@ def _timestamp(source: Path, phase: str, field: str, value: object) -> datetime:
 def _string(source: Path, field: str, value: object) -> str:
     if not isinstance(value, str):
         raise TimingRecordError(f"{source}: evidence field '{field}' must be a string")
+    return value
+
+
+def _identity(source: Path, field: str, entry: dict[str, Any]) -> str:
+    if field not in entry:
+        raise TimingRecordError(f"{source}: evidence field '{field}' is required")
+    value = _string(source, field, entry[field]).strip()
+    if not value:
+        raise TimingRecordError(f"{source}: evidence field '{field}' must not be empty")
     return value
 
 
@@ -114,7 +140,7 @@ def _parse_phase(source: Path, phase: str, raw: object) -> tuple[PhaseTiming, in
     declared = raw.get("seconds")
     seconds: float | None = None
     if declared is not None:
-        seconds = _number(declared)
+        seconds = _number(source, phase, declared)
         if seconds is None:
             raise _fail(source, phase, "seconds must be a number")
         if seconds < 0:
@@ -126,6 +152,13 @@ def _parse_phase(source: Path, phase: str, raw: object) -> tuple[PhaseTiming, in
             raise _fail(source, phase, "started_at and completed_at must both be present")
         started = _timestamp(source, phase, "started_at", raw["started_at"])
         completed = _timestamp(source, phase, "completed_at", raw["completed_at"])
+        if (started.tzinfo is None) != (completed.tzinfo is None):
+            # Never guess the missing zone: the offset could be anything.
+            raise _fail(
+                source,
+                phase,
+                "started_at and completed_at must both be timezone-aware or both naive",
+            )
         measured = (completed - started).total_seconds()
         if measured < 0:
             raise _fail(source, phase, "completed_at precedes started_at")
@@ -170,10 +203,12 @@ def _parse_entry(source: Path, entry: object) -> TimingRecord:
             retry_count = count
 
     return TimingRecord(
-        source=str(source),
-        tier=_string(source, "tier", entry.get("tier", "")),
-        command=_string(source, "command", entry.get("command", "")),
-        commit=_string(source, "commit", entry.get("commit", "")),
+        # Only the bare file name reaches the summary; a local absolute path is
+        # an environment detail, and error messages keep the full path instead.
+        source=source.name,
+        tier=_identity(source, "tier", entry),
+        command=_identity(source, "command", entry),
+        commit=_identity(source, "commit", entry),
         mode=_string(source, "mode", entry.get("mode", "")),
         outcome=_string(source, "outcome", entry.get("outcome", "")),
         timings=timings,
@@ -188,10 +223,16 @@ def _load_file(path: Path) -> list[TimingRecord]:
         raise TimingRecordError(f"{path}: could not be read as JSON: {exc}") from exc
     if not isinstance(document, dict):
         raise TimingRecordError(f"{path}: run-state must be a JSON object")
-    e2e = document.get("e2e") or {}
+    # Type-check before defaulting: `or {}` would turn `false` into a silent
+    # zero-row success, quietly dropping a corrupt file from a combined summary.
+    e2e = document.get("e2e", {})
+    if e2e is None:
+        e2e = {}
     if not isinstance(e2e, dict):
         raise TimingRecordError(f"{path}: run-state field 'e2e' must be an object")
-    evidence = e2e.get("evidence") or []
+    evidence = e2e.get("evidence", [])
+    if evidence is None:
+        evidence = []
     if not isinstance(evidence, list):
         raise TimingRecordError(f"{path}: run-state field 'e2e.evidence' must be a list")
     return [_parse_entry(path, entry) for entry in evidence]
