@@ -13,9 +13,11 @@ sync fixtures.
 from __future__ import annotations
 
 import contextlib
+import os
 import socket
 import threading
-from collections.abc import AsyncIterator, Callable
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -825,3 +827,467 @@ async def kernel_harness(
         for extra_server in extra_servers:
             with contextlib.suppress(Exception):
                 await extra_server.close()
+
+
+# --- Composed approval-journey fixtures (interface pilot stage 2) -------------
+#
+# Everything below is ADDITIVE and explicitly requested: nothing here is
+# autouse. Only ``test_approval_journey_dev.py`` asks for these, because they
+# mutate process environment (``RUNS_STREAM``, ``DATABASE_URL``, the API's
+# Valkey parts) that every other kernel test in the session must not inherit.
+#
+# The seam they build: the real ``curie_api`` app under a real uvicorn server on
+# a loopback ephemeral port, so the dispatcher's real ``ApprovalResolveClient``
+# talks real HTTP to it with its own default ``httpx.Client``. An
+# ``httpx.ASGITransport`` cannot be used -- it is an ``AsyncBaseTransport`` a
+# sync ``httpx.Client`` will not accept, and it skips the app lifespan, which is
+# where ``app.state.sessionmaker`` / ``resume_queue`` / ``approver_sets`` (the
+# real authorizer and the real enqueue) are composed
+# (apps/api/src/curie_api/main.py:78-95).
+
+
+# Test placeholders hoisted to constants (not inline literals) so the repo's
+# secret-shaped-literal gate does not trip on these quoted values.
+_JOURNEY_PLATFORM_CREDENTIAL = "journey-platform-api-key"
+# Deliberately DISTINCT from the platform key: sharing them is what
+# ``approval_auth.py:92-97`` refuses outright, and what ADR-0106 (#1531) exists
+# to prevent. ``config.py:430-431`` also refuses equal values at boot.
+_JOURNEY_ATTESTER_VALUE = "journey-chat-attester-secret"
+
+# Env vars the journey fixtures own. Snapshotted and restored as a unit so a
+# failed test cannot leak API settings into the rest of the session.
+_JOURNEY_ENV_KEYS = (
+    "RUNS_STREAM",
+    "CURIE_STREAM",
+    "VALKEY_URL",
+    "VALKEY_HOST",
+    "VALKEY_PORT",
+    "VALKEY_PASSWORD",
+    "API_KEY",
+    "CURIE_APPROVAL_CHAT_ATTESTER_SECRET",
+    # NOT ``CURIE_``-prefixed: ``Settings`` has no ``env_prefix`` and these two
+    # fields carry no ``validation_alias`` (config.py:237, :270), so pydantic-
+    # settings reads the bare field names. With ``extra="ignore"`` (config.py:35)
+    # a ``CURIE_``-prefixed key is silently dropped and the guard never binds.
+    "APPROVAL_SWEEP_INTERVAL_S",
+    "RESUME_RECONCILER_ENABLED",
+    # Owned per-test rather than left to the session fixture below, so this
+    # module can neither be broken by nor break ``apps/api/tests`` (which owns
+    # the same key, apps/api/tests/conftest.py:117-142) in one session.
+    "DATABASE_URL",
+    "S3_ENDPOINT_URL",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+    "ENVIRONMENT",
+)
+
+
+@dataclass(frozen=True)
+class JourneyEnv:
+    """The credentials and stream the composed API booted with."""
+
+    api_key: str
+    attester_secret: str
+    runs_stream: str
+
+
+@pytest.fixture
+def approval_api_env(names: dict[str, str], approval_api_db: str) -> Iterator[JourneyEnv]:
+    """Point the API's settings at THIS test's Valkey namespace and stack.
+
+    Not autouse, on purpose: ``RUNS_STREAM`` and the Valkey parts are process
+    globals, and leaking them would retarget any later test that builds API
+    settings.
+
+    Two apps, two different names for one Valkey. The worker harness reads
+    ``curie_test_support.valkey``'s ``TEST_VALKEY_*`` constants, FROZEN at import
+    (valkey.py:19-21); the API reads its own ``valkey_host``/``valkey_port``/
+    ``valkey_password`` settings, which default to ``localhost:26379``
+    (config.py:197-199). On the isolated pilot stack (36379) that divergence
+    would leave the API writing the resume onto a DIFFERENT store -- or, worse,
+    onto a shared one where a pre-existing entry makes an assertion pass for the
+    wrong reason. So the parts are copied across from the frozen constants.
+
+    ``VALKEY_URL`` is DELETED rather than set: it wins outright over the parts
+    (config.py:404-406, #2315), so setting the parts underneath an inherited URL
+    is a silent no-op that re-opens exactly that trap.
+
+    ``DATABASE_URL`` is set HERE, per test, rather than being left to the
+    session-scoped ``approval_api_db``: that key is also owned by
+    ``apps/api/tests/conftest.py:117-142``, so a session that interleaves the two
+    suites would otherwise be order-dependent in both directions.
+
+    Both background loops the app would otherwise start are disabled. The expiry
+    sweeper (config.py:237, 30s) can flip a pending row mid-test and the resume
+    reconciler (config.py:270, enabled by default) can enqueue a SECOND resume,
+    either of which breaks "exactly one stream entry" for a reason that has
+    nothing to do with the code under test. Both are stage 3's to drive.
+
+    That disable is ASSERTED against the resolved ``Settings`` below, not merely
+    written into ``os.environ``: the keys are unprefixed field names and a future
+    rename (or a re-added ``CURIE_`` prefix) would otherwise drop them silently
+    under ``extra="ignore"`` and leave both loops running on every composed
+    server (main.py:146-167).
+    """
+
+    previous = {key: os.environ.get(key) for key in _JOURNEY_ENV_KEYS}
+
+    os.environ["DATABASE_URL"] = approval_api_db
+    os.environ["RUNS_STREAM"] = names["stream"]
+    os.environ.pop("VALKEY_URL", None)
+    os.environ["VALKEY_HOST"] = _VALKEY_HOST
+    os.environ["VALKEY_PORT"] = str(_VALKEY_PORT)
+    os.environ["VALKEY_PASSWORD"] = _VALKEY_PW or ""
+    os.environ["API_KEY"] = _JOURNEY_PLATFORM_CREDENTIAL
+    os.environ["CURIE_APPROVAL_CHAT_ATTESTER_SECRET"] = _JOURNEY_ATTESTER_VALUE
+    os.environ["APPROVAL_SWEEP_INTERVAL_S"] = "0"
+    os.environ["RESUME_RECONCILER_ENABLED"] = "false"
+    # The lifespan calls ``BundleStore.ensure_bucket()``; the pilot stack serves
+    # RustFS on 39000. ``setdefault`` so an exported value wins, mirroring
+    # apps/api/tests/conftest.py:41-42.
+    os.environ.setdefault("S3_ENDPOINT_URL", "http://localhost:39000")
+    os.environ.setdefault("S3_ACCESS_KEY", "rustfs")
+    os.environ.setdefault("S3_SECRET_KEY", "rustfssecret")
+    # ``dev``: the prod boot gate (config.py:422) is Stream C's subject, not this
+    # module's, and an inherited ENVIRONMENT=prod would refuse boot here.
+    os.environ["ENVIRONMENT"] = "dev"
+
+    # Every mutation above precedes the cache clear, which precedes any
+    # ``create_app()``: ``get_settings`` is ``lru_cache``d, so building the app
+    # first and mutating after is a silent no-op.
+    from curie_api.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        # The guards above are only real if they BIND. Resolve the settings the
+        # app is about to be built from and check the values, so a rename, a
+        # re-added prefix or an inherited ``.env`` fails here with a clear
+        # message instead of silently re-arming a background loop or pointing
+        # the API at a second Valkey.
+        settings = get_settings()
+        assert settings.approval_sweep_interval_s <= 0, (
+            "the expiry sweeper is NOT disabled: APPROVAL_SWEEP_INTERVAL_S did "
+            f"not bind (resolved {settings.approval_sweep_interval_s!r}). "
+            "main.py:146-167 starts the loop on every composed server."
+        )
+        assert settings.resume_reconciler_enabled is False, (
+            "the resume reconciler is NOT disabled: RESUME_RECONCILER_ENABLED "
+            f"did not bind (resolved {settings.resume_reconciler_enabled!r})."
+        )
+        # ``VALKEY_URL`` popped from ``os.environ`` is not enough: ``Settings``
+        # also reads ``env_file=".env"`` (config.py:35) and a URL from there wins
+        # outright over the parts (config.py:404-406, #2315). Assert the RESOLVED
+        # dsn, which is the only thing that closes the two-Valkey trap.
+        assert not settings.valkey_url, (
+            "VALKEY_URL is set (most likely from a .env file) and wins over the "
+            "host/port parts, so the API would write the resume to a different "
+            f"store than the worker reads: {settings.valkey_url!r}"
+        )
+        assert settings.valkey_host == _VALKEY_HOST and settings.valkey_port == _VALKEY_PORT, (
+            "the API is pointed at a different Valkey than the worker harness: "
+            f"{settings.valkey_dsn()!r} vs {_VALKEY_HOST}:{_VALKEY_PORT}"
+        )
+        yield JourneyEnv(
+            api_key=_JOURNEY_PLATFORM_CREDENTIAL,
+            attester_secret=_JOURNEY_ATTESTER_VALUE,
+            runs_stream=names["stream"],
+        )
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        get_settings.cache_clear()
+
+
+@pytest.fixture(scope="session")
+def approval_api_db() -> Iterator[str]:
+    """A disposable, migrated database, and the URL every reader must use.
+
+    Recipe from apps/api/tests/conftest.py:127-143 (create / ``alembic upgrade
+    head`` / drop). Migrating is not optional: the app lifespan calls
+    ``assert_servable()``, which refuses to boot against an unmigrated schema
+    with "database schema None is below application min ...".
+
+    Not autouse, and it hands back the URL rather than leaving ``DATABASE_URL``
+    set, so the API app, the direct row assertions and the AC3 seeding provably
+    read ONE database rather than three that merely look alike. ``DATABASE_URL``
+    is set only for the duration of the migration and then RESTORED: the
+    function-scoped ``approval_api_env`` re-sets it per test. Holding it for the
+    whole session would make an interleaved run with ``apps/api/tests`` (which
+    owns the same key, apps/api/tests/conftest.py:117-142) order-dependent.
+    """
+
+    import asyncio as _asyncio
+    import secrets
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+    from pathlib import Path
+
+    import asyncpg
+    from alembic import command
+    from alembic.config import Config
+    from curie_api.config import get_settings
+    from sqlalchemy import make_url
+
+    base_url = os.environ.get(
+        "TEST_DATABASE_URL",
+        "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres",
+    )
+    base = make_url(base_url)
+    run_db = f"curie_journey_{_datetime.now(_UTC).strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(3)}"
+
+    async def _admin(sql: str) -> None:
+        conn = await asyncpg.connect(
+            user=base.username,
+            password=base.password,
+            host=base.host,
+            port=base.port,
+            database="postgres",
+        )
+        try:
+            await conn.execute(sql)
+        finally:
+            await conn.close()
+
+    _asyncio.run(_admin(f'CREATE DATABASE "{run_db}"'))
+    url = base.set(database=run_db).render_as_string(hide_password=False)
+    previous = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = url
+    get_settings.cache_clear()
+    try:
+        # Inside the try so a failed migration still drops the database.
+        alembic_dir = Path(__file__).resolve().parents[3] / "api" / "alembic"
+        cfg = Config()
+        cfg.set_main_option("script_location", str(alembic_dir))
+        command.upgrade(cfg, "head")
+        # Hand the key back the moment the migration no longer needs it.
+        _restore_database_url(previous)
+        get_settings.cache_clear()
+        yield url
+    finally:
+        _asyncio.run(_admin(f'DROP DATABASE IF EXISTS "{run_db}" WITH (FORCE)'))
+        _restore_database_url(previous)
+        get_settings.cache_clear()
+
+
+def _restore_database_url(previous: str | None) -> None:
+    if previous is None:
+        os.environ.pop("DATABASE_URL", None)
+    else:
+        os.environ["DATABASE_URL"] = previous
+
+
+@dataclass(frozen=True)
+class ComposedApi:
+    """A live loopback API: its base URL and the port it is bound to."""
+
+    base_url: str
+    port: int
+
+
+@contextlib.contextmanager
+def composed_api_server(*, startup_timeout_s: float = 30.0) -> Iterator[ComposedApi]:
+    """Run the REAL ``curie_api`` app on a loopback ephemeral port.
+
+    Exposed as a context manager as well as the ``approval_api_server`` fixture
+    because AC-SEC3 has to observe the port AFTER teardown, which a fixture the
+    test is still inside cannot do.
+
+    The port is picked by binding 0 and closing the probe socket rather than by
+    reading it back off ``server.servers[0].sockets[0]``: the client and the
+    AC-SEC3 assertion both need the number, and a pre-picked port is available
+    before the server thread exists. The narrow race (something else grabbing
+    the port in between) fails loudly as a bind error, never silently.
+
+    A lifespan failure (unmigrated schema, unreachable RustFS) means the server
+    never reports ``started``; the captured exception is re-raised here so the
+    test says what actually broke instead of timing out into a confusing
+    connection-refused.
+    """
+
+    import uvicorn
+    from curie_api.config import get_settings
+    from curie_api.main import create_app
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+
+    get_settings.cache_clear()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            lifespan="on",
+        )
+    )
+    failure: list[BaseException] = []
+
+    def _serve() -> None:
+        try:
+            server.run()
+        except BaseException as exc:  # noqa: BLE001 - surfaced below, not swallowed
+            failure.append(exc)
+
+    thread = threading.Thread(target=_serve, name=f"journey-api-{port}", daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + startup_timeout_s
+        while not server.started:
+            if failure:
+                raise AssertionError(
+                    f"the composed API failed to start on port {port}: {failure[0]!r}"
+                ) from failure[0]
+            if not thread.is_alive():
+                raise AssertionError(
+                    f"the composed API server thread exited before starting on port {port}"
+                )
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    f"the composed API did not start within {startup_timeout_s}s on port {port}"
+                )
+            time.sleep(0.02)
+        yield ComposedApi(base_url=f"http://127.0.0.1:{port}", port=port)
+    finally:
+        server.should_exit = True
+        thread.join(timeout=startup_timeout_s)
+        assert not thread.is_alive(), f"the composed API on port {port} did not shut down"
+
+
+@pytest.fixture
+def approval_api_server(
+    approval_api_db: str, approval_api_env: JourneyEnv
+) -> Iterator[ComposedApi]:
+    """The loopback API for one test. Ordering is the contract: the disposable
+    database and every env mutation are in place (and the settings cache
+    cleared) before ``create_app()`` runs."""
+
+    assert os.environ.get("DATABASE_URL") == approval_api_db
+    with composed_api_server() as api:
+        yield api
+
+
+@pytest.fixture
+def composed_resolver_factory(
+    approval_api_server: ComposedApi, approval_api_env: JourneyEnv
+) -> Iterator[Callable[..., Any]]:
+    """Build the REAL ``ApprovalResolveClient`` against the loopback API.
+
+    ``client=`` is deliberately omitted so the production default
+    ``httpx.Client(timeout=_RESOLVE_TIMEOUT)`` is the transport
+    (approval_actions.py:251-262). The injectable seam every other test uses is
+    what this module exists NOT to use.
+    """
+
+    from curie_dispatcher.approval_actions import ApprovalResolveClient
+
+    built: list[Any] = []
+
+    def factory(**overrides: Any) -> Any:
+        kwargs: dict[str, Any] = {
+            "api_base_url": approval_api_server.base_url,
+            "api_key": approval_api_env.api_key,
+            "approval_chat_attester_secret": approval_api_env.attester_secret,
+        }
+        kwargs.update(overrides)
+        client = ApprovalResolveClient(**kwargs)
+        built.append(client)
+        return client
+
+    yield factory
+
+    # The class owns its default ``httpx.Client`` and exposes no ``close()``
+    # (approval_actions.py:262), so nothing else would ever release the
+    # connection pool. AC5 builds two of these per run.
+    for client in built:
+        with contextlib.suppress(Exception):
+            client._client.close()
+
+
+# --- The action ledger recorder and its gated-tool script --------------------
+#
+# Redeclared from apps/worker/tests/kernel/test_action_ledger.py:37 (FakeRecorder)
+# and :76 (_call), NOT moved: that module is not in this PR's file list and
+# hoisting its helpers here would silently change its import surface. It stays
+# byte-identical and green, which is what keeps the duplication from drifting
+# unnoticed.
+#
+# Why a recorder at all: ``kernel_harness`` defaults ``actions=None`` and
+# ``FakeRunner.default_script`` is a bare ``Final`` (conftest.py:464), so with
+# neither a recorder nor a gated tool call, BOTH "zero side effects" and
+# "exactly one side effect" are assertions that cannot fail.
+
+
+@dataclass
+class JourneyRecorder:
+    """Records the calls the kernel makes to the action ledger (ADR-0117)."""
+
+    recorded: list[dict[str, Any]] = field(default_factory=list)
+    completed: list[tuple[str, Any]] = field(default_factory=list)
+
+    async def record(
+        self,
+        frame: Any,
+        *,
+        event_id: str,
+        conversation_id: str,
+        agent_id: str | None,
+        gate_approval_id: str | None = None,
+    ) -> Any:
+        from curie_worker.actions import RecordedAction
+
+        self.recorded.append(
+            {
+                "frame": frame,
+                "event_id": event_id,
+                "conversation_id": conversation_id,
+                "agent_id": agent_id,
+                "gate_approval_id": gate_approval_id,
+            }
+        )
+        return RecordedAction(id=f"a{len(self.recorded)}", status="pending")
+
+    async def complete(self, action_id: str, frame: Any) -> dict[str, Any]:
+        self.completed.append((action_id, frame))
+        return {
+            "tool": frame.tool,
+            "result": frame.result,
+            "detail": frame.detail,
+            "status": "failed" if frame.failed else "succeeded",
+            "undoable": bool(frame.result and frame.result.get("prior")),
+        }
+
+
+@pytest.fixture
+def journey_recorder() -> JourneyRecorder:
+    return JourneyRecorder()
+
+
+def gated_call(call_id: str, tool: str = "scale_deployment") -> list[OutboundEvent]:
+    """The two frames one side-effecting tool call produces.
+
+    Mirrors test_action_ledger.py:76-95. A runner script containing one of these
+    is what makes ``len(recorder.recorded) == 1`` mutation-sensitive.
+    """
+
+    from aci_protocol import SideEffectFlag
+
+    return [
+        SideEffectFlag(
+            tool=tool,
+            call_id=call_id,
+            arguments={"replicas": 10},
+            detail="non-idempotent tool executed",
+        ),
+        SideEffectFlag(
+            tool=tool,
+            call_id=call_id,
+            failed=False,
+            result={"ok": True, "prior": {"spec": {"replicas": 3}}},
+            detail="non-idempotent tool completed",
+        ),
+    ]

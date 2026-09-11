@@ -520,6 +520,72 @@ def test_approval_chat_attester_secret_is_independent_and_minimally_distributed(
             )
 
 
+def test_no_dev_approval_surface_ships_and_the_attester_key_set_is_closed():
+    """Neither compose form ships a dev approval surface, on either axis.
+
+    The test above pins the worker and the UI by name. This one pins the
+    COMPLEMENT: any service that is not the attestation producer (dispatcher)
+    or its verifier (API) must not receive the key, so a service added later
+    cannot silently inherit it by being absent from a named list. The second
+    axis is the KEY's own reach: no service outside that pair may carry the
+    attester value under any env name at all, so renaming the variable is not
+    an escape hatch either.
+
+    The name/image token scan below is deliberately NOT part of this claim. A
+    name denylist is the same control this PR rejected for API routes: it does
+    not see `curie-dev-signer`, `curie-fake-slack`, or any second process that
+    forges clicks without advertising itself in its own name. It is kept only
+    as a cheap extra tripwire; the two env-based pins above and below are what
+    the test actually guarantees.
+
+    Known gap, tracked separately: this pins the attester's REACH, not its
+    VALUE. compose.dev.yaml:414 writes
+    `${CURIE_APPROVAL_CHAT_ATTESTER_SECRET:-curie-dev-approval-chat-attester}`
+    and the generator copies that line verbatim, so the generated release
+    compose still resolves to the published dev default when the variable is
+    unset. Removing that default from compose.dev.yaml is the fix; asserting it
+    here today would simply fail.
+    """
+    env_name = "CURIE_APPROVAL_CHAT_ATTESTER_SECRET"
+    allowed = {"curie-api", "curie-dispatcher"}
+    # Cheap extra tripwire only -- see docstring. Nothing in this test's claim
+    # depends on it.
+    forbidden = ("approval", "attest", "mock", "stub", "synthetic")
+    for label, doc in compose_docs():
+        services = doc["services"]
+        assert allowed <= set(services), (
+            f"{label}: {sorted(allowed - set(services))} missing; the allowed-set "
+            f"assertion below would be vacuous"
+        )
+        for service_name, spec in services.items():
+            image = str(spec.get("image", ""))
+            for token in forbidden:
+                assert token not in service_name.lower(), (
+                    f"{label}: service {service_name!r} looks like a dev/mock "
+                    f"approval surface (matched {token!r})"
+                )
+                assert token not in image.lower(), (
+                    f"{label}: service {service_name!r} runs image {image!r}, "
+                    f"which looks like a dev/mock approval surface (matched {token!r})"
+                )
+            if service_name in allowed:
+                continue
+            env = env_map(spec)
+            assert env_name not in env, (
+                f"{label}: {service_name} is outside {sorted(allowed)} and still "
+                f"receives {env_name}; only the attestation producer and verifier may"
+            )
+            # The value, not just the name: a forger service handed the same
+            # secret under `SIGNING_KEY` would pass the name check above.
+            attester_value = env_map(services["curie-api"])[env_name]
+            leaked = sorted(key for key, value in env.items() if value == attester_value)
+            assert not leaked, (
+                f"{label}: {service_name} is outside {sorted(allowed)} and still "
+                f"carries the chat attestation value under {leaked}; renaming the "
+                f"variable is not an escape hatch"
+            )
+
+
 def test_dispatcher_depends_on_api_healthy():
     """The dispatcher waits for the API to be healthy before it starts.
 
