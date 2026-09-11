@@ -1206,6 +1206,82 @@ jobs:
           docker rm -f curie-api-smoke || true
           docker network rm curie-ui-smoke-net || true
 
+  # #2611: the Python job never builds curie-runner, so every container leg of
+  # runner/tests/test_repo_toolchain_proof.py skips on that job. This is the
+  # missing half: it builds the runner image and runs the harness with
+  # CURIE_REPO_TOOLCHAIN_PROOF=required so an absent image is a failure
+  # rather than a skip. No `needs:` on the Python job -- the image build must
+  # not serialise behind the ~22 min suite (#2230).
+  #
+  # Runtime (stated for #2611): the `images` matrix runner leg is ~2 min
+  # cache-warm (104s on run 34590132629). This job repeats that build with
+  # `load: true` (read-only `scope=runner` cache, same as the smoke jobs) and
+  # then runs the harness (~39s locally in required mode, 14 passed). Wall
+  # clock grows only if this job exceeds Python.
+  #
+  # GHA-layer-cached off the same `scope=runner` the `images` matrix writes,
+  # read-only so the two writers do not contend. `load: true` because the
+  # harness `docker run`s the tag. The builder is created with `use: false`
+  # so the default `docker` driver stays current, matching the smoke jobs.
+  repo-toolchain-proof:
+    name: Repository toolchain proof (runner image)
+    runs-on: ubuntu-latest
+    env:
+      CURIE_REPO_TOOLCHAIN_PROOF: required
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
+      - name: Required setting is present (negative control)
+        run: |
+          set -euo pipefail
+          if [ "${CURIE_REPO_TOOLCHAIN_PROOF}" != "required" ]; then
+            echo "CURIE_REPO_TOOLCHAIN_PROOF must be required so a missing image cannot skip; got ${CURIE_REPO_TOOLCHAIN_PROOF:-<empty>}" >&2
+            exit 1
+          fi
+      - name: Absent image fails in required mode (negative control)
+        env:
+          CURIE_RUNNER_IMAGE: curie-runner-absent-2611
+        run: |
+          set -euo pipefail
+          set +e
+          output=$(uv run pytest \
+            runner/tests/test_repo_toolchain_proof.py::test_dependency_install_succeeds_under_read_only_rootfs \
+            -q --tb=line 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "required mode passed or skipped without the runner image" >&2
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -F "may not skip"
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the runner image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: runner/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: curie-runner
+          push: false
+          load: true
+          cache-from: type=gha,scope=runner
+      - name: Repository toolchain proof
+        env:
+          CURIE_PROOF_EVIDENCE_DIR: ${{ runner.temp }}/repo-toolchain-proof
+        run: uv run pytest runner/tests/test_repo_toolchain_proof.py -q --durations=25
+
   # FALSIFIABILITY gate for the committed eval suites (issue #619). This is NOT
   # an E2E test: it never runs a real agent or makes a model call. It boots the
   # runner's scripted FAKE model (offline, no credential, no network) -- a

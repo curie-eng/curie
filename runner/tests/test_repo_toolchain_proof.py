@@ -13,20 +13,18 @@ one of these tests goes red.
 
 Gating rules (see the plan's Edge cases):
 
-- no ``docker`` binary, or a binary with an unreachable daemon -> **skip**;
+- no ``docker`` binary, or a binary with an unreachable daemon -> **skip**,
+  unless ``CURIE_REPO_TOOLCHAIN_PROOF=required``, which **fails**;
 - the resolved runner image absent locally -> **skip** with a message naming
-  ``curie build``;
+  ``curie build``, unless required, which **fails**;
 - hardening disabled (``run_args()`` empty) -> **fail**, because a vacuous proof
   is worse than no proof.
 
-**What this module does NOT currently gate.** Those skips are real skips. The
-repository's Python CI job does not build ``curie-runner``, so on the merge gate
-every container leg here skips and only the static tests run. Until CI both
-builds the runner image and runs this module with
-``CURIE_REPO_TOOLCHAIN_PROOF=required``, **this module does not gate the merge**
-and must not be described as if it does. Setting that variable to ``required``
-converts an absent ``docker`` or an absent image from a skip into a failure, so
-a pipeline that intends to gate cannot silently degrade to a green skip.
+The Python job still does not build ``curie-runner``, so its collection of this
+module skips every container leg. Merge gating lives in the dedicated
+``repo-toolchain-proof`` CI job, which builds the runner image and runs this
+module with ``CURIE_REPO_TOOLCHAIN_PROOF=required``. An absent image or an
+absent Docker daemon then fails that job instead of skipping.
 
 Evidence JSON is written to ``CURIE_PROOF_EVIDENCE_DIR`` when that is set, and
 only otherwise to pytest's ``tmp_path`` (which pytest deletes, making it useless
@@ -257,6 +255,39 @@ def _evidence_dir(tmp_path: Path) -> Path:
     directory = Path(configured).expanduser()
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def test_required_mode_fails_when_the_runner_image_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches required mode degrading to a skip when the image is missing.
+
+    The dedicated CI job sets ``CURIE_REPO_TOOLCHAIN_PROOF=required`` so an
+    absent ``curie-runner`` cannot silently skip. If ``_unavailable`` starts
+    skipping again under that setting, this test goes red even while the
+    workflow YAML still says required.
+    """
+
+    monkeypatch.setenv(PROOF_MODE_ENV, "required")
+    monkeypatch.setattr(sys.modules[__name__], "RUNNER_IMAGE", "curie-runner-absent-2611")
+    with pytest.raises(AssertionError, match="may not skip"):
+        _require_runner_image()
+
+
+def test_without_required_a_missing_image_skips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The contributor default: no image, no required flag, skip rather than fail.
+
+    The CI pin is what forbids this path on the merge gate. This test keeps
+    the skip path honest so a future change cannot make a missing image fail
+    for every local contributor.
+    """
+
+    monkeypatch.delenv(PROOF_MODE_ENV, raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "RUNNER_IMAGE", "curie-runner-absent-2611")
+    with pytest.raises(pytest.skip.Exception, match="unavailable|not present locally"):
+        _require_runner_image()
 
 
 # --- pinning the unittest run itself ----------------------------------------
