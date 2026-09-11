@@ -379,10 +379,10 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     # unwired lane as "the concept does not exist here" and leaves the turn
     # otherwise untouched, so a message carrying files is answered exactly as
     # v0.8.8 answers it. The chart's ``worker.attachments.enabled`` gates the
-    # sandbox half from the same value, so there is one knob, not two.
+    # sandbox half from the same value, so there is one knob and not two.
     #
-    # The credential condition is separate and unchanged: the lane's single job is to download a referenced
-    # file with the bot token, and the kernel treats a wired lane as
+    # The credential condition is separate and unchanged: the lane's single job
+    # is to download a referenced file with the bot token, and the kernel treats a wired lane as
     # authoritative, so a credential-less install (compose smoke, a mail-only
     # deployment) must keep running every turn exactly as it does today rather
     # than failing on the first message that carries a file.

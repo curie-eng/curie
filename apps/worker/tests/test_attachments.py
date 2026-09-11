@@ -559,7 +559,8 @@ def test_unique_attachment_leaf_suffixes_before_the_extension(attachments: Any) 
 
 
 def test_unique_attachment_leaf_skips_a_name_a_person_really_sent(attachments: Any) -> None:
-    assert attachments.unique_attachment_leaf("report.pdf", {"report.pdf", "report-2.pdf"}) == "report-3.pdf"
+    taken = {"report.pdf", "report-2.pdf"}
+    assert attachments.unique_attachment_leaf("report.pdf", taken) == "report-3.pdf"
 
 
 @pytest.mark.parametrize(

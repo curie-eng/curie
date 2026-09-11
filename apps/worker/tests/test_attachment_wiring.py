@@ -192,7 +192,8 @@ def test_the_switch_on_its_own_does_not_wire_the_lane_without_a_credential(
 def test_build_hands_the_kernel_an_attachment_coordinator(built: Any) -> None:
     # THE test for S4. revert: drop `attachments=` from the Kernel(...) call in
     # run.build -> this fails and nothing else in the suite does.
-    assert isinstance(_lane(built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN)), AttachmentCoordinator)
+    kwargs = built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN)
+    assert isinstance(_lane(kwargs), AttachmentCoordinator)
 
 
 def test_the_kernel_actually_holds_the_lane_it_was_handed(built: Any) -> None:
@@ -211,7 +212,13 @@ def test_the_lane_downloads_through_the_bot_token_and_parks_in_the_private_store
     # channel download (the worker's bot token, ADR-0075) and the PRIVATE
     # object store. Wiring it to the public bundle bucket would publish every
     # inbound file to anything holding a bundle URL.
-    lane = _lane(built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN, workspace_bucket="curie-workspaces"))
+    lane = _lane(
+        built(
+            attachment_enabled=True,
+            slack_bot_token=_FAKE_BOT_TOKEN,
+            workspace_bucket="curie-workspaces",
+        )
+    )
     assert lane.files is not None
     assert isinstance(lane.objects, WorkspaceObjectStore)
     assert lane.objects._bucket == "curie-workspaces"  # noqa: SLF001
