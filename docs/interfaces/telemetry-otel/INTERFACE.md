@@ -57,10 +57,25 @@ than an open bag of `gen_ai.*` names.
 - `operation_span`
   (`packages/telemetry/src/curie_telemetry/tracing.py::operation_span`) provides explicit
   parentage and honest status for platform operations. Its caller vocabulary is closed
-  to `service.name`, `operation`, `role`, `source`, `outcome`, and `retry_class`; custom
-  keys export only as `curie.operation`, `curie.role`, `curie.source`, `curie.outcome`,
-  and `curie.retry_class`. Event mutations are separately closed to `curie.outcome` and
-  the standard `error.type`; adding an arbitrary identifier at construction or later
+  to `service.name`, `operation`, `role`, `source`, `outcome`, `retry_class`, and
+  `event_id`; custom keys export only as `curie.operation`, `curie.role`, `curie.source`,
+  `curie.outcome`, `curie.retry_class`, and `curie.channel.event_id`. `event_id` is the
+  one correlation identifier the vocabulary admits, and it is admitted on spans only:
+  the metric catalog stays closed to it, because `record_metric` enumerates a value
+  domain per attribute and an identifier has none. Spans describing the turn's own
+  request-path work carry `curie.channel.event_id`, so a query on that attribute never
+  returns another request's spans -- it may simply not return every span of its own
+  request. Two cases are deliberately not stamped. Maintenance work interleaved on the
+  same handler task is not stamped -- specifically the thread-reset drain
+  (`_drain_thread_reset_requests`), which tears down *other* threads and whose spans would
+  otherwise be falsely attributed to this request. Work driven by a task created before
+  the event-id scope opens also does not inherit it: the delivery-lease heartbeat task
+  (created at `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._delivery_lease`, before the scope
+  opens in `consumer.py`) can lose its lease and issue an `interrupt` RPC for this same
+  turn, and that `curie.runner.rpc` span carries no event id. The value propagates by contextvar, is
+  per-asyncio-task, is stamped verbatim, is omitted entirely when no turn is in scope, and
+  is never emitted on any metric. Event mutations are separately closed to `curie.outcome`
+  and the standard `error.type`; adding an arbitrary identifier at construction or later
   fails before export. Producers inject
   and consumers extract only W3C `traceparent` through the separate Stream field or
   runner HTTP header using `inject_trace_context` and `extract_trace_context`
