@@ -54,6 +54,7 @@ _COPY_SOURCES = (
     "packages/telemetry-schema",
     "runner",
     "runner/export_dependency_pins.py",
+    "runner/pip.conf",
 )
 
 # Patterns that would drop a COPY source wholesale. dockerignore last-match

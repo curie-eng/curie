@@ -26,6 +26,13 @@ harness, from a released binary or someone else's bundle.
   on what commands exist.** It is hidden from `--help`, and it is real.
 - `curie schema-index`: the committed, versioned JSON Schemas for every `--json`
   result, so you can check that a payload field exists before you trust it.
+- [Repository toolchain in the managed sandbox](guides/repository-toolchain-in-the-managed-sandbox.md):
+  installing a repository's dependencies and running its checks inside a
+  managed sandbox. A live-registry install under the chart's fail-closed
+  egress default is a refusal, not a hang: about 368 seconds on pip's
+  unconfigured retry budget (measured 2026-09-11 on curie-runner:0.8.7). The
+  runner image now ships /etc/pip.conf with retries = 0 so the same command
+  fails on the first unreachable attempt.
 
 ## Supported SRE bundle
 

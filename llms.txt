@@ -10,6 +10,7 @@ The point of the three targets (`skill` in-process, `local` via docker compose, 
 * [docs/agent-install.md](docs/agent-install.md): an unattended release install, verification, and result reporting procedure for a coding agent.
 - [README.md](README.md): what Curie is, how to run it, and the target-by-target CLI walkthroughs.
 - [docs/agents.md](docs/agents.md): the verification contract for an agent driving Curie. The exact commands that prove an outcome, and the rule that a file existing or a string appearing in output is never evidence.
+- [docs/guides/repository-toolchain-in-the-managed-sandbox.md](docs/guides/repository-toolchain-in-the-managed-sandbox.md): the supported recipe for installing a repository's dependencies and running its checks in a managed sandbox. A fail-closed live-registry pip install is a refusal, not a hang: ~368s on unconfigured pip (curie-runner:0.8.7); the image now ships /etc/pip.conf with retries=0.
 - [docs/vision.md](docs/vision.md): the north star, who it is for, and the parity thesis new features are held against.
 
 ## The parity ladder (skill -> local -> cluster)
