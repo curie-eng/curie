@@ -141,6 +141,22 @@ verify_sha256() {
     echo "$want  $file" | sha256sum -c -
 }
 
+chart_version() {
+    awk '$1 == "version:" { print $2; exit }' "$1"
+}
+
+cli_version() {
+    awk -F '"' '$1 == "version = " { print $2; exit }' "$1"
+}
+
+release_identities_match() {
+    local chart="$1" cargo="$2" chart_identity cli_identity
+    [[ -f "$chart" && -f "$cargo" ]] || return 1
+    chart_identity="$(chart_version "$chart")"
+    cli_identity="$(cli_version "$cargo")"
+    [[ "$chart_identity" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$chart_identity" == "$cli_identity" ]]
+}
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -160,7 +176,7 @@ parse_args() {
 }
 
 run_self_test() {
-    local failed=0 tmp
+    local failed=0 tmp identity mismatch_chart
     if is_soak_namespace "curie" && is_soak_namespace "default" && ! is_soak_namespace "acme-2426"; then
         log "soak namespace curie refused"
         log "soak namespace default refused"
@@ -216,13 +232,22 @@ run_self_test() {
         log "sha256 helper rejected a mismatched fixture"
     fi
     rm -f "$tmp"
-    if [[ -f "$REPO_ROOT/charts/curie/Chart.yaml" ]] \
-        && grep -q 'version: 0.8.7' "$REPO_ROOT/charts/curie/Chart.yaml"; then
-        log "candidate Chart.yaml left at 0.8.7 (no unauthorized identity bump)"
+    if release_identities_match "$REPO_ROOT/charts/curie/Chart.yaml" "$REPO_ROOT/cli/Cargo.toml"; then
+        identity="$(chart_version "$REPO_ROOT/charts/curie/Chart.yaml")"
+        log "candidate Chart.yaml and CLI identities match at $identity"
     else
-        log "self-test: Chart.yaml version pin drifted"
+        log "self-test: Chart.yaml and CLI identities drifted"
         failed=1
     fi
+    mismatch_chart="$(mktemp)"
+    printf '%s\n' 'version: 9.9.9' >"$mismatch_chart"
+    if release_identities_match "$mismatch_chart" "$REPO_ROOT/cli/Cargo.toml"; then
+        log "self-test: release identity guard accepted a mismatch"
+        failed=1
+    else
+        log "mismatched chart and CLI identities refused"
+    fi
+    rm -f "$mismatch_chart"
     local script_path="${BASH_SOURCE[0]}"
     if grep -q '^--set security.gvisor' "$script_path"; then
         log "self-test: image_sets must emit KEY=VAL lines, not combined --set tokens"
@@ -236,7 +261,7 @@ run_self_test() {
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
-        printf '%s\n' '{"status":"self-test","issue":2426,"baseline":"0.8.6","predecessor":"0.8.7","chart_identity":"0.8.7"}'
+        printf '{"status":"self-test","issue":2426,"baseline":"0.8.6","predecessor":"0.8.7","chart_identity":"%s"}\n' "$identity"
     fi
 }
 

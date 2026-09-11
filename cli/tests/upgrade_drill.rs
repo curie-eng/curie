@@ -84,6 +84,10 @@ fn upgrade_drill_self_test_refuses_soak_unknown_scenario_and_missing_live() {
         "self-test must demonstrate the checksum guard rejecting a mismatch\n{text}"
     );
     assert!(
+        text.contains("mismatched chart and CLI identities refused"),
+        "self-test must demonstrate the release identity guard rejecting drift\n{text}"
+    );
+    assert!(
         text.contains("helm --set KEY=VAL tokens are split"),
         "self-test must pin split --set KEY=VAL argv tokens for the 0.8.6 CLI\n{text}"
     );
