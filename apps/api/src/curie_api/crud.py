@@ -1138,7 +1138,7 @@ async def publication_lineage_has_pending_revision(
     session: AsyncSession,
     lineage: ThreadPublicationLineage,
 ) -> bool:
-    """Return only whether private revision work still owns this lineage."""
+    """Return whether an active publication revision owns this lineage."""
 
     if lineage.status != "open":
         return False
@@ -1150,8 +1150,17 @@ async def publication_lineage_has_pending_revision(
         )
         .limit(1)
     )
-    if pending_id is not None:
-        return True
+    return pending_id is not None
+
+
+async def _publication_lineage_has_reserved_review(
+    session: AsyncSession,
+    lineage: ThreadPublicationLineage,
+) -> bool:
+    """Return whether a verified review currently reserves this lineage."""
+
+    if lineage.status != "open":
+        return False
     return (
         await session.scalar(
             select(PublicationReviewReservation.id)
@@ -2378,9 +2387,11 @@ async def reserve_review_revision(
             "publication.lineage_stale",
             "review expected a stale lineage version",
         )
-    if await publication_lineage_has_pending_revision(
-        session, lineage
-    ) or await publication_lineage_has_pending_outcome(session, lineage):
+    if (
+        await publication_lineage_has_pending_revision(session, lineage)
+        or await _publication_lineage_has_reserved_review(session, lineage)
+        or await publication_lineage_has_pending_outcome(session, lineage)
+    ):
         raise PublicationLineageConflict(
             "publication.revision_conflict",
             "a revision or its durable outcome already owns this lineage",
