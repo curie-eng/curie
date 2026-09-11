@@ -1145,9 +1145,17 @@ spec:
 | `CURIE_WORKSPACE_REF` | Yes -- `containerName: workspace-init` only | `workspace-init`. Deliberately NOT injected into the runner: it is a short-lived signed URL and the claim is plaintext in etcd. |
 | `CURIE_WORKSPACE_SHA256` | Yes -- `containerName: workspace-init` only | `workspace-init`, to verify the fetched archive. |
 | `CURIE_SESSION_ID`, `CURIE_HISTORY_REF`, `CURIE_PLUGIN_DIR`, and the rest of the boot env | Yes -- runner, no `containerName` | The runner. |
-| `CURIE_CREDENTIALS` | **No.** Stripped off the claim by the worker | The runner, from the chart Secret's `secretKeyRef`. A claim env entry would persist it as plaintext in etcd. |
-| Per-agent connector secrets (the keys named by `CURIE_CONNECTOR_SECRET_KEYS`) | **No.** Stripped off the claim by the worker | The runner, from the per-agent SandboxTemplate's `secretKeyRef`. |
-| `S3_ENDPOINT`, `BUNDLE_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `AWS_*` | **No.** Chart-wired from values and Secrets | `bundle-fetch`. Not a per-claim decision. |
+| `CURIE_CREDENTIALS` | Don't. Worker-filtered, not schema-rejected | The runner, from the chart Secret's `secretKeyRef`. The worker strips this key off every claim it writes; a claim you write yourself is not filtered, and the value would sit in plaintext in etcd. |
+| Per-agent connector secrets (the keys named by `CURIE_CONNECTOR_SECRET_KEYS`) | Don't. Worker-filtered, not schema-rejected | The runner, from the per-agent SandboxTemplate's `secretKeyRef`. Same plaintext-in-etcd caveat. |
+| `S3_ENDPOINT`, `BUNDLE_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `AWS_*` | Don't. Chart-managed defaults | `bundle-fetch`. Wired from values and Secrets, not a per-claim decision. An explicitly targeted claim entry would override them under `Overrides`. |
+
+**Nothing on this list is enforced by the CRD.** The vendored `SandboxClaim`
+schema accepts any env name, and `envVarsInjectionPolicy: Overrides` means a
+claim entry that names a container wins over the template's own value for it.
+The "Don't" rows above are the worker's discipline and the chart's wiring, both
+of which a hand-written claim bypasses entirely. Treat them as what you must not
+do, not as what you cannot do -- in particular, a credential you put on a claim
+is persisted in plaintext in etcd and nothing will stop you.
 
 **How the mistake shows up.** It does not look like a mistake. Every init
 container exits 0 -- an empty ref is its documented no-op path, which is what a

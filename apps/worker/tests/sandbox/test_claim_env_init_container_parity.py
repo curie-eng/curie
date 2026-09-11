@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 from curie_worker.sandbox.k8s import (
     BUNDLE_INIT_CONTAINERS,
     BUNDLE_REF_ENV,
@@ -41,8 +42,23 @@ _TEMPLATE = _REPO / "charts/curie/templates/agent-sandbox.yaml"
 # and their env entries at twelve. Go-template control lines (`{{- if ... }}`)
 # never carry a `- name:` head, so an indentation scan reads the same structure a
 # render would without needing one.
-_INIT_CONTAINER = re.compile(r"^ {8}- name: ([a-z0-9][a-z0-9-]*)\s*$")
-_ENV_ENTRY = re.compile(r"^ {12}- name: (CURIE_[A-Z0-9_]+)\s*$")
+#
+# The scan FAILS CLOSED. A `- name:` head this file does not recognise -- a
+# quoted key, a different indentation, a templated name -- is an error, not an
+# absence. Treating it as an absence is how a newly consumed staging key would
+# sail past the very gate that advertises it cannot.
+_INIT_CONTAINER = re.compile(r"^ {8}- name: (\S+)\s*$")
+_ENV_ENTRY = re.compile(r"^ {12}- name: (\S+)\s*$")
+_ANY_NAME_HEAD = re.compile(r"^(\s*)- name:(.*)$")
+_PLAIN_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+def _unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
 # The keys the worker targets per init container, from the worker's own
 # declaration. The chart is the other half of this contract.
 _TARGETED: dict[str, frozenset[str]] = {
@@ -62,13 +78,23 @@ _TARGETED: dict[str, frozenset[str]] = {
 _CHART_WIRED_ONLY: frozenset[str] = frozenset()
 
 
+class TemplateScanError(AssertionError):
+    """A `- name:` head in the init-container region this scanner cannot classify."""
+
+
 def _init_container_env() -> dict[str, set[str]]:
-    """Map each init container in the SandboxTemplate to the CURIE_ keys it declares."""
+    """Map each init container in the SandboxTemplate to the CURIE_ keys it declares.
+
+    Raises ``TemplateScanError`` on any `- name:` head inside the region that is
+    neither an init container at eight spaces nor an env entry at twelve. That
+    is the fail-closed half: an env declaration written in a shape this scanner
+    does not read must break the gate, not slip through it.
+    """
 
     found: dict[str, set[str]] = {}
     current: str | None = None
     in_init_containers = False
-    for line in _TEMPLATE.read_text(encoding="utf-8").splitlines():
+    for number, line in enumerate(_TEMPLATE.read_text(encoding="utf-8").splitlines(), 1):
         if line.strip() == "initContainers:":
             in_init_containers = True
             continue
@@ -76,16 +102,43 @@ def _init_container_env() -> dict[str, set[str]]:
             continue
         if line.strip() == "containers:":
             break
+        head = _ANY_NAME_HEAD.match(line)
+        if head is None:
+            continue
+
         match = _INIT_CONTAINER.match(line)
         if match:
-            current = match.group(1)
+            name = _unquote(match.group(1))
+            if not _PLAIN_NAME.match(name):
+                raise TemplateScanError(
+                    f"{_TEMPLATE}:{number}: init container name {name!r} is not a "
+                    "plain identifier this scanner can compare against the "
+                    "worker's containerName targets."
+                )
+            current = name
             found.setdefault(current, set())
             continue
-        if current is None:
-            continue
+
         env_match = _ENV_ENTRY.match(line)
-        if env_match:
-            found[current].add(env_match.group(1))
+        if env_match is None or current is None:
+            raise TemplateScanError(
+                f"{_TEMPLATE}:{number}: unreadable '- name:' declaration inside "
+                f"the init-container region: {line!r}. This gate only reads init "
+                "containers at eight-space and env entries at twelve-space "
+                "indentation; anything else is treated as a scan failure rather "
+                "than as an absent key, because an absence here would silently "
+                "un-gate a newly consumed staging key (#2612). Either write the "
+                "declaration in the shape above, or teach this scanner to read "
+                "the new one."
+            )
+        key = _unquote(env_match.group(1))
+        if not _PLAIN_NAME.match(key):
+            raise TemplateScanError(
+                f"{_TEMPLATE}:{number}: env name {key!r} is not a plain "
+                "identifier; this gate cannot tell whether the worker targets it."
+            )
+        if key.startswith("CURIE_"):
+            found[current].add(key)
     return found
 
 
@@ -120,3 +173,78 @@ def test_the_runner_and_the_worker_agree_on_the_bundle_init_container_names() ->
     from curie_runner.plugin import BUNDLE_INIT_CONTAINERS as RUNNER_BUNDLE_INIT
 
     assert RUNNER_BUNDLE_INIT == BUNDLE_INIT_CONTAINERS
+
+
+# --- the scanner's own fail-closed property ------------------------------------
+#
+# The gate above is only worth anything if a declaration it cannot read breaks
+# it. An earlier revision matched only bare, twelve-space `- name: CURIE_...`
+# heads and treated everything else as an absent key, so a quoted key or an
+# env list at another indentation slipped through the drift gate untargeted.
+
+
+def _scan(text: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, set[str]]:
+    stand_in = tmp_path / "agent-sandbox.yaml"
+    stand_in.write_text(text, encoding="utf-8")
+    monkeypatch.setitem(globals(), "_TEMPLATE", stand_in)
+    return _init_container_env()
+
+
+_ONE_CONTAINER = """
+      initContainers:
+        - name: bundle-fetch
+          env:
+{env}
+      containers:
+"""
+
+
+def test_a_quoted_env_key_is_read_not_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found = _scan(
+        _ONE_CONTAINER.format(
+            env='            - name: "CURIE_BUNDLE_REF"\n              value: ""'
+        ),
+        monkeypatch,
+        tmp_path,
+    )
+    assert found == {"bundle-fetch": {"CURIE_BUNDLE_REF"}}
+
+
+def test_an_env_entry_at_an_unread_indentation_fails_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(TemplateScanError, match="unreadable"):
+        _scan(
+            _ONE_CONTAINER.format(
+                env='              - name: CURIE_BUNDLE_REF\n                value: ""'
+            ),
+            monkeypatch,
+            tmp_path,
+        )
+
+
+def test_a_templated_env_name_fails_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name the scanner cannot resolve statically is an error, not an absence."""
+    with pytest.raises(TemplateScanError, match="not a plain identifier"):
+        _scan(
+            _ONE_CONTAINER.format(
+                env='            - name: {{$key}}\n              value: ""'
+            ),
+            monkeypatch,
+            tmp_path,
+        )
+
+    # A templated name carrying a space does not even reach that check; it is
+    # rejected one step earlier, still closed.
+    with pytest.raises(TemplateScanError, match="unreadable"):
+        _scan(
+            _ONE_CONTAINER.format(
+                env='            - name: {{ $key }}\n              value: ""'
+            ),
+            monkeypatch,
+            tmp_path,
+        )

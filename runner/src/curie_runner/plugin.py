@@ -132,20 +132,33 @@ def _is_empty(root: Path) -> bool:
 
 
 def staging_no_op_detail(root: Path) -> str:
-    """The operator-facing diagnosis for a claim whose staging env never landed."""
+    """The operator-facing diagnosis for a ref that is set over an empty dir.
+
+    Deliberately worded as "the most common cause", not a proven one. What this
+    runner observes is missing content, and a mis-shaped claim is the only cause
+    of it the sandbox's own loud failures do not already rule out -- but it is
+    not the only cause reachable from outside that path. A claim that overrides
+    CURIE_PLUGIN_DIR away from the init pair's mount path, or ``run_check``
+    pointed at an arbitrary directory, both land here with the init containers
+    entirely innocent. Naming the likely cause and the ones to rule out is the
+    honest form of that.
+    """
 
     entries = ", ".join(
         f"{{name: {BUNDLE_REF_ENV}, value: <ref>, containerName: {container}}}"
         for container in BUNDLE_INIT_CONTAINERS
     )
     return (
-        f"{BUNDLE_REF_ENV} is set but no plugin bundle was staged at {root}: the "
-        "bundle-fetch/bundle-extract init containers took their no-op path, so "
-        "the ref never reached them. SandboxClaim spec.env entries that carry no "
-        "containerName are injected into the runner container ONLY. A "
-        "hand-written claim must repeat each staging entry once per init "
-        f"container, e.g. {entries}. See docs/operations.md, 'Which claim env "
-        "reaches which sandbox container'."
+        f"{BUNDLE_REF_ENV} is set but nothing was staged at {root}. The most "
+        "common cause is a SandboxClaim whose staging env never reached the "
+        "init containers: a spec.env entry that carries no containerName is "
+        "injected into the runner container ONLY, so bundle-fetch and "
+        "bundle-extract keep the SandboxTemplate's empty default and take their "
+        "no-op path. A hand-written claim must repeat each staging entry once "
+        f"per init container, e.g. {entries}. Other causes to rule out: a "
+        f"CURIE_PLUGIN_DIR that does not name the path the init pair extracts "
+        "into, and a plugin dir emptied after extraction. See "
+        "docs/operations.md, 'Which claim env reaches which sandbox container'."
     )
 
 
