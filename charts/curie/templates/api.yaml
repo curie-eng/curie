@@ -167,6 +167,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: githubWebhookSecret
+            - name: GITHUB_REVIEW_INGRESS_ENABLED
+              value: {{ .Values.api.githubReviewIngressEnabled | quote }}
+            - name: GITHUB_REVIEW_RECONCILER_INTERVAL_S
+              value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the

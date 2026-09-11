@@ -418,6 +418,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/github-app-credential-assertions.sh
 
+      # Prove GitHub review ingress stays off by default, renders explicit
+      # operator values, rejects invalid types/cadences, and reserves both env
+      # names against api.extraEnv collisions.
+      - name: helm render assertions (github review config)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/github-review-config-assertions.sh
+
       # Prove the sealing keypair's handling (ADR-0094). It is the one credential
       # in this chart nobody can regenerate: losing it does not rotate anything,
       # it makes every value sealed to it -- in every agent repository --

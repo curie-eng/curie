@@ -101,6 +101,8 @@ api:
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret
   GITHUB_CLONE_BASE: api.githubCloneBase
   GITHUB_REPO_ALLOWLIST: api.githubRepoAllowlist
+  GITHUB_REVIEW_INGRESS_ENABLED: api.githubReviewIngressEnabled
+  GITHUB_REVIEW_RECONCILER_INTERVAL_S: api.githubReviewReconcilerIntervalSeconds
   GITHUB_TOKEN: api.githubTokenExistingSecret
   GITHUB_WEBHOOK_SECRET: api.githubWebhookSecret
   LANGFUSE_HOST: langfuse.host / langfuse.web.service.port

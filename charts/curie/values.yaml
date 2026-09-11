@@ -1096,6 +1096,11 @@ api:
   orgName: Curie
   # HMAC secret the GitHub git-flow webhook authenticates inbound events with.
   githubWebhookSecret: dev-webhook-secret
+  # GitHub review-feedback ingress is opt-in. When enabled, the API boot gate
+  # requires a GitHub App id/private key, a non-default webhook secret, and a
+  # positive reconciliation interval.
+  githubReviewIngressEnabled: false
+  githubReviewReconcilerIntervalSeconds: 5
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed

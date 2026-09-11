@@ -69,7 +69,7 @@ assert_rendered_values(
     render(
         "--set",
         "api.githubReviewIngressEnabled=true",
-        "--set",
+        "--set-json",
         "api.githubReviewReconcilerIntervalSeconds=2.5",
         "--set-string",
         "api.githubAppId=12345",
@@ -84,10 +84,10 @@ assert_rendered_values(
 
 # Exercise Helm's values-schema gate through the real render consumer.
 for arguments, path in (
-    (("--set-string", "api.githubReviewIngressEnabled=true"), "api.githubReviewIngressEnabled"),
-    (("--set", "api.githubReviewReconcilerIntervalSeconds=0"), "api.githubReviewReconcilerIntervalSeconds"),
-    (("--set", "api.githubReviewReconcilerIntervalSeconds=-1"), "api.githubReviewReconcilerIntervalSeconds"),
-    (("--set-string", "api.githubReviewReconcilerIntervalSeconds=5"), "api.githubReviewReconcilerIntervalSeconds"),
+    (("--set-string", "api.githubReviewIngressEnabled=true"), "/api/githubReviewIngressEnabled"),
+    (("--set", "api.githubReviewReconcilerIntervalSeconds=0"), "/api/githubReviewReconcilerIntervalSeconds"),
+    (("--set", "api.githubReviewReconcilerIntervalSeconds=-1"), "/api/githubReviewReconcilerIntervalSeconds"),
+    (("--set-string", "api.githubReviewReconcilerIntervalSeconds=5"), "/api/githubReviewReconcilerIntervalSeconds"),
 ):
     failure = render(*arguments, expect_success=False)
     diagnostic = failure.stdout + failure.stderr
