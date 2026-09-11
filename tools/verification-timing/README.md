@@ -61,10 +61,22 @@ over sparse data is honest about its own sample size: `observed_count` and
 `unknown_count` sit next to each other in every phase total, and a phase nobody
 measured reports `null` totals rather than a confident `0`.
 
-A malformed record — a negative duration, a non-numeric duration, a completion
-before its start, an unrecognised phase name — aborts the load naming the
-offending file and phase. It is never skipped silently, because a quietly
-dropped row is indistinguishable from a fast one.
+A malformed record aborts the load, naming the offending file and phase. It is
+never skipped silently, because a quietly dropped row is indistinguishable from
+a fast one. Rejected as malformed: a negative, non-numeric, non-finite
+(`NaN`/infinity) or unrepresentably large duration; a completion before its
+start; a date-only timestamp, which would make a guessed midnight look like a
+measured zero; a timestamp pair mixing a timezone-aware endpoint with a naive
+one, since the missing offset cannot be guessed; an unrecognised phase name; a
+corrupt `e2e` or `e2e.evidence` container, which would otherwise drop a whole
+file's rows from a combined summary; and an evidence entry missing any of
+`tier`, `command` or `commit`, whose absence would let unrelated candidates
+collapse into one duplicate group. An absent `e2e` key and an empty
+`"evidence": []` are not malformed — they simply contribute no rows.
+
+The `source` reported for each row and duplicate group is the state file's bare
+name, never its local absolute path; error messages keep the full path, because
+a diagnosis needs it.
 
 ## Running it
 
