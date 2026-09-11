@@ -424,7 +424,7 @@ jobs:
       - name: helm render assertions (github review config)
         run: |
           set -euo pipefail
-          bash charts/curie/ci/github-review-config-assertions.sh
+          charts/curie/ci/github-review-config-assertions.sh
 
       # Prove the sealing keypair's handling (ADR-0094). It is the one credential
       # in this chart nobody can regenerate: losing it does not rotate anything,
