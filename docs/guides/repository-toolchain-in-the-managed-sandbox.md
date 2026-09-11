@@ -111,6 +111,9 @@ published, and everything the sandbox produced is gone:**
 | uncommitted edits and untracked files | preserved | **lost** |
 | the virtualenv, and anything under `/tmp` or `/home/runner` | preserved | **lost** |
 
+Put plainly: **uncommitted changes are lost, and so is any commit you made in
+the sandbox but never published.** Both die with the pod.
+
 This is structural, not a gap to be fixed by being careful. A replacement pod
 re-materializes `/workspace` through `workspace-init`, which fetches the signed
 archive the trusted worker built from *its own* clone of the remote. Nothing
@@ -119,14 +122,19 @@ is no mechanism by which in-sandbox work could survive. `workspace-init` also
 erases `/workspace` before extracting, deliberately, so that an interrupted
 extraction can never be overlaid.
 
-Three ordinary things replace the pod, and only the first is obvious:
+Three ordinary things replace the pod, and the last is the one that catches
+people out:
 
 - the late workspace handoff of ADR-0136, when a conversation acquires a
   repository after it has already started;
-- suspend/resume (ADR-0003 suspend *is* pod deletion), and any eviction, node
-  drain or rescheduling — here the claim, the route and the session id are all
-  unchanged, so there is no claim-level event that says work was discarded;
-- any pod restart that is not an in-place container restart.
+- suspend and resume — ADR-0003 suspend *is* pod deletion, and resume does not
+  bring the pod back: it retires the suspended claim and creates a fresh one at
+  the next route generation, so the replacement is visible as a new claim;
+- eviction, node drain or any rescheduling, where the controller recreates the
+  pod beneath a claim that never changes. The claim, the route and the session
+  id all stay exactly as they were and only the pod's uid moves, so nothing at
+  claim level records that a workspace was discarded and rebuilt. This is the
+  one you will not be told about.
 
 So: **the only durable place for work is publication.** `publish_changes` is not
 a nicety at the end of a task, it is the step that makes the work exist outside a

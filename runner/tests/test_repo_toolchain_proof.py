@@ -1094,14 +1094,37 @@ _HONESTY_ROWS: tuple[tuple[str, str, str], ...] = (
 
 _DATA_LOSS_WARNING_TERMS: tuple[tuple[str, str], ...] = (
     ("the pod-replacement case must be named", r"pod\s+replacement|pod-replacing"),
-    ("uncommitted work must be named as lost", r"uncommitted"),
     (
-        "an unpublished commit must be named as lost too, not just uncommitted edits",
-        r"unpublished\s+commit",
+        "uncommitted work must be asserted LOST, not merely mentioned",
+        r"uncommitted[^.|\n]{0,80}\b(lost|gone|discard\w*|erase\w*|wipe\w*)\b"
+        r"|\b(lost|gone|discard\w*|erase\w*|wipe\w*)\b[^.|\n]{0,80}uncommitted",
+    ),
+    (
+        "an unpublished commit must be asserted LOST too, not just uncommitted edits",
+        r"unpublished\s+commit[^.|\n]{0,80}\b(dies|lost|gone|discard\w*)\b",
     ),
     (
         "publication must be named as the durable answer",
         r"publish_changes",
+    ),
+)
+
+# A warning that says the opposite of what #2615 measured must never pass. These
+# are the shapes a softened rewrite actually takes -- "it survives", "it is
+# preserved", "it is kept" said of a pod replacement -- and each is a lie about
+# the recorded run.
+_DATA_LOSS_CONTRADICTIONS: tuple[tuple[str, str], ...] = (
+    (
+        "uncommitted work claimed to survive a replacement",
+        r"pod\s+replacement[^.|\n]{0,120}\b(preserv\w*|surviv\w*|keep\w*|kept|retain\w*)\b"
+        r"[^.|\n]{0,60}uncommitted"
+        r"|uncommitted[^.|\n]{0,80}\b(preserv\w*|surviv\w*|kept|retain\w*)\b"
+        r"[^.|\n]{0,60}pod\s+replacement",
+    ),
+    (
+        "publication declared unnecessary",
+        r"no\s+need\s+for\s+publish_changes|publish_changes\s+is\s+(not\s+)?"
+        r"(necessary|needed|required)",
     ),
 )
 
@@ -1115,6 +1138,12 @@ def _assert_guide_warns_about_pod_replacement_data_loss(text: str) -> None:
     *before* the recipe an operator is about to follow. A drift test that merely
     pinned the applicability row would stay green while the body warning was
     deleted -- the row is read after the fact, the warning is read in time.
+
+    Pinning the *subject words* alone is not enough either, and that is the
+    sharper trap: a rewrite saying a pod replacement **preserves** uncommitted
+    work names every required term while asserting the opposite of the measured
+    result. So each term is pinned to its loss relationship, and the inverted
+    claims are rejected outright as negative controls.
     """
 
     body = text.split("## 3. The recipe")[0]
@@ -1125,6 +1154,13 @@ def _assert_guide_warns_about_pod_replacement_data_loss(text: str) -> None:
             f"{label}: the pod-replacement data-loss warning must appear before "
             "the recipe. Deleting or softening it lets an operator follow the "
             "recipe without being told the workspace is not storage."
+        )
+    for label, pattern in _DATA_LOSS_CONTRADICTIONS:
+        assert not re.search(pattern, lowered), (
+            f"{label}: the guide now claims the opposite of what the #2615 "
+            "cluster run measured. A pod replacement re-fetches the signed "
+            "archive and discards every in-sandbox change; saying otherwise "
+            "invites exactly the data loss this warning exists to prevent."
         )
     assert re.search(r"in-place", lowered), (
         "the warning must distinguish an in-place container restart (which "
