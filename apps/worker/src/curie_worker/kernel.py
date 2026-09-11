@@ -2464,10 +2464,16 @@ class Kernel:
         # mode emits one final chat.update. A placeholderless approval is an
         # exception: its approval path posts the request text before persistence,
         # then updates that message with the approval notice.
-        # A placeholderless job must route first. Otherwise every busy redelivery
-        # posts a notice for a turn that never started.
+        # A placeholderless job or review candidate must route first. Otherwise
+        # every busy redelivery or authority outage posts a notice for a turn
+        # that never started. Reviews publish their receipt after reservation;
+        # jobs publish the deferred booting state below after routing succeeds.
+        review_candidate = _REVIEW_EVENT_ID_RE.fullmatch(qevent.event_id) is not None
         defer_job_booting = qevent.reply_handle.placeholder is None and qevent.source.is_job
-        if not self._config.slack_no_edit_streaming and not defer_job_booting:
+        defer_review_booting = qevent.reply_handle.placeholder is None and review_candidate
+        if not self._config.slack_no_edit_streaming and not (
+            defer_job_booting or defer_review_booting
+        ):
             try:
                 await self._reply_for(
                     qevent, route, self._config.booting_text, terminal=False
@@ -2492,7 +2498,7 @@ class Kernel:
 
         try:
             try:
-                if _REVIEW_EVENT_ID_RE.fullmatch(qevent.event_id) is not None:
+                if review_candidate:
                     verifier = getattr(
                         self._publication_creator, "verify_review_feedback", None
                     )
