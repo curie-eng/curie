@@ -144,7 +144,7 @@ def test_pull_request_issue_comment_url_shapes_normalize_to_one_identity(
 @pytest.mark.parametrize(
     "claimed_url",
     [
-        f"https://github.com/acme-corp/other/pull/17#issuecomment-71",
+        "https://github.com/acme-corp/other/pull/17#issuecomment-71",
         f"https://github.com/{REPO}/pull/18#issuecomment-71",
         f"https://github.com/{REPO}/pull/17#issuecomment-72",
         f"https://github.com/{REPO}/issues/18#issuecomment-71",
