@@ -44,12 +44,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -243,6 +244,45 @@ def decode_attachment_refs(value: str) -> tuple[AttachmentRef, ...]:
         ):
             raise AttachmentResolutionError("reference", "attachment digest is invalid")
     return refs
+
+
+def unique_attachment_leaf(leaf: str, taken: Container[str]) -> str:
+    """The name this attachment gets on disk once ``taken`` is already there.
+
+    Two people attaching ``report.pdf`` to one message is ordinary, and until
+    this existed the second one landed on top of the first: the substrate wrote
+    both to ``<mount>/report.pdf`` and the agent saw one file where two arrived,
+    with nothing anywhere saying one had been destroyed. That is the same silent
+    loss #2567 was filed to close, one layer down, so it is disambiguated rather
+    than refused -- refusing would turn a routine upload into a dead turn.
+
+    The scheme is a numeric suffix BEFORE the extension (``report.pdf``,
+    ``report-2.pdf``, ``report-3.pdf``). The first file keeps the name the
+    person sent, which is what the agent will be asked about by name; the
+    extension survives, so anything selecting by suffix still works; and the
+    collision is visible in the listing the runner announces rather than hidden.
+    A per-attachment subdirectory was the alternative and was rejected: it
+    changes the path shape of the overwhelmingly common single-file turn to pay
+    for the rare one.
+
+    The counter skips a name that is itself already taken, so an upload set of
+    (``report.pdf``, ``report-2.pdf``, ``report.pdf``) lands as those two plus
+    ``report-3.pdf`` rather than colliding on the rename.
+
+    ``charts/curie/templates/agent-sandbox.yaml`` reimplements this inline --
+    the init container is a rendered program and cannot import the worker -- and
+    ``charts/curie/ci/attachment-init-behavior-assertions.sh`` executes that copy
+    against the same case this one is tested on, so the two tiers cannot drift
+    into naming the same set differently.
+    """
+
+    if leaf not in taken:
+        return leaf
+    stem, extension = os.path.splitext(leaf)
+    bump = 2
+    while f"{stem}-{bump}{extension}" in taken:
+        bump += 1
+    return f"{stem}-{bump}{extension}"
 
 
 @dataclass(frozen=True)

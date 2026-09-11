@@ -533,3 +533,49 @@ def test_a_second_resolve_of_the_same_turn_never_reuses_an_object_key(
 
     assert first.object_keys != second.object_keys
     assert set(objects.objects) >= set(first.object_keys) | set(second.object_keys)
+
+
+# --- duplicate filenames (#2567 follow-up) ----------------------------------
+
+
+def test_unique_attachment_leaf_suffixes_before_the_extension(attachments: Any) -> None:
+    """The naming contract both substrates implement.
+
+    Asserted here as well as through the two materializers because the scheme
+    itself is the cross-tier agreement: the Docker driver imports this function
+    and the rendered ``attachments-init`` program reimplements it, so a change
+    to the shape here is a change to what a pod produces.
+    """
+
+    unique_attachment_leaf = attachments.unique_attachment_leaf
+
+    taken: set[str] = set()
+    landed = []
+    for leaf in ("report.pdf", "report.pdf", "report.pdf"):
+        name = unique_attachment_leaf(leaf, taken)
+        taken.add(name)
+        landed.append(name)
+    assert landed == ["report.pdf", "report-2.pdf", "report-3.pdf"]
+
+
+def test_unique_attachment_leaf_skips_a_name_a_person_really_sent(attachments: Any) -> None:
+    assert attachments.unique_attachment_leaf("report.pdf", {"report.pdf", "report-2.pdf"}) == "report-3.pdf"
+
+
+@pytest.mark.parametrize(
+    ("leaf", "expected"),
+    [
+        # No extension at all: the suffix is simply appended.
+        ("README", "README-2"),
+        # A dotfile is all stem, not all extension -- os.path.splitext's rule,
+        # and the one that keeps ".bashrc" recognisable.
+        (".bashrc", ".bashrc-2"),
+        # Only the last component is an extension, so the recognisable
+        # "archive.tar" stays intact.
+        ("archive.tar.gz", "archive.tar-2.gz"),
+    ],
+)
+def test_unique_attachment_leaf_keeps_the_extension_readable(
+    attachments: Any, leaf: str, expected: str
+) -> None:
+    assert attachments.unique_attachment_leaf(leaf, {leaf}) == expected

@@ -605,6 +605,7 @@ spec:
               stage.mkdir(mode=0o700)
               opener = urllib.request.build_opener(NoRedirect())
               staged = []
+              taken = set()
               try:
                   signal.alarm({{ $af.fetchTimeoutSeconds }})
                   for index, entry in enumerate(entries):
@@ -631,7 +632,22 @@ spec:
                           raise SystemExit("attachments-init: attachment digest mismatch")
                       staged.append((target, name))
                   signal.alarm(0)
+                  # Two uploads sharing a filename must both survive: `os.replace`
+                  # onto the same path destroyed one of them silently, which is
+                  # the bug this lane exists to close. The twin of
+                  # curie_worker.attachments.unique_attachment_leaf -- a numeric
+                  # suffix before the extension, first file keeping the person's
+                  # own name -- reimplemented because a rendered program cannot
+                  # import the worker. ci/attachment-init-behavior-assertions.sh
+                  # executes this copy on the case the worker's is tested on.
                   for target, name in staged:
+                      if name in taken:
+                          stem, extension = os.path.splitext(name)
+                          bump = 2
+                          while "%s-%d%s" % (stem, bump, extension) in taken:
+                              bump += 1
+                          name = "%s-%d%s" % (stem, bump, extension)
+                      taken.add(name)
                       destination = root / name
                       if destination.resolve().parent != root.resolve():
                           raise SystemExit("attachments-init: attachment name escapes the mount")

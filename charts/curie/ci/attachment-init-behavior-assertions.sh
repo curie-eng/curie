@@ -253,6 +253,59 @@ if not any("report" in name for name in landed):
     fail(f"the uploader's filename did not survive into the mount: {sorted(landed)}")
 print("  ok: the uploader's filename is recoverable from the mount")
 
+# --- (a2) two uploads sharing a filename ------------------------------------
+#
+# Two `report.pdf` in one message is ordinary. Until this was fixed both were
+# written to `<mount>/report.pdf` and the second silently destroyed the first --
+# the agent saw one file where two arrived. The k8s half of the fix lives in the
+# rendered program below; the worker half is
+# curie_worker.attachments.unique_attachment_leaf, and
+# apps/worker/tests/sandbox/test_docker_attachment_claim.py runs this same case
+# through the Docker driver. Both tiers must produce the SAME names, so this
+# asserts the names and the bytes rather than just the count.
+
+one, two, three = b"first report", b"second report", b"third report"
+completed = run(
+    encode(
+        [
+            entry("report.pdf", publish(7, one), one, mime="application/pdf"),
+            entry("report.pdf", publish(8, two), two, mime="application/pdf"),
+            entry("report.pdf", publish(9, three), three, mime="application/pdf"),
+        ]
+    )
+)
+if completed.returncode != 0:
+    fail(
+        "three same-named attachments were not materialized "
+        f"(exit {completed.returncode})\n    stderr={completed.stderr!r}"
+    )
+landed = visible()
+if landed != {"report.pdf": one, "report-2.pdf": two, "report-3.pdf": three}:
+    fail(
+        "duplicate filenames did not disambiguate to report.pdf / report-2.pdf / "
+        f"report-3.pdf; the mount holds {sorted(landed)}. A same-named upload "
+        "that overwrites its predecessor is the silent loss this lane exists to close."
+    )
+print("  ok: three uploads named report.pdf all materialize, byte-exactly and distinctly")
+
+# The counter must skip a name a person really did send, or the disambiguation
+# becomes the overwrite it was added to prevent.
+completed = run(
+    encode(
+        [
+            entry("report.pdf", publish(10, one), one, mime="application/pdf"),
+            entry("report-2.pdf", publish(11, two), two, mime="application/pdf"),
+            entry("report.pdf", publish(12, three), three, mime="application/pdf"),
+        ]
+    )
+)
+if completed.returncode != 0:
+    fail(f"a literal report-2.pdf alongside two report.pdf was refused\n    stderr={completed.stderr!r}")
+landed = visible()
+if landed != {"report.pdf": one, "report-2.pdf": two, "report-3.pdf": three}:
+    fail(f"a literal report-2.pdf was overwritten by the disambiguator: {sorted(landed)}")
+print("  ok: a literal report-2.pdf is not overwritten by the disambiguator")
+
 # --- (b) a digest that does not match ---------------------------------------
 
 expect_refusal(

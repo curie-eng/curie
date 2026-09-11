@@ -67,6 +67,7 @@ from ..attachments import (
     AttachmentResolutionError,
     AttachmentTooLargeError,
     decode_attachment_refs,
+    unique_attachment_leaf,
 )
 from ..binding import (
     BASE_URL_ENV,
@@ -682,6 +683,11 @@ class DockerSandboxClient:
         tmp = tempfile.mkdtemp(prefix="curie-attachments-")
         root = Path(tmp) / "attachments"
         root.mkdir(mode=0o755)
+        # Two files named `report.pdf` in one message used to land on the same
+        # path and the second silently destroyed the first. `unique_attachment_leaf`
+        # is the same scheme the rendered `attachments-init` program applies, in
+        # the same order, so a set materializes identically on both substrates.
+        taken: set[str] = set()
         try:
             for ref in refs:
                 if ref.expires_in_seconds <= 0:
@@ -699,6 +705,8 @@ class DockerSandboxClient:
                         "attachments-fetch",
                         f"name {ref.name!r} is unusable as a filename",
                     )
+                leaf = unique_attachment_leaf(leaf, taken)
+                taken.add(leaf)
                 destination = root / leaf
                 if destination.resolve().parent != root.resolve():
                     raise AttachmentResolutionError(

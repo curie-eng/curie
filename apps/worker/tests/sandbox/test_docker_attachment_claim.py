@@ -391,6 +391,90 @@ def test_attachments_are_materialized_and_bind_mounted_read_only(
     assert objects.requested == [report_url, notes_url]
 
 
+def test_two_attachments_sharing_a_filename_both_survive(
+    objects: _FakeObjectStore, staged: list[Path]
+) -> None:
+    """Two ``report.pdf`` in one message. Both must be readable.
+
+    Before this, both were written to ``<mount>/report.pdf`` and the second
+    destroyed the first: the agent saw one file where two arrived, with nothing
+    saying one had been lost. That is exactly the silent loss #2567 exists to
+    close, reintroduced one layer down, and it defeats the lane's own
+    all-or-nothing argument -- a partial set reads to an agent like a complete
+    one.
+
+    The disambiguation is asserted by NAME, not merely by count: the scheme is a
+    cross-substrate contract (the rendered ``attachments-init`` program applies
+    the same one, and ci/attachment-init-behavior-assertions.sh executes it on
+    this case), so a driver that invented its own suffix would still mount two
+    files and still be wrong.
+    """
+
+    first, second, third = b"first report", b"second report", b"third report"
+    urls = [
+        objects.add("https://objects.example.test/attachments/a/000.bin", first),
+        objects.add("https://objects.example.test/attachments/a/001.bin", second),
+        objects.add("https://objects.example.test/attachments/a/002.bin", third),
+    ]
+
+    client = _client()
+    client.create_claim(
+        "claim-attachments",
+        pool="pool",
+        env=_env(
+            _ref(url=urls[0], name="report.pdf", payload=first),
+            _ref(url=urls[1], name="report.pdf", payload=second),
+            _ref(url=urls[2], name="report.pdf", payload=third),
+        ),
+    )
+
+    root, _mode = _attachment_mount(client.calls[0])
+    visible = sorted(entry.name for entry in root.iterdir() if not entry.name.startswith("."))
+    assert visible == ["report-2.pdf", "report-3.pdf", "report.pdf"], (
+        f"three same-named uploads materialized as {visible}; one of them was "
+        "silently destroyed or renamed by some other scheme than the chart's"
+    )
+    # The bytes, not just the names: a scheme that produced three paths but
+    # pointed two of them at the same object would pass a name-only check.
+    assert (root / "report.pdf").read_bytes() == first
+    assert (root / "report-2.pdf").read_bytes() == second
+    assert (root / "report-3.pdf").read_bytes() == third
+    assert objects.requested == urls
+
+
+def test_a_collision_with_an_already_disambiguated_name_does_not_overwrite(
+    objects: _FakeObjectStore, staged: list[Path]
+) -> None:
+    """A person really did upload a file called ``report-2.pdf``.
+
+    The counter has to skip a name that is already taken, or the disambiguation
+    itself becomes the overwrite it was added to prevent.
+    """
+
+    first, literal, third = b"one", b"literally report-2", b"three"
+    urls = [
+        objects.add("https://objects.example.test/attachments/a/000.bin", first),
+        objects.add("https://objects.example.test/attachments/a/001.bin", literal),
+        objects.add("https://objects.example.test/attachments/a/002.bin", third),
+    ]
+
+    client = _client()
+    client.create_claim(
+        "claim-attachments",
+        pool="pool",
+        env=_env(
+            _ref(url=urls[0], name="report.pdf", payload=first),
+            _ref(url=urls[1], name="report-2.pdf", payload=literal),
+            _ref(url=urls[2], name="report.pdf", payload=third),
+        ),
+    )
+
+    root, _mode = _attachment_mount(client.calls[0])
+    assert (root / "report.pdf").read_bytes() == first
+    assert (root / "report-2.pdf").read_bytes() == literal
+    assert (root / "report-3.pdf").read_bytes() == third
+
+
 def test_the_mount_path_agrees_with_the_runner_and_the_chart(
     objects: _FakeObjectStore, staged: list[Path]
 ) -> None:
