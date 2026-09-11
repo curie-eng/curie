@@ -55,6 +55,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_REPO = Path(__file__).resolve().parent / "fixtures" / "repo_toolchain"
 GUIDE = REPO_ROOT / "docs" / "guides" / "repository-toolchain-in-the-managed-sandbox.md"
+PIP_CONF = REPO_ROOT / "runner" / "pip.conf"
+DOCKERFILE = REPO_ROOT / "runner" / "Dockerfile"
 
 # --- product posture, imported rather than hardcoded -------------------------
 #
@@ -366,6 +368,7 @@ def _run_in_sandbox(
     network: str | None = "none",
     timeout: int = DEFAULT_TIMEOUT,
     workdir: str | None = None,
+    extra_run_args: list[str] | None = None,
 ) -> Step:
     """Run one shell script inside the runner image under the product posture.
 
@@ -375,6 +378,8 @@ def _run_in_sandbox(
     name = f"{CONTAINER_PREFIX}{uuid.uuid4().hex[:12]}"
     _LAUNCHED_CONTAINER_NAMES.append(name)
     argv = ["docker", "run", "--rm", "--name", name, *HARDENING_ARGS]
+    if extra_run_args:
+        argv += extra_run_args
     if network is not None:
         argv += ["--network", network]
     if workspace is not None:
@@ -717,6 +722,66 @@ def test_unreachable_registry_fails_bounded_and_truthfully(tmp_path: Path) -> No
     evidence.write(_evidence_dir(tmp_path) / "repo-toolchain-unreachable-registry-evidence.json")
 
 
+def test_default_index_blocked_egress_fails_on_the_image_retry_budget(
+    tmp_path: Path,
+) -> None:
+    """Catches a fail-closed live-registry install hanging on pip's default retries.
+
+    The cluster observation (#2614) was a default-index pip install under
+    NetworkPolicy ENETUNREACH that ran for ~368s because pip retried every
+    resolved address. The image ships ``/etc/pip.conf`` with ``retries = 0``
+    so that command fails on the first attempt.
+
+    Local analog: pin ``pypi.org`` to TEST-NET-1 so DNS "succeeds" and the TCP
+    connect sits on pip's 15s socket timeout instead of failing at name
+    resolution (``--network none``). Without the image pip.conf this takes
+    ~90s (5 attempts * 15s) and trips the 45s bound below.
+    """
+
+    _require_runner_image()
+    _require_non_vacuous_hardening()
+    _require_fixture()
+
+    evidence = Evidence()
+    with tempfile.TemporaryDirectory(prefix="curie-2614-blocked-") as root:
+        workspace = _materialize_fixture_clone(Path(root))
+        step = evidence.record(
+            _run_in_sandbox(
+                "install-default-index-blocked-egress",
+                INSTALL_LIVE,
+                workspace=workspace,
+                network=None,
+                timeout=45,
+                extra_run_args=[
+                    "--add-host",
+                    "pypi.org:192.0.2.1",
+                    "--add-host",
+                    "files.pythonhosted.org:192.0.2.1",
+                ],
+            )
+        )
+
+    assert step.exit_status != 0, (
+        f"a blocked default-index install must not report success:\n{step.output}"
+    )
+    assert step.duration_seconds < 30, (
+        f"the image pip.conf must fail the blocked install on the first attempt, "
+        f"not pip's default retry budget; observed {step.duration_seconds}s:\n"
+        f"{step.output}"
+    )
+    lowered = step.output.casefold()
+    assert (
+        "could not find a version that satisfies the requirement" in lowered
+        or "no matching distribution found" in lowered
+        or "network is unreachable" in lowered
+        or "timed out" in lowered
+        or "connection" in lowered
+    ), f"the failure text must truthfully name the blocked registry:\n{step.output}"
+    assert "successfully installed" not in lowered, "a failed install must never claim success"
+
+    evidence.write(_evidence_dir(tmp_path) / "repo-toolchain-blocked-default-index-evidence.json")
+
+
 def test_missing_toolchain_fails_bounded_and_truthfully(tmp_path: Path) -> None:
     """Catches a missing toolchain being swallowed into a silent pass.
 
@@ -1006,6 +1071,17 @@ def test_guide_documents_the_recipe_and_the_boundary() -> None:
     assert "command not found" in lowered or "not found" in lowered, (
         "bounded failure mode 2 (missing toolchain) must be shown"
     )
+    assert "368" in text, (
+        "the guide must record the measured fail-closed live-registry latency, "
+        "not describe it only as 'well inside its timeout'"
+    )
+    assert "/etc/pip.conf" in text and "retries = 0" in text, (
+        "the guide must name the image pip.conf that bounds the refusal"
+    )
+    assert "network is unreachable" in lowered, (
+        "the fail-closed default-index error must be shown, not only the "
+        "wrong-index 'no matching distribution' text"
+    )
 
     for tier in ("local", "cluster", "slack"):
         assert tier in lowered, f"the applicability matrix must cover the {tier} tier"
@@ -1015,6 +1091,31 @@ def test_guide_documents_the_recipe_and_the_boundary() -> None:
     # The docs gate bans raw line-coordinate citations anywhere in the file.
     assert not re.search(r"\.(?:py|rs|toml|yaml|md)(?::\d+|#L\d+)", text), (
         "the docs citation gate bans file:line citations; cite by path only"
+    )
+
+
+def test_runner_image_ships_fail_fast_pip_retries() -> None:
+    """Catches the image retry bound drifting back to pip's default of 5.
+
+    The 368s cluster refusal was pip's default retry budget. If /etc/pip.conf
+    loses ``retries = 0``, or the Dockerfile stops copying it, the naive
+    Profile B command hangs for minutes again and the guide's fail-fast claim
+    is false.
+    """
+
+    assert PIP_CONF.is_file(), f"the runner image pip.conf must exist at {PIP_CONF}"
+    conf = PIP_CONF.read_text()
+    assert re.search(r"^retries\s*=\s*0\s*$", conf, flags=re.MULTILINE), (
+        "runner/pip.conf must set retries = 0; a higher value reintroduces the "
+        f"multi-minute fail-closed install:\n{conf}"
+    )
+    assert re.search(r"^timeout\s*=\s*15\s*$", conf, flags=re.MULTILINE), (
+        f"runner/pip.conf must keep pip's 15s socket timeout explicit:\n{conf}"
+    )
+    dockerfile = DOCKERFILE.read_text()
+    assert "COPY runner/pip.conf /etc/pip.conf" in dockerfile, (
+        "the Dockerfile must install the pip.conf at the site-wide path "
+        "workspace venvs actually read"
     )
 
 

@@ -50,6 +50,11 @@ git history (`git log -- docs/`).
   declarative data rather than code, and what is wired today.
 - [`operations.md`](operations.md): running a cluster install, plus
   operator-facing findings from early installs.
+- [`guides/repository-toolchain-in-the-managed-sandbox.md`](guides/repository-toolchain-in-the-managed-sandbox.md):
+  the supported recipe for installing a repository's dependencies and running
+  its checks inside a managed sandbox, including the measured fail-closed
+  live-registry refusal (~368s on unconfigured pip; the runner image now
+  ships `/etc/pip.conf` with `retries = 0`).
 - [`release-verification.md`](release-verification.md): what every release asset
   carries (checksums, signature, provenance, SBOM) and how to verify one before
   you run it, plus the patch-release rule that the cut names its defect trigger

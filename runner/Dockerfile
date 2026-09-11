@@ -97,5 +97,10 @@ ENV PATH="/app/.venv/bin:$PATH"
 ENV CURIE_RUNNER_PORT=8080
 EXPOSE 8080
 
+# Runtime pip defaults (#2614). Copied after the image's own pip installs so a
+# flaky registry during the build still gets pip's default retries. Workspace
+# venvs created at runtime read this site-wide file.
+COPY runner/pip.conf /etc/pip.conf
+
 USER 1000:1000
 CMD ["python", "-m", "curie_runner"]

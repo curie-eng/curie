@@ -1079,7 +1079,12 @@ sandbox and renders whenever an in-chart store is deployed.
 **Fail-closed egress.** `security.networkPolicy.allowedEgress` is EMPTY by
 default: a fresh install denies all egress except DNS until the operator declares
 where the model API and MCP endpoints live (`{cidr, ports}` entries). An unset
-allowlist never means allow-all. The BYO in-chart peers are not on that list
+allowlist never means allow-all. A live-registry `pip install` under that default
+is a truthful refusal (`Network is unreachable`, exit 1), not a hang: on
+`curie-runner:0.8.7` it took ~368s (pip's default retry budget across every
+resolved address). The runner image now ships `/etc/pip.conf` with `retries = 0`
+so the same command fails on the first unreachable attempt. See
+[Repository toolchain in the managed sandbox](../../docs/guides/repository-toolchain-in-the-managed-sandbox.md). The BYO in-chart peers are not on that list
 either, because each names one endpoint rather than a class of destinations: set
 `rustfs.egress` (and `rustfs.stsEgress` on the key-free path) so the sandbox
 bundle-fetch can reach S3 and STS, `otelCollector.egress` when the runner's

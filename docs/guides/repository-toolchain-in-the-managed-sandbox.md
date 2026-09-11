@@ -203,16 +203,37 @@ Both failure modes an operator actually meets are non-zero, terminating, and say
 what went wrong. Neither is ever reported as success, and under the publication
 contract the coder must report the failure and **not** publish.
 
-**Wrong or unreachable registry.** pip exhausts its retries and exits non-zero
-with the requirement named:
+**Wrong or unreachable registry.** pip exits non-zero and names the unsatisfied
+requirement:
 
 ```text
 ERROR: Could not find a version that satisfies the requirement <name> (from versions: none)
 ERROR: No matching distribution found for <name>
 ```
 
-No `Successfully installed` line is printed. The step terminates well inside its
-timeout rather than hanging.
+No `Successfully installed` line is printed. Under the chart's fail-closed
+egress default the same command talking to real `pypi.org` is also a refusal
+(`Network is unreachable`, exit 1) — it is not a hang. What *looks* like a hang
+is pip's default retry budget: `retries=5` at a 15s socket timeout, across every
+resolved address.
+
+| What you ran | Where | Wall clock | What bounded it |
+|---|---|---|---|
+| `.venv/bin/pip install requests==2.32.3` (pip defaults) | live kind cluster, chart fail-closed egress, `curie-runner:0.8.7`, 2026-09-11 | **~368 s**, exit 1, `[Errno 101] Network is unreachable (pypi.org:443)` | pip default retries=5, not Curie |
+| wrong-but-reachable index (`--index-url https://192.0.2.1/simple`) | same cluster proof | **~8 s** | connection refused / TEST-NET |
+| missing toolchain (`poetry install`) | same cluster proof | **well under 1 s**, exit 127 | shell `command not found` |
+| `git push` to unreachable github.com | same cluster proof | **~135 s**, exit 128 | git's own HTTP retry |
+| default-index pip, `PIP_RETRIES=0` | local analog, `pypi.org` pinned to TEST-NET-1 so DNS "succeeds" and TCP sits on the socket timeout | **18.6 s** (venv + one 15s connect) | image `/etc/pip.conf` |
+| default-index pip, `PIP_RETRIES=0` | local analog, `--network none` (fails at DNS) | **2.8 s** | image `/etc/pip.conf` |
+
+The runner image now ships `/etc/pip.conf` with `timeout = 15` and `retries = 0`,
+copied after the image's own pip installs so a flaky registry during the *build*
+still gets pip's default retries. Workspace venvs created at runtime read that
+site-wide file, so the naive Profile B command — the one an agent actually types —
+fails on the first unreachable attempt instead of spending six minutes of a run
+budget discovering the same ENETUNREACH. Override with `--retries` / `PIP_RETRIES`
+when a reachable index is flaky. Released `curie-runner:0.8.7` does **not** carry
+this file; that is the image the 368s number was measured against.
 
 **Missing toolchain.** A check command whose toolchain the image does not carry
 fails immediately with a `command not found`-class error and a non-zero status —
@@ -229,7 +250,7 @@ What the committed evidence does and does not cover.
 | live provider | **Not covered.** | The harness makes no model call. The recipe is about the toolchain, not the session. |
 | slack | **Not covered.** | No Slack external-integration run is included. The publication approval a Slack thread would carry is asserted statically here, not exercised. |
 | GitHub | **Boundary asserted statically.** | The credential handling in section 5 is read from the worker's workspace acquisition path and the publication tool's contract; no live human publication approval was exercised. |
-| Profile B against an enforcing NetworkPolicy | **Refusal proved; admission not.** | Under the chart's fail-closed default, a live-registry install fails truthfully (`Network is unreachable`, exit 1) — but only after **~368 s**, pip's default retry budget. That a hand-written `--allow-web-egress` CIDR then *admits* PyPI is still unproved. |
+| Profile B against an enforcing NetworkPolicy | **Refusal proved; admission not.** | Under the chart's fail-closed default, a live-registry install fails truthfully (`Network is unreachable`, exit 1). Unconfigured pip on `curie-runner:0.8.7` took **~368 s**; the image now ships `/etc/pip.conf` with `retries = 0` so the same command fails on the first attempt (see section 6). That a hand-written `--allow-web-egress` CIDR then *admits* PyPI is still unproved. |
 | repeat in a newly acquired workspace, and after restart/handoff | **Supported and proved.** | A second, independently claimed sandbox reproduced the whole recipe from the acquired head with no state carried over, producing its own distinct commits. An in-place container restart preserved the workspace, its three-commit history, the expected head and the credential-free origin. A *pod-replacing* handoff is still unproved: it would discard all `emptyDir` state and re-fetch the workspace from the signed archive. |
 
 Every container the harness starts is `--rm` and every workspace it creates is a
