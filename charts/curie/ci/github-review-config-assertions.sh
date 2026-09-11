@@ -82,16 +82,21 @@ assert_rendered_values(
     "2.5",
 )
 
-# Exercise Helm's values-schema gate through the real render consumer.
-for arguments, path in (
-    (("--set-string", "api.githubReviewIngressEnabled=true"), "/api/githubReviewIngressEnabled"),
-    (("--set", "api.githubReviewReconcilerIntervalSeconds=0"), "/api/githubReviewReconcilerIntervalSeconds"),
-    (("--set", "api.githubReviewReconcilerIntervalSeconds=-1"), "/api/githubReviewReconcilerIntervalSeconds"),
-    (("--set-string", "api.githubReviewReconcilerIntervalSeconds=5"), "/api/githubReviewReconcilerIntervalSeconds"),
+# Exercise Helm's values-schema gate through the real render consumer. Helm
+# reports the same schema location as a dotted path in v3 and a JSON pointer in
+# v4, so accept those two exact shapes while still requiring the named field.
+for arguments, field in (
+    (("--set-string", "api.githubReviewIngressEnabled=true"), "githubReviewIngressEnabled"),
+    (("--set", "api.githubReviewReconcilerIntervalSeconds=0"), "githubReviewReconcilerIntervalSeconds"),
+    (("--set", "api.githubReviewReconcilerIntervalSeconds=-1"), "githubReviewReconcilerIntervalSeconds"),
+    (("--set-string", "api.githubReviewReconcilerIntervalSeconds=5"), "githubReviewReconcilerIntervalSeconds"),
 ):
     failure = render(*arguments, expect_success=False)
     diagnostic = failure.stdout + failure.stderr
-    assert path in diagnostic, f"schema refusal did not name {path}: {diagnostic}"
+    exact_paths = (f"api.{field}", f"/api/{field}")
+    assert any(path in diagnostic for path in exact_paths), (
+        f"schema refusal did not name {exact_paths}: {diagnostic}"
+    )
 
 # Both first-class entries stay reserved even while ingress is disabled.
 for name, replacement in (
