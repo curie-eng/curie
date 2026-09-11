@@ -1161,6 +1161,314 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                 cleanup.callback(objects_client.delete_object, Bucket=bucket, Key=obj["Key"])
 
 
+@pytest.mark.parametrize("route_case", ["steer", "finish_race"])
+def test_reserved_review_keeps_ordinary_slack_routing(
+    review_stack,
+    tmp_path,
+    route_case: str,
+) -> None:
+    """A real review reservation is not an ordinary pending publication.
+
+    The persisted reservation comes from the actual API and Postgres path. The
+    ordinary Slack follow-up then crosses Consumer, the production
+    ApprovalClient lineage read, Kernel, and RunnerClient. GitHub and the ACI
+    peer remain the two external fixtures.
+    """
+    import uvicorn
+    from aci_protocol import (
+        Final,
+        QueuedTurn,
+        ReplyHandle,
+        SessionStatus,
+        TextDelta,
+        TurnSource,
+    )
+    from aci_protocol.s3 import build_s3_client
+    from curie_dispatcher.queue import to_stream_fields
+    from curie_worker.approvals import ApprovalClient
+    from curie_worker.binding import BindingResolver
+    from curie_worker.consumer import Consumer
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from curie_worker.workspace import (
+        SubprocessCommands,
+        WorkspaceClaimCoordinator,
+        WorkspaceCredentialClient,
+        WorkspaceLimits,
+        WorkspaceObjectStore,
+        WorkspacePreparer,
+    )
+
+    from apps.worker.tests.kernel.conftest import kernel_harness, make_config
+
+    client, truth, valkey, stream = review_stack
+    settings = get_settings()
+    names = {
+        "stream": stream,
+        "group": f"{stream}:group",
+        "prefix": settings.worker_key_prefix,
+        "sandbox_prefix": f"{stream}:sandbox",
+    }
+    conversation_id = "1700000000.000001"
+    thread_key = scoped_conversation_id(
+        "slack", "C0EXAMPLE1", conversation_id
+    )
+    lineage_authorization = "Basic " + base64.b64encode(
+        b"x-access-token:fixture-app-token-private-sentinel"
+    ).decode()
+
+    def github(request):
+        if (
+            request.url.path == f"/repos/{REPO}/pulls/17"
+            and request.headers.get("Authorization") == lineage_authorization
+        ):
+            truth.calls.append(request.url.path)
+            return httpx.Response(200, json=truth.pr)
+        return truth.handle(request)
+
+    bucket = f"review-slack-routing-{uuid.uuid4().hex}"
+    objects_client = build_s3_client(
+        endpoint_url=settings.s3_endpoint_url,
+        access_key=settings.s3_access_key,
+        secret_key=settings.s3_secret_key,
+        region=settings.s3_region,
+    )
+    objects_client.create_bucket(Bucket=bucket)
+
+    async def exercise() -> None:
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(16)
+        api_url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        server = uvicorn.Server(
+            uvicorn.Config(
+                client.app,
+                lifespan="off",
+                log_level="critical",
+                access_log=False,
+            )
+        )
+        server_task = asyncio.create_task(server.serve(sockets=[sock]))
+        engine = create_async_engine(settings.database_url)
+        try:
+            async with asyncio.timeout(5):
+                while not server.started:
+                    await asyncio.sleep(0.01)
+            async with httpx.AsyncClient() as http:
+                publication_client = ApprovalClient(
+                    api_base_url=api_url,
+                    api_key="",
+                    client=http,
+                    worker_token="fixture-review-worker-token",
+                    read_timeout_s=2.0,
+                )
+                def workspace(substrate):
+                    return WorkspaceClaimCoordinator(
+                        preparer=WorkspacePreparer(
+                            credentials=WorkspaceCredentialClient(
+                                api_url=api_url,
+                                worker_token="fixture-review-worker-token",
+                            ),
+                            commands=SubprocessCommands(),
+                            objects=WorkspaceObjectStore(
+                                client=objects_client,
+                                bucket=bucket,
+                            ),
+                            scratch_root=tmp_path,
+                            limits=WorkspaceLimits(),
+                        ),
+                        substrate=substrate,
+                    )
+
+                async with kernel_harness(
+                    names,
+                    valkey,
+                    binding=BindingResolver(engine, make_config(names)),
+                    publication_creator=publication_client,
+                    workspace_factory=workspace,
+                ) as h:
+                    await asyncio.to_thread(
+                        h.substrate.claim,
+                        thread_key,
+                        env={"CURIE_RUNNER_TOKEN": "example-review-route-token"},
+                        workspace_repo=REPO,
+                        workspace_materialized_head=HEAD,
+                        publication_visible_outcome_revision=1,
+                    )
+                    consumer = Consumer(
+                        redis=h.async_redis,
+                        kernel=h.kernel,
+                        config=h.config,
+                        leases=DeliveryLeaseStore(h.async_redis, h.config),
+                    )
+                    await consumer.ensure_group()
+                    review_hold = asyncio.Event()
+                    h.runner.hold = review_hold
+                    h.runner.default_script = [TextDelta(text="review working")]
+                    h.runner.tail = [
+                        Final(text="review complete", status=SessionStatus.DONE)
+                    ]
+
+                    async def dispatch_new() -> tuple[str, dict[str, str]]:
+                        rows = await h.async_redis.xreadgroup(
+                            h.config.consumer_group,
+                            h.config.consumer_name,
+                            {stream: ">"},
+                            count=1,
+                        )
+                        assert rows
+                        entry_id, fields = rows[0][1][0]
+                        await consumer._dispatch(entry_id, fields)
+                        return entry_id, fields
+
+                    async def handler_done(entry_id: str) -> None:
+                        async with asyncio.timeout(10):
+                            while entry_id in consumer._inflight_ids:
+                                await asyncio.sleep(0.01)
+
+                    try:
+                        admitted = await asyncio.to_thread(post_review, client, truth)
+                        assert admitted.status_code == 200, admitted.text
+                        assert admitted.json()["status"] == "feedback_queued"
+                        review_id, review_fields = await dispatch_new()
+                        async with asyncio.timeout(10):
+                            while True:
+                                reservations = await asyncio.to_thread(
+                                    review_rows,
+                                    "SELECT origin_key,status "
+                                    "FROM curie.publication_review_reservations",
+                                )
+                                if h.runner.turn_active and reservations:
+                                    break
+                                assert review_id in consumer._inflight_ids
+                                await asyncio.sleep(0.01)
+                        assert reservations == [
+                            {
+                                "origin_key": truth.feedback.event_id,
+                                "status": "reserved",
+                            }
+                        ]
+                        review_text = json.loads(review_fields["payload"])["text"]
+                        assert h.runner.opened == [review_text]
+
+                        status_saw_active = False
+                        if route_case == "finish_race":
+                            real_status = h.kernel._runner.status
+
+                            async def finish_between_status_and_steer(
+                                *args,
+                                **kwargs,
+                            ):
+                                nonlocal status_saw_active
+                                status = await real_status(*args, **kwargs)
+                                assert status["turn_active"] is True
+                                status_saw_active = True
+                                review_hold.set()
+                                async with asyncio.timeout(5):
+                                    while h.runner.turn_active:
+                                        await asyncio.sleep(0.01)
+                                h.runner.hold = None
+                                h.runner.tail = []
+                                h.runner.default_script = [
+                                    Final(
+                                        text="follow-up complete",
+                                        status=SessionStatus.DONE,
+                                    )
+                                ]
+                                return status
+
+                            h.kernel._runner.status = (  # type: ignore[method-assign]
+                                finish_between_status_and_steer
+                            )
+
+                        followup = QueuedTurn(
+                            event_id=f"ordinary-{uuid.uuid4()}",
+                            conversation_id=conversation_id,
+                            author="U0REQUEST1",
+                            text="Also apply this ordinary Slack follow-up.",
+                            reply_handle=ReplyHandle(
+                                kind="slack",
+                                channel="C0EXAMPLE1",
+                                placeholder="1700000000.000003",
+                            ),
+                            received_at="2026-09-05T01:01:00+00:00",
+                            source=TurnSource.SLACK,
+                        )
+                        await h.async_redis.xadd(stream, to_stream_fields(followup))
+                        followup_id, _ = await dispatch_new()
+                        await handler_done(followup_id)
+
+                        assert len(h.runner.steer_headers) == 1
+                        if route_case == "steer":
+                            assert status_saw_active is False
+                            assert h.runner.steers == [followup.text]
+                            assert h.runner.opened == [review_text]
+                            review_hold.set()
+                        else:
+                            assert status_saw_active is True
+                            assert h.runner.steers == []
+                            assert h.runner.opened == [review_text, followup.text]
+                        await handler_done(review_id)
+                        assert await h.async_redis.xpending_range(
+                            stream,
+                            h.config.consumer_group,
+                            review_id,
+                            followup_id,
+                            2,
+                        ) == []
+                        assert await asyncio.to_thread(
+                            review_rows,
+                            "SELECT origin_key,status "
+                            "FROM curie.publication_review_reservations",
+                        ) == [
+                            {
+                                "origin_key": truth.feedback.event_id,
+                                "status": "reserved",
+                            }
+                        ]
+                    finally:
+                        review_hold.set()
+                        await asyncio.gather(
+                            *list(consumer._inflight),
+                            return_exceptions=True,
+                        )
+        finally:
+            await engine.dispose()
+            server.should_exit = True
+            try:
+                await asyncio.wait_for(server_task, 5)
+            finally:
+                if not server_task.done():
+                    server_task.cancel()
+                    await asyncio.gather(server_task, return_exceptions=True)
+                sock.close()
+
+    original_github = client.app.state.http_client
+    injected = httpx.AsyncClient(transport=httpx.MockTransport(github))
+    client.app.state.http_client = injected
+    try:
+        client.portal.call(exercise)
+    finally:
+        client.app.state.http_client = original_github
+
+        def cleanup_sandbox_keys() -> None:
+            keys = list(valkey.scan_iter(match=f"{stream}:sandbox*"))
+            if keys:
+                valkey.delete(*keys)
+
+        with ExitStack() as cleanup:
+            cleanup.callback(client.portal.call, injected.aclose)
+            cleanup.callback(cleanup_sandbox_keys)
+            cleanup.callback(objects_client.close)
+            cleanup.callback(objects_client.delete_bucket, Bucket=bucket)
+            contents = objects_client.list_objects_v2(Bucket=bucket).get("Contents", [])
+            for obj in contents:
+                cleanup.callback(
+                    objects_client.delete_object,
+                    Bucket=bucket,
+                    Key=obj["Key"],
+                )
+
+
 def test_real_enqueue_refusal_backs_off_then_recovers_without_second_quota(review_stack) -> None:
     import redis.asyncio as redis
 
