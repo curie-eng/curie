@@ -196,6 +196,7 @@ testpaths = [
     "tools/ci-release-target-parity/tests",
     "tools/restore-drill/tests",
     "tools/sre-contract/tests",
+    "tools/verification-timing/tests",
 ]
 
 [tool.ruff]
