@@ -76,7 +76,7 @@ def feedback_payload(event: str = "issue_comment") -> dict:
                 "url": f"https://api.github.com/repos/{REPO}/pulls/17",
             },
         }
-        feedback["html_url"] = f"{pr['html_url']}#issuecomment-71"
+        feedback["html_url"] = f"https://github.com/{REPO}/issues/17#issuecomment-71"
         result["comment"] = feedback
     elif event == "pull_request_review_comment":
         feedback.update(
@@ -112,13 +112,23 @@ def test_each_human_review_family_retains_canonical_identity_and_provenance(even
     assert result.sender_id == 41 and result.sender_login == "example-reviewer"
     assert result.feedback_id == 71 and result.installation_id == 11
     assert result.body == "Please add a regression test before updating this PR."
-    assert result.url.startswith(f"https://github.com/{REPO}/pull/17#")
+    expected_path = "issues" if event == "issue_comment" else "pull"
+    assert result.url.startswith(f"https://github.com/{REPO}/{expected_path}/17#")
     assert (
         result.event_id
         == parse_feedback(event, feedback_payload(event), str(uuid.UUID(int=2))).event_id
     )
     if event == "pull_request_review_comment":
         assert result.path == "src/example.py" and result.line == 12 and result.review_id == 81
+
+
+def test_documented_pull_request_issue_comment_url_is_actionable() -> None:
+    # GitHub documents that issue-comment objects cover pull requests and gives
+    # their html_url under /issues/{number}:
+    # https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
+    feedback = parse_feedback("issue_comment", feedback_payload(), DELIVERY)
+
+    assert feedback.url == f"https://github.com/{REPO}/issues/17#issuecomment-71"
 
 
 @pytest.mark.parametrize("action", ["edited", "deleted", "dismissed"])
@@ -1549,7 +1559,7 @@ def test_legacy_name_only_lineage_cannot_override_verified_github_owner(
     review_rows("UPDATE curie.thread_publication_lineages SET status='closed' "
                 "WHERE github_repository_id IS NOT NULL")
     truth.payload["comment"].update(
-        id=72, html_url=f"https://github.com/{REPO}/pull/17#issuecomment-72"
+        id=72, html_url=f"https://github.com/{REPO}/issues/17#issuecomment-72"
     )
     truth.comment.update(truth.payload["comment"])
     truth.calls.clear()

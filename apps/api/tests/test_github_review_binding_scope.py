@@ -103,7 +103,7 @@ def test_concurrent_feedback_is_durable_for_same_and_independent_thread_lineages
             expected_conversation = "1700000000.000001"
         number = 18 if other_conversation else 17
         truth.payload["comment"].update(
-            id=72, html_url=f"https://github.com/{REPO}/pull/{number}#issuecomment-72"
+            id=72, html_url=f"https://github.com/{REPO}/issues/{number}#issuecomment-72"
         )
         truth.comment = copy.deepcopy(truth.payload["comment"])
         truth.comment["issue_url"] = f"https://api.github.com/repos/{REPO}/issues/{number}"
