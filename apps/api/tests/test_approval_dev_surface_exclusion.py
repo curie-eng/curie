@@ -36,15 +36,23 @@ Bypasses this set does NOT test, stated plainly rather than claimed complete:
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import inspect
 import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
 import threading
 import time
+import tomllib
 import types
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from pathlib import Path, PurePath
 from typing import Any
 
 import httpx
@@ -732,3 +740,953 @@ def test_the_composed_loopback_api_seam_does_not_outlive_its_fixture(
 
     with httpx.Client() as after, pytest.raises(httpx.ConnectError):
         after.get(f"http://127.0.0.1:{port}/health")
+
+
+# --- Stage 3: the dev interaction harness never reaches production ----------
+#
+# Stage 3 adds a dev-only interaction harness at
+# ``packages/test-support/src/curie_test_support/interaction/`` with a
+# ``python -m curie_test_support.interaction`` entry point. It registers no
+# route, adds no service and adds no toggle -- so the assertions below defend
+# the CAPABILITY ("nothing that can drive an approval without a genuine chat
+# click ships"), not the name. The primary control is the resolved
+# ``--no-dev`` dependency closure: a distribution that is not installed cannot
+# be imported however it is spelled, where a module-name grep only ever finds
+# the name we happened to think of.
+
+HARNESS_DISTRIBUTION = "curie-test-support"
+HARNESS_MODULE = "curie_test_support"
+HARNESS_SUBMODULE = f"{HARNESS_MODULE}.interaction"
+HARNESS_PACKAGE_PATH = "packages/test-support"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+# Every first-party image whose build context is the WORKSPACE, keyed by the
+# distribution its Dockerfile installs and valued by the workspace member that
+# ships in it. Those are the only images the harness could reach, because they
+# are the only ones that copy `packages/test-support` into a build stage at all.
+#
+# `adapters/discord` was missing from this list while being exactly that shape
+# (`COPY . .` then `uv sync --frozen --no-dev --no-editable --package
+# curie-discord-adapter`), so "every production image" excluded an image. The
+# list is re-derived and cross-checked against the tree below rather than
+# hand-maintained, so the next one cannot go missing silently.
+APP_PACKAGES = (
+    "curie-api",
+    "curie-dispatcher",
+    "curie-worker",
+    "curie-mail-adapter",
+    "curie-discord-adapter",
+)
+APP_MEMBERS = {
+    "curie-api": "apps/api",
+    "curie-dispatcher": "apps/dispatcher",
+    "curie-worker": "apps/worker",
+    "curie-mail-adapter": "apps/mail-adapter",
+    "curie-discord-adapter": "adapters/discord",
+}
+APP_NAMES = ("api", "dispatcher", "worker", "mail-adapter")
+APP_DOCKERFILES = tuple(f"{member}/Dockerfile" for member in APP_MEMBERS.values())
+PROD_DOCKERFILES = (*APP_DOCKERFILES, "runner/Dockerfile")
+# Images whose build context is their own directory (the sre-bot connectors) or
+# which install no Python from the workspace (apps/ui, node) cannot reach a
+# workspace member at all; `prototypes/` and `cli/scripts/fixtures/` are not
+# shipped. `test_the_production_image_list_covers_every_workspace_context_image`
+# below re-derives this from the tree so the exclusion is checked, not asserted.
+NON_WORKSPACE_DOCKERFILES = frozenset(
+    {
+        "apps/ui/Dockerfile",
+        "examples/sre-bot/connectors/tempo/Dockerfile",
+        "examples/sre-bot/connectors/self-upgrade/Dockerfile",
+        "prototypes/runner/Dockerfile",
+        "cli/scripts/fixtures/mcp-receipt/Dockerfile",
+        "charts/curie/ci/postgres-readiness-delay.Dockerfile",
+        "compose/worker-local.Dockerfile",
+    }
+)
+
+
+def _normalize_distribution(name: str) -> str:
+    """PEP 503 normalization, so ``curie_test_support`` and ``Curie-Test-Support`` match."""
+
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
+
+
+def _editable_distribution(relative: str) -> str:
+    """The distribution a ``-e <path>`` entry actually installs.
+
+    Reality check, corrected after this parser first shipped: ``uv export``
+    writes workspace members as PATHS (``-e ./packages/test-support``), and the
+    directory basename is NOT the distribution name -- that path installs
+    ``curie-test-support``. Deriving the name from the basename made every
+    editable member unrecognisable, so both the harness assertion and its own
+    sanity guard were looking for names that can never appear. The name is read
+    from the member's ``[project] name`` instead, with the basename kept only as
+    a fallback for a path that carries no pyproject.
+    """
+
+    pyproject = REPO_ROOT / relative / "pyproject.toml"
+    if pyproject.is_file():
+        declared = (tomllib.loads(pyproject.read_text()).get("project") or {}).get("name")
+        if isinstance(declared, str) and declared:
+            return _normalize_distribution(declared)
+    return _normalize_distribution(Path(relative).name)
+
+
+def _closure_distributions(exported: str) -> set[str]:
+    """Distribution names in a ``uv export`` / pip-requirements document.
+
+    Parses both shapes the production images install: pinned registry
+    requirements (``name==1.2.3``) and workspace members exported as editable
+    paths (``-e ./packages/foo``). The editable form is the one that matters
+    here -- the harness would arrive that way, and a scan that only understood
+    ``==`` lines would be blind to exactly the case under test.
+    """
+
+    found: set[str] = set()
+    for raw in exported.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            if line.startswith("-e "):
+                found.add(_editable_distribution(line[3:].strip()))
+            continue
+        found.add(_normalize_distribution(re.split(r"[<>=!~\[; ]", line, maxsplit=1)[0]))
+    return {name for name in found if name}
+
+
+def _export_closure(package: str) -> str:
+    """The exact closure the image installs: ``uv export --frozen --no-dev --package <p>``."""
+
+    completed = subprocess.run(
+        ["uv", "export", "--frozen", "--no-dev", "--package", package],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "NO_COLOR": "1"},
+        timeout=600,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout
+
+
+def _runner_pins() -> str:
+    """The runner image's own pinned requirements, produced by its real exporter.
+
+    ``runner/Dockerfile`` does not use ``uv sync`` at all: it pipes ``uv.lock``
+    through ``runner/export_dependency_pins.py`` and installs the result with
+    ``--no-deps``. Asserting on that exporter's actual output is the only way
+    this covers the fifth image rather than assuming it resembles the other four.
+    """
+
+    completed = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "runner" / "export_dependency_pins.py")],
+        cwd=REPO_ROOT,
+        input=(REPO_ROOT / "uv.lock").read_text(),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not installed")
+def test_no_production_dependency_closure_installs_the_harness_distribution() -> None:
+    """PRIMARY control: the harness distribution is in no production closure.
+
+    Decision 3 of the plan: assert on the resolved ``--no-dev`` closure rather
+    than building five images. The four app Dockerfiles install with
+    ``uv sync --frozen --no-dev --no-editable --package curie-<app>`` and the
+    runner installs ``export_dependency_pins.py``'s output, so these are the
+    same sets those images end up with -- not a proxy for them.
+
+    This is deliberately an assertion about the DISTRIBUTION, not about a module
+    name: it is complete against any harness surface however it is renamed,
+    where the name sweep below is only complete against today's spelling.
+    """
+
+    closures = {
+        package: _closure_distributions(_export_closure(package)) for package in APP_PACKAGES
+    }
+    closures["curie-runner"] = _closure_distributions(_runner_pins())
+
+    for package, distributions in closures.items():
+        # Guard the guard: an export that silently produced nothing would make
+        # the absence assertion below pass for the wrong reason.
+        assert len(distributions) > 20, (package, sorted(distributions))
+        assert _normalize_distribution(package) in distributions or package == "curie-runner", (
+            f"{package}'s own closure does not contain {package}; the parse is wrong, "
+            "so its absence assertion proves nothing"
+        )
+        assert _normalize_distribution(HARNESS_DISTRIBUTION) not in distributions, (
+            f"{package}'s --no-dev closure installs {HARNESS_DISTRIBUTION}; the dev "
+            "interaction harness would be importable inside the production image"
+        )
+
+    # Seeded violation: the same parser, handed a closure that DOES carry the
+    # harness, must report it. Without this the assertion above could be passing
+    # because the parser never recognises the distribution at all.
+    seeded = _closure_distributions(
+        "\n".join(["-e ./apps/api", "-e ./packages/test-support", "httpx==0.27.0"])
+    )
+    assert _normalize_distribution(HARNESS_DISTRIBUTION) in seeded, seeded
+
+
+def _harness_declaration_sites(pyproject: dict[str, Any]) -> dict[str, list[str]]:
+    """Where ``curie-test-support`` is declared in a parsed pyproject document.
+
+    Returns a map of site -> the declaring list, so a failure names the exact
+    table a future author added it to rather than only saying "somewhere".
+    """
+
+    target = _normalize_distribution(HARNESS_DISTRIBUTION)
+
+    def declares(entries: Any) -> bool:
+        return isinstance(entries, list) and any(
+            isinstance(entry, str)
+            and _normalize_distribution(re.split(r"[<>=!~\[; ]", entry, maxsplit=1)[0]) == target
+            for entry in entries
+        )
+
+    sites: dict[str, list[str]] = {}
+    project = pyproject.get("project") or {}
+    if declares(project.get("dependencies")):
+        sites["project.dependencies"] = list(project["dependencies"])
+    for extra, entries in (project.get("optional-dependencies") or {}).items():
+        if declares(entries):
+            sites[f"project.optional-dependencies.{extra}"] = list(entries)
+    for group, entries in (pyproject.get("dependency-groups") or {}).items():
+        if declares(entries):
+            sites[f"dependency-groups.{group}"] = list(entries)
+    return sites
+
+
+def test_the_harness_distribution_is_declared_only_in_the_dev_dependency_group() -> None:
+    """``--no-dev`` is sufficient ONLY while ``dev`` is the single declaration.
+
+    The image assertion above is downstream of this one: the moment
+    ``curie-test-support`` also appears in an app's ``[project] dependencies``,
+    ``--no-dev`` stops excluding it and every production image gains the
+    harness. A future author who adds it there fails here, at the declaration,
+    with the reason attached -- rather than shipping it.
+
+    ``[tool.uv.sources]`` and ``[tool.uv.workspace] members`` are NOT
+    declarations of a dependency; they only say where the workspace member
+    lives, so they are expected and are not counted as sites.
+    """
+
+    root = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    assert _harness_declaration_sites(root) == {
+        "dependency-groups.dev": root["dependency-groups"]["dev"]
+    }, "curie-test-support must be declared only in [dependency-groups] dev"
+
+    # Every workspace member that ships in an image must not declare it either:
+    # a per-app dependency would reach the image through --package resolution.
+    for relative in (*APP_MEMBERS.values(), "runner"):
+        member = tomllib.loads((REPO_ROOT / relative / "pyproject.toml").read_text())
+        assert _harness_declaration_sites(member) == {}, (
+            f"{relative}/pyproject.toml declares {HARNESS_DISTRIBUTION}; it would then be "
+            "installed by --package resolution regardless of --no-dev"
+        )
+
+    # Seeded violation: a second declaration in a runtime dependency list must
+    # be reported by the very helper the assertions above trust.
+    seeded = dict(root)
+    seeded["project"] = {
+        **root["project"],
+        "dependencies": [*root["project"]["dependencies"], HARNESS_DISTRIBUTION],
+    }
+    assert "project.dependencies" in _harness_declaration_sites(seeded)
+
+
+def _dev_only_workspace_members() -> dict[str, str]:
+    """Workspace members that ONLY the dev dependency group installs.
+
+    Derived from the root pyproject rather than listed here: a member is
+    dev-only when the root declares its distribution in a
+    ``[dependency-groups]`` table and never in the root's runtime
+    ``[project] dependencies``. Today that is the harness plus the two dev
+    tools; a future dev-only member is covered without an edit.
+    """
+
+    root = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+
+    def names(entries: Any) -> set[str]:
+        return {
+            _normalize_distribution(re.split(r"[<>=!~\[; ]", entry, maxsplit=1)[0])
+            for entry in entries or []
+            if isinstance(entry, str)
+        }
+
+    runtime = names((root.get("project") or {}).get("dependencies"))
+    grouped: set[str] = set()
+    for entries in (root.get("dependency-groups") or {}).values():
+        grouped |= names(entries)
+
+    members: dict[str, str] = {}
+    workspace = ((root.get("tool") or {}).get("uv") or {}).get("workspace") or {}
+    for relative in workspace.get("members") or []:
+        pyproject = REPO_ROOT / relative / "pyproject.toml"
+        if not pyproject.is_file():
+            continue
+        declared = (tomllib.loads(pyproject.read_text()).get("project") or {}).get("name")
+        name = _normalize_distribution(declared) if isinstance(declared, str) else ""
+        if name and name in grouped and name not in runtime:
+            members[name] = relative
+    return members
+
+
+# ``uv sync --package <member>`` IS an install: it resolves that member into the
+# builder venv the runtime stage ships. Leaving it out of this tuple was how a
+# ``uv sync --frozen --no-dev --package curie-api --package curie-test-support``
+# passed every control (round-2 review finding A).
+_INSTALL_VERBS = (
+    ("pip", "install"),
+    ("pip3", "install"),
+    ("uv", "pip", "install"),
+    ("uv", "add"),
+    ("poetry", "add"),
+    ("uv", "sync"),
+)
+_SYNC_VERB = ("uv", "sync")
+_SHELL_OPERATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")", "{", "}"})
+# Flags that put a non-runtime dependency group back into a ``--no-dev`` sync.
+_DEV_GROUP_FLAGS = ("--dev", "--all-groups", "--group", "--only-group", "--only-dev")
+_WORKSPACE_COPY = re.compile(r"COPY\s+\.\s+\./?$", re.IGNORECASE)
+
+
+def _dockerfile_commands(text: str) -> list[str]:
+    """One string per Dockerfile instruction, continuations joined, comments dropped.
+
+    A per-LINE reading is what let finding 1 through: a shell continuation
+    splits ``uv sync`` from its flags, and a line-oriented check then judges a
+    fragment. Joining first is what makes "the flags of THIS instruction" a
+    question the checker can actually answer.
+    """
+
+    commands: list[str] = []
+    buffer = ""
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if line.lstrip().startswith("#") or (not buffer and not line.strip()):
+            continue
+        if line.endswith("\\"):
+            buffer += line[:-1] + " "
+            continue
+        commands.append(" ".join(f"{buffer}{line}".split()))
+        buffer = ""
+    if buffer.strip():
+        commands.append(" ".join(buffer.split()))
+    return commands
+
+
+def _tokenize(command: str) -> list[str]:
+    """Shell tokens of one instruction, with end-of-line comments removed.
+
+    Round-2 finding B: ``"--no-dev" in command`` is satisfied by text uv never
+    receives -- ``uv sync ... # --no-dev``. ``shlex`` with ``comments=True``
+    drops what the shell drops, so flags are judged as ARGUMENTS.
+    """
+
+    try:
+        return shlex.split(command, comments=True)
+    except ValueError:
+        return [token for token in command.split() if not token.startswith("#")]
+
+
+def _segments(command: str) -> list[list[str]]:
+    """The shell commands inside one ``RUN``, each as its own token list.
+
+    Round-2 finding B again, second shape: ``uv sync ... || echo --no-dev``.
+    Splitting on the shell operators is what keeps a flag belonging to `echo`
+    from being read as a flag of the sync. The argv head is reduced to its
+    basename (``/app/.venv/bin/pip`` -> ``pip``) and leading ``VAR=value``
+    assignments and ``python -m`` are stripped, so the verb match is on the
+    program actually run.
+    """
+
+    tokens = _tokenize(command)
+    if not tokens or tokens[0] != "RUN":
+        return []
+    tokens = tokens[1:]
+    while tokens and tokens[0].startswith("--mount"):
+        tokens = tokens[1:]
+    split: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_OPERATORS:
+            split.append(current)
+            current = []
+        else:
+            current.append(token)
+    split.append(current)
+    found: list[list[str]] = []
+    for segment in split:
+        while segment and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", segment[0]):
+            segment = segment[1:]
+        if (
+            len(segment) > 2
+            and PurePath(segment[0]).name in ("python", "python3")
+            and segment[1] == "-m"
+        ):
+            segment = segment[2:]
+        if segment:
+            found.append([PurePath(segment[0]).name, *segment[1:]])
+    return found
+
+
+def _starts_with(segment: list[str], verb: tuple[str, ...]) -> bool:
+    return tuple(segment[: len(verb)]) == verb
+
+
+def _has_flag(segment: list[str], flag: str) -> bool:
+    return any(token == flag or token.startswith(f"{flag}=") for token in segment)
+
+
+def _flag_value(token: str) -> str:
+    """The value half of ``--flag=value``; the token itself otherwise."""
+
+    if token.startswith("-") and "=" in token:
+        return token.split("=", 1)[1]
+    return token
+
+
+def _names_path(token: str, target: str) -> bool:
+    cleaned = _flag_value(token).strip("'\"")
+    cleaned = cleaned[2:] if cleaned.startswith("./") else cleaned
+    cleaned = cleaned.rstrip("/")
+    target = target[2:] if target.startswith("./") else target
+    target = target.rstrip("/")
+    return bool(target) and (cleaned == target or cleaned.startswith(f"{target}/"))
+
+
+def _names_distribution(token: str, distribution: str) -> bool:
+    head = re.split(r"[<>=!~\[;]", _flag_value(token).strip("'\""), maxsplit=1)[0]
+    return _normalize_distribution(head) == distribution
+
+
+def _copy_aliases(commands: list[str], member: str) -> set[str]:
+    """Destinations a ``COPY`` gave the dev-only member's tree.
+
+    Round-2 finding C: ``COPY packages/test-support /opt/x`` then
+    ``RUN uv pip install /opt/x`` names neither the member path nor the
+    distribution, so a name match alone cannot see it. Following the COPY is
+    what keeps the renamed path recognisable as the harness.
+    """
+
+    aliases: set[str] = set()
+    for command in commands:
+        tokens = _tokenize(command)
+        if not tokens or tokens[0] != "COPY":
+            continue
+        operands = [token for token in tokens[1:] if not token.startswith("--")]
+        if len(operands) < 2:
+            continue
+        for source in operands[:-1]:
+            if _names_path(source, member):
+                aliases.add(operands[-1])
+    return aliases
+
+
+def _dockerfile_posture(path: str, text: str) -> list[str]:
+    """Violations of the no-dev / no-dev-member posture in one Dockerfile.
+
+    A list rather than an assertion so the seeded-violation cases below can run
+    the SAME check against mutated text; a checker that is only ever called on
+    the real files cannot be shown to be capable of failing.
+
+    Four independent controls, because ``uv export`` sees none of them. The
+    app images ``COPY . .`` into the builder and ship that stage's
+    ``/app/.venv``, so a single builder line can install a dev-only member into
+    the shipped venv while every export-based control still reads clean:
+
+    1. no install verb (``pip install`` / ``uv pip install`` / ``uv add`` /
+       ``uv sync``) may name a dev-only workspace member -- by distribution, by
+       path, or by a path a ``COPY`` renamed it to;
+    2. every ``uv sync`` carries ``--no-dev`` as a real argument, and none
+       re-admits a group with ``--group`` / ``--all-groups`` / ``--dev``;
+    3. the FINAL sync -- the one after ``COPY . .``, the only one whose result
+       is what ships -- carries ``--no-dev`` and ``--package``. "Some line has
+       the flag" is not this property: the pre-copy dependency-layer sync
+       already carries it, so dropping it from the post-copy sync passes any
+       any-line check.
+    """
+
+    problems: list[str] = []
+    commands = _dockerfile_commands(text)
+    parsed = [(command, _segments(command)) for command in commands]
+
+    for distribution, member in _dev_only_workspace_members().items():
+        targets = {member, *_copy_aliases(commands, member)}
+        for command, command_segments in parsed:
+            for segment in command_segments:
+                if not any(_starts_with(segment, verb) for verb in _INSTALL_VERBS):
+                    continue
+                if any(
+                    any(_names_path(token, target) for target in targets)
+                    or _names_distribution(token, distribution)
+                    for token in segment[1:]
+                ):
+                    problems.append(
+                        f"{path} installs the dev-only workspace member {member} "
+                        f"({distribution}) into the image venv: {command}"
+                    )
+
+    if path == "runner/Dockerfile":
+        if HARNESS_PACKAGE_PATH in text:
+            problems.append(f"{path} references {HARNESS_PACKAGE_PATH}")
+        return problems
+
+    installs = [
+        (command, segment)
+        for command, command_segments in parsed
+        for segment in command_segments
+        if _starts_with(segment, _SYNC_VERB)
+    ]
+    if not installs:
+        problems.append(f"{path} has no uv sync line; the posture assertion would be vacuous")
+    for command, segment in installs:
+        if not _has_flag(segment, "--no-dev"):
+            problems.append(f"{path} installs without --no-dev: {command}")
+        for flag in _DEV_GROUP_FLAGS:
+            if _has_flag(segment, flag):
+                problems.append(
+                    f"{path} re-admits a non-runtime dependency group with {flag}: {command}"
+                )
+
+    copies = [index for index, command in enumerate(commands) if _WORKSPACE_COPY.match(command)]
+    if not copies:
+        problems.append(
+            f"{path} has no `COPY . .`; this checker assumes the workspace-copy image shape "
+            "and cannot judge the final install layer of a different one"
+        )
+        return problems
+    final = [
+        (command, segment)
+        for command, command_segments in parsed[copies[-1] :]
+        for segment in command_segments
+        if _starts_with(segment, _SYNC_VERB)
+    ]
+    if not final:
+        problems.append(
+            f"{path} runs no uv sync after `COPY . .`; the shipped venv is then whatever "
+            "an earlier layer left, which this checker cannot bound"
+        )
+    for command, segment in final:
+        if not _has_flag(segment, "--no-dev"):
+            problems.append(f"{path} post-`COPY . .` sync omits --no-dev: {command}")
+        if not _has_flag(segment, "--package"):
+            problems.append(
+                f"{path} post-`COPY . .` sync omits --package, so it resolves the whole "
+                f"workspace rather than one member: {command}"
+            )
+    return problems
+
+
+def test_the_production_image_list_covers_every_workspace_context_image() -> None:
+    """Nothing in the tree builds from the workspace without being on the list.
+
+    ``adapters/discord/Dockerfile`` was a production recipe of exactly the app
+    shape and was on no list in this module -- so "every production image" was
+    an unchecked claim about a hand-maintained tuple. This re-derives the
+    Dockerfile set from the tree and forces every one of them to be either a
+    production workspace image (checked above) or an explicitly named
+    non-workspace one.
+    """
+
+    ignored = {".git", ".venv", "node_modules", "target", ".worktrees", "dist", ".mypy_cache"}
+    # Filter on the path RELATIVE to the repo root: this checkout is itself
+    # under a `.worktrees/` directory, so filtering absolute parts discards
+    # every file in the tree and the sweep passes vacuously.
+    found = {
+        str(path.relative_to(REPO_ROOT))
+        for path in REPO_ROOT.rglob("*Dockerfile")
+        if not ignored & set(path.relative_to(REPO_ROOT).parts)
+    }
+    assert set(PROD_DOCKERFILES) <= found, sorted(set(PROD_DOCKERFILES) - found)
+    unaccounted = found - set(PROD_DOCKERFILES) - NON_WORKSPACE_DOCKERFILES
+    assert unaccounted == set(), (
+        f"{sorted(unaccounted)} is neither on the production workspace-image list nor "
+        "declared as building outside the workspace; if it copies the workspace it can "
+        "install the dev harness and must be added to APP_MEMBERS/PROD_DOCKERFILES"
+    )
+
+
+def test_every_production_image_installs_without_the_dev_dependency_group() -> None:
+    """The Dockerfile posture that makes the closure assertion true in the image.
+
+    The closure test proves ``--no-dev`` EXCLUDES the harness; this proves the
+    images actually pass ``--no-dev`` -- and, since ``uv export`` cannot see a
+    Dockerfile-level install at all, that no builder line puts a dev-only
+    workspace member into the venv that ships.
+    """
+
+    for relative in PROD_DOCKERFILES:
+        text = (REPO_ROOT / relative).read_text()
+        assert _dockerfile_posture(relative, text) == [], (
+            relative,
+            _dockerfile_posture(relative, text),
+        )
+
+    # Seeded violation: --no-dev stripped everywhere.
+    for relative in APP_DOCKERFILES:
+        mutated = (REPO_ROOT / relative).read_text().replace("--no-dev", "")
+        assert _dockerfile_posture(relative, mutated) != [], relative
+
+    # Seeded violation (finding 1): --no-dev dropped from the FINAL, post-
+    # `COPY . .` sync ONLY. Every earlier line keeps the flag, so an any-line
+    # check reads the file as clean while the shipped venv gains the dev group.
+    for relative in APP_DOCKERFILES:
+        text = (REPO_ROOT / relative).read_text()
+        head, sep, tail = text.rpartition("uv sync")
+        assert sep, relative
+        mutated = f"{head}{sep}{tail.replace(' --no-dev', '', 1)}"
+        # Where the image has a pre-copy dependency-layer sync (four of the
+        # five), the flag survives on that earlier line -- which is the whole
+        # point: an any-line check still sees "--no-dev" here.
+        if text.count("uv sync") > 1:
+            assert "--no-dev" in mutated, relative
+        problems = _dockerfile_posture(relative, mutated)
+        assert any("post-`COPY . .` sync omits --no-dev" in problem for problem in problems), (
+            relative,
+            problems,
+        )
+
+    # Seeded violation (finding 1): a path- or name-install of the dev-only
+    # harness in the builder. `uv export` is byte-identical under this edit and
+    # every sync keeps --no-dev, so this is exactly the shape that no
+    # closure-based control -- here or in the chart script -- could ever see.
+    for relative in PROD_DOCKERFILES:
+        for line in (
+            f"RUN uv pip install ./{HARNESS_PACKAGE_PATH}",
+            f"RUN pip install {HARNESS_PACKAGE_PATH}",
+            f"RUN uv add {HARNESS_DISTRIBUTION}",
+            f"RUN uv pip install \\\n    ./{HARNESS_PACKAGE_PATH}",
+        ):
+            mutated = f"{(REPO_ROOT / relative).read_text()}\n{line}\n"
+            problems = _dockerfile_posture(relative, mutated)
+            assert any("dev-only workspace member" in problem for problem in problems), (
+                relative,
+                line,
+                problems,
+            )
+
+    # Seeded violation A (round-2 review): `uv sync --package <dev-only member>`.
+    # `--no-dev` and `--package` are both present and `uv export --frozen
+    # --no-dev --package curie-api` is byte-identical, so every other control
+    # here reads clean while the member lands in the builder venv that ships.
+    for relative in APP_DOCKERFILES:
+        mutated = (REPO_ROOT / relative).read_text() + (
+            f"\nRUN uv sync --frozen --no-dev --no-editable --package curie-api "
+            f"--package {HARNESS_DISTRIBUTION}\n"
+        )
+        problems = _dockerfile_posture(relative, mutated)
+        assert any("dev-only workspace member" in problem for problem in problems), (
+            relative,
+            problems,
+        )
+
+    # Seeded violation B (round-2 review): a `--no-dev` uv never receives. Both
+    # shapes -- an end-of-line comment and an `|| echo` the shell only reaches
+    # on failure -- satisfy a substring match on the joined instruction.
+    for relative in APP_DOCKERFILES:
+        text = (REPO_ROOT / relative).read_text()
+        head, sep, tail = text.rpartition("uv sync")
+        assert sep, relative
+        # Only the REST OF THAT LINE is rewritten: appending at EOF would leave
+        # the real final sync untouched and the seed would prove nothing.
+        line, newline, rest = tail.partition("\n")
+        for suffix in ("# --no-dev", "|| echo --no-dev"):
+            mutated = f"{head}{sep}{line.replace(' --no-dev', '', 1)} {suffix}{newline}{rest}"
+            # The decoy text IS on the sync line: a substring check still sees it.
+            assert "--no-dev" in mutated.rpartition("uv sync")[2].partition("\n")[0], relative
+            problems = _dockerfile_posture(relative, mutated)
+            assert any("post-`COPY . .` sync omits --no-dev" in problem for problem in problems), (
+                relative,
+                suffix,
+                problems,
+            )
+
+    # Seeded violation C (round-2 review): the harness copied to a renamed path
+    # and installed from there. The RUN names neither `packages/test-support`
+    # nor `curie-test-support`, so only following the COPY can see it.
+    for relative in APP_DOCKERFILES:
+        mutated = (REPO_ROOT / relative).read_text() + (
+            f"\nCOPY {HARNESS_PACKAGE_PATH} /opt/vendored\nRUN uv pip install /opt/vendored\n"
+        )
+        assert HARNESS_DISTRIBUTION not in "RUN uv pip install /opt/vendored"
+        problems = _dockerfile_posture(relative, mutated)
+        assert any("dev-only workspace member" in problem for problem in problems), (
+            relative,
+            problems,
+        )
+
+    # Seeded violation D (found while closing A-C): `--no-dev` is present and
+    # honest, and a later `--group dev` puts the dev group straight back.
+    for relative in APP_DOCKERFILES:
+        mutated = (REPO_ROOT / relative).read_text() + (
+            "\nRUN uv sync --frozen --no-dev --group dev --no-editable --package curie-api\n"
+        )
+        problems = _dockerfile_posture(relative, mutated)
+        assert any("re-admits a non-runtime dependency group" in problem for problem in problems), (
+            relative,
+            problems,
+        )
+
+    runner_mutated = (
+        REPO_ROOT / "runner" / "Dockerfile"
+    ).read_text() + f"\nCOPY {HARNESS_PACKAGE_PATH} ./{HARNESS_PACKAGE_PATH}\n"
+    assert _dockerfile_posture("runner/Dockerfile", runner_mutated) != []
+
+
+def _python_sources(*relatives: str) -> Iterator[Path]:
+    for relative in relatives:
+        yield from sorted((REPO_ROOT / relative).rglob("*.py"))
+
+
+def _imports_harness(source: str) -> bool:
+    """Does this module import ``curie_test_support`` (either import form)?
+
+    SECONDARY to the distribution assertion above, by design: a renamed harness
+    module would evade this and not the closure probe. It is kept because it
+    fails at edit time, in the file that introduced the coupling, where the
+    closure probe fails later and further away.
+    """
+
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".")[0] == HARNESS_MODULE for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] == HARNESS_MODULE:
+                return True
+    return False
+
+
+def test_no_production_module_imports_the_harness() -> None:
+    """No shipped source tree reaches the harness, by AST rather than by grep.
+
+    A substring scan would hit this test file, every docstring mentioning the
+    module, and nothing that matters; the AST answers the real question, which
+    is whether a production module would fail to import inside an image that
+    (correctly) does not install the distribution.
+    """
+
+    trees = (*(f"{member}/src" for member in APP_MEMBERS.values()), "runner/src")
+    scanned = 0
+    for path in _python_sources(*trees):
+        scanned += 1
+        assert not _imports_harness(path.read_text()), (
+            f"{path.relative_to(REPO_ROOT)} imports {HARNESS_MODULE}, which no production "
+            "image installs; the module would ImportError at boot"
+        )
+    assert scanned > 50, scanned
+
+    # Seeded violations: both import spellings must be detected.
+    assert _imports_harness(f"import {HARNESS_SUBMODULE}\n")
+    assert _imports_harness(f"from {HARNESS_SUBMODULE} import harness\n")
+
+
+def _harness_toggle_fields(source: str) -> list[str]:
+    """Settings fields whose name or default could switch a harness on.
+
+    The threat is not "a field named after the harness" -- it is "a field whose
+    VALUE can enable it". So this looks at both: any assignment whose target
+    name or whose literal default text mentions the harness, interaction
+    harness, or a synthetic-principal switch.
+    """
+
+    needles = (HARNESS_MODULE, HARNESS_DISTRIBUTION, "interaction_harness", "synthetic_principal")
+    found: list[str] = []
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        targets: list[str] = []
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target.id]
+        elif isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if not targets:
+            continue
+        rendered = f"{' '.join(targets)} {ast.unparse(node)}".lower()
+        if any(needle in rendered for needle in needles):
+            found.extend(targets)
+    return found
+
+
+def test_no_production_config_carries_a_toggle_that_could_enable_the_harness() -> None:
+    """There is no production switch, so there is nothing an operator can flip.
+
+    Decision 2 of the plan says the harness adds no production toggle. That is
+    a claim about config surface, so it is asserted over the real config
+    modules -- and the seeded violation proves the scan can see such a field,
+    which a scan over four clean files otherwise could not demonstrate.
+    """
+
+    configs = sorted(
+        {
+            *REPO_ROOT.glob("apps/*/src/**/config.py"),
+            *REPO_ROOT.glob("adapters/*/src/**/config.py"),
+        }
+    )
+    assert len(configs) >= 5, [str(path) for path in configs]
+    for path in configs:
+        assert _harness_toggle_fields(path.read_text()) == [], path.relative_to(REPO_ROOT)
+
+    seeded = "class Settings:\n    enable_interaction_harness: bool = False\n"
+    assert _harness_toggle_fields(seeded) == ["enable_interaction_harness"]
+    seeded_by_value = f'class Settings:\n    extra_module: str = "{HARNESS_SUBMODULE}"\n'
+    assert _harness_toggle_fields(seeded_by_value) == ["extra_module"]
+
+
+def _mint_resolve_inventory(app: Any) -> dict[str, set[str]]:
+    """The live-router inventory PR2 pins, extracted so a seeded app can use it.
+
+    PR2 asserted this inline, which made the walk itself unfalsifiable: an
+    inventory that resolved nothing reads identically to "no surfaces exist".
+    Sharing the function with a deliberately-violating app is what proves it
+    would notice a new surface named after the harness.
+    """
+
+    targets = {
+        id(approval_principal.mint): "mint",
+        id(crud.claim_approval_resolution): "resolve",
+    }
+    inventory: dict[str, set[str]] = {}
+    for route in _api_routes(app):
+        reached = _reaches(route.endpoint, targets)
+        if reached:
+            inventory[route.endpoint.__qualname__] = reached
+    return inventory
+
+
+def test_a_harness_shaped_synthetic_surface_would_fail_the_live_app_inventory() -> None:
+    """The inventory catches a NEW mint/resolve surface, harness-named or not.
+
+    The production assertion (exactly one mint, one resolve) already exists
+    above. What it could not show is that it would fail -- so here the same
+    walk runs against an app carrying a synthetic route named after the
+    harness, and must report it. If a future harness ever grew an HTTP surface
+    to drive approvals, this is the assertion that stops it.
+    """
+
+    app = create_app()
+    assert _mint_resolve_inventory(app) == {
+        "mint_operator_principal": {"mint"},
+        "resolve_approval": {"resolve"},
+    }
+
+    seeded = create_app()
+
+    async def mint_interaction_harness_principal() -> dict[str, str]:
+        """A synthetic-principal surface of exactly the shape being excluded."""
+        return {
+            "token": approval_principal.mint(
+                "k",
+                subject=SUBJECT,
+                kind="chat",
+                actor_channel=CARD_CHANNEL,
+                approval_id="a",
+                scope=approval_principal.APPROVE_SCOPE,
+                exp=0,
+            )
+        }
+
+    seeded.post("/curie-test-support/principals")(mint_interaction_harness_principal)
+    # Reality check: the inventory is keyed by ``__qualname__``, so a handler
+    # defined inside a test function is keyed ``<test>.<locals>.<name>``, never
+    # by its bare name. Match the final segment -- asserting the bare name made
+    # this fail even though the seeded surface WAS detected.
+    reached = _mint_resolve_inventory(seeded)
+    seeded_keys = [
+        key for key in reached if key.split(".")[-1] == "mint_interaction_harness_principal"
+    ]
+    assert seeded_keys, reached
+    assert reached[seeded_keys[0]] == {"mint"}, reached
+
+
+def test_synthetic_action_and_identity_probes_in_prod_are_refused_and_change_nothing(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """The harness's two verbs, aimed at a genuinely prod-booted app, move nothing.
+
+    A refusal alone is not the property worth pinning -- a 403 returned AFTER
+    the approval was resolved, or after an audit row was written, is the exact
+    failure this test exists to catch. So the status and the full audit trail
+    are captured before and compared after, and the comparison happens outside
+    the prod block so it is made with the ordinary platform credential rather
+    than depending on the prod key the probes ran under.
+
+    Corrected after review: this used to reuse ``approvals_client``, whose
+    ``create_app()`` had already run under the TEST environment, and merely
+    clear the settings cache under ``ENVIRONMENT=prod``. Routers were never
+    rebuilt, so an ``environment == "prod"`` branch in ``create_app()`` that
+    mounted a synthetic mint/resolve router was invisible to this test AND to
+    the dev-time live-app inventory -- which is exactly the surface AC8 claims
+    does not exist. A SECOND app is now built inside the prod block, from the
+    real factory under real prod settings, the mint/resolve inventory is taken
+    against THAT app, and the probes are driven against it.
+
+    What this now proves: the prod-configured router table contains exactly one
+    mint surface and one resolve surface, both the production ones, and neither
+    harness verb moves the row or the audit trail.
+    What it still does NOT prove: anything about a surface introduced by
+    something other than ``create_app()`` under these settings -- a reverse
+    proxy, a sidecar, or in-process ``dependency_overrides`` (see the module
+    docstring's stated bypasses). The inventory walk's own blind spot
+    (indirection outside ``curie_api``, a ``getattr``-resolved target) is
+    unchanged by this and is stated there too.
+    """
+
+    approval = _create_approval(approvals_client, auth_headers)
+    before_status = _status(approvals_client, approval["id"], auth_headers)
+    before_audit = _audit(approvals_client, approval["id"], auth_headers)
+    assert before_status == "pending"
+    assert before_audit == []
+
+    with _settings_env(
+        ENVIRONMENT="prod",
+        API_KEY=_PLATFORM_CREDENTIAL_VALUE,
+        GITHUB_WEBHOOK_SECRET=_WEBHOOK_VALUE,
+        CURIE_INTERNAL_WORKER_TOKEN=_WORKER_TOKEN_VALUE,
+        **{ATTESTER_ENV: _ATTESTER_VALUE},
+    ):
+        # The real factory, under real prod settings. `create_app()` reads
+        # `get_settings()` at build time, and the cache was just cleared, so
+        # every router this app mounts is the set a prod process mounts.
+        prod_app = create_app()
+        # Guard the guard: if the settings cache had not actually retargeted,
+        # this would be a second dev app wearing a prod label.
+        assert get_settings().environment == "prod"
+
+        # Take the inventory against the PROD app, not the dev one: a
+        # `if settings.environment == "prod"` router is precisely the shape the
+        # dev-time inventory cannot see.
+        prod_routes = list(_api_routes(prod_app))
+        assert len(prod_routes) > 50, len(prod_routes)
+        assert _mint_resolve_inventory(prod_app) == {
+            "mint_operator_principal": {"mint"},
+            "resolve_approval": {"resolve"},
+        }, _mint_resolve_inventory(prod_app)
+
+        with TestClient(prod_app) as prod_client:
+            # Probe 1 -- synthetic ACTION: "approve this" with no chat principal
+            # at all, the shape a harness verb would take if it ever leaked.
+            action_probe = prod_client.post(
+                f"/approvals/{approval['id']}/resolve",
+                json={"decision": "approved", "actor": SUBJECT, "principal": HARNESS_SUBMODULE},
+            )
+            # Probe 2 -- synthetic IDENTITY: a principal header that is a harness
+            # string rather than a minted, signed chat principal.
+            identity_probe = prod_client.post(
+                f"/approvals/{approval['id']}/resolve",
+                json={"decision": "approved"},
+                headers=_principal_headers(f"{HARNESS_DISTRIBUTION}-synthetic-principal"),
+            )
+
+    for label, response in (("action", action_probe), ("identity", identity_probe)):
+        assert response.status_code in (401, 403, 422), (
+            f"{label} probe: {response.status_code} {response.text}"
+        )
+
+    assert _status(approvals_client, approval["id"], auth_headers) == before_status
+    assert _audit(approvals_client, approval["id"], auth_headers) == before_audit

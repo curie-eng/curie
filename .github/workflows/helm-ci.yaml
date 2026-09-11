@@ -39,6 +39,19 @@ on:
       # (#2190) both read compose.dev.yaml to check third-party image tags,
       # so a compose-only edit that unpins one must run this workflow too.
       - "compose.dev.yaml"
+      # The dev-harness exclusion gate EXECUTES every production image recipe
+      # and the runner pin exporter. A PR that adds the harness to one of them
+      # touches no charts/ path, so without these the gate that exists to catch
+      # exactly that is skipped. `adapters/discord/Dockerfile` is a production
+      # recipe of the same shape (COPY . . then a --package uv sync) and was
+      # missing here, so a Dockerfile-only path-install there ran no gate.
+      - "runner/Dockerfile"
+      - "runner/export_dependency_pins.py"
+      - "apps/api/Dockerfile"
+      - "apps/dispatcher/Dockerfile"
+      - "apps/worker/Dockerfile"
+      - "apps/mail-adapter/Dockerfile"
+      - "adapters/discord/Dockerfile"
 
 permissions:
   contents: read
@@ -520,6 +533,27 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/approval-principal-wiring-assertions.sh
 
+      # `uv` must exist BEFORE the dev-harness exclusion gate below: that gate's
+      # PRIMARY control is `uv export --frozen --no-dev`, so a setup-uv step
+      # placed after it (as it was) makes the step fail on a hosted runner
+      # before it reaches the chart sweep or its own seeded self-checks. The
+      # later `uv sync` for the web-identity gate stays where it is; only the
+      # toolchain install is hoisted.
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+
+      # The dev interaction harness (packages/test-support) must reach no
+      # shipped artifact: neither the resolved --no-dev dependency closure of
+      # the five production images nor any document of the sealed chart render
+      # may name it. The script seeds violations against both controls and must
+      # reject them, so a typo'd needle cannot pass for a clean result.
+      - name: helm render assertions (dev harness exclusion)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/dev-harness-exclusion-assertions.sh
+
       # Prove the mail adapter's chart wiring (issue #1515): it does not render
       # at all by default, it is told where the platform API is, it receives its
       # channel token, egress secret and AgentMail key by reference only, and it
@@ -600,11 +634,9 @@ jobs:
       # the real API and worker BundleStore objects under each rendered
       # workload's env and asks the constructed boto3 client which credential
       # provider won. Reading the manifests alone cannot tell an omitted
-      # credential apart from one the SDK signs as an empty identity.
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
-        with:
-          python-version: "3.13"
+      # credential apart from one the SDK signs as an empty identity. `uv`
+      # itself is installed much earlier, above the dev-harness exclusion gate,
+      # because that gate's primary control shells out to `uv export`.
       - name: Sync workspace
         run: uv sync
 
