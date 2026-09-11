@@ -207,7 +207,11 @@ def parse_feedback(event: str, payload: Any, delivery_id: str) -> UnverifiedFeed
             line = _positive(raw_line, "invalid_review_context")
         review_id = _positive(feedback.get("pull_request_review_id"), "invalid_review_context")
     separator = "" if fragment_kind == "discussion_r" else "-"
-    url = f"https://github.com/{repo}/pull/{pr_number}#{fragment_kind}{separator}{feedback_id}"
+    url_family = "issues" if event == "issue_comment" else "pull"
+    url = (
+        f"https://github.com/{repo}/{url_family}/{pr_number}"
+        f"#{fragment_kind}{separator}{feedback_id}"
+    )
     claimed_url = feedback.get("html_url")
     if not isinstance(claimed_url, str) or claimed_url.casefold() != url.casefold():
         raise FeedbackIgnored("invalid_feedback_url")
