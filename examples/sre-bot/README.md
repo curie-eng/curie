@@ -71,6 +71,20 @@ reliability alerts. Follow [METRICS-ROLLOUT.md](docs/METRICS-ROLLOUT.md) for the
 staged rollout and runtime proof; rendered configuration is evidence of wiring,
 not proof that live samples or alerts reached their destination.
 
+Metric labels stay bounded: operation class and outcome only. Run, session,
+sandbox, user, and deployment identifiers are correlation attributes on logs
+and traces. To diagnose a failed synthetic request:
+
+1. Take the accepted-message timestamp and the W3C `trace_id` from the
+   structured log line, without reading the private message body.
+2. In Tempo, open that `traceId` and confirm the expected operations on the
+   same trace.
+3. In Prometheus, check the matching low-cardinality series. Do not add
+   `run_id` or `trace_id` as label matchers; those identities are not metric
+   labels.
+4. Diagnose completion debt from the completion-outbox metrics rather than
+   inspecting message bodies or credentials.
+
 ## Operational limits
 
 - Events normally expire quickly and pod logs disappear with the pod. The MCP

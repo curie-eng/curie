@@ -4366,6 +4366,8 @@ rung_local_release() {
     if [[ -f "$WORKDIR/bundle-release/evals/trajectory.json" ]]; then
         compose_profile="full"
     fi
+    python3 "$REPO_ROOT/compose/release_images.py" \
+        --compose "$release_compose" --profiles "$compose_profile" --check || return 1
     # Derive the required GHCR refs from the generated compose plus the
     # images `local message` still needs (dispatcher one-shot, runner env)
     # rather than a hardcoded list that grows one missing image at a time
