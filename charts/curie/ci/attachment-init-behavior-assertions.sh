@@ -47,7 +47,12 @@ mkdir -p "$MOUNT"
 CAP=64
 
 echo "=== Rendering the sandbox pod (mountPath=$MOUNT, maxFileBytes=$CAP) ==="
+# The lane ships OFF (worker.attachments.enabled: false), so every assertion
+# below is about what an operator gets after switching it on. The off state has
+# its own gate in attachment-init-assertions.sh: with the flag false the
+# rendered pod carries no attachments-init container at all.
 helm template curie "$CHART" --namespace dev \
+  --set "worker.attachments.enabled=true" \
   --set "agentSandbox.runner.attachments.mountPath=$MOUNT" \
   --set "worker.attachments.maxFileBytes=$CAP" \
   > "$TMP/rendered.yaml"

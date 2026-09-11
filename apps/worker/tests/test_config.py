@@ -1321,12 +1321,18 @@ def test_attachment_fields_read_only_their_curie_aliases(
         "ATTACHMENT_RETENTION_TTL_SECONDS",
     ):
         monkeypatch.setenv(name, "999999")
+    # The off switch reads the same way: a name drift here is an operator who
+    # sets the chart value, sees it in the pod env, and still gets a worker that
+    # downloads and parks every upload.
+    monkeypatch.setenv("ATTACHMENT_ENABLED", "false")
+    monkeypatch.setenv("CURIE_ATTACHMENT_ENABLED", "true")
     monkeypatch.setenv("CURIE_ATTACHMENT_MAX_FILE_BYTES", "8388608")
     monkeypatch.setenv("CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS", "120")
     monkeypatch.setenv("CURIE_ATTACHMENT_RETENTION_TTL_SECONDS", "900")
 
     config = WorkerConfig()
 
+    assert config.attachment_enabled is True
     assert config.attachment_max_file_bytes == 8388608
     assert config.attachment_reference_ttl_seconds == 120
     assert config.attachment_retention_ttl_seconds == 900
@@ -1371,6 +1377,18 @@ def test_the_chart_defaults_match_the_worker_defaults() -> None:
     # ambient CURIE_ATTACHMENT_* in the shell cannot decide what this compares.
     fields = WorkerConfig.model_fields
 
+    assert chart["enabled"] == fields["attachment_enabled"].default, (
+        "the chart and the worker disagree about whether the inbound-attachment "
+        "lane is on. This is the operator's single off switch and it ships OFF; "
+        "a chart that says false while the worker defaults true means an "
+        "operator who never sets the value gets a worker that downloads, parks "
+        "and bills every upload for a sandbox that renders no init container."
+    )
+    assert chart["enabled"] is False, (
+        "worker.attachments.enabled must ship false for this release: the Slack "
+        "download has not been exercised against a real workspace, and this is "
+        "the one knob that returns a deployment to v0.8.8 behaviour."
+    )
     assert chart["maxFileBytes"] == fields["attachment_max_file_bytes"].default
     assert chart["referenceTtlSeconds"] == fields["attachment_reference_ttl_seconds"].default
     assert chart["retentionTtlSeconds"] == fields["attachment_retention_ttl_seconds"].default

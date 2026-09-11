@@ -207,6 +207,56 @@ def test_a_resolved_attachment_reference_reaches_the_claim_env(make_harness) -> 
     asyncio.run(go())
 
 
+def test_a_turn_with_files_is_answered_normally_when_the_lane_is_switched_off(
+    make_harness,
+) -> None:
+    """The shipped default (``worker.attachments.enabled: false``) end to end.
+
+    Off is a real state, not an absence of tests: ``run.build`` wires no
+    coordinator, so ``Kernel._attachments`` is None and a message that DOES
+    carry files has to behave exactly as v0.8.8 behaves -- answered, text only,
+    files ignored, no error and no attachment key on the claim. The failure this
+    guards is an ``assert lane is not None`` or an unguarded attribute reaching
+    the turn path: every uploaded file would then dead-letter the turn on a
+    deployment that had deliberately switched the feature off.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            assert h.kernel._attachments is None, (  # noqa: SLF001 -- the state IS the subject
+                "the harness pre-wires a lane; this test is about its absence"
+            )
+            h.runner.default_script = [Final(text="answered without the file", status=DONE)]
+
+            await h.kernel.process_event(
+                _qevent(
+                    "what does this say?",
+                    thread="tLaneOff",
+                    attachments=[
+                        Attachment(id="F1", name="report.csv", mime_type="text/csv"),
+                        Attachment(id="F2", name="report.csv", mime_type="text/csv"),
+                    ],
+                )
+            )
+
+            assert h.sink.last_text == "answered without the file", (
+                "a turn carrying files errored or was never answered with the lane off"
+            )
+            # Read straight off the substrate rather than through _claim_env:
+            # with the lane off the kernel never touches boot_env at all, so the
+            # claim carries None -- not an empty dict, which is what a lane that
+            # resolved to nothing produces. Both are attachment-free; only this
+            # one proves the turn path was not entered.
+            assert h.fake_k8s.claim_envs and all(
+                env is None or ATTACHMENTS_REF_ENV not in env for env in h.fake_k8s.claim_envs
+            ), (
+                "the lane is off and the claim still carries an attachment "
+                f"capability: {h.fake_k8s.claim_envs}"
+            )
+
+    asyncio.run(go())
+
+
 def test_the_attachment_ledger_is_swept_from_the_same_reap_tick_under_the_route_lock(
     make_harness,
 ) -> None:

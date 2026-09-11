@@ -367,8 +367,21 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         if config.workspace_enabled
         else None
     )
-    # The inbound-attachment lane (#2567). Wired only when this deployment holds
-    # the channel credential: the lane's single job is to download a referenced
+    # The inbound-attachment lane (#2567). Wired only when the operator has
+    # switched the lane on AND this deployment holds the channel credential.
+    #
+    # ``attachment_enabled`` is the lane's single off switch and it ships off:
+    # off means the coordinator is never built, so no file is downloaded, no
+    # bytes are parked, no retention ledger is written and no capability is
+    # minted -- and because nothing is minted the claim carries no
+    # ``CURIE_ATTACHMENTS_REF``, so the k8s driver emits no Overrides entry
+    # naming an init container the chart did not render. The kernel treats an
+    # unwired lane as "the concept does not exist here" and leaves the turn
+    # otherwise untouched, so a message carrying files is answered exactly as
+    # v0.8.8 answers it. The chart's ``worker.attachments.enabled`` gates the
+    # sandbox half from the same value, so there is one knob, not two.
+    #
+    # The credential condition is separate and unchanged: the lane's single job is to download a referenced
     # file with the bot token, and the kernel treats a wired lane as
     # authoritative, so a credential-less install (compose smoke, a mail-only
     # deployment) must keep running every turn exactly as it does today rather
@@ -388,7 +401,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
             objects=workspace_objects,
             limits=_attachment_limits(config),
         )
-        if config.slack_bot_token
+        if config.attachment_enabled and config.slack_bot_token
         else None
     )
     # One API-lane HTTP client shared by the approval writer (#244) and the two

@@ -4,6 +4,7 @@
 worker:
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
   CURIE_ADAPTER_CREDENTIALS: worker.adapterCredentialsExistingSecret
+  CURIE_ATTACHMENT_ENABLED: worker.attachments.enabled
   CURIE_ATTACHMENT_MAX_FILE_BYTES: worker.attachments.maxFileBytes
   CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS: worker.attachments.referenceTtlSeconds
   CURIE_ATTACHMENT_RETENTION_TTL_SECONDS: worker.attachments.retentionTtlSeconds

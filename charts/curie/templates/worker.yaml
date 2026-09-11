@@ -233,6 +233,8 @@ spec:
             python reads 3.3554432e+07 as the number -- so the two sides are
             compared NUMERICALLY by ci/attachment-init-assertions.sh.
             */}}
+            - name: CURIE_ATTACHMENT_ENABLED
+              value: {{ .Values.worker.attachments.enabled | quote }}
             - name: CURIE_ATTACHMENT_MAX_FILE_BYTES
               value: {{ .Values.worker.attachments.maxFileBytes | int64 | quote }}
             - name: CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS

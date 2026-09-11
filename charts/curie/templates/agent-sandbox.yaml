@@ -161,6 +161,21 @@ roleRef:
 {{- $bf := $runner.bundleFetch }}
 {{- $wf := $runner.workspace }}
 {{- $af := $runner.attachments | default dict }}
+{{/*
+The inbound-attachment lane is ONE switch. `worker.attachments.enabled` gates
+the worker half -- the channel download, the parked bytes, the retention ledger
+and the minted capability -- and it gates this half too, because the halves are
+only useful together. With the worker half off and this one on, the pod carries
+an init container that never receives a reference; with this half off and the
+worker half on, the worker pays for every upload and the agent is handed
+nothing, which is a worse silent loss than the bug the lane closes.
+`agentSandbox.runner.attachments.enabled` remains as the sandbox-side sub-gate
+for an operator who wants the pod shape without the mount; it cannot turn the
+lane ON by itself.
+*/}}
+{{- if not .Values.worker.attachments.enabled }}
+{{- $af = set (deepCopy $af) "enabled" false }}
+{{- end }}
 {{- $templateName := printf "%s-runner" (include "curie.fullname" .) }}
 {{- $poolName := printf "%s-runner-pool" (include "curie.fullname" .) }}
 {{- if $agent }}

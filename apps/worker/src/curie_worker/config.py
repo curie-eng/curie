@@ -935,6 +935,18 @@ class WorkerConfig(BaseSettings):
     # zero: a zero cap silently read as "unlimited" is how a bounded ingestion
     # path stops being bounded, and a zero TTL mints an already-expired
     # capability.
+    # The lane switch, OFF by default for this release. It gates the lane whole:
+    # run.py wires no AttachmentCoordinator, so nothing is downloaded, nothing
+    # is parked, no retention ledger is written and no capability is minted --
+    # and with nothing minted the claim carries no CURIE_ATTACHMENTS_REF, so
+    # sandbox/k8s.py emits no Overrides entry naming an init container the chart
+    # did not render. A message carrying files is answered exactly as it is
+    # today: text only, files ignored, no error. Mirrored by
+    # charts/curie/values.yaml worker.attachments.enabled, which also gates the
+    # sandbox half, and pinned by test_config.py.
+    attachment_enabled: bool = Field(
+        default=False, validation_alias="CURIE_ATTACHMENT_ENABLED"
+    )
     attachment_max_file_bytes: int = Field(
         default=32 * 1024 * 1024,
         gt=0,

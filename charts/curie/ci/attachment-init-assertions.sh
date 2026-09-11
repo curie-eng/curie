@@ -315,8 +315,13 @@ def expect_failure(docs, messages, label="probe"):
         assert message in output, f"missing diagnostic {message!r} in:\n{output}"
 
 
-default_docs = render()
-assert_contract(default_docs, "default")
+# The lane ships OFF (worker.attachments.enabled: false), so the contract below
+# describes what an operator gets after switching it on. The chart DEFAULT --
+# the lane off -- is asserted at the bottom of this file.
+LANE_ON = "worker.attachments.enabled=true"
+
+default_docs = render(LANE_ON)
+assert_contract(default_docs, "lane on")
 
 # --- mutation honesty: each property, removed, must fail the gate above -----
 #
@@ -376,7 +381,7 @@ print("    fails the contract above")
 
 # --- switched off leaves the pod exactly as it is today ---------------------
 
-off_docs = render("agentSandbox.runner.attachments.enabled=false")
+off_docs = render(LANE_ON, "agentSandbox.runner.attachments.enabled=false")
 off_spec = pod_spec(off_docs)
 off_inits = off_spec.get("initContainers") or []
 off_mains = off_spec.get("containers") or []
@@ -404,11 +409,57 @@ assert set(off_runner_mounts) == set(on_runner_mounts) - new_volumes, (
 print(f"ok: attachments.enabled=false renders no {INIT_NAME}, no {sorted(new_volumes)}")
 print("    volume and no runner mount -- the sandbox pod is what it is today")
 
+# --- the SHIPPED default: the whole lane off, from one value ----------------
+#
+# worker.attachments.enabled is the lane's single switch and it ships false. Off
+# has to mean off on BOTH halves from that one value, or an operator reading
+# "enabled: false" in values.yaml gets a pod carrying an init container that
+# never receives a reference while the worker pays for every upload. The worker
+# half of the same assertion is
+# apps/worker/tests/test_run.py and apps/worker/tests/test_config.py.
+
+shipped_docs = render()
+shipped_spec = pod_spec(shipped_docs)
+shipped_inits = shipped_spec.get("initContainers") or []
+shipped_mains = shipped_spec.get("containers") or []
+assert named(shipped_inits, INIT_NAME) is None, (
+    f"the chart default renders {INIT_NAME}; worker.attachments.enabled is false, "
+    "so the pod would carry an init container nothing ever hands a reference"
+)
+for container in shipped_inits + shipped_mains:
+    assert REF_ENV not in env_names(container), (
+        f"the chart default still hands {REF_ENV} to {container.get('name')}"
+    )
+shipped_volume_names = {v["name"] for v in (shipped_spec.get("volumes") or [])}
+assert not (new_volumes & shipped_volume_names), (
+    f"the chart default still renders the {sorted(new_volumes)} volume"
+)
+assert set(mount_paths(named(shipped_mains, "runner"))) == set(off_runner_mounts), (
+    "the chart default leaves an attachment mount on the runner"
+)
+
+shipped_worker_env = worker_env(shipped_docs)
+assert shipped_worker_env["CURIE_ATTACHMENT_ENABLED"]["value"] == "false", (
+    "the worker does not receive CURIE_ATTACHMENT_ENABLED=false, so the worker "
+    "half of the lane keeps downloading, parking and minting with the chart "
+    "value set to off"
+)
+on_worker_env = worker_env(default_docs)
+assert on_worker_env["CURIE_ATTACHMENT_ENABLED"]["value"] == "true", (
+    "worker.attachments.enabled=true does not reach the worker as "
+    "CURIE_ATTACHMENT_ENABLED, so the switch cannot turn the lane on"
+)
+
+print("ok: the shipped default (worker.attachments.enabled: false) renders no")
+print(f"    {INIT_NAME}, no attachment volume, no runner mount, and tells the")
+print("    worker CURIE_ATTACHMENT_ENABLED=false -- one value, both halves")
+
 print()
 print(
     "PASS: attachments-init runs before the runner, shares one size-limited "
     "emptyDir with it, receives the presigned reference that the runner never "
     "sees, verifies the minted sha256, enforces the worker's own size cap, and "
-    "disappears entirely when the lane is switched off."
+    "disappears entirely -- on both halves, from one value -- when the lane is "
+    "switched off."
 )
 PY

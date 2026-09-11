@@ -142,20 +142,64 @@ def _lane(kwargs: dict[str, Any]) -> AttachmentCoordinator:
     return lane
 
 
+# --- the lane's off switch, which is where it ships -------------------------
+
+
+def test_the_lane_ships_off_and_wires_nothing_at_all(built: Any) -> None:
+    """The rollback state, and this release's DEFAULT.
+
+    ``attachment_enabled`` is false out of the box, so a deployment that holds a
+    perfectly good bot token still builds NO coordinator. That is what makes the
+    switch a real off switch rather than a sandbox-side one: with no coordinator
+    there is no download, no parked object, no retention ledger and no minted
+    capability, so nothing is billed and -- because no
+    ``CURIE_ATTACHMENTS_REF`` is ever minted -- ``sandbox/k8s.py`` emits no
+    Overrides entry naming an init container the chart (also off, from the same
+    value) did not render.
+
+    revert: change ``run.build``'s condition back to the bot token alone -> this
+    fails and nothing else in the suite does.
+    """
+
+    kwargs = built(slack_bot_token=_FAKE_BOT_TOKEN)
+    assert kwargs.get("attachments") is None, (
+        "the lane was wired with attachment_enabled at its default. The off "
+        "switch does not switch anything off: the worker still downloads every "
+        "upload, parks the bytes, bills the storage and mints a capability."
+    )
+    # Not just the keyword: the kernel's own state is what the turn path
+    # branches on, and `attachments=<something falsy>` would satisfy the former.
+    assert _KernelSpy.instances[0].inner._attachments is None  # noqa: SLF001
+
+
+def test_the_default_config_ships_the_lane_off(built: Any) -> None:
+    """Stated once, directly, so a default flip cannot be a silent diff."""
+
+    assert WorkerConfig(slack_bot_token=_FAKE_BOT_TOKEN).attachment_enabled is False
+
+
+def test_the_switch_on_its_own_does_not_wire_the_lane_without_a_credential(
+    built: Any,
+) -> None:
+    """Both conditions still hold. The credential guard is unchanged."""
+
+    assert built(attachment_enabled=True, slack_bot_token="").get("attachments") is None
+
+
 # --- the lane reaches the kernel -------------------------------------------
 
 
 def test_build_hands_the_kernel_an_attachment_coordinator(built: Any) -> None:
     # THE test for S4. revert: drop `attachments=` from the Kernel(...) call in
     # run.build -> this fails and nothing else in the suite does.
-    assert isinstance(_lane(built(slack_bot_token=_FAKE_BOT_TOKEN)), AttachmentCoordinator)
+    assert isinstance(_lane(built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN)), AttachmentCoordinator)
 
 
 def test_the_kernel_actually_holds_the_lane_it_was_handed(built: Any) -> None:
     # Passing the keyword is not enough: `attachments=None` would satisfy the
     # signature and leave the turn path untouched. Read the constructed kernel's
     # own state, which is what _handle_event branches on.
-    kwargs = built(slack_bot_token=_FAKE_BOT_TOKEN)
+    kwargs = built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN)
     kernel = _KernelSpy.instances[0].inner
     assert kernel._attachments is _lane(kwargs)  # noqa: SLF001 -- the wiring IS the subject
 
@@ -167,7 +211,7 @@ def test_the_lane_downloads_through_the_bot_token_and_parks_in_the_private_store
     # channel download (the worker's bot token, ADR-0075) and the PRIVATE
     # object store. Wiring it to the public bundle bucket would publish every
     # inbound file to anything holding a bundle URL.
-    lane = _lane(built(slack_bot_token=_FAKE_BOT_TOKEN, workspace_bucket="curie-workspaces"))
+    lane = _lane(built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN, workspace_bucket="curie-workspaces"))
     assert lane.files is not None
     assert isinstance(lane.objects, WorkspaceObjectStore)
     assert lane.objects._bucket == "curie-workspaces"  # noqa: SLF001
@@ -179,7 +223,7 @@ def test_no_bot_token_leaves_the_lane_unwired_rather_than_half_wired(built: Any)
     # kernel treats a wired lane as authoritative. A deployment with no bot
     # token (compose smoke, a mail-only install) must run every turn exactly as
     # it does today rather than failing on the first message with a file.
-    assert built(slack_bot_token="").get("attachments") is None
+    assert built(attachment_enabled=True, slack_bot_token="").get("attachments") is None
 
 
 # --- the configured envelope reaches the lane ------------------------------
@@ -190,6 +234,7 @@ def test_the_configured_limits_reach_the_wired_coordinator(built: Any) -> None:
     # dead wiring one level down: the operator's value changes nothing.
     lane = _lane(
         built(
+            attachment_enabled=True,
             slack_bot_token=_FAKE_BOT_TOKEN,
             attachment_max_file_bytes=7 * 1024 * 1024,
             attachment_reference_ttl_seconds=120,
@@ -204,7 +249,7 @@ def test_the_configured_limits_reach_the_wired_coordinator(built: Any) -> None:
 def test_an_unconfigured_deployment_gets_the_lane_defaults(built: Any) -> None:
     # The shipped envelope, read off the lane the kernel holds rather than off
     # the dataclass, so a wiring that quietly substitutes its own numbers fails.
-    lane = _lane(built(slack_bot_token=_FAKE_BOT_TOKEN))
+    lane = _lane(built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN))
     default = AttachmentLimits()
     assert lane.limits.max_file_bytes == default.max_file_bytes
     assert lane.limits.reference_ttl_seconds == default.reference_ttl_seconds
@@ -255,7 +300,7 @@ def test_a_resolved_turn_delivers_the_capability_under_the_init_containers_key(
     # k8s substrate scopes to attachments-init. Driven through the WIRED lane's
     # own resolve so a build that hands over a differently-configured
     # coordinator cannot pass.
-    lane = _lane(built(slack_bot_token=_FAKE_BOT_TOKEN))
+    lane = _lane(built(attachment_enabled=True, slack_bot_token=_FAKE_BOT_TOKEN))
 
     class _Objects:
         def put_stream(self, key: str, chunks: Any) -> None:

@@ -1601,6 +1601,18 @@ worker:
   # apps/worker/tests/test_config.py compares them against the Python defaults
   # and ci/attachment-init-assertions.sh compares the rendered pair.
   attachments:
+    # THE lane switch, and it is OFF for this release. Off means off everywhere:
+    # the worker does not download a referenced file, parks no bytes, writes no
+    # retention ledger and mints no capability, and the sandbox pod renders
+    # without the attachments volume, the attachments-init container and the
+    # runner's mount -- so an inbound message carrying files is answered exactly
+    # as it is today, text only, with the files ignored and no error. Turning it
+    # on is a deliberate operator action: the Slack-side download has not been
+    # exercised against a real workspace yet, and the app must have the
+    # `files:read` scope (a missing scope degrades to a WARNING at boot, it does
+    # not refuse). Gates agentSandbox.runner.attachments too; that key is only a
+    # sandbox-side sub-gate and cannot turn the lane on by itself.
+    enabled: false
     # Per-file ceiling, enforced while streaming in the worker (nothing is
     # buffered past the crossing chunk) and again in the init container. A zero
     # is refused rather than read as "unlimited".
