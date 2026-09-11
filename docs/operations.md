@@ -1103,11 +1103,82 @@ with anything. If such an approval expires, its message keeps its buttons.
 Edit or delete that Slack message by hand, or ignore it -- the approval itself
 is expired in the API either way, so a click on it cannot approve anything.
 
+## Which claim env reaches which sandbox container
+
+Almost nobody writes a `SandboxClaim` by hand -- the worker creates them. But
+reproducing a sandbox by hand is the normal way to build a proof, a bug repro,
+or a support investigation, and the claim's env has a shape that is easy to get
+wrong in a way that looks like success.
+
+A sandbox pod runs up to three staging **init containers** before the runner
+starts: `bundle-fetch` and `bundle-extract` pull the plugin bundle out of the
+object store into `CURIE_PLUGIN_DIR`, and `workspace-init` fetches and unpacks
+the repository workspace. Each one reads its own env.
+
+A `SandboxClaim` env entry carries an optional `containerName`. **An entry with
+no `containerName` is injected into the runner container only** -- the
+`envVarsInjectionPolicy: Overrides` on the SandboxTemplate governs which side
+wins for a container the entry names, not which containers it reaches. So an
+entry the init containers need must be repeated once per init container, each
+with an explicit `containerName`:
+
+```yaml
+spec:
+  env:
+    # Reaches the runner only -- correct for runner-side keys.
+    - name: CURIE_SESSION_ID
+      value: thread-42
+    # Staging keys must be repeated per init container.
+    - name: CURIE_BUNDLE_REF
+      value: bundles/my-agent-v7.tgz
+    - name: CURIE_BUNDLE_REF
+      value: bundles/my-agent-v7.tgz
+      containerName: bundle-fetch
+    - name: CURIE_BUNDLE_REF
+      value: bundles/my-agent-v7.tgz
+      containerName: bundle-extract
+```
+
+| Env | Claim-settable? | Who consumes it |
+|---|---|---|
+| `CURIE_BUNDLE_REF` | Yes -- runner **and** `containerName: bundle-fetch` **and** `containerName: bundle-extract` | The init pair fetches and extracts the bundle; the runner reads the ref only to diagnose a staging failure. |
+| `CURIE_WORKSPACE_REF` | Yes -- `containerName: workspace-init` only | `workspace-init`. Deliberately NOT injected into the runner: it is a short-lived signed URL and the claim is plaintext in etcd. |
+| `CURIE_WORKSPACE_SHA256` | Yes -- `containerName: workspace-init` only | `workspace-init`, to verify the fetched archive. |
+| `CURIE_SESSION_ID`, `CURIE_HISTORY_REF`, `CURIE_PLUGIN_DIR`, and the rest of the boot env | Yes -- runner, no `containerName` | The runner. |
+| `CURIE_CREDENTIALS` | Don't. Worker-filtered, not schema-rejected | The runner, from the chart Secret's `secretKeyRef`. The worker strips this key off every claim it writes; a claim you write yourself is not filtered, and the value would sit in plaintext in etcd. |
+| Per-agent connector secrets (the keys named by `CURIE_CONNECTOR_SECRET_KEYS`) | Don't. Worker-filtered, not schema-rejected | The runner, from the per-agent SandboxTemplate's `secretKeyRef`. Same plaintext-in-etcd caveat. |
+| `S3_ENDPOINT`, `BUNDLE_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `AWS_*` | Don't. Chart-managed defaults | `bundle-fetch`. Wired from values and Secrets, not a per-claim decision. An explicitly targeted claim entry would override them under `Overrides`. |
+
+**Nothing on this list is enforced by the CRD.** The vendored `SandboxClaim`
+schema accepts any env name, and `envVarsInjectionPolicy: Overrides` means a
+claim entry that names a container wins over the template's own value for it.
+The "Don't" rows above are the worker's discipline and the chart's wiring, both
+of which a hand-written claim bypasses entirely. Treat them as what you must not
+do, not as what you cannot do -- in particular, a credential you put on a claim
+is persisted in plaintext in etcd and nothing will stop you.
+
+**How the mistake shows up.** It does not look like a mistake. Every init
+container exits 0 -- an empty ref is its documented no-op path, which is what a
+warm or unbound pod needs. The claim reports `Pod is Running but not Ready`, and
+the runner crash-loops on `[manifest.missing]`, which reads like a broken
+bundle. Two things now name the real cause:
+
+- each staging init container logs, on its no-op path, that a `spec.env` entry
+  with no `containerName` reaches the runner only, and which `containerName` to
+  add (`kubectl logs <pod> -c bundle-fetch`);
+- the runner refuses to boot with `CURIE_BUNDLE_REF` set over an empty plugin
+  dir, and says so in those terms instead of blaming the bundle.
+
 ## Known gotchas
 
 Notes from the first installs of the chart on fresh clusters, kept for the
 next operator.
 
+- **A hand-written `SandboxClaim`'s `spec.env` reaches the runner container
+  only** unless each entry names a `containerName`. Staging a plugin bundle or a
+  workspace by hand therefore needs the entry repeated per init container --
+  see [Which claim env reaches which sandbox container](#which-claim-env-reaches-which-sandbox-container)
+  above. It used to fail silently: every init container exited 0 (#2612).
 - **The agent-sandbox controller is enabled by default.** The chart ships the
   agent-sandbox CRDs and deploys the vendored controller when
   `agentSandbox.controller.deploy=true`, which is the default. A cluster that

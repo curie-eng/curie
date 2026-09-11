@@ -498,6 +498,19 @@ jobs:
       # image-GCed node cannot cold-pull amazon/aws-cli (~418MB) inside the
       # 90s claim window. Compares the two rendered objects; a sandbox image
       # with no matching prewarm container fails.
+      # Prove every sandbox staging init container explains its no-op instead of
+      # taking it silently (issue #2612). A SandboxClaim spec.env entry with no
+      # containerName reaches the runner container only, so a hand-written claim
+      # leaves bundle-fetch/bundle-extract/workspace-init on the template's empty
+      # defaults: all three exit 0 having staged nothing and the runner
+      # crash-loops on an unrelated [manifest.missing]. The no-op stays (a warm
+      # pod has no ref) but must now name containerName as the fix, in the log of
+      # the container that took it.
+      - name: helm render assertions (claim env / init containers)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/claim-env-init-container-assertions.sh
+
       - name: helm render assertions (prewarm bundle-fetch images)
         run: |
           set -euo pipefail

@@ -2079,3 +2079,18 @@ that cannot reach it. See that helper for the containment/family rules.
   {{- end }}
 {{- end }}
 {{- end -}}
+
+{{/* ---- Claim-env no-op notice for the sandbox init containers (#2612) ----
+     Every staging init container below takes a silent no-op path when its own
+     env is empty, which is correct for a warm or unbound pod and WRONG-looking
+     for a hand-written SandboxClaim: a `spec.env` entry with no `containerName`
+     is injected into the runner container only, so the init container keeps the
+     template's baked empty default, logs "nothing to do", and exits 0. Every
+     container reported success and the runner then crash-looped on an unrelated
+     [manifest.missing]. The no-op stays a no-op -- the pod must still boot warm
+     -- but it now names the one mistake that produces it, in the log of the
+     container that took it.
+     Args: dict "key" <env var name> "container" <this init container's name>. */}}
+{{- define "curie.sandbox.claimEnvNoOpNotice" -}}
+no {{ .key }} in this container's env: nothing to stage. This is expected for a warm or unbound pod. If you set {{ .key }} on a SandboxClaim and expected staging, note that a spec.env entry with no containerName reaches the RUNNER container only -- repeat it with containerName: {{ .container }}.
+{{- end -}}

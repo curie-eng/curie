@@ -317,7 +317,7 @@ spec:
               set -eu
               REF="${CURIE_BUNDLE_REF:-}"
               if [ -z "$REF" ]; then
-                echo "no CURIE_BUNDLE_REF; skipping bundle fetch"
+                echo {{ include "curie.sandbox.claimEnvNoOpNotice" (dict "key" "CURIE_BUNDLE_REF" "container" "bundle-fetch") | quote }}
                 exit 0
               fi
               {{- if include "curie.rustfs.staticCredentials" . }}
@@ -382,7 +382,7 @@ spec:
               DEST={{ $bf.mountPath }}/current
               mkdir -p "$DEST"
               if [ -z "$REF" ]; then
-                echo "no CURIE_BUNDLE_REF; starting with an empty plugin dir"
+                echo {{ include "curie.sandbox.claimEnvNoOpNotice" (dict "key" "CURIE_BUNDLE_REF" "container" "bundle-extract") | quote }}
                 exit 0
               fi
               ARCHIVE={{ $bf.mountPath }}/.bundle-archive
@@ -447,6 +447,7 @@ spec:
               destination = root / ".curie-workspace.tar.gz"
               stage = root / ".curie-stage"
               if not ref:
+                  print({{ include "curie.sandbox.claimEnvNoOpNotice" (dict "key" "CURIE_WORKSPACE_REF" "container" "workspace-init") | quote }}, flush=True)
                   sys.exit(0)
               # An init-container restart must never overlay a partial prior
               # extraction. The signed archive is fetched again after cleanup.
