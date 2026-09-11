@@ -295,6 +295,7 @@ fn rollback_opts(revision: Option<u32>, allow_failed_revision: bool) -> Rollback
         // Always: an unanswered prompt would hang the test binary.
         yes: true,
         disable_schema_gate: false,
+        live_schema_revision: None,
     }
 }
 

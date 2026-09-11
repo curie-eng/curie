@@ -1,0 +1,104 @@
+{
+  "comment": "Single source of truth for ErrorEvent.classification allowlist-constrain across the Python runner (curie_runner.translate.map_error_classification) and the Python worker (curie_worker.kernel.map_error_classification). The two lanes cannot share code, so the rule is frozen here: a platform vocabulary token passes through unchanged; any other raw value, including SDK tokens (unknown, rate_limit, error_during_execution, server_error), empty, and null, becomes unclassified. Do not synonym-map SDK rate_limit onto platform rate-limit: that would make a currently non-retryable token retryable (RETRYABLE_CLASSIFICATIONS contains rate-limit only) and is classification/retry policy, out of scope for cause recording. Changing a rule here requires changing both lanes; changing a lane without this file fails that lane's test. Read by runner/tests/test_vector_error_classification.py and apps/worker/tests/kernel/test_vector_error_classification.py. Both loaders reject unknown top-level and per-vector keys, so a key one lane cannot see cannot pass vacuously.",
+  "unclassified": "unclassified",
+  "platform": [
+    "rate-limit",
+    "runner-error",
+    "runner-timeout",
+    "workspace-error",
+    "budget-exceeded",
+    "server-error",
+    "ledger-error",
+    "model-credential-rejected",
+    "approval-not-acted",
+    "false-completion",
+    "publication-unrecorded"
+  ],
+  "vectors": [
+    {
+      "name": "sdk_unknown_is_unclassified",
+      "input": "unknown",
+      "expected": "unclassified"
+    },
+    {
+      "name": "sdk_rate_limit_underscore_is_unclassified",
+      "input": "rate_limit",
+      "expected": "unclassified"
+    },
+    {
+      "name": "sdk_error_during_execution_is_unclassified",
+      "input": "error_during_execution",
+      "expected": "unclassified"
+    },
+    {
+      "name": "sdk_server_error_underscore_is_unclassified",
+      "input": "server_error",
+      "expected": "unclassified"
+    },
+    {
+      "name": "empty_string_is_unclassified",
+      "input": "",
+      "expected": "unclassified"
+    },
+    {
+      "name": "null_is_unclassified",
+      "input": null,
+      "expected": "unclassified"
+    },
+    {
+      "name": "platform_rate_limit",
+      "input": "rate-limit",
+      "expected": "rate-limit"
+    },
+    {
+      "name": "platform_runner_error",
+      "input": "runner-error",
+      "expected": "runner-error"
+    },
+    {
+      "name": "platform_runner_timeout",
+      "input": "runner-timeout",
+      "expected": "runner-timeout"
+    },
+    {
+      "name": "platform_workspace_error",
+      "input": "workspace-error",
+      "expected": "workspace-error"
+    },
+    {
+      "name": "platform_budget_exceeded",
+      "input": "budget-exceeded",
+      "expected": "budget-exceeded"
+    },
+    {
+      "name": "platform_server_error",
+      "input": "server-error",
+      "expected": "server-error"
+    },
+    {
+      "name": "platform_ledger_error",
+      "input": "ledger-error",
+      "expected": "ledger-error"
+    },
+    {
+      "name": "platform_model_credential_rejected",
+      "input": "model-credential-rejected",
+      "expected": "model-credential-rejected"
+    },
+    {
+      "name": "platform_approval_not_acted",
+      "input": "approval-not-acted",
+      "expected": "approval-not-acted"
+    },
+    {
+      "name": "platform_false_completion",
+      "input": "false-completion",
+      "expected": "false-completion"
+    },
+    {
+      "name": "platform_publication_unrecorded",
+      "input": "publication-unrecorded",
+      "expected": "publication-unrecorded"
+    }
+  ]
+}

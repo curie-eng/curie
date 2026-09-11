@@ -113,6 +113,8 @@ scrapeConfigs:
           own_namespace: true
     metric_relabel_configs: *curie_source_stamp
 server:
+  extraArgs:
+    web.enable-remote-write-receiver: ""
   retention: 7d
   retentionSize: 3GB
   global:
@@ -128,3 +130,204 @@ server:
       memory: 512Mi
     limits:
       memory: 1Gi
+
+# Reliability alerts for retained Curie metrics and node capacity. Alertmanager
+# stays disabled: these rules fire inside Prometheus so an operator can query
+# /api/v1/alerts. This issue does not send notifications to people.
+serverFiles:
+  alerting_rules.yml:
+    groups:
+      - name: curie-reliability
+        rules:
+          - alert: CurieApplicationMetricsAbsent
+            expr: absent(curie_turn_accepted_total)
+            for: 10m
+            labels:
+              severity: page
+              component: curie-metrics
+            annotations:
+              summary: Curie application metrics are absent from Prometheus
+              description: >-
+                No curie_turn_accepted_total series has been retained for 10
+                minutes. Treat missing metrics as a failure, not as a quiet
+                system.
+          - alert: CurieTurnAcceptedStale
+            expr: |
+              (
+                increase(curie_turn_accepted_total[90m]) == 0
+              )
+              and
+              (
+                increase(curie_turn_accepted_total[7d]) > 0
+              )
+            for: 15m
+            labels:
+              severity: page
+              component: curie-canary
+            annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+          - alert: CurieTaskFailure
+            expr: |
+              increase(
+                curie_turn_completed_total{outcome="classified_failure"}[15m]
+              ) > 0
+            for: 5m
+            labels:
+              severity: page
+              component: curie-task
+            annotations:
+              summary: A Curie turn completed as classified_failure
+              description: >-
+                curie_turn_completed_total with outcome classified_failure
+                increased in the last 15 minutes.
+          - alert: CurieQueueMessageAgeHigh
+            expr: curie_queue_message_age_seconds > 900
+            for: 10m
+            labels:
+              severity: page
+              component: curie-queue
+            annotations:
+              summary: Oldest queued Curie message is older than 15 minutes
+              description: >-
+                curie_queue_message_age_seconds has stayed above 900 for 10
+                minutes.
+          - alert: CurieCompletionOutboxAgeHigh
+            expr: curie_completion_outbox_age_seconds > 300
+            for: 10m
+            labels:
+              severity: page
+              component: curie-completion
+            annotations:
+              summary: An owed completion is older than five minutes
+              description: >-
+                curie_completion_outbox_age_seconds has stayed above 300 for
+                10 minutes. A drained run queue does not clear this signal.
+          - alert: CurieCompletionOutboxSignalAbsent
+            expr: |
+              absent(curie_completion_outbox)
+              and
+              count(curie_turn_accepted_total) > 0
+            for: 10m
+            labels:
+              severity: page
+              component: curie-completion
+            annotations:
+              summary: Completion-outbox metrics are absent while turns flow
+              description: >-
+                Turns are being accepted, but curie_completion_outbox is
+                missing. Absent completion-delivery telemetry is a failure
+                signal.
+          - alert: CurieReplyDeliveryRefused
+            expr: |
+              increase(
+                curie_reply_delivery_total{outcome="failure"}[15m]
+              ) >= 3
+            for: 10m
+            labels:
+              severity: page
+              component: curie-delivery
+            annotations:
+              summary: Repeated Curie reply delivery failures
+              description: >-
+                curie_reply_delivery_total with outcome failure increased by
+                three or more in 15 minutes.
+          - alert: CurieChannelTokenRotationFailed
+            expr: |
+              increase(
+                curie_http_server_request_total{
+                  operation="/channels/token",
+                  outcome="5xx"
+                }[1h]
+              ) > 0
+            for: 5m
+            labels:
+              severity: page
+              component: curie-token
+            annotations:
+              summary: Channel-token HTTP rotation returned 5xx
+              description: >-
+                curie_http_server_request_total for /channels/token with
+                outcome 5xx increased in the last hour.
+          - alert: CurieMailAdapterNotReady
+            expr: |
+              kube_deployment_status_replicas_unavailable{
+                deployment=~".*mail-adapter"
+              } > 0
+            for: 5m
+            labels:
+              severity: page
+              component: curie-token
+            annotations:
+              summary: Mail adapter replicas are unavailable
+              description: >-
+                The mail adapter Deployment has unavailable replicas. An
+                expired channel token fails /readyz and surfaces here without
+                inspecting a token value.
+          - alert: CurieNodeMemoryHeadroomLow
+            expr: |
+              100 * (
+                node_memory_MemAvailable_bytes{curie_source="curie-sre-bot"}
+                /
+                node_memory_MemTotal_bytes{curie_source="curie-sre-bot"}
+              ) < 10
+            for: 15m
+            labels:
+              severity: page
+              component: curie-node
+            annotations:
+              summary: Node memory headroom is below 10 percent
+              description: >-
+                A curie_source=curie-sre-bot memory series has had less than
+                10 percent available for 15 minutes.
+          - alert: CurieRootDiskPressure
+            expr: |
+              (
+                node_filesystem_avail_bytes{
+                  curie_source="curie-sre-bot",
+                  mountpoint="/",
+                  fstype!~"rootfs|tmpfs|overlay"
+                }
+                /
+                node_filesystem_size_bytes{
+                  curie_source="curie-sre-bot",
+                  mountpoint="/",
+                  fstype!~"rootfs|tmpfs|overlay"
+                }
+              ) < 0.20
+            for: 15m
+            labels:
+              severity: page
+              component: curie-node
+            annotations:
+              summary: Root disk has less than 20 percent free
+              description: >-
+                A curie_source=curie-sre-bot root filesystem has stayed below
+                20 percent free for 15 minutes.
+          - alert: CurieDuplicateNodeExporter
+            expr: |
+              count(
+                node_memory_MemAvailable_bytes{
+                  curie_source="curie-sre-bot",
+                  instance=~".*:9100"
+                }
+              ) > 0
+              and
+              count(
+                node_memory_MemAvailable_bytes{
+                  curie_source="curie-sre-bot",
+                  instance=~".*:9101"
+                }
+              ) > 0
+            for: 10m
+            labels:
+              severity: page
+              component: curie-node
+            annotations:
+              summary: Both 9100 and 9101 node-exporter series are retained
+              description: >-
+                node_memory_MemAvailable_bytes with curie_source=curie-sre-bot
+                has series on :9100 and :9101. Naive sums of that set
+                double-count the node. Isolate scrape to one intended series.

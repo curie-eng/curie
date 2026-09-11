@@ -27,10 +27,10 @@ through SQLAlchemy 2.0 (async) with Alembic migrations. The swappable thing is t
 Postgres — while the SQL/ORM layer and the `curie` schema stay opinionated core.
 This is a deliberately un-abstracted seam: a managed-Postgres swap is a **DSN change**
 (`DATABASE_URL`), not a code change. There is no repository/DAL port; SQLAlchemy 2.0 +
-Alembic *is* the contract for the API, while the worker reads the same schema through
-hand-written SQL over its own engine, so the schema itself (table and column names
-included) is the real coupling. A narrower port would be extracted only if a
-non-Postgres store is ever demanded.
+Alembic *is* the contract for the API, while the worker reaches the same schema through
+hand-written SQL over its own engine (reads and writes), so the schema itself (table
+and column names included) is the real coupling. A narrower port would be extracted
+only if a non-Postgres store is ever demanded.
 
 ## Current contract
 
@@ -40,8 +40,8 @@ PostgreSQL 16:
 
 - **DSN + schema** (`apps/api/src/curie_api/db.py::SCHEMA`, `apps/api/src/curie_api/db.py::create_engine`): `SCHEMA = get_settings().db_schema` (default `"curie"`, `apps/api/src/curie_api/config.py::Settings`); the engine is built from `database_url` (env `DATABASE_URL`) via `create_async_engine(..., pool_pre_ping=True)`.
 - **Schema-scoped metadata** (`apps/api/src/curie_api/db.py::Base`): `Base.metadata = MetaData(schema=SCHEMA)` — every table is qualified into the `curie` schema.
-- **Models** (`apps/api/src/curie_api/models.py`): every `Base` subclass in that module is `apps/api/src/curie_api/models.py::Agent` (table `agents`), `apps/api/src/curie_api/models.py::AgentChannel` (table `agent_channels`), `apps/api/src/curie_api/models.py::AgentVersion` (table `agent_versions`), `apps/api/src/curie_api/models.py::Deployment` (table `deployments`), `apps/api/src/curie_api/models.py::ThreadWorkspace` (table `thread_workspaces`), `apps/api/src/curie_api/models.py::Approval` (table `approvals`), `apps/api/src/curie_api/models.py::Publication` (table `publications`), `apps/api/src/curie_api/models.py::CredentialRedemptionAuditEntry` (table `credential_redemption_audit_entries`), `apps/api/src/curie_api/models.py::ApprovalAuditEntry` (table `approval_audit_entries`), `apps/api/src/curie_api/models.py::AgentAction` (table `agent_actions`), `apps/api/src/curie_api/models.py::ActionAuditEntry` (table `action_audit_entries`), `apps/api/src/curie_api/models.py::WorkflowStateEntry` (table `workflow_state_entries`), and `apps/api/src/curie_api/models.py::ConsoleSession` (table `console_sessions`), plus the `apps/api/src/curie_api/models.py::Environment` and `apps/api/src/curie_api/models.py::ApprovalStatus` StrEnums. The authoritative list remains the set of `Base` subclasses in that module.
-- **Two readers, one DSN** (`apps/api/src/curie_api/db.py::create_engine`, `apps/worker/src/curie_worker/run.py::build`): the API and the worker each build their own `create_async_engine(...)` from their own `database_url` setting (`apps/api/src/curie_api/config.py::Settings`, `apps/worker/src/curie_worker/config.py::WorkerConfig`), both read from `DATABASE_URL`, so a swap repoints both services. The worker never imports the API's models: it reads the schema read-only through hand-written SQL (`apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL`, `apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`), which makes table and column names a second, ORM-independent coupling a conforming DB must honor.
+- **Models** (`apps/api/src/curie_api/models.py`): every `Base` subclass in that module is `apps/api/src/curie_api/models.py::Agent` (table `agents`), `apps/api/src/curie_api/models.py::AgentChannel` (table `agent_channels`), `apps/api/src/curie_api/models.py::AgentVersion` (table `agent_versions`), `apps/api/src/curie_api/models.py::Deployment` (table `deployments`), `apps/api/src/curie_api/models.py::ThreadWorkspace` (table `thread_workspaces`), `apps/api/src/curie_api/models.py::Approval` (table `approvals`), `apps/api/src/curie_api/models.py::Publication` (table `publications`), `apps/api/src/curie_api/models.py::CredentialRedemptionAuditEntry` (table `credential_redemption_audit_entries`), `apps/api/src/curie_api/models.py::ApprovalAuditEntry` (table `approval_audit_entries`), `apps/api/src/curie_api/models.py::AgentAction` (table `agent_actions`), `apps/api/src/curie_api/models.py::ActionAuditEntry` (table `action_audit_entries`), `apps/api/src/curie_api/models.py::WorkflowStateEntry` (table `workflow_state_entries`), and `apps/api/src/curie_api/models.py::ConsoleSession` (table `console_sessions`), plus the `apps/api/src/curie_api/models.py::Environment`, `apps/api/src/curie_api/models.py::ApprovalStatus`, and `apps/api/src/curie_api/models.py::ActionStatus` StrEnums. The authoritative list remains the set of `Base` subclasses in that module.
+- **Two engines, one DSN** (`apps/api/src/curie_api/db.py::create_engine`, `apps/worker/src/curie_worker/run.py::build`): the API and the worker each build their own `create_async_engine(...)` from their own `database_url` setting (`apps/api/src/curie_api/config.py::Settings`, `apps/worker/src/curie_worker/config.py::WorkerConfig`), both read from `DATABASE_URL`, so a swap repoints both services. The worker never imports the API's models: it reaches the schema through hand-written SQL, both reading (`apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL`, `apps/worker/src/curie_worker/binding.py::_UNDEPLOYED_BINDING_SQL`, `apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`) and writing (`apps/worker/src/curie_worker/publication_store.py::PostgresPublicationStore` updates `publications` / `approvals` under `FOR UPDATE ... SKIP LOCKED`). Table and column names are a second, ORM-independent coupling a conforming DB must honor.
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything).
 
 ## Implementations today
@@ -100,6 +100,16 @@ is a judgement call, not something derivable from the tree.
    ordinary Postgres unique semantics would allow duplicate NULL tuples. This clause is
    PostgreSQL-specific and was added in PostgreSQL 15, which is the minimum server
    version for this relational contract.
+6. **`SELECT ... FOR UPDATE ... SKIP LOCKED`** — the worker's
+   `apps/worker/src/curie_worker/publication_store.py::PostgresPublicationStore`
+   claims publication and approval rows under `FOR UPDATE OF p SKIP LOCKED` (and
+   sibling `FOR UPDATE SKIP LOCKED` statements in the same module) so concurrent
+   workers do not block on one another's in-flight claim. The API uses the same
+   clause on other claim paths
+   (`apps/api/src/curie_api/crud.py::claim_resume_row`,
+   `apps/api/src/curie_api/resumereconciler.py::ResumeReconciler`). A second
+   engine that honors the models but not this skip-locked claim would serialize
+   those loops.
 
 Items 1 to 3 are cheap within the Postgres family: any managed Postgres speaks all three
 natively, so the DSN-only swap is unaffected by them. Item 4 is different in kind: it is
@@ -108,12 +118,13 @@ stated contract as well as past Postgres; swapping the models and migrations wou
 carry it, and a reader looking only at `models.py` would not find it. Item 5 is likewise
 a database-level contract rather than a model type: it is native on a supported managed
 Postgres, but a pre-15 server cannot represent Curie's singular NULL shared identity.
-All five items would need rework for a different RDBMS, which is the marker that a real
-port should be extracted first.
+Item 6 is a row-claim concurrency primitive: native on Postgres, not on every
+SQLAlchemy target. All six items would need rework for a different RDBMS, which is
+the marker that a real port should be extracted first.
 
 ## Cross-links
 
-- **Swap guide + validation:** [managed-postgres-swap.md](./managed-postgres-swap.md) — the DSN-only swap to RDS/Cloud SQL/Neon, with the `apps/api/tests/test_managed_pg_swap.py` smoke test that proves the migration chain applies against a DSN-selected throwaway database (#283). That test covers leakage items 1 and 2 only; items 3 through 5 have no equivalent managed-swap assertion.
+- **Swap guide + validation:** [managed-postgres-swap.md](./managed-postgres-swap.md) — the DSN-only swap to RDS/Cloud SQL/Neon, with the `apps/api/tests/test_managed_pg_swap.py` smoke test that proves the migration chain applies against a DSN-selected throwaway database (#283). That test covers leakage items 1 and 2 only; items 3 through 6 have no equivalent managed-swap assertion.
 - **Epic(s):** #84 — vision epic for the relational-DB seam (keep the swap a DSN change; extract a port only for a non-Postgres store).
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 5 (Relational database), grade A-
 - **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — Adopt-not-build boundaries ("vanilla Postgres" adopted for app state)

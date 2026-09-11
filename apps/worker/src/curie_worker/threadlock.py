@@ -9,6 +9,14 @@ that expired and was re-taken by another worker is never released by us).
 
 The lock is held only for the bounded critical section (decision + turn start),
 never for the whole stream, so a follow-up can steer the live turn.
+
+A force-killed holder cannot release or renew (#2500). Tokens are
+``{consumer}{RS}{boot}{RS}{nonce}`` so a replacement can CAS-steal when that
+consumer's alive lease is gone, or when the same consumer name is back with a
+new boot id (replicas:1 kubelet restart). Opaque legacy values are never
+stolen: they stay on TTL, matching #849's foreign-holder timeout. Live capable
+owners still serialize. The TTL itself is unchanged and still outlives a live
+cold claim.
 """
 
 from __future__ import annotations
@@ -18,10 +26,14 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from typing import Protocol
 
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 from redis.asyncio import Redis
+
+# ASCII RS: consumer names are hostname-pid and do not contain this.
+_OWNER_SEP = "\x1e"
 
 # Release only if we still own the lock (token match); avoids deleting a lock a
 # later holder acquired after ours expired.
@@ -40,6 +52,40 @@ else
     return 0
 end
 """
+
+_STEAL_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    redis.call('set', KEYS[1], ARGV[2], 'PX', ARGV[3])
+    return 1
+else
+    return 0
+end
+"""
+
+
+class OwnerLiveness(Protocol):
+    """Consumer heartbeat view used to steal a crashed owner's lock (#2500)."""
+
+    async def is_alive(self, owner: str) -> bool: ...
+
+    async def is_capable(self, owner: str) -> bool: ...
+
+
+def _lock_token(owner: str | None, boot_id: str | None) -> str:
+    nonce = uuid.uuid4().hex
+    if owner and boot_id:
+        return f"{owner}{_OWNER_SEP}{boot_id}{_OWNER_SEP}{nonce}"
+    return nonce
+
+
+def _parse_lock_parts(value: str) -> tuple[str, str] | None:
+    owner, sep, rest = value.partition(_OWNER_SEP)
+    if not sep or not owner or not rest:
+        return None
+    boot_id, sep, nonce = rest.partition(_OWNER_SEP)
+    if not sep or not boot_id or not nonce:
+        return None
+    return owner, boot_id
 
 
 class LockAcquireTimeout(TimeoutError):
@@ -98,41 +144,111 @@ class ThreadLock:
         ttl_ms: int,
         acquire_timeout_s: float,
         poll_interval_s: float,
+        owner: str | None = None,
+        owner_liveness: OwnerLiveness | None = None,
+        dead_owner_proof_s: float = 0.0,
     ) -> None:
         self._redis = redis
         self._ttl_ms = ttl_ms
         self._acquire_timeout_s = acquire_timeout_s
         self._poll_interval_s = poll_interval_s
+        self._owner = owner
+        self._boot_id = uuid.uuid4().hex
+        self._owner_liveness = owner_liveness
+        self._dead_owner_proof_s = dead_owner_proof_s
+        # Tokens this process currently holds or is trying to acquire. Register
+        # before SET NX so a sibling task on the same instance cannot treat a
+        # just-won token as a prior-incarnation leftover (#2500 replicas:1).
+        self._held_tokens: set[str] = set()
+
+    async def _cas_steal(self, key: str, held: str, token: str) -> bool:
+        stolen = await self._redis.eval(_STEAL_LUA, 1, key, held, token, self._ttl_ms)
+        return bool(stolen)
+
+    async def _try_steal(self, key: str, token: str, deadline: float) -> bool:
+        """CAS-steal a crashed owner's lock, or a same-name leftover we do not hold."""
+
+        held = await self._redis.get(key)
+        if not isinstance(held, str):
+            return False
+        if held in self._held_tokens:
+            return False
+        parts = _parse_lock_parts(held)
+        if parts is None:
+            return False
+        owner, boot_id = parts
+        if self._owner and owner == self._owner:
+            if boot_id == self._boot_id:
+                return False
+            return await self._cas_steal(key, held, token)
+        if self._owner_liveness is None:
+            return False
+        try:
+            capable = await self._owner_liveness.is_capable(owner)
+            alive = await self._owner_liveness.is_alive(owner)
+        except Exception:
+            return False
+        if not capable or alive:
+            return False
+        proof = self._dead_owner_proof_s
+        if proof > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= proof:
+                return False
+            await asyncio.sleep(proof)
+            if time.monotonic() >= deadline:
+                return False
+            held_again = await self._redis.get(key)
+            if held_again != held:
+                return False
+            try:
+                if await self._owner_liveness.is_alive(owner):
+                    return False
+                if not await self._owner_liveness.is_capable(owner):
+                    return False
+            except Exception:
+                return False
+        return await self._cas_steal(key, held, token)
 
     async def acquire(self, key: str) -> str:
         """Block until the lock is held (returns the owner token) or time out."""
-        token = uuid.uuid4().hex
+        token = _lock_token(self._owner, self._boot_id)
+        self._held_tokens.add(token)
         deadline = time.monotonic() + self._acquire_timeout_s
         started = time.monotonic()
         contended = False
         error: LockAcquireTimeout | None = None
         acquired = False
         outcome = "acquired"
-        with operation_span(
-            "curie.thread.lock",
-            kind=SpanKind.INTERNAL,
-            attributes={"service.name": "curie-worker", "source": "worker"},
-        ) as span:
-            while True:
-                if await self._redis.set(key, token, nx=True, px=self._ttl_ms):
-                    acquired = True
-                    outcome = "contended" if contended else "acquired"
-                    span.add_event("thread.lock.acquired", {"outcome": outcome})
-                    break
-                contended = True
-                if time.monotonic() >= deadline:
-                    outcome = "timeout"
-                    error = LockAcquireTimeout(key)
-                    if hasattr(span, "set_status"):
-                        span.set_status(StatusCode.ERROR)
-                    span.add_event("thread.lock.timeout", {"outcome": "timeout"})
-                    break
-                await asyncio.sleep(self._poll_interval_s)
+        try:
+            with operation_span(
+                "curie.thread.lock",
+                kind=SpanKind.INTERNAL,
+                attributes={"service.name": "curie-worker", "source": "worker"},
+            ) as span:
+                while True:
+                    if await self._redis.set(key, token, nx=True, px=self._ttl_ms):
+                        acquired = True
+                        outcome = "contended" if contended else "acquired"
+                        span.add_event("thread.lock.acquired", {"outcome": outcome})
+                        break
+                    contended = True
+                    if await self._try_steal(key, token, deadline):
+                        acquired = True
+                        outcome = "contended"
+                        span.add_event("thread.lock.stolen", {"outcome": "stolen"})
+                        break
+                    if time.monotonic() >= deadline:
+                        outcome = "timeout"
+                        error = LockAcquireTimeout(key)
+                        if hasattr(span, "set_status"):
+                            span.set_status(StatusCode.ERROR)
+                        span.add_event("thread.lock.timeout", {"outcome": "timeout"})
+                        break
+                    await asyncio.sleep(self._poll_interval_s)
+        finally:
+            if not acquired:
+                self._held_tokens.discard(token)
 
         record_metric(
             "curie.thread.lock.wait.duration",
@@ -149,7 +265,10 @@ class ThreadLock:
         return token
 
     async def release(self, key: str, token: str) -> None:
-        await self._redis.eval(_RELEASE_LUA, 1, key, token)
+        try:
+            await self._redis.eval(_RELEASE_LUA, 1, key, token)
+        finally:
+            self._held_tokens.discard(token)
 
     async def _renew(self, key: str, token: str) -> bool:
         renewed = await self._redis.eval(_RENEW_LUA, 1, key, token, self._ttl_ms)

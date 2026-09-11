@@ -93,7 +93,18 @@ spec:
             # app cannot drift.
             - name: CURIE_HEARTBEAT_FILE
               value: /tmp/curie-dispatcher.heartbeat
-            {{- include "curie.extraEnv" (dict "root" . "workload" "dispatcher" "env" .Values.dispatcher.extraEnv) | nindent 12 }}
+            {{- $threadedReserved := dict -}}
+            {{- if .Values.dispatcher.threadedBotAllowlist }}
+            # First-class allowlist (#2437). Rendered ONLY when the typed value is
+            # non-empty; the chart then owns the name for this render, so the
+            # #2297 guard below refuses a dispatcher.extraEnv entry that also
+            # names it. An empty value renders nothing and reserves nothing, so a
+            # pre-existing extraEnv entry keeps working unchanged.
+            - name: CURIE_SLACK_THREADED_BOT_ALLOWLIST
+              value: {{ include "curie.dispatcher.threadedBotAllowlist" . | quote }}
+            {{- $threadedReserved = dict "CURIE_SLACK_THREADED_BOT_ALLOWLIST" "dispatcher.threadedBotAllowlist" -}}
+            {{- end }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "dispatcher" "env" .Values.dispatcher.extraEnv "additionalReserved" $threadedReserved) | nindent 12 }}
           # No HTTP port on the dispatcher (Slack Socket Mode is outbound-only),
           # so an exec probe checks a heartbeat file a background daemon thread
           # touches each tick. The dispatcher blocks the main thread in

@@ -1,0 +1,53 @@
+{
+  "comment": "Expansion diagnosis for a declared connector's MCP header placeholders (#2519). The runner owns diagnose_derived_connector_headers in runner/src/curie_runner/mcp_tool_capability.py. The Rust CLI cannot share that function, so this vector is the seam: header templates plus env presence/emptiness map to a reason enum, credential NAMES, and the exact caller sentence. Changing a rule here without changing the runner fails the Python loop in runner/tests/test_connector_probe_diagnosis.py. #2352 may implement the same expansion diagnosis against this file; it must not add a second HTTP MCP capability probe at deploy time. #2352 still owns deploy-time hosted readiness vs mounted declaration. expected is names and reasons only -- never a secret VALUE. Both the Python loop and any later Rust loop must reject unknown fields so a key one lane cannot see cannot pass vacuously.",
+  "vectors": [
+    {
+      "name": "empty_bearer_expansion",
+      "connector": "github",
+      "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"},
+      "env": {"GITHUB_TOKEN": ""},
+      "expected_reason": "empty_expansion",
+      "expected_credentials": ["GITHUB_TOKEN"],
+      "expected_message": "declared connector 'github' failed MCP capability probe: credential GITHUB_TOKEN expanded empty. Connector tools are unavailable."
+    },
+    {
+      "name": "whitespace_bearer_expansion",
+      "connector": "github",
+      "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"},
+      "env": {"GITHUB_TOKEN": "  "},
+      "expected_reason": "empty_expansion",
+      "expected_credentials": ["GITHUB_TOKEN"],
+      "expected_message": "declared connector 'github' failed MCP capability probe: credential GITHUB_TOKEN expanded empty. Connector tools are unavailable."
+    },
+    {
+      "name": "missing_env_var",
+      "connector": "github",
+      "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"},
+      "env": {},
+      "expected_reason": "missing_credential",
+      "expected_credentials": ["GITHUB_TOKEN"],
+      "expected_message": "declared connector 'github' failed MCP capability probe: credential GITHUB_TOKEN is not set in the sandbox. Connector tools are unavailable."
+    },
+    {
+      "name": "healthy_nonempty",
+      "connector": "github",
+      "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"},
+      "env": {"GITHUB_TOKEN": "ghp-not-a-real-token-PLACEHOLDER"},
+      "expected_reason": null,
+      "expected_credentials": [],
+      "expected_message": null
+    },
+    {
+      "name": "empty_does_not_echo_other_env",
+      "connector": "github",
+      "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"},
+      "env": {
+        "GITHUB_TOKEN": "",
+        "PLANTED_SECRET": "must-not-appear-PLACEHOLDER"
+      },
+      "expected_reason": "empty_expansion",
+      "expected_credentials": ["GITHUB_TOKEN"],
+      "expected_message": "declared connector 'github' failed MCP capability probe: credential GITHUB_TOKEN expanded empty. Connector tools are unavailable."
+    }
+  ]
+}

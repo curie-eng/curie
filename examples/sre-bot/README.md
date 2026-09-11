@@ -57,7 +57,33 @@ purpose-built upgrade path with much wider authority.
 
 For a manual install, apply `manifests/kubernetes-access.yaml`, assemble a
 kubeconfig for `sre-bot-kubernetes`, store it as the connector secret
-`K8S_KUBECONFIG`, and deploy the unchanged bundle.
+`K8S_KUBECONFIG`, bind the declared `sre-approvals` route, and deploy the
+unchanged bundle. Deploy is refused until that route is bound:
+
+```bash
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
+curie cluster approvals sre-bot --list-routes
+curie cluster deploy --plugin-dir examples/sre-bot
+```
+
+With `--observability`, the example also installs the metrics pipeline and
+reliability alerts. Follow [METRICS-ROLLOUT.md](docs/METRICS-ROLLOUT.md) for the
+staged rollout and runtime proof; rendered configuration is evidence of wiring,
+not proof that live samples or alerts reached their destination.
+
+Metric labels stay bounded: operation class and outcome only. Run, session,
+sandbox, user, and deployment identifiers are correlation attributes on logs
+and traces. To diagnose a failed synthetic request:
+
+1. Take the accepted-message timestamp and the W3C `trace_id` from the
+   structured log line, without reading the private message body.
+2. In Tempo, open that `traceId` and confirm the expected operations on the
+   same trace.
+3. In Prometheus, check the matching low-cardinality series. Do not add
+   `run_id` or `trace_id` as label matchers; those identities are not metric
+   labels.
+4. Diagnose completion debt from the completion-outbox metrics rather than
+   inspecting message bodies or credentials.
 
 ## Operational limits
 

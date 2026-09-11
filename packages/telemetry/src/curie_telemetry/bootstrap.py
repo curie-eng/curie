@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Protocol
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
@@ -214,24 +216,44 @@ def _meter_provider(resource: Resource, env: Mapping[str, str]) -> MeterProvider
     return MeterProvider(metric_readers=readers, resource=resource, shutdown_on_exit=False)
 
 
-def _bounded_call(target: object, method: str, timeout_millis: int) -> bool:
-    complete = threading.Event()
+class _DrainableProvider(Protocol):
+    """The slice of a provider that teardown actually uses.
 
-    def invoke() -> None:
-        try:
-            function = getattr(target, method)
-            if method == "force_flush":
-                function(timeout_millis=timeout_millis)
-            else:
-                function()
-        except BaseException:
-            pass
-        finally:
-            complete.set()
+    TracerProvider, LoggerProvider and MeterProvider share no base class, so a
+    Protocol is the only way to type this without falling back to ``Any``. Both
+    members are declared with the widest shape the three SDK classes have in
+    common: ``timeout_millis`` is keyword-addressable on every one of them, and
+    ``shutdown`` is declared argument-free because ``TracerProvider.shutdown``
+    takes none — MeterProvider's optional parameters still satisfy that.
+    """
 
-    thread = threading.Thread(target=invoke, daemon=True)
-    thread.start()
-    return complete.wait(timeout_millis / 1000)
+    def force_flush(self, timeout_millis: int = ...) -> bool: ...
+
+    def shutdown(self) -> None: ...
+
+
+def _drain_provider(provider: _DrainableProvider, deadline: float) -> None:
+    """Flush then shut down one provider, sequentially, swallowing every failure.
+
+    One worker owns one provider's whole lifecycle: that is the only shape that
+    keeps flush-before-shutdown ordering while still letting independent
+    providers drain concurrently, and it guarantees the two calls never overlap
+    on the same provider — the SDK gives us no evidence that racing them is safe.
+    The two calls are guarded independently so a provider whose flush explodes is
+    still shut down, rather than leaking its export threads.
+    """
+
+    try:
+        remaining_millis = max(0.0, deadline - time.monotonic()) * 1000
+        provider.force_flush(timeout_millis=int(remaining_millis))
+    except BaseException:
+        pass
+    try:
+        # Never pass a timeout here: TracerProvider.shutdown() takes no such
+        # parameter, and telemetry teardown must not depend on SDK specifics.
+        provider.shutdown()
+    except BaseException:
+        pass
 
 
 @dataclass
@@ -254,10 +276,36 @@ class ServiceTelemetry:
             )
             if provider is not None
         ]
+        # One wall-clock deadline for the entire call, computed once and shared
+        # by every worker and by the join loop. Bounding each of the 2 x N calls
+        # on its own made the worst case scale with provider count (six 5s waits
+        # in series); against one deadline the whole teardown costs at most
+        # timeout_millis however many providers exist. Workers are daemons so a
+        # provider still wedged in an unreachable exporter is abandoned at the
+        # deadline instead of holding the interpreter open past exit.
+        deadline = time.monotonic() + timeout_millis / 1000
+        # Thread.start() itself can raise RuntimeError("can't start new thread")
+        # — realistically during interpreter shutdown, which is exactly when a
+        # telemetry teardown runs. shutdown() must never raise and must never
+        # hold the process open, so a worker that will not start is abandoned
+        # rather than drained inline: draining on the calling thread would
+        # reintroduce the unbounded blocking this deadline exists to remove.
+        # Every other provider is still started, and only started workers are
+        # joined.
+        started: list[threading.Thread] = []
         for provider in providers:
-            _bounded_call(provider, "force_flush", timeout_millis)
-        for provider in providers:
-            _bounded_call(provider, "shutdown", timeout_millis)
+            worker = threading.Thread(
+                target=_drain_provider,
+                args=(provider, deadline),
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except BaseException:
+                continue
+            started.append(worker)
+        for worker in started:
+            worker.join(max(0.0, deadline - time.monotonic()))
 
 
 def bootstrap_service_telemetry(

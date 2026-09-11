@@ -188,7 +188,17 @@ or credential.
 For manual deployment, apply
 [the Kubernetes access manifest](examples/sre-bot/manifests/kubernetes-access.yaml),
 construct a kubeconfig for `sre-bot-kubernetes`, store it under the owned
-connector key `K8S_KUBECONFIG`, and deploy the unchanged bundle. The
+connector key `K8S_KUBECONFIG`, bind the bundle's declared approval route, and
+deploy the unchanged bundle:
+
+```bash
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
+curie cluster approvals sre-bot --list-routes
+curie cluster deploy --plugin-dir examples/sre-bot
+```
+
+Deploy is refused (`422` / `approval_routes.unbound`) until the route is bound.
+The
 [permission map](examples/sre-bot/docs/PERMISSION-MAP.md) lists every mutation,
 its approval classification, and the RBAC ceiling.
 

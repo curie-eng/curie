@@ -125,7 +125,7 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_CHANNEL_TOKEN` | "" | the scoped `chn` token, sent as `X-API-Key` on ingress. Required |
 | `CURIE_EGRESS_SECRET` | "" | shared secret the platform presents on `X-Curie-Adapter-Secret`. Required |
 | `ADAPTER_INGRESS_ENABLED` | `true` | gates the poller only, never the egress server |
-| `CURIE_MAIL_POLL_INTERVAL_SECONDS` | `5.0` | seconds between listings; must be greater than zero. A transport failure or 429 arms bounded exponential backoff on top, up to 60s, reset by the next successful listing |
+| `CURIE_MAIL_POLL_INTERVAL_SECONDS` | `5.0` | seconds between listings; must be greater than zero. A transport failure or any 4xx refusal arms bounded exponential backoff on top, up to 60s; a successful 200 listing resets it, while 5xx responses retain their existing semantics and neither arm nor clear an already armed delay |
 | `CURIE_MAIL_INGRESS_ATTEMPTS` | `3` | short in-process attempts for transport ambiguity and retryable status; durable retry continues after this budget |
 | `CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS` | `2.0` | base delay between those attempts; 429 may extend it with `Retry-After` |
 | `CURIE_MAIL_PORT` | `8080` | port the egress server binds |
@@ -133,7 +133,7 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_MAIL_MAX_PENDING_DELIVERIES` | `1000` | maximum unresolved inbound deliveries admitted to SQLite; capacity refusal leaves provider mail recoverable |
 | `CURIE_MAIL_MAX_BODY_BYTES` | `1048576` | maximum provider message body read or stored, in bytes |
 | `CURIE_MAIL_MAX_REPLY_BYTES` | `1048576` | maximum accumulated outbound reply, in bytes |
-| `CURIE_MAIL_MAX_STATE_BYTES` | `268435456` | maximum SQLite page budget; size the volume above this for the WAL and filesystem overhead |
+| `CURIE_MAIL_MAX_STATE_BYTES` | `268435456` | maximum SQLite page budget; size the volume above this for the WAL and filesystem overhead. Terminal `completion_events` rows (`delivered=1` or `deleted=1`, not both-required) are compacted oldest-first under the same derived ceiling as terminal receipts (at most 4096, and at most one quarter of the page budget). Unresolved and leased completion rows are never evicted to admit newer mail. A late duplicate whose row was evicted and whose provider marker is gone resends; keep the cap above the worker's 7-day completion retention if that duplicate must not fire |
 | `CURIE_MAIL_ALLOWED_SENDERS` | "" | the allow-list above. Required while ingress is enabled |
 
 ### Boot gates
@@ -224,9 +224,9 @@ and names that verb as the fix. No platform signing key is given to the adapter.
   (`otelCollector.deploy=true`) the chart both sets the OTLP env and opens the
   adapter's egress policy to the collector. With `otelCollector.deploy=false`
   and an external `otelCollector.endpoint`, the env is set but the adapter's own
-  egress policy has no peer for that address, so the operator must apply an
-  additional egress policy selecting the adapter or the exports are silently
-  dropped -- see the mail-adapter section of `charts/curie/README.md`. What is
+  egress policy has no peer for that address, so the chart requires
+  `mailAdapter.otelEgress.httpsCidrs` and refuses the render without it -- see
+  the mail-adapter section of `charts/curie/README.md`. What is
   exported is log records: the adapter authors no spans of its own yet, so a
   trace search for it comes back empty even on a healthy export path.
 
@@ -248,6 +248,19 @@ instead of deleting state to make an old image boot.
 There is no selective erase command. For complete erasure, stop the adapter,
 delete its PVC and every snapshot/backup, and start with a new claim, accepting
 that the next start is a first boot and primes the current inbox.
+
+A file already larger than `CURIE_MAIL_MAX_STATE_BYTES` (typically after
+lowering the cap; `PRAGMA max_page_count` already clamps organic growth) refuses
+to boot. Deleting rows does not shrink `st_size`. Recover an offline copy with
+no manual SQL, then swap it in while the adapter is stopped:
+
+```bash
+python -m curie_mail_adapter recover --state /path/to/copy.sqlite3
+```
+
+Do not point recover at a live writer. The command compacts terminal
+completions, VACUUMs the copy, and exits 0 only when the file is under the byte
+budget.
 
 ## Run it
 

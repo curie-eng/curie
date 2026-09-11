@@ -40,7 +40,26 @@ if scenario.startswith("pinned-"):
     ]
 alias_image = "example.com/custom-api:sibling"
 alias_id = "example.com/imported-api@sha256:" + "d" * 64
-if scenario.startswith("alias-"):
+# Observed 2026-09-09 on k3s/containerd: shorter kubelet aliases of the same
+# repo digest, each tag in its own Node.status.images entry.
+# https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
+busybox_id = (
+    "docker.io/library/busybox@sha256:"
+    "73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
+)
+clickhouse_id = (
+    "docker.io/clickhouse/clickhouse-server@sha256:"
+    "8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6"
+)
+if scenario.startswith("alias-shorter"):
+    deployment["spec"]["template"]["spec"]["containers"][0]["image"] = "busybox:1.36.1"
+    deployment["spec"]["template"]["spec"]["initContainers"] = [
+        {"name": "extract", "image": "busybox:1.36.1"}
+    ]
+    statefulset["spec"]["template"]["spec"]["containers"][0]["image"] = (
+        "clickhouse/clickhouse-server:25.12.11.4"
+    )
+elif scenario.startswith("alias-"):
     deployment["spec"]["template"]["spec"]["initContainers"] = [
         {"name": "init-api", "image": "example.com/custom-api:target"}
     ]
@@ -138,6 +157,47 @@ if program == "kubectl":
             images = []
         if scenario == "alias-no-reported-alias":
             images = [{"names": [names[0], names[2]]}]
+        if scenario.startswith("alias-shorter"):
+            busybox_alias = "docker.io/library/busybox:1.36"
+            clickhouse_alias = "docker.io/clickhouse/clickhouse-server:25.12"
+            images = [
+                {"names": ["docker.io/library/busybox:1.36.1", busybox_id]},
+                {"names": [busybox_alias, busybox_id]},
+                {"names": ["docker.io/clickhouse/clickhouse-server:25.12.11.4", clickhouse_id]},
+                {"names": [clickhouse_alias, clickhouse_id]},
+            ]
+            if scenario == "alias-shorter-missing":
+                images = [
+                    {"names": ["docker.io/library/busybox:1.36.1", busybox_alias]},
+                    {
+                        "names": [
+                            "docker.io/clickhouse/clickhouse-server:25.12.11.4",
+                            clickhouse_alias,
+                        ]
+                    },
+                ]
+            if scenario == "alias-shorter-wrong-digest":
+                images = [
+                    {
+                        "names": [
+                            "docker.io/library/busybox:1.36.1",
+                            "docker.io/library/busybox@sha256:" + "a" * 64,
+                        ]
+                    },
+                    {"names": [busybox_alias, "docker.io/library/busybox@sha256:" + "a" * 64]},
+                    {
+                        "names": [
+                            "docker.io/clickhouse/clickhouse-server:25.12.11.4",
+                            "docker.io/clickhouse/clickhouse-server@sha256:" + "b" * 64,
+                        ]
+                    },
+                    {
+                        "names": [
+                            clickhouse_alias,
+                            "docker.io/clickhouse/clickhouse-server@sha256:" + "b" * 64,
+                        ]
+                    },
+                ]
         emit(
             {
                 "kind": "Node",
@@ -268,7 +328,27 @@ if program == "kubectl":
             pods[1]["spec"]["containers"][0]["image"] = pinned_image.replace("a" * 64, "b" * 64)
         if scenario == "pinned-init-failed":
             pinned_statuses[0]["state"]["terminated"]["exitCode"] = 1
-    if scenario.startswith("alias-"):
+    if scenario.startswith("alias-shorter"):
+        pods[0]["spec"]["nodeName"] = "acme-node"
+        pods[1]["spec"]["nodeName"] = "acme-node"
+        pods[0]["status"]["containerStatuses"][0].update(
+            image="docker.io/library/busybox:1.36", imageID=busybox_id
+        )
+        pods[0]["spec"]["initContainers"] = copy.deepcopy(
+            deployment["spec"]["template"]["spec"]["initContainers"]
+        )
+        pods[0]["status"]["initContainerStatuses"] = [
+            {
+                "name": "extract",
+                "image": "docker.io/library/busybox:1.36",
+                "imageID": busybox_id,
+                "state": {"terminated": {"exitCode": 0}},
+            }
+        ]
+        pods[1]["status"]["containerStatuses"][0].update(
+            image="docker.io/clickhouse/clickhouse-server:25.12", imageID=clickhouse_id
+        )
+    elif scenario.startswith("alias-"):
         pods[0]["spec"]["nodeName"] = "acme-node"
         pods[0]["status"]["containerStatuses"][0].update(image=alias_image, imageID=alias_id)
         pods[0]["spec"]["initContainers"] = copy.deepcopy(

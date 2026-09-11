@@ -13,6 +13,7 @@ frozen ACI nor plugin-format contracts participate in this seam.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import importlib
 import io
@@ -698,19 +699,29 @@ def test_worker_rehashes_private_object_before_delivery(workspace: Any, tmp_path
 
 
 def _tar_with_member(name: str, *, kind: str = "file", data: bytes = b"x") -> bytes:
+    """Build one hostile archive, byte for byte the same on every call.
+
+    `mode="w:gz"` writes a gzip header carrying the time it was written, and
+    these bytes are used as pytest parameter values. Under xdist each worker
+    collects at its own moment, so an unpinned header gives the same case a
+    different node id per worker and pytest refuses to run at all: "Different
+    tests were collected between gw0 and gw3". Pinning mtime makes the payload
+    a constant, which is what a fixture of hostile bytes should have been.
+    """
     raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w:gz") as archive:
-        info = tarfile.TarInfo(name)
-        if kind == "symlink":
-            info.type = tarfile.SYMTYPE
-            info.linkname = "../../outside"
-            archive.addfile(info)
-        elif kind == "device":
-            info.type = tarfile.CHRTYPE
-            archive.addfile(info)
-        else:
-            info.size = len(data)
-            archive.addfile(info, io.BytesIO(data))
+    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w") as archive:
+            info = tarfile.TarInfo(name)
+            if kind == "symlink":
+                info.type = tarfile.SYMTYPE
+                info.linkname = "../../outside"
+                archive.addfile(info)
+            elif kind == "device":
+                info.type = tarfile.CHRTYPE
+                archive.addfile(info)
+            else:
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
     return raw.getvalue()
 
 
@@ -722,6 +733,9 @@ def _tar_with_member(name: str, *, kind: str = "file", data: bytes = b"x") -> by
         (_tar_with_member("repo/link", kind="symlink"), "link"),
         (_tar_with_member("repo/device", kind="device"), "special"),
     ],
+    # Without these the node id is the raw gzip payload, which no `Fix pin:`
+    # selector can be typed to name even once the bytes are deterministic.
+    ids=["traversal", "absolute", "link", "special"],
 )
 def test_hostile_workspace_archive_is_rejected_before_init(
     workspace: Any, payload: bytes, reason: str

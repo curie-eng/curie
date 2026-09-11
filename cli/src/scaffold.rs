@@ -151,6 +151,9 @@ const MCP_JSON: &str = "{\n  \"mcpServers\": {}\n}\n";
 const CONNECTORS_YAML: &str = r#"# What this agent needs running. Curie derives the Deployment, Service,
 # container hardening, host allowlist, sandbox-to-connector NetworkPolicy,
 # secret wiring, and the URL the agent dials -- so none of that lives here.
+# The container must listen on port 8000.
+# HTTP MCP is served at /mcp where applicable.
+# Connector args are passed through verbatim.
 #
 # Uncomment and edit to declare one:
 #
@@ -623,6 +626,31 @@ mod tests {
                 "{name} must explain itself; it is the only place an author learns it exists"
             );
         }
+
+        let connectors = std::fs::read_to_string(dir.path().join("connectors.yaml")).unwrap();
+        assert!(
+            connectors.contains("The container must listen on port 8000."),
+            "connectors.yaml must name Curie's fixed connector listen port: {connectors}"
+        );
+        assert!(
+            connectors.contains("HTTP MCP is served at /mcp where applicable."),
+            "connectors.yaml must name the HTTP MCP path when the connector serves it: {connectors}"
+        );
+        assert!(
+            connectors.contains("Connector args are passed through verbatim."),
+            "connectors.yaml must warn authors that args control the connector itself: {connectors}"
+        );
+        assert!(
+            connectors.ends_with("connectors: {}\n"),
+            "connectors.yaml must remain an empty valid map until an author opts in: {connectors}"
+        );
+        assert!(
+            connectors.lines().all(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with('#') || !trimmed.starts_with("port:")
+            }),
+            "connectors.yaml must not advertise an active port: key: {connectors}"
+        );
 
         let mcp: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join(".mcp.json")).unwrap())

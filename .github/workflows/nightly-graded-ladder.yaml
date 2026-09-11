@@ -249,6 +249,23 @@ jobs:
           load: true
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
+      # Image tags here must cover every ghcr.io/curie-eng/curie-* ref
+      # compose/release_images.py derives from the generated compose artifact
+      # for full+slack (#2424). Do not add images one at a time: the compose
+      # tests fail this job when the derived set grows past these tags.
+      # Dispatcher is required even without --slack because local message
+      # runs a one-shot container from that image (#1915).
+      - name: Build the dispatcher image locally (one-shot local message producer, no registry auth)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.releasecache.outputs.name }}
+          tags: ghcr.io/curie-eng/curie-dispatcher:latest
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-dispatcher
+          cache-to: type=gha,mode=max,scope=ladder-dispatcher
       # Mirrors ci.yaml's e2e-ladder-release step of the same name. The ladder
       # selects compose's `full` profile whenever the bundle carries
       # evals/trajectory.json, which the weather bundle this rung runs does, and

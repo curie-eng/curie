@@ -484,6 +484,54 @@ fn sibling_alias_refuses_unbound_inventory_and_unhealthy_or_stale_containers() {
 }
 
 #[test]
+fn shorter_tag_alias_with_same_digest_is_accepted_on_up_and_status() {
+    // QA10-01 / #2499: kubelet reports busybox:1.36.1 as busybox:1.36 and
+    // clickhouse :25.12.11.4 as :25.12. Containerd lists each tag as its own
+    // Node.status.images entry that still names the same repo digest.
+    // https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
+    for verb in ["status", "up"] {
+        let fixture = Fixture::new();
+        let output = fixture.run(verb, "alias-shorter-split");
+        assert!(
+            output.status.success(),
+            "{verb}: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if verb == "status" {
+            assert_eq!(Fixture::json(&output)["healthy"], true);
+        }
+        let calls = fs::read_to_string(fixture.0.path().join("calls.jsonl")).unwrap();
+        assert!(
+            calls.contains("\"kubectl\", \"get\", \"node\", \"acme-node\""),
+            "{verb}: {calls}"
+        );
+    }
+}
+
+#[test]
+fn shorter_tag_alias_refuses_missing_or_wrong_digest() {
+    for scenario in ["alias-shorter-missing", "alias-shorter-wrong-digest"] {
+        let output = Fixture::new().run("status", scenario);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{scenario}: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = Fixture::json(&output);
+        assert_eq!(json["healthy"], false, "{scenario}: {json}");
+        let text = json.to_string();
+        assert!(
+            text.contains("tagged alias") || text.contains("has no unique same-node"),
+            "{scenario}: {json}"
+        );
+        assert!(!text.contains("PRIVATE_MESSAGE_SENTINEL"));
+    }
+}
+
+#[test]
 fn denied_alias_node_read_returns_structured_up_recovery() {
     let output = Fixture::new().run("up", "alias-forbidden");
     assert_eq!(output.status.code(), Some(1));

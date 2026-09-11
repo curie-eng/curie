@@ -696,3 +696,26 @@ def test_the_same_bundle_still_renders_for_an_unambiguous_agent(
         f"{name}-allow-ingress",
     }
     assert name in body["mcp_entries"]["grafana"]["url"]
+
+
+GITHUB = (
+    "connectors:\n"
+    "  github:\n"
+    "    image: ghcr.io/github/github-mcp-server:v0.20.1\n"
+    "    secrets: [GITHUB_PERSONAL_ACCESS_TOKEN]\n"
+)
+
+
+def test_the_returned_entry_carries_the_connector_credential(tmp_path: Path) -> None:
+    # The CLI mounts what this endpoint returns, so an entry that loses the
+    # header here is a 401 in the sandbox no matter what plugin-format derives.
+    # github-mcp-server's HTTP transport requires `Authorization: Bearer <PAT>`
+    # per GitHub's docs; without it the agent lists no `mcp__github__*` tools
+    # and nothing errors (#2503).
+    root = _bundle(tmp_path, GITHUB)
+    entries = bundles.connector_mcp_entries(
+        bundles.read_connectors(root), release=RELEASE, agent=AGENT, namespace=NAMESPACE
+    )
+    assert entries["github"]["headers"] == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }

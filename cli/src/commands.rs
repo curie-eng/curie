@@ -1216,6 +1216,8 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
     let plugin_dir = resolve_agent_folder(folder)?;
     let api_url = opts.api_url.clone();
     let result = deploy(DeployOpts {
+        // Local tier: there is no release to read, so delivery is not assessed.
+        delivery: None,
         plugin_dir,
         // deploy_named is the multi-agent-folder path: the folder IS the agent
         // identity there, so there is nothing to override.
@@ -1552,7 +1554,12 @@ const OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 /// fake/local model run: a bundle's authed MCP server needs its token
 /// regardless of which model drives the session. Names already present (a user
 /// passing a model-credential var as a secret) are not duplicated.
-fn merge_secret_env(mut passthrough: Vec<String>, secrets: &[String]) -> Vec<String> {
+///
+/// Also the union used for the connector-owned secret NAMES resolved from a
+/// bundle's `connectors.yaml` (#2503): same order-preserving dedupe, so the
+/// explicit `--secret` order wins and an owned name already named by a flag is
+/// bound once.
+pub fn merge_secret_env(mut passthrough: Vec<String>, secrets: &[String]) -> Vec<String> {
     for name in secrets {
         if !passthrough.contains(name) {
             passthrough.push(name.clone());
@@ -2226,6 +2233,10 @@ pub async fn start(opts: StartOpts) -> Result<()> {
                 if let Some(ollama) = &ollama_container {
                     let _ = docker::remove_container(ollama).await;
                 }
+                // The label teardown has removed every started connector, so
+                // this unrecorded boot can now release the snapshot that no
+                // later `skill down` can discover.
+                let _ = crate::bundle::remove_snapshot(&snapshot.dir, &plugin_dir);
                 return Err(err.context("starting the bundle's connectors"));
             }
         }
@@ -4375,6 +4386,14 @@ pub fn resolve_cases_path(
 }
 
 pub struct DeployOpts {
+    /// What was observed about this release's push-delivery paths (#2496).
+    ///
+    /// `None` means delivery was NOT assessed -- the local tier, which has no
+    /// release to read -- and prints nothing at all. Deliberately distinct from
+    /// `Some(Delivery::Unknown)`, which means assessed and undetermined and
+    /// still speaks: collapsing the two would recreate the very conflation this
+    /// ticket exists to remove.
+    pub delivery: Option<crate::delivery::Delivery>,
     /// Deploy under this agent name instead of the manifest's.
     ///
     /// One repository is otherwise structurally one agent (#1166): the name
@@ -4584,6 +4603,9 @@ pub fn normalize_deploy_api_key(api_key: Option<String>) -> Option<String> {
 }
 
 pub struct PreparedDeploy {
+    /// See [`DeployOpts::delivery`]. Carried, not re-observed: the assessment
+    /// belongs to the caller that has a namespace/release.
+    delivery: Option<crate::delivery::Delivery>,
     client: ApiClient,
     outcome: crate::api::PreparedDeployOutcome,
     plugin_name: String,
@@ -4665,14 +4687,15 @@ async fn prepare_deploy_with_commit_sha(
     // failure names the operator's own directory rather than a temp path, and
     // long before anything is applied. `opts.plugin_dir` (not the canonicalized
     // copy) is the path they typed.
+    let connector_decl = crate::connector_build::load(&plugin_dir)?;
     {
-        let decl = crate::connector_build::load(&plugin_dir)?;
+        let decl = &connector_decl;
         if decl.connectors.values().any(|spec| spec.build.is_some()) {
-            let recomputed = recompute_source_digests(&plugin_dir, &decl)?;
+            let recomputed = recompute_source_digests(&plugin_dir, decl)?;
             let lock = crate::connector_build::load_lock(&plugin_dir)?;
             lock_preflight(
                 &opts.plugin_dir,
-                &decl,
+                decl,
                 lock.as_ref(),
                 &recomputed,
                 opts.tier,
@@ -4681,7 +4704,7 @@ async fn prepare_deploy_with_commit_sha(
             // claims about it, is what a node has to pull (see
             // `registry_preflight`). Cluster only: no local deploy pulls this.
             if opts.tier == DeployTier::Cluster {
-                run_registry_preflight(&decl, lock.as_ref()).await?;
+                run_registry_preflight(decl, lock.as_ref()).await?;
             }
         }
     }
@@ -4703,9 +4726,28 @@ async fn prepare_deploy_with_commit_sha(
     // name-set diff on `opts.secret` (the bound NAME set) and needs no packed
     // bundle or resolved values, so a declared-but-unbound policy fails fast
     // without doing any of that work.
+    // The NAMES this deploy will actually bind into the agent sandbox: the
+    // explicit `--secret` flags, plus the Bearer secret each hosted connector
+    // names (#2503, #2559). Curie resolves those itself, so a
+    // plugin.json-declared name that connectors.yaml already auto-binds is not
+    // a gap and must not be diffed against the flags alone -- the #464 gate
+    // below would otherwise refuse a deploy that needs no flag. A manifest
+    // secret nothing binds still fails, unchanged. Extra `secrets:` names stay
+    // on the connector pod.
+    let connector_env_secret_names =
+        crate::connector_build::hosted_env_secret_names(&connector_decl);
+    // Automatic delivery of connectors.yaml secrets exists only for
+    // DeployTier::Cluster (#2503 follow-up); `local deploy` has no delivery
+    // path yet, so its effective set must stay exactly `opts.secret`.
+    let effective_secret_names = if opts.tier == DeployTier::Cluster {
+        merge_secret_env(opts.secret.clone(), &connector_env_secret_names)
+    } else {
+        opts.secret.clone()
+    };
+
     if opts.secret_binding_supported {
         let declared = read_declared_secrets(&plugin_dir)?;
-        let unbound = unbound_declared_secrets(&declared, &opts.secret);
+        let unbound = unbound_declared_secrets(&declared, &effective_secret_names);
         if !unbound.is_empty() {
             return Err(crate::exit::usage(format!(
                 "{plugin_name} declares connector secret(s) that were not bound on deploy: {}. \
@@ -4863,7 +4905,17 @@ async fn prepare_deploy_with_commit_sha(
             archive,
             &match opts.tier {
                 DeployTier::Local => secrets.clone(),
-                DeployTier::Cluster => crate::cluster_secrets::agent_record_secrets(&secrets),
+                // Names-only placeholders over the EFFECTIVE set, not just
+                // the resolved `--secret` values: the worker keys
+                // `inject_connector_secrets` -- and with it the per-agent
+                // sandbox pool routing -- off this map, so a connector secret
+                // missing from it lands the claim on the generic pool with no
+                // connector env at all (#2503). The connector's own value is
+                // resolved cluster-scoped later (#1913) and reaches the pod
+                // through the per-agent Helm Secret, never through the record.
+                DeployTier::Cluster => {
+                    crate::cluster_secrets::agent_record_secret_names(&effective_secret_names)
+                }
             },
             opts.repo.as_deref(),
             commit_sha.as_deref(),
@@ -4882,6 +4934,7 @@ async fn prepare_deploy_with_commit_sha(
     };
 
     Ok(PreparedDeploy {
+        delivery: opts.delivery,
         client,
         outcome,
         plugin_name,
@@ -4966,6 +5019,7 @@ fn routing_warning(check: &RoutingCheck) -> String {
 pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
     let ui = crate::ui::ui();
     let PreparedDeploy {
+        delivery,
         client,
         outcome,
         plugin_name,
@@ -5006,9 +5060,10 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         .as_deref()
         .filter(|want| outcome.agent.repo_full_name.as_deref() == Some(*want));
     if let Some(repo) = bound_repo {
-        ui.note(&format!(
-            "repo binding: git-flow pushes to {repo} deploy this agent"
-        ));
+        // A binding FACT, not a delivery promise (#2496). Binding is observed;
+        // whether a push reaches this install is a separate, unobserved fact
+        // that the delivery line below answers from the release's own values.
+        ui.note(&crate::delivery::bind_note(repo));
         // ...unless they no longer route anywhere (#1221). Migration 0018
         // (ADR-0091) dropped the unique index on `repo_full_name`, so a SECOND
         // agent may bind the same repository -- and with no declared targets
@@ -5029,6 +5084,22 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         {
             if !check.resolvable {
                 ui.warn(&routing_warning(&check));
+            }
+        }
+
+        // Delivery last, because it is the operator's action item: binding fact,
+        // then routing (#1221), then whether a push has any observed path here.
+        // Inside the `bound_repo` block on purpose -- a declined `--repo` binds
+        // nothing, so there is no binding to make a delivery claim about.
+        //
+        // Advisory in every direction, exactly as #1221's check above: it states
+        // only what was observed locally, never mutates helm, and never changes
+        // the exit code. A deploy that already succeeded is not soured by it.
+        if let Some(line) = crate::delivery::render_optional(delivery.as_ref()) {
+            if line.warning {
+                ui.warn(&line.text);
+            } else {
+                ui.note(&line.text);
             }
         }
     }
@@ -8781,6 +8852,7 @@ mod tests {
             Some("curie-api-1   curie-api:dev   curie-api   Up 8 seconds (health: starting)"),
         );
         let opts = super::DeployOpts {
+            delivery: None,
             agent: None,
             target: None,
             plugin_dir: dir.path().to_path_buf(),
@@ -8854,6 +8926,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gate_accepts_a_declared_name_that_connectors_yaml_auto_binds() {
+        // #2503 x #464: the gate diffs the declared names against the
+        // EFFECTIVE bind set, not the `--secret` flags alone. A name Curie
+        // itself resolves from connectors.yaml is bound, so a deploy that
+        // needs no flag must not be refused.
+        let declared = vec!["GH".to_string()];
+        let effective = super::merge_secret_env(vec![], &["GH".to_string()]);
+        assert!(
+            super::unbound_declared_secrets(&declared, &effective).is_empty(),
+            "an auto-bound connector secret is not a gap"
+        );
+    }
+
+    #[test]
+    fn gate_still_reports_a_name_bound_by_neither_source() {
+        // The gate must not go vacuous: a manifest secret that neither a
+        // `--secret` flag nor connectors.yaml binds still fails the deploy.
+        let declared = vec!["GH".to_string(), "SLACK".to_string()];
+        let effective = super::merge_secret_env(vec![], &["GH".to_string()]);
+        assert_eq!(
+            super::unbound_declared_secrets(&declared, &effective),
+            vec!["SLACK".to_string()]
+        );
+    }
+
+    #[test]
+    fn secret_env_binds_owned_connector_name_with_no_explicit_flag() {
+        // #2503: a hosted connector's declared GITHUB_PERSONAL_ACCESS_TOKEN
+        // must reach the sandbox env with zero `--secret` flags, so the
+        // derived `Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}` header (ADR-0009 /
+        // #1488 delivery path) expands instead of sending a literal `${...}`.
+        assert_eq!(
+            merge_secret_env(vec![], &["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()]),
+            vec!["GITHUB_PERSONAL_ACCESS_TOKEN".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn deploy_fails_when_declared_secret_is_not_bound() {
         // AC3: a declared secret NAME with no matching --secret binding fails the
@@ -8864,6 +8974,7 @@ mod tests {
         scaffold_with_secrets(dir.path(), "test-agent", &["GITHUB_PERSONAL_ACCESS_TOKEN"]);
 
         let opts = super::DeployOpts {
+            delivery: None,
             agent: None,
             target: None,
             plugin_dir: dir.path().to_path_buf(),
@@ -8892,6 +9003,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deploy_local_tier_still_refuses_a_connectors_yaml_auto_bound_secret() {
+        // #2503 round-2 review finding: automatic hosted-connector secret
+        // delivery is Cluster-only (no sandbox delivery path on Local yet), so
+        // a bundle that declares GH in plugin.json AND connectors.yaml, with no
+        // `--secret` flag, must still be refused on `local deploy` -- the same
+        // bundle passes the gate on `cluster deploy` (see the paired test
+        // below). This drives the real gate through `deploy()`, not the pure
+        // helper functions.
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_with_secrets(dir.path(), "test-agent", &["GH"]);
+        write_manifest(
+            dir.path(),
+            "connectors.yaml",
+            "connectors:\n  gh:\n    image: ghcr.io/example/gh:1\n    secrets:\n      - GH\n",
+        );
+
+        let opts = super::DeployOpts {
+            delivery: None,
+            agent: None,
+            target: None,
+            plugin_dir: dir.path().to_path_buf(),
+            api_url: "http://127.0.0.1:1".to_string(),
+            api_key: "k".to_string(),
+            slack_channel: None,
+            repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
+            env: Some(super::DeployEnv::Dev),
+            label: Some("v0".to_string()),
+            secret: vec![],
+            secret_binding_supported: true,
+            connect_hint: "UNREACHABLE-HINT-SENTINEL".to_string(),
+            tier: super::DeployTier::Local,
+        };
+        let err = super::deploy(opts).await.unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("GH"),
+            "local deploy has no auto-delivery path, so the gate must still name GH: {rendered}"
+        );
+        assert!(
+            !rendered.contains("UNREACHABLE-HINT-SENTINEL"),
+            "the gate must fire before any network attempt: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_cluster_tier_passes_the_gate_on_a_connectors_yaml_auto_bound_secret() {
+        // The paired case: the SAME bundle (GH declared in both plugin.json and
+        // connectors.yaml, no `--secret` flag) reaches the network on Cluster,
+        // because the effective bind set there is the union with
+        // `hosted_env_secret_names`, not `opts.secret` alone.
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_with_secrets(dir.path(), "test-agent", &["GH"]);
+        write_manifest(
+            dir.path(),
+            "connectors.yaml",
+            "connectors:\n  gh:\n    image: ghcr.io/example/gh:1\n    secrets:\n      - GH\n",
+        );
+
+        let opts = super::DeployOpts {
+            delivery: None,
+            agent: None,
+            target: None,
+            plugin_dir: dir.path().to_path_buf(),
+            api_url: "http://127.0.0.1:1".to_string(),
+            api_key: "k".to_string(),
+            slack_channel: None,
+            repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
+            env: Some(super::DeployEnv::Dev),
+            label: Some("v0".to_string()),
+            secret: vec![],
+            secret_binding_supported: true,
+            connect_hint: "UNREACHABLE-HINT-SENTINEL".to_string(),
+            tier: super::DeployTier::Cluster,
+        };
+        let err = super::deploy(opts).await.unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("declares connector secret(s) that were not bound on deploy"),
+            "cluster's effective bind set auto-includes GH via connectors.yaml, \
+             so the gate must pass and the error must be the network path: {rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn deploy_skips_secrets_gate_when_binding_unsupported() {
         // AC2: a tier that cannot bind `--secret` skips the declared-secrets
         // gate so a secrets-declaring bundle is not preempted with a
@@ -8901,6 +9098,7 @@ mod tests {
         scaffold_with_secrets(dir.path(), "test-agent", &["GITHUB_PERSONAL_ACCESS_TOKEN"]);
 
         let opts = super::DeployOpts {
+            delivery: None,
             agent: None,
             target: None,
             plugin_dir: dir.path().to_path_buf(),
@@ -11102,6 +11300,45 @@ pub fn connectors_needing_rebuild(
 // The local tier's connector bring-up
 // ---------------------------------------------------------------------------
 
+/// Resolve each generated Compose service to its actual Docker container IDs.
+///
+/// The overlay's service names are not Docker container names: Compose adds its
+/// project and replica components. An empty result remains a named readiness
+/// target so the shared waiter can report which connector Compose did not
+/// create, rather than leaking Compose output or assuming a container name.
+async fn compose_connector_readiness_targets(
+    overlay: &Path,
+    project: &str,
+    connectors: &[(String, String)],
+    deadline: Instant,
+) -> Vec<(String, String)> {
+    let mut targets = Vec::new();
+    for (connector, service) in connectors {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining == Duration::ZERO {
+            targets.push((connector.clone(), String::new()));
+            continue;
+        }
+        let command =
+            crate::connector_build::compose_service_ids_command(overlay, project, service);
+        let ids = match tokio::time::timeout(remaining, crate::ops::run_capture(&command)).await {
+            Ok(Ok((true, stdout, _))) => stdout
+                .lines()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if ids.is_empty() {
+            targets.push((connector.clone(), String::new()));
+        } else {
+            targets.extend(ids.into_iter().map(|id| (connector.clone(), id)));
+        }
+    }
+    targets
+}
+
 /// Reconcile this agent's connector containers against the deployed bundle, then
 /// generate the connector compose overlay and bring the declared set up.
 ///
@@ -11158,6 +11395,16 @@ pub async fn bring_up_local(
         return Ok(());
     }
 
+    let connector_services: Vec<(String, String)> = hosted
+        .iter()
+        .map(|(connector, _)| {
+            (
+                connector.to_string(),
+                cb::object_name(&identity.release, &identity.agent, connector.as_str()),
+            )
+        })
+        .collect();
+
     let mut secret_values = std::collections::BTreeMap::new();
     for (connector, spec) in &hosted {
         for name in cb::declared_secret_names(spec) {
@@ -11190,11 +11437,56 @@ pub async fn bring_up_local(
     // where `${NAME}` in the file above expands from -- never through the file,
     // never through argv, and masked in anything printed.
     let command = cb::compose_up_command(&path, project, &secret_values);
-    let (ok, _out, err) = crate::ops::run_capture(&command)
-        .await
-        .context("starting the bundle's connectors")?;
-    if !ok {
-        bail!("starting the bundle's connectors failed: {}", err.trim());
+    // Compose itself retains its 60-second readiness limit. The client gets a
+    // separate five-second allowance for Compose process creation and polling
+    // overhead. The bounded ID lookup and fresh final readiness observation
+    // below make the local readiness stage at most 80 seconds; the shared
+    // skill-tier readiness budget remains 60 seconds.
+    let compose_client_deadline =
+        Instant::now() + docker::CONNECTOR_START_TIMEOUT + docker::CONNECTOR_DIAGNOSTIC_TIMEOUT;
+    let activation_context = "the API deployment was activated and was not rolled back, but starting the bundle's connectors failed";
+    let compose_succeeded = match tokio::time::timeout(
+        compose_client_deadline.saturating_duration_since(Instant::now()),
+        crate::ops::run_capture(&command),
+    )
+    .await
+    {
+        // `compose up --wait` can identify an exited or unhealthy service, but
+        // its text is not a stable connector diagnostic. The shared Docker
+        // waiter below reads the owned service IDs and reports the named reason
+        // without exposing Compose, container, or health check logs.
+        Ok(Ok((ok, _out, _err))) => ok,
+        Err(_) => false,
+        Ok(Err(err)) => return Err(err).context(activation_context),
+    };
+    // Compose can return ready at the end of its own 60-second readiness
+    // limit. Resolve the declared keys to actual Docker IDs in a separately
+    // bounded window so that work cannot consume the five-second readiness
+    // observation a no-health connector needs to prove uninterrupted running.
+    let resolution_deadline = Instant::now() + docker::CONNECTOR_ID_RESOLUTION_TIMEOUT;
+    let readiness_targets = compose_connector_readiness_targets(
+        &path,
+        project,
+        &connector_services,
+        resolution_deadline,
+    )
+    .await;
+    // Start this fresh clock only after every ID lookup has completed. This
+    // never turns a failed Compose invocation into success.
+    let diagnostic_deadline = Instant::now() + docker::CONNECTOR_DIAGNOSTIC_TIMEOUT;
+    let mut readiness =
+        docker::wait_for_connectors_ready(&readiness_targets, diagnostic_deadline).await;
+    if !compose_succeeded && readiness.is_ok() {
+        let connector_keys = connector_services
+            .iter()
+            .map(|(connector, _)| connector.clone())
+            .collect::<Vec<_>>();
+        readiness = Err(docker::connector_compose_start_failure(&connector_keys));
+    }
+    if let Err(err) = readiness {
+        let (_, remedy) = crate::exit::classify(&err);
+        let message = format!("{activation_context}: {err}");
+        return Err(crate::exit::operator_context(err, message, remedy));
     }
     Ok(())
 }
@@ -11297,7 +11589,9 @@ async fn start_skill_connectors(
         version: cb::LOCK_VERSION,
         connectors: std::collections::BTreeMap::new(),
     });
+    let readiness_deadline = Instant::now() + docker::CONNECTOR_START_TIMEOUT;
     let mut started = Vec::new();
+    let mut readiness_targets = Vec::new();
     for (connector, image) in skill_connector_plan(decl, &lock)? {
         let connector = connector.as_str();
         let spec = decl
@@ -11329,7 +11623,9 @@ async fn start_skill_connectors(
         docker::docker_with_env(&start.run_args(), &start.docker_env)
             .await
             .with_context(|| format!("starting connector '{connector}'"))?;
+        readiness_targets.push((connector.to_string(), start.container_name.clone()));
         started.push(start.container_name);
     }
+    docker::wait_for_connectors_ready(&readiness_targets, readiness_deadline).await?;
     Ok(started)
 }

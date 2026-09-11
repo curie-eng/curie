@@ -65,6 +65,8 @@ pub(super) const RUNNER_MODEL_KEY: &str = "agentSandbox.runner.model";
 
 pub(crate) const INFERENCE_PERSISTENCE_ENABLED_KEY: &str = "inference.persistence.enabled";
 pub(crate) const INFERENCE_PULL_MODEL_KEY: &str = "inference.pullModel";
+pub(crate) const INFERENCE_DEPLOY_KEY: &str = "inference.deploy";
+pub(crate) const INFERENCE_MODEL_KEY: &str = "inference.model";
 
 pub(crate) fn inference_asset_policy_is_safe(
     persistence_enabled: Option<bool>,

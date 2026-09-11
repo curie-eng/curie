@@ -117,10 +117,15 @@ end
 return 1
 """
 
-# Compare every applicable key before deleting any of them. A delayed release
-# must never clear one half of a newer mixed version marker. The bare ``1`` is
-# recognized only as the unversioned standalone predecessor (revision zero), so
-# a local release can still recover a marker written by the previous version.
+# Delete keys owned by this revision without splitting a newer mixed-version
+# pair. KEYS[1] is the authoritative scoped marker; later keys are the shared
+# legacy bridge. The owned scoped marker is safe to delete unilaterally when
+# it matches, so a foreign marker on the shared key cannot strand it. A
+# delayed release must still not clear the shared key while the scoped key
+# holds a newer revision -- that would resume legacy workers during the newer
+# drain. The bare ``1`` is recognized only as the unversioned standalone
+# predecessor (revision zero), so a local release can still recover a marker
+# written by the previous version.
 _CLEAR_OWNED_MARKER_LUA = """
 local function marker_revision(raw, requested)
   if raw == '1' and requested == 0 then return 0 end
@@ -133,14 +138,24 @@ local function marker_revision(raw, requested)
 end
 
 local requested = tonumber(ARGV[1])
-for _, key in ipairs(KEYS) do
+local auth_raw = redis.call('GET', KEYS[1])
+local auth_rev = nil
+if auth_raw then
+  auth_rev = marker_revision(auth_raw, requested)
+end
+local may_clear_siblings = (not auth_raw) or (auth_rev == requested)
+
+local deleted = 0
+for i, key in ipairs(KEYS) do
   local raw = redis.call('GET', key)
   if raw then
     local current = marker_revision(raw, requested)
-    if current == nil or current ~= requested then return 0 end
+    if current == requested and (i == 1 or may_clear_siblings) then
+      deleted = deleted + redis.call('DEL', key)
+    end
   end
 end
-return redis.call('DEL', unpack(KEYS))
+return deleted
 """
 
 
@@ -164,6 +179,14 @@ class DrainOutcome:
     drained: bool
     remaining: tuple[str, ...]
     waited_s: float
+
+
+class QuiesceWriteRefused(Exception):
+    """The fenced Lua write did not take pause authority.
+
+    Raised when an applicable key already holds a higher revision. The gate
+    must not report a drain over a fleet it never quiesced.
+    """
 
 
 class UpgradeDrainGate:
@@ -201,6 +224,9 @@ class UpgradeDrainGate:
         ALWAYS with an expiry. A permanent flag turns any upgrade that dies
         between this call and the post-upgrade release into a fleet that has
         stopped answering and looks perfectly healthy while doing it.
+
+        Raises :class:`QuiesceWriteRefused` when the fenced write does not take
+        effect, so a caller cannot proceed as if the fleet had paused.
         """
         ttl = self._config.upgrade_quiesce_ttl_s if ttl_s is None else ttl_s
         revision = self._revision()
@@ -212,7 +238,7 @@ class UpgradeDrainGate:
             separators=(",", ":"),
         )
         keys = self._marker_keys()
-        await self._redis.eval(
+        written = await self._redis.eval(
             _WRITE_OWNED_MARKER_LUA,
             len(keys),
             *keys,
@@ -220,6 +246,11 @@ class UpgradeDrainGate:
             marker,
             max(1, int(ttl * 1000)),
         )
+        if written != 1:
+            raise QuiesceWriteRefused(
+                "refusing to quiesce: a higher revision marker already holds "
+                "pause authority"
+            )
 
     async def clear_quiesce(self) -> None:
         """Clear only markers owned by this revision. Idempotent."""
@@ -351,16 +382,19 @@ class UpgradeDrainGate:
     ) -> DrainOutcome:
         """Quiesce, then wait for the in-flight deliveries to settle.
 
-        Sets the flag FIRST and unconditionally: the wait is only meaningful
-        while nothing new is being admitted, and a wait that admitted new work
-        could never terminate under load.
+        Sets the flag FIRST: the wait is only meaningful while nothing new is
+        being admitted, and a wait that admitted new work could never terminate
+        under load. A fenced write that does not take effect raises
+        :class:`QuiesceWriteRefused` rather than proceeding into the wait --
+        reporting drained over a fleet that is still claiming is the failure
+        the gate exists to prevent.
 
-        The flag is deliberately left set on BOTH outcomes. On success it is what
-        keeps the replacement pods from reclaiming while the roll is in progress,
-        and the post-upgrade release clears it; on refusal, clearing it is the
-        caller's decision (see :func:`main`), because a caller that wants to
-        retry the gate immediately should not have to re-quiesce a fleet that
-        just resumed.
+        The flag is deliberately left set on BOTH outcomes of a write that
+        succeeded. On success it is what keeps the replacement pods from
+        reclaiming while the roll is in progress, and the post-upgrade release
+        clears it; on refusal, clearing it is the caller's decision (see
+        :func:`main`), because a caller that wants to retry the gate immediately
+        should not have to re-quiesce a fleet that just resumed.
         """
         timeout = self._config.upgrade_drain_timeout_s if timeout_s is None else timeout_s
         interval = (
@@ -420,7 +454,15 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
             )
             return 0
         gate = UpgradeDrainGate(redis, config)
-        outcome = await gate.await_drained()
+        try:
+            outcome = await gate.await_drained()
+        except QuiesceWriteRefused:
+            logger.error(
+                "refusing the upgrade: quiesce marker write was fenced by a "
+                "higher revision; workers were never asked to stop claiming. "
+                "Nothing was rolled."
+            )
+            return 1
         if outcome.drained:
             logger.info(
                 "upgrade drain complete after %.1fs; no delivery is in flight",

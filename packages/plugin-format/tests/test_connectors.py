@@ -333,7 +333,11 @@ def test_both_forms_can_be_mixed_on_one_connector() -> None:
     parsed, errors = validate_connectors(
         {
             "connectors": {
-                "g": {"image": "x:1", "secrets": ["OWNED", {"name": "REFD", "from_secret": "s"}]}
+                "g": {
+                    "image": "x:1",
+                    "secrets": ["OWNED", {"name": "REFD", "from_secret": "s"}],
+                    "bearer_secret": "OWNED",
+                }
             }
         }
     )
@@ -396,6 +400,75 @@ def test_a_malformed_secret_name_is_refused() -> None:
     codes = _codes({"connectors": {"g": {"image": "x:1", "secrets": ["grafana-token"]}}})
     assert "connectors.secret_name_invalid" in codes
     assert "connectors.secret_name_reserved" not in codes, "shape is reported once, not twice"
+
+
+def test_a_hosted_connector_with_several_secrets_must_name_the_bearer() -> None:
+    # #2559: picking secrets[0] as the Authorization header is positional.
+    # Two names and no bearer_secret is refused rather than silently binding
+    # both into the sandbox (and using the first as the Bearer).
+    assert "connectors.bearer_secret_required" in _codes(
+        {"connectors": {"g": {"image": "x:1", "secrets": ["POD_ONLY", "PAT"]}}}
+    )
+
+
+def test_a_named_bearer_secret_must_be_one_of_the_declared_secrets() -> None:
+    assert "connectors.bearer_secret_unknown" in _codes(
+        {
+            "connectors": {
+                "g": {
+                    "image": "x:1",
+                    "secrets": ["POD_ONLY", "PAT"],
+                    "bearer_secret": "NOT_DECLARED",
+                }
+            }
+        }
+    )
+
+
+def test_a_named_bearer_secret_is_accepted_on_a_multi_secret_hosted_connector() -> None:
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "g": {
+                    "image": "x:1",
+                    "secrets": ["POD_ONLY", "PAT"],
+                    "bearer_secret": "PAT",
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["g"].bearer_secret == "PAT"
+
+
+def test_a_single_secret_hosted_connector_does_not_require_bearer_secret() -> None:
+    # Compat for the github-mcp-server shape: one name, that name is the Bearer.
+    parsed, errors = validate_connectors(
+        {"connectors": {"g": {"image": "x:1", "secrets": ["PAT"]}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["g"].bearer_secret is None
+
+
+def test_a_remote_connector_does_not_require_bearer_secret_for_several_secrets() -> None:
+    # Derivation is hosted-only. A url: connector's headers are author input
+    # (ADR-0009 ${VAR} in .mcp.json / headers), so several secrets without
+    # bearer_secret stay legal.
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "r": {
+                    "url": "https://mcp.example.com/mcp",
+                    "secrets": ["A", "B"],
+                    "headers": {"Authorization": "Bearer ${A}"},
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
 
 
 def test_an_ordinary_connector_secret_name_still_validates() -> None:

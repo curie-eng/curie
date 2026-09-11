@@ -125,7 +125,7 @@ via `curie local message` / `cluster message` (`cli/src/chat.rs`, `cli/src/messa
 
 ## Adapter admission and the drop contract (Slack)
 
-This clarifies *this* seam's ingress contract for the one adapter that exists (#2006). It
+This clarifies *this* seam's ingress contract for the Slack dispatcher adapter (#2006). It
 is a Slack-adapter statement, not a vocabulary other adapters are asked to adopt.
 
 **The rule.** The adapter normalizes what it receives; routing decides what is relevant.
@@ -277,11 +277,12 @@ incomplete adapter coverage and conformance.
   resolves the required `(kind, address)` pair with uniqueness on that same pair. There is
   no address-only overload or default kind: two adapters can own the same address without
   silently selecting one another's binding.
-- **Still leaks — adapter coverage and conformance.** Slack is the only registered kind:
-  `HttpReplyAdapter` ships as a second adapter behind the port, but there is no
-  multi-channel adapter framework and no second adapter proving conformance yet
-  (#27). The routing pair removes the binding ambiguity; it does not by itself implement or
-  verify another adapter's ingress and egress behavior.
+- **Still leaks — registered address shapes.** Slack is the only registered kind in
+  `_CHANNEL_ADDRESS_SHAPES`
+  (`apps/api/src/curie_api/schemas.py::_CHANNEL_ADDRESS_SHAPES`); Discord and email
+  bind under the generic non-empty rule. There is still no multi-channel adapter
+  framework (#27). The routing pair removes the binding ambiguity; it does not by
+  itself give other kinds a registered address shape.
 
 ## Cross-links
 

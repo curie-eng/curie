@@ -89,11 +89,12 @@ Response is `{"token": "..."}`. `ttl_s` defaults to 3600 and is capped at
 binding has no reply route yet, so a half-configured route is caught at bind
 time instead of mid-turn.
 
-The token claims the binding row's id plus its current `generation`. Every
-binding write bumps that generation unconditionally, including a re-assert of
-identical values, so a rebind kills every outstanding token for it. Plan for
-re-minting: treat a 401 from ingress as "ask the operator for a fresh token",
-not as a bug.
+The token claims the binding row's id plus the `generation` the mint stamps.
+Every mint bumps that generation, and every binding write bumps it too,
+including a re-assert of identical values, so a remint or a rebind kills every
+outstanding token for the pair. Plan for re-minting: treat a 401 from ingress
+as "ask the operator for a fresh token", not as a bug. The previous token is
+already dead; installing the new one is what restores enqueue.
 
 **Outbound (the platform's credential for calling you).** The operator puts a
 shared secret under your adapter slug in the worker's credential map:

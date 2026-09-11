@@ -162,11 +162,11 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
-{{/* Per-driver TLS query suffix for a Postgres DSN (#2431). ONE helper,
+{{/* Per-driver TLS query suffix for a Postgres DSN (#2431, #2507). ONE helper,
      included from BOTH curie.env.postgres (SQLAlchemy/asyncpg: ?ssl=require)
-     and curie.langfuse.env (Prisma/node-postgres: ?sslmode=no-verify): the
-     two driver families disagree on the spelling, so an operator cannot put
-     a suffix in postgres.auth.database.
+     and curie.langfuse.env (Prisma: ?sslmode=require&sslaccept=accept_invalid_certs):
+     the two driver families disagree on the spelling, so an operator cannot
+     put a suffix in postgres.auth.database.
 
      Empty (the default, and a missing key on --reuse-values of a release
      created before this existed) renders nothing, so an existing in-cluster
@@ -179,7 +179,12 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
      listener, so sslMode=require against it would break every consumer at
      once behind a healthy-looking manifest. Refuse at render, naming both
      keys. Neither rendered suffix verifies the server certificate; a
-     verify-full mode needs a mounted CA bundle and is a second step. */}}
+     verify-full mode needs a mounted CA bundle and is a second step (#2508).
+
+     Why not sslmode=no-verify for Prisma. Prisma/quaint accepts only
+     disable|prefer|require; an unknown value is logged at debug and treated
+     as prefer, so #2476's no-verify suffix did not enforce TLS. sslaccept=
+     accept_invalid_certs is the no-CA posture matching asyncpg ssl=require. */}}
 {{- define "curie.postgres.dsnParams" -}}
 {{- $root := required "curie.postgres.dsnParams requires root" .root -}}
 {{- $driver := required "curie.postgres.dsnParams requires driver" .driver -}}
@@ -193,7 +198,7 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- if $root.Values.postgres.deploy -}}
 {{- fail "postgres.sslMode is require but postgres.deploy is also true: the in-chart Postgres serves no TLS listener, so every consumer would fail to connect. Set postgres.deploy=false and point postgres.host at your external TLS store, or leave postgres.sslMode empty." -}}
 {{- end -}}
-{{- if eq $driver "asyncpg" -}}?ssl=require{{- else -}}?sslmode=no-verify{{- end -}}
+{{- if eq $driver "asyncpg" -}}?ssl=require{{- else -}}?sslmode=require&sslaccept=accept_invalid_certs{{- end -}}
 {{- else -}}
 {{- fail (printf "postgres.sslMode must be empty or \"require\", got %q" (printf "%v" $mode)) -}}
 {{- end -}}
@@ -520,7 +525,7 @@ http
 {{- $exporterType := first (splitList "/" $name) -}}
 {{- if not (or (eq $exporterType "nop") (eq $exporterType "debug")) -}}
 {{- if not (kindIs "map" $config) -}}
-{{- fail (printf "otelCollector.extraExporters[%q] is a network exporter and must be a map with retry_on_failure and sending_queue settings." $name) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] is a network exporter and must be a map with retry_on_failure and a bounded queue." $name) -}}
 {{- end -}}
 {{- $headers := get $config "headers" -}}
 {{- if and $headers (not (kindIs "map" $headers)) -}}
@@ -544,6 +549,19 @@ http
 {{- end -}}
 {{- include "curie.otelCollector.requirePositiveDuration" (dict "exporter" $name "field" "max_interval" "value" (get $retry "max_interval")) -}}
 {{- include "curie.otelCollector.requirePositiveDuration" (dict "exporter" $name "field" "max_elapsed_time" "value" (get $retry "max_elapsed_time")) -}}
+{{- if eq $exporterType "prometheusremotewrite" -}}
+{{- if hasKey $config "sending_queue" -}}
+{{- fail (printf "otelCollector.extraExporters[%q] is prometheusremotewrite and must use remote_write_queue, not sending_queue. Collector 0.119 rejects sending_queue on this exporter." $name) -}}
+{{- end -}}
+{{- $queue := get $config "remote_write_queue" -}}
+{{- if not (kindIs "map" $queue) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must configure remote_write_queue with enabled: true and a finite queue_size." $name) -}}
+{{- end -}}
+{{- $queueSize := int (get $queue "queue_size") -}}
+{{- if or (ne (lower (toString (get $queue "enabled"))) "true") (le $queueSize 0) (gt $queueSize 100000) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] remote_write_queue must be enabled and set queue_size between 1 and 100000." $name) -}}
+{{- end -}}
+{{- else -}}
 {{- $queue := get $config "sending_queue" -}}
 {{- if not (kindIs "map" $queue) -}}
 {{- fail (printf "otelCollector.extraExporters[%q] must configure sending_queue with enabled: true, storage: file_storage, and a finite queue_size." $name) -}}
@@ -551,6 +569,7 @@ http
 {{- $queueSize := int (get $queue "queue_size") -}}
 {{- if or (ne (lower (toString (get $queue "enabled"))) "true") (ne (toString (get $queue "storage")) "file_storage") (le $queueSize 0) (gt $queueSize 100000) -}}
 {{- fail (printf "otelCollector.extraExporters[%q] sending_queue must be enabled, use storage: file_storage, and set queue_size between 1 and 100000." $name) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -1041,6 +1060,276 @@ before contacting Valkey.
 {{- define "curie.env.api" -}}
 {{- include "curie.env.apiUrl" . }}
 {{ include "curie.env.apiKey" . }}
+{{- end -}}
+
+{{/* Literal extraEnv value for one name, or the sentinel __valueFrom__ when
+     the entry exists without a string value. Empty when the name is absent.
+     A present empty value is the sentinel __empty__: worker.yaml treats name
+     presence as an override, so Rail 1 must not fall through to the in-chart
+     URL. valueFrom cannot be proven in-cluster at render. */}}
+{{- define "curie.extraEnv.lookup" -}}
+{{- $found := "" -}}
+{{- range (.env | default list) -}}
+{{- if eq .name $.name -}}
+{{- if and (hasKey . "value") (kindIs "string" .value) -}}
+{{- if eq (trim .value) "" -}}
+{{- $found = "__empty__" -}}
+{{- else -}}
+{{- $found = .value -}}
+{{- end -}}
+{{- else if hasKey . "value" -}}
+{{- $found = printf "%v" .value -}}
+{{- else -}}
+{{- $found = "__valueFrom__" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $found -}}
+{{- end -}}
+
+{{/* Hostname of a URL, port stripped for host:port. Bracketed IPv6 is left
+     intact; those hosts are never this chart's in-cluster Service DNS. A
+     host:port with no scheme (sprig urlParse leaves host empty) is treated
+     as the raw string so curie-api:8000 still matches the in-chart Service. */}}
+{{- define "curie.endpoint.host" -}}
+{{- $raw := trim . -}}
+{{- if $raw -}}
+{{- $parsed := urlParse $raw -}}
+{{- $host := $parsed.host | default "" -}}
+{{- if not $host -}}
+{{- $host = $raw -}}
+{{- end -}}
+{{- if contains "[" $host -}}
+{{- $host -}}
+{{- else -}}
+{{- regexReplaceAll ":[0-9]+$" $host "" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* TCP port a URL actually dials. Same urlParse plus :[0-9]+$ plus
+     scheme-default pattern as curie.mailAdapter.otelEgressPort: the URL
+     port wins; else https => 443, http => 80. Empty scheme and no
+     explicit port emit empty -- do not invent 4318. Does not fail. */}}
+{{- define "curie.endpoint.dialPort" -}}
+{{- $raw := trim . -}}
+{{- if $raw -}}
+{{- $parsed := urlParse $raw -}}
+{{- $hostPort := $parsed.host | default "" -}}
+{{- $scheme := lower ($parsed.scheme | default "") -}}
+{{/* A bracketed IPv6 host is NOT skipped here, which is the opposite of
+     curie.endpoint.host: that helper leaves brackets intact because such a host
+     is never in-chart Service DNS, whereas this helper must still find the
+     port. ":[0-9]+$" is safe on a literal address because a bare bracketed host
+     ends in "]" -- only a real port can follow the closing bracket, so a hextet
+     is never mistaken for one. Skipping brackets instead left $urlPort empty,
+     fell through to the scheme default, and opened 443 while the SDK dialled
+     the port the URL actually named. */}}
+{{- $urlPort := trimPrefix ":" (regexFind ":[0-9]+$" $hostPort) -}}
+{{- if $urlPort -}}
+{{- $urlPort -}}
+{{- else if eq $scheme "https" -}}
+443
+{{- else if eq $scheme "http" -}}
+80
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* True when host is this release's Service DNS for component (api or
+     otel-collector), including the usual cluster.local FQDNs. */}}
+{{- define "curie.host.inChartService" -}}
+{{- $fullname := include "curie.fullname" .root -}}
+{{- $ns := .root.Release.Namespace -}}
+{{- $svc := printf "%s-%s" $fullname .component -}}
+{{- $h := lower (trim .host) -}}
+{{- if or (eq $h $svc) (eq $h (printf "%s.%s" $svc $ns)) (eq $h (printf "%s.%s.svc" $svc $ns)) (eq $h (printf "%s.%s.svc.cluster.local" $svc $ns)) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* API URL a spawned runner actually dials (#2367). worker.extraEnv
+     CURIE_RUNNER_API_URL wins, then CURIE_API_URL, then dispatcher.apiBaseUrl
+     / the in-chart API Service. Matches apps/worker runner_facing_api_base_url. */}}
+{{- define "curie.runner.effectiveApiUrl" -}}
+{{- $runner := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_RUNNER_API_URL") | trim -}}
+{{- $api := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_API_URL") | trim -}}
+{{- if $runner -}}
+{{- $runner -}}
+{{- else if $api -}}
+{{- $api -}}
+{{- else -}}
+{{- include "curie.api.url" (dict "root" . "baseUrl" .Values.dispatcher.apiBaseUrl) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.runner.effectiveApiSource" -}}
+{{- $runner := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_RUNNER_API_URL") | trim -}}
+{{- $api := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_API_URL") | trim -}}
+{{- if $runner -}}
+worker.extraEnv CURIE_RUNNER_API_URL
+{{- else if $api -}}
+worker.extraEnv CURIE_API_URL
+{{- else if trim (printf "%v" (.Values.dispatcher.apiBaseUrl | default "")) -}}
+dispatcher.apiBaseUrl
+{{- else -}}
+the in-chart API Service
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.runner.apiIsExternal" -}}
+{{- $url := include "curie.runner.effectiveApiUrl" . | trim -}}
+{{- if or (eq $url "__valueFrom__") (eq $url "__empty__") -}}
+true
+{{- else if empty $url -}}
+{{- else if include "curie.host.inChartService" (dict "root" . "host" (include "curie.endpoint.host" $url) "component" "api") -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* True when the operator overrode the runner-facing API URL, including an
+     in-chart Service DNS leftover. The deploy-false BYO gate uses this so
+     api.deploy false plus dispatcher.apiBaseUrl=http://<release>-api still
+     requires api.egress (#2317), while empty apiBaseUrl with no extraEnv
+     still dead-ends at dispatcher boot. */}}
+{{- define "curie.runner.apiOverrideSet" -}}
+{{- $base := trim (printf "%v" (.Values.dispatcher.apiBaseUrl | default "")) -}}
+{{- $runner := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_RUNNER_API_URL") | trim -}}
+{{- $api := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_API_URL") | trim -}}
+{{- if or $base $runner $api -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* OTLP URL the runner sandbox actually dials (#2367). Signal-specific
+     extraEnv (traces, then metrics, then logs) wins over the generic
+     OTEL_EXPORTER_OTLP_ENDPOINT, then the chart-owned curie.otel.endpoint. */}}
+{{- define "curie.runner.effectiveOtlpEndpoint" -}}
+{{- $traces := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") | trim -}}
+{{- $metrics := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") | trim -}}
+{{- $logs := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") | trim -}}
+{{- $generic := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_ENDPOINT") | trim -}}
+{{- if $traces -}}
+{{- $traces -}}
+{{- else if $metrics -}}
+{{- $metrics -}}
+{{- else if $logs -}}
+{{- $logs -}}
+{{- else if $generic -}}
+{{- $generic -}}
+{{- else -}}
+{{- include "curie.otel.endpoint" . | trim -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.runner.effectiveOtlpSource" -}}
+{{- $traces := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") | trim -}}
+{{- $metrics := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") | trim -}}
+{{- $logs := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") | trim -}}
+{{- $generic := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_ENDPOINT") | trim -}}
+{{- if $traces -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+{{- else if $metrics -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+{{- else if $logs -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
+{{- else if $generic -}}
+agentSandbox.runner.extraEnv OTEL_EXPORTER_OTLP_ENDPOINT
+{{- else -}}
+curie.otel.endpoint
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.runner.otlpIsExternal" -}}
+{{- $url := include "curie.runner.effectiveOtlpEndpoint" . | trim -}}
+{{- if or (eq $url "__valueFrom__") (eq $url "__empty__") -}}
+true
+{{- else if empty $url -}}
+{{- else if include "curie.host.inChartService" (dict "root" . "host" (include "curie.endpoint.host" $url) "component" "otel-collector") -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* OTLP URL the mail adapter actually dials (#2361). The adapter passes
+     curie.env.otel an EMPTY extraEnv list on purpose -- there is no
+     mailAdapter.extraEnv key, so this pod cannot be repointed independently --
+     which makes its effective endpoint exactly curie.otel.endpoint. That is
+     written as its own named helper anyway: the reason is then recorded next to
+     the runner's equivalent, and if a mailAdapter.extraEnv surface is ever
+     accepted there is one place to teach it rather than a bare
+     curie.otel.endpoint include scattered through the template. */}}
+{{- define "curie.mailAdapter.effectiveOtlpEndpoint" -}}
+{{- include "curie.otel.endpoint" . | trim -}}
+{{- end -}}
+
+{{/* True when the adapter's effective endpoint is one the rendered in-chart
+     collector peer does NOT cover (#2361). Deliberately keyed off deploy AND
+     the host, not the host alone: otelCollector.deploy=false with an endpoint
+     that still names this release's collector Service is the dangerous leftover
+     shape -- the host looks in-chart while no such pod exists, so the
+     pod-selector rule the adapter would otherwise get selects nothing. Empty
+     endpoint (telemetry disabled, or no-endpoint mode) exports nothing and is
+     therefore not external: it needs no peer at all. */}}
+{{- define "curie.mailAdapter.otlpIsExternal" -}}
+{{- $url := include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim -}}
+{{- if empty $url -}}
+{{- else if and .Values.otelCollector.deploy (include "curie.host.inChartService" (dict "root" . "host" (include "curie.endpoint.host" $url) "component" "otel-collector")) -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* TCP port the adapter's external-OTLP ipBlock rule opens (#2361).
+     Precedence: an explicit mailAdapter.otelEgress.port, else the port the
+     endpoint URL names, else the scheme default. A rule on the wrong port looks
+     configured and still drops every export, so a disagreement between the two
+     operator statements is refused rather than resolved by picking a winner --
+     whichever lost would have been discarded silently. Only meaningful, and
+     only included, on the external path. */}}
+{{- define "curie.mailAdapter.otelEgressPort" -}}
+{{- $endpoint := include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim -}}
+{{- $parsed := urlParse $endpoint -}}
+{{- $hostPort := $parsed.host | default "" -}}
+{{- $scheme := lower ($parsed.scheme | default "") -}}
+{{/* A bracketed IPv6 host is NOT skipped here, which is the opposite of
+     curie.endpoint.host: that helper leaves brackets intact because such a host
+     is never in-chart Service DNS, whereas this helper must still find the
+     port. ":[0-9]+$" is safe on a literal address because a bare bracketed host
+     ends in "]" -- only a real port can follow the closing bracket, so a hextet
+     is never mistaken for one. Skipping brackets instead left $urlPort empty,
+     fell through to the scheme default, and opened 443 while the SDK dialled
+     the port the URL actually named. */}}
+{{- $urlPort := trimPrefix ":" (regexFind ":[0-9]+$" $hostPort) -}}
+{{/* The port the SDK will actually dial, whether or not the URL writes it: a
+     portless https:// endpoint is dialled on 443 just as definitely as an
+     explicit :4318. The explicit key is compared against THIS, not against the
+     presence of a ":port" substring -- otherwise an explicit 4318 beside a
+     portless https:// URL passed unchallenged and rendered a 4318 peer for a
+     443 dial. */}}
+{{- $dialPort := $urlPort -}}
+{{- if not $dialPort -}}
+{{- if eq $scheme "https" -}}
+{{- $dialPort = "443" -}}
+{{- else if eq $scheme "http" -}}
+{{- $dialPort = "80" -}}
+{{- end -}}
+{{- end -}}
+{{- $explicit := trim (printf "%v" (.Values.mailAdapter.otelEgress.port | default "")) -}}
+{{- $port := "" -}}
+{{- if $explicit -}}
+{{- if and $dialPort (regexMatch "^[0-9]+$" $explicit) (ne (int $explicit) (int $dialPort)) -}}
+{{- fail (printf "mailAdapter.otelEgress.port is %s but the OTLP endpoint %s is dialed on port %s (the port its URL names, or the scheme default when the URL names none). Set one of them, or make them agree: opening %s while the exporter connects to %s renders a peer that looks configured and still drops every export." $explicit $endpoint $dialPort $explicit $dialPort) -}}
+{{- end -}}
+{{- $port = $explicit -}}
+{{- else -}}
+{{- $port = $dialPort -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[0-9]+$" $port)) (lt (int $port) 1) (gt (int $port) 65535) -}}
+{{- fail (printf "mailAdapter.otelEgress.port must be an integer from 1 through 65535, or empty to derive it from the resolved OTLP endpoint %s" $endpoint) -}}
+{{- end -}}
+{{- $port -}}
 {{- end -}}
 
 {{/* Coalesce the worker's chart-managed egress credentials and the first-party

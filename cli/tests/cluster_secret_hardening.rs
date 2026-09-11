@@ -445,6 +445,7 @@ fn pure_up() -> UpOpts {
         secrets: vec![],
         github_token: GithubTokenPlan::Untouched,
         dev: true,
+        adopt: false,
     }
 }
 

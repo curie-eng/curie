@@ -50,6 +50,9 @@ the enforceable-rule summary.
 - **Admission is bounded before state or body allocation.** At the pending or
   state-byte cap, leave provider mail unclaimed and unmodified so later capacity
   can recover it. Never evict an unresolved delivery merely to admit a newer one.
+  Terminal `completion_events` (`delivered=1` or `deleted=1`) are compacted
+  oldest-first under the derived cap; unresolved and leased completion rows are
+  never evicted to make room.
 - **Logs carry no raw mail PII.** Do not log sender addresses, subjects, bodies,
   provider message/thread ids, or reply text. Use a one-way correlation token
   and a reason/state label so operators can join retries without copying mail
@@ -63,16 +66,12 @@ the enforceable-rule summary.
   reintroduce `logging.basicConfig` (it installs a root handler and the same
   record is then emitted twice, once unformatted), and do not attach a handler
   that bypasses the service logger -- either move re-opens the unfiltered path
-  this closed. What the filter does **not** do is the load-bearing half:
-  `packages/telemetry/src/curie_telemetry/redact.py`'s `REDACTION_RULES` has no
-  rule for any of this adapter's own credential shapes. A `chn-` channel token,
-  an AgentMail API key and `CURIE_EGRESS_SECRET` all pass through verbatim
-  unless they happen to appear as a URL query parameter (`?token=`,
-  `?api_key=`), as a bare `token=`/`secret=`/`api_key=` assignment, or after
-  `Authorization: Bearer`. `CURIE_CHANNEL_TOKEN=<value>` is specifically **not**
-  redacted -- the `secret_assignment` rule needs a word boundary before `token`,
-  and the preceding `_` denies it -- and neither is an `X-API-Key: <value>`
-  header rendered into a message. The "no raw mail PII" rule above is likewise a
+  this closed. The shared `REDACTION_RULES` now match this adapter's credential
+  *shapes*: a bare `chn.{payload}.{signature}` token, an AgentMail `am_` key,
+  `CURIE_*_TOKEN=` / `*_SECRET=` assignments, and an `X-API-Key: <value>`
+  header. An unprefixed `CURIE_EGRESS_SECRET` value still needs that
+  assignment or header context -- the filter will not claim to recognize the
+  secret as an arbitrary string. The "no raw mail PII" rule above is likewise a
   code-level obligation the filter cannot enforce: no rule matches an address,
   subject, body or provider id. Keep credentials and mail content out of the
   record in the first place; the filter only catches the shapes it knows.

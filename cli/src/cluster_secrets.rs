@@ -58,10 +58,22 @@ pub fn resolve_named_secrets(names: &[String]) -> Result<BTreeMap<String, String
     Ok(secrets)
 }
 
-/// Names-only map written to the agent record at the cluster tier.
-pub fn agent_record_secrets(secrets: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    secrets
-        .keys()
+/// Names-only placeholder map written to the agent record at the cluster tier,
+/// built from NAMES that have no resolved value on this box.
+///
+/// The cluster tier's agent record is placeholders either way -- the value
+/// lives in the per-agent Helm Secret, never in the record -- so a connector
+/// secret whose value is resolved later, cluster-scoped (#1913), still belongs
+/// in it. It has to: the worker keys `inject_connector_secrets` off this map,
+/// and `sandbox.types` routes the claim to the per-agent pool only when the
+/// marker is present. A record built from `--secret` alone routes the pod to
+/// the generic pool with no connector secret env at all (#2503).
+pub fn agent_record_secret_names<'a, I>(names: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    names
+        .into_iter()
         .map(|name| (name.clone(), CLUSTER_SECRET_PLACEHOLDER.to_string()))
         .collect()
 }
@@ -158,7 +170,7 @@ mod tests {
 
     #[test]
     fn agent_record_keeps_names_and_drops_values() {
-        let stored = agent_record_secrets(&secrets());
+        let stored = agent_record_secret_names(secrets().keys());
         assert_eq!(
             stored["GITHUB_PERSONAL_ACCESS_TOKEN"],
             CLUSTER_SECRET_PLACEHOLDER
@@ -167,6 +179,34 @@ mod tests {
         assert!(!stored
             .values()
             .any(|v| v.contains("ghp_") || v.contains("jira-a")));
+    }
+
+    #[test]
+    fn record_from_names_alone_is_the_same_placeholder_map() {
+        // #2503: a connector secret whose value is resolved cluster-scoped
+        // later has no value on this box, but the record still has to carry
+        // its NAME -- the worker keys `inject_connector_secrets` (and the
+        // per-agent sandbox pool routing) off this map. Names-only and
+        // value-bearing inputs must produce byte-identical records for the
+        // same key set, so the two deploy paths cannot diverge.
+        let names: Vec<String> = secrets().keys().cloned().collect();
+        let from_names = agent_record_secret_names(names.iter());
+        assert_eq!(from_names, agent_record_secret_names(secrets().keys()));
+        assert_eq!(
+            from_names["GITHUB_PERSONAL_ACCESS_TOKEN"],
+            CLUSTER_SECRET_PLACEHOLDER
+        );
+        assert_eq!(from_names["JIRA_TOKEN"], CLUSTER_SECRET_PLACEHOLDER);
+    }
+
+    #[test]
+    fn record_from_names_carries_a_name_that_has_no_local_value() {
+        // The #2503 case proper: the name reaches the record even though
+        // nothing on this box ever resolved a value for it, and no value-like
+        // material is invented for it.
+        let stored = agent_record_secret_names(["CONNECTOR_ONLY".to_string()].iter());
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored["CONNECTOR_ONLY"], CLUSTER_SECRET_PLACEHOLDER);
     }
 
     #[test]

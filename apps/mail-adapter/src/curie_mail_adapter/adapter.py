@@ -33,12 +33,16 @@ POLL_LIMIT = 20
 POLL_MAX_PAGES = 5
 BACKOFF_STEP_SECONDS = 5.0
 BACKOFF_MAX_SECONDS = 60.0
-# Status 0 is a transport failure and 429 is provider rate limiting; both mean
-# "slow down", and neither did except 429, so a provider outage re-polled at the
-# normal cadence and burst a warning per pass (373 in 24h in the soak, #2012).
-POLL_BACKOFF_STATUSES = frozenset({0, 429})
+# Status 0 is a transport failure and every 4xx is a provider refusal. Neither
+# can recover because the adapter repeats the same request at normal cadence, so
+# both use the bounded discovery backoff. A 5xx deliberately retains its prior
+# semantics: it neither arms nor clears an already armed delay.
 CAUSE_MAX_CHARS = 120
 REJECTED_LABELS = frozenset({"unauthenticated", "spam", "blocked"})
+
+
+def _poll_should_back_off(status: int) -> bool:
+    return status == 0 or 400 <= status < 500
 
 
 class ProviderThreadDeletedError(RuntimeError):
@@ -179,7 +183,7 @@ class MailAdapter:
             if self.shutdown.is_set():
                 return
             status = self.poll_once()
-            if status in POLL_BACKOFF_STATUSES:
+            if _poll_should_back_off(status):
                 backoff = min(backoff * 2 + BACKOFF_STEP_SECONDS, BACKOFF_MAX_SECONDS)
                 logger.warning(
                     "poll: status=%s, backing off %ss before the next discovery pass",
@@ -292,7 +296,11 @@ class MailAdapter:
         depend on a stdlib rendering staying that way.
         """
         if status != 0:
-            return "unavailable"
+            # The status line is the only provider-authored response metadata
+            # admitted into this diagnostic. Valid HTTP codes have a fixed
+            # three-digit budget; an impossible value gets one fixed fallback
+            # rather than an unbounded rendering of the integer.
+            return f"http_{status}" if 100 <= status <= 599 else "http_invalid"
         if not isinstance(body, dict):
             return "unavailable"
         error = body.get("error")

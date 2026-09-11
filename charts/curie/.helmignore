@@ -8,3 +8,7 @@
 *.swp
 .idea/
 .vscode/
+# Test scripts are not part of the installable chart. Shipping them in the
+# release Secret is what blew the 1MiB Kubernetes Secret cap on
+# `curie cluster up` once the BYO egress assertions grew (#2367).
+ci/

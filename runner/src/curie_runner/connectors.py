@@ -36,10 +36,13 @@ rather than silently displacing the approval server.
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Collection, MutableMapping
 from pathlib import Path
 from typing import Any
 
 import yaml
+from aci_protocol import BootEnv
 from plugin_format.connector_render import (
     AmbiguousObjectName,
     mcp_entry,
@@ -164,3 +167,58 @@ def build_mcp_servers(platform: dict[str, Any], derived: dict[str, Any]) -> dict
     """
 
     return {**derived, **platform}
+
+
+_BEARER_PLACEHOLDER = re.compile(r"^Bearer \$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def materialize_hosted_bearer_headers(
+    servers: dict[str, Any],
+    env: MutableMapping[str, str],
+) -> frozenset[str]:
+    """Expand hosted ``Bearer ${NAME}`` headers in memory and drop NAME from env.
+
+    ``derive_mcp_servers`` / ``mcp_entry`` keep the placeholder so a value never
+    lands on disk. The MCP client still needs the real header, so the runner
+    expands it here and unsets the name before the SDK session (and Bash) can
+    read the process environment (#2559). Names that were never in ``env`` stay
+    as the placeholder (the empty-Bearer gap, #2519). Unrelated secrets are
+    left in ``env`` so ADR-0009 stdio / remote ``${VAR}`` expansion still works.
+    """
+
+    dropped: set[str] = set()
+    for server in servers.values():
+        if not isinstance(server, dict):
+            continue
+        headers = server.get("headers")
+        if not isinstance(headers, dict):
+            continue
+        auth = headers.get("Authorization")
+        if not isinstance(auth, str):
+            continue
+        match = _BEARER_PLACEHOLDER.fullmatch(auth)
+        if match is None:
+            continue
+        name = match.group(1)
+        value = env.get(name)
+        if value is None:
+            continue
+        headers["Authorization"] = f"Bearer {value}"
+        dropped.add(name)
+    drop_connector_secret_names(env, dropped)
+    return frozenset(dropped)
+
+
+def drop_connector_secret_names(env: MutableMapping[str, str], names: Collection[str]) -> None:
+    """Remove hosted Bearer names from a process or spawn env mapping."""
+
+    for name in names:
+        env.pop(name, None)
+    marker = BootEnv.env_key("connector_secret_keys")
+    raw = env.get(marker)
+    if raw and names:
+        remaining = [key for key in raw.split(",") if key and key not in names]
+        if remaining:
+            env[marker] = ",".join(sorted(remaining))
+        else:
+            env.pop(marker, None)

@@ -104,6 +104,8 @@ pub struct UpOpts {
     /// generating strong per-release randoms (the first-class dev escape hatch
     /// that replaces hand-passing `--set` for every secret).
     pub dev: bool,
+    /// Explicit operator override for adopting a pre-existing primary namespace.
+    pub adopt: bool,
 }
 
 impl UpOpts {
@@ -902,6 +904,14 @@ const MODEL_CREDENTIAL_REFERENCE_KEYS: &[&str] = &[
 ];
 const CREATED_BY_LABEL: &str = "curietech.ai/created-by";
 const CREATED_IN_LABEL: &str = "curietech.ai/created-in";
+const ADOPTED_BY_LABEL: &str = "curietech.ai/adopted-by";
+const ADOPTED_IN_LABEL: &str = "curietech.ai/adopted-in";
+const ADOPTED_AT_ANNOTATION: &str = "curietech.ai/adopted-at";
+const ADOPTED_LABELS_ANNOTATION: &str = "curietech.ai/adopted-labels";
+const ADOPTED_CONTENTS_ANNOTATION: &str = "curietech.ai/adopted-contents";
+const ADOPTION_RECORD_LIMIT: usize = 4096;
+const ADOPT_HINT: &str =
+    "; pass --adopt to adopt it anyway, recording what was adopted on the namespace";
 
 /// Emitted alongside [`MODEL_CREDENTIAL_KEY`], and only when a credential is
 /// present -- see `up_commands`, which pushes both inside one `if let`.
@@ -1056,20 +1066,54 @@ fn resolve_preserved_runner_identity_values(
         }
     }
     opts.secrets.extend(references);
+    let preserve_inline_credential = opts.fake_model && opts.local_model.is_none();
     if opts.credentials.is_none() {
         opts.secrets.extend(
             resolve_credential_values(existing, operator_sets, &[MODEL_CREDENTIAL_KEY])
                 .into_iter()
-                .filter(|(_, value)| value.is_empty()),
+                .filter(|(_, value)| value.is_empty() || preserve_inline_credential),
         );
     }
 
-    if !opts.fake_model
-        && opts.local_model.is_none()
-        && opts.model.is_none()
-        && !overridden.contains(RUNNER_MODEL_KEY)
+    if opts.local_model.is_none() && opts.model.is_none() && !overridden.contains(RUNNER_MODEL_KEY)
     {
         opts.model = preserved_value(existing, RUNNER_MODEL_KEY);
+    }
+
+    resolve_preserved_inference_values(opts, existing, operator_sets);
+}
+
+/// Carry a recorded in-cluster inference install into a later plain `cluster up`.
+fn resolve_preserved_inference_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    if opts.fake_model || opts.local_model.is_some() || opts.credentials.is_some() {
+        return;
+    }
+    let overridden = operator_set_keys(operator_sets);
+    if overridden.contains(INFERENCE_DEPLOY_KEY) {
+        return;
+    }
+    let Some(existing) = existing else {
+        return;
+    };
+    if !crate::doctor::helm_truthy(existing.pointer("/inference/deploy")) {
+        return;
+    }
+    opts.set.push(format!("{INFERENCE_DEPLOY_KEY}=true"));
+    let mut recorded = BTreeMap::new();
+    crate::installation::flatten_values(existing, "", &mut recorded);
+    for (key, value) in recorded {
+        if key == INFERENCE_DEPLOY_KEY
+            || !key_is_or_descends_from(&key, "inference")
+            || overridden.contains(&key)
+            || value.is_empty()
+        {
+            continue;
+        }
+        opts.set.push(format!("{key}={value}"));
     }
 }
 
@@ -2047,6 +2091,7 @@ fn overlay_family_is_managed(key: &str) -> bool {
     key_is_or_descends_from(key, MODEL_CREDENTIAL_KEY)
         || key_is_or_descends_from(key, RUNNER_MODEL_KEY)
         || key_is_or_descends_from(key, FAKE_MODEL_KEY)
+        || key_is_or_descends_from(key, "inference")
         || key_is_or_descends_from(key, GVISOR_MODE_KEY)
         || key_is_or_descends_from(key, ALLOWED_EGRESS_KEY)
         || key_is_or_descends_from(key, SLACK_TRUSTED_ORIGINS_KEY)
@@ -2537,8 +2582,8 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
         plan.set("langfuse.web.service.type", "NodePort");
     }
     if let Some(model) = &o.local_model {
-        plan.set("inference.deploy", "true");
-        plan.set("inference.model", model);
+        plan.set(INFERENCE_DEPLOY_KEY, "true");
+        plan.set(INFERENCE_MODEL_KEY, model);
     }
     if let Some(credentials) = &o.credentials {
         plan.set(FAKE_MODEL_KEY, "false");
@@ -4180,7 +4225,7 @@ async fn run_prepared_up(
     }
     if !opts.common.dry_run {
         require_on_path("kubectl")?;
-        establish_primary_namespace_ownership(&opts.common).await?;
+        establish_primary_namespace_ownership(&opts.common, opts.adopt).await?;
     }
     let mut ownership_candidates: Vec<(String, bool)> = Vec::new();
     for ns in owned_namespaces {
@@ -4237,6 +4282,12 @@ async fn run_prepared_up(
     }
     if opts.common.dry_run {
         let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        if opts.adopt {
+            lines.push(format!(
+                "# --adopt: a live run may adopt a pre-existing primary namespace with foreign labels or non-default contents, stamp {ADOPTED_BY_LABEL}={}/{ADOPTED_IN_LABEL}={} with an audit record, and retain it on cluster down. The shared controller and terminating namespaces remain ineligible.",
+                opts.common.release, opts.common.namespace
+            ));
+        }
         lines.push("# After Helm and ownership stamping, verify convergence for at most 300 seconds; repeat observations every 2 seconds while rollout is pending.".to_owned());
         lines.push(convergence::DRY_RUN_NOTE.to_owned());
         lines.extend(
@@ -4394,6 +4445,7 @@ mod tests {
                 secrets: vec![],
                 github_token: GithubTokenPlan::Untouched,
                 dev: true,
+                adopt: false,
             },
             Some(existing),
             None,
@@ -4582,6 +4634,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -4626,6 +4679,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: false,
                 set: vec![],
                 set_string: vec![],
@@ -4681,6 +4735,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![
@@ -4737,6 +4792,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -4800,6 +4856,7 @@ mod tests {
                 secrets: vec![],
                 retained_mail_values: None,
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -4884,6 +4941,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -4930,6 +4988,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
@@ -4976,6 +5035,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec!["worker.slackTrustedOrigins=https://trusted.example.com".into()],
                 set_string: vec![],
@@ -5023,6 +5083,7 @@ mod tests {
                 chart: "charts/curie".into(),
                 secrets: vec![],
                 dev: false,
+                adopt: false,
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
@@ -5079,6 +5140,7 @@ mod tests {
                     chart: "charts/curie".into(),
                     secrets: vec![],
                     dev: false,
+                    adopt: false,
                     no_expose: true,
                     set: vec![],
                     set_string: vec![],
@@ -5133,6 +5195,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -5157,6 +5220,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec!["worker.replicas=2".into(), "dispatcher.deploy=false".into()],
             set_string: vec![],
@@ -5187,6 +5251,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec![],
@@ -5214,6 +5279,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -5240,6 +5306,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec![],
@@ -5347,6 +5414,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -5373,6 +5441,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -5398,6 +5467,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -5427,6 +5497,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -5452,6 +5523,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec!["agentSandbox.runner.model=z-ai/glm-5.2".into()],
             set_string: vec![],
@@ -5485,6 +5557,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec!["worker.replicas=2,agentSandbox.runner.model=glm".into()],
             allow_web_egress: vec![],
@@ -5512,6 +5585,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -5552,6 +5626,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec!["0.0.0.0/0".into()],
@@ -5587,6 +5662,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -5623,6 +5699,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             allow_web_egress: vec![],
@@ -5643,6 +5720,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec![],
@@ -5867,6 +5945,7 @@ mod tests {
                 "xoxb-preserved-secret".into(),
             )],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -6047,6 +6126,7 @@ mod tests {
                 secrets: vec![],
                 retained_mail_values: None,
                 dev: true,
+                adopt: false,
                 no_expose: true,
                 set,
                 set_string: vec![],
@@ -6214,6 +6294,7 @@ mod tests {
                 ),
             ],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -6266,6 +6347,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: true,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -6292,6 +6374,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: true,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -6322,6 +6405,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -6373,6 +6457,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -6425,6 +6510,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -6458,6 +6544,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -6746,6 +6833,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: true,
+            adopt: false,
             no_expose: true,
             set: vec![],
             set_string: vec![],
@@ -6998,6 +7086,7 @@ mod tests {
             chart: "charts/curie".into(),
             secrets: vec![],
             dev: true,
+            adopt: false,
             no_expose: false,
             set: vec![],
             set_string: vec!["security.allowDevDefaults=false".into()],
@@ -7141,6 +7230,7 @@ mod tests {
                 ),
             ],
             dev: false,
+            adopt: false,
             no_expose: true,
             set: vec![],
             allow_web_egress: vec![],
@@ -7417,6 +7507,7 @@ mod tests {
 #[derive(Debug, Clone)]
 pub(crate) struct NamespaceRecord {
     labels: BTreeMap<String, String>,
+    annotations: BTreeMap<String, String>,
     uid: String,
     resource_version: String,
     terminating: bool,
@@ -7519,7 +7610,64 @@ pub(crate) async fn namespace_probe(namespace: &str) -> Result<NamespaceProbe> {
     parse_namespace_probe(namespace, &out)
 }
 
-async fn establish_primary_namespace_ownership(o: &CommonOpts) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdoptionOverride {
+    prior_labels: String,
+    prior_contents: String,
+    at: String,
+}
+
+fn adoption_record_value(value: &str) -> String {
+    if value.is_empty() {
+        return "(none)".to_string();
+    }
+    if value.len() <= ADOPTION_RECORD_LIMIT {
+        return value.to_string();
+    }
+    let mut cut = ADOPTION_RECORD_LIMIT;
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{} (truncated)", &value[..cut])
+}
+
+fn rendered_labels(labels: &BTreeMap<String, String>) -> String {
+    labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn adoption_timestamp() -> Result<String> {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("formatting the adoption timestamp")
+}
+
+fn announce_adoption_override(namespace: &str, taken: &AdoptionOverride) {
+    let ui = crate::ui::ui();
+    ui.warn(&format!(
+        "--adopt: took over pre-existing namespace `{namespace}` at {}",
+        taken.at
+    ));
+    ui.warn(&format!(
+        "--adopt: pre-existing labels: {}",
+        adoption_record_value(&taken.prior_labels)
+    ));
+    ui.warn(&format!(
+        "--adopt: pre-existing objects: {}",
+        adoption_record_value(&taken.prior_contents)
+    ));
+    ui.warn(&format!(
+        "--adopt: recorded on the namespace as {ADOPTED_BY_LABEL}/{ADOPTED_IN_LABEL} plus the {ADOPTED_AT_ANNOTATION}, {ADOPTED_LABELS_ANNOTATION} and {ADOPTED_CONTENTS_ANNOTATION} annotations; read it back with `kubectl get namespace {namespace} -o yaml`"
+    ));
+    ui.warn(&format!(
+        "--adopt: `curie cluster down` will uninstall the release and RETAIN namespace `{namespace}`, because an adopted namespace is not stamped with the sweep's ownership labels. Delete it yourself if you want it gone."
+    ));
+}
+
+async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> Result<()> {
     match namespace_probe(&o.namespace).await? {
         NamespaceProbe::Absent => {
             let manifest = namespace_manifest(&o.namespace, &o.release)?;
@@ -7547,29 +7695,59 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts) -> Result<()> {
             {
                 return Ok(());
             }
-            if created_by.is_some() || created_in.is_some() {
+            if record.labels.get(ADOPTED_BY_LABEL).map(String::as_str) == Some(o.release.as_str())
+                && record.labels.get(ADOPTED_IN_LABEL).map(String::as_str)
+                    == Some(o.namespace.as_str())
+            {
+                return Ok(());
+            }
+            if (created_by.is_some() || created_in.is_some()) && !adopt {
                 let by = created_by.map(String::as_str).unwrap_or("<missing>");
                 let install = created_in.map(String::as_str).unwrap_or("<missing>");
                 bail!(
-                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it",
+                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it{ADOPT_HINT}",
                     o.namespace
                 );
             }
             if o.namespace == CONTROLLER_DEPLOYMENT_NAMESPACE {
                 bail!(
-                    "pre-existing shared controller namespace `{}` is never eligible for adoption",
+                    "pre-existing shared controller namespace `{}` is never eligible for adoption, with or without --adopt",
                     o.namespace
                 );
             }
-            if !labels_allow_empty_adoption(&record.labels, &o.namespace) {
+            let foreign_labels = !labels_allow_empty_adoption(&record.labels, &o.namespace);
+            if foreign_labels && !adopt {
                 let keys = record.labels.keys().cloned().collect::<Vec<_>>().join(", ");
                 bail!(
-                    "namespace `{}` has foreign labels ({keys}) and cannot be adopted",
+                    "namespace `{}` has foreign labels ({keys}) and cannot be adopted{ADOPT_HINT}",
                     o.namespace
                 );
             }
-            verify_namespace_is_empty(&o.namespace).await?;
-            let command = namespace_adoption_cmd(&o.namespace, &o.release, &record)?;
+            let contents = namespace_foreign_contents(&o.namespace).await?;
+            if let Some(detail) = &contents {
+                if !adopt {
+                    bail!(
+                        "namespace `{}` contains non-default objects and cannot be adopted: {detail}{ADOPT_HINT}",
+                        o.namespace
+                    );
+                }
+            }
+            let overridden = if adopt
+                && (created_by.is_some()
+                    || created_in.is_some()
+                    || foreign_labels
+                    || contents.is_some())
+            {
+                Some(AdoptionOverride {
+                    prior_labels: rendered_labels(&record.labels),
+                    prior_contents: contents.clone().unwrap_or_default(),
+                    at: adoption_timestamp()?,
+                })
+            } else {
+                None
+            };
+            let command =
+                namespace_adoption_cmd(&o.namespace, &o.release, &record, overridden.as_ref())?;
             let (ok, _out, err) = run_capture(&command).await?;
             if !ok {
                 bail!(
@@ -7577,6 +7755,9 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts) -> Result<()> {
                     o.namespace,
                     failure_reason(&err)
                 );
+            }
+            if let Some(taken) = &overridden {
+                announce_adoption_override(&o.namespace, taken);
             }
         }
     }
@@ -7587,14 +7768,36 @@ fn namespace_adoption_cmd(
     namespace: &str,
     release: &str,
     record: &NamespaceRecord,
+    overridden: Option<&AdoptionOverride>,
 ) -> Result<OpsCommand> {
     let mut labels = record.labels.clone();
-    labels.insert(CREATED_BY_LABEL.to_string(), release.to_string());
-    labels.insert(CREATED_IN_LABEL.to_string(), namespace.to_string());
+    let mut annotations = record.annotations.clone();
+    match overridden {
+        None => {
+            labels.insert(CREATED_BY_LABEL.to_string(), release.to_string());
+            labels.insert(CREATED_IN_LABEL.to_string(), namespace.to_string());
+        }
+        Some(taken) => {
+            labels.remove(CREATED_BY_LABEL);
+            labels.remove(CREATED_IN_LABEL);
+            labels.insert(ADOPTED_BY_LABEL.to_string(), release.to_string());
+            labels.insert(ADOPTED_IN_LABEL.to_string(), namespace.to_string());
+            annotations.insert(ADOPTED_AT_ANNOTATION.to_string(), taken.at.clone());
+            annotations.insert(
+                ADOPTED_LABELS_ANNOTATION.to_string(),
+                adoption_record_value(&taken.prior_labels),
+            );
+            annotations.insert(
+                ADOPTED_CONTENTS_ANNOTATION.to_string(),
+                adoption_record_value(&taken.prior_contents),
+            );
+        }
+    }
     let patch = serde_json::to_string(&serde_json::json!([
         {"op": "test", "path": "/metadata/uid", "value": record.uid.clone()},
         {"op": "test", "path": "/metadata/resourceVersion", "value": record.resource_version.clone()},
         {"op": "add", "path": "/metadata/labels", "value": labels},
+        {"op": "add", "path": "/metadata/annotations", "value": annotations},
     ]))
     .context("serializing the guarded Namespace ownership patch")?;
     Ok(OpsCommand::new(
@@ -7664,6 +7867,11 @@ fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe
         Some(value) => serde_json::from_value(value.clone())
             .with_context(|| format!("Namespace `{namespace}` has malformed labels"))?,
     };
+    let annotations = match metadata.get("annotations") {
+        None | Some(serde_json::Value::Null) => BTreeMap::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .with_context(|| format!("Namespace `{namespace}` has malformed annotations"))?,
+    };
     let uid = metadata
         .get("uid")
         .and_then(serde_json::Value::as_str)
@@ -7678,6 +7886,7 @@ fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe
         .to_string();
     Ok(NamespaceProbe::Present(NamespaceRecord {
         labels,
+        annotations,
         uid,
         resource_version,
         terminating,
@@ -7835,7 +8044,7 @@ fn labels_allow_empty_adoption(labels: &BTreeMap<String, String>, namespace: &st
                 == Some(namespace))
 }
 
-async fn verify_namespace_is_empty(namespace: &str) -> Result<()> {
+async fn namespace_foreign_contents(namespace: &str) -> Result<Option<String>> {
     verify_remote_apiservices_available(namespace).await?;
     let (ok, discovered, err) = run_capture(&namespaced_resources_cmd()).await?;
     if !ok {
@@ -7889,20 +8098,19 @@ async fn verify_namespace_is_empty(namespace: &str) -> Result<()> {
             foreign.entry(kind).or_default().push(name);
         }
     }
-    if !foreign.is_empty() {
-        let detail = foreign
+    if foreign.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        foreign
             .into_iter()
             .map(|(kind, mut names)| {
                 names.sort();
                 format!("{kind} ({}): {}", names.len(), names.join(", "))
             })
             .collect::<Vec<_>>()
-            .join("; ");
-        bail!(
-            "namespace `{namespace}` contains non-default objects and cannot be adopted: {detail}"
-        );
-    }
-    Ok(())
+            .join("; "),
+    ))
 }
 
 async fn verify_remote_apiservices_available(namespace: &str) -> Result<()> {

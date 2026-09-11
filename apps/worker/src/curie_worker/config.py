@@ -603,7 +603,8 @@ class WorkerConfig(BaseSettings):
     # SandboxSubstrate._claim_fresh) so the lock never lapses mid-section and lets
     # a second worker open a concurrent turn. 90s claim + slack/route overhead
     # stays safely under this 120s TTL; if you raise claim_timeout keep it below
-    # this.
+    # this. A force-killed holder cannot renew (#2500); replacement steal uses
+    # the consumer alive lease rather than waiting this TTL out.
     lock_ttl_ms: int = 120000
     lock_acquire_timeout_s: float = 45.0
     lock_poll_interval_s: float = 0.02

@@ -246,11 +246,13 @@ trip against `compose.release.yaml` instead -- the file
 `compose/generate_release_compose.py` derives from `compose.dev.yaml` and the
 artifact a release binary's `curie local up` actually runs, one half of the
 `compose.dev.yaml` / generated-release-compose parity seam (AGENTS.md). It
-generates that file fresh each run, preflights that the release-pinned
-`ghcr.io/curie-eng/curie-api` and `-worker-local` images already exist
-locally (failing with a fix hint otherwise, since the generated file has no
-build directive to fall back on and a release binary has no checkout to build
-one from), then runs the same `local up --minimal -f compose.release.yaml` ->
+generates that file fresh each run, then `compose/release_images.py --check`
+derives the required `ghcr.io/curie-eng/curie-*` set from that artifact
+(including the slack-profile dispatcher `local message` needs) and fails with
+the missing identity and a recovery action if any ref is absent locally --
+the generated file has no build directive to fall back on and a release
+binary has no checkout to build one from -- then runs the same
+`local up --minimal -f compose.release.yaml` ->
 `local deploy` -> `local message` (reply asserted) -> `local down -f
 compose.release.yaml` against it. Elsewhere in CI, the `compose` job already
 asserts this generated file parses and renders the right service counts but

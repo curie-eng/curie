@@ -12,6 +12,7 @@ loader (gated on the ``claude`` CLI being present).
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -580,6 +581,23 @@ def test_remote_url_var_strips_a_shell_style_default(tmp_path: Path) -> None:
     assert extract_declared(str(root))[0]["cred_vars"] == ["GRAFANA_MCP_URL"]
 
 
+def test_connectors_yaml_unhosted_url_strips_a_shell_style_default(tmp_path: Path) -> None:
+    # Same stripping rule as `test_remote_url_var_strips_a_shell_style_default`,
+    # but mined from a connectors.yaml connector's `unhosted_url` rather than an
+    # `.mcp.json` `url`: the operator forwards LOCAL_MCP_PORT, not the literal
+    # default, so `cred_vars` must name the bare var and neither the suffix nor
+    # the fallback value.
+    bundle = _connector_bundle(
+        tmp_path / "unhosted_default",
+        "connectors:\n"
+        "  grafana:\n"
+        "    image: grafana/mcp-grafana:0.17.2\n"
+        "    unhosted_url: ${LOCAL_MCP_PORT:-8765}/mcp\n",
+    )
+    cred_vars = _row(extract_declared(str(bundle)), "grafana")["cred_vars"]
+    assert cred_vars == ["LOCAL_MCP_PORT"], cred_vars
+
+
 def test_remote_advisory_says_the_red_is_expected_and_names_the_secret() -> None:
     from curie_runner.check import _remote_advisory
 
@@ -610,3 +628,662 @@ def test_remote_advisory_takes_precedence_over_the_authed_one() -> None:
     hints = " ".join(result["hints"])
     assert "cannot be reached offline" in hints
     assert "was not exercised offline" not in hints
+
+
+# --------------------------------------------------------------------------- #
+# Declared connectors (#2348)
+#
+# `connectors.yaml` is the OTHER way a bundle declares an MCP server, and the
+# check never read it: a bundle whose only server is a declared connector
+# reported `declared: 0` and `verdict: green` -- byte-identical to a bundle that
+# declares nothing at all. `curie skill check` is the documented diagnostic for
+# "my tools are missing", so that false green is the defect, not a gap.
+# --------------------------------------------------------------------------- #
+_CONNECTORS_SOURCE = "connectors.yaml"
+
+# The reason/hint substring the tier situation must be named by. A hosted
+# connector on a tier that hosts nothing is "declared but not exercisable here"
+# (#1093) -- a bare "never registered" reads as a bundle defect and sends the
+# author debugging a bundle that is fine.
+_TIER_REASON = "not exercisable"
+_CURIE_COMMAND_RE = re.compile(r"curie [a-z]")
+
+
+def _write_connectors(root: Path, body: str) -> Path:
+    """Drop a `connectors.yaml` into an existing bundle root."""
+
+    (root / "connectors.yaml").write_text(body, encoding="utf-8")
+    return root
+
+
+def _connector_bundle(root: Path, body: str, *, mcp: dict | None = None) -> Path:
+    """A minimal loadable bundle whose declaration is a `connectors.yaml`."""
+
+    _write_bundle(
+        root,
+        {"name": "b", "version": "0.1.0", "description": "t"},
+        mcp_files={".mcp.json": mcp} if mcp is not None else None,
+    )
+    return _write_connectors(root, body)
+
+
+def _row(rows: list[dict], name: str) -> dict:
+    matching = [r for r in rows if r["name"] == name]
+    assert len(matching) == 1, f"{name} must appear exactly once, got {rows}"
+    return matching[0]
+
+
+_HOSTED_YAML = (
+    "connectors:\n"
+    "  grafana:\n"
+    "    image: grafana/mcp-grafana:0.17.2\n"
+    "    args: [-t, streamable-http]\n"
+    "    secrets: [GRAFANA_SERVICE_ACCOUNT_TOKEN]\n"
+)
+_HOSTED_UNHOSTED_YAML = (
+    "connectors:\n"
+    "  grafana:\n"
+    "    image: grafana/mcp-grafana:0.17.2\n"
+    "    unhosted_url: http://localhost:8765/mcp\n"
+)
+_BARE_HOSTED_YAML = "connectors:\n  plainbox:\n    image: x:1\n    args: [--serve]\n"
+
+
+def test_extract_no_mcp_and_no_connectors_yaml_is_still_empty_green(tmp_path: Path) -> None:
+    # Negative control for the whole feature: a bundle that genuinely declares
+    # nothing must keep reporting nothing and stay green. If this ever goes red,
+    # the connector rows are being invented rather than read.
+    bundle = _write_bundle(tmp_path / "nothing", {"name": "no-decl", "version": "0.1.0"})
+    assert extract_declared(str(bundle)) == []
+    assert evaluate([], [])["verdict"] == "green"
+
+
+def test_extract_hosted_connector_is_declared_and_authed(tmp_path: Path) -> None:
+    # The #2348 bug in one assertion: this bundle declared a connector and the
+    # check reported zero declared rows.
+    bundle = _connector_bundle(tmp_path / "hosted", _HOSTED_YAML)
+    rows = extract_declared(str(bundle))
+    assert len(rows) == 1, rows
+    row = _row(rows, "grafana")
+    assert row["source"] == _CONNECTORS_SOURCE
+    # `image` with no `unhosted_url`: Curie hosts it, and nothing else can.
+    assert row["form"] == "hosted"
+    # `secrets:` is a credential the credential-free offline check never
+    # forwards, exactly like an `env` map on an `.mcp.json` server.
+    assert row["authed"] is True
+    assert row["cred_vars"] == ["GRAFANA_SERVICE_ACCOUNT_TOKEN"]
+
+
+def test_hosted_connector_that_never_registered_is_not_green(tmp_path: Path) -> None:
+    # The verdict half of the bug. Deletion check: drop the connector rows from
+    # extract_declared and this false-greens, which is the shipped behaviour.
+    bundle = _connector_bundle(tmp_path / "hosted_red", _HOSTED_YAML)
+    result = evaluate(extract_declared(str(bundle)), [])
+    assert result["verdict"] != "green", result
+    assert result["reasons"], result
+    # A bare "never registered" is wrong here: on a tier that hosts nothing the
+    # connector is correctly absent, and the reason must say so rather than
+    # accuse the bundle.
+    reason = " ".join(result["reasons"])
+    assert "grafana" in reason, reason
+    assert _TIER_REASON in reason, reason
+    # And the user is pointed at a real next command, naming the connector.
+    hint = next((h for h in result["hints"] if "grafana" in h), "")
+    assert hint, result["hints"]
+    assert _CURIE_COMMAND_RE.search(hint), hint
+
+
+def test_bare_hosted_connector_with_no_credential_is_not_authed(tmp_path: Path) -> None:
+    # `authed` is a credential signal, not a "is a connector" signal: an
+    # image+args connector carrying no secrets of any form must stay False, or
+    # the authed advisory fires on every connector and stops meaning anything.
+    bundle = _connector_bundle(tmp_path / "bare_hosted", _BARE_HOSTED_YAML)
+    row = _row(extract_declared(str(bundle)), "plainbox")
+    assert row["authed"] is False
+    assert row["cred_vars"] == []
+
+
+def test_every_credential_holder_is_authed_and_named(tmp_path: Path) -> None:
+    # The credential holders a VALID `connectors.yaml` can carry: a plain
+    # `secrets:` name, a SecretRef naming the env var in `name:`, a
+    # `secret_files:` map keyed by the env var, and a remote connector's
+    # `headers` carrying a ${VAR}. All of them mean the same thing here --
+    # something the credential-free offline check never forwarded.
+    bundle = _connector_bundle(
+        tmp_path / "authed_forms",
+        "connectors:\n"
+        "  filed:\n"
+        "    image: x:1\n"
+        "    secret_files:\n"
+        "      FILED_KUBECONFIG: /secrets/kubeconfig\n"
+        "  plain:\n"
+        "    image: x:1\n"
+        "    secrets: [PLAIN_TOKEN]\n"
+        "  reffed:\n"
+        "    image: x:1\n"
+        "    secrets:\n"
+        "      - name: REFFED_TOKEN\n"
+        "        from_secret: grafana-mcp\n"
+        "  headed:\n"
+        "    url: https://mcp.internal/mcp\n"
+        "    headers:\n"
+        '      Authorization: "Bearer ${HEADED_TOKEN}"\n',
+    )
+    rows = extract_declared(str(bundle))
+    assert all(_row(rows, n)["authed"] is True for n in ("filed", "plain", "reffed", "headed"))
+    # cred_vars names what `--secret` would have to forward. A SecretRef's env
+    # var is its `name:`, never the Kubernetes Secret it points at.
+    assert _row(rows, "plain")["cred_vars"] == ["PLAIN_TOKEN"]
+    assert _row(rows, "reffed")["cred_vars"] == ["REFFED_TOKEN"]
+    assert "grafana-mcp" not in _row(rows, "reffed")["cred_vars"]
+    assert _row(rows, "headed")["cred_vars"] == ["HEADED_TOKEN"]
+    # `secret_files` is KEYED BY the env var name, so the key belongs in
+    # cred_vars and the VALUE -- a path into the runner filesystem -- never
+    # does; without the key the advisory named no `--secret` at all while still
+    # calling the connector authed.
+    filed = _row(rows, "filed")["cred_vars"]
+    assert filed == ["FILED_KUBECONFIG"], filed
+    assert not any("/secrets" in var for var in filed), filed
+
+
+def test_a_whole_file_refusal_contributes_no_rows_and_does_not_raise(tmp_path: Path) -> None:
+    # `validate_connectors` refuses the WHOLE file when any connector in it is
+    # invalid -- `sealed_secrets` is unsupported, so this file is refused
+    # entirely. The census must refuse it too: `derive_mcp_servers` mounts
+    # nothing and `approval_policy.connector_server_names` returns None for the
+    # same input, and a census that reported rows where those two report none
+    # would be the one reader of the file that disagrees with the mount.
+    # Fail-soft, not fail-hard: zero rows, no exception (`validate_bundle`
+    # reports the refusal itself, as `invalid_bundle`, on the real path).
+    bundle = _connector_bundle(
+        tmp_path / "refused_file",
+        "connectors:\n"
+        "  sealed:\n"
+        "    image: x:1\n"
+        "    sealed_secrets:\n"
+        "      SEALED_TOKEN: AgBv3n2K\n"
+        "  fine:\n"
+        "    image: x:1\n"
+        "    secrets: [FINE_TOKEN]\n",
+    )
+    rows = extract_declared(str(bundle))
+    assert [r for r in rows if r["source"] == _CONNECTORS_SOURCE] == [], rows
+
+
+def test_unhosted_url_connector_is_hosted_unhosted_and_can_still_go_green(
+    tmp_path: Path,
+) -> None:
+    # The reachable-fallback case, and the one that must remain ABLE to pass:
+    # a hosted connector carrying `unhosted_url` really is mountable on a tier
+    # that hosts nothing, so when it registers with a tool the verdict is green.
+    # Deletion check: make every connector row unconditionally red and this
+    # fails -- the fix must not turn "declared" into "always red".
+    bundle = _connector_bundle(tmp_path / "unhosted", _HOSTED_UNHOSTED_YAML)
+    row = _row(extract_declared(str(bundle)), "grafana")
+    assert row["form"] == "hosted_unhosted"
+    result = evaluate(
+        [row],
+        [{"name": "grafana", "scope": "dynamic", "status": "connected", "tools": ["t"]}],
+    )
+    assert result["verdict"] == "green", result
+    assert result["reasons"] == []
+
+
+def test_unhosted_advisory_says_the_red_is_expected_not_a_broken_bundle() -> None:
+    # `unhosted_url` IS an address this tier knows how to MOUNT, but it is not
+    # one this tier can REACH: the check runs `--network none` by construction,
+    # so `http://localhost:8765/mcp` is exactly as unreachable here as any
+    # remote `url:`. The advisory must mirror `_remote_advisory`'s honesty --
+    # claiming the result "is real" tells the author the red is about their
+    # connector when it is really about the check's network policy, which is the
+    # misdiagnosis #2348 exists to prevent.
+    from curie_runner.check import _connector_advisory
+
+    hint = _connector_advisory("grafana", "hosted_unhosted", ["GRAFANA_TOKEN"])
+    assert "unhosted_url" in hint, hint
+    assert "no network" in hint, hint
+    assert "NOT evidence" in hint, hint
+    assert "curie skill up" in hint, hint
+    assert "--secret GRAFANA_TOKEN" in hint, hint
+
+    # The plain hosted branch keeps its distinct meaning: nothing was mounted
+    # because this tier hosts no connector at all.
+    hosted = _connector_advisory("grafana", "hosted", [])
+    assert "hosts no connector" in hosted, hosted
+    assert _TIER_REASON in hosted, hosted
+
+
+def test_a_forced_red_keeps_the_per_server_reasons_after_its_own(tmp_path: Path) -> None:
+    # A timeout or a client-startup failure forces red with its own proximate
+    # cause. That cause goes FIRST, but it must not REPLACE the per-declared
+    # reasons `evaluate` computed: "declared connector X was not exercisable in
+    # this tier" is the sentence #2348 is about, and substituting the list left
+    # the author staring at a generic timeout with no mention of the connector.
+    from curie_runner.check import _red_result
+
+    bundle = _connector_bundle(tmp_path / "forced_red", _HOSTED_YAML)
+    declared = extract_declared(str(bundle))
+    result = _red_result(str(bundle), declared, "MCP init did not complete within 30s")
+    assert result["verdict"] == "red", result
+    assert result["reasons"][0] == "MCP init did not complete within 30s", result["reasons"]
+    rest = " ".join(result["reasons"][1:])
+    assert "grafana" in rest, result["reasons"]
+    assert _TIER_REASON in rest, result["reasons"]
+
+
+def test_remote_and_hosted_in_one_connectors_yaml_get_distinct_forms(tmp_path: Path) -> None:
+    # `url:` is the remote form: already running, reachable from anywhere, and
+    # nothing for Curie to host. Collapsing it into "hosted" would attach the
+    # tier advisory to a connector whose absence really IS a defect.
+    bundle = _connector_bundle(
+        tmp_path / "mixed",
+        "connectors:\n"
+        "  internal:\n"
+        "    url: https://mcp.internal/mcp\n"
+        "  grafana:\n"
+        "    image: grafana/mcp-grafana:0.17.2\n",
+    )
+    rows = extract_declared(str(bundle))
+    assert len(rows) == 2, rows
+    assert _row(rows, "internal")["form"] == "remote"
+    assert _row(rows, "grafana")["form"] == "hosted"
+    assert {r["source"] for r in rows} == {_CONNECTORS_SOURCE}
+
+    # And the two forms must stay distinguishable in the ADVISORY, not only in
+    # the row: the remote row gets the unreachable-by-design explanation
+    # (#1093), the hosted row the tier one. Collapsing either way tells the
+    # author to run the wrong command.
+    hints = evaluate(rows, [])["hints"]
+    internal = next(h for h in hints if "internal" in h)
+    grafana = next(h for h in hints if "grafana" in h)
+    assert "cannot be reached offline" in internal, internal
+    assert _TIER_REASON not in internal, internal
+    assert _TIER_REASON in grafana, grafana
+    assert "cannot be reached offline" not in grafana, grafana
+
+
+def test_empty_image_plus_url_stays_remote(tmp_path: Path) -> None:
+    """`image: ""` alongside `url:` is a LEGAL validated spec, and it is remote.
+
+    `validate_connectors` decides which form is present by TRUTHINESS
+    (`bool(spec.image)` / `bool(spec.build)` / `bool(spec.url)`), while
+    `ConnectorSpec.is_hosted` is `image is not None or build is not None`. Those
+    are different tests, so this file validates with ZERO errors and reaches
+    `extract_declared` with `image == ""`, a real `url`, AND `is_hosted` True.
+    `_connector_form` must therefore test `url` FIRST: branching on `is_hosted`
+    first calls this "hosted", flips `remote` to False, and swaps the remote
+    advisory ("a red here is expected") for the tier one -- which is actively
+    wrong, because an unreachable remote connector IS a potential real defect.
+    Do not "simplify" the ordering.
+    """
+
+    bundle = _connector_bundle(
+        tmp_path / "empty_image_remote",
+        'connectors:\n  internal:\n    image: ""\n    url: https://mcp.internal/mcp\n',
+    )
+    row = _row(extract_declared(str(bundle)), "internal")
+    assert row["form"] == "remote", row
+    assert row["remote"] is True, row
+
+    hint = next(h for h in evaluate([row], [])["hints"] if "internal" in h)
+    assert "cannot be reached offline" in hint, hint
+    assert _TIER_REASON not in hint, hint
+
+
+def test_the_same_name_in_both_channels_is_counted_exactly_once(tmp_path: Path) -> None:
+    # AC1's "each name counted exactly once". Tested against `extract_declared`
+    # directly and not `run_check` on purpose: the real entrypoint REJECTS this
+    # bundle outright (`connectors.duplicate_server`, covered separately), so
+    # the census function is the only place the union's de-duplication is
+    # observable at all. A union that appended blindly would report `declared:
+    # 2` for one server and make the count unreconcilable.
+    bundle = _connector_bundle(
+        tmp_path / "same_name",
+        "connectors:\n  grafana:\n    image: x:1\n",
+        mcp={"mcpServers": {"grafana": {"type": "http", "url": "http://hand-written/mcp"}}},
+    )
+    rows = extract_declared(str(bundle))
+    assert [r["name"] for r in rows].count("grafana") == 1, rows
+    assert len(rows) == 1, rows
+
+
+def test_build_form_connector_is_hosted(tmp_path: Path) -> None:
+    # ADR 0113's `build:` form changes only where the image comes FROM; it is
+    # the same hosted form and must classify identically, or a sourced connector
+    # loses the tier advisory that a referenced one gets.
+    bundle = _connector_bundle(
+        tmp_path / "built",
+        "connectors:\n"
+        "  k8s-write:\n"
+        "    build:\n"
+        "      context: connectors/k8s-write\n"
+        "      platforms: [linux/amd64]\n",
+    )
+    assert _row(extract_declared(str(bundle)), "k8s-write")["form"] == "hosted"
+
+
+def test_build_form_connector_with_unhosted_url_is_hosted_unhosted(tmp_path: Path) -> None:
+    # Same point as `test_build_form_connector_is_hosted`, but crossed with the
+    # `unhosted_url` reachable-fallback case: ADR 0113's `build:` is the same
+    # hosted form as `image:`, only sourced differently, so a `build:` connector
+    # that also carries `unhosted_url` must classify "hosted_unhosted", not
+    # collapse to plain "hosted" the way a bug keyed on `image` truthiness would.
+    bundle = _connector_bundle(
+        tmp_path / "built_unhosted",
+        "connectors:\n"
+        "  k8s-write:\n"
+        "    build:\n"
+        "      context: connectors/k8s-write\n"
+        "      platforms: [linux/amd64]\n"
+        "    unhosted_url: http://localhost:8765/mcp\n",
+    )
+    assert _row(extract_declared(str(bundle)), "k8s-write")["form"] == "hosted_unhosted"
+
+
+def test_mcp_json_and_connectors_yaml_union_without_double_counting(tmp_path: Path) -> None:
+    # Two channels, two rows, each attributed to the file it came from. The
+    # union is what makes `declared: N` a count an operator can reconcile
+    # against the bundle they wrote.
+    bundle = _connector_bundle(
+        tmp_path / "union",
+        "connectors:\n  beta:\n    image: x:1\n",
+        mcp={"mcpServers": {"alpha": {"command": "python3"}}},
+    )
+    rows = extract_declared(str(bundle))
+    assert len(rows) == 2, rows
+    assert _row(rows, "alpha")["source"] == ".mcp.json"
+    assert _row(rows, "beta")["source"] == _CONNECTORS_SOURCE
+    assert [r["name"] for r in rows].count("beta") == 1
+
+
+def test_connector_registered_with_zero_tools_is_not_green(tmp_path: Path) -> None:
+    # The capability probe failing is the case `skill check` exists for: the
+    # server came up, so nothing is obviously broken, and it exposes no tools.
+    bundle = _connector_bundle(tmp_path / "zero_tools", _HOSTED_UNHOSTED_YAML)
+    result = evaluate(
+        extract_declared(str(bundle)),
+        [{"name": "grafana", "scope": "dynamic", "status": "connected", "tools": []}],
+    )
+    assert result["verdict"] != "green", result
+    joined = " ".join(result["reasons"])
+    assert "grafana" in joined, joined
+    assert "zero tools" in joined, joined
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "connectors:\n  grafana:\n   image: x:1\n  \tbroken",  # not parseable YAML
+        "connectors:\n  grafana:\n    image: x:1\n    nonsense_key: 1\n",  # does not validate
+        "just a string",  # parses, wrong shape
+    ],
+)
+def test_a_bad_connectors_yaml_contributes_no_rows_and_does_not_raise(
+    tmp_path: Path, body: str
+) -> None:
+    # Same fail-soft trade `curie_runner.connectors._read` makes: the check is a
+    # diagnostic, and crashing it removes the only tool the author has. Zero
+    # rows, no exception. The bundle's own validation is what reports the file.
+    bundle = _connector_bundle(tmp_path / f"bad_{abs(hash(body))}", body)
+    rows = extract_declared(str(bundle))
+    assert [r for r in rows if r["source"] == _CONNECTORS_SOURCE] == [], rows
+
+
+def test_declared_row_contract_and_check_version_are_unchanged(tmp_path: Path) -> None:
+    # The runner<->CLI JSON seam is frozen (plan Section 3). Adding connector
+    # rows is additive: the version stays 1 and every row -- from either
+    # channel -- keeps the keys the CLI already reads. A contract guard, not an
+    # AC guard: CHECK_VERSION does not depend on the union, so nothing here
+    # pins #2348's acceptance criteria.
+    from curie_runner.check import CHECK_VERSION
+
+    assert CHECK_VERSION == 1
+    bundle = _connector_bundle(
+        tmp_path / "contract",
+        "connectors:\n  beta:\n    image: x:1\n",
+        mcp={"mcpServers": {"alpha": {"command": "python3"}}},
+    )
+    for row in extract_declared(str(bundle)):
+        assert {"name", "source", "form", "authed"} <= set(row), row
+
+
+def _colliding_bundle(root: Path) -> Path:
+    """A bundle declaring the SAME server name in both channels (#1118)."""
+
+    (root / "skills" / "b").mkdir(parents=True, exist_ok=True)
+    (root / "skills" / "b" / "SKILL.md").write_text(
+        "---\nname: b\ndescription: t\n---\nhi\n", encoding="utf-8"
+    )
+    return _connector_bundle(
+        root,
+        "connectors:\n  grafana:\n    image: x:1\n",
+        mcp={"mcpServers": {"grafana": {"type": "http", "url": "http://hand-written/mcp"}}},
+    )
+
+
+def test_a_name_in_both_channels_is_invalid_bundle_and_exits_2(tmp_path: Path) -> None:
+    # One name, one owner (#1118). The check reads both channels now, so it
+    # would be the natural place to "resolve" a collision -- it must not: the
+    # bundle never loads, and that refusal is what keeps a silently-overridden
+    # entry from reaching a runtime at all. Driven through `run_check` (not just
+    # `validate_bundle`) because it is the CHECK's refusal that is the AC: the
+    # union must not quietly de-duplicate a collision into one working row.
+    bundle = _colliding_bundle(tmp_path / "collide")
+    result = anyio.run(run_check, str(bundle))
+    assert result["verdict"] == "invalid_bundle", result
+    # No census at all for a bundle that never loads -- reporting a declared row
+    # for a name whose ownership is ambiguous is the outcome being refused.
+    assert result["declared"] == [], result
+    assert result["reasons"], result
+    # And the verdict carries the operator-visible exit code 2, not 1.
+    from curie_runner.check import _EXIT_CODES
+
+    assert _EXIT_CODES[result["verdict"]] == 2
+
+
+def test_a_name_in_both_channels_exits_2_through_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same refusal at the real entrypoint: `main()` maps the verdict to the
+    # process exit code the CLI reads, and a collision must be 2 (invalid
+    # bundle), never 1 (red) and never 0.
+    from curie_runner.check import PLUGIN_DIR_ENV, main
+
+    bundle = _colliding_bundle(tmp_path / "collide_main")
+    monkeypatch.setenv(PLUGIN_DIR_ENV, str(bundle))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert main() == 2
+
+
+def test_run_check_on_the_issue_repro_declares_one_row_and_is_not_green(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The #2348 reproduction verbatim, at the real entrypoint: a bundle whose
+    # ONLY declaration is a hosted `connectors.yaml` connector reported
+    # `declared: 0, verdict: green` -- byte-identical to a bundle declaring
+    # nothing. Asserting this at `run_check` (not at
+    # `evaluate(extract_declared(...), [])`) is what pins AC3 on the path the
+    # CLI actually runs.
+    import curie_runner.check as check_mod
+
+    bundle = _connector_bundle(
+        tmp_path / "issue_repro",
+        "connectors:\n"
+        "  github:\n"
+        "    image: ghcr.io/github/github-mcp-server:v0.6.0\n"
+        "    args: [stdio]\n"
+        "    secrets: [GITHUB_PERSONAL_ACCESS_TOKEN]\n",
+    )
+    monkeypatch.setattr(_FakeMcpClient, "servers", [])
+    monkeypatch.setattr(_FakeMcpClient, "plugin_registered", [])
+    monkeypatch.setattr(check_mod, "ClaudeSDKClient", _FakeMcpClient)
+    result = anyio.run(run_check, str(bundle))
+    assert len(result["declared"]) == 1, result["declared"]
+    assert result["declared"][0]["name"] == "github", result["declared"]
+    assert result["verdict"] != "green", result
+    assert result["reasons"], result
+
+
+def test_extract_declared_mounts_nothing_itself(tmp_path: Path) -> None:
+    # extract_declared reports INTENT. Deriving a URL is a separate job with a
+    # separate input (the release/agent/namespace scope, which the check does
+    # not have), so a row must never carry a mount entry -- a URL invented here
+    # would resolve nowhere and turn a clear "not exercisable" into a mid-turn
+    # connection refused.
+    bundle = _connector_bundle(tmp_path / "nomount", _HOSTED_YAML)
+    for row in extract_declared(str(bundle)):
+        assert not (set(row) & {"url", "type", "mcp_entry", "entry", "command"}), row
+
+
+# --------------------------------------------------------------------------- #
+# The derived entries reach the real client (#2348)
+#
+# Reading connectors.yaml only fixes the REPORT. The check also has to actually
+# try the connector, or a `hosted_unhosted` bundle stays red for the same reason
+# it was invisible: nothing ever mounted it.
+# --------------------------------------------------------------------------- #
+def _bare_name(registered_name: str) -> str:
+    """The server name without any `plugin:<bundle>:` scoping prefix."""
+
+    return registered_name.rsplit(":", 1)[-1]
+
+
+class _FakeMcpClient:
+    """Stands in for ClaudeSDKClient: connects, reports, disconnects. No turn.
+
+    It HONORS the `mcp_servers` it was constructed with: a server from
+    `servers` is reported only when that name was actually MOUNTED into the
+    options. `plugin_registered` is the separate set the plugin itself brings
+    up, which no mount is needed for.
+
+    That distinction is the point. A fake that answered for a connector nobody
+    mounted would leave every mount test green with `derive_mcp_servers`
+    deleted, which is exactly the false confidence the #2348 review found.
+    """
+
+    servers: list[dict] = []
+    plugin_registered: list[dict] = []
+
+    def __init__(self, options: object) -> None:
+        self.options = options
+        self.mounted = set(getattr(options, "mcp_servers", None) or {})
+
+    async def connect(self) -> None:
+        return None
+
+    async def get_mcp_status(self) -> dict:
+        reported = [
+            dict(s)
+            for s in type(self).servers
+            if _bare_name(str(s.get("name", ""))) in self.mounted
+        ]
+        reported.extend(dict(s) for s in type(self).plugin_registered)
+        return {"mcpServers": reported}
+
+    async def disconnect(self) -> None:
+        return None
+
+
+def _captured_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch, bundle: Path, *, servers: list[dict] | None = None
+) -> dict:
+    """Run `run_check` against a fake client and return the mcp_servers kwarg."""
+
+    import curie_runner.check as check_mod
+
+    captured: dict = {}
+    real_build_options = check_mod.build_options
+
+    def _spy(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return real_build_options(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(check_mod, "build_options", _spy)
+    monkeypatch.setattr(_FakeMcpClient, "servers", list(servers or []))
+    monkeypatch.setattr(_FakeMcpClient, "plugin_registered", [])
+    monkeypatch.setattr(check_mod, "ClaudeSDKClient", _FakeMcpClient)
+    anyio.run(run_check, str(bundle))
+    assert "mcp_servers" in captured, captured
+    return dict(captured["mcp_servers"] or {})
+
+
+def test_unhosted_connector_is_mounted_for_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An `unhosted_url` connector is reachable on this tier, so the check must
+    # mount it and genuinely find out -- that is the difference between a
+    # diagnostic and a restatement of the bundle file.
+    # And it must mount THAT address: the entry has to be the one
+    # `unhosted_mcp_entry` derives from the spec, not a cluster-scoped
+    # `mcp_entry` built from an invented release/agent/namespace, which would
+    # resolve nowhere and turn a clear diagnostic into a connection refused.
+    # Compared against the renderer rather than a hardcoded shape so this stays
+    # true if the entry's shape evolves.
+    from plugin_format.connector_render import unhosted_mcp_entry
+    from plugin_format.connectors import validate_connectors
+    from plugin_format.yaml_loader import safe_load_unique
+
+    bundle = _connector_bundle(tmp_path / "mount_unhosted", _HOSTED_UNHOSTED_YAML)
+    mounted = _captured_mcp_servers(monkeypatch, bundle)
+    assert "grafana" in mounted, mounted
+
+    parsed, errors = validate_connectors(
+        safe_load_unique((bundle / "connectors.yaml").read_text(encoding="utf-8"))
+    )
+    assert parsed is not None, errors
+    assert mounted["grafana"] == unhosted_mcp_entry(parsed.connectors["grafana"]), mounted
+
+
+def test_hosted_only_connector_mounts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No scope, no `unhosted_url`: there is no address, and inventing one turns
+    # "declared but not exercisable" into a connection refused. Mount nothing
+    # and let the tier reason explain the red.
+    bundle = _connector_bundle(tmp_path / "mount_hosted", _HOSTED_YAML)
+    assert _captured_mcp_servers(monkeypatch, bundle) == {}
+
+
+def test_a_mounted_connector_that_answers_makes_the_run_green(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # End to end over the fake client: declared from connectors.yaml, mounted,
+    # registered with a tool -> green. The fake only answers for servers that
+    # were actually mounted, so deleting the `derive_mcp_servers` mount from
+    # `_connect_and_poll` flips this red -- without that, the same bundle can
+    # never be anything but red, which is the failure this pair guards.
+    import curie_runner.check as check_mod
+
+    bundle = _connector_bundle(tmp_path / "green_e2e", _HOSTED_UNHOSTED_YAML)
+    monkeypatch.setattr(
+        _FakeMcpClient,
+        "servers",
+        [{"name": "grafana", "scope": "dynamic", "status": "connected", "tools": [_tool("t")]}],
+    )
+    monkeypatch.setattr(_FakeMcpClient, "plugin_registered", [])
+    monkeypatch.setattr(check_mod, "ClaudeSDKClient", _FakeMcpClient)
+    result = anyio.run(run_check, str(bundle))
+    assert [r["name"] for r in result["declared"]] == ["grafana"], result
+    assert result["verdict"] == "green", result
+
+
+def test_an_unmounted_connector_cannot_answer_and_stays_red(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The negative half of the pair, and what makes the green above mean
+    # something: the SAME connected-with-tools server, on a bundle whose
+    # connector has no `unhosted_url` to mount, is never reported -- so a
+    # hosted-only bundle cannot borrow another tier's green.
+    import curie_runner.check as check_mod
+
+    bundle = _connector_bundle(tmp_path / "unmounted", _HOSTED_YAML)
+    monkeypatch.setattr(
+        _FakeMcpClient,
+        "servers",
+        [{"name": "grafana", "scope": "dynamic", "status": "connected", "tools": [_tool("t")]}],
+    )
+    monkeypatch.setattr(_FakeMcpClient, "plugin_registered", [])
+    monkeypatch.setattr(check_mod, "ClaudeSDKClient", _FakeMcpClient)
+    result = anyio.run(run_check, str(bundle))
+    assert [r["name"] for r in result["declared"]] == ["grafana"], result
+    assert result["verdict"] != "green", result
