@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 import yaml
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEV_PATH = REPO_ROOT / "compose.dev.yaml"
 OTEL_PATH = REPO_ROOT / "otel" / "collector-config.yaml"

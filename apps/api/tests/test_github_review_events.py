@@ -1819,6 +1819,110 @@ def test_final_reserve_provider_timeout_is_retryable_without_reservation(
     assert valkey.xlen(stream) == 1
 
 
+def test_production_worker_reserve_deadline_cancels_stalled_provider_without_late_reservation(
+    review_stack,
+) -> None:
+    """The real ASGI/API/Postgres path bounds only the stubbed provider read."""
+
+    from aci_protocol import parse_queued_turn
+    from curie_api.routers.github_reviews import _FINAL_RESERVE_CONTROL_PLANE_TIMEOUT_S
+    from curie_worker.approvals import ApprovalBackendError, ApprovalClient
+
+    client, truth, valkey, stream = review_stack
+    assert post_review(client, truth).json()["status"] == "feedback_queued"
+    turn = parse_queued_turn(valkey.xrange(stream)[0][1]["payload"])
+    deployment_id = review_rows(
+        "SELECT deployment_id FROM curie.thread_publication_lineages"
+    )[0]["deployment_id"]
+
+    async def exercise() -> None:
+        provider_started = asyncio.Event()
+        provider_cancelled = asyncio.Event()
+        provider_release = asyncio.Event()
+        provider_returned = asyncio.Event()
+        pull_path = f"/repos/{REPO}/pulls/17"
+        api_statuses: list[int] = []
+
+        async def stalled_provider(request: httpx.Request) -> httpx.Response:
+            # GitHub is the only stub in this path. Waiting on an event keeps the
+            # provider pending until the API's overall deadline cancels it.
+            if request.url.path == pull_path:
+                truth.calls.append(request.url.path)
+                provider_started.set()
+                try:
+                    await provider_release.wait()
+                except asyncio.CancelledError:
+                    provider_cancelled.set()
+                    raise
+                provider_returned.set()
+            return truth.handle(request)
+
+        class RecordingAsgiTransport(httpx.AsyncBaseTransport):
+            def __init__(self) -> None:
+                self.inner = httpx.ASGITransport(app=client.app)
+
+            async def handle_async_request(
+                self, request: httpx.Request
+            ) -> httpx.Response:
+                response = await self.inner.handle_async_request(request)
+                api_statuses.append(response.status_code)
+                return response
+
+            async def aclose(self) -> None:
+                await self.inner.aclose()
+
+        injected_provider = httpx.AsyncClient(
+            transport=httpx.MockTransport(stalled_provider)
+        )
+        previous_provider = client.app.state.http_client
+        try:
+            async with httpx.AsyncClient(
+                transport=RecordingAsgiTransport(),
+                base_url="http://api.example.test",
+            ) as api_http:
+                worker = ApprovalClient(
+                    api_base_url="http://api.example.test",
+                    api_key="",
+                    client=api_http,
+                    read_timeout_s=2,
+                    worker_token="fixture-review-worker-token",
+                )
+                verified = await worker.verify_review_feedback(turn, deployment_id)
+                client.app.state.http_client = injected_provider
+                with pytest.raises(
+                    ApprovalBackendError,
+                    match="reservation temporarily unavailable",
+                ):
+                    await asyncio.wait_for(
+                        worker.reserve_review_feedback(turn, deployment_id, verified),
+                        timeout=_FINAL_RESERVE_CONTROL_PLANE_TIMEOUT_S + 1,
+                    )
+
+            assert api_statuses[-2:] == [200, 503]
+            assert provider_started.is_set()
+            assert provider_cancelled.is_set()
+            assert not provider_returned.is_set()
+            assert await asyncio.to_thread(
+                review_rows,
+                "SELECT id FROM curie.publication_review_reservations",
+            ) == []
+
+            # Releasing a cancelled provider cannot resume the timed-out reserve
+            # coroutine and create a reservation after its 503 response.
+            provider_release.set()
+            await asyncio.sleep(0)
+            assert not provider_returned.is_set()
+            assert await asyncio.to_thread(
+                review_rows,
+                "SELECT id FROM curie.publication_review_reservations",
+            ) == []
+        finally:
+            client.app.state.http_client = previous_provider
+            await injected_provider.aclose()
+
+    client.portal.call(exercise)
+
+
 def test_review_reservation_is_one_atomic_origin_after_concurrent_replays(review_stack):
     client, _, valkey, stream = review_stack
     base, payload, headers = _review_reserve_request(review_stack)

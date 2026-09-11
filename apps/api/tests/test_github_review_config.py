@@ -6,7 +6,6 @@ import pytest
 from curie_api.config import Settings
 from pydantic import ValidationError
 
-
 _REVIEW_ENV = (
     "GITHUB_REVIEW_INGRESS_ENABLED",
     "GITHUB_REVIEW_RECONCILER_INTERVAL_S",

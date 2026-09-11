@@ -204,6 +204,10 @@ class Settings(BaseSettings):
     valkey_port: int = 26379
     valkey_tls: bool = False
     valkey_url: str | None = None
+    # Terminal review reconciliation reads the worker's completion/dead-letter
+    # keyspace. Match WorkerConfig's actual legacy environment contract:
+    # KEY_PREFIX overrides it; CURIE_KEY_PREFIX deliberately does not.
+    worker_key_prefix: str = Field(default="curie:worker", validation_alias="KEY_PREFIX")
 
     # The runs stream approval resolutions enqueue resume turns onto (#244).
     # Must match the worker's CURIE_STREAM (its consumer side) -- which is why
@@ -443,7 +447,8 @@ class Settings(BaseSettings):
             offenders.append("GITHUB_REVIEW_RECONCILER_INTERVAL_S")
         if offenders:
             raise ValueError(
-                "GITHUB_REVIEW_INGRESS_ENABLED requires complete active configuration; "
+                "GitHub review ingress (GITHUB_REVIEW_INGRESS_ENABLED) requires "
+                "complete active configuration; "
                 f"set valid values for: {', '.join(offenders)}"
             )
         return self
