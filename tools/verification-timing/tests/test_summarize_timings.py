@@ -380,3 +380,215 @@ def test_cli_exits_two_and_prints_no_summary_on_a_malformed_file(
     assert module.main([str(tmp_path)]) == 2
     captured = capsys.readouterr()
     assert captured.out.strip() == ""
+
+
+# --- Gaps found by adversarial cross-engine review -------------------------
+
+
+def _raw_state(tmp_path: Path, name: str, body: str) -> Path:
+    """Write a state file verbatim, so non-standard JSON literals survive."""
+    path = tmp_path / f"{name}.state.json"
+    path.write_text(body)
+    return path
+
+
+def _raw_entry(timings: str) -> str:
+    return (
+        '{"tier": "skill", "criterion": "synthetic criterion", '
+        f'"command": "{COMMAND}", "commit": "{COMMIT_A}", '
+        '"mode": "fake", "outcome": "pass", "observed": "OBSERVED_SENTINEL", '
+        '"negative": null, "teardown": null, "blocker": null, '
+        f'"timings": {timings}}}'
+    )
+
+
+def _raw_document(entry: str) -> str:
+    return (
+        '{"branch": "task/raw", "ticket": "1234", '
+        f'"commit": "{COMMIT_A}", "e2e": {{"evidence": [{entry}]}}}}'
+    )
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        pytest.param("NaN", id="nan"),
+        pytest.param("Infinity", id="infinity"),
+        pytest.param("-Infinity", id="negative-infinity"),
+        pytest.param("1e309", id="overflows-to-inf"),
+    ],
+)
+def test_non_finite_durations_are_rejected(tmp_path: Path, literal: str) -> None:
+    """A duration that is not a finite real number is not a measurement."""
+    module = _module()
+    path = _raw_state(
+        tmp_path,
+        "nonfinite",
+        _raw_document(_raw_entry(f'{{"seconds": {literal}}}')),
+    )
+
+    with pytest.raises(module.TimingRecordError) as excinfo:
+        module.summarize(module.load_records([path]))
+    assert str(path) in str(excinfo.value)
+
+
+def test_date_only_timestamps_are_rejected(tmp_path: Path) -> None:
+    """A guessed midnight must never become a measured zero."""
+    module = _module()
+    path = _state(
+        tmp_path,
+        "dateonly",
+        [_entry(timings={"tests": {"started_at": "2026-01-01", "completed_at": "2026-01-01"}})],
+    )
+
+    with pytest.raises(module.TimingRecordError) as excinfo:
+        module.summarize(module.load_records([path]))
+    assert str(path) in str(excinfo.value)
+
+
+def test_timestamps_with_a_time_component_still_work(tmp_path: Path) -> None:
+    """The date-only fix must not become a blanket rejection of timestamps."""
+    module = _module()
+    path = _state(
+        tmp_path,
+        "withtime",
+        [
+            _entry(
+                timings={
+                    "tests": {
+                        "started_at": "2026-01-01T00:00:00Z",
+                        "completed_at": "2026-01-01T00:01:00Z",
+                    }
+                }
+            )
+        ],
+    )
+    cell = _phase(module.summarize(module.load_records([path])), 0, "tests")
+
+    assert cell == {"seconds": 60.0, "provenance": "timestamps"}
+
+
+def _mixed_awareness_state(tmp_path: Path, name: str) -> Path:
+    return _state(
+        tmp_path,
+        name,
+        [
+            _entry(
+                timings={
+                    "tests": {
+                        "started_at": "2026-01-01T00:00:00Z",
+                        "completed_at": "2026-01-01T00:01:00",
+                    }
+                }
+            )
+        ],
+    )
+
+
+def test_mixed_timezone_awareness_is_a_record_error(tmp_path: Path) -> None:
+    """Naive versus aware must be diagnosed, not surface as an uncaught TypeError."""
+    module = _module()
+    path = _mixed_awareness_state(tmp_path, "mixedtz")
+
+    with pytest.raises(module.TimingRecordError) as excinfo:
+        module.summarize(module.load_records([path]))
+    assert str(path) in str(excinfo.value)
+
+
+def test_cli_exits_two_on_mixed_timezone_awareness(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    module = _module()
+    _mixed_awareness_state(tmp_path, "mixedtzcli")
+
+    assert module.main([str(tmp_path)]) == 2
+    assert capsys.readouterr().out.strip() == ""
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param('{"branch": "task/x", "ticket": "1234", "e2e": false}', id="e2e-not-object"),
+        pytest.param(
+            '{"branch": "task/x", "ticket": "1234", "e2e": {"evidence": {}}}',
+            id="evidence-not-list",
+        ),
+        pytest.param(
+            '{"branch": "task/x", "ticket": "1234", "e2e": {"evidence": "none"}}',
+            id="evidence-is-a-string",
+        ),
+    ],
+)
+def test_malformed_e2e_container_aborts(tmp_path: Path, body: str) -> None:
+    """A corrupt file must not silently drop its rows from a combined summary."""
+    module = _module()
+    path = _raw_state(tmp_path, "badcontainer", body)
+
+    with pytest.raises(module.TimingRecordError) as excinfo:
+        module.summarize(module.load_records([path]))
+    assert str(path) in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param('{"branch": "task/x", "ticket": "1234"}', id="e2e-absent"),
+        pytest.param(
+            '{"branch": "task/x", "ticket": "1234", "e2e": {"evidence": []}}',
+            id="evidence-empty-list",
+        ),
+    ],
+)
+def test_absent_or_empty_evidence_is_zero_rows_without_error(tmp_path: Path, body: str) -> None:
+    """Absent is not malformed: it contributes nothing and raises nothing."""
+    module = _module()
+    path = _raw_state(tmp_path, "emptyok", body)
+    summary = module.summarize(module.load_records([path]))
+
+    assert summary["rows"] == []
+    assert summary["duplicate_groups"] == []
+
+
+def test_absolute_paths_never_reach_the_summary(tmp_path: Path) -> None:
+    """The emitted source is the file's bare name, never its local absolute path."""
+    module = _module()
+    first = _state(tmp_path, "src1", [_entry(timings={"tests": {"seconds": 1.0}})])
+    second = _state(tmp_path, "src2", [_entry(timings={"tests": {"seconds": 2.0}})])
+    summary = module.summarize(module.load_records([first, second]))
+    rendered = json.dumps(summary)
+
+    assert str(tmp_path) not in rendered
+    assert "/" not in summary["rows"][0]["source"]
+    assert {row["source"] for row in summary["rows"]} == {first.name, second.name}
+    assert set(summary["duplicate_groups"][0]["sources"]) == {first.name, second.name}
+
+
+def test_error_messages_still_name_the_full_path(tmp_path: Path) -> None:
+    """Redaction is for the summary only; a diagnosis needs the real path."""
+    module = _module()
+    path = _state(tmp_path, "diagpath", [_entry(timings={"tests": {"seconds": -1.0}})])
+
+    with pytest.raises(module.TimingRecordError) as excinfo:
+        module.summarize(module.load_records([path]))
+    assert str(tmp_path) in str(excinfo.value)
+    assert str(path) in str(excinfo.value)
+
+
+@pytest.mark.parametrize("field", ["tier", "command", "commit"])
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_missing_provenance_identity_is_rejected(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Empty identity would let unrelated candidates collapse into one duplicate group."""
+    module = _module()
+    entry = _entry(timings={"tests": {"seconds": 1.0}})
+    if value is None:
+        del entry[field]
+    else:
+        entry[field] = value
+    path = _state(tmp_path, "identity", [entry])
+
+    with pytest.raises(module.TimingRecordError) as excinfo:
+        module.summarize(module.load_records([path]))
+    assert str(path) in str(excinfo.value)
+    assert field in str(excinfo.value)
