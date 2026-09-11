@@ -544,6 +544,190 @@ pub struct MetricSeries {
 /// response check keeps a skewed backend from violating the public result bound.
 pub const MAX_OBSERVABILITY_METRIC_POINTS: usize = 1000;
 
+/// Match one agent by exact name or id. Free-standing so the deploy flow's
+/// [`ApiClient::find_agent`] and the observability lookup can never
+/// grow different identity rules; the no-match case is the typed
+/// [`AgentLookupNotFound`] marker.
+fn match_agent(
+    agents: Vec<Agent>,
+    identifier: &str,
+) -> std::result::Result<Agent, AgentLookupNotFound> {
+    agents
+        .into_iter()
+        .find(|a| a.name == identifier || a.id == identifier)
+        .ok_or_else(|| AgentLookupNotFound(identifier.to_string()))
+}
+
+/// The Langfuse timeDimension bucket each shipped granularity maps to, and the
+/// number of buckets a window touches. Buckets are wall-clock aligned: hour and
+/// day boundaries are epoch-aligned in UTC, so the touched count is the
+/// difference of the epoch bucket floors over the half-open `[start, end)`
+/// window, which charges the window for BOTH partial end buckets (#1948
+/// review). Langfuse's week boundary anchoring is not the epoch, so week adds
+/// one safety bucket against the alignment skew. An unknown granularity has no
+/// client-side estimate; the server answers it with a 422, which the CLI
+/// preserves.
+fn series_bucket_estimate(
+    granularity: &str,
+    start: time::OffsetDateTime,
+    end: time::OffsetDateTime,
+) -> Option<i64> {
+    let bucket_seconds: i64 = match granularity {
+        "hour" => 3600,
+        "day" => 86_400,
+        "week" => 604_800,
+        _ => return None,
+    };
+    // Bucket floors are computed at nanosecond precision: whole_seconds()
+    // truncates toward zero, which on a negative (pre-epoch) fractional
+    // duration rounds UP and under-counts the window's first partial bucket
+    // (#1948 review, round 5). div_euclid on the nanosecond remainder is a
+    // true floor for every sign.
+    let epoch = time::OffsetDateTime::UNIX_EPOCH;
+    let bucket_nanos = bucket_seconds as i128 * 1_000_000_000;
+    let bucket_floor =
+        |dt: time::OffsetDateTime| ((dt - epoch).whole_nanoseconds()).div_euclid(bucket_nanos);
+    // The half-open window's last instant is end minus an arbitrarily small
+    // epsilon, so an exactly bucket-aligned end contributes its previous
+    // bucket, while an end even a fraction of a second past a boundary (RFC
+    // 3339 accepts fractional seconds) still touches the bucket that boundary
+    // opens (#1948 review, round 3).
+    let end_nanos = (end - epoch).whole_nanoseconds();
+    let end_aligned = end_nanos.rem_euclid(bucket_nanos) == 0;
+    let end_floor = if end_aligned {
+        end_nanos.div_euclid(bucket_nanos) - 1
+    } else {
+        end_nanos.div_euclid(bucket_nanos)
+    };
+    let touched = (end_floor - bucket_floor(start) + 1) as i64;
+    Some(if granularity == "week" {
+        touched + 1
+    } else {
+        touched
+    })
+}
+
+/// #1948: enforce the CLI's series point cap on the requested span before the
+/// upstream query is dispatched, so an over-cap window never reaches Langfuse
+/// and ClickHouse. Absent `--start` is bounded server-side by the metrics
+/// default window (168 hours, `apps/api` config), under the cap at every
+/// shipped granularity, so no estimate is attempted there; the post-dispatch
+/// bound still catches an operator-raised default. Absent `--end` defaults to
+/// now on the server (`apps/api/src/curie_api/metrics.py::resolve_window`), so
+/// `now` is the effective bound here too. Values the CLI cannot parse stay the
+/// server's 422 business rather than a stricter client-side format contract.
+/// Parse a `--start`/`--end` value with the same leniency the platform API's
+/// `datetime.fromisoformat` accepts for its documented common forms (#1948
+/// scope review): strict RFC 3339, a date-only value (midnight UTC), a space
+/// separator between date and time, a time without seconds, and a naive
+/// timestamp (assumed UTC for the estimate). A value none of these cover is
+/// `None`: the guard skips it and the API's own 422 or the post-dispatch bound
+/// answers, because the CLI must not become stricter than the API on formats
+/// neither documents.
+fn parse_api_timestamp(raw: &str) -> Option<time::OffsetDateTime> {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    let trimmed = raw.trim();
+    if let Ok(parsed) = OffsetDateTime::parse(trimmed, &Rfc3339) {
+        return Some(parsed);
+    }
+    let mut normalized = String::from(trimmed);
+    let bytes = normalized.as_bytes();
+    if bytes.len() == 10 && bytes[4] == b'-' && bytes[7] == b'-' {
+        // Date-only: the API resolves it to midnight.
+        normalized.push_str("T00:00:00Z");
+    } else {
+        normalized = normalized.replacen(' ', "T", 1);
+        let bytes = normalized.as_bytes();
+        if bytes.len() >= 16 && bytes[10] == b'T' {
+            // Where does the time end? The time-of-day segment runs from
+            // index 11 to the first offset marker (Z, +, -) if any.
+            let offset_start = bytes[11..]
+                .iter()
+                .position(|byte| *byte == b'Z' || *byte == b'+' || *byte == b'-')
+                .map(|index| 11 + index)
+                .unwrap_or(bytes.len());
+            let time_len = offset_start - 11;
+            if time_len == 5 {
+                // A time truncated at the minute (HH:MM), with or without an
+                // offset: fromisoformat accepts it, RFC 3339 does not, so the
+                // seconds segment is inserted before any offset marker.
+                normalized.insert_str(offset_start, ":00");
+            }
+        }
+        // Python 3.11+ datetime.fromisoformat accepts a compact ±HHMM offset
+        // (no colon). RFC 3339 does not, so an over-cap span in that form
+        // would skip the pre-dispatch cap and still execute upstream (#1948
+        // code review). Insert the colon so the estimate sees the same window.
+        let bytes = normalized.as_bytes();
+        if let Some(sign_at) = bytes[11.min(bytes.len())..]
+            .iter()
+            .position(|byte| *byte == b'+' || *byte == b'-')
+            .map(|index| 11 + index)
+        {
+            let offset = &normalized[sign_at + 1..];
+            if offset.len() == 4 && offset.as_bytes().iter().all(|byte| byte.is_ascii_digit()) {
+                normalized.insert(sign_at + 3, ':');
+            }
+        }
+        let bytes = normalized.as_bytes();
+        // Nothing after byte 10 can carry an offset when the value is this
+        // short, and slicing past the end would panic on an arbitrary
+        // --start/--end value; the parse below answers instead (scope review
+        // round 3).
+        let has_offset = normalized.ends_with('Z')
+            || (bytes.len() > 11
+                && bytes[11..]
+                    .iter()
+                    .any(|byte| *byte == b'+' || *byte == b'-'));
+        if !has_offset {
+            // A naive timestamp has no offset in fromisoformat; the estimate
+            // assumes UTC and the post-dispatch bound stays the backstop.
+            normalized.push('Z');
+        }
+    }
+    OffsetDateTime::parse(&normalized, &Rfc3339).ok()
+}
+
+fn prevalidate_series_span(
+    granularity: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Result<()> {
+    let Some(start) = start else {
+        return Ok(());
+    };
+    let start_dt = match parse_api_timestamp(start) {
+        Some(parsed) => parsed,
+        None => return Ok(()),
+    };
+    let end_dt = match end {
+        Some(end) => match parse_api_timestamp(end) {
+            Some(parsed) => parsed,
+            None => return Ok(()),
+        },
+        None => time::OffsetDateTime::now_utc(),
+    };
+    if end_dt <= start_dt {
+        // An inverted or empty window is the server's business.
+        return Ok(());
+    }
+    let Some(buckets) = series_bucket_estimate(granularity, start_dt, end_dt) else {
+        return Ok(());
+    };
+    if buckets > MAX_OBSERVABILITY_METRIC_POINTS as i64 {
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::failure(format!(
+                "--start/--end span {start} to {} is about {buckets} {granularity} buckets, above the CLI maximum of {MAX_OBSERVABILITY_METRIC_POINTS}",
+                end.unwrap_or("now")
+            ))
+            .with_fix("narrow --start/--end or choose a coarser --granularity"),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ObservabilityApiUnavailable(String);
 
@@ -561,6 +745,33 @@ pub fn is_observability_api_unavailable(error: &anyhow::Error) -> bool {
             .downcast_ref::<ObservabilityApiUnavailable>()
             .is_some()
     })
+}
+
+/// The agent lookup found no record matching the identifier. A typed marker
+/// rather than a bare message so the observability query path can tell a
+/// genuine no-match (operator input, a usage refusal) from a transport or
+/// availability failure, which must keep its transient or failure class
+/// (#1948 review). The display text is unchanged from the message the deploy
+/// flow's callers already render.
+#[derive(Debug)]
+struct AgentLookupNotFound(String);
+
+impl std::fmt::Display for AgentLookupNotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "no agent found matching {:?} (by name or id); deploy it first with `curie cluster deploy`",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for AgentLookupNotFound {}
+
+pub fn is_agent_lookup_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<AgentLookupNotFound>().is_some())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1469,6 +1680,12 @@ impl ApiClient {
         environment: Option<&str>,
         agent: Option<&str>,
     ) -> Result<MetricSeries> {
+        // #1948: refuse an over-cap span before the request, because the
+        // backend has already executed the query by the time a response can be
+        // buffered and rejected. The post-dispatch bound below stays as the
+        // defense against a server that returns more points than the
+        // requested span implies.
+        prevalidate_series_span(granularity, start, end)?;
         let mut query = vec![
             ("metric", metric.to_string()),
             ("granularity", granularity.to_string()),
@@ -2022,15 +2239,34 @@ impl ApiClient {
     /// deploy flow uses (`resolve_agent`), so the lifecycle verbs never grow a
     /// second resolution path. Errors when nothing matches; never creates.
     pub async fn find_agent(&self, identifier: &str) -> Result<Agent> {
-        self.list_agents()
+        match_agent(self.list_agents().await?, identifier).map_err(anyhow::Error::new)
+    }
+
+    /// The observability query path's agent lookup (#1948): the same exact
+    /// name-or-id match as [`Self::find_agent`], but the `/agents` GET is
+    /// classified with the observability status semantics, so a 5xx stays
+    /// transient, an auth failure keeps its credential fix, and only a genuine
+    /// no-match reaches the caller's usage refusal.
+    pub(crate) async fn find_agent_observability(&self, identifier: &str) -> Result<Agent> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/agents", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    // The same request budget the observability reads carry:
+                    // the client default is a connect timeout only, so a
+                    // stalled-but-accepted connection must not hang the query
+                    // indefinitely (#1948 review, round 4).
+                    .timeout(std::time::Duration::from_secs(30)),
+                "GET /agents",
+            )
+            .await?;
+        let agents: Vec<Agent> = Self::expect_observability_ok(resp, "listing agents")
             .await?
-            .into_iter()
-            .find(|a| a.name == identifier || a.id == identifier)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no agent found matching {identifier:?} (by name or id); deploy it first with `curie cluster deploy`"
-                )
-            })
+            .json()
+            .await
+            .context("decoding agent list")?;
+        match_agent(agents, identifier).map_err(anyhow::Error::new)
     }
 
     /// Flip the agent kill switch on: `POST /agents/{id}/kill` (no request body).
@@ -2733,8 +2969,151 @@ impl ApiClient {
 mod tests {
     use super::{
         add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint,
-        validate_allowlist_entry,
+        prevalidate_series_span, validate_allowlist_entry, MAX_OBSERVABILITY_METRIC_POINTS,
     };
+
+    /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
+    /// buckets from 1970-01-01T00:00:00Z is legal, one more is not.
+    #[test]
+    fn series_span_guard_enforces_the_point_cap_boundary() {
+        prevalidate_series_span(
+            "hour",
+            Some("1970-01-01T00:00:00Z"),
+            Some("1970-02-11T16:00:00Z"),
+        )
+        .expect("exactly the cap dispatches");
+        let error = prevalidate_series_span(
+            "hour",
+            Some("1970-01-01T00:00:00Z"),
+            Some("1970-02-11T17:00:00Z"),
+        )
+        .expect_err("one bucket over the cap is refused");
+        assert!(error.to_string().contains("buckets"));
+    }
+
+    /// Wall-clock buckets charge an unaligned window for its partial leading
+    /// and trailing buckets (#1948 review): a span of exactly 1,000 hours that
+    /// starts mid-hour touches 1,001 hour buckets and must be refused before
+    /// dispatch, while the aligned same-length span stays at the cap.
+    #[test]
+    fn series_span_guard_charges_partial_boundary_buckets() {
+        prevalidate_series_span(
+            "hour",
+            Some("1970-01-01T00:00:00Z"),
+            Some("1970-02-11T16:00:00Z"),
+        )
+        .expect("the aligned cap-length window dispatches");
+        let error = prevalidate_series_span(
+            "hour",
+            Some("1970-01-01T00:30:00Z"),
+            Some("1970-02-11T16:30:00Z"),
+        )
+        .expect_err("the unaligned same-length window touches one more bucket");
+        assert!(error.to_string().contains("1001"));
+
+        // A fractional-second end past the cap boundary still opens the
+        // boundary's bucket (RFC 3339 accepts fractional seconds, round 3).
+        let error = prevalidate_series_span(
+            "hour",
+            Some("1970-01-01T00:00:00Z"),
+            Some("1970-02-11T16:00:00.500Z"),
+        )
+        .expect_err("a half-second-past-cap end touches one more bucket");
+        assert!(error.to_string().contains("1001"));
+        prevalidate_series_span(
+            "hour",
+            Some("1970-01-01T00:00:00Z"),
+            Some("1970-02-11T15:00:00.500Z"),
+        )
+        .expect("a fractional end still under the cap dispatches");
+
+        // A fractional pre-epoch start floors DOWN at nanosecond precision:
+        // epoch minus half a second sits in bucket -1, so the same cap-length
+        // window touches 1,001 buckets (round 5).
+        let error = prevalidate_series_span(
+            "hour",
+            Some("1969-12-31T23:59:59.500Z"),
+            Some("1970-02-11T16:00:00Z"),
+        )
+        .expect_err("a pre-epoch fractional start opens its partial bucket");
+        assert!(error.to_string().contains("1001"));
+
+        // Langfuse's week anchoring is not the epoch, so week carries one
+        // safety bucket: an aligned 999-week window is the last allowed.
+        prevalidate_series_span(
+            "week",
+            Some("1970-01-01T00:00:00Z"),
+            Some("1989-02-23T00:00:00Z"),
+        )
+        .expect("999 aligned weeks stay at the cap");
+        prevalidate_series_span(
+            "week",
+            Some("1970-01-01T00:00:00Z"),
+            Some("1989-03-02T00:00:00Z"),
+        )
+        .expect_err("1,000 aligned weeks exceed the cap with the safety bucket");
+    }
+
+    /// An absent --start is bounded by the server's default window and an
+    /// unparseable bound stays the server's 422 business: neither may invent a
+    /// client-side refusal.
+    #[test]
+    fn series_span_guard_skips_what_the_server_owns() {
+        prevalidate_series_span("hour", None, None).expect("absent start stays server-owned");
+        prevalidate_series_span(
+            "hour",
+            Some("not-a-timestamp"),
+            Some("2026-01-01T00:00:00Z"),
+        )
+        .expect("unparseable start stays server-owned");
+        prevalidate_series_span("hour", Some("x"), Some("2026-01-01T00:00:00Z"))
+            .expect("a too-short value must never panic the guard");
+        prevalidate_series_span("hour", Some("19700101"), Some("2026-01-01T00:00:00Z"))
+            .expect("a basic-format date this parser does not model stays server-owned");
+        prevalidate_series_span(
+            "fortnight",
+            Some("1970-01-01T00:00:00Z"),
+            Some("2026-01-01T00:00:00Z"),
+        )
+        .expect("unknown granularity stays server-owned");
+    }
+
+    /// The API's datetime.fromisoformat accepts lenient timestamp forms the
+    /// strict RFC 3339 parser rejects (#1948 scope review). The guard must
+    /// parse those forms too, or an over-cap span in an accepted format
+    /// reaches the backend unprevalidated. Naive values are assumed UTC for
+    /// the estimate; the post-dispatch bound is the backstop for anything
+    /// else fromisoformat accepts that this parser does not.
+    #[test]
+    fn series_span_guard_parses_the_api_lenient_timestamp_forms() {
+        for (start, end) in [
+            ("1970-01-01", "2026-01-01"),
+            ("1970-01-01 00:00:00", "2026-01-01 00:00:00"),
+            ("1970-01-01T00:00", "2026-01-01T00:00"),
+            ("1970-01-01 00:00", "2026-01-01 00:00"),
+            ("1970-01-01T00:00:00", "2026-01-01T00:00:00"),
+            ("1970-01-01T00:00Z", "2026-01-01T00:00Z"),
+            ("1970-01-01T00:00+00:00", "2026-01-01T00:00+00:00"),
+            ("1970-01-01T00:00:00+0000", "2026-01-01T00:00:00+0000"),
+        ] {
+            let error = prevalidate_series_span("hour", Some(start), Some(end))
+                .expect_err("a 56 year hourly window must be refused in every API-accepted form");
+            assert!(error.to_string().contains("buckets"), "{start} to {end}");
+        }
+    }
+
+    /// A --start with no --end is unbounded server-side (the API defaults end
+    /// to now), so the guard validates it against the current clock.
+    #[test]
+    fn series_span_guard_bounds_a_one_sided_start_window() {
+        let error = prevalidate_series_span("hour", Some("1970-01-01T00:00:00Z"), None)
+            .expect_err("a start of 1970 with no end exceeds the cap against now");
+        assert!(error.to_string().contains("now"));
+        assert_eq!(
+            MAX_OBSERVABILITY_METRIC_POINTS, 1000,
+            "the pre-dispatch guard and the post-dispatch bound share one cap"
+        );
+    }
 
     #[test]
     fn allowlist_entries_accept_owner_repo_and_owner_wildcard() {

@@ -2890,10 +2890,11 @@ fn mcp_receipt_setup_leaves_a_valid_owned_weather_bundle_and_refuses_a_rerun() {
     );
 }
 
-/// #2423: the connector-fixture setup overwrites connectors.yaml on the
-/// sre-bot scratch copy. It must also own the matching approval gates so the
-/// scratch bundle stays valid. The self-upgrade fixture must retain both of
-/// its gates while gates for every unhosted connector are removed.
+/// #2423/#2295: the connector-fixture setup overwrites connectors.yaml on the
+/// sre-bot scratch copy. It must also own the matching approval gates and
+/// toolPolicy entries so the scratch bundle stays valid. The self-upgrade
+/// fixture must retain both of its gates while gates and grants for every
+/// unhosted connector are removed.
 #[test]
 fn connector_fixture_setup_owns_consistent_approval_gates() {
     if Command::new("uv").arg("--version").output().is_err() {
@@ -2936,6 +2937,16 @@ fn connector_fixture_setup_owns_consistent_approval_gates() {
             "mcp__self-upgrade__upgrade_platform".to_string(),
         ],
         "the owned scratch copy must retain exactly the gates for the hosted self-upgrade connector"
+    );
+    let allow: Vec<&str> = plugin["toolPolicy"]["allow"]
+        .as_array()
+        .expect("toolPolicy.allow")
+        .iter()
+        .map(|entry| entry.as_str().expect("allow entry"))
+        .collect();
+    assert!(
+        allow.iter().all(|entry| !entry.starts_with("grafana/")),
+        "the fixture does not host grafana, so grafana grants must be stripped: {allow:?}"
     );
 
     let result = validate_bundle_json(&bundle);
