@@ -130,11 +130,12 @@ people out:
 - suspend and resume — ADR-0003 suspend *is* pod deletion, and resume does not
   bring the pod back: it retires the suspended claim and creates a fresh one at
   the next route generation, so the replacement is visible as a new claim;
-- eviction, node drain or any rescheduling, where the controller recreates the
-  pod beneath a claim that never changes. The claim, the route and the session
-  id all stay exactly as they were and only the pod's uid moves, so nothing at
-  claim level records that a workspace was discarded and rebuilt. This is the
-  one you will not be told about.
+- the pod going away beneath a claim that never changes. The claim, the route
+  and the session id all stay exactly as they were and only the pod's uid moves,
+  so nothing at claim level records that a workspace was discarded and rebuilt.
+  This is the one you will not be told about. It was exercised by deleting the
+  pod directly; an eviction, a node drain or any other rescheduling reaches the
+  same controller path, though this guide has not measured those individually.
 
 So: **the only durable place for work is publication.** `publish_changes` is not
 a nicety at the end of a task, it is the step that makes the work exist outside a
@@ -159,11 +160,17 @@ exists in the CRD, but nothing in Curie sets it, and the shipped runner
 `VolumeClaimTemplatesError`, creating neither pod nor PVC.
 
 Allowing it does not get you a persistent workspace either. With the policy
-flipped and a PVC bound at `/workspace`, the volume genuinely does survive a pod
-replacement — and `workspace-init` then wipes it on the new pod's first start,
-because its unconditional clean is what guarantees a partial extraction is never
-overlaid. Persisting the workspace would mean changing that, and trading away
-the property the wipe exists to provide.
+flipped and a PVC bound at `/workspace`, the claim binds and the sandbox comes
+up — and a pod replacement still lands on an empty-then-re-extracted workspace,
+with the PVC itself unchanged throughout (same uid, same volume).
+
+The wipe is what does it, and that is measured rather than inferred: the same
+PVC, replaced the same way but mounted into a pod carrying **no**
+`workspace-init`, keeps its contents across the replacement intact. Put the init
+container back and the contents go. Its first action is to empty `/workspace`
+before extracting, which is exactly what guarantees a partial extraction is
+never overlaid — so persisting the workspace means changing that, and trading
+away the property the wipe exists to provide.
 
 The platform's answer to durability is elsewhere and is already in the recipe:
 committed work becomes durable by publication, and conversation state survives
@@ -333,6 +340,14 @@ What the committed evidence does and does not cover.
 | repeat in a newly acquired workspace, and after an in-place restart | **Supported and proved.** | A second, independently claimed sandbox reproduced the whole recipe from the acquired head with no state carried over, producing its own distinct commits. An in-place container restart preserved the workspace, its three-commit history, the expected head and the credential-free origin. See `ac5-cluster-evidence/`. |
 | after a pod-replacing handoff | **Proved — and it discards everything the sandbox made.** | Exercised on a kind cluster on 2026-09-11 in both shapes: the ADR-0136 cold-claim handoff, and a pod deleted under an unchanged live claim. Both re-fetched the signed archive, so the repository and its credential-free origin came back — at the **archive head**, with the in-sandbox commit, the uncommitted edits, the untracked files and the virtualenv all gone. Recorded for operators under *Nothing in the sandbox survives a pod replacement*. See `pod-replacing-handoff-evidence/`. |
 | a persistent workspace volume | **Not the answer; not supported today.** | Nothing in Curie sets `SandboxClaim.spec.volumeClaimTemplates`, and the shipped template leaves the policy at the CRD default `Disallowed`, so such a claim is refused with no pod and no PVC. With the policy flipped, the PVC does survive the pod replacement and `workspace-init` wipes it anyway. A persistent workspace would require changing that wipe. |
+
+The `ac5-cluster-evidence/` and `pod-replacing-handoff-evidence/` records named
+above are the raw per-run artifacts of the two cluster runs — claim manifests,
+cluster version, and the measured before/after of each case. They are kept with
+the v0.9.0 queue contract under the maintainer's local `.projects/` tree, which
+this repository does not track, so you will not find them in a checkout. What
+they support is stated in full in the rows above; the citation is there to name
+the run, not to send you looking.
 
 Every container the harness starts is `--rm` and every workspace it creates is a
 temporary directory; it asserts observably that neither survives the run.
