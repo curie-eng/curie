@@ -16,7 +16,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
+from aci_protocol import (
+    Final,
+    QueuedTurn,
+    ReplyHandle,
+    SessionStatus,
+    TextDelta,
+    TurnSource,
+)
 from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyUpdate
 from curie_worker.approvals import (
@@ -57,6 +64,27 @@ def _review_turn(
             placeholder=None,
         ),
         received_at="2026-09-05T01:00:00+00:00",
+        source=TurnSource.SLACK,
+    )
+
+
+def _slack_turn(
+    *,
+    event_number: int = 101,
+    text: str = "Please make the answer shorter.",
+) -> QueuedTurn:
+    return QueuedTurn(
+        event_id=f"slack-{uuid.UUID(int=event_number)}",
+        conversation_id=THREAD,
+        author="U0EXAMPLE1",
+        text=text,
+        reply_handle=ReplyHandle(
+            kind="slack",
+            channel=CHANNEL,
+            placeholder=f"placeholder-{event_number}",
+        ),
+        received_at="2026-09-05T01:01:00+00:00",
+        source=TurnSource.SLACK,
     )
 
 
@@ -296,6 +324,9 @@ def test_verified_review_defers_while_busy_then_retries_without_steering(
                 await h.kernel.process_event(turn)
 
             assert api.reserve_calls == []
+            assert h.sink.text_posts == [], (
+                "a deferred review posted before it owned a runnable revision"
+            )
             assert h.runner.steer_headers == []
             assert h.runner.event_headers == []
 
@@ -315,6 +346,76 @@ def test_verified_review_defers_while_busy_then_retries_without_steering(
             assert api.reserve_calls[0][2].origin_key == turn.event_id
             assert h.runner.steer_headers == []
             assert h.runner.opened == [turn.text]
+
+    asyncio.run(exercise())
+
+
+def test_review_routing_keeps_normal_slack_steering(make_harness) -> None:
+    """Installing verified-review routing must not reclassify a Slack follow-up."""
+
+    async def exercise() -> None:
+        persisted_review = _review_turn()
+        followup = _slack_turn()
+        api = ReviewPublicationApi(persisted_review)
+        async with make_harness(
+            binding=ReviewBinding(),
+            publication_creator=api,
+            workspace_factory=ReviewWorkspace,
+        ) as h:
+            _claim_matching_route(h, followup)
+            h.runner.turn_active = True
+
+            await h.kernel.process_event(followup)
+
+            assert api.verify_calls == []
+            assert api.reserve_calls == []
+            assert h.runner.steers == [followup.text]
+            assert h.runner.opened == []
+
+    asyncio.run(exercise())
+
+
+def test_review_routing_keeps_normal_slack_finish_race_fallback(
+    make_harness,
+) -> None:
+    """A Slack follow-up whose live turn finishes before steer opens a new turn."""
+
+    async def exercise() -> None:
+        persisted_review = _review_turn()
+        followup = _slack_turn(event_number=102, text="Use the original wording.")
+        api = ReviewPublicationApi(persisted_review)
+        async with make_harness(
+            binding=ReviewBinding(),
+            publication_creator=api,
+            workspace_factory=ReviewWorkspace,
+        ) as h:
+            _claim_matching_route(h, followup)
+            h.runner.turn_active = False
+            h.runner.default_script = [
+                Final(text="Original wording restored.", status=SessionStatus.DONE)
+            ]
+
+            async def status_before_finish_race(
+                *_args: object, **_kwargs: object
+            ) -> dict[str, object]:
+                return {
+                    "status": SessionStatus.IDLE_AWAITING_INPUT.value,
+                    "turn_active": True,
+                    "history_durable": True,
+                }
+
+            h.kernel._runner.status = (  # type: ignore[method-assign]
+                status_before_finish_race
+            )
+
+            await h.kernel.process_event(followup)
+
+            assert api.verify_calls == []
+            assert api.reserve_calls == []
+            assert len(h.runner.steer_headers) == 1
+            assert h.runner.steers == []
+            assert h.runner.opened == [followup.text]
+            assert h.sink.last_text == "Original wording restored."
 
     asyncio.run(exercise())
 
@@ -372,6 +473,9 @@ def test_final_reserve_unavailability_leaves_review_retryable(make_harness) -> N
                 await h.kernel.process_event(turn)
 
             assert len(api.reserve_calls) == 1
+            assert h.sink.text_posts == [], (
+                "a retryable authority outage left an orphan Slack message"
+            )
             assert h.runner.steer_headers == []
             assert h.runner.event_headers == []
             assert not await h.async_redis.exists(h.config.done_key(turn.event_id))
@@ -403,6 +507,7 @@ def test_verified_review_posts_receipt_and_terminal_outcome_to_bare_thread(
                 for event, _route, _best_effort in h.sink.events
                 if isinstance(event, ReplyUpdate) and event.target.conversation_id == THREAD
             ]
+            assert review_updates[0].text == RECEIPT
             assert [event.text for event in review_updates].count(RECEIPT) == 1
             assert review_updates[-1].text == "Review changes are ready."
             assert len(h.sink.completions) == 1
