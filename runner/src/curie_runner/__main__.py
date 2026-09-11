@@ -39,7 +39,12 @@ from .approval import (
     resolve_approval_policy,
 )
 from .config import RunnerConfig
-from .connectors import build_mcp_servers, derive_mcp_servers
+from .connectors import (
+    build_mcp_servers,
+    derive_mcp_servers,
+    drop_connector_secret_names,
+    materialize_hosted_bearer_headers,
+)
 from .fake import FakeModelSession
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
@@ -58,7 +63,12 @@ from .history import (
     resolve_history,
 )
 from .hooks import load_bundle_hooks
-from .mcp_tool_capability import McpToolCapabilityProbe, probe_mcp_tool_capability
+from .mcp_tool_capability import (
+    ConnectorCapabilityFailure,
+    McpToolCapabilityProbe,
+    diagnose_derived_connector_headers,
+    probe_mcp_tool_capability,
+)
 from .memory import MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
 from .plugin import load_bundle_web_search_enabled
@@ -160,6 +170,7 @@ def build_runner(
     mcp_capability: McpToolCapabilityProbe | None = None,
     harness: HarnessContribution | None = None,
     workspace_path: Path | None = None,
+    connector_failures: tuple[ConnectorCapabilityFailure, ...] = (),
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -281,6 +292,13 @@ def build_runner(
         agent=config.connector_agent,
         namespace=config.connector_namespace,
     )
+    # Expand hosted Bearer ${NAME} headers in memory and drop NAME so Bash
+    # cannot read the PAT from the process env (#2559). The on-disk catalog
+    # keeps the placeholder; derive_mcp_servers never sees a value.
+    spawn_env = sdk_env if sdk_env is not None else os.environ
+    dropped = materialize_hosted_bearer_headers(derived_mcp_servers, spawn_env)
+    if spawn_env is not os.environ:
+        drop_connector_secret_names(os.environ, dropped)
 
     # A configured permission gate is already positive evidence that the
     # session carries an actionable approval boundary. Publication is excluded:
@@ -293,6 +311,7 @@ def build_runner(
 
     real_options: ClaudeAgentOptions | None = None
     observed_readonly_tools: frozenset[str] = frozenset()
+    capability = mcp_capability
     if not fake_model:
         # The bundle's live MCP ``tools/list`` response is the actual advertised
         # MCP surface. Probe even when an explicit gate already requires the
@@ -301,7 +320,6 @@ def build_runner(
         # and probe failures preserve the historical fail-closed behavior. The
         # annotation remains a non-authoritative hint: it never authorizes or
         # denies tool execution.
-        capability = mcp_capability
         if capability is None:
             capability = anyio.run(
                 probe_mcp_tool_capability,
@@ -464,6 +482,12 @@ def build_runner(
             approval_decision=config.approval_decision,
             false_completion_check=config.false_completion_check,
             history_resumed=conversation_replay.present,
+            connector_failures=connector_failures
+            or (
+                capability.connector_failures
+                if capability is not None
+                else ()
+            ),
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,
@@ -553,6 +577,7 @@ class _BootFetches:
     history_store: TranscriptStore
     conversation_replay: ConversationReplay
     mcp_capability: McpToolCapabilityProbe | None
+    connector_failures: tuple[ConnectorCapabilityFailure, ...] = ()
 
 
 async def _load_boot_fetches(
@@ -568,6 +593,19 @@ async def _load_boot_fetches(
     memory: tuple[MemoryStore, str | None] | None = None
     history: tuple[TranscriptStore, ConversationReplay] | None = None
     capability: McpToolCapabilityProbe | None = None
+    derived = derive_mcp_servers(
+        config.session.plugin_dir,
+        release=config.connector_release,
+        agent=config.connector_agent,
+        namespace=config.connector_namespace,
+    )
+    expansion_failures = (
+        diagnose_derived_connector_headers(
+            derived, {**os.environ, **dict(sdk_env or {})}
+        )
+        if fake_model
+        else ()
+    )
 
     async def load_memory() -> None:
         nonlocal memory
@@ -579,12 +617,6 @@ async def _load_boot_fetches(
 
     async def probe() -> None:
         nonlocal capability
-        derived = derive_mcp_servers(
-            config.session.plugin_dir,
-            release=config.connector_release,
-            agent=config.connector_agent,
-            namespace=config.connector_namespace,
-        )
         capability = await probe_mcp_tool_capability(
             config.session.plugin_dir,
             derived,
@@ -599,12 +631,16 @@ async def _load_boot_fetches(
 
     assert memory is not None
     assert history is not None
+    connector_failures = (
+        capability.connector_failures if capability is not None else expansion_failures
+    )
     return _BootFetches(
         memory_store=memory[0],
         memory_preamble=memory[1],
         history_store=history[0],
         conversation_replay=history[1],
         mcp_capability=capability,
+        connector_failures=connector_failures,
     )
 
 
@@ -666,6 +702,7 @@ def _serve() -> None:
         mcp_capability=fetches.mcp_capability,
         harness=harness,
         workspace_path=workspace_path,
+        connector_failures=fetches.connector_failures,
     )
     def capture_mounted_workspace() -> WorkspaceSnapshot:
         # The sanitized, credential-free origin in /workspace/.git/config is

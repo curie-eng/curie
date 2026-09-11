@@ -8605,7 +8605,7 @@
     },
     "/channels/token": {
       "post": {
-        "description": "Mint a `chn` token for one binding (platform key only).\n\nPlatform-key-only on purpose: a `chn` token does exactly one thing, enqueue\nfor the binding in its claims. If it could mint, a compromised adapter would\ndefeat both the TTL and the generation -- the only two things standing in for\na revocation list.\n\nThe token claims the ROW's id and its CURRENT generation, so it dies both\nwhen the pair is deleted and recreated (a new row id) and when the binding is\nre-pointed or merely re-asserted (a bumped generation).",
+        "description": "Mint a `chn` token for one binding (platform key only).\n\nPlatform-key-only on purpose: a `chn` token does exactly one thing, enqueue\nfor the binding in its claims. If it could mint, a compromised adapter would\ndefeat both the TTL and the generation -- the only two things standing in for\na revocation list.\n\nThe token claims the ROW's id and the generation this mint stamps. Minting\nis a rotation write: it bumps the row under `FOR UPDATE` and signs the NEW\nvalue, so a remint revokes the token it replaces (#2379). The token also\ndies when the pair is deleted and recreated (a new row id) and when the\nbinding is re-pointed or merely re-asserted (another bump).",
         "operationId": "mint_channel_token_channels_token_post",
         "parameters": [
           {

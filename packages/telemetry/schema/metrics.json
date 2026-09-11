@@ -1048,7 +1048,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2880
+      "cardinality_bound": 2920
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1155,7 +1155,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 2880
+      "cardinality_bound": 2920
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1255,7 +1255,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 576
+      "cardinality_bound": 584
     },
     "curie.background.loop": {
       "type": "counter",
@@ -1327,6 +1327,30 @@
         ]
       },
       "cardinality_bound": 3
+    },
+    "curie.worker.supervised.restart": {
+      "type": "counter",
+      "unit": "{restart}",
+      "description": "In-process supervised worker task restarts.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "operation": [
+          "runs",
+          "killswitch",
+          "evals",
+          "heartbeat",
+          "connectors",
+          "publications",
+          "other"
+        ],
+        "outcome": [
+          "restart"
+        ]
+      },
+      "cardinality_bound": 7
     }
   }
 }

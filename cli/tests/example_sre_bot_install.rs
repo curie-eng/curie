@@ -237,6 +237,18 @@ case " $* " in
         printf '%s\n' 'curie'
         exit 0
         ;;
+    *" get replicasets "*)
+        printf '%s\n' '{"apiVersion":"v1","kind":"List","items":[]}'
+        exit 0
+        ;;
+    *" get pods "*)
+        printf '%s\n' '{"apiVersion":"v1","kind":"List","items":[]}'
+        exit 0
+        ;;
+    *" get deployment "*" -o json"*)
+        printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"generation":1},"spec":{"replicas":1},"status":{"observedGeneration":1,"replicas":1,"updatedReplicas":1,"readyReplicas":1,"availableReplicas":1}}'
+        exit 0
+        ;;
     *" delete deployment,service,networkpolicy,secret "*)
         exit 0
         ;;
@@ -2408,12 +2420,15 @@ fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_con
     assert!(
         curie_values.contains("tempo.soak-obs.svc.cluster.local")
             && curie_values.contains("grafana.soak-obs.svc.cluster.local")
-            && curie_values.contains("namespace: soak-obs"),
+            && curie_values.contains("prometheus-server.soak-obs.svc.cluster.local")
+            && curie_values.contains("namespace: soak-obs")
+            && curie_values.contains("kubernetes.io/metadata.name: soak-obs"),
         "Curie integration values must point at soak-obs: {curie_values}"
     );
     assert!(
         !curie_values.contains(".observability.svc.cluster.local")
-            && !curie_values.contains("namespace: observability"),
+            && !curie_values.contains("namespace: observability")
+            && !curie_values.contains("kubernetes.io/metadata.name: observability"),
         "Curie integration values must not retain observability: {curie_values}"
     );
 

@@ -2,12 +2,15 @@
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 import discord
 import httpx
 import uvicorn
+from curie_telemetry import bootstrap_service_telemetry, configure_service_logging
 
+from . import __version__
 from .config import DiscordConfig
 from .egress import DiscordReplyService
 from .http import create_reply_app
@@ -15,6 +18,20 @@ from .ingress import DiscordBinding, DiscordMessage, build_turn
 from .state import DiscordState
 
 logger = logging.getLogger(__name__)
+
+SERVICE_NAME = "curie-discord-adapter"
+
+# The third-party libraries this process actually runs under: discord.py owns
+# the Gateway, uvicorn serves the reply wire, and httpx makes every outbound
+# call. Each name is a namespace *root*, so one bootstrap apiece covers
+# `discord.gateway`, `uvicorn.error`, `httpx._client` and every sibling by
+# propagation. They are enumerated here because dropping `basicConfig` took the
+# root handler with it: with no handler anywhere on their chain their WARNING+
+# records fall to `logging.lastResort`, which writes them to stderr as plain
+# unredacted text -- the exact defect #2358 closes, merely moved out of our
+# package and into our dependencies. discord.py emits such a warning on every
+# start, so this is observed rather than hypothetical.
+_THIRD_PARTY_LOG_NAMESPACES = ("discord", "uvicorn", "httpx")
 
 
 class DiscordAdapter(discord.Client):
@@ -181,8 +198,20 @@ async def run() -> None:
     adapter = DiscordAdapter(config, state)
     reply_service = DiscordReplyService(adapter, state)
     app = create_reply_app(reply_service, config.adapter_secret)
+    # uvicorn.Config(...)'s own constructor applies uvicorn's own LOGGING_CONFIG via dictConfig,
+    # which hands uvicorn.access a plain-text stdout handler and sets propagate=False, detaching
+    # it from the uvicorn namespace handler set up above. Access lines carry method, path and
+    # query string, exactly what url_secret_param redacts, so log_config=None skips uvicorn's
+    # config: uvicorn.access gets no handler and propagate=True, so it reaches the redacting
+    # JSON handler like every other logger here.
     server = uvicorn.Server(
-        uvicorn.Config(app, host=config.reply_host, port=config.reply_port, log_level="info")
+        uvicorn.Config(
+            app,
+            host=config.reply_host,
+            port=config.reply_port,
+            log_level="info",
+            log_config=None,
+        )
     )
     try:
         await asyncio.gather(server.serve(), adapter.start(config.discord_bot_token))
@@ -192,5 +221,35 @@ async def run() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(run())
+    # The *package* logger is handed over, not this module's.
+    # `configure_service_logging` sets `propagate=False` on exactly the logger
+    # it is given, and `main`, `config`, `egress`, `http`, `ingress` and `state`
+    # each hold their own `getLogger(__name__)` child of it -- so one bootstrap
+    # installs the redacting JSON handler for all six, and for every module
+    # added later, by propagation. Bootstrapping the module loggers one at a
+    # time passes for today's six and silently leaves the seventh outside the
+    # filter.
+    telemetry = bootstrap_service_telemetry(
+        SERVICE_NAME,
+        service_version=__version__,
+        logger=logging.getLogger("curie_discord_adapter"),
+        environ=os.environ,
+    )
+    for namespace in _THIRD_PARTY_LOG_NAMESPACES:
+        configure_service_logging(
+            logging.getLogger(namespace),
+            service_name=SERVICE_NAME,
+            logger_provider=telemetry.logger_provider,
+            level=logging.INFO,
+        )
+    try:
+        asyncio.run(run())
+    finally:
+        # After the body, not a context manager around a narrower region:
+        # `shutdown` force-flushes the batch processors, whose schedule delay is
+        # 1000 ms, so a process that exits sooner delivers nothing at all. Placing
+        # the flush here is what makes both the last records of a graceful stop
+        # and the records immediately preceding a crash actually reach the
+        # collector -- the ones an operator most needs and the ones an unflushed
+        # `BatchLogRecordProcessor` takes down with the process.
+        telemetry.shutdown()

@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 from plugin_format import connector_render as r
-from plugin_format.connectors import ConnectorSpec, validate_connectors
+from plugin_format.connectors import ConnectorSpec, SecretRef, validate_connectors
 
 HOSTED = ConnectorSpec(
     image="grafana/mcp-grafana:0.17.2",
@@ -1467,3 +1467,110 @@ def test_the_dns_corpus_covers_the_truncation_branch() -> None:
     assert all(len(v["object_name"]) <= 63 for v in truncated)
     assert all(not v["object_name"].endswith("-") for v in truncated)
     assert len({v["object_name"] for v in truncated}) == len(truncated)
+
+
+# --------------------------------------------------------------------------- #
+# The Authorization header a hosted HTTP MCP server needs -- #2503
+#
+# `ghcr.io/github/github-mcp-server` over HTTP authenticates the CLIENT: per
+# GitHub's docs its streamable-HTTP transport requires `Authorization: Bearer
+# <PAT>` on every request, and an unauthenticated `GET /mcp` is a 401. Until
+# now the hosted entry carried a URL and nothing else, so the probe failed and
+# the agent simply listed no `mcp__github__*` tools -- a silent no-tools, not
+# an error. The header is DERIVED from ``bearer_secret`` (or the single
+# declared secret) for the same reason the URL is derived (ADR-0086): the
+# author writes neither.
+# --------------------------------------------------------------------------- #
+GITHUB = ConnectorSpec(
+    image="ghcr.io/github/github-mcp-server:v0.20.1",
+    secrets=["GITHUB_PERSONAL_ACCESS_TOKEN"],
+)
+
+
+def _github_entry(spec: ConnectorSpec = GITHUB) -> dict:
+    return r.mcp_entry("acme-rel", "acme-bot", "acme-ns", "github", spec)
+
+
+def test_a_hosted_connector_carries_a_bearer_header_for_its_declared_secret() -> None:
+    # Without this the mounted entry is a bare URL, github-mcp-server answers
+    # 401, and the failure surfaces only as an agent with no tools (#2503).
+    entry = _github_entry()
+    assert entry["headers"] == {"Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"}
+    # The URL derivation is untouched: the header rides alongside it.
+    assert entry["url"] == (
+        "http://acme-rel-acme-bot-mcp-github.acme-ns.svc.cluster.local:8000/mcp"
+    )
+
+
+def test_a_secret_ref_contributes_its_env_var_name_not_the_secret_it_points_at() -> None:
+    # `secrets:` is `list[str | SecretRef]`. The header names the ENV VAR the
+    # MCP client expands, which for a SecretRef is `.name` -- `from_secret` is
+    # a Kubernetes Secret name and would expand to nothing in the sandbox.
+    spec = ConnectorSpec(
+        image="ghcr.io/github/github-mcp-server:v0.20.1",
+        secrets=[SecretRef(name="GITHUB_PERSONAL_ACCESS_TOKEN", from_secret="gh-pat")],
+    )
+    assert _github_entry(spec)["headers"] == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
+
+
+def test_a_hosted_connector_with_no_secrets_renders_exactly_as_it_did_before() -> None:
+    # Regression guard on the byte-identical claim: a connector that declares
+    # no credential has no env var to reference, so emitting an empty or
+    # literal header would change the mounted entry of every existing bundle.
+    spec = ConnectorSpec(image="ghcr.io/github/github-mcp-server:v0.20.1")
+    assert _github_entry(spec) == {
+        "type": "http",
+        "url": "http://acme-rel-acme-bot-mcp-github.acme-ns.svc.cluster.local:8000/mcp",
+    }
+
+
+def test_a_remote_connector_keeps_the_headers_its_author_wrote() -> None:
+    # Derivation is scoped to the hosted form. A `url:` connector's headers are
+    # author input, so deriving over them would silently replace a hand-written
+    # Authorization (or drop a second header) on every existing remote bundle.
+    assert r.mcp_entry("acme-rel", "acme-bot", "acme-ns", "internal", REMOTE) == {
+        "type": "http",
+        "url": "https://mcp.internal/mcp",
+        "headers": {"Authorization": "Bearer ${T}"},
+    }
+
+
+def test_only_the_placeholder_is_emitted_never_a_resolved_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `${VAR}` is expanded by the MCP client from the sandbox environment. If
+    # the renderer ever read the value instead, the credential would land in
+    # the mounted `.mcp.json` -- a plaintext copy on disk in every tier, and in
+    # anything that logs the rendered entry.
+    monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "ghp_sentinel")
+    assert "ghp_sentinel" not in json.dumps(_github_entry())
+
+
+def test_bearer_secret_names_the_header_when_several_secrets_are_declared() -> None:
+    # #2559: secrets[0] was the Bearer only because it came first. A hosted
+    # connector that also declares a pod-side credential must name the header
+    # secret, or the sandbox would bind the wrong name (or every name).
+    spec = ConnectorSpec(
+        image="ghcr.io/github/github-mcp-server:v0.20.1",
+        secrets=["POD_ONLY", "GITHUB_PERSONAL_ACCESS_TOKEN"],
+        bearer_secret="GITHUB_PERSONAL_ACCESS_TOKEN",
+    )
+    assert _github_entry(spec)["headers"] == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
+
+
+def test_a_single_declared_secret_still_derives_the_header_without_bearer_secret() -> None:
+    # The github-mcp-server shape. Requiring the new field on every existing
+    # one-secret bundle would be a break for no security gain: there is only
+    # one name that could be the Bearer.
+    spec = ConnectorSpec(
+        image="ghcr.io/github/github-mcp-server:v0.20.1",
+        secrets=["GITHUB_PERSONAL_ACCESS_TOKEN"],
+    )
+    assert spec.bearer_secret is None
+    assert _github_entry(spec)["headers"] == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }

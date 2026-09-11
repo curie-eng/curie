@@ -13,7 +13,12 @@
 # operator cannot fix this from postgres.auth.database:
 #
 #   api, worker (SQLAlchemy + asyncpg)  ->  ?ssl=require
-#   Langfuse web + worker (Prisma)      ->  ?sslmode=no-verify
+#   Langfuse web + worker (Prisma)      ->  ?sslmode=require&sslaccept=accept_invalid_certs
+#
+# Prisma/quaint accepts only disable|prefer|require for sslmode. #2476 rendered
+# ?sslmode=no-verify, which Prisma logs at debug and treats as prefer, so the
+# Langfuse half did not enforce TLS (#2507). sslaccept=accept_invalid_certs is
+# the no-CA posture; verify-full still needs a mounted CA (#2508).
 #
 # One more consumer: the api migrate init container calls asyncpg.connect() on
 # the DSN directly. asyncpg's DSN parser knows sslmode, not ssl, so an ssl=
@@ -34,8 +39,9 @@
 #      query parameter. This is what makes assertion 3 non-vacuous: without
 #      it, a template that emitted the suffix unconditionally would pass.
 #   3. byo-require (deploy=false + host + sslMode=require): api/worker/migrate
-#      DSNs end in ?ssl=require; both Langfuse DSNs end in ?sslmode=no-verify.
-#      Host still resolves to the BYO host in the SAME render.
+#      DSNs end in ?ssl=require; both Langfuse DSNs end in
+#      ?sslmode=require&sslaccept=accept_invalid_certs. Host still resolves to
+#      the BYO host in the SAME render.
 #   4. NEGATIVE CONTROL -- the in-chart guard: helm template
 #      --set postgres.sslMode=require with postgres.deploy left true exits
 #      non-zero and stderr names BOTH postgres.sslMode and postgres.deploy.
@@ -50,6 +56,11 @@
 #   7. The same extracted probe runs against a closed port with the installed
 #      asyncpg driver (no fake), so a scheme or ssl-kwarg rejection cannot hide
 #      behind the argument stub.
+#   8. Prisma sslmode set: every rendered Langfuse DATABASE_URL's sslmode, if
+#      present, is one of disable|prefer|require. A synthetic no-verify (the
+#      #2476 spelling) and verify-full each fail that check, so a later
+#      helper that reintroduces a non-Prisma value cannot pass by updating
+#      assertion 3's expected string alone.
 #
 # Every render goes through --output-dir, never a stdout pipe: piping helm
 # template in this environment silently truncates a large render at exit 0
@@ -100,6 +111,7 @@ BYO_REQUIRE_DIR="$BYO_REQUIRE_DIR" BYO_HOST="$BYO_HOST" \
 python3 <<'PY'
 import os
 import sys
+from urllib.parse import parse_qs, urlparse
 
 import yaml
 
@@ -214,8 +226,60 @@ for label, containers, expected in consumers(BYO_REQUIRE_DIR, BYO_HOST):
     if label in {"api", "worker", "schema-migrate"}:
         expected = expected + "?ssl=require"
     else:
-        expected = expected + "?sslmode=no-verify"
+        expected = expected + "?sslmode=require&sslaccept=accept_invalid_certs"
     check_url("3", containers, label, expected, "byo-require render")
+
+# Prisma/quaint sslmode values: https://www.prisma.io/docs/orm/overview/databases/postgresql
+# sslmode=(disable|prefer|require). Unknown values (no-verify, verify-full, ...)
+# are logged at debug and treated as prefer, so they cannot enforce TLS.
+PRISMA_SSLMODES = frozenset({"disable", "prefer", "require"})
+
+
+def prisma_sslmode_violations(url):
+    modes = parse_qs(urlparse(url).query).get("sslmode", [])
+    return [mode for mode in modes if mode not in PRISMA_SSLMODES]
+
+
+for ctx, templates_dir in (
+    ("default render", DEFAULT_DIR),
+    ("byo-plain render", BYO_PLAIN_DIR),
+    ("byo-require render", BYO_REQUIRE_DIR),
+):
+    for label, containers, _expected in consumers(templates_dir, "unused"):
+        if label not in {"langfuse-web", "langfuse-worker"}:
+            continue
+        actual = database_url(containers, f"{ctx}:{label}")
+        if actual is None:
+            continue
+        for mode in prisma_sslmode_violations(actual):
+            failures.append(
+                f"[8] {ctx}: {label} DATABASE_URL sslmode={mode!r} is outside "
+                f"Prisma's {sorted(PRISMA_SSLMODES)}"
+            )
+
+for synthetic, label in (
+    (
+        "postgresql://postgres:$(POSTGRES_PASSWORD)@pg.acme.internal:5432/postgres?sslmode=no-verify",
+        "no-verify",
+    ),
+    (
+        "postgresql://postgres:$(POSTGRES_PASSWORD)@pg.acme.internal:5432/postgres?sslmode=verify-full",
+        "verify-full",
+    ),
+):
+    found = prisma_sslmode_violations(synthetic)
+    if not found:
+        failures.append(
+            f"[8] prisma sslmode set check did not reject synthetic sslmode={label!r}"
+        )
+
+require_ok = prisma_sslmode_violations(
+    "postgresql://postgres:x@pg.acme.internal:5432/postgres?sslmode=require&sslaccept=accept_invalid_certs"
+)
+if require_ok:
+    failures.append(
+        f"[8] prisma sslmode set check rejected a valid require DSN: {require_ok!r}"
+    )
 
 if failures:
     for message in failures:
@@ -225,7 +289,8 @@ if failures:
 
 print("  [1] default: DATABASE_URL has no TLS query parameter on all five consumers: OK")
 print("  [2] byo-plain: still no TLS query parameter (require is not unconditional): OK")
-print("  [3] byo-require: ?ssl=require on asyncpg, ?sslmode=no-verify on Prisma: OK")
+print("  [3] byo-require: ?ssl=require on asyncpg, ?sslmode=require&sslaccept=accept_invalid_certs on Prisma: OK")
+print("  [8] Prisma sslmode is disable|prefer|require; synthetic no-verify and verify-full are rejected: OK")
 PY
 
 echo
@@ -476,7 +541,7 @@ PY
 
 echo
 echo "PASS: postgres.sslMode renders a TLS parameter on every Postgres DSN"
-echo "      (asyncpg ?ssl=require, Prisma ?sslmode=no-verify), the default and"
+echo "      (asyncpg ?ssl=require, Prisma ?sslmode=require&sslaccept=accept_invalid_certs), the default and"
 echo "      BYO-plain renders stay suffix-free, invalid values and require+"
 echo "      in-chart deploy are refused by name, and the schema-migrate probe"
 echo "      connects through DATABASE_URL with asyncpg, including against a"

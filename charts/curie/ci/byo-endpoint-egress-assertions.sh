@@ -41,14 +41,20 @@
 #   6. Opting out of Rail 1 (`security.networkPolicy.enabled=false`) does not
 #      require either key: there is no fail-closed runner policy to satisfy.
 #   7. Both new keys reuse the shared `curie.objectStore.egressEntry`
-#      validator, so a default route, a metadata-covering CIDR, and a
-#      ports-less entry are each refused.
+#      validator, so a default route, a metadata-covering CIDR, a
+#      ports-less entry, a quarter-route prefix, IPv6 ULA metadata
+#      containment (including uncompressed spelling), a protocol-only
+#      ports item, and an endPort range are each refused, while a /32,
+#      /24, /128, /48, and named-port peer still render (#2368).
 #   8. Neither key is a silent no-op on the in-chart path. Setting
 #      otelCollector.egress with otelCollector.deploy=true, or api.egress with
 #      api.deploy=true, is refused at render naming the key -- the key is only
 #      read on the BYO branch, and quietly ignoring it there is how an operator
 #      ends up believing egress is declared when the pod selector is what
-#      actually governs.
+#      actually governs. That unused-key refusal is scoped to the runner still
+#      dialing the in-chart Service. When the effective runner-facing endpoint
+#      is external (#2367), the dedicated key is the peer for that host even
+#      while the in-chart pod remains deployed.
 #   9. CLASS GUARD. The point of #2317 is that this was a class, not two bugs.
 #      Assertion 12 parses EVERY template under charts/curie/templates that
 #      renders a `kind: NetworkPolicy` -- discovered by grep, never a hardcoded
@@ -60,6 +66,19 @@
 #      (keyed by file AND component) with a written reason. A future author adding a
 #      fourth in-chart carve-out is caught at CI time rather than by a customer
 #      whose telemetry silently stops.
+#  13. #2367 inverse: api.deploy=true with an external dispatcher.apiBaseUrl and
+#      no declared peer fails at render naming api.egress. The same render with
+#      api.egress emits runner-allow-api-endpoint (in-chart runner-allow-api
+#      stays). The same render with only allowedEgress still succeeds -- that
+#      is the documented legacy allow, including 0.0.0.0/0.
+#  14. #2367 extraEnv siblings: worker.extraEnv CURIE_API_URL,
+#      worker.extraEnv CURIE_RUNNER_API_URL, and agentSandbox.runner.extraEnv
+#      OTEL_EXPORTER_OTLP_ENDPOINT each fail closed when they point the runner
+#      at an external host with no peer, and render the dedicated endpoint
+#      policy when the matching egress key is set. A valueFrom extraEnv is
+#      treated as external because the chart cannot prove it is in-cluster.
+#  15. An in-chart dispatcher.apiBaseUrl (this release's API Service) is not
+#      external: api.deploy=true does not require api.egress.
 #
 # NetworkPolicy speaks CIDRs, not DNS names, so the chart cannot derive an
 # allow from otelCollector.endpoint or dispatcher.apiBaseUrl. Values-level CIDR
@@ -97,8 +116,9 @@ API_BASE_URL=https://api.example.net
 # Each entry is `<template-basename>:<component>=reason`. The key is the FILE as
 # well as the component, because the same component gates a carve-out in more
 # than one NetworkPolicy template with different justifications (otelCollector
-# is both an in-chart runner peer and an in-chart mail-adapter peer, and only
-# one of those two is exempt).
+# is both an in-chart runner peer and an in-chart mail-adapter peer; neither is
+# exempt today -- the mail-adapter row was removed once #2361 gave that carve-out
+# a real BYO branch of its own).
 #
 # An exemption says: this in-chart `.deploy` carve-out deliberately has no BYO
 # `{{- else }}` branch, and here is why the external form of that destination is
@@ -107,7 +127,6 @@ API_BASE_URL=https://api.example.net
 declare -a DEPLOY_GATE_EXEMPTIONS=(
   "security-networkpolicy.yaml:inference=an external inference endpoint is the model API, already governed by the operator's security.networkPolicy.allowedEgress model allowlist, which is the intended mechanism there"
   "mail-adapter.yaml:mailAdapter=this is the whole-template deploy gate for the mail adapter itself, not an egress carve-out: with mailAdapter.deploy false there is no adapter pod, no policy, and no destination to bring your own"
-  "mail-adapter.yaml:otelCollector=deliberate, documented asymmetry. The mail adapter is the only first-party workload with its own egress policy, so with otelCollector.deploy false and an external otelCollector.endpoint the chart invents no broad allow for an address it cannot know; the operator applies an additional egress policy selecting the adapter's labels, because NetworkPolicies union rather than intersect. Written up in charts/curie/README.md -- search for \"asymmetric\" in the mail adapter section"
 )
 
 fail() {
@@ -143,6 +162,7 @@ must_fail_naming() {
 
 CHECKER="$TMP/check.py"
 cat > "$CHECKER" <<'PY'
+import json
 import pathlib
 import sys
 
@@ -385,6 +405,109 @@ elif ACTION == "no-collector-policy":
         )
     print("ok: telemetry-off BYO renders with no collector egress policy of either kind")
 
+elif ACTION == "has-block":
+    policy_name, cidr, ports_json = sys.argv[3], sys.argv[4], sys.argv[5]
+    expected_ports = json.loads(ports_json)
+    policy = named(docs, policy_name)
+    if policy is None:
+        die(f"missing NetworkPolicy/{policy_name}")
+    matches = [
+        (block_cidr, ports, excepts)
+        for block_cidr, ports, excepts in ip_blocks(policy)
+        if block_cidr == cidr
+    ]
+    if not matches:
+        die(
+            f"{policy_name} has no ipBlock {cidr}; "
+            f"blocks={ip_blocks(policy)!r}"
+        )
+    for block_cidr, ports, excepts in matches:
+        if ports != expected_ports:
+            die(f"{cidr} ports are {ports!r}, expected {expected_ports!r}")
+        if excepts:
+            die(f"{cidr} must not except anything on a narrow allow; got {excepts}")
+    print(f"ok: {policy_name} allows {cidr} with {expected_ports}")
+
+elif ACTION == "inverse-api-legacy":
+    (api_name, api_byo_name, deny_name, allow_name) = ARGS
+    if named(docs, api_name) is None:
+        die(f"inverse legacy render dropped in-chart {api_name}")
+    if named(docs, api_byo_name) is not None:
+        die(
+            f"inverse legacy render emitted {api_byo_name}; allowedEgress is the "
+            "peer on this path, so the dedicated endpoint policy must stay off"
+        )
+    if named(docs, deny_name) is None:
+        die("inverse legacy render dropped runner-default-deny-egress")
+    if named(docs, allow_name) is None:
+        die(f"inverse legacy render dropped {allow_name}")
+    print(
+        "ok: api.deploy=true + external API + allowedEgress keeps the in-chart "
+        "api allow and the legacy runner-allow-egress; no dedicated endpoint policy"
+    )
+
+elif ACTION == "inverse-api-dedicated":
+    (api_name, api_byo_name, deny_name, allow_name, cidr) = ARGS
+    if named(docs, api_name) is None:
+        die(f"inverse dedicated render dropped in-chart {api_name}")
+    if named(docs, deny_name) is None:
+        die("inverse dedicated render dropped runner-default-deny-egress")
+    if named(docs, allow_name) is not None:
+        die(
+            f"inverse dedicated render emitted {allow_name}; allowedEgress is "
+            "empty on this path"
+        )
+    assert_byo(
+        named(docs, api_byo_name),
+        api_byo_name,
+        cidr,
+        [{"protocol": "TCP", "port": 443}],
+    )
+    print(
+        "ok: api.deploy=true + external API + api.egress renders "
+        "runner-allow-api-endpoint beside the in-chart api allow"
+    )
+
+elif ACTION == "inverse-collector-dedicated":
+    (
+        collector_name,
+        collector_byo_name,
+        deny_name,
+        allow_name,
+        cidr,
+        grpc_port,
+        http_port,
+    ) = ARGS
+    if named(docs, collector_name) is None:
+        die(f"inverse collector render dropped in-chart {collector_name}")
+    if named(docs, deny_name) is None:
+        die("inverse collector render dropped runner-default-deny-egress")
+    if named(docs, allow_name) is not None:
+        die(
+            f"inverse collector render emitted {allow_name}; allowedEgress is "
+            "empty on this path"
+        )
+    assert_in_chart(
+        named(docs, collector_name),
+        collector_name,
+        "otel-collector",
+        [
+            {"protocol": "TCP", "port": int(grpc_port)},
+            {"protocol": "TCP", "port": int(http_port)},
+        ],
+    )
+    assert_byo(
+        named(docs, collector_byo_name),
+        collector_byo_name,
+        cidr,
+        [{"protocol": "TCP", "port": 4318}],
+    )
+    print(
+        "ok: otelCollector.deploy=true + runner extraEnv OTLP + "
+        "otelCollector.egress renders runner-allow-collector-endpoint beside "
+        "the in-chart collector allow"
+    )
+
 else:
     die(f"unknown action {ACTION!r}")
 PY
@@ -560,7 +683,26 @@ EOF
   fi
 }
 
+must_render_block() {
+  local label="$1"
+  local policy_name="$2"
+  local cidr="$3"
+  local ports_json="$4"
+  local values="$5"
+  local out
+  out="$(render_dir "${label// /_}" --values "$values")" \
+    || fail "${label} must render"
+  python3 "$CHECKER" "$out" has-block "$policy_name" "$cidr" "$ports_json" \
+    || fail "${label} did not render ipBlock ${cidr} with ports ${ports_json}"
+}
+
 for KEY in otelCollector.egress api.egress; do
+  if [[ "$KEY" == "otelCollector.egress" ]]; then
+    POLICY_NAME="$COLLECTOR_BYO_POLICY"
+  else
+    POLICY_NAME="$API_BYO_POLICY"
+  fi
+
   DEFAULT_ROUTE_ENTRY=$'    - cidr: 0.0.0.0/0\n      ports: [{ protocol: TCP, port: 443 }]'
   IMDS_ENTRY=$'    - cidr: 169.254.0.0/16\n      ports: [{ protocol: TCP, port: 443 }]'
   NO_PORTS_ENTRY=$'    - cidr: 192.0.2.30/32'
@@ -573,6 +715,55 @@ for KEY in otelCollector.egress api.egress; do
 
   write_entry_values "$TMP/entry-no-ports.yaml" "$KEY" "$NO_PORTS_ENTRY"
   must_fail_naming "ports-missing ${KEY}" "ports" "$TMP/entry-no-ports.yaml"
+
+  write_entry_values "$TMP/entry-quarter-route.yaml" "$KEY" \
+    $'    - cidr: 64.0.0.0/2\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "quarter-route ${KEY}" "IPv4 /8, IPv6 /32" "$TMP/entry-quarter-route.yaml"
+
+  write_entry_values "$TMP/entry-ula8.yaml" "$KEY" \
+    $'    - cidr: fd00::/8\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "ipv6-ula-8 ${KEY}" "169.254.169.254" "$TMP/entry-ula8.yaml"
+
+  write_entry_values "$TMP/entry-ula7.yaml" "$KEY" \
+    $'    - cidr: fc00::/7\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "ipv6-ula-7 ${KEY}" "169.254.169.254" "$TMP/entry-ula7.yaml"
+
+  write_entry_values "$TMP/entry-ula-uncompressed.yaml" "$KEY" \
+    $'    - cidr: fd00:0ec2::/48\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_fail_naming "ipv6-ula-uncompressed ${KEY}" "169.254.169.254" "$TMP/entry-ula-uncompressed.yaml"
+
+  write_entry_values "$TMP/entry-protocol-only.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP }]'
+  must_fail_naming "protocol-only ${KEY}" "each ports item must set port" "$TMP/entry-protocol-only.yaml"
+
+  write_entry_values "$TMP/entry-endport.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP, port: 1, endPort: 65535 }]'
+  must_fail_naming "endport ${KEY}" "endPort" "$TMP/entry-endport.yaml"
+
+  write_entry_values "$TMP/entry-p1.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_render_block "narrow-v4-32 ${KEY}" "$POLICY_NAME" "192.0.2.30/32" \
+    '[{"protocol": "TCP", "port": 443}]' "$TMP/entry-p1.yaml"
+
+  write_entry_values "$TMP/entry-p2.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.0/24\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_render_block "narrow-v4-24 ${KEY}" "$POLICY_NAME" "192.0.2.0/24" \
+    '[{"protocol": "TCP", "port": 443}]' "$TMP/entry-p2.yaml"
+
+  write_entry_values "$TMP/entry-p3.yaml" "$KEY" \
+    $'    - cidr: 2001:db8::10/128\n      ports: [{ protocol: TCP, port: 4318 }]'
+  must_render_block "narrow-v6-128 ${KEY}" "$POLICY_NAME" "2001:db8::10/128" \
+    '[{"protocol": "TCP", "port": 4318}]' "$TMP/entry-p3.yaml"
+
+  write_entry_values "$TMP/entry-p4.yaml" "$KEY" \
+    $'    - cidr: 2001:db8::/48\n      ports: [{ protocol: TCP, port: 443 }]'
+  must_render_block "narrow-v6-48 ${KEY}" "$POLICY_NAME" "2001:db8::/48" \
+    '[{"protocol": "TCP", "port": 443}]' "$TMP/entry-p4.yaml"
+
+  write_entry_values "$TMP/entry-p5.yaml" "$KEY" \
+    $'    - cidr: 192.0.2.30/32\n      ports: [{ protocol: TCP, port: https }]'
+  must_render_block "named-port ${KEY}" "$POLICY_NAME" "192.0.2.30/32" \
+    '[{"protocol": "TCP", "port": "https"}]' "$TMP/entry-p5.yaml"
 done
 
 echo "=== Assertion 10: otelCollector.egress with deploy=true is refused at render, naming the key ==="
@@ -837,5 +1028,234 @@ else
   fail "class guard: an in-chart .deploy carve-out has no BYO else branch and no exemption"
 fi
 
+echo "=== Assertion 13: api.deploy=true + external apiBaseUrl with no peer fails at render, naming api.egress ==="
+INVERSE_API_MISSING="$TMP/inverse-api-missing.yaml"
+cat > "$INVERSE_API_MISSING" <<EOF
+dispatcher:
+  apiBaseUrl: ${API_BASE_URL}
+ui:
+  apiBaseUrl: ${API_BASE_URL}
+EOF
+must_fail_naming "inverse apiBaseUrl missing peer" "api.egress" "$INVERSE_API_MISSING"
+
+echo "=== Assertion 14: api.deploy=true + external apiBaseUrl + allowedEgress is the documented legacy allow ==="
+INVERSE_API_LEGACY="$TMP/inverse-api-legacy.yaml"
+cat > "$INVERSE_API_LEGACY" <<EOF
+dispatcher:
+  apiBaseUrl: ${API_BASE_URL}
+ui:
+  apiBaseUrl: ${API_BASE_URL}
+security:
+  networkPolicy:
+    allowedEgress:
+      - cidr: ${API_CIDR}
+        ports: [{ protocol: TCP, port: 443 }]
+EOF
+INVERSE_API_LEGACY_OUT="$(render_dir inverse-api-legacy --values "$INVERSE_API_LEGACY")"
+python3 "$CHECKER" "$INVERSE_API_LEGACY_OUT" inverse-api-legacy \
+  "$API_POLICY" "$API_BYO_POLICY" "$DEFAULT_DENY_EGRESS" "$ALLOW_EGRESS" \
+  || fail "inverse apiBaseUrl + allowedEgress must keep runner-allow-api and runner-allow-egress without a dedicated endpoint policy"
+
+echo "=== Assertion 15: api.deploy=true + external apiBaseUrl + allowedEgress 0.0.0.0/0 still renders (documented web egress) ==="
+INVERSE_API_WEB="$TMP/inverse-api-web.yaml"
+cat > "$INVERSE_API_WEB" <<EOF
+dispatcher:
+  apiBaseUrl: ${API_BASE_URL}
+ui:
+  apiBaseUrl: ${API_BASE_URL}
+security:
+  networkPolicy:
+    allowedEgress:
+      - cidr: 0.0.0.0/0
+        ports: [{ protocol: TCP, port: 443 }]
+EOF
+INVERSE_API_WEB_OUT="$(render_dir inverse-api-web --values "$INVERSE_API_WEB")" \
+  || fail "inverse apiBaseUrl + allowedEgress 0.0.0.0/0 must still render"
+python3 "$CHECKER" "$INVERSE_API_WEB_OUT" inverse-api-legacy \
+  "$API_POLICY" "$API_BYO_POLICY" "$DEFAULT_DENY_EGRESS" "$ALLOW_EGRESS" \
+  || fail "inverse apiBaseUrl + 0.0.0.0/0 must keep the legacy runner-allow-egress path"
+
+echo "=== Assertion 16: api.deploy=true + external apiBaseUrl + api.egress renders the dedicated endpoint policy ==="
+INVERSE_API_DEDICATED="$TMP/inverse-api-dedicated.yaml"
+cat > "$INVERSE_API_DEDICATED" <<EOF
+api:
+  egress:
+    - cidr: ${API_CIDR}
+      ports: [{ protocol: TCP, port: 443 }]
+dispatcher:
+  apiBaseUrl: ${API_BASE_URL}
+ui:
+  apiBaseUrl: ${API_BASE_URL}
+EOF
+INVERSE_API_DEDICATED_OUT="$(render_dir inverse-api-dedicated --values "$INVERSE_API_DEDICATED")"
+python3 "$CHECKER" "$INVERSE_API_DEDICATED_OUT" inverse-api-dedicated \
+  "$API_POLICY" "$API_BYO_POLICY" "$DEFAULT_DENY_EGRESS" "$ALLOW_EGRESS" "$API_CIDR" \
+  || fail "inverse apiBaseUrl + api.egress must render ${API_BYO_POLICY} covering api.egress"
+
+echo "=== Assertion 17: in-chart apiBaseUrl is not external and does not require api.egress ==="
+IN_CHART_API_BASE="$TMP/in-chart-api-base.yaml"
+cat > "$IN_CHART_API_BASE" <<'EOF'
+dispatcher:
+  apiBaseUrl: http://curie-api:8000
+ui:
+  apiBaseUrl: http://curie-api:8000
+EOF
+IN_CHART_API_BASE_OUT="$(render_dir in-chart-api-base --values "$IN_CHART_API_BASE")" \
+  || fail "dispatcher.apiBaseUrl pointing at this release's API Service must still render without api.egress"
+python3 "$CHECKER" "$IN_CHART_API_BASE_OUT" default \
+  "$COLLECTOR_POLICY" "$COLLECTOR_BYO_POLICY" "$API_POLICY" "$API_BYO_POLICY" \
+  "$DEFAULT_DENY_EGRESS" "$ALLOW_EGRESS" "$GRPC_PORT" "$HTTP_PORT" \
+  || fail "in-chart apiBaseUrl must keep the default in-chart collector/api carve-outs"
+
+echo "=== Assertion 18: worker.extraEnv CURIE_API_URL external with no peer fails, naming api.egress ==="
+EXTRAENV_API_MISSING="$TMP/extraenv-api-missing.yaml"
+cat > "$EXTRAENV_API_MISSING" <<EOF
+worker:
+  extraEnv:
+    - name: CURIE_API_URL
+      value: ${API_BASE_URL}
+EOF
+must_fail_naming "extraEnv CURIE_API_URL missing peer" "api.egress" "$EXTRAENV_API_MISSING"
+
+echo "=== Assertion 19: worker.extraEnv CURIE_API_URL + api.egress renders the dedicated endpoint policy ==="
+EXTRAENV_API_DEDICATED="$TMP/extraenv-api-dedicated.yaml"
+cat > "$EXTRAENV_API_DEDICATED" <<EOF
+api:
+  egress:
+    - cidr: ${API_CIDR}
+      ports: [{ protocol: TCP, port: 443 }]
+worker:
+  extraEnv:
+    - name: CURIE_API_URL
+      value: ${API_BASE_URL}
+EOF
+EXTRAENV_API_OUT="$(render_dir extraenv-api-dedicated --values "$EXTRAENV_API_DEDICATED")"
+python3 "$CHECKER" "$EXTRAENV_API_OUT" inverse-api-dedicated \
+  "$API_POLICY" "$API_BYO_POLICY" "$DEFAULT_DENY_EGRESS" "$ALLOW_EGRESS" "$API_CIDR" \
+  || fail "extraEnv CURIE_API_URL + api.egress must render ${API_BYO_POLICY}"
+
+echo "=== Assertion 20: worker.extraEnv CURIE_RUNNER_API_URL external with no peer fails, naming api.egress ==="
+EXTRAENV_RUNNER_API_MISSING="$TMP/extraenv-runner-api-missing.yaml"
+cat > "$EXTRAENV_RUNNER_API_MISSING" <<EOF
+worker:
+  extraEnv:
+    - name: CURIE_RUNNER_API_URL
+      value: ${API_BASE_URL}
+EOF
+must_fail_naming "extraEnv CURIE_RUNNER_API_URL missing peer" "api.egress" "$EXTRAENV_RUNNER_API_MISSING"
+
+echo "=== Assertion 21: worker.extraEnv CURIE_API_URL valueFrom with no peer fails, naming api.egress ==="
+EXTRAENV_API_VALUEFROM="$TMP/extraenv-api-valuefrom.yaml"
+cat > "$EXTRAENV_API_VALUEFROM" <<'EOF'
+worker:
+  extraEnv:
+    - name: CURIE_API_URL
+      valueFrom:
+        secretKeyRef:
+          name: acme-api-url
+          key: url
+EOF
+must_fail_naming "extraEnv CURIE_API_URL valueFrom missing peer" "api.egress" "$EXTRAENV_API_VALUEFROM"
+
+echo "=== Assertion 22: runner extraEnv OTEL_EXPORTER_OTLP_ENDPOINT with collector in-chart and no peer fails, naming otelCollector.egress ==="
+EXTRAENV_OTLP_MISSING="$TMP/extraenv-otlp-missing.yaml"
+cat > "$EXTRAENV_OTLP_MISSING" <<EOF
+agentSandbox:
+  runner:
+    extraEnv:
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: ${OTLP_ENDPOINT}
+EOF
+must_fail_naming "extraEnv OTEL_EXPORTER_OTLP_ENDPOINT missing peer" "otelCollector.egress" "$EXTRAENV_OTLP_MISSING"
+
+echo "=== Assertion 23: runner extraEnv OTEL + otelCollector.egress with deploy=true renders the dedicated endpoint policy ==="
+EXTRAENV_OTLP_DEDICATED="$TMP/extraenv-otlp-dedicated.yaml"
+cat > "$EXTRAENV_OTLP_DEDICATED" <<EOF
+otelCollector:
+  egress:
+    - cidr: ${COLLECTOR_CIDR}
+      ports: [{ protocol: TCP, port: 4318 }]
+agentSandbox:
+  runner:
+    extraEnv:
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: ${OTLP_ENDPOINT}
+EOF
+EXTRAENV_OTLP_OUT="$(render_dir extraenv-otlp-dedicated --values "$EXTRAENV_OTLP_DEDICATED")"
+python3 "$CHECKER" "$EXTRAENV_OTLP_OUT" inverse-collector-dedicated \
+  "$COLLECTOR_POLICY" "$COLLECTOR_BYO_POLICY" "$DEFAULT_DENY_EGRESS" "$ALLOW_EGRESS" \
+  "$COLLECTOR_CIDR" "$GRPC_PORT" "$HTTP_PORT" \
+  || fail "runner extraEnv OTEL + otelCollector.egress must render ${COLLECTOR_BYO_POLICY} beside the in-chart collector allow"
+
+echo "=== Assertion 24: api.deploy=false with dispatcher.apiBaseUrl set to this release's Service DNS still requires api.egress ==="
+INCHART_BYO_API="$TMP/inchart-byo-api.yaml"
+cat > "$INCHART_BYO_API" <<'EOF'
+api:
+  deploy: false
+dispatcher:
+  apiBaseUrl: http://curie-api:8000
+ui:
+  apiBaseUrl: http://curie-api:8000
+EOF
+must_fail_naming "deploy-false in-chart apiBaseUrl missing peer" "api.egress" "$INCHART_BYO_API"
+
+echo "=== Assertion 25: runner extraEnv OTEL_EXPORTER_OTLP_TRACES_ENDPOINT with no peer fails, naming otelCollector.egress ==="
+EXTRAENV_OTLP_TRACES="$TMP/extraenv-otlp-traces.yaml"
+cat > "$EXTRAENV_OTLP_TRACES" <<EOF
+agentSandbox:
+  runner:
+    extraEnv:
+      - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+        value: ${OTLP_ENDPOINT}
+EOF
+must_fail_naming "extraEnv OTEL_EXPORTER_OTLP_TRACES_ENDPOINT missing peer" "otelCollector.egress" "$EXTRAENV_OTLP_TRACES"
+
+echo "=== Assertion 26: runner extraEnv OTEL + allowedEgress is the documented collector legacy allow ==="
+INVERSE_OTLP_LEGACY="$TMP/inverse-otlp-legacy.yaml"
+cat > "$INVERSE_OTLP_LEGACY" <<EOF
+agentSandbox:
+  runner:
+    extraEnv:
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: ${OTLP_ENDPOINT}
+security:
+  networkPolicy:
+    allowedEgress:
+      - cidr: ${COLLECTOR_CIDR}
+        ports: [{ protocol: TCP, port: 4318 }]
+EOF
+INVERSE_OTLP_LEGACY_OUT="$(render_dir inverse-otlp-legacy --values "$INVERSE_OTLP_LEGACY")"
+python3 "$CHECKER" "$INVERSE_OTLP_LEGACY_OUT" inverse-api-legacy \
+  "$COLLECTOR_POLICY" "$COLLECTOR_BYO_POLICY" "$DEFAULT_DENY_EGRESS" "$ALLOW_EGRESS" \
+  || fail "inverse OTEL extraEnv + allowedEgress must keep runner-allow-collector and runner-allow-egress without a dedicated endpoint policy"
+
+echo "=== Assertion 27: Rail 1 off does not require a peer for an external apiBaseUrl with api.deploy=true ==="
+INVERSE_RAIL_OFF="$TMP/inverse-rail-off.yaml"
+cat > "$INVERSE_RAIL_OFF" <<EOF
+security:
+  networkPolicy:
+    enabled: false
+dispatcher:
+  apiBaseUrl: ${API_BASE_URL}
+ui:
+  apiBaseUrl: ${API_BASE_URL}
+EOF
+if ! helm template "$RELEASE" "$CHART" --namespace "$NAMESPACE" \
+  --values "$INVERSE_RAIL_OFF" > /dev/null; then
+  fail "networkPolicy.enabled=false must render an external apiBaseUrl without api.egress"
+fi
+echo "ok: opting out of Rail 1 does not require api.egress for an external apiBaseUrl"
+
+echo "=== Assertion 28: helm package does not ship ci/ test scripts into the release Secret ==="
+PKG_DIR="$TMP/helm-pkg"
+mkdir -p "$PKG_DIR"
+helm package "$CHART" -d "$PKG_DIR" >/dev/null
+PKG_TGZ="$(find "$PKG_DIR" -maxdepth 1 -name '*.tgz' -print)"
+[ -n "$PKG_TGZ" ] || fail "helm package wrote no tgz"
+if tar -tzf "$PKG_TGZ" | grep -q '/ci/'; then
+  fail "helm package still contains ci/ test scripts; add ci/ to charts/curie/.helmignore so the release Secret stays under 1MiB"
+fi
+echo "ok: helm package excludes ci/"
+
 echo
-echo "PASS: BYO collector and API egress are required and rendered as runner NetworkPolicies; the in-chart carve-outs are unchanged; and no .deploy carve-out lacks a BYO branch."
+echo "PASS: BYO collector and API egress are required and rendered as runner NetworkPolicies; the in-chart carve-outs are unchanged; the effective runner-facing endpoint fails closed without a declared peer; and no .deploy carve-out lacks a BYO branch."

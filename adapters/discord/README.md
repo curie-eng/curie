@@ -49,3 +49,31 @@ failure never falls back to Slack or another surface.
 
 SQLite stores thread routing and delivery ids but not scoped channel tokens.
 Those remain in the environment or mounted bindings file.
+
+## Telemetry
+
+`main()` calls `bootstrap_service_telemetry` on the `curie_discord_adapter`
+package logger, so every module beneath it — including ones added later —
+writes single-line JSON that has passed
+`curie_telemetry.redact.RedactingLogFilter`, and those logs export over OTLP
+when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The bootstrap also installs the
+trace and metric exporters, but the adapter authors no spans and records no
+instruments yet, so those two signals carry nothing until someone
+instruments a call path. The three
+third-party namespaces the process runs under (`discord`, `uvicorn`, `httpx`)
+are bootstrapped alongside it, because they lost their handler when
+`logging.basicConfig` was removed and would otherwise print unredacted text via
+`logging.lastResort`. No endpoint set is a supported no-op, not a boot failure:
+that is what every local, offline and CI install runs.
+
+The adapter is a first-party workload that instruments itself, and it stays
+**outside** the instrumented-set enumeration in `charts/curie/CLAUDE.md`. That
+rule defines membership as exactly the workloads whose container `env` block
+includes the `curie.env.otel` helper, with
+`grep -n 'curie.env.otel' charts/curie/templates/` as the authoritative answer
+at any commit. This adapter has no chart template at all, and no compose
+service, so it renders no container `env` block and cannot be a member of a set
+defined by a template include; writing it in as prose would recreate exactly the
+stale hand-maintained list that rule exists to abolish. Whoever later adds a
+chart template for this adapter must add the `curie.env.otel` include, and that
+is the moment it joins the enumerated set.

@@ -22,6 +22,8 @@ SCHEMA_VERSION = 2
 LEASE_SECONDS = 300.0
 BODY_FAILURE_BACKOFF_SECONDS = 60.0
 TERMINAL_RECEIPT_MAX = 4096
+TERMINAL_COMPLETION_MAX = 4096
+_TERMINAL_COMPLETION_SQL = "delivered=1 OR deleted=1"
 
 _TERMINAL_STATES = ("accepted", "oversize", "primed", "rejected")
 _COMPACTABLE_TERMINAL_STATES = ("oversize", "rejected")
@@ -43,15 +45,25 @@ EventClaim = Literal["claimed", "busy", "done", "deleted"]
 class MailState:
     """The adapter's serialized SQLite owner."""
 
-    def __init__(self, path: str, *, max_pending: int, max_bytes: int) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        max_pending: int,
+        max_bytes: int,
+        terminal_completion_max: int | None = None,
+        enforce_size: bool = True,
+    ) -> None:
         self.path = Path(path)
         self.max_pending = max_pending
         self.max_bytes = max_bytes
         self.lock = threading.RLock()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if self.path.exists() and self.path.stat().st_size > max_bytes:
+        if enforce_size and self.path.exists() and self.path.stat().st_size > max_bytes:
             raise RuntimeError(
-                f"mail state {self.path} is larger than CURIE_MAIL_MAX_STATE_BYTES"
+                f"mail state {self.path} is larger than CURIE_MAIL_MAX_STATE_BYTES; "
+                "recover an offline copy with python -m curie_mail_adapter recover "
+                "--state <copy>"
             )
         self.connection = sqlite3.connect(
             self.path,
@@ -87,14 +99,30 @@ class MailState:
                 8,
                 min(TERMINAL_RECEIPT_MAX, max(1, max_bytes // page_size) // 4),
             )
+            derived_completion_max = max(
+                8,
+                min(TERMINAL_COMPLETION_MAX, max(1, max_bytes // page_size) // 4),
+            )
+            self.terminal_completion_max = (
+                derived_completion_max
+                if terminal_completion_max is None
+                else max(0, int(terminal_completion_max))
+            )
             page_limit = max(page_count, max_bytes // page_size)
             self.connection.execute(f"PRAGMA max_page_count={page_limit}")
             # A replacement is the sole writer. A lease left behind by SIGKILL
             # cannot still have an owner, so reclaim it immediately on open.
             self.connection.execute(
-                "UPDATE completion_events SET lease_owner=NULL, lease_until=NULL "
-                "WHERE delivered=0"
+                "UPDATE completion_events SET lease_owner=NULL, lease_until=NULL WHERE delivered=0"
             )
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._compact_terminal_completions(self.connection)
+                self.connection.commit()
+            except BaseException:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
 
     def _migrate(self, version: int) -> None:
         if version == 0:
@@ -203,6 +231,7 @@ class MailState:
                 ).fetchone():
                     return "known"
                 self._compact_terminal_receipts(connection)
+                self._compact_terminal_completions(connection)
                 pending = int(
                     connection.execute(
                         "SELECT count(*) FROM deliveries "
@@ -285,6 +314,26 @@ class MailState:
             "ORDER BY updated_at, message_id LIMIT ?)",
             (*_COMPACTABLE_TERMINAL_STATES, excess),
         )
+
+    def _compact_terminal_completions(
+        self, connection: sqlite3.Connection, *, incoming: int = 0
+    ) -> int:
+        """Evict oldest delivered or deleted completion rows; never unresolved or leased."""
+        count = int(
+            connection.execute(
+                f"SELECT count(*) FROM completion_events WHERE {_TERMINAL_COMPLETION_SQL}"
+            ).fetchone()[0]
+        )
+        excess = count + incoming - self.terminal_completion_max
+        if excess <= 0:
+            return 0
+        cursor = connection.execute(
+            "DELETE FROM completion_events WHERE event_id IN ("
+            f"SELECT event_id FROM completion_events WHERE {_TERMINAL_COMPLETION_SQL} "
+            "ORDER BY updated_at, event_id LIMIT ?)",
+            (excess,),
+        )
+        return max(0, int(cursor.rowcount))
 
     def _at_size_limit(self, connection: sqlite3.Connection) -> bool:
         page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
@@ -402,8 +451,7 @@ class MailState:
     ) -> Literal["ok", "missing", "too_large"]:
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT text FROM reply_state "
-                "WHERE conversation_id=? AND reply_ref=? AND active=1",
+                "SELECT text FROM reply_state WHERE conversation_id=? AND reply_ref=? AND active=1",
                 (conversation_id, reply_ref),
             ).fetchone()
             if row is None:
@@ -496,6 +544,7 @@ class MailState:
                 "WHERE conversation_id=? AND reply_ref=?",
                 (time.time(), conversation_id, reply_ref),
             )
+            self._compact_terminal_completions(connection)
 
     def finish_event(self, event_id: str) -> None:
         with self.transaction() as connection:
@@ -504,6 +553,7 @@ class MailState:
                 "updated_at=? WHERE event_id=?",
                 (time.time(), event_id),
             )
+            self._compact_terminal_completions(connection)
 
 
 def _receipt_json(message_id: str) -> str:

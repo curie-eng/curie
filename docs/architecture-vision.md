@@ -195,12 +195,14 @@ License; locally, the compose stack.
 change, and that is the realistic swap. A different SQL engine is a small
 refactor, not a rewrite.
 
-**Leakage:** two Postgres-isms are in the models: the
+**Leakage:** Postgres-isms in the models include the
 `sqlalchemy.dialects.postgresql.UUID` column type
-(`apps/api/src/curie_api/models.py`) and schema-qualified tables plus a
+(`apps/api/src/curie_api/models.py`), schema-qualified tables plus a
 schema-scoped native enum (`apps/api/src/curie_api/db.py::SCHEMA`, the
-`Environment` enum). Both have portable SQLAlchemy equivalents if a
-non-Postgres target ever materializes.
+`Environment` enum), and `JSONB`. The relational-db INTERFACE enumerates
+further application-SQL and constraint isms (`DISTINCT ON`,
+`NULLS NOT DISTINCT`, `SKIP LOCKED`). All have portable SQLAlchemy or SQL
+equivalents if a non-Postgres target ever materializes.
 
 ### 6. Communication channel (Slack, Discord, and email today)
 
@@ -218,20 +220,20 @@ versioned neutral reply events through one `emit` verb, and
 renders those events into Slack posts and `chat.update` edits; `HttpReplyAdapter`
 POSTs the same neutral JSON event to a binding's server-controlled endpoint.
 
-**Current adapter:** `apps/dispatcher` (Bolt, Socket Mode) on ingress,
-`SlackReplyAdapter` for Slack egress, and `HttpReplyAdapter` for configured
-non-Slack reply endpoints.
+**Current adapter:** Slack (`apps/dispatcher` Bolt + `SlackReplyAdapter`),
+Discord (`adapters/discord`), and email (`apps/mail-adapter`). Discord and
+email join on the authenticated HTTP edge; the worker delivers through
+`HttpReplyAdapter`.
 
 **What this proves, and what it does not:** `curie local message` and
 `curie cluster message` (`cli/src/chat.rs`, `cli/src/message.rs`) drive the entire
 deployed system with zero Slack contact by minting the exact
 `QueuedTurn` wire payload (`cli/src/queue.rs`) and standing in as the
-Slack Web API. Together with the HTTP adapter, that proves the neutral reply
-wire and per-turn routing, not a second production channel: Slack remains the
-only first-party production surface, and a complete third-party adapter
-lifecycle has not been exercised. Slack-specific rendering and interaction
-handling remain below the port: mrkdwn and Block Kit, including approval-card
-buttons and their settlement forms, live in
+Slack Web API. The HTTP adapter plus two first-party services prove the
+wire. Slack still owns interactive approvals (Choice / Confirm cards). A
+complete third-party adapter lifecycle has not been exercised. Slack-specific
+rendering and interaction handling remain below the port: mrkdwn and Block Kit,
+including approval-card buttons and their settlement forms, live in
 `apps/worker/src/curie_worker/slack_sink.py`.
 
 **Remaining channel work:** `QueuedTurn` carries `{event_id, conversation_id,
@@ -326,8 +328,8 @@ flowchart TB
 | Observability | OTLP to collector (write), API DTOs (read) | Langfuse behind `langfuse.py` | B+: write side clean but for three vendor span attributes (`langfuse.trace.name`, `langfuse.session.id`, `langfuse.user.id`); read side spans several API modules plus routers | Map the three `langfuse.*` attributes to neutral names in the collector; rename the `/langfuse/*` API routes |
 | Evals | Our stream schema + `EvalMatrix` DTO; store behind recorder | Langfuse traces + `eval_pass` scores | B: schema is ours; the case format converged into one frozen, drift-gated schema (#8, ADR-0019), leaving the `version:`/`suite:` tag convention as the unfrozen part | Freeze the tag convention into the schema, or record it as a deliberate soft contract |
 | Blob storage | S3 protocol (boto3 + AWS CLI, path-style, endpoint-configurable) | RustFS | B+: config-only within S3-compatible stores; the client is now built in one shared place (`packages/aci-protocol/src/aci_protocol/s3.py::build_s3_client`, #572), and the `ObjectStore` port (`apps/api/src/curie_api/storage.py::ObjectStore`) names the contract, but the second, non-S3 adapter is deferred by decision until a real demand lands (#282) | None needed until a non-S3 demand exists |
-| Relational DB | SQLAlchemy 2.0 + alembic | Postgres | A-: managed-Postgres swap is a DSN change; two Postgres-isms in models | Leave as is; note the `postgresql.UUID` and schema-scoped enum as the two things a non-Postgres target would touch |
-| Communication | `QueuedTurn` (channel-neutral, in `aci-protocol`) + versioned `ReplySink` events | Slack (Bolt + `SlackReplyAdapter`) plus `HttpReplyAdapter` for configured endpoints | B-: ingress and reply egress are neutral, with Slack-specific rendering and interactions held in its adapter; the HTTP adapter proves the wire, not a second first-party production channel or complete third-party lifecycle | Exercise a second production channel end to end, including its rendering, interaction, and lifecycle ownership |
+| Relational DB | SQLAlchemy 2.0 + alembic | Postgres | A-: managed-Postgres swap is a DSN change; enumerated Postgres-isms in models | Leave as is; a non-Postgres target reworks the enumerated leakage in the relational-db INTERFACE, not only UUID and the schema-scoped enum |
+| Communication | `QueuedTurn` (channel-neutral, in `aci-protocol`) + versioned `ReplySink` events | Slack (Bolt + `SlackReplyAdapter`), Discord (`adapters/discord`), and email (`apps/mail-adapter`) | B-: ingress and reply egress are neutral, with Slack-specific rendering and interactions held in its adapter; the HTTP adapter plus two first-party services prove the wire, with Slack still owning interactive approvals | Give Discord and email the interactive approval path Slack already owns, or exercise a complete third-party adapter lifecycle |
 
 ## What we deliberately do not abstract yet
 

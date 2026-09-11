@@ -30,11 +30,12 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   OR a `chn` token (`channel_token.py`) scoped to the binding row named in the
   request BODY -- its `channel_id` plus that row's current `generation` -- so an
   ingress adapter can enqueue turns for its own route without holding the
-  platform key. It is a SIBLING credential, never a widening of the sandbox
-  token: the two verify against different modules and neither authenticates as
-  the other. `POST /channels/token` (the mint) stays platform-key-only, and a
-  `chn` token is refused on every other router, `/approvals/{id}/resolve`
-  included. Extending it further still takes a new ADR.
+  platform key. `POST /channels/token` bumps that generation on every mint so a
+  remint revokes the previous token (#2379). It is a SIBLING credential, never a
+  widening of the sandbox token: the two verify against different modules and
+  neither authenticates as the other. `POST /channels/token` (the mint) stays
+  platform-key-only, and a `chn` token is refused on every other router,
+  `/approvals/{id}/resolve` included. Extending it further still takes a new ADR.
 - **The GitHub webhook is authenticated differently, on purpose.** `/github/webhook`
   verifies the HMAC signature GitHub sends (`x-hub-signature-256` against
   `settings.github_webhook_secret`), not the API key -- GitHub cannot send an

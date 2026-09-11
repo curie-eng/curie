@@ -9,7 +9,10 @@ pipeline, and it fails closed on either of two questions:
   ancestry  Is the tagged commit reachable from an explicitly supplied
             reviewed branch? A tag on a feature branch, a rebased commit, or
             anything that bypassed a merged PR is refused here, before any
-            image builds.
+            image builds. A final semver tag must be reachable from the
+            primary reviewed ref (the first `--reviewed-ref`, `origin/main`
+            in the release workflow). A prerelease may come from any
+            reviewed ref so `next` RCs still publish (issues #1476, #1560).
 
   checks    Does that commit's check-runs list show every REQUIRED_CHECK_NAMES
             entry successful (or neutral)? An explicit allowlist,
@@ -42,6 +45,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -129,6 +133,38 @@ REQUIRED_CHECK_NAMES = frozenset(
 
 class AuthorizationError(Exception):
     """A tagged commit is not authorized to publish a release."""
+
+
+# Semver 2.0.0 with an optional leading `v`. A non-empty prerelease
+# identifier is the tag class; build metadata does not make a tag a
+# prerelease.
+_SEMVER_TAG = re.compile(
+    r"^v?(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)"
+    r"(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
+    r"(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$"
+)
+
+
+def classify_release_tag(tag: str) -> str:
+    """Return `final` or `prerelease` for a semver `v*` tag.
+
+    Strips a `refs/tags/` prefix so either `GITHUB_REF` or `GITHUB_REF_NAME`
+    can be passed. Raises AuthorizationError on a non-semver name so a tag
+    that the workflow's `v*` glob accepted but that has no prerelease
+    component we can trust cannot publish as a final release by accident.
+    """
+    raw = tag.strip()
+    if raw.startswith("refs/tags/"):
+        raw = raw.removeprefix("refs/tags/")
+    match = _SEMVER_TAG.fullmatch(raw)
+    if match is None:
+        raise AuthorizationError(
+            f"tag {tag!r} is not a semver v* tag; refusing to authorize this tag"
+        )
+    if match.group("prerelease"):
+        return "prerelease"
+    return "final"
 
 
 def commit_is_on_reviewed_branch(
@@ -247,8 +283,16 @@ def authorize(
     nightly_conclusion: str | None = None,
     allow_red_nightly: bool = False,
     require_nightly: bool = False,
+    tag: str | None = None,
 ) -> None:
-    """Raise AuthorizationError unless `sha` may publish a release."""
+    """Raise AuthorizationError unless `sha` may publish a release.
+
+    `tag` is the pushed tag name (`v0.7.0`, `v0.7.0-rc.1`). A missing tag
+    is treated as final (fail closed) so omitting the class cannot widen
+    the reviewed-ref set. `main()` always passes `--tag`. A final tag must
+    be reachable from the first reviewed ref (the stable line); a
+    prerelease may use any reviewed ref (issue #1560).
+    """
     if not reviewed_refs:
         raise AuthorizationError(
             "at least one reviewed ref is required; refusing to authorize this tag"
@@ -264,6 +308,17 @@ def authorize(
             f"commit {sha} is not reachable from any reviewed ref "
             f"({checked_refs}); refusing to authorize this tag"
         )
+    tag_class = "final" if tag is None else classify_release_tag(tag)
+    if tag_class == "final":
+        primary_ref = reviewed_refs[0]
+        if not reachability[0]:
+            tag_label = tag if tag is not None else "unspecified"
+            raise AuthorizationError(
+                f"commit {sha} is not reachable from {primary_ref}; "
+                f"a final tag ({tag_label}) requires the merge-then-tag sequence: "
+                f"merge the reviewed branch into {primary_ref}, then tag. "
+                "Refusing to authorize this tag"
+            )
     other_runs = exclude_current_workflow_run(check_runs, exclude_run_id)
     missing = missing_required_checks(other_runs, required_names)
     if missing:
@@ -352,6 +407,11 @@ def main(argv: list[str] | None = None) -> int:
         help="a reviewed branch ref; repeat for every allowed branch",
     )
     parser.add_argument(
+        "--tag",
+        default=None,
+        help="the pushed tag name, e.g. v0.7.0 or v0.7.0-rc.1",
+    )
+    parser.add_argument(
         "--run-id",
         default=os.environ.get("GITHUB_RUN_ID"),
         help="this workflow run's id; its own check-runs are excluded from the gate",
@@ -362,7 +422,16 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         check_runs = fetch_check_runs(args.sha, args.repo)
-        authorize(args.sha, check_runs, args.reviewed_ref, exclude_run_id=args.run_id)
+        # Establish reachability, tag class, and required CI before the nightly
+        # network lookup. This keeps a deterministic authorization refusal from
+        # being masked by an unrelated lookup failure.
+        authorize(
+            args.sha,
+            check_runs,
+            args.reviewed_ref,
+            exclude_run_id=args.run_id,
+            tag=args.tag,
+        )
         matching = [
             ref
             for ref in args.reviewed_ref
@@ -386,12 +455,16 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        reason = _nightly.nightly_refusal_reason(
-            nightly_conclusion,
-            allow_red=_nightly.allow_red_nightly_from_bodies(bodies),
+        authorize(
+            args.sha,
+            check_runs,
+            args.reviewed_ref,
+            exclude_run_id=args.run_id,
+            tag=args.tag,
+            nightly_conclusion=nightly_conclusion,
+            allow_red_nightly=_nightly.allow_red_nightly_from_bodies(bodies),
+            require_nightly=True,
         )
-        if reason:
-            raise AuthorizationError(reason)
     except AuthorizationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

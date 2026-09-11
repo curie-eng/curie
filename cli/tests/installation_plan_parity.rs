@@ -2829,55 +2829,96 @@ fn cluster_up_rejects_preserved_openrouter_credential_before_dns_or_helm_mutatio
 }
 
 #[test]
-fn cluster_up_explicit_model_modes_suppress_recorded_provider_configuration() {
-    for (name, args, expected_value) in [
-        (
-            "local model",
-            &[
-                "--local-model",
-                "qwen3:4b",
-                "--set",
-                "inference.pullModel=false",
-            ] as &[&str],
-            Some("inference.model=qwen3:4b"),
-        ),
-        ("fake model", &["--fake-model"], None),
-    ] {
-        let fixture = HelmFixture::new(
-            installation_for_the_stateful_guard(),
-            recorded_runner_values(),
-        );
-        let output = fixture.cluster_up_with(
-            args,
-            &[("CURIE_TEST_EXPECT_RECORDED_PROVIDER_SUPPRESSED", "1")],
-        );
-        let visible = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            !visible.contains(RERUN_CREDENTIAL_SENTINEL),
-            "the recorded credential leaked during {name}: {visible}"
-        );
-        json_output(output, name);
+fn cluster_up_local_model_suppresses_recorded_provider_configuration() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        recorded_runner_values(),
+    );
+    let output = fixture.cluster_up_with(
+        &[
+            "--local-model",
+            "qwen3:4b",
+            "--set",
+            "inference.pullModel=false",
+        ],
+        &[("CURIE_TEST_EXPECT_RECORDED_PROVIDER_SUPPRESSED", "1")],
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !visible.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked during local model: {visible}"
+    );
+    json_output(output, "local model");
 
-        let calls = fixture.calls();
-        assert!(
-            calls.contains("RUNNER_RECORDED_PROVIDER_SUPPRESSED: yes"),
-            "{name} must suppress the recorded provider credential and model: {calls}"
-        );
-        if let Some(expected_value) = expected_value {
-            assert!(
-                calls.contains(expected_value),
-                "{name} must select the requested local model: {calls}"
-            );
-        }
-        assert!(
-            !calls.contains(RERUN_CREDENTIAL_SENTINEL),
-            "the recorded credential leaked into the command log during {name}: {calls}"
-        );
-    }
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("RUNNER_RECORDED_PROVIDER_SUPPRESSED: yes"),
+        "local model must suppress the recorded provider credential and model: {calls}"
+    );
+    assert!(
+        calls.contains("inference.model=qwen3:4b"),
+        "local model must select the requested local model: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked into the command log during local model: {calls}"
+    );
+}
+
+/// #2469: `--fake-model` no longer erases the release's recorded runner
+/// identity. The recorded model and inline credential are carried forward so a
+/// later plain `up` still knows who the runner is, while the effective runner
+/// stays fake (`agentSandbox.runner.fakeModel=false` is still not emitted).
+/// The sibling `--local-model` case above still asserts full suppression;
+/// this weaker expectation is the intended #2469 contract, not a regression.
+#[test]
+fn cluster_up_fake_model_preserves_recorded_runner_identity_without_real_mode() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        recorded_runner_values(),
+    );
+    let output = fixture.cluster_up_with(
+        &["--fake-model"],
+        &[
+            (
+                "CURIE_TEST_EXPECT_RUNNER_CREDENTIAL",
+                RERUN_CREDENTIAL_SENTINEL,
+            ),
+            ("CURIE_TEST_EXPECT_RUNNER_MODEL", RERUN_MODEL_SENTINEL),
+        ],
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !visible.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked during fake model: {visible}"
+    );
+    json_output(output, "fake model");
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("RUNNER_CREDENTIAL_PRESERVED: yes"),
+        "--fake-model must carry the recorded inline credential forward: {calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_MODEL_PRESERVED: yes"),
+        "--fake-model must carry the recorded runner model forward: {calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_REAL_MODE_PRESERVED: no"),
+        "--fake-model must still leave the runner fake: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the preserved credential must travel in a secret values file, never argv: {calls}"
+    );
 }
 
 #[test]
@@ -5442,5 +5483,258 @@ fn fake_model_up_preserves_a_recorded_byo_credential_reference() {
     assert!(
         !visible.contains("fakeModel"),
         "--fake-model must not select the real model off the value it preserved:\n{visible}"
+    );
+}
+
+/// #2469: the rest of the runner identity family survives `--fake-model` too.
+///
+/// `agentSandbox.runner.model` and a NON-EMPTY inline
+/// `agentSandbox.runner.credentials` are the two members #2459 left behind. Same
+/// reasoning, same recovery: `up` is a full upgrade, so a member this run does
+/// not re-supply is the member the release forgets, and the next plain `up`
+/// faithfully preserves the chart default. Driven through the real binary and
+/// the values it actually hands helm, because a plan that preserved them
+/// internally and dropped them on the way out is exactly the failure.
+#[test]
+fn fake_model_up_preserves_a_recorded_model_and_inline_credential() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(json!({
+            "agentSandbox": {"runner": {
+                "credentials": "sk-acme-recorded",
+                "model": "z-ai/glm-5.2"
+            }}
+        })),
+    );
+    let captured = fixture.temp.path().join("all-values.json");
+    json_output(
+        fixture.cluster_up_with(
+            &["--fake-model"],
+            &[("CURIE_TEST_CAPTURE_ALL_VALUES", captured.to_str().unwrap())],
+        ),
+        "fake-model up over a recorded runner model and inline credential",
+    );
+
+    // The inline credential is a SECRET, so it travels in a values file rather
+    // than on the command line; the model id is an ordinary `--set`.
+    let supplied = fs::read_to_string(&captured).expect("helm received at least one values file");
+    let inline = supplied
+        .split("\n---\n")
+        .filter(|chunk| !chunk.trim().is_empty())
+        .filter_map(|chunk| serde_json::from_str::<Value>(chunk).ok())
+        .find_map(|values| {
+            values["agentSandbox"]["runner"]["credentials"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            panic!("--fake-model dropped the recorded inline credential entirely:\n{supplied}")
+        });
+    assert_eq!(
+        inline, "sk-acme-recorded",
+        "--fake-model supplies no replacement, so it must not blank the credential:\n{supplied}"
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("agentSandbox.runner.model=z-ai/glm-5.2"),
+        "--fake-model must re-supply the recorded model id:\n{calls}"
+    );
+
+    // The CLI only ever pins this key to `false`, so its absence is the
+    // assertion that the effective runner is still fake.
+    let visible = format!("{calls}\n{supplied}");
+    assert!(
+        !visible.contains("fakeModel"),
+        "--fake-model must not select the real model off the values it preserved:\n{visible}"
+    );
+}
+
+/// #2510: `--local-model` over a recorded BYO credential reference writes the
+/// inference replacement and blanks the reference. Driven through the real
+/// binary and the values it hands helm.
+#[test]
+fn local_model_up_replaces_a_recorded_byo_reference_with_inference() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(json!({
+            "agentSandbox": {"runner": {
+                "credentialsExistingSecret": "acme-runner-source",
+                "credentialsExistingSecretKey": "runner-selector"
+            }}
+        })),
+    );
+    let captured = fixture.temp.path().join("all-values.json");
+    json_output(
+        fixture.cluster_up_with(
+            &[
+                "--local-model",
+                "qwen3:4b",
+                "--set",
+                "inference.pullModel=false",
+            ],
+            &[("CURIE_TEST_CAPTURE_ALL_VALUES", captured.to_str().unwrap())],
+        ),
+        "local-model up over a recorded BYO credential reference",
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("inference.deploy=true"),
+        "--local-model must write inference.deploy:\n{calls}"
+    );
+    assert!(
+        calls.contains("inference.model=qwen3:4b"),
+        "--local-model must write inference.model:\n{calls}"
+    );
+
+    let supplied = fs::read_to_string(&captured).expect("helm received at least one values file");
+    let visible = format!("{calls}\n{supplied}");
+    assert!(
+        !visible.contains("acme-runner-source"),
+        "--local-model must blank the recorded reference rather than leave it mounted:\n{visible}"
+    );
+}
+
+/// #2510: a following plain `up` re-supplies the recorded inference
+/// configuration, so the in-cluster model stays the effective source.
+#[test]
+fn plain_up_preserves_a_recorded_local_model_install() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(json!({
+            "inference": {
+                "deploy": true,
+                "model": "qwen3:4b",
+                "pullModel": false,
+                "persistence": {"enabled": true, "size": "40Gi"}
+            }
+        })),
+    );
+    json_output(
+        fixture.cluster_up_without_credentials(&[]),
+        "plain up over a recorded local-model install",
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("inference.deploy=true"),
+        "a plain up must re-supply inference.deploy:\n{calls}"
+    );
+    assert!(
+        calls.contains("inference.model=qwen3:4b"),
+        "a plain up must re-supply inference.model:\n{calls}"
+    );
+    assert!(
+        calls.contains("inference.pullModel=false"),
+        "a plain up must re-supply the recorded asset policy:\n{calls}"
+    );
+    assert!(
+        calls.contains("inference.persistence.enabled=true"),
+        "a plain up must keep durable inference storage enabled:\n{calls}"
+    );
+    assert!(
+        calls.contains("inference.persistence.size=40Gi"),
+        "a recorded PVC size must not shrink back to the chart default:\n{calls}"
+    );
+    assert!(
+        !calls.contains("agentSandbox.runner.fakeModel=false"),
+        "inference is the model source; do not pin fakeModel off a blank credential:\n{calls}"
+    );
+}
+
+/// #2510: `CURIE_CREDENTIALS` after `--local-model` replaces the inference
+/// family. The inline credential is the durable source.
+#[test]
+fn credentials_env_replaces_a_recorded_local_model_install() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(json!({
+            "inference": {
+                "deploy": true,
+                "model": "qwen3:4b",
+                "pullModel": false
+            }
+        })),
+    );
+    let captured = fixture.temp.path().join("all-values.json");
+    json_output(
+        fixture.cluster_up_with(
+            &[],
+            &[
+                ("CURIE_CREDENTIALS", OPENROUTER_CREDENTIAL),
+                ("CURIE_TEST_CAPTURE_ALL_VALUES", captured.to_str().unwrap()),
+            ],
+        ),
+        "credentials env over a recorded local-model install",
+    );
+
+    let calls = fixture.calls();
+    let supplied = fs::read_to_string(&captured).expect("helm received at least one values file");
+    assert!(
+        !calls.contains("inference.deploy=true"),
+        "an explicit credential must not re-supply inference.deploy:\n{calls}"
+    );
+    assert!(
+        calls.contains("agentSandbox.runner.fakeModel=false"),
+        "an explicit credential must select the real model:\n{calls}"
+    );
+    assert!(
+        supplied.contains(OPENROUTER_CREDENTIAL),
+        "the inline credential must reach Helm's private values file"
+    );
+    assert!(
+        !calls.contains(OPENROUTER_CREDENTIAL),
+        "the credential leaked into the command log: {calls}"
+    );
+}
+
+/// #2510: an explicit operator `--set` still owns inference.deploy.
+#[test]
+fn operator_set_wins_over_recorded_inference_on_cluster_up() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(json!({
+            "inference": {
+                "deploy": true,
+                "model": "qwen3:4b",
+                "pullModel": false
+            }
+        })),
+    );
+    json_output(
+        fixture.cluster_up_with(&["--set", "inference.deploy=false"], &[]),
+        "operator --set over recorded inference",
+    );
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("inference.deploy=false"),
+        "the operator --set must reach Helm:\n{calls}"
+    );
+    assert!(
+        !calls.contains("inference.deploy=true"),
+        "recorded inference.deploy=true must not ride alongside the operator clear:\n{calls}"
+    );
+}
+
+/// #2510: a fresh install does not invent in-cluster inference.
+#[test]
+fn fresh_cluster_up_does_not_invent_inference() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    json_output(
+        fixture.cluster_up_without_credentials(&[("CURIE_TEST_EXPECT_FRESH_FAKE_MODEL", "1")]),
+        "fresh cluster up",
+    );
+    let calls = fixture.calls();
+    assert!(
+        !calls.contains("inference.deploy"),
+        "a fresh install must not invent inference.deploy:\n{calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_FRESH_FAKE_MODE: yes"),
+        "a fresh install without a model source stays fake:\n{calls}"
     );
 }

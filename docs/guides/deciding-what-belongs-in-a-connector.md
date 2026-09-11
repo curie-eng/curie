@@ -141,6 +141,11 @@ when it stops being true rather than after.
 
 Each of these has cost somebody a day.
 
+**Expose the fixed endpoint.** Connector containers must listen on port `8000`.
+HTTP MCP connectors serve `/mcp` where applicable. The `args` in
+`connectors.yaml` pass through verbatim, so configure the image to listen on
+that port and serve that path.
+
 **Fail closed on missing configuration.** An empty allowlist means refuse to
 start, never "everything permitted". A connector that comes up with no ceiling
 looks healthy and is wrong.

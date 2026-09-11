@@ -25,6 +25,8 @@ pub struct RollbackOpts {
     /// gate so the status filter's unsafe target is handed to Helm.
     /// The clap path never sets this.
     pub disable_schema_gate: bool,
+    /// Operator-asserted live Alembic revision. The schema window still runs.
+    pub live_schema_revision: Option<String>,
 }
 
 /// The version declared by the chart at `chart`, read from its own `Chart.yaml`.
@@ -1013,7 +1015,7 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         }));
     }
     ui.warn(&format!(
-        "this uninstalls release '{0}' in namespace '{1}', removes only that release's Helm hook Jobs, and deletes only namespaces carrying curietech.ai/created-by={0} AND curietech.ai/created-in={1}. Empty primary namespaces adopted by `cluster up` carry that pair; legacy unlabeled, foreign-content, foreign-owned, and shared controller namespaces are retained",
+        "this uninstalls release '{0}' in namespace '{1}', removes only that release's Helm hook Jobs, and deletes only namespaces carrying curietech.ai/created-by={0} AND curietech.ai/created-in={1}. Empty primary namespaces adopted by `cluster up` carry that pair; legacy unlabeled, foreign-content, foreign-owned, `--adopt`-adopted, and shared controller namespaces are retained",
         opts.common.release, opts.common.namespace
     ));
     if !opts.yes
@@ -1643,6 +1645,37 @@ fn skipped_note(skipped: &[u32], from: u32) -> Option<String> {
     })
 }
 
+const LIVE_SCHEMA_PROBE_OVERRIDE_FIX: &str =
+    "pass --live-schema-revision <rev> with the live Alembic revision so the schema-window check can run without the API pod";
+
+async fn probe_live_schema_revision(common: &CommonOpts, ui: &crate::ui::Ui) -> Result<String> {
+    require_on_path("kubectl")?;
+    let probe = live_schema_revision_cmd(common);
+    ui.plumbing(&format!("+ {}", probe.display()));
+    let (ok, probe_out, probe_err) = run_capture(&probe).await?;
+    if !ok {
+        let detail = crate::schema_window::redact_probe_text(
+            probe_err
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("kubectl exec exited nonzero with no message"),
+        );
+        return Err(crate::exit::CliError::failure(format!(
+            "refusing rollback: could not read the live database revision from the API pod: {detail}"
+        ))
+        .with_fix(LIVE_SCHEMA_PROBE_OVERRIDE_FIX)
+        .into());
+    }
+    crate::schema_window::parse_alembic_current_output(&probe_out).ok_or_else(|| {
+        crate::exit::CliError::failure(
+            "refusing rollback: the API pod did not report a live database revision",
+        )
+        .with_fix(LIVE_SCHEMA_PROBE_OVERRIDE_FIX)
+        .into()
+    })
+}
+
 pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     let ui = crate::ui::ui();
     let history_cmd = helm_history_cmd(&opts.common);
@@ -1689,7 +1722,6 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     };
 
     if !opts.disable_schema_gate {
-        require_on_path("kubectl")?;
         let target_row = history
             .iter()
             .find(|row| row.revision == choice.to_revision);
@@ -1698,33 +1730,17 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
             .iter()
             .filter_map(HelmRevision::application_version)
             .collect();
-        let probe = live_schema_revision_cmd(&opts.common);
-        ui.plumbing(&format!("+ {}", probe.display()));
-        let (ok, probe_out, probe_err) = run_capture(&probe).await?;
-        if !ok {
-            let detail = crate::schema_window::redact_probe_text(
-                probe_err
-                    .trim()
-                    .lines()
-                    .next()
-                    .unwrap_or("kubectl exec exited nonzero with no message"),
-            );
-            return Err(crate::exit::CliError::failure(format!(
-                "refusing rollback: could not read the live database revision from the API pod: {detail}"
-            ))
-            .with_fix(format!(
-                "confirm the API is running with `curie cluster status --release {} --namespace {}` and retry",
-                opts.common.release, opts.common.namespace
-            ))
-            .into());
-        }
-        let live =
-            crate::schema_window::parse_alembic_current_output(&probe_out).ok_or_else(|| {
-                crate::exit::CliError::failure(
-                    "refusing rollback: the API pod did not report a live database revision",
+        let live = match opts.live_schema_revision.as_deref() {
+            Some(raw) => {
+                crate::schema_window::parse_alembic_current_output(raw).ok_or_else(|| {
+                    crate::exit::CliError::failure(
+                    "refusing rollback: --live-schema-revision did not contain a database revision",
                 )
-                .with_fix("confirm the API is running with `curie cluster status` and retry")
-            })?;
+                .with_fix("pass a revision id such as 0039")
+                })?
+            }
+            None => probe_live_schema_revision(&opts.common, ui).await?,
+        };
         let Some(target_app) = target_app else {
             return Err(crate::exit::CliError::failure(format!(
                 "refusing rollback to Helm revision {}: no application version on that revision",
@@ -1739,6 +1755,11 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
             return Err(crate::exit::CliError::failure(refusal.message)
                 .with_fix(refusal.fix)
                 .into());
+        }
+        if opts.live_schema_revision.is_some() {
+            ui.warn(&format!(
+                "schema window checked against operator-asserted live revision {live}; the API pod was not probed"
+            ));
         }
     }
 

@@ -254,6 +254,41 @@ fn needs_node_identity(expected: &str, status: &Value) -> bool {
         && normalize_image(text(status, "/image")) != normalize_image(expected)
 }
 
+/// Unique repo@digest bound to `reference` in this node's image inventory.
+/// containerd/kubelet may list each tag of one loaded image as its own
+/// Node.status.images entry; only an exact digest identity combines them.
+/// A missing name, a digest-less entry, or two distinct digests fail closed.
+fn unique_inventory_identity(node: &Value, reference: &str) -> Option<String> {
+    let wanted = normalize_image(reference);
+    let mut found = false;
+    let mut identities = BTreeSet::new();
+    for image in array(node, "/status/images") {
+        let names: Vec<&str> = array(image, "/names")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        if !names
+            .iter()
+            .copied()
+            .any(|name| normalize_image(name) == wanted)
+        {
+            continue;
+        }
+        found = true;
+        for name in names {
+            if let Some(identity) = manifest_identity(name) {
+                identities.insert(identity);
+            }
+        }
+    }
+    if !found {
+        return None;
+    }
+    let mut identities = identities.into_iter();
+    let identity = identities.next()?;
+    identities.next().is_none().then_some(identity)
+}
+
 fn observed_image_matches(expected: &str, status: &Value, node: Option<&Value>) -> bool {
     let image_id = text(status, "/imageID");
     if let Some(expected) = manifest_identity(expected) {
@@ -276,27 +311,17 @@ fn observed_image_matches(expected: &str, status: &Value, node: Option<&Value>) 
     ) else {
         return false;
     };
-    // Kubelet's per-node inventory groups aliases for one loaded image. Never
-    // combine separate entries or infer equivalence from tag/repository text.
-    // Missing/truncated/ambiguous inventory cannot establish this binding.
-    let matches: Vec<_> = array(node, "/status/images")
-        .iter()
-        .filter(|image| {
-            array(image, "/names")
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|name| normalize_image(name) == normalize_image(expected))
-        })
-        .collect();
-    matches.len() == 1
-        && array(matches[0], "/names")
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|name| normalize_image(name) == normalize_image(text(status, "/image")))
-        && array(matches[0], "/names")
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|name| manifest_identity(name).as_ref() == Some(&identity))
+    // Bind the requested tag and the kubelet-reported alias to the running
+    // imageID through unique same-digest inventory identities. Do not infer
+    // equivalence from tag or repository text, and do not require those names
+    // to share one names array.
+    let Some(expected_identity) = unique_inventory_identity(node, expected) else {
+        return false;
+    };
+    let Some(alias_identity) = unique_inventory_identity(node, text(status, "/image")) else {
+        return false;
+    };
+    expected_identity == identity && alias_identity == identity
 }
 
 fn selected(workload: &Value, pod: &Value) -> bool {

@@ -161,8 +161,10 @@ class TestChartIndexWorkflowContract:
             r"git\s+checkout\s+origin/main\s+--\s+release/",
             authorization_script,
         )
-        assert "--reviewed-ref origin/main" in authorization_script
-        assert "--reviewed-ref origin/next" in authorization_script
+        reviewed_refs = re.findall(r"--reviewed-ref\s+(\S+)", authorization_script)
+        assert reviewed_refs[0] == "origin/main"
+        assert "origin/next" in reviewed_refs
+        assert re.search(r'--tag\s+"\$RELEASE_TAG"', authorization_script)
 
         resolve_script = run_script(
             next(step for step in steps if step.get("id") == "release")

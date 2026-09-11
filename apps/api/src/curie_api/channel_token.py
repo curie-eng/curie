@@ -18,7 +18,7 @@ and widening would also have broken the byte-identical api/worker twin of
 binding row IN PLACE and ``delete_agent`` frees the pair for reuse, so a token
 claiming the PAIR does not go inert when the route changes hands -- it goes live
 again against the new owner. The row id is a stable identity and ``generation``
-is what makes a rebind observable to a credential minted before it.
+is what makes a rebind or a remint observable to a credential minted before it.
 ``crud.delete_channel_binding`` is the third case and needs no counter: the row
 is gone, so the ``channel_id`` in the claim resolves to nothing and every token
 naming that binding is dead by construction.

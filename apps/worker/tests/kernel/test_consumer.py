@@ -32,6 +32,7 @@ from curie_worker.consumer_liveness import (
 )
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.stream_consumer import ConsumerLivenessExpired
+from curie_worker.threadlock import ThreadLock
 from curie_worker.workspace import WorkspacePreparationError
 from redis.asyncio import Redis as AsyncRedis
 
@@ -164,7 +165,6 @@ def test_consumes_stream_entry_end_to_end_and_acks(make_harness) -> None:
             assert summary["pending"] == 0  # the entry was acked
 
     asyncio.run(go())
-
 
 def test_reclaim_skips_this_consumers_own_inflight_entry(make_harness) -> None:
     async def go() -> None:
@@ -2109,5 +2109,216 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
             assert not await h.async_redis.sismember(
                 THREAD_RESET_INFLIGHT_SET, thread_key
             )
+
+    asyncio.run(go())
+
+
+class _LockOwnerLiveness:
+    """Runs-stream adapter so ThreadLock steal uses the real consumer leases."""
+
+    def __init__(self, store: ConsumerLivenessStore, *, stream: str, group: str) -> None:
+        self._store = store
+        self._stream = stream
+        self._group = group
+
+    async def is_alive(self, owner: str) -> bool:
+        return await self._store.is_alive(
+            stream=self._stream, group=self._group, consumer=owner
+        )
+
+    async def is_capable(self, owner: str) -> bool:
+        return await self._store.is_capable(
+            stream=self._stream, group=self._group, consumer=owner
+        )
+
+
+def _wire_stealable_lock(h: Any, *, owner: str, proof_s: float) -> ThreadLock:
+    """Replace the harness lock with the production steal wiring (#2500)."""
+
+    lock = ThreadLock(
+        h.async_redis,
+        ttl_ms=h.config.lock_ttl_ms,
+        acquire_timeout_s=h.config.lock_acquire_timeout_s,
+        poll_interval_s=h.config.lock_poll_interval_s,
+        owner=owner,
+        owner_liveness=_LockOwnerLiveness(
+            ConsumerLivenessStore(h.async_redis),
+            stream=h.config.stream,
+            group=h.config.consumer_group,
+        ),
+        dead_owner_proof_s=proof_s,
+    )
+    h.kernel._lock = lock
+    return lock
+
+
+def test_force_killed_worker_lock_is_stolen_and_cluster_message_reply_is_delivered(
+    make_harness,
+) -> None:
+    """#2500: a SIGKILLed worker's per-thread lock must not delay PEL reclaim.
+
+    Cluster message enqueues a QueuedTurn (XADD) and waits for the worker
+    reply. The 2026-09-09 cluster reproduction force-killed replicas:1 mid
+    claim: PEL moved promptly, then the replacement logged LockAcquireTimeout
+    for ~90s and the CLI timed out before the recovered fakeModel reply.
+
+    This pin drives that path against real Valkey: the dead consumer owns the
+    PEL row and the thread lock (acquire without release, matching SIGKILL),
+    its heartbeat is gone, and the replacement must deliver the reply in much
+    less than the 60s lock TTL, then ACK so nothing stays pending under the
+    dead consumer.
+
+    Red on revert of steal: the replacement waits out acquire_timeout and the
+    sink never sees ``recovered`` inside the 2s bound.
+    """
+
+    async def go() -> None:
+        async with make_harness(
+            lock_ttl_ms=60_000,
+            lock_acquire_timeout_s=1.0,
+            max_attempts=1,
+            reclaim_min_idle_ms=5000,
+            dead_consumer_idle_ms=0,
+            consumer_heartbeat_ttl_ms=30,
+            consumer_capability_ttl_ms=6000,
+        ) as h:
+            h.runner.default_script = [Final(text="recovered", status=DONE)]
+            thread = "t-2500-crash"
+            dead_name = "dead-worker-2500"
+            _wire_stealable_lock(
+                h,
+                owner=h.config.consumer_name,
+                proof_s=h.config.consumer_heartbeat_ttl_ms / 1000,
+            )
+            dead_lock = ThreadLock(
+                h.async_redis,
+                ttl_ms=h.config.lock_ttl_ms,
+                acquire_timeout_s=h.config.lock_acquire_timeout_s,
+                poll_interval_s=h.config.lock_poll_interval_s,
+                owner=dead_name,
+            )
+            await dead_lock.acquire(h.config.lock_key(_thread_key(thread)))
+
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+            qe = _qevent("crash-reclaim", thread=thread, event_id="e-2500-crash")
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+            claimed = await h.async_redis.xreadgroup(
+                h.config.consumer_group, dead_name, {h.config.stream: ">"}, count=1
+            )
+            assert claimed
+
+            store = ConsumerLivenessStore(h.async_redis)
+            await store.publish(
+                stream=h.config.stream,
+                group=h.config.consumer_group,
+                consumer=dead_name,
+                heartbeat_ttl_ms=1,
+                capability_ttl_ms=h.config.consumer_capability_ttl_ms,
+            )
+            alive_key = consumer_heartbeat_key(
+                h.config.stream, h.config.consumer_group, dead_name
+            )
+            await _wait_key(h.async_redis, alive_key, present=False)
+            await _wait_consumer_idle(
+                h.async_redis,
+                h.config.stream,
+                h.config.consumer_group,
+                dead_name,
+                h.config.dead_consumer_idle_ms,
+            )
+            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            assert summary["pending"] == 1
+
+            assert await consumer._prompt_reclaim_once() == 0
+            await asyncio.sleep(h.config.consumer_heartbeat_ttl_ms / 1000 + 0.015)
+            started = time.monotonic()
+            reclaimed = await consumer._prompt_reclaim_once()
+            assert reclaimed == 1
+            await _wait_until(lambda: h.sink.last_text == "recovered", timeout=2.0)
+            elapsed = time.monotonic() - started
+            await asyncio.gather(*list(consumer._inflight))
+
+            assert elapsed < 2.0, (
+                f"recovered reply took {elapsed:.3f}s; replacement still waited "
+                "out the dead worker lock TTL"
+            )
+            assert h.runner.opened == ["crash-reclaim"]
+            assert h.sink.last_text == "recovered"
+            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            assert summary["pending"] == 0
+            owners = await h.async_redis.xpending_range(
+                h.config.stream, h.config.consumer_group, min="-", max="+", count=10
+            )
+            assert all(str(row["consumer"]) != dead_name for row in owners)
+            assert await h.async_redis.exists(h.config.done_key(qe.event_id))
+
+    asyncio.run(go())
+
+
+def test_live_worker_lock_still_serializes_a_replacement(make_harness) -> None:
+    """#2500 negative: a live owner's heartbeat blocks steal; the waiter fails.
+
+    Same QueuedTurn / PEL / lock path as the crash pin, except the lock holder
+    keeps its alive lease. The replacement must not run the turn.
+    """
+
+    async def go() -> None:
+        async with make_harness(
+            lock_ttl_ms=60_000,
+            lock_acquire_timeout_s=0.4,
+            max_attempts=1,
+            reclaim_min_idle_ms=5000,
+            dead_consumer_idle_ms=0,
+            consumer_heartbeat_ttl_ms=30,
+            consumer_capability_ttl_ms=6000,
+        ) as h:
+            h.runner.default_script = [Final(text="should-not-run", status=DONE)]
+            thread = "t-2500-live"
+            live_name = "live-worker-2500"
+            _wire_stealable_lock(
+                h,
+                owner=h.config.consumer_name,
+                proof_s=h.config.consumer_heartbeat_ttl_ms / 1000,
+            )
+            live_lock = ThreadLock(
+                h.async_redis,
+                ttl_ms=h.config.lock_ttl_ms,
+                acquire_timeout_s=h.config.lock_acquire_timeout_s,
+                poll_interval_s=h.config.lock_poll_interval_s,
+                owner=live_name,
+            )
+            live_token = await live_lock.acquire(h.config.lock_key(_thread_key(thread)))
+
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+            qe = _qevent("live-hold", thread=thread, event_id="e-2500-live")
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+            claimed = await h.async_redis.xreadgroup(
+                h.config.consumer_group, live_name, {h.config.stream: ">"}, count=1
+            )
+            assert claimed
+            store = ConsumerLivenessStore(h.async_redis)
+            await store.publish(
+                stream=h.config.stream,
+                group=h.config.consumer_group,
+                consumer=live_name,
+                heartbeat_ttl_ms=5_000,
+                capability_ttl_ms=h.config.consumer_capability_ttl_ms,
+            )
+            await h.async_redis.xclaim(
+                h.config.stream,
+                h.config.consumer_group,
+                h.config.consumer_name,
+                0,
+                [claimed[0][1][0][0]],
+            )
+            await consumer._dispatch(str(claimed[0][1][0][0]), dict(claimed[0][1][0][1]))
+            await asyncio.gather(*list(consumer._inflight))
+
+            assert h.runner.opened == []
+            assert h.sink.last_text != "should-not-run"
+            assert await h.async_redis.get(h.config.lock_key(_thread_key(thread))) == live_token
+            await live_lock.release(h.config.lock_key(_thread_key(thread)), live_token)
 
     asyncio.run(go())

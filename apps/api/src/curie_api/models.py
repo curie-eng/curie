@@ -219,9 +219,10 @@ class AgentChannel(Base):
     `endpoint`/`adapter` are the server-controlled reply route: where this kind's
     replies go back through, and which egress credential authenticates them. They
     are set here by the platform and never accepted from an ingress request body.
-    `generation` counts rebinds: `update_channel_binding` mutates this row IN PLACE,
-    so the row id is a stable identity and the generation is the only thing that
-    makes a rebind observable to a credential minted before it.
+    `generation` counts rotations: `update_channel_binding` mutates this row IN
+    PLACE, and `POST /channels/token` bumps it on every mint, so the row id is a
+    stable identity and the generation is the only thing that makes a rebind or
+    remint observable to a credential minted before it.
     """
 
     __tablename__ = "agent_channels"
@@ -264,9 +265,10 @@ class AgentChannel(Base):
     # the database so a half-configured route cannot be written out of band.
     endpoint: Mapped[str | None] = mapped_column(default=None)
     adapter: Mapped[str | None] = mapped_column(default=None)
-    # Rebind counter (ADR-0096 D5). Bumped on every binding write, including one
-    # that changes nothing: re-asserting a binding is the "something is wrong
-    # with this route" gesture that should invalidate outstanding credentials.
+    # Rotation counter (ADR-0096 D5, #2379). Bumped on every binding write,
+    # including one that changes nothing, and on every `POST /channels/token`
+    # mint: re-asserting a binding or reminting its credential both invalidate
+    # outstanding tokens.
     generation: Mapped[int] = mapped_column(server_default="0", default=0)
 
     agent: Mapped[Agent] = relationship(back_populates="channels")

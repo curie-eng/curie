@@ -63,8 +63,9 @@ generic endpoints as a plugin API:
   `POST /channels/token` plus `POST /channels/turns`
   (`apps/api/src/curie_api/routers/channels.py`). The platform mints a scoped
   `chn` token for one binding row and generation
-  (`apps/api/src/curie_api/channel_token.py`); that credential can enqueue only
-  for the current binding. The turn body supplies its channel identity and
+  (`apps/api/src/curie_api/channel_token.py`); minting bumps that generation so
+  a remint revokes the previous token, and the credential can enqueue only for
+  the current binding. The turn body supplies its channel identity and
   delivery content, while the API loads the binding and supplies `kind`,
   `endpoint`, and `adapter` itself. A caller therefore cannot turn a token into
   an authenticated request to a caller-selected endpoint. Raw broker produce

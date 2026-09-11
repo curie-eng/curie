@@ -26,6 +26,13 @@ on:
       - "apps/api/src/curie_api/storage.py"
       - "apps/worker/src/curie_worker/config.py"
       - "apps/worker/src/curie_worker/bundle_store.py"
+      # Same obligation, second gate: the threaded bot allowlist gate (#2437)
+      # executes this file to prove the rendered value survives the REAL
+      # ThreadedBotAdmission parser. Without it here, a PR that reverts or
+      # loosens that model matches nothing in this filter, the helm job is
+      # skipped, and the gate that exists to catch exactly that revert
+      # never runs.
+      - "apps/dispatcher/src/curie_dispatcher/config.py"
       - "uv.lock"
       - "pyproject.toml"
       # The unpinned-image gate (#2319) and the Langfuse image-pin gate
@@ -224,6 +231,17 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-durability-assertions.sh
 
+      # Prove every first-party chart workload carries the shared OTLP env
+      # (#2360). Membership is derived from rendered chart-owned images, not a
+      # named allowlist, so a sixth Deployment is rejected rather than skipped.
+      # Optional mail, the runner SandboxTemplate, collector-on vs external
+      # endpoint, and the two mutation controls (unknown-without-OTLP, stripped
+      # OTLP) live in this script rather than the durability suite.
+      - name: helm render assertions (instrumented first-party workloads)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/instrumented-workload-assertions.sh
+
       - name: helm render assertions (SRE bot observability stack)
         run: |
           set -euo pipefail
@@ -281,6 +299,15 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/security-probe-byo-postgres-assertions.sh
+
+      # Prove Claim 1d lists BYO runner peers in BYO_RUNNER_TARGETS when the
+      # corresponding -endpoint / object-store policy would render, skips when
+      # empty, and still curls Claim 1 BLOCKED (#2369). Live reachability is
+      # scripts/check-runner-byo-egress.sh, not this render pin.
+      - name: helm render assertions (BYO runner-egress security probe)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/security-probe-byo-runner-egress-assertions.sh
 
       # Keep the chart ClickHouse default and Langfuse pin as one supported
       # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
@@ -597,6 +624,17 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/object-store-web-identity-assertions.sh
 
+      # Prove the first-class bot-thread allowlist (#2437) renders a value the
+      # REAL dispatcher parser accepts, not a hand-copied regex: the rendered
+      # env string is fed through curie_dispatcher.config.DispatcherConfig, so a
+      # future drift in ThreadedBotAdmission breaks this chart gate. Needs the
+      # uv workspace above, which is why it sits here rather than beside the
+      # other reserved-env assertions earlier in this job.
+      - name: helm render assertions (threaded bot allowlist)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/threaded-bot-allowlist-assertions.sh
+
       # Prove a BYO object store gets a runner egress allow for S3 (and STS on
       # the key-free path). Rail 1 is fail-closed and the in-chart rustfs pod
       # selector does not render when rustfs.deploy is false, so a default-shaped
@@ -624,6 +662,15 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/networkpolicy-empty-to-assertions.sh
+
+      # Prove the release record helm stores for a default install still fits
+      # the 1 MiB Kubernetes Secret ceiling, with headroom. The chart renders
+      # and lints fine right up to the byte that breaks it, and then every
+      # install fails at once with `Secret ... data: Too long`.
+      - name: helm render assertions (release record size budget)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/release-record-size-assertions.sh
 
       - name: helm template + kubeconform (values-dev overlay)
         run: |

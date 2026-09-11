@@ -83,7 +83,7 @@ the same `curie:runs` stream, and a truthful inventory names them:
   message` retains the direct `xadd` path in `cli/src/queue.rs` as the legacy
   carrierless compatibility control. Both are operator-driven wakes that skip
   the live Slack listener, GitHub webhook, and commit poller, and both hand-mint
-  their dedupe id (`new_event_id` in `cli/src/message.rs`), which is the leak
+  their dedupe id (`new_event_id` in `cli/src/queue.rs`), which is the leak
   recorded below.
 
 **Declaration vs. consumption (#273/#270).** The bundle manifest now carries deploy-time-validated
@@ -139,4 +139,4 @@ first thing a real `Trigger` port would have to take ownership of.
 
 - **Epic(s):** #29 — triggers: decide whether "trigger" is a real seam (extract an `EventSource` port) or just new event types on the existing ingresses.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six swappable jobs; not separately graded.
-- **ADR(s):** none yet — no accepted ADR governs the trigger seam.
+- **ADR(s):** [ADR-0079](../../adr/0079-inbound-triggers-as-a-new-event-kind.md) (Accepted) — inbound triggers as a new event kind, ingested by the API; [ADR-0099](../../adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Draft) — hooks are bundle-declared turns the system starts.

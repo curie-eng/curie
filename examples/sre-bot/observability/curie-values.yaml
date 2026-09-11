@@ -12,8 +12,37 @@ otelCollector:
         storage: file_storage
         queue_size: 1000
         num_consumers: 2
+    # Same exporter name the soak overlay already uses, so a later -f of that
+    # overlay cannot install a second competing remote-write path.
+    prometheusremotewrite/soak:
+      endpoint: http://prometheus-server.observability.svc.cluster.local/api/v1/write
+      tls:
+        insecure: true
+      resource_to_telemetry_conversion:
+        enabled: false
+      retry_on_failure:
+        enabled: true
+        initial_interval: 5s
+        max_interval: 30s
+        max_elapsed_time: 5m
+      remote_write_queue:
+        enabled: true
+        queue_size: 1000
+        num_consumers: 2
   extraPipelineExporters:
     - otlphttp/tempo
+  extraMetricPipelineExporters:
+    - prometheusremotewrite/soak
+security:
+  otelCollectorNetworkPolicy:
+    metricsIngress:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: observability
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus
+            app.kubernetes.io/instance: prometheus
 grafanaConnector:
   enabled: true
   url: http://grafana.observability.svc.cluster.local

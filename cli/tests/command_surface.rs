@@ -351,6 +351,89 @@ fn process_dev_help_lists_verify_fix_pin() {
 }
 
 #[test]
+fn process_dev_help_lists_recovery_drill() {
+    let output = run_help(&["dev"]);
+    assert!(
+        output.status.success(),
+        "expected success for dev help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        help_lists_subcommand(&text, "recovery-drill"),
+        "missing recovery-drill\n{text}"
+    );
+
+    let leaf = run_help(&["dev", "recovery-drill"]);
+    assert!(
+        leaf.status.success(),
+        "expected success for recovery-drill help\n{}",
+        output_text(&leaf)
+    );
+    let leaf_text = output_text(&leaf);
+    assert!(
+        leaf_text.contains("--surface") && leaf_text.contains("--scenario"),
+        "recovery-drill help must name surface and scenario\n{leaf_text}"
+    );
+}
+
+#[test]
+fn process_dev_help_lists_lease_expiry_cluster_proof() {
+    let output = run_help(&["dev"]);
+    assert!(
+        output.status.success(),
+        "expected success for dev help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        help_lists_subcommand(&text, "lease-expiry-cluster-proof"),
+        "missing lease-expiry-cluster-proof\n{text}"
+    );
+
+    let leaf = run_help(&["dev", "lease-expiry-cluster-proof"]);
+    assert!(
+        leaf.status.success(),
+        "expected success for lease-expiry-cluster-proof help\n{}",
+        output_text(&leaf)
+    );
+    let leaf_text = output_text(&leaf);
+    assert!(
+        leaf_text.contains("--self-test") && leaf_text.contains("900000"),
+        "lease-expiry-cluster-proof help must name self-test and the default backstop\n{leaf_text}"
+    );
+}
+
+#[test]
+fn process_dev_help_lists_upgrade_drill() {
+    let output = run_help(&["dev"]);
+    assert!(
+        output.status.success(),
+        "expected success for dev help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        help_lists_subcommand(&text, "upgrade-drill"),
+        "missing upgrade-drill\n{text}"
+    );
+
+    let leaf = run_help(&["dev", "upgrade-drill"]);
+    assert!(
+        leaf.status.success(),
+        "expected success for upgrade-drill help\n{}",
+        output_text(&leaf)
+    );
+    let leaf_text = output_text(&leaf);
+    assert!(
+        leaf_text.contains("--self-test")
+            && leaf_text.contains("--scenario")
+            && leaf_text.contains("0.8.6"),
+        "upgrade-drill help must name self-test, scenario, and the v0.8.6 baseline\n{leaf_text}"
+    );
+}
+
+#[test]
 fn process_dev_e2e_ci_selection_delegates_path_selection() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
