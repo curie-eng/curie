@@ -83,6 +83,24 @@ def deliver_until_acked(
     return None
 
 
+def deliver_once(
+    handler: Any,
+    sock: FakeSocketClient,
+    app: Any,
+    request: Any,
+) -> None:
+    """Handle exactly one Socket Mode envelope and return.
+
+    Unlike ``deliver_until_acked``, this does not walk other connections and
+    does not stop at the first ack. Owner-only proof is one delivery to the
+    non-owner (no ack, no mutate) then one delivery to the owner, not a loop
+    until someone acks (#2307).
+    """
+
+    handler.handle(sock, request)
+    app.listener_runner.listener_executor.shutdown(wait=True)
+
+
 @contextmanager
 def _black_hole_api() -> Iterator[str]:
     """A real port that completes the TCP handshake and then never answers.

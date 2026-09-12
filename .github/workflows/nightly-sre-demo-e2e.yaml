@@ -8,9 +8,8 @@ name: Nightly SRE demo e2e
 #
 # GitHub fires schedule and workflow_dispatch from the default branch, so a
 # scheduled run checks out next to grade the v0.9.0 train. Missing the CI Slack
-# app, throwaway repo, or live provider skips with the reason in the run
-# summary; the expensive kind job does not run. That skip is a documented
-# missing prerequisite, not a green that proved the six assertions.
+# app, throwaway repo, or live provider blocks required scheduled/dispatch/RC
+# acceptance. Pull requests only inventory readiness without running live work.
 on:
   schedule:
     - cron: "0 5 * * *"   # 05:00 UTC, before the 08:00 graded ladder
@@ -28,7 +27,9 @@ on:
     paths:
       - ".github/workflows/nightly-sre-demo-e2e.yaml"
       - "cli/scripts/sre-demo-e2e.sh"
+      - "cli/scripts/sre-demo-mcp-probe.py"
       - "cli/tests/nightly_sre_demo_e2e.rs"
+      - "cli/tests/sre_demo_e2e_test.py"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -51,9 +52,10 @@ jobs:
           ref: ${{ github.event_name == 'schedule' && 'next' || github.ref }}
           persist-credentials: false
       - id: check
-        name: Document a skip when a live prerequisite is missing
+        name: Report missing setup and fail required live acceptance
         env:
           CURIE_SRE_DEMO_PHASE: prereqs
+          CURIE_SRE_DEMO_REQUIRED: ${{ github.event_name != 'pull_request' && '1' || '0' }}
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CI_SLACK_APP_TOKEN: ${{ secrets.CI_SLACK_APP_TOKEN }}
           CI_SLACK_BOT_TOKEN: ${{ secrets.CI_SLACK_BOT_TOKEN }}
@@ -77,6 +79,8 @@ jobs:
       - name: Toolchain
         working-directory: cli
         run: rustc --version
+      - name: Install uv for the runner's MCP SDK probe
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -209,6 +213,9 @@ jobs:
           kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
       - name: Six SRE demo assertions
         env:
+          CURIE_SRE_DEMO_RESULTS_FILE: ${{ runner.temp }}/sre-demo-outcomes.jsonl
+          # Dedicated verifier capability, when configured; not the product App.
+          GH_TOKEN: ${{ secrets.CI_THROWAY_REPO_READ_TOKEN }}
           CURIE_BIN: cli/target/release/curie
           CURIE_SRE_DEMO_PHASE: run
           CURIE_SRE_DEMO_ALLOW_LIVE: "1"
@@ -220,10 +227,11 @@ jobs:
           CI_SLACK_CHANNEL_ID: ${{ secrets.CI_SLACK_CHANNEL_ID }}
           CI_THROWAY_REPO: ${{ secrets.CI_THROWAY_REPO }}
         run: bash cli/scripts/sre-demo-e2e.sh run
-      - name: Dump cluster diagnostics on failure
-        if: failure()
-        run: |
-          kubectl get pods -A -o wide || true
-          kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
-          kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
-          kubectl logs -n curie -l app.kubernetes.io/component=dispatcher --tail=100 || true
+      - name: Retain sanitized assertion outcomes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sre-demo-outcomes
+          path: ${{ runner.temp }}/sre-demo-outcomes.jsonl
+          if-no-files-found: ignore
+          retention-days: 7

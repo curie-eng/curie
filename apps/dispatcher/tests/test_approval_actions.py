@@ -9,6 +9,7 @@ resolved by X", and the ordinary-button catch-all never double-handles an
 approval click.
 """
 
+import ast
 import base64
 import hashlib
 import hmac
@@ -28,6 +29,7 @@ from curie_dispatcher.approval_actions import (
     _APPROVAL_ACTION_IDS,
     _DECISION_BY_ACTION_ID,
     APPROVE_ACTION_ID,
+    APPROVE_NOTE_ACTION_ID,
     REJECT_ACTION_ID,
     ApprovalResolveClient,
     ResolveOutcome,
@@ -43,7 +45,8 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient
 
-from .conftest import FakeSocketClient, _authorize, deliver_until_acked
+from .conftest import FakeSocketClient, _authorize, deliver_once, deliver_until_acked
+from .test_approval_note_dialog import _note_click, _note_submit
 
 APPROVAL_ID = "9a1e8a10-0000-0000-0000-000000000246"
 _PLATFORM_API_KEY = "platform-api-test-key"
@@ -200,6 +203,20 @@ def _approval_click(
     )
 
 
+def _stub_dialog_web(web_client: WebClient) -> None:
+    web_client.views_open = MagicMock(return_value={"ok": True})  # type: ignore[method-assign]
+    web_client.conversations_replies = MagicMock(  # type: ignore[method-assign]
+        return_value={"messages": [_CARD_MESSAGE]},
+    )
+
+
+_ONESHOT_TWO_RELEASE_TESTS = (
+    "test_two_releases_oneshot_non_owner_then_owner_resolves_an_immediate_action",
+    "test_two_releases_oneshot_non_owner_then_owner_opens_a_note_dialog",
+    "test_two_releases_oneshot_non_owner_then_owner_resolves_a_note_submission",
+)
+
+
 def test_authorized_click_resolves_and_stamps_the_card(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
@@ -308,6 +325,131 @@ def test_two_releases_only_the_owner_resolves_an_immediate_action(
     assert any(
         "may be owned by another Curie release" in record.getMessage() for record in caplog.records
     )
+
+
+def test_two_releases_oneshot_non_owner_then_owner_resolves_an_immediate_action(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    """One delivery to the non-owner, then one to the owner. No retry loop (#2307)."""
+
+    non_owner = ScriptedResolver(ResolveOutcome(status_code=404, detail="approval not found"))
+    owner = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    non_owner_app, non_owner_web = _build(config, redis_client, non_owner)
+    owner_app, owner_web = _build(config, redis_client, owner)
+    non_owner_socket = FakeSocketClient()
+    owner_socket = FakeSocketClient()
+    click = _approval_click("env-oneshot-immediate", action_id=APPROVE_ACTION_ID)
+    non_owner_handler = SocketModeHandler(non_owner_app, app_token="xapp-test")
+    owner_handler = SocketModeHandler(owner_app, app_token="xapp-test")
+
+    deliver_once(non_owner_handler, non_owner_socket, non_owner_app, click)
+
+    assert non_owner_socket.acked_envelope_ids == []
+    non_owner_web.chat_update.assert_not_called()
+    non_owner_web.chat_postMessage.assert_not_called()
+    non_owner_web.chat_postEphemeral.assert_not_called()
+
+    deliver_once(owner_handler, owner_socket, owner_app, click)
+
+    assert owner_socket.acked_envelope_ids == ["env-oneshot-immediate"]
+    assert len(non_owner.calls) == 1
+    assert len(owner.calls) == 1
+    owner_web.chat_update.assert_called_once()
+    assert "Approved by <@U_MANAGER>" in owner_web.chat_update.call_args.kwargs["text"]
+    owner_web.chat_postEphemeral.assert_not_called()
+
+
+def test_two_releases_oneshot_non_owner_then_owner_opens_a_note_dialog(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    """One-shot note-open: non-owner leaves the envelope, owner opens the dialog."""
+
+    non_owner = ScriptedResolver(ResolveOutcome(status_code=404, detail="approval not found"))
+    owner = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    non_owner_app, non_owner_web = _build(config, redis_client, non_owner)
+    owner_app, owner_web = _build(config, redis_client, owner)
+    _stub_dialog_web(non_owner_web)
+    _stub_dialog_web(owner_web)
+    non_owner_socket = FakeSocketClient()
+    owner_socket = FakeSocketClient()
+    click = _note_click("env-oneshot-note-open", action_id=APPROVE_NOTE_ACTION_ID)
+    non_owner_handler = SocketModeHandler(non_owner_app, app_token="xapp-test")
+    owner_handler = SocketModeHandler(owner_app, app_token="xapp-test")
+
+    deliver_once(non_owner_handler, non_owner_socket, non_owner_app, click)
+
+    assert non_owner_socket.acked_envelope_ids == []
+    non_owner_web.chat_update.assert_not_called()
+    non_owner_web.chat_postMessage.assert_not_called()
+    non_owner_web.chat_postEphemeral.assert_not_called()
+    non_owner_web.views_open.assert_not_called()
+    assert non_owner.calls == []
+
+    deliver_once(owner_handler, owner_socket, owner_app, click)
+
+    assert owner_socket.acked_envelope_ids == ["env-oneshot-note-open"]
+    assert owner.calls == []
+    owner_web.views_open.assert_called_once()
+
+
+def test_two_releases_oneshot_non_owner_then_owner_resolves_a_note_submission(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    """One-shot note-submit: non-owner leaves the envelope, owner resolves."""
+
+    non_owner = ScriptedResolver(ResolveOutcome(status_code=404, detail="approval not found"))
+    owner = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    non_owner_app, non_owner_web = _build(config, redis_client, non_owner)
+    owner_app, owner_web = _build(config, redis_client, owner)
+    _stub_dialog_web(non_owner_web)
+    _stub_dialog_web(owner_web)
+    non_owner_socket = FakeSocketClient()
+    owner_socket = FakeSocketClient()
+    submit = _note_submit("env-oneshot-note-submit", note="approved for Q3")
+    non_owner_handler = SocketModeHandler(non_owner_app, app_token="xapp-test")
+    owner_handler = SocketModeHandler(owner_app, app_token="xapp-test")
+
+    deliver_once(non_owner_handler, non_owner_socket, non_owner_app, submit)
+
+    assert non_owner_socket.acked_envelope_ids == []
+    non_owner_web.chat_update.assert_not_called()
+    non_owner_web.chat_postMessage.assert_not_called()
+    non_owner_web.chat_postEphemeral.assert_not_called()
+
+    deliver_once(owner_handler, owner_socket, owner_app, submit)
+
+    assert owner_socket.acked_envelope_ids == ["env-oneshot-note-submit"]
+    assert len(non_owner.calls) == 1
+    assert len(owner.calls) == 1
+    assert owner.calls[0]["note"] == "approved for Q3"
+    owner_web.chat_update.assert_called_once()
+    assert "approved for Q3" in owner_web.chat_update.call_args.kwargs["text"]
+
+
+def test_oneshot_two_release_tests_do_not_call_deliver_until_acked() -> None:
+    """Retry-loop-only is not the #2307 proof: inspect the one-shot sources."""
+
+    source = Path(__file__).read_text()
+    tree = ast.parse(source)
+    funcs = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert "test_two_releases_only_the_owner_resolves_an_immediate_action" in funcs
+    for name in _ONESHOT_TWO_RELEASE_TESTS:
+        node = funcs.get(name)
+        assert node is not None, f"missing one-shot test {name}"
+        func_src = ast.get_source_segment(source, node) or ""
+        assert "deliver_until_acked" not in func_src, (
+            f"{name} must not call deliver_until_acked; retry-loop-only is insufficient"
+        )
+        assert "deliver_once(" in func_src, f"{name} must deliver via deliver_once"
 
 
 def test_a_proxy_404_still_consumes_the_envelope(
