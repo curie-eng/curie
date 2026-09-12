@@ -5483,6 +5483,11 @@ export const commandManifest = {
           "name": "sre-demo-e2e"
         },
         {
+          "about": "Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`)",
+          "hidden": false,
+          "name": "two-release-approval-e2e"
+        },
+        {
           "about": "Select the end to end tiers CI would run for paths or revisions",
           "args": [
             {

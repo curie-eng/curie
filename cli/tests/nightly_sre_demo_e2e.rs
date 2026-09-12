@@ -252,7 +252,9 @@ fn workflow_skips_the_live_job_unless_prereqs_are_ready() {
 fn workflow_assigns_required_flag_on_non_pr_events() {
     let text = workflow();
     assert!(
-        text.contains("CURIE_SRE_DEMO_REQUIRED: ${{ github.event_name != 'pull_request' && '1' || '0' }}"),
+        text.contains(
+            "CURIE_SRE_DEMO_REQUIRED: ${{ github.event_name != 'pull_request' && '1' || '0' }}"
+        ),
         "required live acceptance must set CURIE_SRE_DEMO_REQUIRED=1 on \
          schedule, dispatch, and RC events, and leave PR inventory skippable; \
          file contents:\n{text}"

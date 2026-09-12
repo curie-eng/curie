@@ -13,14 +13,13 @@ fn repo_root() -> PathBuf {
 }
 
 fn workflow_text() -> String {
-    fs::read_to_string(
-        repo_root().join(".github/workflows/two-release-approval-e2e.yaml"),
-    )
-    .unwrap_or_default()
+    fs::read_to_string(repo_root().join(".github/workflows/two-release-approval-e2e.yaml"))
+        .unwrap_or_default()
 }
 
 fn script_text() -> String {
-    fs::read_to_string(repo_root().join("cli/scripts/two-release-approval-e2e.sh")).unwrap_or_default()
+    fs::read_to_string(repo_root().join("cli/scripts/two-release-approval-e2e.sh"))
+        .unwrap_or_default()
 }
 
 fn main_rs() -> String {
@@ -134,11 +133,7 @@ fn pull_request_paths(text: &str) -> Vec<String> {
                 paths_indent = Some(indent);
             }
             if Some(indent) == paths_indent {
-                let path = item
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string();
+                let path = item.trim().trim_matches('"').trim_matches('\'').to_string();
                 if !path.is_empty() {
                     paths.push(path);
                 }
@@ -267,9 +262,8 @@ fn script_does_not_pass_by_retrying_until_acked() {
     );
     let retry_until_ack = uncommented_logical_lines(&text).into_iter().filter(|line| {
         let lower = line.to_ascii_lowercase();
-        let looping = lower.contains("until ")
-            || lower.contains("while ")
-            || lower.contains("for ");
+        let looping =
+            lower.contains("until ") || lower.contains("while ") || lower.contains("for ");
         looping
             && (lower.contains("ack") || lower.contains("acked") || lower.contains("acknowledge"))
     });
@@ -302,7 +296,8 @@ fn workflow_path_triggers_are_exactly_the_approval_action_fixture() {
         "unrelated dispatcher PRs must not pay this cost: config.py is not a path trigger"
     );
     assert!(
-        !got.iter().any(|path| path == "runner" || path.starts_with("runner/")),
+        !got.iter()
+            .any(|path| path == "runner" || path.starts_with("runner/")),
         "do not expand SDK approval-gate path triggers (#2308): runner/ is not in paths"
     );
     assert!(

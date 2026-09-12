@@ -1,0 +1,23 @@
+# Consumer overlay for the #2307 two-release owner-only approval fixture.
+#
+# COMPOSES WITH values-e2e-nogvisor.yaml (apply BOTH, nogvisor first):
+#   helm install <rel> charts/curie -n <ns> --skip-crds \
+#     -f charts/curie/values-e2e-nogvisor.yaml \
+#     -f charts/curie/values-e2e-two-release-consumer.yaml
+#
+# Skips cluster-scoped singletons the owner release already installed
+# (ADR-0129). Keeps the dispatcher on so both releases share one Slack app.
+# Do not reuse values-e2e-harness.yaml: that overlay disables the dispatcher.
+
+agentSandbox:
+  controller:
+    deploy: false
+
+priorityClasses:
+  platform:
+    create: false
+  sandbox:
+    create: false
+
+dispatcher:
+  deploy: true
