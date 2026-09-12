@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/release-accept/v1.json",
+  "title": "curie dev release-accept --json",
+  "description": "Read-only evaluator result for the seven-day / 200-canary release gate (#2430). qualified is true only when every criterion is met. Fixture or source evidence cannot qualify in live mode. self_test_cases is populated only for --self-test.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "qualified": {
+      "type": "boolean"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["live", "fixture-self-test"]
+    },
+    "window": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "start": {
+          "type": "string"
+        },
+        "end": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": ["start", "end", "kind"]
+    },
+    "candidate": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "cli": {
+          "type": "string"
+        },
+        "chart": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        }
+      },
+      "required": ["cli", "chart", "image"]
+    },
+    "workload": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "cadence": {
+          "type": "string"
+        }
+      },
+      "required": ["name", "model", "cadence"]
+    },
+    "percentile_method": {
+      "type": ["string", "null"]
+    },
+    "evidence_kind": {
+      "type": ["string", "null"]
+    },
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["met", "missing"]
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "required": ["id", "status", "detail"]
+      }
+    },
+    "missing": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reproduced": {
+          "type": "boolean"
+        },
+        "fixed": {
+          "type": "boolean"
+        },
+        "released": {
+          "type": "boolean"
+        },
+        "deployed": {
+          "type": "boolean"
+        },
+        "observed": {
+          "type": "boolean"
+        }
+      },
+      "required": ["reproduced", "fixed", "released", "deployed", "observed"]
+    },
+    "self_test_cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "expected_missing": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "actual_missing": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": ["name", "passed", "expected_missing", "actual_missing"]
+      }
+    }
+  },
+  "required": [
+    "qualified",
+    "mode",
+    "window",
+    "candidate",
+    "workload",
+    "percentile_method",
+    "evidence_kind",
+    "criteria",
+    "missing",
+    "lifecycle",
+    "self_test_cases"
+  ]
+}
