@@ -1,0 +1,21 @@
+{{- if .Values.api.deploy }}
+{{- $metadata := required "schema compatibility metadata is missing from the packaged chart" (.Files.Get "files/schema-compat.json") }}
+{{- $_ := mustFromJson $metadata }}
+{{/*
+Generated from the API schema window and Alembic graph (ADR-0142). Never make
+this a values override: the target binary determines compatibility. The CLI
+reads this template before mutation; the installed copy records provenance.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "curie.fullname" . }}-schema-compat
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: schema-compat
+data:
+  api-image: {{ include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) | quote }}
+  application-version: {{ .Chart.AppVersion | quote }}
+  compatibility.json: |
+    {{- $metadata | nindent 4 }}
+{{- end }}

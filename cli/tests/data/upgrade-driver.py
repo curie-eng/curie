@@ -83,6 +83,36 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                     convergence sub-flag goes false.
 #   apply_fails       False | "always" | "after-converge"  -- when `kubectl
 #                     apply` (the checkpoint write) exits non-zero
+#   alembic_current   stdout of `kubectl exec ... alembic current`
+#   alembic_fail      that exec exits 1 (unreadable live revision)
+#   compat_metadata   object served as ConfigMap data.compatibility.json from
+#                     `helm template --show-only templates/schema-compat.yaml`
+DEFAULT_COMPAT_METADATA = {
+    "schema_min": "0043",
+    "schema_head": "0043",
+    "revisions": [
+        {
+            "revision": "0043",
+            "parents": ["0042"],
+            "kind": "expand",
+            "sha256": "ab",
+        }
+    ],
+}
+
+# Live 0039, head 0043, pending 0041 is contract. Used by schema-contract.
+CONTRACT_COMPAT_METADATA = {
+    "schema_min": "0043",
+    "schema_head": "0043",
+    "revisions": [
+        {"revision": "0039", "parents": ["0038"], "kind": "expand", "sha256": "ab"},
+        {"revision": "0040", "parents": ["0039"], "kind": "expand", "sha256": "ab"},
+        {"revision": "0041", "parents": ["0040"], "kind": "contract", "sha256": "ab"},
+        {"revision": "0042", "parents": ["0041"], "kind": "expand", "sha256": "ab"},
+        {"revision": "0043", "parents": ["0042"], "kind": "expand", "sha256": "ab"},
+    ],
+}
+
 BASE = {
     "before": "0.8.6",
     "after": "0.9.0",
@@ -103,6 +133,9 @@ BASE = {
     "selector_drift": False,
     "terminal": False,
     "apply_fails": False,
+    "alembic_current": "0043 (head)",
+    "alembic_fail": False,
+    "compat_metadata": None,
 }
 
 SCENARIOS = {
@@ -168,6 +201,22 @@ SCENARIOS = {
     # Drain phase is skipped for having nothing in flight.
     "fresh-install": {"status_missing_before": True},
     "local-chart-mismatch": {"show_chart": "0.8.7"},
+    # Live revision 0099 is not in the target graph: Validate must refuse
+    # before `helm upgrade`.
+    "schema-incompatible": {"alembic_current": "0099"},
+    # Live 0039, target head 0043, pending 0041 is contract.
+    "schema-contract": {
+        "alembic_current": "0039 (head)",
+        "compat_metadata": CONTRACT_COMPAT_METADATA,
+    },
+    # Live already at target head. Chart upgrade may still proceed.
+    "schema-compatible": {"alembic_current": "0043 (head)"},
+    # Existing release, but the alembic probe fails. Fail closed; this is
+    # not an empty-DB shortcut.
+    "schema-probe-fails": {"alembic_fail": True},
+    # No Helm release and the API probe also fails. Retained for the
+    # empty-DB vs missing-API distinction; live tests do not drive it yet.
+    "schema-fresh-empty": {"status_missing_before": True, "alembic_fail": True},
 }
 
 root = Path(os.environ["UPGRADE_DRIVER_ROOT"])
@@ -363,8 +412,39 @@ if program == "helm":
         )
         sys.exit(0)
     if args[0] == "template":
-        show_only = flag_value("--show-only") or "<template>"
-        print(f"Error: could not find template {show_only} in chart", file=sys.stderr)
+        show_only = flag_value("--show-only")
+        if show_only is None:
+            for arg in args:
+                if arg.startswith("--show-only="):
+                    show_only = arg.split("=", 1)[1]
+                    break
+        if show_only == "templates/schema-compat.yaml":
+            metadata = scenario["compat_metadata"] or DEFAULT_COMPAT_METADATA
+            payload = (
+                metadata
+                if isinstance(metadata, str)
+                else json.dumps(metadata, sort_keys=True)
+            )
+            print(
+                json.dumps(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": f"{RELEASE}-curie-schema-compat",
+                            "labels": {
+                                "app.kubernetes.io/component": "schema-compat"
+                            },
+                        },
+                        "data": {"compatibility.json": payload},
+                    }
+                )
+            )
+            sys.exit(0)
+        print(
+            f"Error: could not find template {show_only or '<template>'} in chart",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if args[0] == "upgrade":
         values = flag_value("-f")
@@ -402,6 +482,16 @@ if program == "kubectl":
     if args[:2] == ["get", "deploy"] and len(args) > 2 and not args[2].startswith("-"):
         # The drain probe reads one named Deployment; its output is not parsed.
         print(f"{args[2]}   1/1")
+        sys.exit(0)
+    if args[0] == "exec" and "alembic" in args and "current" in args:
+        if scenario["alembic_fail"]:
+            print(
+                "Error from server (NotFound): deployments.apps "
+                f'"{RELEASE}-curie-api" not found',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(scenario["alembic_current"])
         sys.exit(0)
 
 print("unhandled recording command: " + repr([program, *args]), file=sys.stderr)

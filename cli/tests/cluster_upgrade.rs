@@ -24,6 +24,7 @@ fn opts(to: &str) -> UpgradeOpts {
         to: to.into(),
         chart: None,
         yes: true,
+        forward_only: false,
     }
 }
 
@@ -124,6 +125,11 @@ async fn same_version_rerun_is_idempotent_and_still_proves_canary() {
     );
 }
 
+// Schema refusal at Validate must not begin mutation. `--forward-only` is a
+// clap/LiveHost flag; FakeUpgradeHost keeps a boolean `refuse_schema`.
+// The live binary tests in `cluster_upgrade_live.rs` own that AC:
+// `pending_contract_refuses_and_names_forward_only` and
+// `forward_only_allows_pending_contract_to_reach_helm_upgrade`.
 #[tokio::test]
 async fn validate_failure_does_not_begin_mutation() {
     let mut host = FakeUpgradeHost::installed("0.8.6").refuse_schema();
@@ -132,7 +138,9 @@ async fn validate_failure_does_not_begin_mutation() {
         .expect_err("schema refuse");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("compatibility") || msg.contains("schema") || msg.contains("validate"),
+        msg.contains(
+            "database/application compatibility check refused the target schema before mutation"
+        ),
         "error must name the validate refusal: {msg}"
     );
     assert_eq!(host.mutate_calls, 0);

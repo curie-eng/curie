@@ -137,9 +137,11 @@ banned in this contract, so all three tiers are written out in full:
 
 **After `curie cluster upgrade --to 0.9.0 --json`:** `status` is `"succeeded"`
 only when `convergence.exact` is true and `canary.passed` is true. A failed
-attempt reports `previous_serving` or one `fail_forward.command`. Resume by
-re-running the same command. `curie cluster status --json` reports the current
-upgrade phase and `known_good_version`.
+attempt reports `previous_serving` or one `fail_forward.command`. The
+payload always includes a `compatibility` object (or `null`) with the
+redacted schema-compatibility decision. Resume by re-running the same
+command. `curie cluster status --json` reports the current upgrade phase
+and `known_good_version`.
 
 At the skill tier the bundle is the session, so there is no separate deploy
 <!-- doclint:ignore-line -->

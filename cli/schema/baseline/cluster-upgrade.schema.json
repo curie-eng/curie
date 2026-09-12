@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/cluster-upgrade/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/cluster-upgrade/v1.1.json",
   "title": "curie cluster upgrade --json",
   "description": "The agent-facing payload of `curie cluster upgrade`: the redacted dry-run plan, or the completed lifecycle (succeeded or failed). Success requires exact convergence and a passing target-version canary. A failure either leaves the previous known-good version serving or returns one fail-forward command.",
   "$defs": {
@@ -90,6 +90,82 @@
         "command",
         "reason"
       ]
+    },
+    "pendingStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "kind"
+      ]
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "type": "string"
+        },
+        "current_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target_min": {
+          "type": "string"
+        },
+        "target_head": {
+          "type": "string"
+        },
+        "source_head": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pending": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pendingStep"
+          }
+        },
+        "rollback_compatible": {
+          "type": "boolean"
+        },
+        "forward_only": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "decision",
+        "current_revision",
+        "target_min",
+        "target_head",
+        "source_head",
+        "pending",
+        "rollback_compatible",
+        "forward_only",
+        "reason",
+        "outcome"
+      ]
     }
   },
   "oneOf": [
@@ -164,6 +240,16 @@
           "oneOf": [
             {
               "$ref": "#/$defs/failForward"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "compatibility": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/compatibility"
             },
             {
               "type": "null"

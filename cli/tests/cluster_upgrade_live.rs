@@ -409,6 +409,53 @@ fn remote_chart_ref_pins_the_target_version() {
     );
 }
 
+/// #2588 -- remote `helm template` for schema metadata must pin `--version`
+/// the same way `helm upgrade` does, or Validate reads the latest chart.
+#[test]
+fn remote_chart_schema_template_pins_the_target_version() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run("schema-compatible", "0.9.0", "oci://example.invalid/curie");
+    let templates: Vec<_> = fixture
+        .argv()
+        .into_iter()
+        .filter(|call| is_schema_compat_template(call))
+        .collect();
+    assert!(
+        !templates.is_empty(),
+        "schema Validate must render target metadata: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let position = templates[0]
+        .iter()
+        .position(|arg| arg == "--version")
+        .unwrap_or_else(|| panic!("--version absent from helm template {:?}", templates[0]));
+    assert_eq!(
+        templates[0].get(position + 1).map(String::as_str),
+        Some("0.9.0"),
+        "--version must pin helm template to the requested target: {:?}",
+        templates[0]
+    );
+    let upgrades = fixture.helm_upgrades();
+    assert_eq!(
+        upgrades.len(),
+        1,
+        "compatible remote chart must still upgrade: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let position = upgrades[0]
+        .iter()
+        .position(|arg| arg == "--version")
+        .unwrap_or_else(|| panic!("--version absent from {:?}", upgrades[0]));
+    assert_eq!(
+        upgrades[0].get(position + 1).map(String::as_str),
+        Some("0.9.0"),
+        "--version must carry the requested target: {:?}",
+        upgrades[0]
+    );
+}
+
 // T2 -- #2301 "never reports success for an unconverged release": the observed
 // Helm revision, not the requested string, is the authority.
 //
@@ -1099,4 +1146,224 @@ fn dry_run_helm_line_matches_the_recorded_upgrade_argv() {
             "--version must show exactly when passed: {line}"
         );
     }
+}
+
+fn is_alembic_current(call: &[String]) -> bool {
+    call.first().map(String::as_str) == Some("kubectl")
+        && call.iter().any(|arg| arg == "exec")
+        && call.iter().any(|arg| arg == "alembic")
+        && call.iter().any(|arg| arg == "current")
+}
+
+fn is_schema_compat_template(call: &[String]) -> bool {
+    if call.first().map(String::as_str) != Some("helm")
+        || call.get(1).map(String::as_str) != Some("template")
+    {
+        return false;
+    }
+    call.windows(2)
+        .any(|pair| pair[0] == "--show-only" && pair[1] == "templates/schema-compat.yaml")
+        || call
+            .iter()
+            .any(|arg| arg == "--show-only=templates/schema-compat.yaml")
+}
+
+fn is_schema_compat_configmap_get(call: &[String]) -> bool {
+    call.len() >= 3
+        && call[0] == "kubectl"
+        && call[1] == "get"
+        && call[2] == "configmap"
+        && call.iter().any(|arg| arg.contains("schema-compat"))
+}
+
+fn overlay_sets_forward_only(fixture: &Fixture) -> bool {
+    let upgrades = fixture.helm_upgrades();
+    if upgrades.is_empty() {
+        return false;
+    }
+    let argv = upgrades[0].join(" ");
+    if argv.contains("forwardOnly") || argv.contains("forward-only") {
+        return true;
+    }
+    fs::read_to_string(fixture.0.path().join("values-1.yaml"))
+        .map(|text| text.contains("forwardOnly") || text.contains("forward-only"))
+        .unwrap_or(false)
+}
+
+/// #2588 -- an unknown live revision refuses at Validate with zero `helm
+/// upgrade`. Current LiveHost ignores schema, so this fails until the bind.
+#[test]
+fn incompatible_live_revision_refuses_before_helm_upgrade() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("schema-incompatible");
+    assert!(
+        !output.status.success(),
+        "live revision 0099 must refuse the target schema: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "schema refusal must precede mutation: {:?}",
+        fixture.argv()
+    );
+    let message = visible(&output).to_lowercase();
+    assert!(
+        message.contains("compatibility")
+            || message.contains("schema")
+            || message.contains("revision"),
+        "refusal must name compatibility/schema/revision: {}",
+        visible(&output)
+    );
+}
+
+/// #2588 -- pending contract 0041 refuses and names `--forward-only`.
+#[test]
+fn pending_contract_refuses_and_names_forward_only() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("schema-contract");
+    assert!(
+        !output.status.success(),
+        "pending contract 0041 must refuse without --forward-only: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "contract refusal must precede mutation: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        visible(&output).contains("--forward-only"),
+        "refusal must name --forward-only: {}",
+        visible(&output)
+    );
+}
+
+/// #2588 -- a resume that already completed Validate still refuses a freshly
+/// computed contract migration and must not skip to Apply.
+#[test]
+fn resume_after_validate_still_refuses_fresh_schema_contract() {
+    let fixture = Fixture::new(None).checkpoint(&checkpoint_through(&["plan", "validate"], true));
+    let output = fixture.local("schema-contract");
+    assert!(
+        !output.status.success(),
+        "resume without --forward-only must refuse a pending contract: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "fresh schema refusal must precede mutation: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        visible(&output).contains("--forward-only"),
+        "refusal must name --forward-only: {}",
+        visible(&output)
+    );
+}
+
+/// #2588 -- the same pending contract proceeds once `--forward-only` is set.
+/// Clap does not accept the flag on `cluster upgrade` yet, so this fails today.
+#[test]
+fn forward_only_allows_pending_contract_to_reach_helm_upgrade() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run_with(
+        "schema-contract",
+        "0.9.0",
+        "charts/curie",
+        &["--forward-only"],
+    );
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "--forward-only must reach helm upgrade: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    assert!(
+        overlay_sets_forward_only(&fixture),
+        "Apply overlay must carry api.migrate.forwardOnly: {:?} / {}",
+        fixture.helm_upgrades(),
+        fs::read_to_string(fixture.0.path().join("values-1.yaml")).unwrap_or_default()
+    );
+}
+
+/// #2588 -- already at head is the positive control: helm upgrade without the
+/// flag. LiveHost currently ignores schema, so this may already pass.
+#[test]
+fn compatible_already_at_head_reaches_helm_upgrade_without_forward_only() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("schema-compatible");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "compatible already-at-head must still upgrade the chart: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    assert!(
+        !fixture
+            .argv()
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "--forward-only")),
+        "the compatible path must not pass --forward-only: {:?}",
+        fixture.argv()
+    );
+}
+
+/// #2588 -- a v0.8.x install has no schema-compat ConfigMap. Source window
+/// comes from the catalog; target window from `helm template --show-only`.
+#[test]
+fn v08x_source_window_comes_from_catalog_not_configmap() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("schema-compatible");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "compatible v0.8.6 source must still upgrade: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    assert!(
+        fixture.argv().iter().any(|call| is_alembic_current(call)),
+        "live revision must be read with kubectl exec alembic current: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture
+            .argv()
+            .iter()
+            .any(|call| is_schema_compat_template(call)),
+        "target window must come from helm template --show-only templates/schema-compat.yaml: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        !fixture
+            .argv()
+            .iter()
+            .any(|call| is_schema_compat_configmap_get(call)),
+        "v0.8.x source window must not be read from a schema-compat ConfigMap: {:?}",
+        fixture.argv()
+    );
+}
+
+/// #2588 -- an existing release whose alembic probe fails is not an empty-DB
+/// install. Current LiveHost never execs, so the upgrade still succeeds today.
+#[test]
+fn unreadable_live_revision_on_existing_release_refuses_empty_db_shortcut() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("schema-probe-fails");
+    assert!(
+        !output.status.success(),
+        "a failed alembic probe on an existing release must refuse: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "an unreadable live revision must not mutate: {:?}",
+        fixture.argv()
+    );
 }
