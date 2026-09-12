@@ -1066,6 +1066,7 @@ use curie::ops::{
     ClusterDownOutput, ClusterRollbackOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput,
     PodRow,
 };
+use curie::release_accept::ReleaseAcceptOutput;
 use curie::secrets::SecretsListOutput;
 
 fn assert_valid(schema_file: &str, value: &serde_json::Value) {
@@ -1153,6 +1154,17 @@ fn bump_version_output_validates() {
         version: "1.2.3".to_string(),
     };
     assert_valid("bump-version.schema.json", &out.to_json());
+}
+
+#[test]
+fn release_accept_output_validates() {
+    let out = curie::release_accept::evaluate(
+        &curie::release_accept::qualifying_ledger(),
+        curie::release_accept::EvaluateMode::FixtureSelfTest,
+    );
+    assert_valid("release-accept.schema.json", &out.to_json());
+    let self_test: ReleaseAcceptOutput = curie::release_accept::run_self_test();
+    assert_valid("release-accept.schema.json", &self_test.to_json());
 }
 
 #[test]

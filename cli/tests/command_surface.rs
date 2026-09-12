@@ -416,6 +416,36 @@ fn process_dev_help_lists_upgrade_drill() {
 }
 
 #[test]
+fn process_dev_help_lists_release_accept() {
+    let output = run_help(&["dev"]);
+    assert!(
+        output.status.success(),
+        "expected success for dev help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        help_lists_subcommand(&text, "release-accept"),
+        "missing release-accept\n{text}"
+    );
+
+    let leaf = run_help(&["dev", "release-accept"]);
+    assert!(
+        leaf.status.success(),
+        "expected success for release-accept help\n{}",
+        output_text(&leaf)
+    );
+    let leaf_text = output_text(&leaf);
+    assert!(
+        leaf_text.contains("--self-test")
+            && leaf_text.contains("--ledger")
+            && leaf_text.contains("seven-day")
+            && !leaf_text.to_lowercase().contains("closes #2430"),
+        "release-accept help must name self-test, ledger, and the seven-day gate without closing the issue\n{leaf_text}"
+    );
+}
+
+#[test]
 fn process_dev_e2e_ci_selection_delegates_path_selection() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

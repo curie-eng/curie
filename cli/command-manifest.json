@@ -5713,6 +5713,34 @@
           ],
           "hidden": false,
           "name": "bump-version"
+        },
+        {
+          "about": "Read-only evaluator for the seven-day / 200-canary release gate (#2430)",
+          "args": [
+            {
+              "global": false,
+              "help": "JSON evidence ledger. Evaluated as a live release result",
+              "id": "ledger",
+              "long": "ledger",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Run committed fixture controls: qualifying pass plus each independent miss. Does not evaluate a live window",
+              "id": "self_test",
+              "long": "self-test",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read-only evaluator for the seven-day / 200-canary release gate (#2430).\n\nScores a private evidence ledger against pinned window, candidate, workload, and percentile-method fields. A synthetic qualifying fixture passes `--self-test`; independently missing each campaign criterion fails closed with that criterion id. Fixture or source proof cannot qualify as a live release result. Does not start a seven-day campaign, rotate credentials, mutate the permanent soak, merge, or close #2430. Checkout-only.",
+          "name": "release-accept"
         }
       ]
     },

@@ -238,6 +238,12 @@
       "version": "1.0"
     },
     {
+      "result": "ReleaseAcceptOutput",
+      "kind": "CliOutput",
+      "schema": "release-accept.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ResetThreadOutput",
       "kind": "CliOutput",
       "schema": "reset-thread.schema.json",
