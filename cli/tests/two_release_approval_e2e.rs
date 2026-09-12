@@ -413,11 +413,71 @@ fn helm_installs_pass_api_key_via_values_file_not_argv() {
 }
 
 #[test]
+fn helm_installs_always_pass_slack_values_file_not_argv() {
+    let text = script_text();
+    assert!(
+        !text.is_empty(),
+        "cli/scripts/two-release-approval-e2e.sh must exist"
+    );
+    let helm = helm_release_commands(&text);
+    let installs: Vec<&String> = helm
+        .iter()
+        .filter(|cmd| cmd.contains("helm install") || cmd.contains("helm upgrade"))
+        .collect();
+    assert!(
+        installs.len() >= 2,
+        "the fixture needs two Helm releases; found {}: {installs:?}",
+        installs.len()
+    );
+    for cmd in &installs {
+        assert!(
+            cmd.contains(r#"-f "$SLACK_VALUES""#),
+            "both helm installs must pass -f SLACK_VALUES so dispatcher.enabled \
+             deploys; command: {cmd}"
+        );
+        assert!(
+            !cmd.contains("appToken="),
+            "do not put dispatcher.slack.appToken on helm argv: {cmd}"
+        );
+        assert!(
+            !cmd.contains("botToken="),
+            "do not put dispatcher.slack.botToken on helm argv: {cmd}"
+        );
+        assert!(
+            !cmd.contains("xapp-fixture-2307") && !cmd.contains("xoxb-fixture-2307"),
+            "fixture Slack tokens must stay in the 0600 values file, not helm argv: {cmd}"
+        );
+    }
+    assert!(
+        text.contains("chmod 600 \"$SLACK_VALUES\""),
+        "Slack values file must be 0600; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("xapp-fixture-2307") && text.contains("xoxb-fixture-2307"),
+        "empty CI_SLACK_* must fall back to xapp-fixture-2307 / xoxb-fixture-2307; \
+         file contents:\n{text}"
+    );
+    assert!(
+        text.contains(r#"$(fullname "$RELEASE_A")-dispatcher"#)
+            && text.contains(r#"$(fullname "$RELEASE_B")-dispatcher"#),
+        "both namespaces must rollout-status the dispatcher deploy; file contents:\n{text}"
+    );
+}
+
+#[test]
 fn summary_names_api_isolation_pass_and_dispatcher_ownership_blocked() {
     let text = script_text();
     assert!(
         !text.is_empty(),
         "cli/scripts/two-release-approval-e2e.sh must exist"
+    );
+    assert!(
+        text.contains("helm two-release") && text.contains(": PASS"),
+        "Helm two-release must be a named PASS; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("API isolation: PASS"),
+        "API isolation must be a named PASS; file contents:\n{text}"
     );
     assert!(
         text.contains("API isolation one-shot B (404 approval not found): PASS"),
@@ -428,9 +488,28 @@ fn summary_names_api_isolation_pass_and_dispatcher_ownership_blocked() {
         "API isolation A pending must be a named PASS; file contents:\n{text}"
     );
     assert!(
+        text.contains("B one-shot resolve miss (404 approval not found): PASS"),
+        "B one-shot resolve miss must be a named PASS; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("A resolve-once: ${a_resolve_row}"),
+        "A resolve-once must name PASS or BLOCKED honestly; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("print(\"PASS\\tresolved\")")
+            && text.contains("print(\"BLOCKED\\thuman/operator principal required\")"),
+        "A resolve-once must emit PASS on 200/201 and BLOCKED on 401/403; \
+         file contents:\n{text}"
+    );
+    assert!(
         text.contains("deployed dispatcher envelope ownership: BLOCKED"),
         "deployed dispatcher envelope ownership must be BLOCKED without a \
          delivered one-shot envelope; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("live Slack owner-only envelope: ${live_row}"),
+        "live Slack envelope must stay named BLOCKED without a dedicated app; \
+         file contents:\n{text}"
     );
     assert!(
         !text.contains("dispatcher envelope ownership: PASS")
@@ -458,5 +537,62 @@ fn force_kind_delete_requires_job_owned_label() {
     assert!(
         body.contains("cluster_is_job_owned") && body.contains("kind delete cluster"),
         "FORCE recreate must not delete by name alone; file contents:\n{text}"
+    );
+}
+
+#[test]
+fn owned_kind_is_set_immediately_after_kind_create() {
+    let text = script_text();
+    assert!(
+        !text.is_empty(),
+        "cli/scripts/two-release-approval-e2e.sh must exist"
+    );
+    let lines = uncommented_logical_lines(&text);
+    let create_idx = lines
+        .iter()
+        .position(|line| line.contains("kind create cluster") && line.contains("$KIND_CLUSTER"))
+        .expect("script must create the job-owned kind cluster");
+    assert!(
+        lines
+            .get(create_idx + 1)
+            .is_some_and(|line| line.contains("OWNED_KIND=1")),
+        "OWNED_KIND=1 must be set immediately after kind create succeeds, before \
+         label_kind_cluster, so EXIT cleanup still deletes this cluster if labeling \
+         fails; got {:?}",
+        lines.get(create_idx..create_idx.saturating_add(4))
+    );
+    assert!(
+        lines
+            .get(create_idx + 2)
+            .is_some_and(|line| line.trim() == "label_kind_cluster"),
+        "label_kind_cluster must run after OWNED_KIND=1; got {:?}",
+        lines.get(create_idx..create_idx.saturating_add(4))
+    );
+}
+
+#[test]
+fn one_shot_resolve_posts_do_not_loop() {
+    let text = script_text();
+    assert!(
+        !text.is_empty(),
+        "cli/scripts/two-release-approval-e2e.sh must exist"
+    );
+    let body = uncommented_logical_lines(&text).join("\n");
+    assert!(
+        !body.contains("deliver_until_acked"),
+        "the Helm fixture must not pass by looping until a release acks"
+    );
+    assert!(
+        text.contains(r#"api_json "$consumer_url/approvals/${approval_id}/resolve" POST"#)
+            && text.contains(r#"api_json "$owner_url/approvals/${approval_id}/resolve" POST"#),
+        "one-shot B then A resolve must use api_json POST /resolve; file contents:\n{text}"
+    );
+    let resolve_posts = uncommented_logical_lines(&text)
+        .into_iter()
+        .filter(|line| line.contains("/resolve") && line.contains("POST"))
+        .count();
+    assert_eq!(
+        resolve_posts, 2,
+        "exactly one consumer resolve POST and one owner resolve POST; no retry loop"
     );
 }

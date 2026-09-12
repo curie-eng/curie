@@ -19,9 +19,14 @@
 #   2. Observe consumer B once via API GET (404 not found). No resolve /
 #      reject / mutate.
 #   3. Observe owner A once via API GET (still pending).
-# API isolation is the Helm PASS. Deployed dispatcher envelope ownership is
-# BLOCKED unless an actual one-shot envelope was delivered (it is not today).
-# Missing dedicated Slack app: BLOCKED live ownership row, not PASS.
+#   4. POST resolve to B once (404 approval not found); A still pending.
+#   5. POST resolve to A once. 200/201 resolved is PASS; 401/403 because a
+#      human/operator principal is required is BLOCKED (do not impersonate
+#      Slack). B-miss stays PASS either way.
+# Helm two-release always writes a 0600 Slack values file so both dispatcher
+# Deployments exist (curie.dispatcher.enabled requires appToken AND botToken).
+# Missing dedicated Slack app: BLOCKED live envelope row, not PASS. Dummy
+# fixture tokens make the dispatcher backoff; that is OK.
 
 set -euo pipefail
 
@@ -204,9 +209,10 @@ write_slack_values() {
   python3 - "$SLACK_VALUES" <<'PY'
 import json, os, pathlib, sys
 path = pathlib.Path(sys.argv[1])
-app = os.environ.get("CI_SLACK_APP_TOKEN", "")
-bot = os.environ.get("CI_SLACK_BOT_TOKEN", "")
-# Tokens stay in this 0600 file, never on the helm argv.
+# CI tokens when present; otherwise non-connecting placeholders so
+# curie.dispatcher.enabled still deploys. Never real Slack, never helm argv.
+app = os.environ.get("CI_SLACK_APP_TOKEN") or "xapp-fixture-2307"
+bot = os.environ.get("CI_SLACK_BOT_TOKEN") or "xoxb-fixture-2307"
 path.write_text(
     "dispatcher:\n"
     "  slack:\n"
@@ -252,16 +258,12 @@ install_owner_release() {
   while IFS= read -r line; do
     [[ -n "$line" ]] && sets+=("$line")
   done < <(helm_set_args)
-  local slack_file=()
-  if [[ -n "${CI_SLACK_APP_TOKEN:-}" && -n "${CI_SLACK_BOT_TOKEN:-}" ]]; then
-    slack_file=(-f "$SLACK_VALUES")
-  fi
   helm install "$RELEASE_A" "$CHART" \
     --namespace "$NS_A" \
     --wait --timeout 15m \
     -f "$NOGVISOR" \
     -f "$API_VALUES" \
-    "${slack_file[@]}" \
+    -f "$SLACK_VALUES" \
     "${sets[@]}"
 }
 
@@ -271,10 +273,6 @@ install_consumer_release() {
   while IFS= read -r line; do
     [[ -n "$line" ]] && sets+=("$line")
   done < <(helm_set_args)
-  local slack_file=()
-  if [[ -n "${CI_SLACK_APP_TOKEN:-}" && -n "${CI_SLACK_BOT_TOKEN:-}" ]]; then
-    slack_file=(-f "$SLACK_VALUES")
-  fi
   helm install "$RELEASE_B" "$CHART" \
     --namespace "$NS_B" \
     --skip-crds \
@@ -282,7 +280,7 @@ install_consumer_release() {
     -f "$NOGVISOR" \
     -f "$CONSUMER_OVERLAY" \
     -f "$API_VALUES" \
-    "${slack_file[@]}" \
+    -f "$SLACK_VALUES" \
     "${sets[@]}"
 }
 
@@ -322,8 +320,8 @@ ensure_kind_cluster() {
     kind delete cluster --name "$KIND_CLUSTER"
   fi
   kind create cluster --name "$KIND_CLUSTER" --wait 120s
-  label_kind_cluster
   OWNED_KIND=1
+  label_kind_cluster
   if [[ -n "${CURIE_API_IMAGE:-}" ]]; then
     kind load docker-image "$CURIE_API_IMAGE" --name "$KIND_CLUSTER"
   fi
@@ -446,6 +444,60 @@ print("owner one-shot: row still pending on A")
 PY
 }
 
+# One POST /resolve on the consumer. Do not wrap this in a retry.
+resolve_consumer_once() {
+  local owner_url="$1" consumer_url="$2" approval_id="$3"
+  local miss owner_after
+  miss="$(api_json "$consumer_url/approvals/${approval_id}/resolve" POST '{"decision":"approved"}')"
+  owner_after="$(api_json "$owner_url/approvals/${approval_id}" GET)"
+  python3 - "$miss" "$owner_after" <<'PY'
+import json, sys
+miss = json.loads(sys.argv[1])
+owner = json.loads(sys.argv[2])
+detail = ""
+body = miss.get("body")
+if isinstance(body, dict):
+    detail = str(body.get("detail") or "")
+if miss.get("status") != 404 or detail.strip().casefold() != "approval not found":
+    raise SystemExit(
+        f"consumer one-shot resolve must 404 approval not found; got {miss}"
+    )
+if owner.get("status") != 200:
+    raise SystemExit(f"owner row missing after consumer resolve-once: {owner}")
+status = (owner.get("body") or {}).get("status") if isinstance(owner.get("body"), dict) else None
+if status != "pending":
+    raise SystemExit(
+        f"consumer resolve-once must not mutate owner; owner status={status}"
+    )
+print("consumer one-shot resolve: 404 ownership miss, owner row still pending")
+PY
+}
+
+# One POST /resolve on the owner. Do not wrap this in a retry.
+# 200/201 resolved -> PASS. 401/403 principal required -> BLOCKED (do not
+# impersonate Slack). Unexpected statuses fail closed.
+resolve_owner_once() {
+  local owner_url="$1" approval_id="$2"
+  local got
+  got="$(api_json "$owner_url/approvals/${approval_id}/resolve" POST '{"decision":"approved"}')"
+  python3 - "$got" <<'PY'
+import json, sys
+got = json.loads(sys.argv[1])
+status = got.get("status")
+body = got.get("body")
+row_status = body.get("status") if isinstance(body, dict) else None
+if status in (200, 201):
+    if row_status not in ("approved", "rejected"):
+        raise SystemExit(f"owner resolve-once HTTP {status} but not resolved: {got}")
+    print("PASS\tresolved")
+    raise SystemExit(0)
+if status in (401, 403):
+    print("BLOCKED\thuman/operator principal required")
+    raise SystemExit(0)
+raise SystemExit(f"owner resolve-once unexpected response: {got}")
+PY
+}
+
 snapshot_consumer_logs_once() {
   local deploy
   deploy="$(fullname "$RELEASE_B")-dispatcher"
@@ -507,17 +559,19 @@ phase_run() {
   create_owned_namespace "$NS_B"
   OWNED_HELM=1
   write_api_values
-  if [[ -n "${CI_SLACK_APP_TOKEN:-}" && -n "${CI_SLACK_BOT_TOKEN:-}" ]]; then
-    write_slack_values
-  fi
+  write_slack_values
   install_owner_release
   install_consumer_release
 
-  local svc_a svc_b
+  local svc_a svc_b disp_a disp_b
   svc_a="$(fullname "$RELEASE_A")-api"
   svc_b="$(fullname "$RELEASE_B")-api"
+  disp_a="$(fullname "$RELEASE_A")-dispatcher"
+  disp_b="$(fullname "$RELEASE_B")-dispatcher"
   kubectl --namespace "$NS_A" rollout status "deploy/${svc_a}" --timeout=300s
   kubectl --namespace "$NS_B" rollout status "deploy/${svc_b}" --timeout=300s
+  kubectl --namespace "$NS_A" rollout status "deploy/${disp_a}" --timeout=300s
+  kubectl --namespace "$NS_B" rollout status "deploy/${disp_b}" --timeout=300s
 
   PF_A_PID="$(start_port_forward "$NS_A" "$svc_a" 18080)"
   PF_B_PID="$(start_port_forward "$NS_B" "$svc_b" 18081)"
@@ -543,6 +597,11 @@ PY
   local consumer_logs
   consumer_logs="$(snapshot_consumer_logs_once)"
   observe_owner_once "http://127.0.0.1:18080" "$approval_id"
+  resolve_consumer_once "http://127.0.0.1:18080" "http://127.0.0.1:18081" "$approval_id"
+  local owner_resolve a_resolve_row a_resolve_reason
+  owner_resolve="$(resolve_owner_once "http://127.0.0.1:18080" "$approval_id")"
+  a_resolve_row="${owner_resolve%%$'\t'*}"
+  a_resolve_reason="${owner_resolve#*$'\t'}"
 
   local live_row="BLOCKED"
   local live_reason="dedicated CI Slack app credentials are not in repo secrets; live ownership observation unavailable. Do not use unknown local bot token."
@@ -560,13 +619,16 @@ PY
 
 - helm two-release (owner CRDs, consumer --skip-crds + values-e2e-two-release-consumer.yaml): PASS
 - create approval on A: PASS ($approval_id)
+- API isolation: PASS
 - API isolation one-shot B (404 approval not found): PASS
 - API isolation one-shot A (still pending): PASS
+- B one-shot resolve miss (404 approval not found): PASS
+- A resolve-once: ${a_resolve_row} (${a_resolve_reason})
 - deployed dispatcher envelope ownership: BLOCKED (no one-shot envelope was delivered)
 - live Slack owner-only envelope: ${live_row} (${live_reason})
 EOF
 )"
-  echo "two-release-approval-e2e: API isolation PASS; dispatcher envelope ownership BLOCKED; live ownership $live_row" >&2
+  echo "two-release-approval-e2e: helm two-release PASS; API isolation PASS; B one-shot resolve miss PASS; A resolve $a_resolve_row; live Slack envelope $live_row" >&2
 }
 
 case "$PHASE" in
