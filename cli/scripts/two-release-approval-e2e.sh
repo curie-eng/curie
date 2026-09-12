@@ -16,8 +16,11 @@
 #
 # Sequence (one shot each; never retry until some release succeeds):
 #   1. Create the approval on owner release A.
-#   2. Deliver/observe consumer B once (no resolve / reject / mutate).
-#   3. Deliver/observe owner A once (resolve when a live envelope exists).
+#   2. Observe consumer B once via API GET (404 not found). No resolve /
+#      reject / mutate.
+#   3. Observe owner A once via API GET (still pending).
+# API isolation is the Helm PASS. Deployed dispatcher envelope ownership is
+# BLOCKED unless an actual one-shot envelope was delivered (it is not today).
 # Missing dedicated Slack app: BLOCKED live ownership row, not PASS.
 
 set -euo pipefail
@@ -34,12 +37,13 @@ NOGVISOR="$CHART/values-e2e-nogvisor.yaml"
 CONSUMER_OVERLAY="$CHART/values-e2e-two-release-consumer.yaml"
 JOB_LABEL_KEY="curie.example.com/two-release-job"
 JOB_LABEL_VALUE="2307"
-API_KEY="${CURIE_API_KEY:-curie-dev-key}"
+API_KEY="${CURIE_API_KEY:-}"
 OWNED_KIND=0
 OWNED_HELM=0
 PF_A_PID=""
 PF_B_PID=""
 SLACK_VALUES=""
+API_VALUES=""
 PREV_CONTEXT=""
 KEEP="${CURIE_TWO_RELEASE_KEEP:-0}"
 FORCE="${CURIE_TWO_RELEASE_FORCE:-0}"
@@ -212,6 +216,36 @@ path.write_text(
 PY
 }
 
+write_api_values() {
+  if [[ -z "$API_KEY" ]]; then
+    API_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+  fi
+  local attester
+  attester="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+  while [[ "$attester" == "$API_KEY" ]]; do
+    attester="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+  done
+  API_VALUES="$(mktemp)"
+  chmod 600 "$API_VALUES"
+  # Keys stay in this 0600 file, never on the helm argv.
+  CURIE_API_KEY="$API_KEY" CURIE_APPROVAL_CHAT_ATTESTER_SECRET="$attester" \
+    python3 - "$API_VALUES" <<'PY'
+import json, os, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+api_key = os.environ["CURIE_API_KEY"]
+attester = os.environ["CURIE_APPROVAL_CHAT_ATTESTER_SECRET"]
+if api_key == attester:
+    raise SystemExit("api.apiKey and api.approvalChatAttesterSecret must differ")
+path.write_text(
+    "security:\n"
+    "  allowDevDefaults: true\n"
+    "api:\n"
+    f"  apiKey: {json.dumps(api_key)}\n"
+    f"  approvalChatAttesterSecret: {json.dumps(attester)}\n"
+)
+PY
+}
+
 install_owner_release() {
   local sets=()
   local line
@@ -226,6 +260,7 @@ install_owner_release() {
     --namespace "$NS_A" \
     --wait --timeout 15m \
     -f "$NOGVISOR" \
+    -f "$API_VALUES" \
     "${slack_file[@]}" \
     "${sets[@]}"
 }
@@ -246,6 +281,7 @@ install_consumer_release() {
     --wait --timeout 15m \
     -f "$NOGVISOR" \
     -f "$CONSUMER_OVERLAY" \
+    -f "$API_VALUES" \
     "${slack_file[@]}" \
     "${sets[@]}"
 }
@@ -256,17 +292,37 @@ create_owned_namespace() {
   kubectl label namespace "$ns" "${JOB_LABEL_KEY}=${JOB_LABEL_VALUE}" --overwrite >/dev/null
 }
 
+cluster_is_job_owned() {
+  local kubeconfig found
+  kubeconfig="$(mktemp)"
+  if ! kind export kubeconfig --name "$KIND_CLUSTER" --kubeconfig "$kubeconfig" >/dev/null 2>&1; then
+    rm -f "$kubeconfig"
+    return 1
+  fi
+  found="$(kubectl --kubeconfig "$kubeconfig" --request-timeout=10s \
+    get nodes -l "${JOB_LABEL_KEY}=${JOB_LABEL_VALUE}" -o name 2>/dev/null || true)"
+  rm -f "$kubeconfig"
+  [[ -n "$found" ]]
+}
+
+label_kind_cluster() {
+  kubectl label nodes --all "${JOB_LABEL_KEY}=${JOB_LABEL_VALUE}" --overwrite >/dev/null
+}
+
 ensure_kind_cluster() {
   refuse_foreign_cluster_name
   if kind get clusters 2>/dev/null | grep -Fxq "$KIND_CLUSTER"; then
-    if [[ "$FORCE" == "1" ]]; then
-      log "recreating leftover kind cluster $KIND_CLUSTER"
-      kind delete cluster --name "$KIND_CLUSTER"
-    else
+    if [[ "$FORCE" != "1" ]]; then
       die "kind cluster $KIND_CLUSTER already exists; set CURIE_TWO_RELEASE_FORCE=1 to recreate this job-owned cluster only"
     fi
+    if ! cluster_is_job_owned; then
+      die "kind cluster $KIND_CLUSTER exists but is not labeled ${JOB_LABEL_KEY}=${JOB_LABEL_VALUE}; refusing to delete"
+    fi
+    log "recreating leftover kind cluster $KIND_CLUSTER"
+    kind delete cluster --name "$KIND_CLUSTER"
   fi
   kind create cluster --name "$KIND_CLUSTER" --wait 120s
+  label_kind_cluster
   OWNED_KIND=1
   if [[ -n "${CURIE_API_IMAGE:-}" ]]; then
     kind load docker-image "$CURIE_API_IMAGE" --name "$KIND_CLUSTER"
@@ -411,6 +467,9 @@ cleanup() {
   if [[ -n "$SLACK_VALUES" && -f "$SLACK_VALUES" ]]; then
     rm -f "$SLACK_VALUES"
   fi
+  if [[ -n "$API_VALUES" && -f "$API_VALUES" ]]; then
+    rm -f "$API_VALUES"
+  fi
   if [[ "$KEEP" == "1" ]]; then
     log "keeping owned resources (kind=$KIND_CLUSTER ns=$NS_A,$NS_B releases=$RELEASE_A,$RELEASE_B)"
     return 0
@@ -447,6 +506,7 @@ phase_run() {
   create_owned_namespace "$NS_A"
   create_owned_namespace "$NS_B"
   OWNED_HELM=1
+  write_api_values
   if [[ -n "${CI_SLACK_APP_TOKEN:-}" && -n "${CI_SLACK_BOT_TOKEN:-}" ]]; then
     write_slack_values
   fi
@@ -467,9 +527,16 @@ phase_run() {
 
   local created approval_id
   created="$(create_approval_on_a "http://127.0.0.1:18080")"
-  approval_id="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); body=d.get("body") or {};
-raise SystemExit("create approval on A failed: "+sys.argv[1]) if d.get("status") not in (200,201) else None;
-print(body["id"])' "$created")"
+  approval_id="$(python3 - "$created" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+status = d.get("status")
+if status not in (200, 201):
+    raise SystemExit("create approval on A failed: " + sys.argv[1])
+body = d.get("body") or {}
+print(body["id"])
+PY
+)"
   log "created approval $approval_id on owner release A"
 
   observe_consumer_once "http://127.0.0.1:18080" "http://127.0.0.1:18081" "$approval_id"
@@ -493,12 +560,13 @@ print(body["id"])' "$created")"
 
 - helm two-release (owner CRDs, consumer --skip-crds + values-e2e-two-release-consumer.yaml): PASS
 - create approval on A: PASS ($approval_id)
-- one-shot B (no resolve/reject/mutate, owner row still pending): PASS
-- one-shot A (row still on A; no retry-until-acked): PASS
+- API isolation one-shot B (404 approval not found): PASS
+- API isolation one-shot A (still pending): PASS
+- deployed dispatcher envelope ownership: BLOCKED (no one-shot envelope was delivered)
 - live Slack owner-only envelope: ${live_row} (${live_reason})
 EOF
 )"
-  echo "two-release-approval-e2e: helm fixture PASS; live ownership $live_row" >&2
+  echo "two-release-approval-e2e: API isolation PASS; dispatcher envelope ownership BLOCKED; live ownership $live_row" >&2
 }
 
 case "$PHASE" in

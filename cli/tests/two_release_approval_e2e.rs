@@ -348,3 +348,115 @@ fn workflow_never_echoes_secrets_on_a_run_line() {
         }
     }
 }
+
+#[test]
+fn create_approval_id_parser_does_not_raise_none_on_success() {
+    let text = script_text();
+    assert!(
+        !text.is_empty(),
+        "cli/scripts/two-release-approval-e2e.sh must exist"
+    );
+    let bad: Vec<String> = uncommented_logical_lines(&text)
+        .into_iter()
+        .filter(|line| line.contains("raise SystemExit") && line.contains("else None"))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "create-id parser must use if/raise/print; `raise SystemExit(...) if \
+         cond else None` raises None on 200/201. matching lines: {bad:?}"
+    );
+    assert!(
+        text.contains("print(body[\"id\"])"),
+        "200/201 must print body[\"id\"]; file contents:\n{text}"
+    );
+}
+
+#[test]
+fn helm_installs_pass_api_key_via_values_file_not_argv() {
+    let text = script_text();
+    assert!(
+        !text.is_empty(),
+        "cli/scripts/two-release-approval-e2e.sh must exist"
+    );
+    let helm = helm_release_commands(&text);
+    let installs: Vec<&String> = helm
+        .iter()
+        .filter(|cmd| cmd.contains("helm install") || cmd.contains("helm upgrade"))
+        .collect();
+    assert!(
+        installs.len() >= 2,
+        "the fixture needs two Helm releases; found {}: {installs:?}",
+        installs.len()
+    );
+    for cmd in &installs {
+        assert!(
+            cmd.contains(r#"-f "$API_VALUES""#),
+            "both helm installs must pass -f API_VALUES; command: {cmd}"
+        );
+        assert!(
+            !cmd.contains("api.apiKey="),
+            "do not put api.apiKey on helm argv: {cmd}"
+        );
+        assert!(
+            !cmd.contains("approvalChatAttesterSecret="),
+            "do not put api.approvalChatAttesterSecret on helm argv: {cmd}"
+        );
+    }
+    assert!(
+        text.contains("allowDevDefaults: true"),
+        "API values file must set security.allowDevDefaults=true; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("chmod 600 \"$API_VALUES\""),
+        "API values file must be 0600; file contents:\n{text}"
+    );
+}
+
+#[test]
+fn summary_names_api_isolation_pass_and_dispatcher_ownership_blocked() {
+    let text = script_text();
+    assert!(
+        !text.is_empty(),
+        "cli/scripts/two-release-approval-e2e.sh must exist"
+    );
+    assert!(
+        text.contains("API isolation one-shot B (404 approval not found): PASS"),
+        "API isolation B 404 must be a named PASS; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("API isolation one-shot A (still pending): PASS"),
+        "API isolation A pending must be a named PASS; file contents:\n{text}"
+    );
+    assert!(
+        text.contains("deployed dispatcher envelope ownership: BLOCKED"),
+        "deployed dispatcher envelope ownership must be BLOCKED without a \
+         delivered one-shot envelope; file contents:\n{text}"
+    );
+    assert!(
+        !text.contains("dispatcher envelope ownership: PASS")
+            && !text.contains("dispatcher ownership PASS"),
+        "do not claim Helm dispatcher ownership PASS; file contents:\n{text}"
+    );
+}
+
+#[test]
+fn force_kind_delete_requires_job_owned_label() {
+    let text = script_text();
+    assert!(
+        !text.is_empty(),
+        "cli/scripts/two-release-approval-e2e.sh must exist"
+    );
+    assert!(
+        text.contains("cluster_is_job_owned"),
+        "FORCE delete must consult cluster_is_job_owned; file contents:\n{text}"
+    );
+    assert!(
+        text.contains(r#"${JOB_LABEL_KEY}=${JOB_LABEL_VALUE}"#),
+        "job ownership is JOB_LABEL_KEY=JOB_LABEL_VALUE; file contents:\n{text}"
+    );
+    let body = uncommented_logical_lines(&text).join("\n");
+    assert!(
+        body.contains("cluster_is_job_owned") && body.contains("kind delete cluster"),
+        "FORCE recreate must not delete by name alone; file contents:\n{text}"
+    );
+}
