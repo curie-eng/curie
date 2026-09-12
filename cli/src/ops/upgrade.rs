@@ -71,6 +71,7 @@ pub struct UpgradeOpts {
     pub to: String,
     pub chart: Option<String>,
     pub yes: bool,
+    pub forward_only: bool,
 }
 
 /// What `cluster status` reports about the in-flight or last upgrade.
@@ -169,6 +170,8 @@ pub struct FailForward {
 }
 
 /// Agent-facing result of `curie cluster upgrade`.
+// Agent-facing `--json` payload; boxing it would churn every match site.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ClusterUpgradeOutput {
     DryRun(crate::ui::DryRunPlan),
@@ -185,6 +188,7 @@ pub enum ClusterUpgradeOutput {
         convergence: Option<Convergence>,
         canary: Option<Canary>,
         fail_forward: Option<FailForward>,
+        compatibility: Option<serde_json::Value>,
     },
 }
 
@@ -205,6 +209,7 @@ impl crate::ui::CliOutput for ClusterUpgradeOutput {
                 convergence,
                 canary,
                 fail_forward,
+                compatibility,
             } => {
                 let mut v = serde_json::json!({
                     "status": status,
@@ -222,6 +227,7 @@ impl crate::ui::CliOutput for ClusterUpgradeOutput {
                         "command": f.command,
                         "reason": f.reason,
                     })),
+                    "compatibility": compatibility.clone().unwrap_or(serde_json::Value::Null),
                 });
                 if let Some(obj) = v.as_object_mut() {
                     if canary.is_none() {
@@ -537,6 +543,7 @@ fn completed_output(
     record: &UpgradeRecord,
     previous_serving: bool,
     failed_phase: Option<UpgradePhase>,
+    compatibility: Option<serde_json::Value>,
 ) -> ClusterUpgradeOutput {
     let last = record
         .completed
@@ -563,6 +570,7 @@ fn completed_output(
         convergence: record.convergence.clone(),
         canary: record.canary.clone(),
         fail_forward: record.fail_forward.clone(),
+        compatibility,
     }
 }
 
@@ -649,6 +657,9 @@ trait UpgradeDriver {
     fn fail_at(&self) -> Option<UpgradePhase> {
         None
     }
+    fn compatibility_decision(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 /// Run the upgrade lifecycle against a host. Tests inject a [`FakeUpgradeHost`].
@@ -721,6 +732,12 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
     let same_version = from.as_deref() == Some(opts.to.as_str())
         && host.known_good().as_deref() == Some(opts.to.as_str());
 
+    // Resume after Validate still honors a freshly computed refusal and
+    // must not replay Drain to reach it.
+    if host.validate_refusal().is_some() || host.refuse_config() || host.refuse_schema() {
+        execute_phase(UpgradePhase::Validate, &opts, host, &mut record)?;
+    }
+
     for phase in remaining_after(&record.completed) {
         if same_version
             && matches!(
@@ -769,7 +786,12 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
                             format!("{}; {}", forward.reason, host.redact(&format!("{error:#}")));
                     }
                 }
-                return Ok(completed_output(&record, previous, Some(phase)));
+                return Ok(completed_output(
+                    &record,
+                    previous,
+                    Some(phase),
+                    host.compatibility_decision(),
+                ));
             }
         }
     }
@@ -778,7 +800,12 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
     record.known_good_version = Some(opts.to.clone());
     host.set_known_good(Some(opts.to.clone()));
     host.store_record(record.clone())?;
-    Ok(completed_output(&record, true, None))
+    Ok(completed_output(
+        &record,
+        true,
+        None,
+        host.compatibility_decision(),
+    ))
 }
 
 enum PhaseOutcome {
@@ -953,6 +980,10 @@ struct LiveHost {
     chart_refusal: Option<String>,
     /// The redacted configuration schema plan line (#2299).
     schema_plan: Option<String>,
+    /// Redacted schema compatibility decision (#2588).
+    schema_decision: Option<serde_json::Value>,
+    /// Why the target schema was refused, if it was.
+    schema_refusal: Option<String>,
 }
 
 /// Ruling 2: Helm SILENTLY IGNORES `--version` for a local directory or
@@ -994,6 +1025,42 @@ fn local_chart(chart: &str) -> bool {
     std::path::Path::new(chart).exists()
 }
 
+fn api_workload_missing(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("not found") && (lower.contains("deploy") || lower.contains("pod"))
+}
+
+fn merge_forward_only(overlay: Option<&str>) -> Result<String> {
+    let mut doc: serde_json::Value = match overlay {
+        Some(text) if !text.trim().is_empty() => {
+            serde_norway::from_str(text).context("overlay YAML is malformed")?
+        }
+        _ => serde_json::json!({}),
+    };
+    if doc.is_null() {
+        doc = serde_json::json!({});
+    }
+    let map = doc.as_object_mut().context("overlay is not a mapping")?;
+    let api = map
+        .entry("api".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if api.is_null() {
+        *api = serde_json::json!({});
+    }
+    let api_map = api.as_object_mut().context("api is not a mapping")?;
+    let migrate = api_map
+        .entry("migrate".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if migrate.is_null() {
+        *migrate = serde_json::json!({});
+    }
+    let migrate_map = migrate
+        .as_object_mut()
+        .context("api.migrate is not a mapping")?;
+    migrate_map.insert("forwardOnly".into(), serde_json::Value::Bool(true));
+    serde_norway::to_string(&doc).context("could not serialize the migrated overlay")
+}
+
 impl LiveHost {
     fn new(opts: UpgradeOpts) -> Self {
         Self {
@@ -1006,6 +1073,8 @@ impl LiveHost {
             config_refusal: None,
             chart_refusal: None,
             schema_plan: None,
+            schema_decision: None,
+            schema_refusal: None,
         }
     }
 
@@ -1072,6 +1141,174 @@ impl LiveHost {
             }
             Ok(None) => {}
             Err(error) => self.config_refusal = Some(format!("{error:#}")),
+        }
+        if self.opts.forward_only {
+            match merge_forward_only(self.overlay.as_deref()) {
+                Ok(overlay) => self.overlay = Some(overlay),
+                Err(error) => {
+                    if self.config_refusal.is_none() {
+                        self.config_refusal = Some(format!("{error:#}"));
+                    }
+                }
+            }
+        }
+        self.compute_schema_compat();
+    }
+
+    fn compute_schema_compat(&mut self) {
+        let live = match self.probe_live_revision() {
+            Ok(rev) => rev,
+            Err(reason) => {
+                self.store_schema_decision(crate::schema_compat::refuse_with_reason(
+                    None,
+                    None,
+                    Vec::new(),
+                    reason,
+                    self.opts.forward_only,
+                    None,
+                ));
+                return;
+            }
+        };
+        let source = self.source_head(live.as_deref());
+        let target = match self.render_target_metadata() {
+            Ok(target) => target,
+            Err(reason) => {
+                self.store_schema_decision(crate::schema_compat::refuse_with_reason(
+                    live.as_deref(),
+                    None,
+                    Vec::new(),
+                    reason,
+                    self.opts.forward_only,
+                    source.as_deref(),
+                ));
+                return;
+            }
+        };
+        let pending = match crate::schema_compat::pending_revisions(live.as_deref(), &target) {
+            Ok(pending) => pending,
+            Err(reason) => {
+                self.store_schema_decision(crate::schema_compat::refuse_with_reason(
+                    live.as_deref(),
+                    Some(&target),
+                    Vec::new(),
+                    reason,
+                    self.opts.forward_only,
+                    source.as_deref(),
+                ));
+                return;
+            }
+        };
+        let decision = crate::schema_compat::plan_upgrade(
+            live.as_deref(),
+            &target,
+            &pending,
+            self.opts.forward_only,
+            source.as_deref(),
+        );
+        self.store_schema_decision(decision);
+    }
+
+    fn source_head(&self, live: Option<&str>) -> Option<String> {
+        crate::schema_window::window_for(self.current.as_deref().unwrap_or(""))
+            .map(|window| window.schema_head)
+            .or_else(|| live.map(ToOwned::to_owned))
+    }
+
+    fn store_schema_decision(&mut self, decision: crate::schema_compat::CompatDecision) {
+        if decision.action == "refuse" {
+            self.schema_refusal = Some(decision.reason.clone());
+        }
+        self.schema_decision = Some(crate::schema_compat::render_decision(&decision));
+    }
+
+    fn probe_live_revision(&self) -> Result<Option<String>, String> {
+        let cmd = super::verbs::live_schema_revision_cmd(&self.opts.common);
+        let (ok, out, err) = match self.run(&cmd) {
+            Ok(v) => v,
+            Err(error) => {
+                return Err(crate::schema_window::redact_probe_text(&format!(
+                    "{error:#}"
+                )));
+            }
+        };
+        if ok {
+            return match crate::schema_window::parse_alembic_current_output(&out) {
+                Some(rev) => Ok(Some(rev)),
+                None if self.current.is_none() => Ok(None),
+                None => Err("the API pod did not report a live database revision".into()),
+            };
+        }
+        let redacted = crate::schema_window::redact_probe_text(err.trim());
+        if self.current.is_none() && api_workload_missing(&err) {
+            return Ok(None);
+        }
+        Err(if redacted.is_empty() {
+            "could not read the live database revision from the API pod".into()
+        } else {
+            format!("could not read the live database revision from the API pod: {redacted}")
+        })
+    }
+
+    fn render_target_metadata(&self) -> Result<crate::schema_compat::TargetMetadata, String> {
+        let chart = self.chart_ref();
+        let mut args = vec![
+            plain("template"),
+            plain(&self.opts.common.release),
+            plain(&chart),
+            plain("--show-only"),
+            plain("templates/schema-compat.yaml"),
+            plain("-n"),
+            plain(&self.opts.common.namespace),
+        ];
+        if !local_chart(&chart) {
+            args.push(plain("--version"));
+            args.push(plain(&self.opts.to));
+        }
+        let tmp = tempfile::NamedTempFile::new().ok();
+        if let (Some(overlay), Some(tmp)) = (&self.overlay, &tmp) {
+            if std::fs::write(tmp.path(), overlay).is_ok() {
+                args.push(plain("-f"));
+                args.push(plain(tmp.path().to_string_lossy().into_owned()));
+            }
+        }
+        let cmd = OpsCommand::new("helm", args);
+        let (ok, out, err) = match self.run(&cmd) {
+            Ok(v) => v,
+            Err(error) => {
+                return Err(crate::schema_window::redact_probe_text(&format!(
+                    "{error:#}"
+                )));
+            }
+        };
+        if !ok {
+            let redacted = crate::schema_window::redact_probe_text(err.trim());
+            return Err(format!(
+                "could not render target schema compatibility metadata: {redacted}"
+            ));
+        }
+        crate::schema_compat::parse_target_metadata(&out)
+    }
+
+    fn failed_schema_output(&self) -> ClusterUpgradeOutput {
+        ClusterUpgradeOutput::Completed {
+            status: "failed".into(),
+            phase: UpgradePhase::Validate.as_str().into(),
+            target_version: self.opts.to.clone(),
+            from_version: self.current.clone(),
+            known_good_version: self.known_good.clone(),
+            resumed: self.record.as_ref().map(|r| r.resumed).unwrap_or(false),
+            previous_serving: self.serving_previous(),
+            unchanged: false,
+            plan: self
+                .record
+                .as_ref()
+                .map(|r| r.plan.clone())
+                .unwrap_or_default(),
+            convergence: None,
+            canary: None,
+            fail_forward: None,
+            compatibility: self.schema_decision.clone(),
         }
     }
 
@@ -1312,9 +1549,16 @@ impl UpgradeDriver for LiveHost {
         self.chart_refusal
             .clone()
             .or_else(|| self.config_refusal.clone())
+            .or_else(|| self.schema_refusal.clone())
     }
     fn refuse_config(&self) -> bool {
         self.config_refusal.is_some()
+    }
+    fn refuse_schema(&self) -> bool {
+        self.schema_refusal.is_some()
+    }
+    fn compatibility_decision(&self) -> Option<serde_json::Value> {
+        self.schema_decision.clone()
     }
     fn observed_version(&self) -> Option<String> {
         self.inspect_version()
@@ -1366,7 +1610,8 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         // values`), so a dry run computes them too and plans the refusal the
         // real run would hit rather than a plan that cannot happen (#2301).
         live.compute_pre_mutation();
-        return run_lifecycle_inner(opts, &mut live).await;
+        let result = run_lifecycle_inner(opts, &mut live).await;
+        return wrap_schema_refusal(live, result);
     }
 
     require_on_path("helm")?;
@@ -1390,7 +1635,21 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         .and_then(|r| r.known_good_version.clone())
         .or_else(|| live.current.clone());
     live.compute_pre_mutation();
-    run_lifecycle_inner(opts, &mut live).await
+    let result = run_lifecycle_inner(opts, &mut live).await;
+    wrap_schema_refusal(live, result)
+}
+
+fn wrap_schema_refusal(
+    live: LiveHost,
+    result: Result<ClusterUpgradeOutput>,
+) -> Result<ClusterUpgradeOutput> {
+    match result {
+        Ok(out) => Ok(out),
+        Err(err) if live.schema_refusal.is_some() => {
+            Err(crate::ui::ui().failed_report(&live.failed_schema_output(), err))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Load the upgrade status view for `cluster status`.

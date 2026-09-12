@@ -353,19 +353,23 @@ passes `--version <to>` internally and lets Helm enforce it; there is no
 | `--chart` | Chart path or ref override. |
 | `--yes` | Skip the confirmation prompt. |
 | `--dry-run` | Print the redacted plan and exit without mutating. Both pre-mutation checks (the local chart's declared version, and the retained-configuration migration) are read-only, so a dry run runs them and the plan names any refusal the real run would hit at Validate. |
+| `--forward-only` | Apply pending contract or irreversible schema migrations. Without this flag, Validate refuses those migrations before mutation so a patch rollback window stays intact. |
 
 One resumable lifecycle: inspect and plan, validate configuration and
-refuse on an ambiguous migration conflict, drain accepted work, checkpoint,
-apply, wait for exact convergence, run a target-version canary, then record
-the new known-good version. There is no separate migration step in the
-command: configuration migration happens at Validate, and schema migration
-is the chart's pre-upgrade Job, which Apply fires. The command chooses the
-values overlay; do not pass `--reuse-values` or `--reset-then-reuse-values`.
-Configuration migration to the current schema happens at Validate, before
-any mutation; database/application schema-compatibility checking is not
-wired into this command yet (tracked as issue #2588) -- the pre-upgrade
-migration Job remains the database's authority. The `migrate` phase is a
-resumable checkpoint boundary only; it performs no migration of its own.
+schema compatibility and refuse on an ambiguous migration conflict, drain
+accepted work, checkpoint, apply, wait for exact convergence, run a
+target-version canary, then record the new known-good version. There is no
+separate migration step in the command: configuration migration happens at
+Validate, and schema migration is the chart's pre-upgrade Job, which Apply
+fires. The command chooses the values overlay; do not pass `--reuse-values`
+or `--reset-then-reuse-values`. Configuration migration to the current
+schema happens at Validate, before any mutation. Database/application
+schema compatibility is also checked at Validate: an incompatible live
+revision or a pending contract/irreversible migration without
+`--forward-only` refuses before `helm upgrade`. `--forward-only` sets
+`api.migrate.forwardOnly=true` on the overlay Apply hands Helm. The
+`migrate` phase is a resumable checkpoint boundary only; it performs no
+migration of its own.
 
 The redacted plan names the configuration schema version the upgrade migrates
 from and to (`config schema: <from> -> <to>`). It never carries credential

@@ -2866,6 +2866,18 @@ export const commandManifest = {
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Apply contract or irreversible schema migrations. Without this flag the upgrade Job refuses those migrations before mutation so a patch rollback window stays intact (#2300)",
+              "id": "forward_only",
+              "long": "forward-only",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
             }
           ],
           "hidden": false,

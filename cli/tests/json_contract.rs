@@ -2569,6 +2569,7 @@ fn cluster_upgrade_output_validates_dry_run_success_and_failure() {
         }),
         canary: Some(curie::ops::Canary { passed: true }),
         fail_forward: None,
+        compatibility: None,
     };
     assert_valid("cluster-upgrade.schema.json", &succeeded.to_json());
     let failed = ClusterUpgradeOutput::Completed {
@@ -2596,8 +2597,23 @@ fn cluster_upgrade_output_validates_dry_run_success_and_failure() {
             command: "curie cluster rollback --yes".into(),
             reason: "canary failed".into(),
         }),
+        compatibility: None,
     };
     assert_valid("cluster-upgrade.schema.json", &failed.to_json());
+    let mut with_compat = succeeded.to_json();
+    with_compat["compatibility"] = serde_json::json!({
+        "decision": "refuse",
+        "current_revision": "0039",
+        "target_min": "0043",
+        "target_head": "0043",
+        "source_head": "0039",
+        "pending": [{"revision": "0041", "kind": "contract"}],
+        "rollback_compatible": false,
+        "forward_only": false,
+        "reason": "pending contract/irreversible migration 0041; pass --forward-only",
+        "outcome": "refused"
+    });
+    assert_valid("cluster-upgrade.schema.json", &with_compat);
     let mut bad = succeeded.to_json();
     bad["canary"]["passed"] = serde_json::json!(false);
     let schema = load_schema("cluster-upgrade.schema.json");

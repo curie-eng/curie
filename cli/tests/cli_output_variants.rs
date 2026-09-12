@@ -592,6 +592,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 }),
                 canary: Some(curie::ops::Canary { passed: true }),
                 fail_forward: None,
+                compatibility: None,
             },
         ],
     );

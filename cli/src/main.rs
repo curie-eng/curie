@@ -2238,6 +2238,11 @@ enum ClusterAction {
         /// Print the redacted upgrade plan and exit without mutating.
         #[arg(long)]
         dry_run: bool,
+        /// Apply contract or irreversible schema migrations. Without this flag
+        /// the upgrade Job refuses those migrations before mutation so a patch
+        /// rollback window stays intact (#2300).
+        #[arg(long = "forward-only")]
+        forward_only: bool,
     },
     /// Carry bundle objects across a chart upgrade that renames the object
     /// store (issue #1324).
@@ -4082,6 +4087,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 chart,
                 yes,
                 dry_run,
+                forward_only,
             } => emit(
                 ops::upgrade(UpgradeOpts {
                     common: CommonOpts {
@@ -4092,6 +4098,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     to,
                     chart,
                     yes,
+                    forward_only,
                 })
                 .await?,
             ),
