@@ -376,7 +376,10 @@ def test_kill_interrupts_a_live_turn(make_harness) -> None:
 
             ev = _qevent("hi", channel="C-bound", thread="tK")
             t1 = asyncio.create_task(h.kernel.process_event(ev))
-            await _wait_until(lambda: h.runner.turn_active)
+            await _wait_until(
+                lambda: h.runner.turn_active
+                and bool(h.kernel._active_by_agent.get(agent_id))
+            )
 
             # Killing the agent interrupts its registered live turn.
             signalled = await h.kernel.interrupt_agent(agent_id)

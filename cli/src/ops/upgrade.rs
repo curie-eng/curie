@@ -74,9 +74,51 @@ impl std::fmt::Display for UpgradePhase {
 pub struct UpgradeOpts {
     pub common: CommonOpts,
     pub to: String,
-    pub chart: Option<String>,
+    pub chart: UpgradeChart,
     pub yes: bool,
     pub forward_only: bool,
+}
+
+/// The chart operand selected before the lifecycle starts, including whether
+/// target-specific checks can run without fetching an absent release asset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeChart {
+    /// A local directory or packaged archive that is available now.
+    AvailableLocal(String),
+    /// A repository or OCI reference Helm resolves and pins with `--version`.
+    HelmReference(String),
+    /// A release archive a network-free dry-run will download before real Apply.
+    PendingRelease {
+        source_url: String,
+        cache_path: String,
+    },
+}
+
+impl UpgradeChart {
+    fn operand(&self) -> &str {
+        match self {
+            Self::AvailableLocal(chart) | Self::HelmReference(chart) => chart,
+            Self::PendingRelease { cache_path, .. } => cache_path,
+        }
+    }
+
+    fn uses_helm_version(&self) -> bool {
+        matches!(self, Self::HelmReference(_))
+    }
+
+    fn is_available_local(&self) -> bool {
+        matches!(self, Self::AvailableLocal(_))
+    }
+
+    fn pending_release(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::PendingRelease {
+                source_url,
+                cache_path,
+            } => Some((source_url, cache_path)),
+            _ => None,
+        }
+    }
 }
 
 /// What `cluster status` reports about the in-flight or last upgrade.
@@ -541,6 +583,11 @@ fn plan_lines(
             mask_secret(secret)
         ));
     }
+    if let Some((source_url, cache_path)) = opts.chart.pending_release() {
+        lines.push(format!(
+            "phase validate pending: chart metadata and schema compatibility after release chart download from {source_url} to {cache_path}"
+        ));
+    }
     lines
 }
 
@@ -996,12 +1043,9 @@ struct LiveHost {
 /// `--version` there would be a pin that does nothing while looking like one,
 /// so a local chart is pinned by refusing before mutation when its own
 /// metadata is not `--to`, and only a ref Helm must resolve carries the flag.
-/// The chart this verb applies. This verb never resolves a release artifact
-/// (issue #2593), so the default is the literal local path.
-fn chart_ref(opts: &UpgradeOpts) -> String {
-    opts.chart
-        .clone()
-        .unwrap_or_else(|| "charts/curie".to_string())
+/// The public command dispatch supplies one mandatory chart selection.
+fn chart_ref(opts: &UpgradeOpts) -> &str {
+    opts.chart.operand()
 }
 
 /// The `helm upgrade` argv, ONE definition shared by the plan line and the
@@ -1014,20 +1058,16 @@ fn helm_upgrade_argv(opts: &UpgradeOpts, to: &str) -> Vec<String> {
         "helm".to_string(),
         "upgrade".into(),
         opts.common.release.clone(),
-        chart.clone(),
+        chart.to_string(),
         "-n".into(),
         opts.common.namespace.clone(),
         "--wait".into(),
     ];
-    if !local_chart(&chart) {
+    if opts.chart.uses_helm_version() {
         argv.push("--version".into());
         argv.push(to.to_string());
     }
     argv
-}
-
-fn local_chart(chart: &str) -> bool {
-    std::path::Path::new(chart).exists()
 }
 
 fn api_workload_missing(stderr: &str) -> bool {
@@ -1087,16 +1127,12 @@ impl LiveHost {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(run_capture(cmd)))
     }
 
-    fn chart_ref(&self) -> String {
+    fn chart_ref(&self) -> &str {
         chart_ref(&self.opts)
     }
 
-    /// The version a LOCAL chart declares for itself. `None` for a ref Helm
-    /// resolves, which `--version` pins instead.
+    /// The version an available local chart declares for itself.
     fn declared_chart_version(&self, chart: &str) -> Result<Option<String>> {
-        if !local_chart(chart) {
-            return Ok(None);
-        }
         let cmd = OpsCommand::new(
             "helm",
             vec![plain("show"), plain("chart"), plain(chart.to_string())],
@@ -1117,11 +1153,11 @@ impl LiveHost {
     /// R1: the pre-mutation half of the target pin, for a local chart only.
     fn chart_pin_refusal(&self) -> Option<String> {
         let chart = self.chart_ref();
-        if !local_chart(&chart) {
+        if !self.opts.chart.is_available_local() {
             return None;
         }
         let to = &self.opts.to;
-        match self.declared_chart_version(&chart) {
+        match self.declared_chart_version(chart) {
             Ok(Some(version)) if version == *to => None,
             Ok(Some(version)) => Some(format!(
                 "chart {chart} declares version {version}, so it cannot install the requested {to}; \
@@ -1134,9 +1170,10 @@ impl LiveHost {
         }
     }
 
-    /// Both pre-mutation refusals and the migrated overlay are computed ONCE,
-    /// before any phase runs (Ruling 8.8). Apply then hands Helm exactly this
-    /// overlay. Every input here is read-only, so the dry-run path runs it too.
+    /// Available pre-mutation refusals and the migrated overlay are computed
+    /// ONCE before any phase runs (Ruling 8.8). Apply then hands Helm exactly
+    /// this overlay. A cold release dry-run keeps only target-dependent checks
+    /// pending; retained configuration checks still run.
     fn compute_pre_mutation(&mut self) {
         self.chart_refusal = self.chart_pin_refusal();
         match self.retained_overlay() {
@@ -1157,7 +1194,9 @@ impl LiveHost {
                 }
             }
         }
-        self.compute_schema_compat();
+        if self.opts.chart.pending_release().is_none() {
+            self.compute_schema_compat();
+        }
     }
 
     fn compute_schema_compat(&mut self) {
@@ -1260,13 +1299,13 @@ impl LiveHost {
         let mut args = vec![
             plain("template"),
             plain(&self.opts.common.release),
-            plain(&chart),
+            plain(chart),
             plain("--show-only"),
             plain("templates/schema-compat.yaml"),
             plain("-n"),
             plain(&self.opts.common.namespace),
         ];
-        if !local_chart(&chart) {
+        if self.opts.chart.uses_helm_version() {
             args.push(plain("--version"));
             args.push(plain(&self.opts.to));
         }
@@ -1643,14 +1682,18 @@ impl UpgradeDriver for LiveHost {
 
 /// Live `curie cluster upgrade` entry point.
 pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
+    if !opts.common.dry_run && opts.chart.pending_release().is_some() {
+        bail!("a pending release chart is only valid for a dry run; download the chart before starting a real upgrade");
+    }
     if opts.common.dry_run {
         require_on_path("helm").ok();
         let mut live = LiveHost::new(opts.clone());
         live.current = live.inspect_version();
         live.known_good = live.current.clone();
-        // Both pre-mutation inputs are read-only (`helm show chart`, `helm get
-        // values`), so a dry run computes them too and plans the refusal the
-        // real run would hit rather than a plan that cannot happen (#2301).
+        // Retained configuration is available without the target chart, so a
+        // dry run always computes it. Chart metadata and schema compatibility
+        // run when the selected local chart or Helm reference is available;
+        // a cold release asset records those checks as pending instead (#2301).
         live.compute_pre_mutation();
         let result = run_lifecycle_inner(opts, &mut live).await;
         return wrap_schema_refusal(live, result);

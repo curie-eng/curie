@@ -748,6 +748,63 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).expect("mark harness executable");
 }
 
+/// The cluster ladder may run an otherwise standard `curie` release in an
+/// owned namespace. Its direct worker probe must follow the same
+/// `CURIE_NAMESPACE` setting as the CLI calls around it, or it reads an
+/// unrelated shared install before the first cluster message is sent.
+#[test]
+fn cluster_worker_probe_uses_the_configured_namespace() {
+    const NAMESPACE: &str = "test-2593-chart-ladder";
+
+    let harness = tempfile::tempdir().expect("create cluster probe harness");
+    let invocation_log = harness.path().join("kubectl-invocation.log");
+    write_executable(
+        &harness.path().join("kubectl"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" > "$STUB_KUBECTL_INVOCATION_LOG"
+printf '1'
+"#,
+    );
+
+    let function = ladder_function("probe_cluster_fake_model");
+    let script = format!("set -euo pipefail\n{function}\nprobe_cluster_fake_model\n");
+    let path = format!(
+        "{}:{}",
+        harness.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("PATH", path)
+        .env("CURIE_NAMESPACE", NAMESPACE)
+        .env("STUB_KUBECTL_INVOCATION_LOG", &invocation_log)
+        .output()
+        .expect("run the real cluster worker probe");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the cluster worker probe must complete through the stub: stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(stdout, "1", "the probe must return kubectl's model mode");
+
+    let invocation = fs::read_to_string(&invocation_log)
+        .expect("read kubectl invocation")
+        .trim()
+        .to_owned();
+    assert_eq!(
+        invocation,
+        format!(
+            "-n {NAMESPACE} get deployment/curie-worker -o \
+             jsonpath={{.spec.template.spec.containers[*].env[?(@.name==\"CURIE_FAKE_MODEL\")].value}}"
+        ),
+        "the direct worker read must use the configured namespace while preserving the standard release's deployment and model-mode assertion"
+    );
+}
+
 // --- Assertion group 1: arms the GRADED path -------------------------------
 
 /// The nightly workflow must arm live grading with the exact double-quoted

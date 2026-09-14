@@ -1798,10 +1798,10 @@ probe_local_fake_model() {
 }
 
 probe_cluster_fake_model() {
-    # Release and namespace both default to `curie` (cli/src/main.rs), which is
-    # what this rung runs against; the deployment name is built the same way the
-    # CLI builds it, as `deployment/<release>-worker`.
-    kubectl -n curie get deployment/curie-worker \
+    # The release defaults to `curie` (cli/src/main.rs), which is what this rung
+    # runs against. Its namespace follows CURIE_NAMESPACE like the surrounding
+    # CLI calls; the deployment remains `deployment/<release>-worker`.
+    kubectl -n "${CURIE_NAMESPACE:-curie}" get deployment/curie-worker \
         -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_FAKE_MODEL")].value}'
 }
 
@@ -4928,9 +4928,9 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
         # -- it is the namespace the release is installed into -- which is why
         # the pinned entry set excludes it.
         local cluster_release cluster_namespace
-        cluster_release="$(kubectl -n curie get deployment/curie-worker \
+        cluster_release="$(kubectl -n "${CURIE_NAMESPACE:-curie}" get deployment/curie-worker \
             -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_RELEASE")].value}')"
-        cluster_namespace="$(kubectl -n curie get deployment/curie-worker \
+        cluster_namespace="$(kubectl -n "${CURIE_NAMESPACE:-curie}" get deployment/curie-worker \
             -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_NAMESPACE")].value}')"
         assert_connector_parity "cluster" kubectl "$cluster_release" "$agent_name" "$cluster_namespace"
         case_connector_registry_missing_cluster "$cluster_release" "$agent_name" "$cluster_namespace"

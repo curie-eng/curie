@@ -11,12 +11,22 @@ from pydantic import ValidationError
 
 def test_valkey_dsn_honors_the_password_override() -> None:
     # The compose VALKEY_PASSWORD knob must reach the DSN the API connects with.
-    assert Settings(valkey_password="s3cret").valkey_dsn() == (
-        "redis://:s3cret@localhost:26379/0"
-    )
+    assert Settings(
+        valkey_password="s3cret",
+        valkey_host="localhost",
+        valkey_port=26379,
+        valkey_tls=False,
+        valkey_url=None,
+    ).valkey_dsn() == ("redis://:s3cret@localhost:26379/0")
     # An explicit full URL overrides the parts.
     assert (
-        Settings(valkey_url="redis://:x@other:1/2").valkey_dsn()
+        Settings(
+            valkey_password="ignored",
+            valkey_host="ignored",
+            valkey_port=9999,
+            valkey_tls=True,
+            valkey_url="redis://:x@other:1/2",
+        ).valkey_dsn()
         == "redis://:x@other:1/2"
     )
 
@@ -26,20 +36,31 @@ def test_valkey_dsn_uses_rediss_scheme_when_tls_is_enabled() -> None:
     # sends a cleartext connection to a store that never negotiates or
     # downgrades. Verified on redis-py 8.1.0: redis.from_url("rediss://...")
     # selects redis.connection.SSLConnection, redis://... selects Connection.
-    assert Settings(valkey_tls=True).valkey_dsn() == (
-        "rediss://:valkeypass@localhost:26379/0"
-    )
+    assert Settings(
+        valkey_password="valkeypass",
+        valkey_host="localhost",
+        valkey_port=26379,
+        valkey_tls=True,
+        valkey_url=None,
+    ).valkey_dsn() == ("rediss://:valkeypass@localhost:26379/0")
     # Otherwise byte-identical to the plain scheme -- only the scheme changes.
-    assert Settings().valkey_dsn() == "redis://:valkeypass@localhost:26379/0"
+    assert (
+        Settings(
+            valkey_password="valkeypass",
+            valkey_host="localhost",
+            valkey_port=26379,
+            valkey_tls=False,
+            valkey_url=None,
+        ).valkey_dsn()
+        == "redis://:valkeypass@localhost:26379/0"
+    )
 
 
 def test_valkey_url_still_wins_over_valkey_tls() -> None:
     # The escape hatch stays outright authoritative even when the new signal
     # is also set.
     assert (
-        Settings(
-            valkey_tls=True, valkey_url="redis://:x@other:1/2"
-        ).valkey_dsn()
+        Settings(valkey_tls=True, valkey_url="redis://:x@other:1/2").valkey_dsn()
         == "redis://:x@other:1/2"
     )
 

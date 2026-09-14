@@ -20,7 +20,7 @@ use curie::docker;
 use curie::github_app as crate_github_app;
 use curie::local::{self, LocalDownOpts, LocalOpts};
 use curie::message::{self, MessageOpts};
-use curie::ops::{self, CommonOpts, DownOpts, RollbackOpts, UpOpts, UpgradeOpts};
+use curie::ops::{self, CommonOpts, DownOpts, RollbackOpts, UpOpts, UpgradeChart, UpgradeOpts};
 use curie::secrets;
 use curie::state::{apply_continue, load_turn, CliTurnArgs, TurnVerb};
 use curie::ui::{self, ColorFlag, Ui};
@@ -2230,8 +2230,9 @@ enum ClusterAction {
         /// Helm release name.
         #[arg(long, default_value = "curie")]
         release: String,
-        /// Helm chart. Default: the version-pinned chart for `--to` on release
-        /// builds; local `charts/curie` on dev builds.
+        /// Helm chart. An explicit path or ref overrides the default. Default:
+        /// the version-pinned release asset for `--to` on release builds; local
+        /// `charts/curie` on dev builds.
         #[arg(long)]
         chart: Option<String>,
         /// Skip the interactive confirmation prompt.
@@ -3006,6 +3007,34 @@ async fn materialize_artifact(
             .await?
             .display()
             .to_string())
+    }
+}
+
+/// Resolve the upgrade chart without erasing whether a release dry-run still
+/// needs the network-free target checks. Explicit operands retain the existing
+/// rule: an available path is local, while any other operand is Helm-resolved.
+async fn materialize_upgrade_chart(
+    resolved: artifacts::Resolved,
+    dry_run: bool,
+) -> Result<UpgradeChart> {
+    let pending_source = match &resolved {
+        artifacts::Resolved::Fetch { url, cache_path } if dry_run && !cache_path.exists() => {
+            Some(url.clone())
+        }
+        _ => None,
+    };
+    let helm_reference = matches!(&resolved, artifacts::Resolved::Local(path) if !path.exists());
+    let operand = materialize_artifact(resolved, dry_run, "chart").await?;
+
+    if let Some(source_url) = pending_source {
+        Ok(UpgradeChart::PendingRelease {
+            source_url,
+            cache_path: operand,
+        })
+    } else if helm_reference {
+        Ok(UpgradeChart::HelmReference(operand))
+    } else {
+        Ok(UpgradeChart::AvailableLocal(operand))
     }
 }
 
@@ -4093,20 +4122,30 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
                 forward_only,
-            } => emit(
-                ops::upgrade(UpgradeOpts {
-                    common: CommonOpts {
-                        namespace,
-                        release,
-                        dry_run,
-                    },
-                    to,
-                    chart,
-                    yes,
-                    forward_only,
-                })
-                .await?,
-            ),
+            } => {
+                let resolved = artifacts::resolve_chart(
+                    chart.as_deref(),
+                    artifacts::Channel::current(),
+                    &to,
+                    artifacts::cache_root,
+                    std::path::Path::new("charts/curie").is_dir(),
+                )?;
+                let chart = materialize_upgrade_chart(resolved, dry_run).await?;
+                emit(
+                    ops::upgrade(UpgradeOpts {
+                        common: CommonOpts {
+                            namespace,
+                            release,
+                            dry_run,
+                        },
+                        to,
+                        chart,
+                        yes,
+                        forward_only,
+                    })
+                    .await?,
+                )
+            }
             ClusterAction::Status {
                 namespace,
                 release,

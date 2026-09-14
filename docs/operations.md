@@ -324,7 +324,7 @@ upgrade phase and the last known-good version.
 ### `curie cluster upgrade`
 
 ```bash
-# source checkout: --chart defaults to the local charts/curie path
+# release build: --chart defaults to the version-pinned release asset for --to
 curie cluster upgrade --to 0.9.0
 
 # local chart file (e.g. a downloaded release archive): same metadata-read
@@ -335,24 +335,33 @@ curie cluster upgrade --to 0.9.0 --chart ./curie-0.9.0.tgz
 curie cluster upgrade --to 0.9.0 --chart oci://<your-registry>/curie
 ```
 
-The chart and `--to` must agree. `--chart` defaults to the literal local
-path `charts/curie` -- this verb never resolves a release build the way
-`cluster up` does (issue #2593) -- so on a source checkout `--to` must
-equal that chart's current version or the command refuses at Validate,
-before any mutation. A released binary has no `charts/curie` beside it
-and must pass `--chart` explicitly (issue #2593). Helm silently ignores
-`--version` on a local directory or file chart, so for that case the
-command reads the chart's own metadata instead of passing `--version`.
+The chart and `--to` must agree. On a release build, omitting `--chart`
+resolves the GitHub release chart for the target version in `--to`. On a
+dev build, omitting it uses the local `charts/curie` chart. An explicit
+`--chart` override wins in either channel. Helm silently ignores `--version`
+on a local directory or file chart, so for that case the command reads the
+chart's own metadata instead of passing `--version`.
 For a chart ref Helm resolves itself (a repo or OCI ref), the command
 passes `--version <to>` internally and lets Helm enforce it; there is no
 `--version` operator flag.
+
+A release dry run still reads the cluster, but it does not download the default
+release chart archive or change the installed release. If its target archive is
+already cached, the command reads the chart version and renders its schema
+compatibility metadata exactly as a real upgrade does. If the archive is absent,
+the plan names the release URL and cache path and marks those two target checks
+pending. An explicit Helm repository or OCI reference may require Helm to fetch
+the chart while `helm template` renders its schema metadata. The command still
+reads and migrates retained configuration, including reporting an ambiguous
+configuration conflict. A real upgrade downloads the archive before Validate
+and runs every target check before mutation.
 
 | Flag | What it does |
 |---|---|
 | `--to <version>` | Target Curie version. Required. |
 | `--chart` | Chart path or ref override. |
 | `--yes` | Skip the confirmation prompt. |
-| `--dry-run` | Print the redacted plan and exit without mutating. Both pre-mutation checks (the local chart's declared version, and the retained-configuration migration) are read-only, so a dry run runs them and the plan names any refusal the real run would hit at Validate. |
+| `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download. |
 | `--forward-only` | Apply pending contract or irreversible schema migrations. Without this flag, Validate refuses those migrations before mutation so a patch rollback window stays intact. |
 
 One resumable lifecycle: inspect and plan, validate configuration and
@@ -375,9 +384,12 @@ The redacted plan names the configuration schema version the upgrade migrates
 from and to (`config schema: <from> -> <to>`). It never carries credential
 values. The plan's `helm upgrade` line is generated from the same chart
 resolution and the same `--version` decision the command executes, so it names
-the chart that will actually be applied (`charts/curie` unless `--chart` says
-otherwise; this verb does not resolve a release artifact, issue #2593) and
-shows `--version <to>` exactly when a resolvable ref makes it a real pin.
+the chart that will actually be applied: the target-version release asset on a
+release build, local `charts/curie` on a dev build, or the explicit `--chart`
+override. It shows `--version <to>` exactly when a resolvable ref makes it a
+real pin. A release asset is applied from its downloaded local archive, so its
+plan never shows `--version`, including when a cold dry run marks target checks
+pending.
 
 After Apply, the command reads the installed chart version from
 `helm get metadata` and fails rather than reporting success if it is not the
