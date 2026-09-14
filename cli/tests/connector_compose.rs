@@ -55,6 +55,7 @@
 //! /// never holds a value.
 //! pub fn compose_up_command(
 //!     overlay: &Path, project: &str, secret_values: &BTreeMap<String, String>,
+//!     connector_start_timeout: Duration,
 //! ) -> curie::ops::OpsCommand;
 //!
 //! // curie::docker
@@ -99,6 +100,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use curie::connector_build::{
     compose_overlay, compose_overlay_path, compose_up_command, connector_scope_env,
@@ -1066,7 +1068,7 @@ fn the_overlay_is_written_under_the_bundles_state_directory() {
     let path = compose_overlay_path(dir.path());
     assert_eq!(path, dir.path().join(".curie/compose.connectors.yaml"));
 
-    let command = compose_up_command(&path, "curie", &BTreeMap::new());
+    let command = compose_up_command(&path, "curie", &BTreeMap::new(), Duration::from_secs(60));
     assert_eq!(command.program, "docker");
     let argv = command.argv();
     assert_eq!(
@@ -1092,6 +1094,21 @@ fn the_overlay_is_written_under_the_bundles_state_directory() {
         Some("60"),
         "Compose --wait only has a finite connector-start deadline when its timeout is explicit: \
          {argv:?}"
+    );
+}
+
+#[test]
+fn the_up_command_uses_the_configured_connector_start_timeout() {
+    let dir = TempDir::new().expect("a scratch bundle");
+    let path = compose_overlay_path(dir.path());
+    let command = compose_up_command(&path, "curie", &BTreeMap::new(), Duration::from_secs(80));
+    let argv = command.argv();
+
+    let wait_timeouts = pairs_after(&argv, "--wait-timeout");
+    assert_eq!(
+        wait_timeouts,
+        vec!["80".to_string()],
+        "Compose must receive the configured connector readiness window exactly once: {argv:?}"
     );
 }
 
@@ -1134,6 +1151,7 @@ fn the_up_command_carries_the_secret_in_the_child_env_never_in_argv() {
         &path,
         "curie",
         &BTreeMap::from([("K8S_WRITE_TOKEN".to_string(), "s3cr3t-value".to_string())]),
+        Duration::from_secs(60),
     );
 
     assert!(

@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1426,6 +1427,7 @@ pub fn compose_up_command(
     overlay: &Path,
     project: &str,
     secret_values: &BTreeMap<String, String>,
+    connector_start_timeout: Duration,
 ) -> crate::ops::OpsCommand {
     plain_command(
         "docker",
@@ -1439,7 +1441,7 @@ pub fn compose_up_command(
             "-d".into(),
             "--wait".into(),
             "--wait-timeout".into(),
-            "60".into(),
+            connector_start_timeout.as_secs().to_string(),
         ],
     )
     .with_secret_env(
