@@ -1117,6 +1117,23 @@ class WorkerConfig(BaseSettings):
     )
     heartbeat_interval_s: float = Field(default=10.0, validation_alias=HEARTBEAT_INTERVAL_ENV)
 
+    # Supervised in-process task restarts (#2637): exponential backoff from the
+    # base up to the cap, and a task that crashes this many times in a row is
+    # parked instead of restarted. A crash after a run of at least the reset
+    # window starts a fresh streak. 0 failures disables the give-up.
+    supervise_restart_backoff_base_s: float = Field(
+        default=1.0, ge=0, validation_alias="CURIE_WORKER_SUPERVISE_BACKOFF_BASE_S"
+    )
+    supervise_restart_backoff_max_s: float = Field(
+        default=60.0, ge=0, validation_alias="CURIE_WORKER_SUPERVISE_BACKOFF_MAX_S"
+    )
+    supervise_max_consecutive_failures: int = Field(
+        default=10, ge=0, validation_alias="CURIE_WORKER_SUPERVISE_MAX_CONSECUTIVE_FAILURES"
+    )
+    supervise_failure_reset_s: float = Field(
+        default=300.0, ge=0, validation_alias="CURIE_WORKER_SUPERVISE_FAILURE_RESET_S"
+    )
+
     key_prefix: str = "curie:worker"
 
     @property

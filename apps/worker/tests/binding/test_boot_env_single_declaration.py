@@ -132,6 +132,13 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # and consumed by ``build_reply_sink``. It is an egress-trust decision
         # made on the worker; nothing about it reaches a sandbox.
         "CURIE_SLACK_TRUSTED_ORIGINS",
+        # Supervised worker task restart policy (#2637), read from the WORKER's
+        # env by WorkerConfig and consumed by ``_supervise`` in run.py. It bounds
+        # in-process task restarts; nothing about it reaches a sandbox.
+        "CURIE_WORKER_SUPERVISE_BACKOFF_BASE_S",
+        "CURIE_WORKER_SUPERVISE_BACKOFF_MAX_S",
+        "CURIE_WORKER_SUPERVISE_MAX_CONSECUTIVE_FAILURES",
+        "CURIE_WORKER_SUPERVISE_FAILURE_RESET_S",
         # Managed-workspace operator settings, read from the WORKER's env by
         # WorkerConfig and consumed by WorkspacePreparer, WorkspaceObjectStore,
         # and the internal credential client. They govern worker-side clone,
