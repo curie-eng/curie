@@ -1812,7 +1812,7 @@ probe_local_fake_model() {
 # Chart fullname worker: release if it contains "curie", else `{release}-curie`,
 # then trunc 63 and strip exactly one trailing dash, then `-worker`.
 cluster_worker_deploy() {
-    local release="${CURIE_RELEASE-}" fullname
+    local release="${CURIE_RELEASE-curie}" fullname
     case "$release" in
         *curie*) fullname="$release" ;;
         *) fullname="${release}-curie" ;;

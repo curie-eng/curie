@@ -767,8 +767,9 @@ printf '1'
 "#,
     );
 
+    let helper = ladder_function("cluster_worker_deploy");
     let function = ladder_function("probe_cluster_fake_model");
-    let script = format!("set -euo pipefail\n{function}\nprobe_cluster_fake_model\n");
+    let script = format!("set -euo pipefail\n{helper}\n{function}\nprobe_cluster_fake_model\n");
     let path = format!(
         "{}:{}",
         harness.path().display(),
