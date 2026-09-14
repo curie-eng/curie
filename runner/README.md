@@ -24,6 +24,9 @@ locally in Docker.
   `mcp__curie__publish_changes` tool, independent of bundle skills and bundle
   MCP policy. Publication remains unusable without a managed `/workspace` and
   only records an approval request; the trusted worker publishes after approval.
+- When a managed git checkout is mounted at `/workspace`, the runner prepends
+  that fact and the fail-closed network-git posture to the session system
+  prompt so the model edits in place instead of cloning over the network.
 - Offers Anthropic's provider-side `WebSearch` tool by default. A bundle can
   suppress it with a root `curie.bundle.json` containing
   `{"webSearch": false}`; the provider connection remains the only network

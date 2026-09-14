@@ -112,20 +112,43 @@ def _resolve_harness(name: str = DEFAULT_HARNESS) -> HarnessContribution:
     return resolve_harness(name)
 
 
+def format_workspace_preamble(mounted_workspace: Path | None) -> str | None:
+    """Render mounted-workspace facts as a system-prompt preamble, or None.
+
+    Hardcodes ``/workspace`` in the text so a caller Path never leaks into the
+    prompt. Conversation history is not part of this block (ADR-0119).
+    """
+
+    if mounted_workspace is None:
+        return None
+    return (
+        "# Mounted workspace\n"
+        "\n"
+        "A managed checkout is already at /workspace (complete git working tree, "
+        "credential-free origin).\n"
+        "Work only in /workspace; edit in place.\n"
+        "Do not git clone, git fetch, or git pull this repository over the network.\n"
+        "General network egress is unavailable in this sandbox; git hosts including "
+        "github.com are unreachable by design.\n"
+        "Do not git push; use publish_changes when ready."
+    )
+
+
 def _compose_system_prompt(
     base: str | None,
     memory_preamble: str | None,
     *,
     model: str | None,
+    workspace_preamble: str | None = None,
 ) -> str | None:
-    """Compose durable memory, bundle instructions, and model identity.
+    """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
 
     Conversation history is deliberately absent: ADR-0119 requires it to cross
     the harness boundary as ordered messages, never rendered system text.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
-    parts = [p for p in (memory_preamble, base, model_preamble) if p]
+    parts = [p for p in (memory_preamble, workspace_preamble, base, model_preamble) if p]
     return "\n\n".join(parts) if parts else None
 
 
@@ -203,18 +226,6 @@ def build_runner(
     compiled = harness.compile_bundle(config.session.plugin_dir)
     system_prompt = compiled.system_prompt
     web_search_enabled = load_bundle_web_search_enabled(config.session.plugin_dir)
-    # Prior memory (#264) still leads the system prompt. Conversation history
-    # (#20) deliberately does not: ADR-0119 sends its ordered messages through
-    # the harness adapter below. The configured model identity is appended after
-    # the bundle prompt.
-    system_prompt = _compose_system_prompt(
-        system_prompt,
-        memory_preamble,
-        model=config.model,
-    )
-    # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
-    # translated into SDK HookMatcher callbacks. None when the bundle declares none.
-    bundle_hooks = load_bundle_hooks(config.session.plugin_dir)
     mounted_workspace = (
         workspace_path
         if workspace_path is not None
@@ -222,6 +233,20 @@ def build_runner(
         and (workspace_path / ".git").exists()
         else None
     )
+    # Prior memory (#264) still leads the system prompt. Workspace facts are a
+    # mounted-only boot block after memory. Conversation history (#20)
+    # deliberately does not: ADR-0119 sends its ordered messages through the
+    # harness adapter below. The configured model identity is appended after
+    # the bundle prompt.
+    system_prompt = _compose_system_prompt(
+        system_prompt,
+        memory_preamble,
+        model=config.model,
+        workspace_preamble=format_workspace_preamble(mounted_workspace),
+    )
+    # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
+    # translated into SDK HookMatcher callbacks. None when the bundle declares none.
+    bundle_hooks = load_bundle_hooks(config.session.plugin_dir)
     # The permission gate (#245/#247): approval-required tools come from the
     # union of the bundle manifest's approvalPolicy gates (versioned with the
     # agent, each carrying its route name) and the CURIE_APPROVAL_REQUIRED_TOOLS
