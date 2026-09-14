@@ -33,12 +33,22 @@ FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT = "DISCORD_BOT_TOKEN=" + FAKE_DISCORD_BOT_TOKE
 FAKE_SHAPED_DISCORD_BOT_TOKEN = (
     "M" + "FAKEFAKEFAKEFAKEFAKE000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
 )
+# Regression for the api_key ordering bug: a shape-valid bot token whose HMAC
+# segment happens to start with an api_key-style prefix must still be
+# redacted as a whole, not partly consumed by the api_key rule first.
+FAKE_SHAPED_DISCORD_BOT_TOKEN_AM_HMAC = (
+    "M" + "FAKEFAKEFAKEFAKEFAKE000." + "FAKE00." + "am_" + "FAKEFAKEFAKEFAKEFAKEFAKE"
+)
+FAKE_SHAPED_DISCORD_BOT_TOKEN_SK_HMAC = (
+    "M" + "FAKEFAKEFAKEFAKEFAKE000." + "FAKE00." + "FAKEFAKE-sk_" + "FAKEFAKEFAKEFAKE"
+)
 # Discord executes webhooks at /webhooks/{webhook.id}/{webhook.token}:
 # https://docs.discord.com/developers/resources/webhook
 FAKE_DISCORD_WEBHOOK_ID = "100000000000000000"
 FAKE_DISCORD_WEBHOOK_TOKEN = (
     "FAKE" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE-" + "FAKEFAKEFAKEFAKEFAKEFAKE_FAKE000"
 )
+FAKE_DISCORD_WEBHOOK_TOKEN_AM = "am_" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
 # Delivery correlation id from the channel protocol tests, not a credential.
 BENIGN_EVENT_ID = "chn-7f3-a1b2c3d4e5f60718"
 
@@ -187,6 +197,105 @@ def test_shaped_discord_bot_token_with_context_keeps_the_context_placeholder() -
     assert redact_text("DISCORD_BOT_TOKEN=" + FAKE_SHAPED_DISCORD_BOT_TOKEN) == (
         "DISCORD_BOT_TOKEN=[REDACTED:discord_bot_token_assignment]"
     )
+
+
+def test_shaped_discord_bot_token_with_am_hmac_prefix_is_fully_redacted() -> None:
+    # Before the Discord rules moved ahead of api_key, the "am_" prefix inside
+    # the HMAC segment let api_key consume part of the token first, leaving
+    # the rest of the shape (and part of the token) unredacted.
+    redacted = redact_text(
+        f"gateway login with {FAKE_SHAPED_DISCORD_BOT_TOKEN_AM_HMAC} failed."
+    )
+
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN_AM_HMAC not in redacted
+    assert redacted == "gateway login with [REDACTED:discord_bot_token] failed."
+
+
+def test_shaped_discord_bot_token_with_sk_hmac_infix_is_fully_redacted() -> None:
+    redacted = redact_text(
+        f"gateway login with {FAKE_SHAPED_DISCORD_BOT_TOKEN_SK_HMAC} failed."
+    )
+
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN_SK_HMAC not in redacted
+    assert redacted == "gateway login with [REDACTED:discord_bot_token] failed."
+
+
+def test_discord_webhook_token_with_am_prefix_is_fully_redacted() -> None:
+    prefix = "https://discord.com/api/webhooks/" + FAKE_DISCORD_WEBHOOK_ID + "/"
+    url = prefix + FAKE_DISCORD_WEBHOOK_TOKEN_AM
+
+    redacted = redact_text(f"POST {url} returned 404")
+
+    assert FAKE_DISCORD_WEBHOOK_TOKEN_AM not in redacted
+    assert redacted == f"POST {prefix}[REDACTED:discord_webhook_url] returned 404"
+
+
+def test_discord_bot_token_first_segment_boundary_is_redacted() -> None:
+    middle = "FAKE00"
+    last = ("FAKE" * 7)[:27]  # valid minimum last-segment length
+    for total_len in (24, 28):  # M + 23, M + 27
+        first = "M" + ("FAKE" * 8)[: total_len - 1]
+        assert len(first) == total_len
+        token = first + "." + middle + "." + last
+
+        assert redact_text(token) == "[REDACTED:discord_bot_token]"
+
+
+def test_discord_bot_token_first_segment_out_of_range_is_not_redacted() -> None:
+    middle = "FAKE00"
+    last = ("FAKE" * 7)[:27]
+    for total_len in (23, 29):  # one below min (23), one above max (28)
+        first = "M" + ("FAKE" * 8)[: total_len - 1]
+        assert len(first) == total_len
+        token = first + "." + middle + "." + last
+
+        assert redact_text(token) == token
+
+
+def test_discord_bot_token_middle_segment_wrong_length_is_not_redacted() -> None:
+    first = "M" + ("FAKE" * 6)[:23]
+    last = ("FAKE" * 7)[:27]
+    for middle_len in (5, 7):
+        middle = ("FAKE" * 2)[:middle_len]
+        token = first + "." + middle + "." + last
+
+        assert redact_text(token) == token
+
+
+def test_discord_bot_token_last_segment_boundary_is_redacted() -> None:
+    first = "M" + ("FAKE" * 6)[:23]
+    middle = "FAKE00"
+    for total_len in (27, 38):
+        last = ("FAKE" * 10)[:total_len]
+        assert len(last) == total_len
+        token = first + "." + middle + "." + last
+
+        assert redact_text(token) == "[REDACTED:discord_bot_token]"
+
+
+def test_discord_bot_token_last_segment_too_short_is_not_redacted() -> None:
+    first = "M" + ("FAKE" * 6)[:23]
+    middle = "FAKE00"
+    last = ("FAKE" * 7)[:26]
+    token = first + "." + middle + "." + last
+
+    assert redact_text(token) == token
+
+
+def test_discord_bot_token_last_segment_too_long_fails_trailing_lookahead() -> None:
+    # The quantifier is greedy and takes at most 38 chars, then the trailing
+    # negative lookahead ``(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])`` requires the
+    # character right after the match to not continue the same charset. With
+    # a 39-char last segment made of one uniform charset, every possible
+    # match length from 27 to 38 is immediately followed by one more
+    # charset character, so the lookahead fails at every backtrack position
+    # and the token is left untouched.
+    first = "M" + ("FAKE" * 6)[:23]
+    middle = "FAKE00"
+    last = ("FAKE" * 10)[:39]
+    token = first + "." + middle + "." + last
+
+    assert redact_text(token) == token
 
 
 def test_discord_bot_token_shape_near_matches_are_not_redacted() -> None:
