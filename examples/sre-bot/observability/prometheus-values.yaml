@@ -237,10 +237,12 @@ serverFiles:
                 The task is backing off and will be parked if it keeps
                 crashing.
           - alert: CurieWorkerSupervisedTaskParked
+            # A level check, not increase(): a parked task emits give_up once
+            # and its series first appears already at 1 with no zero sample, so
+            # increase() would never see it. The series leaves with the worker
+            # process, which is also what un-parks the task.
             expr: |
-              increase(
-                curie_worker_supervised_restart_total{outcome="give_up"}[1h]
-              ) > 0
+              curie_worker_supervised_restart_total{outcome="give_up"} > 0
             labels:
               severity: page
               component: curie-worker
@@ -248,7 +250,7 @@ serverFiles:
               summary: A supervised worker task was parked after repeated crashes
               description: >-
                 curie_worker_supervised_restart_total with outcome give_up
-                increased. The named operation stopped restarting and stays
+                is present. The named operation stopped restarting and stays
                 down until the worker pod restarts.
           - alert: CurieReplyDeliveryRefused
             expr: |

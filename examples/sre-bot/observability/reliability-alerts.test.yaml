@@ -428,11 +428,13 @@ tests:
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts: []
 
-  - name: supervised task parked fires on give_up
+  - name: supervised task parked fires on the first give_up sample
     interval: 5m
     input_series:
+      # Absent, then constant at 1: the real shape of a counter that is
+      # emitted exactly once when the supervisor parks the task.
       - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="runs",outcome="give_up"}'
-        values: '0 0 1 1 1'
+        values: '_ _ 1 1 1'
     alert_rule_test:
       - eval_time: 15m
         alertname: CurieWorkerSupervisedTaskParked
@@ -447,5 +449,15 @@ tests:
               summary: A supervised worker task was parked after repeated crashes
               description: >-
                 curie_worker_supervised_restart_total with outcome give_up
-                increased. The named operation stopped restarting and stays
+                is present. The named operation stopped restarting and stays
                 down until the worker pod restarts.
+
+  - name: supervised task parked stays quiet when only restarts are seen
+    interval: 5m
+    input_series:
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="runs",outcome="restart"}'
+        values: '1 2 3 4 5'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieWorkerSupervisedTaskParked
+        exp_alerts: []
