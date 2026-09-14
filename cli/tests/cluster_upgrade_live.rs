@@ -81,7 +81,20 @@ impl Fixture {
 
     /// `run`, plus any extra flags (`--dry-run`) after the fixed argument set.
     fn run_with(&self, scenario: &str, to: &str, chart: &str, extra: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_curie"))
+        self.run_with_env(scenario, to, chart, extra, &[])
+    }
+
+    /// `run_with`, plus env vars that must reach the `curie` binary.
+    fn run_with_env(
+        &self,
+        scenario: &str,
+        to: &str,
+        chart: &str,
+        extra: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+        command
             .args([
                 "--json",
                 "cluster",
@@ -104,13 +117,19 @@ impl Fixture {
             )
             .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
             .env("UPGRADE_DRIVER_ROOT", self.0.path())
-            .env("UPGRADE_DRIVER_SCENARIO", scenario)
-            .output()
-            .unwrap()
+            .env("UPGRADE_DRIVER_SCENARIO", scenario);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        command.output().unwrap()
     }
 
     fn local(&self, scenario: &str) -> Output {
         self.run(scenario, "0.9.0", "charts/curie")
+    }
+
+    fn local_env(&self, scenario: &str, extra_env: &[(&str, &str)]) -> Output {
+        self.run_with_env(scenario, "0.9.0", "charts/curie", &[], extra_env)
     }
 
     /// Every recorded invocation, in order.
@@ -750,6 +769,40 @@ fn skipped_drain_phases_still_report_drained_queues() {
         );
         assert_eq!(resumed["status"], "succeeded", "{resumed}");
     }
+}
+
+// T20 -- #2639: live Drain must return the worker Deployment probe, not a
+// hardcoded success. A non-NotFound probe failure that stays pending through
+// the phase budget fails Drain, keeps the previous version serving, and never
+// issues helm upgrade.
+#[test]
+fn undrained_deploy_fails_drain_before_mutation() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local_env(
+        "undrained-deploy",
+        &[("CURIE_UPGRADE_DRAIN_TIMEOUT_SECS", "0")],
+    );
+    let json = json(&output);
+    assert_eq!(json["status"], "failed", "{json}");
+    assert_eq!(json["phase"], "drain", "{json}");
+    assert_eq!(json["previous_serving"], true, "{json}");
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "Drain refusal must precede mutation: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture.issued(&["kubectl", "get", "deploy", "rel-worker"]),
+        "Drain must probe the worker Deployment: {:?}",
+        fixture.argv()
+    );
+    let reason = json["fail_forward"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no fail_forward reason: {json}"));
+    assert!(
+        reason.contains("in flight") || reason.contains("drain"),
+        "fail-forward must mention in-flight work or drain: {reason}"
+    );
 }
 
 // T7 -- #2301 "compare Helm's retained target manifest with live owned objects

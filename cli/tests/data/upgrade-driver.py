@@ -226,6 +226,9 @@ SCENARIOS = {
         "metadata_missing_before": True,
         "alembic_fail": True,
     },
+    # Drain's worker Deployment probe fails with a non-NotFound error, so
+    # live_drain retries until the phase budget expires and returns false.
+    "undrained-deploy": {},
 }
 
 root = Path(os.environ["UPGRADE_DRIVER_ROOT"])
@@ -517,8 +520,12 @@ if program == "kubectl":
     if args[:3] == ["get", WORKLOADS, "-n"]:
         emit({"items": [live, pod, *jobs]})
     if args[:2] == ["get", "deploy"] and len(args) > 2 and not args[2].startswith("-"):
-        # The drain probe reads one named Deployment; its output is not parsed.
-        print(f"{args[2]}   1/1")
+        # The drain probe reads one named Deployment; replica output is not parsed.
+        name = args[2]
+        if os.environ["UPGRADE_DRIVER_SCENARIO"] == "undrained-deploy":
+            print(f'deployment "{name}" has not drained', file=sys.stderr)
+            sys.exit(1)
+        print(f"{name}   1/1")
         sys.exit(0)
     if args[0] == "exec" and "alembic" in args and "current" in args:
         if scenario["alembic_fail"]:

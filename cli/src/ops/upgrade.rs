@@ -12,8 +12,13 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 use super::command::{mask_secret, plain, require_on_path, run_capture, CommonOpts, OpsCommand};
+
+const DRAIN_TIMEOUT_ENV: &str = "CURIE_UPGRADE_DRAIN_TIMEOUT_SECS";
+const DRAIN_TIMEOUT_DEFAULT_SECS: u64 = 30;
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Durable phases of a cluster upgrade. Order is load-bearing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1500,22 +1505,62 @@ impl LiveHost {
     }
 
     fn live_drain(&self) -> Result<bool> {
-        // The chart's pre-upgrade Job is the #2010 gate. Apply runs helm, which
-        // fires that hook. This phase records the drain intent; an empty cluster
-        // (no worker) is a skip, not a refusal.
-        let cmd = OpsCommand::new(
-            "kubectl",
-            vec![
-                plain("get"),
-                plain("deploy"),
-                plain(format!("{}-worker", self.opts.common.release)),
-                plain("-n"),
-                plain(&self.opts.common.namespace),
-            ],
-        );
-        let (ok, _, _) = self.run(&cmd)?;
-        let _ = ok;
-        Ok(true)
+        // The chart's pre-upgrade Job is the #2010 gate and fires during Apply.
+        // This phase observes the worker Deployment probe only: success or a
+        // NotFound skip proceeds; any other failure stays pending until the
+        // phase budget expires. Replica counts are not parsed, because the
+        // worker stays scheduled during Drain.
+        tokio::task::block_in_place(|| {
+            let budget = std::env::var(DRAIN_TIMEOUT_ENV)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(DRAIN_TIMEOUT_DEFAULT_SECS);
+            let deadline = Instant::now() + Duration::from_secs(budget);
+            let mut probed = false;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if probed && remaining.is_zero() {
+                    return Ok(false);
+                }
+                let mut args = vec![
+                    plain("get"),
+                    plain("deploy"),
+                    plain(format!("{}-worker", self.opts.common.release)),
+                    plain("-n"),
+                    plain(&self.opts.common.namespace),
+                ];
+                if !remaining.is_zero() {
+                    args.push(plain(format!(
+                        "--request-timeout={}s",
+                        remaining.as_secs().max(1)
+                    )));
+                }
+                let cmd = OpsCommand::new("kubectl", args);
+                let (ok, _, err) = self.run(&cmd)?;
+                probed = true;
+                if let Some(drained) = live_drain_observation(ok, &err) {
+                    return Ok(drained);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                std::thread::sleep(DRAIN_POLL_INTERVAL.min(remaining));
+            }
+        })
+    }
+}
+
+/// Map one drain probe onto proceed / pending.
+///
+/// `Some(true)` is a successful get or a NotFound skip (empty cluster).
+/// `None` is still pending, so the caller retries until the phase budget
+/// expires. Probe failure is not a terminal `Some(false)`; budget expiry is.
+fn live_drain_observation(ok: bool, stderr: &str) -> Option<bool> {
+    if ok || api_workload_missing(stderr) {
+        Some(true)
+    } else {
+        None
     }
 }
 
