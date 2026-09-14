@@ -69,6 +69,7 @@ from channel_protocol.reply import (
     TurnStatus,
 )
 from curie_telemetry import operation_span, record_metric
+from curie_telemetry.redact import redact_text
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import ValidationError
 
@@ -347,7 +348,8 @@ def _escalation_text(
     lead: str,
     detail: str | None,
 ) -> str:
-    clipped = (detail or "").strip()
+    # Redact before clip so a truncated JWT or key still matches the redactor.
+    clipped = redact_text((detail or "").strip())
     if len(clipped) > _ESCALATION_DETAIL_MAX:
         clipped = clipped[:_ESCALATION_DETAIL_MAX]
     extra = (

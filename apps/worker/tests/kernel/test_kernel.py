@@ -1324,6 +1324,44 @@ def test_allowlisted_runner_error_escalates_with_event_id(make_harness) -> None:
     asyncio.run(go())
 
 
+# Hoisted synthetic: prefixes are split so check-secrets does not false-positive.
+_FAKE_ESCALATION_API_KEY = "sk-" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
+
+
+def test_escalation_detail_redacts_token_from_reply_and_log(
+    make_harness, caplog
+) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=1) as h:
+            h.runner.default_script = [
+                ErrorEvent(
+                    message=f"sandbox died: {_FAKE_ESCALATION_API_KEY}",
+                    classification="runner-error",
+                ),
+                Final(text="failed", status=FAIL),
+            ]
+            ev = _qevent("go", event_id="evt-escalation-secret")
+            with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
+                await h.kernel.process_event(ev)
+
+            reply = h.sink.last_text
+            assert reply is not None
+            assert _FAKE_ESCALATION_API_KEY not in reply
+            assert "[REDACTED:api_key]" in reply
+            assert "sandbox died" in reply
+            assert "event_id=evt-escalation-secret" in reply
+            assert "Flagging for a human" in reply
+
+            logged = "\n".join(record.getMessage() for record in caplog.records)
+            assert _FAKE_ESCALATION_API_KEY not in logged
+            assert "[REDACTED:api_key]" in logged
+            assert any(
+                "escalating event" in record.getMessage() for record in caplog.records
+            )
+
+    asyncio.run(go())
+
+
 def test_turn_start_failure_is_retryable_not_a_stall(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
