@@ -323,6 +323,25 @@ fn process_dev_help_lists_sre_demo_e2e() {
     );
 }
 
+/// `curie dev two-release-approval-e2e` is the operator-facing name of the
+/// #2307 two-release owner-only Slack approval fixture. If the verb stops
+/// being reachable, the workflow still calls the script but nobody can run
+/// it locally.
+#[test]
+fn process_dev_help_lists_two_release_approval_e2e() {
+    let output = run_help(&["dev"]);
+    assert!(
+        output.status.success(),
+        "expected success for dev help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        help_lists_subcommand(&text, "two-release-approval-e2e"),
+        "missing two-release-approval-e2e\n{text}"
+    );
+}
+
 #[test]
 fn process_dev_help_lists_verify_fix_pin() {
     let output = run_help(&["dev"]);

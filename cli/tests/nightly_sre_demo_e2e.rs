@@ -249,6 +249,34 @@ fn workflow_skips_the_live_job_unless_prereqs_are_ready() {
 }
 
 #[test]
+fn workflow_assigns_required_flag_on_non_pr_events() {
+    let text = workflow();
+    assert!(
+        text.contains(
+            "CURIE_SRE_DEMO_REQUIRED: ${{ github.event_name != 'pull_request' && '1' || '0' }}"
+        ),
+        "required live acceptance must set CURIE_SRE_DEMO_REQUIRED=1 on \
+         schedule, dispatch, and RC events, and leave PR inventory skippable; \
+         file contents:\n{text}"
+    );
+}
+
+#[test]
+fn workflow_paths_include_outcome_probe_and_python_tests() {
+    let text = workflow();
+    for needle in [
+        "cli/scripts/sre-demo-mcp-probe.py",
+        "cli/tests/sre_demo_e2e_test.py",
+    ] {
+        assert!(
+            text.contains(needle),
+            "the SRE demo workflow path filter must include {needle}; \
+             file contents:\n{text}"
+        );
+    }
+}
+
+#[test]
 fn script_names_all_six_demo_assertions() {
     let text = script();
     for needle in [
@@ -295,6 +323,34 @@ fn missing_slack_secret_skips_with_reason_in_the_summary() {
     assert!(
         !stdout.contains("kind create") && !stderr.contains("kind create"),
         "a skip must not create a cluster; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn missing_prerequisites_fail_required_live_acceptance() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let output = run_script("prereqs", &[("CURIE_SRE_DEMO_REQUIRED", "1")], work.path());
+    assert!(
+        !output.status.success(),
+        "required live acceptance cannot skip green"
+    );
+    let github_output = fs::read_to_string(work.path().join("output.txt")).unwrap_or_default();
+    assert!(github_output.contains("ready=false"));
+}
+
+#[test]
+fn outcome_checks_reject_false_positives_by_execution() {
+    let output = Command::new("uv")
+        .args(["run", "--locked", "--package", "curie-runner", "python"])
+        .current_dir(repo_root())
+        .arg(repo_root().join("cli/tests/sre_demo_e2e_test.py"))
+        .output()
+        .expect("execute outcome regression tests");
+    assert!(
+        output.status.success(),
+        "outcome regression failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

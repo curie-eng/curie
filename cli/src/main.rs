@@ -990,6 +990,8 @@ enum DevAction {
     /// allowlisted throwaway repo (#2246, `bash cli/scripts/sre-demo-e2e.sh`).
     /// Missing those CI secrets skip with the reason in the run summary.
     SreDemoE2e,
+    /// Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`).
+    TwoReleaseApprovalE2e,
     /// Select the end to end tiers CI would run for paths or revisions.
     E2eCiSelection {
         /// Changed path. Repeat for every path in the candidate change.
@@ -3186,6 +3188,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,
             DevAction::SreDemoE2e => commands::dev_script("cli/scripts/sre-demo-e2e.sh", &[]).await,
+            DevAction::TwoReleaseApprovalE2e => {
+                commands::dev_script("cli/scripts/two-release-approval-e2e.sh", &[]).await
+            }
             DevAction::E2eCiSelection {
                 path,
                 base,
@@ -6020,6 +6025,14 @@ mod tests {
             cli.command,
             Some(Command::Dev {
                 action: DevAction::SreDemoE2e
+            })
+        ));
+        let cli = Cli::try_parse_from(["curie", "dev", "two-release-approval-e2e"])
+            .expect("dev two-release-approval-e2e should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::TwoReleaseApprovalE2e
             })
         ));
         let cli = Cli::try_parse_from(["curie", "dev", "chart-runtime-e2e"])
