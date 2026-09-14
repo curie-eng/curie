@@ -14,7 +14,11 @@ from pathlib import Path
 
 import anyio
 import pytest
-from curie_runner.mcp_tool_capability import probe_mcp_tool_capability
+from curie_runner.mcp_tool_capability import (
+    ConnectorCapabilityFailure,
+    probe_mcp_tool_capability,
+    reprobe_connector_failures,
+)
 
 _VECTOR = (
     Path(__file__).resolve().parents[2] / "tests" / "vectors" / "connector-probe-diagnosis.json"
@@ -233,3 +237,38 @@ def test_caller_message_never_contains_a_planted_secret() -> None:
     assert "github" in message
     assert "ghp-" not in message
     assert "${" not in message
+
+
+def test_reprobe_never_redials_expansion_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #2634: an expansion failure is deterministic within the process, and a
+    # materialized empty Bearer must never be sent to /mcp (#2519).
+    dialed: list[str] = []
+
+    async def record(*_args: object, **_kwargs: object) -> tuple[int, bool, frozenset[str]]:
+        dialed.append("dial")
+        return 1, True, frozenset()
+
+    monkeypatch.setattr("curie_runner.mcp_tool_capability._probe_server", record)
+    derived = {
+        name: {
+            "type": "http",
+            "url": "http://127.0.0.1:9/mcp",
+            "headers": {"Authorization": "Bearer "},
+        }
+        for name in ("github", "linear", "jira")
+    }
+    empty = ConnectorCapabilityFailure("github", ("GITHUB_TOKEN",), "empty_expansion")
+    missing = ConnectorCapabilityFailure("linear", ("LINEAR_TOKEN",), "missing_credential")
+    probe = ConnectorCapabilityFailure("jira", ("JIRA_TOKEN",), "probe_failed")
+
+    assert anyio.run(reprobe_connector_failures, (empty, missing), derived, {}) == (
+        empty,
+        missing,
+    )
+    assert dialed == []
+
+    assert anyio.run(reprobe_connector_failures, (empty, probe, missing), derived, {}) == (
+        empty,
+        missing,
+    )
+    assert dialed == ["dial"]
