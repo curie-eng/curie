@@ -33,6 +33,7 @@ from curie_dispatcher.approval_actions import (
     REJECT_ACTION_ID,
     ApprovalResolveClient,
     ResolveOutcome,
+    _refusal_text,
     settled_verdict_line,
 )
 from curie_dispatcher.approval_principal import mint_chat_principal
@@ -46,7 +47,11 @@ from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient
 
 from .conftest import FakeSocketClient, _authorize, deliver_once, deliver_until_acked
-from .test_approval_note_dialog import _note_click, _note_submit
+from .test_approval_note_dialog import (
+    _assert_ownership_miss_ephemeral,
+    _note_click,
+    _note_submit,
+)
 
 APPROVAL_ID = "9a1e8a10-0000-0000-0000-000000000246"
 _PLATFORM_API_KEY = "platform-api-test-key"
@@ -281,8 +286,9 @@ def test_two_releases_only_the_owner_resolves_an_immediate_action(
     """One fake Slack app, two dispatchers: only the owner consumes the click (#2248).
 
     Slack delivers the same envelope to the non-owner first. That release must
-    leave the envelope unacked (so Slack retries) and must not mutate the card
-    or post an ephemeral. The retry reaches the owner, who acks and stamps.
+    leave the envelope unacked (so Slack retries) and must not mutate the card.
+    It posts an ephemeral telling the clicker to disconnect the extra client.
+    The retry reaches the owner, who acks and stamps with no extra ephemeral.
     """
 
     non_owner = ScriptedResolver(ResolveOutcome(status_code=404, detail="approval not found"))
@@ -318,7 +324,7 @@ def test_two_releases_only_the_owner_resolves_an_immediate_action(
     assert len(owner.calls) == 1
     non_owner_web.chat_update.assert_not_called()
     non_owner_web.chat_postMessage.assert_not_called()
-    non_owner_web.chat_postEphemeral.assert_not_called()
+    _assert_ownership_miss_ephemeral(non_owner_web)
     owner_web.chat_update.assert_called_once()
     assert "Approved by <@U_MANAGER>" in owner_web.chat_update.call_args.kwargs["text"]
     owner_web.chat_postEphemeral.assert_not_called()
@@ -350,7 +356,7 @@ def test_two_releases_oneshot_non_owner_then_owner_resolves_an_immediate_action(
     assert non_owner_socket.acked_envelope_ids == []
     non_owner_web.chat_update.assert_not_called()
     non_owner_web.chat_postMessage.assert_not_called()
-    non_owner_web.chat_postEphemeral.assert_not_called()
+    _assert_ownership_miss_ephemeral(non_owner_web)
 
     deliver_once(owner_handler, owner_socket, owner_app, click)
 
@@ -387,7 +393,7 @@ def test_two_releases_oneshot_non_owner_then_owner_opens_a_note_dialog(
     assert non_owner_socket.acked_envelope_ids == []
     non_owner_web.chat_update.assert_not_called()
     non_owner_web.chat_postMessage.assert_not_called()
-    non_owner_web.chat_postEphemeral.assert_not_called()
+    _assert_ownership_miss_ephemeral(non_owner_web)
     non_owner_web.views_open.assert_not_called()
     assert non_owner.calls == []
 
@@ -396,6 +402,7 @@ def test_two_releases_oneshot_non_owner_then_owner_opens_a_note_dialog(
     assert owner_socket.acked_envelope_ids == ["env-oneshot-note-open"]
     assert owner.calls == []
     owner_web.views_open.assert_called_once()
+    owner_web.chat_postEphemeral.assert_not_called()
 
 
 def test_two_releases_oneshot_non_owner_then_owner_resolves_a_note_submission(
@@ -423,7 +430,7 @@ def test_two_releases_oneshot_non_owner_then_owner_resolves_a_note_submission(
     assert non_owner_socket.acked_envelope_ids == []
     non_owner_web.chat_update.assert_not_called()
     non_owner_web.chat_postMessage.assert_not_called()
-    non_owner_web.chat_postEphemeral.assert_not_called()
+    _assert_ownership_miss_ephemeral(non_owner_web)
 
     deliver_once(owner_handler, owner_socket, owner_app, submit)
 
@@ -433,6 +440,7 @@ def test_two_releases_oneshot_non_owner_then_owner_resolves_a_note_submission(
     assert owner.calls[0]["note"] == "approved for Q3"
     owner_web.chat_update.assert_called_once()
     assert "approved for Q3" in owner_web.chat_update.call_args.kwargs["text"]
+    owner_web.chat_postEphemeral.assert_not_called()
 
 
 def test_oneshot_two_release_tests_do_not_call_deliver_until_acked() -> None:
@@ -468,6 +476,35 @@ def test_a_proxy_404_still_consumes_the_envelope(
     assert sock.acked_envelope_ids == ["env-proxy-404"]
     web_client.chat_postEphemeral.assert_called_once()
     assert "try again shortly" in web_client.chat_postEphemeral.call_args.kwargs["text"]
+
+
+def test_an_ownership_miss_posts_recovery_guidance_and_leaves_the_envelope_unacked(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """Wrong-release decline posts the disconnect ephemeral through the handler."""
+
+    resolver = ScriptedResolver(ResolveOutcome(status_code=404, detail="approval not found"))
+    app, web_client = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(sock, _approval_click("env-ownership-miss", action_id=APPROVE_ACTION_ID))
+    _drain(app)
+
+    assert sock.acked_envelope_ids == []
+    web_client.chat_update.assert_not_called()
+    web_client.chat_postMessage.assert_not_called()
+    web_client.chat_postEphemeral.assert_called_once()
+    kwargs = web_client.chat_postEphemeral.call_args.kwargs
+    assert kwargs["channel"] == "C_MGRS"
+    assert kwargs["user"] == "U_MANAGER"
+    assert kwargs["text"] == _refusal_text(
+        ResolveOutcome(status_code=404, detail="approval not found")
+    )
+    folded = kwargs["text"].casefold()
+    assert "disconnect" in folded
+    assert "do not retry from this side" in folded
+    assert "try again" not in folded
 
 
 def test_the_ack_lands_before_any_slack_call_on_the_immediate_path(

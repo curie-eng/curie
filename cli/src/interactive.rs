@@ -32,6 +32,7 @@ use ratatui::{Frame, Terminal};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::channel::{parse_terminal_message, TerminalAction, REPLY_FENCE};
+use crate::comms::SLACK_ONE_APP_PER_RELEASE_NOTE;
 use crate::recipes::{build_argv, recipes, ArgPart, Recipe, RecipeKind, Tier, TuiAction, Workflow};
 
 /// The model credentials Curie accepts, in the order every lookup tries them.
@@ -759,9 +760,8 @@ fn deploy_to_slack(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &
     ));
     if tier == Tier::Cluster {
         intro.push("Requires an installed release (curie cluster up) with a model credential.");
-        intro.push("One Slack app = one Socket Mode owner: do not also run a local dispatcher");
-        intro.push("on the same app token.");
     }
+    intro.push(SLACK_ONE_APP_PER_RELEASE_NOTE);
     for line in [
         "",
         "STEP 1 (one time, in your browser -- not automatable):",

@@ -1597,7 +1597,7 @@ enum LocalAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Connect or disconnect the local compose stack from a real Slack workspace.
+    /// Connect or disconnect the local compose stack from a real Slack workspace. Exactly one Curie release may connect to a given Slack app.
     Comms {
         /// Chat surface to configure. Required until the CLI grows more than
         /// one comms target.
@@ -2335,7 +2335,7 @@ enum ClusterAction {
         #[arg(long)]
         open: bool,
     },
-    /// Connect or disconnect the cluster release from a real Slack workspace.
+    /// Connect or disconnect the cluster release from a real Slack workspace. Exactly one Curie release may connect to a given Slack app.
     Comms {
         /// Chat surface to configure. Required until the CLI grows more than
         /// one comms target.

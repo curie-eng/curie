@@ -743,6 +743,10 @@ curie cluster comms --slack
 workspace: it stores the tokens you pass and restarts the affected pods so the
 change takes effect immediately. Connected `cluster message` replies go to the
 agent's bound Slack channel; disconnected releases use the terminal stub.
+Exactly one Curie release may connect to a given Slack app. Slack Socket Mode
+fans events across every connected client, so two releases sharing one app
+silently split mentions. Use a dedicated Slack app for this release; do not
+share it with a local dispatcher or another cluster install.
 
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).
@@ -1273,13 +1277,12 @@ next operator.
 - **langfuse-web restarts ~2x during first boot** while ClickHouse and
   Postgres come up, then stabilizes. This is startup ordering, not a
   crashloop; do not treat the early restarts as a failure.
-- **Give long-lived releases separate Slack Socket Mode apps.** Slack permits
-  up to ten connections for one app and may send each payload to any connection
-  without a predictable distribution pattern. During a temporary overlap, a
-  non-owning Curie release leaves the Socket Mode envelope unacked so Slack
-  retries the owner; the non-owner does not resolve, reject, or mutate the
-  card. Stop the local dispatcher after testing rather than leaving it
-  competing with the in-cluster release. See
+- **Exactly one Curie release may connect to a given Slack app.** Slack Socket
+  Mode fans events across every connected client, so two releases sharing one
+  app silently split mentions. Give each long-lived release its own app. If a
+  second dispatcher is already connected, stop the extra client; do not retry
+  mentions or approval clicks hoping Slack picks the owner. Leave-unacked
+  approval routing is not an operator retry procedure. See
   [Slack's multiple-connections contract](https://docs.slack.dev/apis/events-api/using-socket-mode/#using-multiple-connections).
 - **kube-router applies NetworkPolicy a few seconds after pod start.** A
   brand-new pod can see open egress for the first seconds before the policy

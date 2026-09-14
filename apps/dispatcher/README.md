@@ -19,12 +19,14 @@ platform API key alone cannot resolve. Authorization still happens in the API: r
 equality neither grants nor denies, so the same authenticated requester may confirm only
 when the selected approver set admits them.
 
-Slack may distribute one app's interactive payloads across any of its open
-Socket Mode connections. If two Curie releases share that app, the release whose
-API does not contain the approval leaves the Socket Mode envelope unacked, so
-Slack retries another connection; only the release whose API owns the row
-acknowledges and can pass the existing compare-and-set. Separate Slack apps per
-long-lived release still avoid sharing a connection pool.
+Exactly one Curie release may connect to a given Slack app. Slack may distribute
+one app's payloads across any of its open Socket Mode connections. If two
+clients share the app, mentions still split: there is no ownership gate on the
+mention path, so either client may enqueue the turn. For an approval click, a
+release whose API does not contain the row leaves the Socket Mode envelope
+unacked so Slack can retry another connection; that leave-unacked path is not an
+operator retry procedure. Disconnect the extra client instead of retrying from
+the non-owning side.
 
 ## What is ingested, and what is refused
 

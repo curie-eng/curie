@@ -17,7 +17,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.web import WebClient
 
-from .config import DispatcherConfig
+from .config import DispatcherConfig, release_identity
 from .handlers import Clock, register_handlers
 from .supervisor import Connection
 
@@ -122,11 +122,39 @@ class SocketModeConnection(Connection):
         self._handler = SocketModeHandler(app, app_token=app_token)
         self._logger = logger or logging.getLogger(__name__)
         self._closed = threading.Event()
+        self._handler.client.message_listeners.append(self._on_socket_message)
+
+    def _on_socket_message(
+        self, client: Any, message: dict[str, Any], raw_message: Any
+    ) -> None:
+        """Warn when Slack reports more than one Socket Mode client on this app.
+
+        Hello ``num_connections`` is the only runtime competition signal. Warn
+        and keep the connection: this ticket detects overlap, it does not refuse
+        connect or post to Slack.
+        """
+        del client, raw_message
+        if message.get("type") != "hello":
+            return
+        raw = message.get("num_connections")
+        if not isinstance(raw, (int, str)):
+            return
+        try:
+            num_connections = int(raw)
+        except ValueError:
+            return
+        if num_connections <= 1:
+            return
+        self._logger.warning(
+            "%s: exactly one Curie release may connect to a given Slack app; "
+            "disconnect extra clients",
+            release_identity(),
+        )
 
     def run(self) -> None:
         self._closed.clear()
         self._handler.connect()  # type: ignore[no-untyped-call]
-        self._logger.info("socket mode connected")
+        self._logger.info("socket mode connected identity=%s", release_identity())
         self._closed.wait()
 
     def close(self) -> None:

@@ -1046,7 +1046,7 @@ export const commandManifest = {
           "name": "status"
         },
         {
-          "about": "Connect or disconnect the local compose stack from a real Slack workspace",
+          "about": "Connect or disconnect the local compose stack from a real Slack workspace. Exactly one Curie release may connect to a given Slack app",
           "args": [
             {
               "global": false,
@@ -3230,7 +3230,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "Connect or disconnect the cluster release from a real Slack workspace",
+          "about": "Connect or disconnect the cluster release from a real Slack workspace. Exactly one Curie release may connect to a given Slack app",
           "args": [
             {
               "global": false,
