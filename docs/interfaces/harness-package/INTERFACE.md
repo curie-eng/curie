@@ -130,7 +130,7 @@ feeds `readonly_tools` to `SideEffectClassifier`
 
 The gate a registration must survive today is the import-linter contract set in
 the root `pyproject.toml`, run as `uv run lint-imports` in
-`.github/workflows/ci.yaml`. One of its three contracts guards this seam
+`.github/workflows/ci.yaml`. One of its four contracts guards this seam
 specifically, forbidding `claude_agent_sdk` inside
 `runner/src/curie_runner/harness/contribution.py` and
 `runner/src/curie_runner/harness/registry.py` while deliberately exempting

@@ -80,7 +80,8 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `EvalOutput`, `DeployOutput`, `AllTargetsDeployOutput`, `KillOutput`, `ResumeOutput`,
   `BudgetOutput`, `ResetThreadOutput`,
   `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `ApprovalsOutput`,
-  `SkillApprovalsOutput`, `OverridesOutput`, `ConnectorBuildOutput`. The last is
+  `SkillApprovalsOutput`, `OverridesOutput`, `ChannelsOutput`,
+  `ConnectorBuildOutput`. The last is
   the `curie build --plugin-dir` receipt for connector source builds (ADR-0113):
   it emits one object even when the bundle declares nothing to build, because
   under `--json` an agent cannot tell "nothing to build" from "the command
@@ -93,7 +94,8 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   multi-variant outcome whose covered variant set the enum-variant walk derives (see
   Known leakage).
 - **`cli/src/installation.rs`**: `ApplyOutput`, `DiffOutput`.
-- **`ObservabilityOutput`** (`cli/src/observability.rs`) — the tier-aware
+- **`cli/src/observability.rs`**: `ObservabilityOutput`, `ObservabilityRunsOutput`,
+  `ObservabilityRunOutput`, `ObservabilityMetricsOutput` — the tier-aware
   observability surfaces (#460). Notable as the shape the seam is for: both the local
   and cluster tiers resolve their own `Endpoint` values and return *the same* output
   type, so tier parity is structural rather than two hand-aligned printers. That
