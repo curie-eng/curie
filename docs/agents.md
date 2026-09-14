@@ -139,9 +139,30 @@ banned in this contract, so all three tiers are written out in full:
 only when `convergence.exact` is true and `canary.passed` is true. A failed
 attempt reports `previous_serving` or one `fail_forward.command`. The
 payload always includes a `compatibility` object (or `null`) with the
-redacted schema-compatibility decision. Resume by re-running the same
-command. `curie cluster status --json` reports the current upgrade phase
-and `known_good_version`.
+redacted schema-compatibility decision. Resume a normal command failure by
+running the same command only when cleanup released ownership. `curie cluster
+status --json` reports the current upgrade phase and `known_good_version`.
+
+After confirmation, a current `curie cluster upgrade` claims the namespaced
+upgrade checkpoint before reading release snapshots or running Helm. A
+competing current `curie cluster upgrade` refuses and names the opaque holder
+and redacted target action. Each checkpoint write and ordinary release compares
+that holder and the last Kubernetes `resourceVersion`. A stale writer stops
+rather than overwriting the newer record. Current `curie cluster up`, `curie
+cluster rollback`, and `curie cluster down` processes do not participate. This
+cooperative check also does not cover older CLIs, raw Helm commands, direct
+Kubernetes writes, or cluster administrators, and it does not make all upgrade
+effects transactional or exactly once.
+
+Any interruption after ownership acquisition, including Ctrl C, SIGINT, and
+SIGTERM, leaves the holder in place. A normal exit that reports an ownership
+release CAS failure can also leave it. There is no expiry or automatic
+takeover. Verify that the old process and its Helm action have stopped before
+following the conditional recovery procedure in
+[`docs/operations.md`](operations.md), then rerun. Never delete the checkpoint
+to recover. Clearing a live holder can allow overlapping operations. If the
+release namespace is absent, establish it with `curie cluster up` first.
+Upgrade ownership is namespaced and does not read the Namespace object.
 
 At the skill tier the bundle is the session, so there is no separate deploy
 <!-- doclint:ignore-line -->

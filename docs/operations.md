@@ -401,17 +401,69 @@ up` observes it, not assumed.
 `--json` reports the current phase, the last known-good version, whether
 the previous version is still serving, and at most one fail-forward
 command. Success is refused unless convergence is exact and the canary
-passed. Re-run the same command to resume after an interruption.
+passed. After a normal command failure, run the same command to resume only
+when cleanup successfully released ownership.
 
 This composes configuration migration (issue 2299) with the drain gate
 (issue 2010): a resume after a completed drain does not drain accepted
 work again.
 
-**Not fenced.** This command does not prevent concurrent upgrades. The
-in-progress checkpoint refuses a second run only when it targets a
-different version, and only when the checkpoint read wins the race; a
-concurrent raw `helm upgrade`, or a second `curie cluster upgrade` from
-another host, is not prevented (issue #2589).
+After confirmation, the command claims the namespaced
+`<release>-upgrade-checkpoint` ConfigMap before it reads release snapshots or
+runs Helm. The claim records an opaque holder identifier and a redacted action
+that names the target version. Another current `curie cluster upgrade` process
+that finds the claim refuses immediately and reports both values, even when it
+requested the same target. Each checkpoint update and the ordinary holder
+release test both that holder and the exact Kubernetes `resourceVersion`
+returned by the preceding successful operation. A process that loses either
+comparison stops without replacing the newer checkpoint.
+
+This is cooperative ownership among concurrent `curie cluster upgrade`
+processes from a current Curie CLI version. The current `curie cluster up`,
+`curie cluster rollback`, and `curie cluster down` verbs do not participate. It
+also does not fence an older CLI, a raw Helm command, a direct Kubernetes write,
+or a cluster administrator. It does not make Helm and the other upgrade effects
+one transaction or guarantee that an external side effect happens exactly once.
+
+The checkpoint is namespaced. If its namespace does not exist, the command
+refuses before Helm mutation and directs the operator to establish the install
+with `curie cluster up` first. Ownership does not require a cluster scoped read
+of the Namespace object.
+
+Any interruption after ownership acquisition, including Ctrl C, SIGINT, and
+SIGTERM, leaves the holder in place. A normal exit that reports an ownership
+release CAS failure can also leave the holder. Do not rerun the upgrade in
+either case until the checked recovery below is complete. There is no expiry,
+heartbeat, or automatic takeover. First read the live checkpoint:
+
+```bash
+kubectl --context <context> -n <namespace> get configmap <release>-upgrade-checkpoint -o json
+```
+
+Record the exact `metadata.resourceVersion`,
+`metadata.annotations["curietech.ai/upgrade-holder"]`, and action from that
+response. Verify that the process identified by the holder has stopped and that
+its Helm action is no longer running. Clearing a live holder can let another
+upgrade overlap the original operation. Never delete the checkpoint as a
+recovery step because it also contains the resumable lifecycle record.
+
+Only after those checks, replace both values in this conditional patch with the
+exact values just observed:
+
+```bash
+kubectl --context <context> -n <namespace> patch configmap <release>-upgrade-checkpoint \
+  --type=json \
+  --patch='[
+    {"op":"test","path":"/metadata/resourceVersion","value":"<observed-resource-version>"},
+    {"op":"test","path":"/metadata/annotations/curietech.ai~1upgrade-holder","value":"<observed-holder>"},
+    {"op":"remove","path":"/metadata/annotations/curietech.ai~1upgrade-holder"},
+    {"op":"remove","path":"/metadata/annotations/curietech.ai~1upgrade-action"}
+  ]'
+```
+
+If either test fails, inspect the ConfigMap again and reassess its current
+holder. Do not retry with stale values or remove the annotations
+unconditionally.
 
 ### `curie cluster down`
 

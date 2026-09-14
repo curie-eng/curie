@@ -8,7 +8,9 @@ on the commands that were *not*). Never claims a real Kubernetes run.
 
 Payload capture:
   * every ``-f <file>`` helm receives is copied to ``values-<n>.yaml``
-  * every ``kubectl apply -f <file>`` manifest is copied to ``applied-<n>.json``
+  * every ``kubectl create -f <file>`` object is copied to ``created-<n>.json``
+  * every ``kubectl patch --patch-file <file>`` document is copied to
+    ``patch-<n>.json``
 
 ``helm get values`` returns the most recently APPLIED overlay when one exists,
 falling back to ``retained.json``. A real release retains what was last handed
@@ -18,7 +20,7 @@ replay of the same input.
 Behaviour is selected by ``$UPGRADE_DRIVER_SCENARIO`` from SCENARIOS below.
 Optional per-test inputs read from the root directory:
   * ``retained.json`` -- the document ``helm get values`` returns (JSON is YAML)
-  * ``checkpoint.json`` -- the record served as the upgrade checkpoint ConfigMap
+  * ``checkpoint.json`` -- the complete upgrade checkpoint ConfigMap
 
 Three observable moments drive the fixtures, derived from the argv log rather
 than from a call ordinal (the number of `helm get metadata` reads is an
@@ -58,6 +60,9 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                     `after`. Only a
 #                     version that moves BETWEEN Apply and Canary can prove the
 #                     canary re-reads it instead of trusting its own bookkeeping.
+#   metadata_numeric_version  return the Helm revision number in metadata's
+#                             `version` field instead of a chart version string
+#   metadata_missing_before  metadata reports no release before Apply
 #   served_before/after  container image tag actually running pre/post upgrade
 #   target            image tag the rendered target manifest asks for
 #   show_chart        version `helm show chart <local path>` reports
@@ -83,8 +88,17 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                     once instead of retrying to its 300s deadline. This is a
 #                     Rollout-facet issue: it must not be the reason any named
 #                     convergence sub-flag goes false.
-#   apply_fails       False | "always" | "after-converge"  -- when `kubectl
-#                     apply` (the checkpoint write) exits non-zero
+#   checkpoint_patch_fails  False | "always" | "after-converge". A record
+#                           patch exits nonzero at the selected moment.
+#   acquire_conflict  None | "create" | "patch". The selected ownership write
+#                     loses to a deterministic external holder.
+#   stale_record_cas  an external writer advances resourceVersion and installs
+#                     a sentinel immediately before the first record patch.
+#   release_conflict  an external writer replaces the holder immediately before
+#                     the normal release patch.
+#   namespace_absent  checkpoint lookup reports the namespace absent.
+#   namespace_disappears  checkpoint lookup reports the ConfigMap absent, then
+#                         create reports the namespace absent.
 #   alembic_current   stdout of `kubectl exec ... alembic current`
 #   alembic_fail      that exec exits 1 (unreadable live revision)
 #   compat_metadata   object served as ConfigMap data.compatibility.json from
@@ -119,6 +133,7 @@ BASE = {
     "before": "0.8.6",
     "after": "0.9.0",
     "after_converge": None,
+    "metadata_numeric_version": False,
     "served_before": "0.8.6",
     "served_after": "0.9.0",
     "target": "0.9.0",
@@ -135,7 +150,12 @@ BASE = {
     "values_drift": False,
     "selector_drift": False,
     "terminal": False,
-    "apply_fails": False,
+    "checkpoint_patch_fails": False,
+    "acquire_conflict": None,
+    "stale_record_cas": False,
+    "release_conflict": False,
+    "namespace_absent": False,
+    "namespace_disappears": False,
     "alembic_current": "0043 (head)",
     "alembic_fail": False,
     "compat_metadata": None,
@@ -157,8 +177,9 @@ SCENARIOS = {
     "metadata-numeric-after": {"metadata_after_shape": "numeric"},
     # A resume whose Apply already happened: release and workloads are on 0.9.0.
     "resumed-applied": {"before": "0.9.0", "served_before": "0.9.0"},
-    # The release reports the new revision and `helm get manifest` renders the
-    # 0.9.0 images, but the live pods still run 0.8.6 at full ready counts.
+    # The release metadata reports the target chart version and `helm get
+    # manifest` renders the 0.9.0 images, but the live pods still run 0.8.6 at
+    # full ready counts.
     # Every other facet is healthy, so `images` is the only sub-flag that may
     # go false.
     "stale-images": {"served_after": "0.8.6", "terminal": True},
@@ -193,20 +214,34 @@ SCENARIOS = {
     "values-drift": {"values_drift": True},
     # Every checkpoint write fails, starting with the first one before any
     # mutation.
-    "persist-fails": {"apply_fails": "always"},
+    "persist-fails": {"checkpoint_patch_fails": "always"},
     # Only the checkpoint write that FOLLOWS a failed Converge fails. The
     # convergence failure is the real verdict; the persist error must travel
     # beside it rather than replace it.
     "converge-then-persist-fails": {
         "served_after": "0.8.6",
         "terminal": True,
-        "apply_fails": "after-converge",
+        "checkpoint_patch_fails": "after-converge",
     },
+    "acquire-create-conflict": {"acquire_conflict": "create"},
+    "acquire-patch-conflict": {"acquire_conflict": "patch"},
+    "stale-record-cas": {"stale_record_cas": True},
+    "release-conflict": {"release_conflict": True},
+    "converge-then-release-conflict": {
+        "served_after": "0.8.6",
+        "terminal": True,
+        "release_conflict": True,
+    },
+    "namespace-absent": {"namespace_absent": True},
+    "namespace-disappears": {"namespace_disappears": True},
     # A local chart directory whose own metadata is not the requested --to.
     # No release yet: `helm get metadata` fails until something is installed,
     # so the Drain phase is skipped for having nothing in flight.
     "fresh-install": {"metadata_missing_before": True},
     "local-chart-mismatch": {"show_chart": "0.8.7"},
+    # Helm metadata's top-level `version` is the numeric revision rather than
+    # the chart version string. The CLI must treat the chart version as absent.
+    "numeric-metadata-version": {"metadata_numeric_version": True},
     # Live revision 0099 is not in the target graph: Validate must refuse
     # before `helm upgrade`.
     "schema-incompatible": {"alembic_current": "0099"},
@@ -248,11 +283,11 @@ upgraded = any(call[:2] == ["helm", "upgrade"] for call in previous)
 converged = any(call[:1] == ["kubectl"] and WORKLOADS in call for call in previous)
 
 if upgraded and converged:
-    version = scenario["after_converge"]
+    chart_version = scenario["after_converge"]
 elif upgraded:
-    version = scenario["after"]
+    chart_version = scenario["after"]
 else:
-    version = scenario["before"]
+    chart_version = scenario["before"]
 served = scenario["served_after"] if upgraded else scenario["served_before"]
 image = f"{REPO}:{served}"
 target_image = f"{REPO}:{scenario['target']}"
@@ -275,6 +310,172 @@ def capture(prefix, suffix, source):
 
 def flag_value(name):
     return args[args.index(name) + 1] if name in args else None
+
+
+CHECKPOINT = f"{RELEASE}-upgrade-checkpoint"
+HOLDER_ANNOTATION = "curietech.ai/upgrade-holder"
+ACTION_ANNOTATION = "curietech.ai/upgrade-action"
+CREATE_WINNER = "00000000-0000-4000-8000-000000000701"
+PATCH_WINNER = "00000000-0000-4000-8000-000000000702"
+RELEASE_WINNER = "00000000-0000-4000-8000-000000000703"
+WINNING_ACTION = "upgrade to 0.9.0"
+SENTINEL_RECORD = json.dumps(
+    {
+        "target_version": "9.9.9",
+        "from_version": "9.9.8",
+        "known_good_version": "9.9.8",
+        "completed": ["plan"],
+        "status": "external_sentinel",
+        "plan": ["external writer sentinel"],
+        "drain_completed": False,
+        "convergence": None,
+        "canary": None,
+        "fail_forward": None,
+        "resumed": False,
+    },
+    separators=(",", ":"),
+)
+
+
+def checkpoint_path():
+    return root / "checkpoint.json"
+
+
+def read_checkpoint():
+    path = checkpoint_path()
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def normalize_config_map(config_map):
+    metadata = config_map.setdefault("metadata", {})
+    if metadata.get("annotations") == {}:
+        metadata.pop("annotations")
+    if config_map.get("data") == {}:
+        config_map.pop("data")
+    return config_map
+
+
+def save_checkpoint(config_map):
+    normalized = normalize_config_map(copy.deepcopy(config_map))
+    checkpoint_path().write_text(json.dumps(normalized, separators=(",", ":")))
+    return normalized
+
+
+def next_resource_version(config_map):
+    current = config_map.get("metadata", {}).get("resourceVersion", "0")
+    try:
+        return str(int(current) + 1)
+    except (TypeError, ValueError):
+        return f"{current}.next"
+
+
+def winning_checkpoint(holder, resource_version, record=SENTINEL_RECORD):
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": CHECKPOINT,
+            "namespace": NAMESPACE,
+            "resourceVersion": resource_version,
+            "labels": {
+                "app.kubernetes.io/managed-by": "curie",
+                "curietech.ai/upgrade": "checkpoint",
+            },
+            "annotations": {
+                HOLDER_ANNOTATION: holder,
+                ACTION_ANNOTATION: WINNING_ACTION,
+            },
+        },
+        "data": {"record": record},
+    }
+
+
+def decode_pointer(path):
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError(f"invalid JSON Pointer {path!r}")
+    return [part.replace("~1", "/").replace("~0", "~") for part in path[1:].split("/")]
+
+
+def pointer_parent(document, path):
+    parts = decode_pointer(path)
+    if not parts:
+        raise ValueError("the document root is not a mutable checkpoint field")
+    current = document
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current:
+            raise KeyError(path)
+        current = current[part]
+    if not isinstance(current, dict):
+        raise KeyError(path)
+    return current, parts[-1]
+
+
+def pointer_value(document, path):
+    current = document
+    for part in decode_pointer(path):
+        if not isinstance(current, dict) or part not in current:
+            raise KeyError(path)
+        current = current[part]
+    return current
+
+
+def apply_patch(document, operations):
+    changed = copy.deepcopy(document)
+    for operation in operations:
+        op = operation.get("op")
+        path = operation.get("path")
+        if op == "test":
+            if pointer_value(changed, path) != operation.get("value"):
+                raise ValueError(f"test failed at {path}")
+            continue
+        parent, key = pointer_parent(changed, path)
+        if op == "add":
+            parent[key] = copy.deepcopy(operation.get("value"))
+        elif op == "replace":
+            if key not in parent:
+                raise KeyError(path)
+            parent[key] = copy.deepcopy(operation.get("value"))
+        elif op == "remove":
+            if key not in parent:
+                raise KeyError(path)
+            del parent[key]
+        else:
+            raise ValueError(f"unsupported JSON Patch operation {op!r}")
+    return changed
+
+
+def patch_adds_holder(operation):
+    if operation.get("op") != "add":
+        return False
+    if operation.get("path") == "/metadata/annotations/curietech.ai~1upgrade-holder":
+        return True
+    return operation.get("path") == "/metadata/annotations" and isinstance(
+        operation.get("value"), dict
+    ) and HOLDER_ANNOTATION in operation["value"]
+
+
+def patch_kind(operations):
+    paths = {operation.get("path") for operation in operations}
+    if any(
+        operation.get("op") == "remove"
+        and operation.get("path") == "/metadata/annotations/curietech.ai~1upgrade-holder"
+        for operation in operations
+    ):
+        return "release"
+    if "/data" in paths or "/data/record" in paths:
+        return "record"
+    if any(patch_adds_holder(operation) for operation in operations):
+        return "acquire"
+    return "unknown"
+
+
+def conflict(message):
+    print(
+        f"Error from server (Conflict): Operation cannot be fulfilled on "
+        f"configmaps \"{CHECKPOINT}\": {message}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 expected = {
@@ -409,11 +610,13 @@ if program == "helm":
         if shape == "malformed":
             print("{")
             sys.exit(0)
+        if scenario["metadata_numeric_version"]:
+            shape = "numeric"
         metadata = {
             "name": RELEASE,
             "chart": "curie",
-            "version": version,
-            "appVersion": version,
+            "version": chart_version,
+            "appVersion": chart_version,
             "namespace": NAMESPACE,
             "revision": 2,
             "status": "deployed",
@@ -497,22 +700,97 @@ if program == "kubectl":
     if scenario["workloads_fail"] and args[:3] == ["get", WORKLOADS, "-n"]:
         print("Error from server (Forbidden): workloads is forbidden", file=sys.stderr)
         sys.exit(1)
-    if args[0] == "apply":
+    if args[0] == "create":
         manifest = flag_value("-f")
         if manifest:
-            capture("applied", ".json", manifest)
-        fails = scenario["apply_fails"]
-        if fails == "always" or (fails == "after-converge" and converged):
-            print("error: could not apply the checkpoint ConfigMap", file=sys.stderr)
+            capture("created", ".json", manifest)
+        if scenario["namespace_absent"] or scenario["namespace_disappears"]:
+            print(
+                f'Error from server (NotFound): error when creating "{manifest}": '
+                f'namespaces "{NAMESPACE}" not found',
+                file=sys.stderr,
+            )
             sys.exit(1)
-        print("configmap/checkpoint configured")
-        sys.exit(0)
+        if scenario["acquire_conflict"] == "create":
+            save_checkpoint(winning_checkpoint(CREATE_WINNER, "701"))
+            conflict("the object has been modified")
+        if read_checkpoint() is not None:
+            print(
+                f'Error from server (AlreadyExists): configmaps "{CHECKPOINT}" already exists',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if manifest is None:
+            print("error: create requires -f", file=sys.stderr)
+            sys.exit(64)
+        created = json.loads(Path(manifest).read_text())
+        metadata = created.setdefault("metadata", {})
+        metadata.setdefault("name", CHECKPOINT)
+        metadata.setdefault("namespace", NAMESPACE)
+        metadata["resourceVersion"] = "100"
+        emit(save_checkpoint(created))
+    if args[0] == "patch" and args[1:3] == ["configmap", CHECKPOINT]:
+        patch_file = flag_value("--patch-file")
+        if patch_file is None:
+            print("error: patch requires --patch-file", file=sys.stderr)
+            sys.exit(64)
+        capture("patch", ".json", patch_file)
+        operations = json.loads(Path(patch_file).read_text())
+        kind = patch_kind(operations)
+        current = read_checkpoint()
+        if current is None:
+            print(
+                f'Error from server (NotFound): configmaps "{CHECKPOINT}" not found',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if kind == "acquire" and scenario["acquire_conflict"] == "patch":
+            save_checkpoint(winning_checkpoint(PATCH_WINNER, next_resource_version(current)))
+            conflict("the object has been modified")
+        if kind == "record" and scenario["stale_record_cas"]:
+            external = copy.deepcopy(current)
+            external.setdefault("data", {})["record"] = SENTINEL_RECORD
+            external["metadata"]["resourceVersion"] = next_resource_version(current)
+            save_checkpoint(external)
+            (root / "sentinel-record.txt").write_text(SENTINEL_RECORD)
+            conflict("the object has been modified")
+        fails = scenario["checkpoint_patch_fails"]
+        if kind == "record" and (
+            fails == "always" or (fails == "after-converge" and converged)
+        ):
+            print("error: could not patch the checkpoint ConfigMap", file=sys.stderr)
+            sys.exit(1)
+        if kind == "release" and scenario["release_conflict"]:
+            external = copy.deepcopy(current)
+            external["metadata"]["resourceVersion"] = next_resource_version(current)
+            external["metadata"]["annotations"] = {
+                HOLDER_ANNOTATION: RELEASE_WINNER,
+                ACTION_ANNOTATION: WINNING_ACTION,
+            }
+            save_checkpoint(external)
+            conflict("the object has been modified")
+        try:
+            patched = apply_patch(current, operations)
+        except (KeyError, TypeError, ValueError) as error:
+            conflict(str(error))
+        patched["metadata"]["resourceVersion"] = next_resource_version(current)
+        emit(save_checkpoint(patched))
     if args[:2] == ["get", "configmap"]:
-        if args[2].endswith("-upgrade-checkpoint"):
-            checkpoint = root / "checkpoint.json"
-            if checkpoint.exists():
-                sys.stdout.write(checkpoint.read_text().strip())
-            sys.exit(0)
+        if args[2] == CHECKPOINT:
+            if scenario["namespace_absent"]:
+                print(
+                    f'Error from server (NotFound): namespaces "{NAMESPACE}" not found',
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            checkpoint = read_checkpoint()
+            if checkpoint is not None:
+                emit(checkpoint)
+            print(
+                f'Error from server (NotFound): configmaps "{CHECKPOINT}" not found',
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print(f'Error from server (NotFound): configmaps "{args[2]}" not found', file=sys.stderr)
         sys.exit(1)
     if args[:2] == ["get", "node"]:
