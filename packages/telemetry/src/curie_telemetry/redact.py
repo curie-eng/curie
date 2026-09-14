@@ -72,9 +72,12 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
     ),
     # Every whole-value context rule runs next (bearer, basic auth, DSN
     # userinfo, X-API-Key, generic secret assignment), before the Discord
-    # shape rules. Each of these consumes its entire value in one match, so
-    # none of them can leave a placeholder for a later rule to partially
-    # re-match and expose a trailing suffix.
+    # shape rules. x_api_key and secret_assignment's guard only skips a
+    # value that is already exactly one placeholder (idempotence); a
+    # placeholder followed by leftover non-space text, left behind when an
+    # earlier rule (e.g. channel_token) redacted just a prefix of the
+    # value, still matches so the whole value is consumed here instead of
+    # being exposed.
     RedactionRule(
         "bearer_token",
         re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+"),
@@ -96,8 +99,13 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
     RedactionRule(
         "x_api_key",
         # Opaque header values have no unique prefix; match the header
-        # name the mail adapter and channel clients send.
-        re.compile(r"(X-API-Key:\s*)(?!\[REDACTED:)\S+", re.IGNORECASE),
+        # name the mail adapter and channel clients send. The guard skips
+        # only a value that IS exactly one placeholder (idempotent
+        # re-run); a placeholder followed by leftover non-space text (an
+        # earlier rule redacted a prefix of the value, e.g. a channel
+        # token, and left a trailing suffix exposed) still matches so the
+        # whole value, placeholder and suffix together, is consumed here.
+        re.compile(r"(X-API-Key:\s*)(?!\[REDACTED:[a-z_]+\](?!\S))\S+", re.IGNORECASE),
         r"\1[REDACTED:x_api_key]",
     ),
     RedactionRule(
@@ -117,8 +125,14 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         # because ``_`` is a word character. Require a non-alphanumeric
         # predecessor so ``*_TOKEN=`` / ``*_SECRET=`` match while
         # ``mytoken=`` does not. Keep the key name; drop only the value.
+        # The guard skips only a value that IS exactly one placeholder
+        # (idempotent re-run); a placeholder followed by leftover
+        # non-space text (channel_token above redacted a prefix of the
+        # value and left a trailing suffix exposed) still matches so the
+        # whole value, placeholder and suffix together, is consumed here.
         re.compile(
-            r"(?<![A-Za-z0-9])((?:secret|password|passwd|pwd|api_key|apikey|access_token|token)=)(?!\[REDACTED:)\S+",
+            r"(?<![A-Za-z0-9])((?:secret|password|passwd|pwd|api_key|apikey|access_token|token)="
+            r")(?!\[REDACTED:[a-z_]+\](?!\S))\S+",
             re.IGNORECASE,
         ),
         r"\1[REDACTED:secret_assignment]",

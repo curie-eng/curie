@@ -630,3 +630,53 @@ def test_bare_discord_bot_token_assignment_still_uses_named_placeholder() -> Non
     redacted = redact_text("DISCORD_BOT_TOKEN=" + FAKE_SHAPED_DISCORD_BOT_TOKEN)
 
     assert redacted == "DISCORD_BOT_TOKEN=[REDACTED:discord_bot_token_assignment]"
+
+
+# Channel token whose signature segment happens to contain an api_key-style
+# ``am_`` prefix, mirroring the finding's exact shape.
+FAKE_CHANNEL_TOKEN_AM_SIG = (
+    "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "am_" + "A" * 24
+)
+
+
+def test_channel_token_with_am_signature_and_suffix_falls_through_to_secret_assignment() -> (
+    None
+):
+    # channel_token consumes only up to the signature (it cannot cross the
+    # ``/``), so its placeholder is left with a trailing suffix. The widened
+    # secret_assignment guard must still consume the whole value.
+    redacted = redact_text("token=" + FAKE_CHANNEL_TOKEN_AM_SIG + "/FAKE_SUFFIX")
+
+    assert redacted == "token=[REDACTED:secret_assignment]"
+    assert "FAKE_SUFFIX" not in redacted
+    assert "[REDACTED:channel_token]" not in redacted
+
+
+def test_channel_token_assignment_with_suffix_falls_through_to_secret_assignment() -> None:
+    redacted = redact_text("token=" + FAKE_CHANNEL_TOKEN + "/FAKE_SUFFIX")
+
+    assert redacted == "token=[REDACTED:secret_assignment]"
+    assert "FAKE_SUFFIX" not in redacted
+    assert "[REDACTED:channel_token]" not in redacted
+
+
+def test_x_api_key_header_with_channel_token_and_suffix_falls_through_to_x_api_key() -> None:
+    redacted = redact_text("X-API-Key: " + FAKE_CHANNEL_TOKEN + "/FAKE_SUFFIX")
+
+    assert redacted == "X-API-Key: [REDACTED:x_api_key]"
+    assert "FAKE_SUFFIX" not in redacted
+    assert "[REDACTED:channel_token]" not in redacted
+
+
+def test_secret_assignment_placeholder_is_idempotent() -> None:
+    once = "token=[REDACTED:secret_assignment]"
+
+    assert redact_text(once) == once
+
+
+def test_channel_token_assignment_is_idempotent() -> None:
+    once = redact_text("CURIE_CHANNEL_TOKEN=" + FAKE_CHANNEL_TOKEN)
+    twice = redact_text(once)
+
+    assert once == "CURIE_CHANNEL_TOKEN=[REDACTED:channel_token]"
+    assert twice == once
