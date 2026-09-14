@@ -10,6 +10,12 @@ metadata:
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: inference
+  # Keep the downloaded weights when a later full upgrade drops
+  # inference.deploy (for example `cluster up --fake-model`, #2640). A kept
+  # PVC keeps its Helm ownership annotations, so a later `--local-model`
+  # upgrade re-adopts it; `helm uninstall` leaves it for manual deletion.
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
   accessModes: ["ReadWriteOnce"]
   {{- if .Values.global.storageClass }}

@@ -56,6 +56,14 @@
 #        check's own diagnostic -- naming both configuration keys and neither
 #        credential value -- proving 9c passes because of the BYO branch, and
 #        not because the check was deleted or some unrelated gate refused first.
+#   10.  CURIE_CREDENTIALS must not reach an effectively fake runner (#2640):
+#        with agentSandbox.runner.fakeModel left at its default true and
+#        inference.deploy false, neither agent-sandbox.yaml nor worker.yaml
+#        renders it, whether the credential is inline (10a/10b) or BYO
+#        (10c/10d). Positive control (10e/10f): fakeModel=true with
+#        inference.deploy=true is a real local-model runner, so the gate keys
+#        on that effective condition and the credential still renders. The
+#        renders for 1, 2 and 5a/5b set fakeModel=false for the same reason.
 #
 # Assertions 2, 4a, 5a/5b and 7 were written to FAIL against the chart as it
 # stood before the *ExistingSecret escape landed for the original eight keys
@@ -73,7 +81,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 FAILED=0
-ASSERTION_COUNT=39
+ASSERTION_COUNT=45
 
 # mailAdapter.deploy=true fails closed without at least one AgentMail HTTPS
 # CIDR (see the chart-level invariant in charts/curie/CLAUDE.md), so this flag
@@ -117,7 +125,9 @@ render() {
 # least one mailAdapter.agentmail.httpsCidrs entry. Drop either and this render
 # stops producing the manifest assertions 1l-1n read.
 # ------------------------------------------------------------------------
+# A credential only reaches the runner on a real-model render (#2640).
 render default \
+  --set agentSandbox.runner.fakeModel=false \
   --set agentSandbox.runner.credentials=default-agentcreds \
   --set worker.adapterCredentials.myadapter=default-adaptercreds \
   --set api.githubToken=default-githubtoken \
@@ -146,7 +156,9 @@ render default \
 # assertion 2c, so neither of those two --set flags is removable even though
 # they read as belonging to unrelated keys.
 # ------------------------------------------------------------------------
+# A credential only reaches the runner on a real-model render (#2640).
 render byo \
+  --set agentSandbox.runner.fakeModel=false \
   --set agentSandbox.runner.credentials=STALE-agentcreds \
   --set agentSandbox.runner.credentialsExistingSecret=byo-agentcreds \
   --set worker.adapterCredentials.myadapter=STALE-adaptercreds \
@@ -176,10 +188,29 @@ render byo \
 # Renders for assertion 5 (agentCredentials gate): credentialsExistingSecret
 # alone (plain field empty), and a bare render with both empty.
 # ------------------------------------------------------------------------
+# A credential only reaches the runner on a real-model render (#2640).
 render agentcred-pos \
+  --set agentSandbox.runner.fakeModel=false \
   --set agentSandbox.runner.credentialsExistingSecret=my-agentcreds-secret
 
 render bare
+
+# ------------------------------------------------------------------------
+# Renders for assertion 10 (#2640): fakeModel left at its chart default true.
+# An inline and a BYO credential must both stay out of the fake runner and
+# the worker that forwards into every claim; inference.deploy=true makes the
+# runner real again (persistence.enabled satisfies the #1779 download guard).
+# ------------------------------------------------------------------------
+render fake-cred \
+  --set agentSandbox.runner.credentials=fake-agentcreds
+
+render fake-byo \
+  --set agentSandbox.runner.credentialsExistingSecret=byo-agentcreds
+
+render fake-inference \
+  --set agentSandbox.runner.credentials=local-agentcreds \
+  --set inference.deploy=true \
+  --set inference.persistence.enabled=true
 
 # ------------------------------------------------------------------------
 # Assertions 1, 2, 3, 5a-5d and 9a-9b: structural checks on the rendered
@@ -192,6 +223,9 @@ DEFAULT_DIR="$TMP/default/curie/templates" \
 BYO_DIR="$TMP/byo/curie/templates" \
 AGENTCRED_POS_DIR="$TMP/agentcred-pos/curie/templates" \
 BARE_DIR="$TMP/bare/curie/templates" \
+FAKE_CRED_DIR="$TMP/fake-cred/curie/templates" \
+FAKE_BYO_DIR="$TMP/fake-byo/curie/templates" \
+FAKE_INFERENCE_DIR="$TMP/fake-inference/curie/templates" \
 python3 <<'PY'
 import json
 import os
@@ -203,6 +237,9 @@ DEFAULT_DIR = os.environ["DEFAULT_DIR"]
 BYO_DIR = os.environ["BYO_DIR"]
 AGENTCRED_POS_DIR = os.environ["AGENTCRED_POS_DIR"]
 BARE_DIR = os.environ["BARE_DIR"]
+FAKE_CRED_DIR = os.environ["FAKE_CRED_DIR"]
+FAKE_BYO_DIR = os.environ["FAKE_BYO_DIR"]
+FAKE_INFERENCE_DIR = os.environ["FAKE_INFERENCE_DIR"]
 SECRET = "curie-secrets"
 
 failures = []
@@ -405,6 +442,24 @@ check_absent("5c", f"{n}/agent-sandbox.yaml", "runner", "CURIE_CREDENTIALS",
 check_absent("5d", f"{n}/worker.yaml", "worker", "CURIE_CREDENTIALS",
              "negative control: both empty, via worker.yaml")
 
+# ---- 10: an effectively fake runner (fakeModel default true, no in-cluster
+#      inference) receives no CURIE_CREDENTIALS from either consumer, since
+#      the worker forwards its own copy into every claim (#2640). ----
+check_absent("10a", f"{FAKE_CRED_DIR}/agent-sandbox.yaml", "runner", "CURIE_CREDENTIALS",
+             "fake runner with inline credentials, via agent-sandbox.yaml")
+check_absent("10b", f"{FAKE_CRED_DIR}/worker.yaml", "worker", "CURIE_CREDENTIALS",
+             "fake runner with inline credentials, via worker.yaml")
+check_absent("10c", f"{FAKE_BYO_DIR}/agent-sandbox.yaml", "runner", "CURIE_CREDENTIALS",
+             "fake runner with credentialsExistingSecret, via agent-sandbox.yaml")
+check_absent("10d", f"{FAKE_BYO_DIR}/worker.yaml", "worker", "CURIE_CREDENTIALS",
+             "fake runner with credentialsExistingSecret, via worker.yaml")
+# Positive control: fakeModel=true plus inference.deploy=true is a real
+# local-model runner, so the gate must key on the effective condition.
+check_present("10e", f"{FAKE_INFERENCE_DIR}/agent-sandbox.yaml", "runner", "CURIE_CREDENTIALS",
+              "fakeModel with inference.deploy (real local model), via agent-sandbox.yaml")
+check_present("10f", f"{FAKE_INFERENCE_DIR}/worker.yaml", "worker", "CURIE_CREDENTIALS",
+              "fakeModel with inference.deploy (real local model), via worker.yaml")
+
 # ---- 9a-9b: the curie.adapterCredentials derivation (_helpers.tpl) and its BYO
 #      branch, read off the chart's own Secret. adapterCredentials is a
 #      JSON-encoded string, so it is parsed rather than substring-matched.
@@ -474,11 +529,11 @@ for key in MAIL_KEYS:
 if failures:
     for msg in failures:
         print(f"FAIL {msg}", file=sys.stderr)
-    print(f"{len(failures)} of 34 python-side assertions failed "
-          "(assertions 1, 2, 5a-5d and 9a-9b; 4a-4b, 7 and 9c-9d run separately in bash)",
+    print(f"{len(failures)} of 40 python-side assertions failed "
+          "(assertions 1, 2, 5a-5d, 9a-9b and 10a-10f; 4a-4b, 7 and 9c-9d run separately in bash)",
           file=sys.stderr)
     sys.exit(1)
-print("OK: all 34 python-side assertions passed (1a-1n, 2a-2n, 5a-5d, 9a-9b)")
+print("OK: all 40 python-side assertions passed (1a-1n, 2a-2n, 5a-5d, 9a-9b, 10a-10f)")
 PY
 [ $? -eq 0 ] || FAILED=1
 
