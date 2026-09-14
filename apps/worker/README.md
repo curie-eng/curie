@@ -195,13 +195,18 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   operator can see which one happened.
   `workspace-error` is a managed-workspace preparation FAULT before the turn was
   ever accepted (#2004): the clone, the archive, the upload, or a missing
-  workspace coordinator. It is told apart from `runner-error` for the same
+  workspace coordinator on a turn that names no repository. It is told apart
+  from `runner-error` for the same
   reason, and it always carries a `workspace start failed` WARNING naming the
   agent, the deployment, the repository the turn asked for and the stage that
   failed -- such a turn used to ack, create no sandbox and log nothing at all.
   A deliberate repository-selection refusal is the other half of that split and
   is NOT this: it is a decision rather than a fault, so it stays terminal,
-  answers the user, and logs at INFO instead.
+  answers the user, and logs at INFO instead. A turn that names a repository
+  while the worker-wide coordinator is off is such a refusal (#2659); and a
+  turn that attaches a workspace because its own message named the repository
+  ends its reply with one platform line naming that repository, placed after
+  the model's answer and before the receipt or the awaiting-approval notice.
 - **Idempotency + crash recovery.** The Slack event id gates a `done` marker, so
   a redelivered or reclaimed entry that already finished is skipped.
   A renewable worker lease distinguishes process death from ordinary consumer

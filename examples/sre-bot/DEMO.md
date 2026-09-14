@@ -26,7 +26,7 @@ by being read. Running it is an operator choice on a disposable cluster.
 | One Slack app per long-lived release | Do not point two dispatchers at the same Slack app | Slack fans interactive payloads across every open Socket Mode connection for that app. Two Curie releases sharing one app make approval clicks land on the wrong release. Create a dedicated app for this install; do not reconnect or stop another dispatcher to steal the socket |
 | Model credential | `CURIE_CREDENTIALS` | Live replies. A fake-model install cannot prove these scenarios |
 | GitHub allowlist | Helm value `api.githubRepoAllowlist`, set at install as `--set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'` | Empty is deny-all. Runtime selection checks this list before clone and again before publication. Same value shape as [examples/coder/README.md](../coder/README.md) |
-| GitHub App | `curie cluster github-app` with Contents Read and write plus Pull requests Read and write, installed on the allowlisted repository | Clone and publication mint a repository-scoped installation token. A PAT on `api.githubToken` / `CURIE_GITHUB_TOKEN` is a fallback and is not enough when selection is installation-scoped: the reply is that the repository is not authorized for this installation |
+| GitHub App | `curie cluster github-app` with Contents Read and write plus Pull requests Read and write, installed on the allowlisted repository | Clone and publication mint a repository-scoped installation token. A PAT on `api.githubToken` / `CURIE_GITHUB_TOKEN` is the fallback. When neither can clone the repository, workspace preparation fails and the thread shows a workspace-error escalation, not an allowlist refusal |
 | `cluster deploy --workspace` | Pass `--workspace` on the SRE-bot deploy | The flag exists on `curie cluster deploy`. Current CLI help marks `--workspace` and `--no-workspace` as deprecated compatibility no-ops because coding tools are built in. Name it anyway so the demo matches the documented surface; the allowlist plus an allowed root GitHub URL in the opening message are what actually mount `/workspace` |
 | Connector RBAC | Applied by `curie example sre-bot install --observability` from [`manifests/kubernetes-access.yaml`](manifests/kubernetes-access.yaml) | Cluster-wide reads of non-secret operational resources; writes only in `sre-demo`. Secrets, RBAC mutation, namespace mutation, and platform-namespace writes are denied by Kubernetes even after a Curie approval |
 
@@ -221,22 +221,25 @@ one-line edit, a pull request. Use a **new** top-level mention so this thread
 can select a repository. Coding tools are built in; publication goes through
 `mcp__curie__publish_changes` and still needs a human approval.
 
-Put the allowlisted root URL in that **opening** message. An opening message
-without a repository URL boots a generic sandbox. A later URL in the same
-thread is currently refused before selection or clone; the fenced replacement
-in ADR 0136 is not the path this runbook can rely on. Choosing another
-repository requires another new thread.
+Ask in plain words and include the allowlisted root repository URL in the
+opening message. No special phrasing is needed; Curie reads the URL, mounts
+that repository's checkout at `/workspace`, and names the repository it
+inferred in its reply. An opening message without a repository URL boots a
+generic sandbox. A root URL in a later message of a thread with no repository
+yet moves the conversation onto a checkout once the thread is idle (ADR 0136);
+this runbook does not rely on that path. A thread works in one repository, so
+choosing another repository requires a new thread.
 
 First (and only opening) message:
 
-> @acme-bot Attach workspace https://github.com/acme-corp/acme-bot then add a one-line note to README.md that this was a disposable SRE demo coding check, and open a pull request against main. Touch no other repository. Do not mutate Kubernetes.
+> @acme-bot Make a change in https://github.com/acme-corp/acme-bot: add a one-line note to README.md that this was a disposable SRE demo coding check, and open a pull request against main. Touch no other repository. Do not mutate Kubernetes.
 
 | Evidence | Expected |
 |---|---|
-| Slack reply | The thread is owned by this release. `/workspace` is a checkout of `acme-corp/acme-bot`. The bot edits README.md and asks to publish |
+| Slack reply | The thread is owned by this release. `/workspace` is a checkout of `acme-corp/acme-bot`. The bot edits README.md and asks to publish. The reply carries the line "Working in acme-corp/acme-bot, from the repository URL in your message." directly above the awaiting-approval notice |
 | Approval state | A publication approval card, distinct from the Kubernetes `resources_scale` cards. Approve it once. The sandbox never receives the GitHub credential |
 | Kubernetes | `acme-demo` remains 2/2 unless a new approved scale was requested |
-| Negative control | `That repository is not authorized for this installation` means the GitHub App is not installed on the allowlisted repo, or the allowlist omitted it. A PAT-only secret that still refuses is not success. A pull request against any other repository, or a push from inside the sandbox, fails this scenario |
+| Negative control | The refusal ``That repository is not in api.githubRepoAllowlist for this installation; allow `owner/repo` or `owner/*` in the chart values.`` means the allowlist omitted the repository. A GitHub credential problem (the App not installed on the repository, or no usable token) is not that refusal: workspace preparation fails and, after its retries, the thread reads `The run failed (workspace-error) after N attempt(s)` and flags a human. A reply that names the repository without the announcement line, a pull request against any other repository, or a push from inside the sandbox fails this scenario |
 
 After you approve publication, the platform posts the pull-request URL back
 into the thread. Confirm it targets `main` on `acme-corp/acme-bot` only.

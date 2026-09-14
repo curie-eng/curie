@@ -948,6 +948,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_approval_id_reads_the_notice_after_a_workspace_announcement() {
+        // #2659: the worker places the inferred repository announcement as its
+        // own block between the answer and the notice. The notice stays the
+        // trailing block, so the id must still be recovered.
+        let id = "00000000-0000-4000-8000-000000000000";
+        let text = format!(
+            "Answer.\n\n\
+             Working in acme-corp/acme-bot, from the repository URL in your message.\n\n\
+             Awaiting approval ({id}): run the deploy\n\
+             The session is paused and will resume once an authorized member \
+             resolves this request."
+        );
+        assert_eq!(parse_approval_id(&text).as_deref(), Some(id));
+    }
+
+    #[test]
     fn parse_approval_id_none_without_a_notice() {
         assert_eq!(parse_approval_id("just a normal reply, no gate here"), None);
     }

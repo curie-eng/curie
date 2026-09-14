@@ -46,6 +46,15 @@ _REPO_FULL_NAME = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
     r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$"
 )
+# The terminal refusal for a message that names a repository while the worker-wide
+# workspace switch is off (#2659). It names no repository, so it neither echoes
+# untrusted message text nor reveals whether the allowlist permits one.
+WORKSPACES_DISABLED_REFUSAL = (
+    "Repository workspaces are turned off on this installation, so no repository "
+    "was attached and no work started. An operator can turn them on with "
+    "agentSandbox.runner.workspace.enabled in the chart values "
+    "(CURIE_WORKSPACE_ENABLED on the worker)."
+)
 _SELECTION_REFUSAL_MESSAGES = {
     "workspace.deployment_disabled": (
         "This deployment does not enable repository workspaces."
@@ -195,7 +204,8 @@ def parse_github_repo_fact(message: str) -> str | None:
             repositories.setdefault(candidate.casefold(), candidate)
     if len(repositories) > 1:
         raise WorkspaceSelectionRefused(
-            "Please name only one root GitHub repository URL in this thread."
+            "This message names more than one GitHub repository, so no repository "
+            "was attached and no work started. A thread works in only one repository."
         )
     return next(iter(repositories.values()), None)
 

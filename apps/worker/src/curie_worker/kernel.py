@@ -119,6 +119,7 @@ from .sandbox.types import (
 )
 from .threadlock import ThreadLock
 from .workspace import (
+    WORKSPACES_DISABLED_REFUSAL,
     WorkspaceClaimCoordinator,
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
@@ -351,6 +352,43 @@ def map_error_classification(raw: str | None) -> str:
     if raw is not None and raw in PLATFORM_ERROR_CLASSIFICATIONS:
         return raw
     return UNCLASSIFIED_ERROR_CLASSIFICATION
+
+
+def _workspace_inference_notice(repo: str | None) -> str | None:
+    """The platform's one-line account of a repository it inferred (#2659).
+
+    Platform-authored, never model text. ``repo`` is only ever the repository
+    the server selected (allowlist-checked and shape-validated), never raw
+    message text, so it cannot carry a blank line or the CLI's approval marker.
+    It is appended after the model's answer as its own block, and never written
+    into the runner's event text or ``TurnOutcome.text``, so the model input,
+    the approval record summary and the approval card stay free of it. None when
+    nothing was inferred, which ``_join_reply_blocks`` skips.
+    """
+
+    if not repo:
+        return None
+    return f"Working in {repo}, from the repository URL in your message."
+
+
+def _same_repo(left: str | None, right: str | None) -> bool:
+    """Whether two repository names are the same repository (#2659).
+
+    GitHub names compare case-insensitively; an absent side is never a match.
+    """
+
+    return left is not None and right is not None and left.casefold() == right.casefold()
+
+
+def _join_reply_blocks(*parts: str | None) -> str:
+    """Join reply blocks with one blank line, skipping empty or absent ones.
+
+    The one place reply blocks are composed, so the CLI's blank-line block parse
+    (``parse_approval_id`` splits on ``\\n\\n``) always sees whole blocks and never
+    an empty one.
+    """
+
+    return "\n\n".join(part for part in parts if part)
 
 
 def _escalation_text(
@@ -629,6 +667,10 @@ class TurnOutcome:
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
     review_origin_key: str | None = None
+    # The repository this turn attached because its own message named it
+    # (#2659). Read by `_pause_for_approval` for the notice composition. None on
+    # every other turn.
+    workspace_inferred_repo: str | None = None
 
 
 class ThreadBusyError(RuntimeError):
@@ -671,6 +713,24 @@ class _RouteResult:
     # route) under the route lock: the canned reply to deliver instead of
     # claiming a sandbox or starting a model turn. None on every other path.
     canned_reply: str | None = None
+    # Set only on the new-turn return, when this message's own repository fact
+    # selected a workspace the route snapshot taken under the lock did not
+    # already carry (#2659). The reply announces it; None on every other path.
+    workspace_inferred_repo: str | None = None
+
+
+@dataclass
+class _WorkspaceInferenceCarry:
+    """One delivery's record of the repository its message inferred (#2659).
+
+    Created in ``process_event``'s local scope and shared by every attempt of
+    that delivery. ``_route_and_start`` records the inference as soon as the
+    claim attaches the workspace, before any steer or turn start, so an
+    attempt that attaches and then fails still leaves the fact for the retry
+    that adopts the attached route. It is only ever set, never cleared.
+    """
+
+    repo: str | None = None
 
 
 @dataclass
@@ -706,24 +766,32 @@ class _StreamAccumulator:
     # here, because ``undoable`` is derived on the record and a receipt built
     # from what the worker SENT could claim a reversibility the row lacks.
     receipt_rows: list[dict[str, Any]] = field(default_factory=list)
+    # The repository this turn attached from its own message (#2659), announced
+    # at finalize only. Intermediate streaming edits show `rendered()` alone.
+    workspace_inferred_repo: str | None = None
 
     def rendered(self) -> str:
         return self.final_text if self.final_text is not None else "".join(self.text_parts)
 
     def rendered_with_receipt(self) -> str:
-        """The turn's answer, then what it did to the world.
+        """The turn's answer, then the inferred repository, then what it did.
 
         Appended rather than replacing: the model's answer is what the person
         asked for, and the receipt is the platform's own account beneath it. A
         turn that changed nothing adds nothing, because most turns are reads and
         a receipt on every one of them is noise.
+
+        The inferred repository announcement (#2659) is a trailing block for the
+        same reason the receipt is: the final edit appends beneath a message the
+        person may already be reading, instead of rewriting its first line. It
+        sits directly after the answer so the receipt stays the last block.
         """
 
-        text = self.rendered()
-        receipt = render_receipt(self.receipt_rows)
-        if receipt is None:
-            return text
-        return f"{text}\n\n{receipt}" if text else receipt
+        return _join_reply_blocks(
+            self.rendered(),
+            _workspace_inference_notice(self.workspace_inferred_repo),
+            render_receipt(self.receipt_rows),
+        )
 
 
 class _ThrottledReply:
@@ -1524,6 +1592,11 @@ class Kernel:
             if _is_fenced(lease) and lease is not None and lease.generation > 1:
                 await self._preflight_reclaimed_delivery(thread_key, lease)
 
+            # Retry carry for the inferred repository announcement (#2659); see
+            # _WorkspaceInferenceCarry. Local to this delivery, never kernel state,
+            # so it cannot leak into another thread's turn. A reclaimed redelivery
+            # starts fresh.
+            workspace_inference = _WorkspaceInferenceCarry()
             attempt = 0
             while True:
                 attempt += 1
@@ -1575,6 +1648,7 @@ class Kernel:
                     workspace_deployment_id,
                     agent_name,
                     remaining_s=_remaining_budget(lease),
+                    workspace_inference=workspace_inference,
                 )
 
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
@@ -2453,6 +2527,7 @@ class Kernel:
         agent_name: str | None = None,
         *,
         remaining_s: float | None = None,
+        workspace_inference: _WorkspaceInferenceCarry,
     ) -> TurnOutcome:
         thread_key = _thread_key_for(qevent)
 
@@ -2546,6 +2621,7 @@ class Kernel:
                         agent_id=agent_id,
                         verified_review=verified_review,
                         review_turn=qevent if verified_review is not None else None,
+                        workspace_inference=workspace_inference,
                     )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -2730,7 +2806,16 @@ class Kernel:
                 and await self._killswitch.is_killed(agent_id)
             ):
                 await self.interrupt_thread(thread_key, f"agent {agent_id} killed by operator")
-            outcome = await self._consume(qevent, route, turn, nav, agent_id)
+            # #2659: this route's own inference wins; otherwise a retry honors the
+            # delivery's carried fact while the adopted handle still carries it.
+            carried = workspace_inference.repo
+            inferred = routed.workspace_inferred_repo or (
+                carried if _same_repo(routed.handle.workspace_repo, carried) else None
+            )
+            outcome = await self._consume(
+                qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
+            )
+            outcome.workspace_inferred_repo = inferred
             if verified_review is not None:
                 outcome.review_origin_key = verified_review.origin_key
             if (
@@ -2802,16 +2887,28 @@ class Kernel:
         pending_publication_approval: bool = False,
         verified_review: VerifiedReviewFeedback | None = None,
         review_turn: QueuedTurn | None = None,
+        workspace_inference: _WorkspaceInferenceCarry,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
         # before any platform response path. This deliberately precedes the
         # greeting/help shortcut: a canned reply must not create a thread whose
         # repository remains ambiguous, and a conflicting repository must be
         # refused before an existing sandbox can be adopted or steered.
+        # Hoisted so the new-turn return can tell whether THIS message named the
+        # repository it attached (#2659); None when no selection ran.
+        repo_fact: str | None = None
         workspace_repo: str | None = None
         lineage: PublicationLineage | None = None
         if workspace_deployment_id is not None:
             if self._workspace is None:
+                # A named repository that cannot be attached is a decision the
+                # user must read (#2659, ADR 0126 terminal refusal), not a
+                # retryable fault. A message naming two repositories raises the
+                # parser's own terminal ambiguity refusal from here unchanged. A
+                # turn naming no repository keeps today's retryable wiring fault
+                # (#2683), because changing it changes turns that never asked.
+                if verified_review is None and parse_github_repo_fact(event.text) is not None:
+                    raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
                 raise WorkspacePreparationError(
                     "wiring", "workspace-enabled deployment has no trusted coordinator"
                 )
@@ -2997,6 +3094,25 @@ class Kernel:
             remaining_s=remaining_s,
         )
         retained_live_route = existing_handle is not None and handle == existing_handle
+        # #2659: announce a repository only when this message named it, the
+        # server selected that same repository, and the route snapshot taken
+        # under the lock did not already carry it (a fresh claim, a lost route,
+        # or the late handoff from a generic route). A sticky follow-up, a
+        # repeated URL on a route that already works there, and a verified
+        # review (whose repo_fact is None) all announce nothing. Decided right
+        # after the attach, before any steer or start_turn, and recorded into the
+        # delivery's holder (see _WorkspaceInferenceCarry).
+        inferred = (
+            workspace_repo
+            if _same_repo(repo_fact, workspace_repo)
+            and not _same_repo(
+                existing_handle.workspace_repo if existing_handle is not None else None,
+                workspace_repo,
+            )
+            else None
+        )
+        if inferred is not None:
+            workspace_inference.repo = inferred
         claim_ms = round((time.monotonic() - claim_started) * 1000)
         logger.info("claim latency for %s: %d ms", thread_key, claim_ms)
         if source.is_job or verified_review is not None:
@@ -3118,7 +3234,10 @@ class Kernel:
             raise
         _record_route("start")
         _lifecycle_event("runner.turn.started", "start")
-        return _RouteResult(steered=False, handle=handle, turn=turn)
+        # The inference decided at the claim above is this route's own value.
+        return _RouteResult(
+            steered=False, handle=handle, turn=turn, workspace_inferred_repo=inferred
+        )
 
     async def _turn_active(
         self, handle: SandboxHandle, *, remaining_s: float | None = None
@@ -3664,12 +3783,19 @@ class Kernel:
             return
 
         base = outcome.text.strip()
+        # #2659: the inferred repository is a reply block only. It is composed
+        # here, beside the text, and never into ``summary`` or ``outcome.text``,
+        # so the durable record, the card and the publication request stay free
+        # of it.
+        inference = _workspace_inference_notice(outcome.workspace_inferred_repo)
         if self._target_for(qevent).reply_ref is None:
             # A placeholderless approval must be addressable before persistence.
             # If this delivery fails, let the exception escape so the event stays
             # retryable instead of creating and suspending an approval whose
             # requester cannot see it.
-            ack = await self._reply_for(qevent, route, base or summary)
+            ack = await self._reply_for(
+                qevent, route, _join_reply_blocks(base or summary, inference)
+            )
             if ack.ref is None:
                 raise RuntimeError("approval reply ref was not minted")
 
@@ -3858,6 +3984,9 @@ class Kernel:
         # resumed reply (#817), so collapse the interpolated summary to one
         # logical line -- the notice is always a single clean block. The durable
         # ``Approval`` record and the Block Kit card keep the original summary.
+        # The inferred repository announcement (#2659) is its own block before
+        # the notice and never starts with the marker, so the notice stays the
+        # single marker-leading, trailing block the CLI expects.
         notice_summary = " ".join(display_summary.split())
         if is_publication:
             notice = (
@@ -3872,9 +4001,7 @@ class Kernel:
                 "The session is paused and will resume once an authorized member "
                 "resolves this request."
             )
-        await self._reply_for(
-            qevent, route, f"{base}\n\n{notice}" if base else notice
-        )
+        await self._reply_for(qevent, route, _join_reply_blocks(base, inference, notice))
 
         if is_publication:
             # The atomic Approval+Publication insert is also the durable initial
@@ -4057,8 +4184,10 @@ class Kernel:
         turn: TurnStream,
         nav: NavAffordance | None = None,
         agent_id: uuid.UUID | None = None,
+        *,
+        workspace_inferred_repo: str | None,
     ) -> TurnOutcome:
-        acc = _StreamAccumulator()
+        acc = _StreamAccumulator(workspace_inferred_repo=workspace_inferred_repo)
         reply = _ThrottledReply(
             self._sink,
             target=self._target_for(qevent),
