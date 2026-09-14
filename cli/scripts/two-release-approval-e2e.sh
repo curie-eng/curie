@@ -159,14 +159,15 @@ fullname() {
 }
 
 shared_helm_sets() {
+  # rustfs deploys: the api refuses to start when it cannot reach its bundle
+  # bucket, so a false host crashes the api pod at startup. persistence stays
+  # off so the fixture bucket is ephemeral.
   cat <<'EOF'
 langfuse.deploy=false
 langfuse.host=langfuse.example.com
 clickhouse.deploy=false
 otelCollector.deploy=false
 otelCollector.telemetryDisabled=true
-rustfs.deploy=false
-rustfs.host=s3.example.com
 ui.deploy=false
 mailAdapter.deploy=false
 inference.deploy=false
@@ -260,9 +261,14 @@ install_owner_release() {
   while IFS= read -r line; do
     [[ -n "$line" ]] && sets+=("$line")
   done < <(helm_set_args)
+  # No --wait: the schema migrator is a post-install hook, and helm runs
+  # post-install hooks only AFTER the readiness wait. The api pod blocks in
+  # its schema-wait init container until that migration lands, so --wait
+  # deadlocks until the timeout. phase_run already asserts readiness with
+  # `kubectl rollout status` on both Deployments after the installs.
   helm install "$RELEASE_A" "$CHART" \
     --namespace "$NS_A" \
-    --wait --timeout 15m \
+    --timeout 15m \
     -f "$NOGVISOR" \
     -f "$API_VALUES" \
     -f "$SLACK_VALUES" \
@@ -275,10 +281,15 @@ install_consumer_release() {
   while IFS= read -r line; do
     [[ -n "$line" ]] && sets+=("$line")
   done < <(helm_set_args)
+  # No --wait: the schema migrator is a post-install hook, and helm runs
+  # post-install hooks only AFTER the readiness wait. The api pod blocks in
+  # its schema-wait init container until that migration lands, so --wait
+  # deadlocks until the timeout. phase_run already asserts readiness with
+  # `kubectl rollout status` on both Deployments after the installs.
   helm install "$RELEASE_B" "$CHART" \
     --namespace "$NS_B" \
     --skip-crds \
-    --wait --timeout 15m \
+    --timeout 15m \
     -f "$NOGVISOR" \
     -f "$CONSUMER_OVERLAY" \
     -f "$API_VALUES" \
@@ -355,15 +366,25 @@ api_json() {
   python3 - "$url" "$method" "$body" <<'PY'
 import json, os, sys, urllib.error, urllib.request
 url, method, body = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def _headers():
+    headers = {
+        "X-API-Key": os.environ["CURIE_API_KEY"],
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    principal = os.environ.get("CURIE_APPROVAL_PRINCIPAL", "")
+    if principal:
+        headers["X-Curie-Approval-Principal"] = principal
+    return headers
+
+
 req = urllib.request.Request(
     url,
     data=body.encode() if body else None,
     method=method,
-    headers={
-        "X-API-Key": os.environ["CURIE_API_KEY"],
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    },
+    headers=_headers(),
 )
 try:
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -447,10 +468,31 @@ PY
 }
 
 # One POST /resolve on the consumer. Do not wrap this in a retry.
+# The resolve route authenticates the resolver BEFORE it looks the row up
+# (ADR-0106 require_approval_principal), so an unauthenticated POST is refused
+# 401 whether or not the row exists -- that status proves nothing about
+# ownership. To keep the frozen ownership vector (404 + "approval not found",
+# is_release_ownership_miss) on the MUTATE path, mint an operator principal on
+# B and authenticate this one resolve. An operator credential is a machine
+# identity minted with B's own platform key; it is NOT a human Slack card
+# click, and the owner's resolve stays BLOCKED on purpose.
 resolve_consumer_once() {
   local owner_url="$1" consumer_url="$2" approval_id="$3"
-  local miss owner_after
-  miss="$(api_json "$consumer_url/approvals/${approval_id}/resolve" POST '{"decision":"approved"}')"
+  local minted token miss owner_after
+  minted="$(api_json "$consumer_url/approvals/principals/operator" POST '{"subject":"two-release-fixture-2307"}')"
+  token="$(python3 - "$minted" <<'PY'
+import json, sys
+minted = json.loads(sys.argv[1])
+if minted.get("status") not in (200, 201):
+    raise SystemExit(f"operator principal mint on consumer failed; got {minted}")
+body = minted.get("body")
+token = body.get("token") if isinstance(body, dict) else None
+if not token:
+    raise SystemExit(f"operator principal mint returned no token; got {minted}")
+print(token)
+PY
+)"
+  miss="$(CURIE_APPROVAL_PRINCIPAL="$token" api_json "$consumer_url/approvals/${approval_id}/resolve" POST '{"decision":"approved"}')"
   owner_after="$(api_json "$owner_url/approvals/${approval_id}" GET)"
   python3 - "$miss" "$owner_after" <<'PY'
 import json, sys
@@ -471,7 +513,7 @@ if status != "pending":
     raise SystemExit(
         f"consumer resolve-once must not mutate owner; owner status={status}"
     )
-print("consumer one-shot resolve: 404 ownership miss, owner row still pending")
+print("consumer one-shot resolve: authenticated operator principal, 404 ownership miss, owner row still pending")
 PY
 }
 
@@ -516,6 +558,29 @@ stop_port_forward() {
 
 cleanup() {
   local status=$?
+  if (( status != 0 )) && (( OWNED_HELM )); then
+    # Capture before teardown: the workflow's own post-mortem step runs after
+    # this trap has deleted the cluster, so it always came back empty. Every
+    # call is time-bounded so a wedged API server cannot stall the teardown
+    # that follows.
+    local kdump=(kubectl --request-timeout=10s)
+    local ns
+    log "dumping pod, job and log state for $NS_A and $NS_B before teardown"
+    for ns in "$NS_A" "$NS_B"; do
+      "${kdump[@]}" get pods -n "$ns" -o wide 2>&1 | sed "s|^|[$ns pods] |" || true
+      # schema-migrate is the post-install hook whose absence deadlocked the
+      # install; its Job and pod state are the first thing to read.
+      "${kdump[@]}" get jobs -n "$ns" 2>&1 | sed "s|^|[$ns jobs] |" || true
+      "${kdump[@]}" logs -n "$ns" -l app.kubernetes.io/component=schema-migrate \
+        --tail=40 2>&1 | sed "s|^|[$ns schema-migrate] |" || true
+      "${kdump[@]}" logs -n "$ns" -l app.kubernetes.io/component=api \
+        -c schema-wait --tail=20 2>&1 | sed "s|^|[$ns schema-wait] |" || true
+      "${kdump[@]}" logs -n "$ns" -l app.kubernetes.io/component=api \
+        -c api --tail=20 2>&1 | sed "s|^|[$ns api] |" || true
+      "${kdump[@]}" logs -n "$ns" -l app.kubernetes.io/component=dispatcher \
+        --tail=20 2>&1 | sed "s|^|[$ns dispatcher] |" || true
+    done
+  fi
   stop_port_forward "$PF_A_PID"
   stop_port_forward "$PF_B_PID"
   if [[ -n "$SLACK_VALUES" && -f "$SLACK_VALUES" ]]; then
@@ -624,7 +689,7 @@ PY
 - API isolation: PASS
 - API isolation one-shot B (404 approval not found): PASS
 - API isolation one-shot A (still pending): PASS
-- B one-shot resolve miss (404 approval not found): PASS
+- B one-shot resolve miss (404 approval not found, operator principal, owner row still pending): PASS
 - A resolve-once: ${a_resolve_row} (${a_resolve_reason})
 - deployed dispatcher envelope ownership: BLOCKED (no one-shot envelope was delivered)
 - live Slack owner-only envelope: ${live_row} (${live_reason})

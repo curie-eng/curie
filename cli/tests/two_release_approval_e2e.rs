@@ -488,7 +488,7 @@ fn summary_names_api_isolation_pass_and_dispatcher_ownership_blocked() {
         "API isolation A pending must be a named PASS; file contents:\n{text}"
     );
     assert!(
-        text.contains("B one-shot resolve miss (404 approval not found): PASS"),
+        text.contains("B one-shot resolve miss (404 approval not found, operator principal, owner row still pending): PASS"),
         "B one-shot resolve miss must be a named PASS; file contents:\n{text}"
     );
     assert!(
