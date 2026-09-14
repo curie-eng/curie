@@ -544,3 +544,89 @@ def test_x_api_key_header_with_discord_shaped_token_and_suffix_is_redacted_throu
     assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in out
     assert "FAKE_SUFFIX" not in out
     assert "[REDACTED:x_api_key]" in out
+
+
+# Regression for the ruling above: secret_assignment now runs before the
+# Discord shape rule, so a ``token=``/``password=`` value carrying a
+# Discord-shaped token plus a trailing suffix is redacted whole rather than
+# leaving the suffix exposed after a narrower placeholder.
+def test_token_assignment_with_discord_shaped_token_and_suffix_is_fully_redacted() -> None:
+    redacted = redact_text(f"token={FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}")
+
+    assert redacted == "token=[REDACTED:secret_assignment]"
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
+    assert "FAKE_SUFFIX" not in redacted
+
+
+def test_password_assignment_with_discord_shaped_token_and_suffix_is_fully_redacted() -> None:
+    redacted = redact_text(f"password={FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}")
+
+    assert redacted == "password=[REDACTED:secret_assignment]"
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
+    assert "FAKE_SUFFIX" not in redacted
+
+
+def test_token_assignment_with_discord_shaped_token_and_suffix_is_redacted_through_filter() -> (
+    None
+):
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactingLogFilter())
+    logger = logging.getLogger("curie.telemetry.redact.discord_token_assignment_suffix")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        logger.info("upstream token=%s rejected", FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX)
+    finally:
+        logger.removeHandler(handler)
+
+    out = stream.getvalue()
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in out
+    assert "FAKE_SUFFIX" not in out
+    assert "[REDACTED:secret_assignment]" in out
+
+
+def test_password_assignment_with_discord_shaped_token_and_suffix_is_redacted_through_filter() -> (
+    None
+):
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactingLogFilter())
+    logger = logging.getLogger("curie.telemetry.redact.discord_password_assignment_suffix")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        logger.info("upstream password=%s rejected", FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX)
+    finally:
+        logger.removeHandler(handler)
+
+    out = stream.getvalue()
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in out
+    assert "FAKE_SUFFIX" not in out
+    assert "[REDACTED:secret_assignment]" in out
+
+
+def test_discord_bot_token_assignment_with_trailing_suffix_falls_through_to_secret_assignment() -> (
+    None
+):
+    # The lookahead narrowing (step 2 of the ruling): a value followed by any
+    # non-space suffix is no longer eligible for the named Discord placeholder
+    # and instead falls through whole to secret_assignment.
+    redacted = redact_text("DISCORD_BOT_TOKEN=" + FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX)
+
+    assert redacted == "DISCORD_BOT_TOKEN=[REDACTED:secret_assignment]"
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
+    assert "FAKE_SUFFIX" not in redacted
+    assert "[REDACTED:discord_bot_token_assignment]" not in redacted
+
+
+def test_bare_discord_bot_token_assignment_still_uses_named_placeholder() -> None:
+    # No trailing suffix: the value ends at end-of-string, so the narrowed
+    # ``(?!\S)`` lookahead still matches and the named placeholder holds.
+    redacted = redact_text("DISCORD_BOT_TOKEN=" + FAKE_SHAPED_DISCORD_BOT_TOKEN)
+
+    assert redacted == "DISCORD_BOT_TOKEN=[REDACTED:discord_bot_token_assignment]"

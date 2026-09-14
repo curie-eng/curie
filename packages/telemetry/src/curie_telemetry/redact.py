@@ -38,6 +38,43 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
         _placeholder("jwt"),
     ),
+    # Discord context rules run first among the header/assignment rules so a
+    # ``DISCORD_BOT_TOKEN=``/``Authorization: Bot`` credential keeps its named
+    # Discord placeholder rather than falling to the generic whole-value
+    # rules below (which would still consume it, just under a less specific
+    # name).
+    RedactionRule(
+        "discord_bot_authorization",
+        # Discord's API reference demonstrates bot credentials in an
+        # ``Authorization: Bot <token>`` header:
+        # https://docs.discord.com/developers/reference
+        re.compile(
+            r"(?<![A-Za-z0-9_-])(Authorization:\s+Bot\s+)(?!\[REDACTED:)"
+            r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-]+)",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED:discord_bot_authorization]",
+    ),
+    RedactionRule(
+        "discord_bot_token_assignment",
+        # A bare trailing lookahead (not just "no adjoining base64url or dot
+        # segment") so a value followed by any other non-space suffix falls
+        # through whole to secret_assignment below, instead of this rule
+        # inserting a placeholder that trips secret_assignment's
+        # ``(?!\[REDACTED:)`` guard and leaves the suffix exposed.
+        re.compile(
+            r"(?<![A-Za-z0-9_])(DISCORD_BOT_TOKEN=)"
+            r"(?!\[REDACTED:)[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+            r"(?!\S)"
+        ),
+        r"\1[REDACTED:discord_bot_token_assignment]",
+    ),
+    # Every whole-value context rule runs next (bearer, basic auth, DSN
+    # userinfo, X-API-Key, generic secret assignment), before the Discord
+    # shape rules. Each of these consumes its entire value in one match, so
+    # none of them can leave a placeholder for a later rule to partially
+    # re-match and expose a trailing suffix.
     RedactionRule(
         "bearer_token",
         re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+"),
@@ -63,35 +100,36 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         re.compile(r"(X-API-Key:\s*)(?!\[REDACTED:)\S+", re.IGNORECASE),
         r"\1[REDACTED:x_api_key]",
     ),
-    # The whole-value header rules above (bearer, basic, DSN userinfo,
-    # X-API-Key) run first so a header credential is removed whole. The four
-    # Discord rules then run before the generic prefix rules (api_key,
-    # github_pat, slack_token, etc.) so a token or webhook token segment that
-    # happens to contain an ``am_``/``sk-`` style prefix is matched whole by
-    # the Discord rule first, rather than being partly consumed by a
-    # narrower prefix rule.
     RedactionRule(
-        "discord_bot_authorization",
-        # Discord's API reference demonstrates bot credentials in an
-        # ``Authorization: Bot <token>`` header:
-        # https://docs.discord.com/developers/reference
+        "channel_token",
+        # Runs before secret_assignment so a Curie channel token assignment
+        # (``CURIE_CHANNEL_TOKEN=chn....``) keeps its named placeholder
+        # instead of being claimed whole by the generic assignment rule.
+        # Curie-minted ingress credential: ``chn.{payload}.{signature}``
+        # (``curie_api.channel_token``, prefix ``chn``). Hyphenated
+        # ``chn-{id}-{digest}`` values are event ids, not credentials.
+        re.compile(r"\bchn\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+        _placeholder("channel_token"),
+    ),
+    RedactionRule(
+        "secret_assignment",
+        # ``\b`` does not fire before ``token`` in ``CURIE_CHANNEL_TOKEN=``
+        # because ``_`` is a word character. Require a non-alphanumeric
+        # predecessor so ``*_TOKEN=`` / ``*_SECRET=`` match while
+        # ``mytoken=`` does not. Keep the key name; drop only the value.
         re.compile(
-            r"(?<![A-Za-z0-9_-])(Authorization:\s+Bot\s+)(?!\[REDACTED:)"
-            r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
-            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-]+)",
+            r"(?<![A-Za-z0-9])((?:secret|password|passwd|pwd|api_key|apikey|access_token|token)=)(?!\[REDACTED:)\S+",
             re.IGNORECASE,
         ),
-        r"\1[REDACTED:discord_bot_authorization]",
+        r"\1[REDACTED:secret_assignment]",
     ),
-    RedactionRule(
-        "discord_bot_token_assignment",
-        re.compile(
-            r"(?<![A-Za-z0-9_])(DISCORD_BOT_TOKEN=)"
-            r"(?!\[REDACTED:)[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
-            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-]+)"
-        ),
-        r"\1[REDACTED:discord_bot_token_assignment]",
-    ),
+    # The Discord shape rules run after the whole-value context rules above
+    # so a token that context has already redacted whole is not re-matched,
+    # then before the generic prefix rules (api_key, github_pat,
+    # slack_token, etc.) so a token or webhook token segment that happens to
+    # contain an ``am_``/``sk-`` style prefix is matched whole by the
+    # Discord rule first, rather than being partly consumed by a narrower
+    # prefix rule.
     RedactionRule(
         "discord_webhook_url",
         # Discord executes webhooks at ``/webhooks/{webhook.id}/{webhook.token}``
@@ -130,14 +168,6 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         _placeholder("api_key"),
     ),
     RedactionRule(
-        "channel_token",
-        # Curie-minted ingress credential: ``chn.{payload}.{signature}``
-        # (``curie_api.channel_token``, prefix ``chn``). Hyphenated
-        # ``chn-{id}-{digest}`` values are event ids, not credentials.
-        re.compile(r"\bchn\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
-        _placeholder("channel_token"),
-    ),
-    RedactionRule(
         "aws_access_key_id",
         re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16,}"),
         _placeholder("aws_access_key_id"),
@@ -161,18 +191,6 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         "google_api_key",
         re.compile(r"\bAIza[A-Za-z0-9_-]{30,}"),
         _placeholder("google_api_key"),
-    ),
-    RedactionRule(
-        "secret_assignment",
-        # ``\b`` does not fire before ``token`` in ``CURIE_CHANNEL_TOKEN=``
-        # because ``_`` is a word character. Require a non-alphanumeric
-        # predecessor so ``*_TOKEN=`` / ``*_SECRET=`` match while
-        # ``mytoken=`` does not. Keep the key name; drop only the value.
-        re.compile(
-            r"(?<![A-Za-z0-9])((?:secret|password|passwd|pwd|api_key|apikey|access_token|token)=)(?!\[REDACTED:)\S+",
-            re.IGNORECASE,
-        ),
-        r"\1[REDACTED:secret_assignment]",
     ),
     RedactionRule(
         "home_path",
