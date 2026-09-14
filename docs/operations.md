@@ -109,7 +109,11 @@ set:
 With `inference_persistence: true`, the existing `postStart` hook pulls the
 model into the PVC. If `set.inference.persistence.size` is absent, the chart
 uses `10Gi`; when supplied it must be a non-boolean string, and large models
-need a larger size.
+need a larger size. The PVC carries `helm.sh/resource-policy: keep`, so an
+upgrade that stops deploying inference or `helm uninstall` leaves it in place;
+delete it yourself to reclaim the space. The annotation lives on the live PVC
+object, not the chart: a PVC created before this chart added it only gets the
+annotation once an upgrade with inference still enabled renders it.
 
 The advanced alternative is a custom image or other provisioning that already
 has the requested weights. Declare that explicitly instead:
@@ -151,7 +155,7 @@ that release's retained values.
 | `--no-expose` | Keep the UI and Langfuse ClusterIP-only instead of exposing them on node ports. |
 | `--adopt` | Install into a pre-existing namespace that already has its own labels or its own objects. Without it, such a namespace is refused. See [Adopting a pre-existing namespace](#adopting-a-pre-existing-namespace). |
 | `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. The interactive check accepts Anthropic `sk-ant-`, OpenRouter `sk-or-`, Zhipu `id.secret`, and bare `sk-` shapes for Moonshot or DeepSeek. The first two prefixes select one provider and infer its egress when no provider flag is present. Other shapes do not identify a provider. Present credentials install live through masked `--set` machinery, so `--dry-run` never prints them. An absent credential uses fake mode on a fresh install and preserves the recorded model configuration on a rerun. |
-| `--fake-model` | Explicitly downgrade to fake mode, even when a credential is present or a rerun has recorded live model configuration. |
+| `--fake-model` | Explicitly downgrade to fake mode, even when a credential is present or a rerun has recorded live model configuration. On a local-model install the rerun stops deploying in-cluster inference, so the inference Deployment and Service are removed. The model-weights PVC is kept only if it already carries `helm.sh/resource-policy: keep`; see [`--fake-model` and the model-weights PVC](#--fake-model-and-the-model-weights-pvc) below for the upgrade prerequisite and how to restore local inference. A recorded credential stays stored in the release but is not mounted into the sandbox runner or worker while fake. |
 | `--github-token <token>` (or `CURIE_GITHUB_TOKEN`) | The Curie API's own GitHub credential, for cloning a PRIVATE repo during a git-flow bundle deploy and for posting the eval commit status. Goes to helm through a private mode-0600 values file, never a command-line argument, so it never appears in the helm command, the printed plan, or that plan's JSON. Prefer the environment variable: a token typed after the flag still sits in `curie`'s own argv, so it still reaches your shell history and `ps`. Omitting both on a later `cluster up` preserves whatever the release already has. Errors if combined with `--set api.githubToken=`. |
 | `--clear-github-token` | Remove the stored GitHub credential. Not a revocation: the running API keeps the old token until its pod restarts (`cluster up` prints the restart command), and the token itself stays valid at GitHub until you revoke it there. |
 | `--allow-egress-host <provider>` (repeatable) | Explicitly open runner egress on TCP 443 to one named model provider: `anthropic`, `openrouter`, `zhipu`, `moonshot`, or `deepseek`. Names are lowercase exact. An explicit list must include the provider detected from an `sk-ant-` or `sk-or-` credential. |
@@ -159,6 +163,28 @@ that release's retained values.
 
 A downloaded release binary needs no repo checkout; the chart resolves from
 the version-pinned release asset by default.
+
+#### `--fake-model` and the model-weights PVC
+
+The `helm.sh/resource-policy: keep` annotation lives on the live PVC object,
+not the chart, so it protects the PVC only if that object already carries it.
+On an existing installation, check first:
+
+```bash
+kubectl get pvc <release>-inference -n <namespace> -o jsonpath='{.metadata.annotations}'
+```
+
+If the annotation is missing, run a plain `curie cluster up` (inference still
+enabled) before `--fake-model`; that upgrade keeps inference deployed and
+applies the annotation. Only then does `--fake-model` keep the PVC when it
+removes the inference Deployment and Service.
+
+`--fake-model` also drops the recorded inference values, including a
+nondefault `inference.persistence.size`. A later `cluster up --local-model`
+that does not resupply that size renders the chart default `10Gi`, and
+Kubernetes refuses to shrink the existing PVC, so the upgrade fails. Resupply
+the same model, persistence settings, and original size (for example
+`--set inference.persistence.size=40Gi`) to reuse the kept PVC.
 
 #### Adopting a pre-existing namespace
 

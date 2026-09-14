@@ -9,7 +9,9 @@
 #
 #   1. inference.deploy=true with the remaining defaults is refused with one
 #      exact, actionable message naming both supported recoveries.
-#   2. Durable persistence keeps the model pull and mounts the generated PVC.
+#   2. Durable persistence keeps the model pull and mounts the generated PVC,
+#      which carries helm.sh/resource-policy: keep so an upgrade that drops
+#      inference.deploy does not delete the downloaded weights (#2640).
 #   3. A pre-provisioned model (pullModel=false) may use ephemeral storage, but
 #      renders neither a postStart hook nor an `ollama pull` command.
 #   4. inference.deploy=false remains unaffected by inference value defaults.
@@ -114,7 +116,14 @@ if expected == "persistent-pull":
         raise SystemExit(
             f"{path}: durable inference did not retain its postStart ollama pull"
         )
-    print("  ok: durable inference renders a PVC mount and postStart model pull")
+    policy = (pvc["metadata"].get("annotations") or {}).get("helm.sh/resource-policy")
+    if policy != "keep":
+        raise SystemExit(
+            f"{path}: model-weights PVC helm.sh/resource-policy={policy!r}, expected 'keep' "
+            "(#2640): without it a full upgrade that drops inference.deploy, such as "
+            "`cluster up --fake-model`, deletes the PVC and the downloaded weights"
+        )
+    print("  ok: durable inference renders a kept PVC mount and postStart model pull")
 elif expected == "ephemeral-no-pull":
     pvcs = [doc for doc in docs if doc.get("kind") == "PersistentVolumeClaim"]
     if pvcs:
@@ -259,4 +268,4 @@ print(f"  ok: requests.memory={res['requests']['memory']} limits.memory={res['li
 PYCHK
 
 echo
-echo "PASS: cluster inference refuses implicit emptyDir downloads, accepts both explicit recovery paths, and ships a container sized above the tenant LimitRange default with a hardened securityContext."
+echo "PASS: cluster inference refuses implicit emptyDir downloads, accepts both explicit recovery paths, keeps the model-weights PVC on removal (#2640), and ships a container sized above the tenant LimitRange default with a hardened securityContext."

@@ -728,11 +728,14 @@ spec:
             - name: CURIE_MODEL
               value: {{ $runner.model | quote }}
             {{- end }}
-            {{- if or $runner.credentials $runner.credentialsExistingSecret }}
+            {{- if and (or $runner.credentials $runner.credentialsExistingSecret) (not (and $runner.fakeModel (not .Values.inference.deploy))) }}
             # Warm-pod fallback credential; the worker's per-claim Overrides
             # injection carries the (per-agent) credential on a bound run.
             # Same shared secret reference worker.yaml resolves (issue #1759,
-            # curie.secretRef), so the two cannot drift apart.
+            # curie.secretRef), so the two cannot drift apart. Withheld from an
+            # effectively fake runner (#2640): it authenticates nothing, and a
+            # live key in a runner executing prompt-injectable model code is
+            # recoverable from /proc.
             - name: CURIE_CREDENTIALS
               valueFrom:
                 secretKeyRef:

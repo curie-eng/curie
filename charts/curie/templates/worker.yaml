@@ -410,11 +410,13 @@ spec:
               value: {{ .Values.worker.statusText | quote }}
             # Runner model passthrough: the worker injects these into every claim
             # (fake model needs no credential; a real credential comes from the
-            # chart Secret and is only wired when one is configured).
+            # chart Secret and is only wired when one is configured and the
+            # claim is not effectively fake, #2640: the worker forwards this
+            # value into every claim, so a fake runner must never receive it).
             {{- $claimFakeModel := and .Values.agentSandbox.runner.fakeModel (not .Values.inference.deploy) }}
             - name: CURIE_FAKE_MODEL
               value: {{ ternary "1" "0" $claimFakeModel | quote }}
-            {{- if or .Values.agentSandbox.runner.credentials .Values.agentSandbox.runner.credentialsExistingSecret }}
+            {{- if and (or .Values.agentSandbox.runner.credentials .Values.agentSandbox.runner.credentialsExistingSecret) (not $claimFakeModel) }}
             # Same shared secret reference agent-sandbox.yaml resolves (issue
             # #1759, curie.secretRef), so the two cannot drift apart.
             - name: CURIE_CREDENTIALS
