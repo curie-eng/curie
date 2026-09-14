@@ -2493,7 +2493,13 @@ class Kernel:
         review_receipt: str | None = None
 
         def close_routed_turn() -> None:
+            # Unregister only a turn this attempt opened. A follow-up that
+            # failed during steer or lock acquire never registered; dropping
+            # the agent+thread key would hide the original live turn from kill.
+            # start_turn's BaseException path unregisters inside _route_and_start
+            # before routed is assigned here. Canned and steered leave turn None.
             if routed is not None and routed.turn is not None:
+                self._unregister_run(agent_id, thread_key)
                 routed.turn.close()
 
         try:
@@ -2537,6 +2543,7 @@ class Kernel:
                         agent_name=agent_name,
                         source=qevent.source,
                         remaining_s=remaining_s,
+                        agent_id=agent_id,
                         verified_review=verified_review,
                         review_turn=qevent if verified_review is not None else None,
                     )
@@ -2786,6 +2793,7 @@ class Kernel:
         agent_name: str | None = None,
         source: TurnSource = TurnSource.SLACK,
         remaining_s: float | None = None,
+        agent_id: uuid.UUID | None = None,
         lineage_branch: str | None = None,
         lineage_head: str | None = None,
         lineage_base_sha: str | None = None,
@@ -3096,9 +3104,18 @@ class Kernel:
         # The per-request timeout is min(runner_total_timeout_s, remaining
         # delivery budget): the budget can only ever SHORTEN a request, never
         # grant one more time than the delivery has left (ADR-0131).
-        turn = await self._runner.start_turn(
-            handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
-        )
+        # Register before start_turn so a kill during the POST can find this
+        # thread. Canned and steered returns above never register. A failed
+        # start unregisters so a turn that never opened cannot leak an entry.
+        if agent_id is not None:
+            self._register_run(agent_id, thread_key)
+        try:
+            turn = await self._runner.start_turn(
+                handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
+            )
+        except BaseException:
+            self._unregister_run(agent_id, thread_key)
+            raise
         _record_route("start")
         _lifecycle_event("runner.turn.started", "start")
         return _RouteResult(steered=False, handle=handle, turn=turn)
