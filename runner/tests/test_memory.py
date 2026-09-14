@@ -115,9 +115,61 @@ def test_preamble_includes_content_and_traces() -> None:
     ]
     preamble = format_memory_preamble(records)
     assert preamble is not None
+    assert preamble.startswith("# Agent memory (learned from prior sessions)")
+    assert "provided by the operator" not in preamble
     assert "deploy is a git push" in preamble
     assert "t1" in preamble
     assert "no-trace lesson" in preamble
+
+
+def test_preamble_operator_only_uses_operator_heading() -> None:
+    records = [
+        MemoryRecord(
+            content="ask before French",
+            provenance=Provenance(source="operator"),
+        )
+    ]
+    preamble = format_memory_preamble(records)
+    assert preamble is not None
+    assert preamble.startswith("# Agent memory (provided by the operator)")
+    assert "ask before French" in preamble
+    assert "learned from prior sessions" not in preamble
+
+
+def test_preamble_mixed_operator_then_learned() -> None:
+    records = [
+        MemoryRecord(content="learned first"),
+        MemoryRecord(
+            content="operator first",
+            provenance=Provenance(source="operator"),
+        ),
+        MemoryRecord(content="learned second"),
+        MemoryRecord(
+            content="operator second",
+            provenance=Provenance(source="operator"),
+        ),
+    ]
+    preamble = format_memory_preamble(records)
+    assert preamble is not None
+    operator_heading = "# Agent memory (provided by the operator)"
+    learned_heading = "# Agent memory (learned from prior sessions)"
+    assert operator_heading in preamble
+    assert learned_heading in preamble
+    operator_at = preamble.index(operator_heading)
+    learned_at = preamble.index(learned_heading)
+    assert operator_at < learned_at
+    operator_section = preamble[operator_at:learned_at]
+    learned_section = preamble[learned_at:]
+    assert "operator first" in operator_section
+    assert "operator second" in operator_section
+    assert operator_section.index("operator first") < operator_section.index("operator second")
+    assert "learned first" not in operator_section
+    assert "learned second" not in operator_section
+    assert "learned first" in learned_section
+    assert "learned second" in learned_section
+    assert learned_section.index("learned first") < learned_section.index("learned second")
+    assert "operator first" not in learned_section
+    assert "operator second" not in learned_section
 
 
 def test_state_store_load_empty_is_empty() -> None:

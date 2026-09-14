@@ -5762,6 +5762,26 @@ pub async fn versions(opts: AgentActionOpts) -> Result<VersionsOutput> {
     })
 }
 
+/// Next command after operator `--add`. `--continue` would reuse a sandbox
+/// that booted without this entry.
+pub fn memory_add_next_command(message_verb: &str) -> String {
+    format!(r#"curie {message_verb} message "...""#)
+}
+
+/// First human line after operator `--add`: the entry is not in the current
+/// sandbox's boot memory.
+pub fn memory_add_fresh_session_required_line() -> &'static str {
+    "A fresh session is required before this entry is injected at boot."
+}
+
+/// Human follow-up after operator `--add`.
+pub fn memory_add_fresh_session_line(message_verb: &str) -> String {
+    format!(
+        "Start a new thread with `{}` (omit --continue).",
+        memory_add_next_command(message_verb)
+    )
+}
+
 /// Output of `<tier> memory <agent>`: the dry-run plan, the empty case, the
 /// learned-memory list, or an operator-seeded add (#1904). Owns its data so it
 /// outlives the `ApiClient`.
@@ -5781,6 +5801,7 @@ pub enum MemoryOutput {
         content: String,
         source: String,
         fresh_session_required: bool,
+        message_verb: String,
     },
 }
 
@@ -5804,12 +5825,14 @@ impl crate::ui::CliOutput for MemoryOutput {
                 content,
                 source,
                 fresh_session_required,
+                message_verb,
             } => serde_json::json!({
                 "agent": agent,
                 "index": index,
                 "content": content,
                 "source": source,
                 "fresh_session_required": fresh_session_required,
+                "next_command": memory_add_next_command(message_verb),
             }),
         }
     }
@@ -5832,13 +5855,13 @@ impl crate::ui::CliOutput for MemoryOutput {
                 content,
                 source,
                 fresh_session_required,
+                message_verb,
             } => {
                 ui.payload(&format!("{agent} — added memory #{index} ({source})"));
                 ui.kv("content", content);
                 if *fresh_session_required {
-                    ui.payload(
-                        "A fresh session is required before this entry is injected at boot.",
-                    );
+                    ui.payload(memory_add_fresh_session_required_line());
+                    ui.payload(&memory_add_fresh_session_line(message_verb));
                 }
             }
         }
@@ -5868,7 +5891,11 @@ pub async fn memory(opts: AgentActionOpts) -> Result<MemoryOutput> {
 }
 
 /// `<tier> memory <agent> --add <content>`: append an operator-authored record.
-pub async fn memory_add(opts: AgentActionOpts, content: String) -> Result<MemoryOutput> {
+pub async fn memory_add(
+    opts: AgentActionOpts,
+    content: String,
+    message_verb: &str,
+) -> Result<MemoryOutput> {
     let content = content.trim().to_string();
     if content.is_empty() {
         return Err(crate::exit::usage(
@@ -5895,6 +5922,7 @@ pub async fn memory_add(opts: AgentActionOpts, content: String) -> Result<Memory
             .source
             .unwrap_or_else(|| "operator".to_string()),
         fresh_session_required: true,
+        message_verb: message_verb.to_string(),
     })
 }
 

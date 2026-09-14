@@ -285,6 +285,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 content: "remembered fact".to_string(),
                 source: "operator".to_string(),
                 fresh_session_required: true,
+                message_verb: "local".to_string(),
             },
         ],
     );
