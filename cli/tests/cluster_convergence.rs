@@ -510,6 +510,50 @@ fn shorter_tag_alias_with_same_digest_is_accepted_on_up_and_status() {
 }
 
 #[test]
+fn shorter_tag_alias_refuses_omitted_node_inventory_without_binding() {
+    // Live k3s Node.status.images cap omits BusyBox. Same-repo imageID is not
+    // digest evidence; keep refusing a missing or different digest.
+    // https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
+    let output = Fixture::new().run("status", "alias-shorter-omitted");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let json = Fixture::json(&output);
+    assert_eq!(json["healthy"], false, "{json}");
+    let text = json.to_string();
+    assert!(
+        text.contains("tagged alias")
+            || text.contains("has no unique same-node")
+            || text.contains("no ready target image"),
+        "{json}"
+    );
+    assert!(!text.contains("PRIVATE_MESSAGE_SENTINEL"));
+}
+
+#[test]
+fn shorter_tag_alias_accepts_separate_digest_entry_when_exact_tag_is_present() {
+    // Cycle 13 exact requested tag already on the node: tag, shorter alias, and
+    // digest as three separate Node.status.images names arrays, plus the same
+    // ClickHouse shape.
+    // https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
+    for verb in ["status", "up"] {
+        let output = Fixture::new().run(verb, "alias-shorter-separate-digest");
+        assert!(
+            output.status.success(),
+            "{verb}: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if verb == "status" {
+            assert_eq!(Fixture::json(&output)["healthy"], true);
+        }
+    }
+}
+
+#[test]
 fn shorter_tag_alias_refuses_missing_or_wrong_digest() {
     for scenario in ["alias-shorter-missing", "alias-shorter-wrong-digest"] {
         let output = Fixture::new().run("status", scenario);
@@ -528,6 +572,83 @@ fn shorter_tag_alias_refuses_missing_or_wrong_digest() {
             "{scenario}: {json}"
         );
         assert!(!text.contains("PRIVATE_MESSAGE_SENTINEL"));
+    }
+}
+
+#[test]
+fn shorter_tag_alias_refuses_omitted_inventory_without_digest() {
+    for scenario in [
+        "alias-shorter-omitted-missing",
+        "alias-shorter-omitted-opaque",
+    ] {
+        let output = Fixture::new().run("status", scenario);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{scenario}: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = Fixture::json(&output);
+        assert_eq!(json["healthy"], false, "{scenario}: {json}");
+        let text = json.to_string();
+        assert!(
+            text.contains("tagged alias")
+                || text.contains("has no unique same-node")
+                || text.contains("no ready target image"),
+            "{scenario}: {json}"
+        );
+        assert!(!text.contains("PRIVATE_MESSAGE_SENTINEL"));
+    }
+}
+
+#[test]
+fn chart_default_alias_without_busybox_node_inventory_converges() {
+    // The recording driver reads the shipped extractImage scalar. This is red
+    // when that scalar is only busybox:1.36.1 because the ready init and
+    // DaemonSet container report busybox:1.36 and Node inventory omits it.
+    for verb in ["status", "up"] {
+        let output = Fixture::new().run(verb, "chart-default-alias-healthy");
+        assert!(
+            output.status.success(),
+            "{verb}: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if verb == "status" {
+            assert_eq!(Fixture::json(&output)["healthy"], true);
+        }
+    }
+}
+
+#[test]
+fn chart_default_alias_refuses_missing_or_wrong_runtime_digest() {
+    for scenario in [
+        "chart-default-alias-missing-image-id",
+        "chart-default-alias-wrong-digest",
+    ] {
+        for verb in ["status", "up"] {
+            let output = Fixture::new().run(verb, scenario);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{verb}/{scenario}: {} / {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let json = Fixture::json(&output);
+            if verb == "status" {
+                assert_eq!(json["healthy"], false, "{scenario}: {json}");
+            } else {
+                assert!(
+                    json["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("no ready target image observation")),
+                    "{scenario}: {json}"
+                );
+            }
+            assert!(!json.to_string().contains("PRIVATE_MESSAGE_SENTINEL"));
+        }
     }
 }
 
