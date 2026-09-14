@@ -18,7 +18,9 @@
 #
 # Proves:
 #   (a) Default values: SandboxTemplate init containers bundle-fetch and
-#       bundle-extract carry the values.yaml fetchImage and extractImage.
+#       bundle-extract carry the values.yaml fetchImage and extractImage, and
+#       bundle-extract uses the registry-verified exact default digest in both
+#       the SandboxTemplate and runner-prewarm DaemonSet.
 #   (b) Default values: those same images are container images on the
 #       runner-prewarm DaemonSet (one sleep container per image).
 #   (c) Cross-object invariant: every bundle-fetch / bundle-extract init image
@@ -30,6 +32,8 @@
 #       omits those extra sleep containers from the prewarm DaemonSet.
 #   (f) NEGATIVE: a rendered prewarm DaemonSet that drops any sandbox
 #       bundle-fetch image fails the same checker the default render uses.
+#   (g) NEGATIVE: removing or changing the default extract digest on both
+#       rendered consumers fails the exact pin checker.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -51,6 +55,12 @@ import sys
 import yaml
 
 BUNDLE_INIT_NAMES = ("bundle-fetch", "bundle-extract")
+# Registry verification on 2026 09 14 used docker buildx imagetools inspect.
+# Both busybox:1.36.1 and busybox:1.36 resolved to this exact digest.
+EXPECTED_DEFAULT_EXTRACT_IMAGE = (
+    "busybox:1.36.1@sha256:"
+    "73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
+)
 
 
 def load_docs(path):
@@ -130,6 +140,27 @@ def require_covered(label, bundle_images, containers):
 
 def main(argv):
     mode = argv[1]
+    if mode == "exact-extract-pin":
+        sandbox = dict(sandbox_bundle_images(load_docs(argv[2])))
+        prewarm = {
+            c.get("name"): c.get("image")
+            for c in (prewarm_containers(load_docs(argv[3])) or [])
+        }
+        actual = {
+            "SandboxTemplate bundle-extract": sandbox.get("bundle-extract"),
+            "DaemonSet prewarm-bundle-extract": prewarm.get("prewarm-bundle-extract"),
+        }
+        wrong = {
+            surface: image
+            for surface, image in actual.items()
+            if image != EXPECTED_DEFAULT_EXTRACT_IMAGE
+        }
+        if wrong:
+            raise SystemExit(
+                f"exact-pin: expected {EXPECTED_DEFAULT_EXTRACT_IMAGE!r}; got {wrong}"
+            )
+        print("  ok: exact default extract pin is rendered on both consumers")
+        return
     if mode == "covered":
         sandbox_docs = load_docs(argv[2])
         prewarm_docs = load_docs(argv[3])
@@ -192,6 +223,9 @@ PY
 echo "=== (a) default sandbox init images match values.yaml ==="
 helm template rel "$CHART" --show-only "$SANDBOX_TPL" > "$TMP/default-sandbox.yaml"
 helm template rel "$CHART" --show-only "$PREWARM_TPL" > "$TMP/default-prewarm.yaml"
+
+python3 "$CHECKER" exact-extract-pin "$TMP/default-sandbox.yaml" "$TMP/default-prewarm.yaml" \
+  || fail "default bundle extract image is not the exact registry-verified digest"
 
 python3 - "$CHART/values.yaml" "$TMP/default-sandbox.yaml" <<'PY' || fail "default sandbox init images did not match values.yaml"
 import sys, yaml
@@ -316,7 +350,17 @@ echo "=== (f) NEGATIVE: dropping sandbox bundle-fetch images from prewarm fails 
 python3 "$CHECKER" mutant-missing "$TMP/default-sandbox.yaml" "$TMP/default-prewarm.yaml" \
   || fail "mutant-missing checker did not reject a prewarm gap"
 
-echo "=== (g) prewarm.imagePullPolicy=Never still leaves extras on the sandbox init policy ==="
+echo "=== (g) NEGATIVE: missing and wrong default extract digests fail ==="
+for mutant in "busybox:1.36.1" "busybox:1.36.1@sha256:0000000000000000000000000000000000000000000000000000000000000000"; do
+  sed -E "s|busybox:1\.36\.1@sha256:[a-f0-9]{64}|$mutant|g" "$TMP/default-sandbox.yaml" > "$TMP/mutant-sandbox.yaml"
+  sed -E "s|busybox:1\.36\.1@sha256:[a-f0-9]{64}|$mutant|g" "$TMP/default-prewarm.yaml" > "$TMP/mutant-prewarm.yaml"
+  if python3 "$CHECKER" exact-extract-pin "$TMP/mutant-sandbox.yaml" "$TMP/mutant-prewarm.yaml" >/dev/null 2>&1; then
+    fail "mutant $mutant passed the exact pin checker"
+  fi
+done
+echo "  ok: missing and wrong digest mutants are rejected"
+
+echo "=== (h) prewarm.imagePullPolicy=Never still leaves extras on the sandbox init policy ==="
 helm template rel "$CHART" --show-only "$SANDBOX_TPL" \
   --set agentSandbox.runner.prewarm.imagePullPolicy=Never \
   > "$TMP/never-sandbox.yaml"
@@ -367,4 +411,3 @@ PY
 
 echo
 echo "PASS: every SandboxTemplate bundle-fetch init image is a container image on the runner-prewarm DaemonSet; an override hits both sides; bundleFetch.enabled=false omits the extra containers; a missing prewarm image is refused; extras keep the sandbox init pull policy when prewarm.imagePullPolicy=Never."
-
