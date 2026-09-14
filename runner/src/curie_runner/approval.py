@@ -5,12 +5,14 @@ trigger types, and this module is the runner half of both:
 
 - **Policy gate** (#244): the agent's own logic decides something needs a
   human decision. An in-process SDK MCP tool
-  (``mcp__curie__request_approval``) is carried when the live MCP surface has
-  a potentially mutating tool or an explicit approval gate. A fully observed
+  (``mcp__curie__request_approval``) is carried when a route is
+  ``grantableViaPolicy``, or when the live MCP surface has a potentially
+  mutating tool and no permission gate already pages. A fully observed
   surface whose tools all declare ``readOnlyHint=true`` omits it, so a model
-  cannot page a human for an action the session cannot perform. The call
-  executes no real-world action; it only marks the turn, and the session emits
-  its terminal ``final`` with ``status=awaiting-approval``.
+  cannot page a human for an action the session cannot perform. Mounting it
+  beside a permission gate produces a second card for one gated action
+  (#2657). The call executes no real-world action; it only marks the turn,
+  and the session emits its terminal ``final`` with ``status=awaiting-approval``.
 - **Permission gate** (#245): configuration marks a tool as
   approval-required, and the runner intercepts the model-initiated call
   proactively through the SDK ``can_use_tool`` callback -- the replacement
@@ -323,6 +325,43 @@ def _distinct_routes(gate: ApprovalGate | None) -> list[str]:
     if gate is None:
         return []
     return sorted({r for r in gate.route_by_tool.values() if r})
+
+
+def has_permission_pager(gate: ApprovalGate | None) -> bool:
+    """Whether ``gate`` already pauses a tool call for a human.
+
+    True when an approvalPolicy / operator gate names a tool other than
+    publication, or when ``toolPolicy.approvalRequired`` is non-empty.
+    Publication has its own dedicated tool and must not keep the generic
+    pager (#1444).
+    """
+
+    if gate is None:
+        return False
+    if gate.required - {PUBLISH_TOOL_NAME}:
+        return True
+    policy = gate.tool_policy
+    return policy is not None and bool(policy.approvalRequired)
+
+
+def include_generic_policy_pager(
+    gate: ApprovalGate | None,
+    *,
+    has_potential_write_tool: bool,
+) -> bool:
+    """Whether to mount ``mcp__curie__request_approval``.
+
+    A permission gate is already a pager. Mounting the generic policy tool
+    beside it produces a grantless policy card and then a second PreToolUse
+    card for the same action (#2657), unless the operator opted a route into
+    ``grantableViaPolicy`` (#558).
+    """
+
+    if gate is not None and gate.grantable_by_route:
+        return True
+    if has_permission_pager(gate):
+        return False
+    return has_potential_write_tool
 
 
 def build_approval_server(

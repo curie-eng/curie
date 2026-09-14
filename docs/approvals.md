@@ -33,12 +33,14 @@ Both end the turn with the same status and share the entire downstream lifecycle
 name is `mcp__curie__request_approval`), the agent may use it for a step that genuinely
 needs sign-off. It takes a one-line `summary` and an optional `route`. The call executes
 nothing; it marks the turn. The skill should say the request is pending and end the turn.
-The runner advertises this generic pager only when the observed MCP surface has an action
-that may write — any tool not explicitly `readOnlyHint=true`, including an unknown or
-unreachable surface — or when an explicit actionable approval gate exists. A bundle with
-no MCP tools, or only explicitly read-only MCP tools and no actionable gate, does not
-carry it: explain that the bundle cannot perform the action instead of fabricating a
-remediation request. `readOnlyHint` is not authorization and does not change gates or
+The runner advertises this generic pager when a route is `grantableViaPolicy`, or when
+the observed MCP surface has an action that may write (any tool not explicitly
+`readOnlyHint=true`, including an unknown or unreachable surface) and no permission
+gate already pages. An explicit `approvalPolicy` or `toolPolicy.approvalRequired` gate
+is already a pager; keeping `request_approval` beside it raises a second card for the
+same action (#2657). A bundle with no MCP tools, or only explicitly read-only MCP tools
+and no grantable policy route, does not carry it: explain that the bundle cannot
+perform the action instead of fabricating a remediation request. `readOnlyHint` is not authorization and does not change gates or
 tool execution. When a live probe explicitly reports it as `true`, Curie also adds that
 MCP tool's SDK-visible name to the read-only classifier: it emits no side-effect flag,
 does not take the no-retry-after-side-effects path, and creates no receipt line. A
