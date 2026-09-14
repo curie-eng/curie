@@ -2024,10 +2024,11 @@ Every ipBlock peer rail 1 renders goes through here, so the metadata carve-out
 is stated ONCE. That carve-out is the security invariant: NetworkPolicy allows
 are additive, so an entry broad enough to contain 169.254.169.254 re-permits the
 cloud metadata endpoint rail 1 otherwise denies. An explicit per-entry `except:`
-list wins (including an empty one, a deliberate operator override); otherwise
-curie.metadataExcept returns a same-family, subset-safe carve-out for ANY CIDR
-that contains the metadata address -- not just an exact /0 -- and "" for CIDRs
-that cannot reach it. See that helper for the containment/family rules.
+list wins (an empty one is refused before render by
+curie.objectStore.egressEntry, because it would drop the carve-out); otherwise
+curie.metadataExcept returns a comma-separated list of same-family, subset-safe
+carve-outs for ANY CIDR that contains a metadata address -- not just an exact /0
+-- rendered one except line per item, and "" for CIDRs that cannot reach one. See that helper for the containment/family rules.
 */}}
 {{- define "curie.egress.ipBlockRules" -}}
 {{- range . }}
@@ -2041,7 +2042,9 @@ that cannot reach it. See that helper for the containment/family rules.
         {{- $auto := include "curie.metadataExcept" .cidr | trim }}
         {{- if $auto }}
         except:
-          - {{ $auto }}
+          {{- range splitList "," $auto }}
+          - {{ . }}
+          {{- end }}
         {{- end }}
         {{- end }}
   {{- with .ports }}

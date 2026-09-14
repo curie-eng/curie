@@ -875,7 +875,8 @@ cover STS (`AssumeRoleWithWebIdentity`). Both are `{cidr, ports}` entries like
 `allowedEgress`. Do not put a DNS name here; NetworkPolicy has no hostname
 peer. A default route, an IPv4 prefix shorter than `/8`, an IPv6 prefix
 shorter than `/32`, a ports item with only `protocol` or with `endPort`, or a
-CIDR that reaches `169.254.169.254` or `fd00:ec2::254` is refused: these lists
+CIDR that reaches `169.254.169.254`, `fd00:ec2::254` or the IPv4-mapped
+`::ffff:169.254.169.254` is refused: these lists
 are store endpoints, not a second model allowlist.
 
 On EKS, create VPC **interface** endpoints for `s3` and `sts` in the cluster
