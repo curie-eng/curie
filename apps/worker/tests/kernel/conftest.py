@@ -12,6 +12,7 @@ sync fixtures.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import socket
 import threading
@@ -438,7 +439,10 @@ class FakeRunner:
     ``final`` and ends the stream models a mid-run drop (no terminal). ``hold``
     (an asyncio.Event set by the test or by ``/v1/interrupt``) makes a turn hang
     active after its prefix so steer/interrupt can be exercised against a live
-    turn; ``tail`` frames flush on release.
+    turn; ``tail`` frames flush on release. ``accept`` is a separate Event that
+    gates after the POST is recorded in ``opened`` and before ``prepare``;
+    ``/v1/interrupt`` must not set it, or a kill before prepare would release
+    the gate and hide the race.
     """
 
     def __init__(self) -> None:
@@ -466,6 +470,7 @@ class FakeRunner:
         self.steers: list[str] = []
         self.interrupts: int = 0
         self.hold: object | None = None  # asyncio.Event when a turn should hang
+        self.accept: asyncio.Event | None = None  # gate after opened, before prepare
         self.tail: list[OutboundEvent] = []
         self.event_fail_times: int = 0  # return 500 on the next N /v1/event calls
         # Per-route captured request headers (the ACI auth Bearer check reads
@@ -501,6 +506,8 @@ class FakeRunner:
             return web.json_response({"error": "transient runner failure"}, status=500)
         script = self.turn_scripts.pop(0) if self.turn_scripts else list(self.default_script)
         resp = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
+        if self.accept is not None:
+            await self.accept.wait()
         await resp.prepare(request)
         self.turn_active = True
         # Cleared on EVERY exit path, not just the normal one. A client that
@@ -539,6 +546,8 @@ class FakeRunner:
         self.interrupts += 1
         if self.hold is not None:
             self.hold.set()  # type: ignore[attr-defined]
+        # ``accept`` is the gate before prepare. Releasing it here would hide a
+        # kill that lands after the POST is received and before the stream starts.
         return web.json_response({"ok": True})
 
 

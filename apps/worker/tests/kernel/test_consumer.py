@@ -84,12 +84,15 @@ class _RenewalProbeStore:
         fail_renewals: int = 0,
         timeout_renewals: int = 0,
         hang_renewals: bool = False,
+        slow_renewal_s: float = 0,
     ) -> None:
         self._delegate = delegate
         self._fail_renewals = fail_renewals
         self._timeout_renewals = timeout_renewals
         self._hang_renewals = hang_renewals
+        self._slow_renewal_s = slow_renewal_s
         self.renew_calls = 0
+        self.slow_completed = 0
         self._never = asyncio.Event()
 
     async def publish(self, **kwargs: Any) -> None:
@@ -103,6 +106,9 @@ class _RenewalProbeStore:
             await self._never.wait()
         if self._hang_renewals:
             await self._never.wait()
+        if self._slow_renewal_s > 0:
+            await asyncio.sleep(self._slow_renewal_s)
+            self.slow_completed += 1
         await self._delegate.renew(**kwargs)
 
     async def is_alive(self, **kwargs: Any) -> bool:
@@ -140,6 +146,24 @@ async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if pred():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met within timeout")
+
+
+async def _wait_until_turn_active_or_consumer_failed(
+    runner: Any, task: asyncio.Task[Any], timeout: float = 5.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if task.done():
+            exc = task.exception()
+            if exc is not None:
+                raise exc
+            raise AssertionError(
+                f"consumer finished before the turn became active: {task.result()!r}"
+            )
+        if runner.turn_active:
             return
         await asyncio.sleep(0.01)
     raise AssertionError("condition not met within timeout")
@@ -854,7 +878,7 @@ def test_graceful_stop_keeps_lease_through_two_ttls_of_inflight_drain(
             )
 
             task = asyncio.create_task(consumer.run())
-            await _wait_until(lambda: h.runner.turn_active)
+            await _wait_until_turn_active_or_consumer_failed(h.runner, task)
             await _wait_key(h.async_redis, alive)
             consumer.request_stop()
             await asyncio.sleep(0.32)
@@ -866,6 +890,79 @@ def test_graceful_stop_keeps_lease_through_two_ttls_of_inflight_drain(
             hold.set()
             await task
             assert not await h.async_redis.exists(alive)
+
+    asyncio.run(go())
+
+
+def test_hang_renewals_during_inflight_turn_expire_liveness(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            reclaim_min_idle_ms=300,
+            consumer_heartbeat_ttl_ms=150,
+            consumer_capability_ttl_ms=450,
+            read_block_ms=10,
+        ) as h:
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=DONE)]
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            consumer._liveness_store = _RenewalProbeStore(  # type: ignore[assignment]
+                ConsumerLivenessStore(h.async_redis), hang_renewals=True
+            )
+            await consumer.ensure_group()
+            await h.async_redis.xadd(
+                h.config.stream,
+                to_stream_fields(_qevent("hang", thread="th-hang", event_id="hang")),
+            )
+            alive = consumer_heartbeat_key(
+                h.config.stream, h.config.consumer_group, h.config.consumer_name
+            )
+
+            task = asyncio.create_task(consumer.run())
+            await _wait_until_turn_active_or_consumer_failed(h.runner, task)
+            with pytest.raises(ConsumerLivenessExpired):
+                await asyncio.wait_for(task, timeout=2)
+            assert not await h.async_redis.exists(alive)
+            hold.set()
+
+    asyncio.run(go())
+
+
+def test_slow_renewal_inside_guard_keeps_lease_alive(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            reclaim_min_idle_ms=300,
+            consumer_heartbeat_ttl_ms=150,
+            consumer_capability_ttl_ms=450,
+            read_block_ms=10,
+        ) as h:
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            probe = _RenewalProbeStore(
+                ConsumerLivenessStore(h.async_redis), slow_renewal_s=0.04
+            )
+            consumer._liveness_store = probe  # type: ignore[assignment]
+            alive = consumer_heartbeat_key(
+                h.config.stream, h.config.consumer_group, h.config.consumer_name
+            )
+
+            task = asyncio.create_task(consumer.run())
+            deadline = time.monotonic() + 2
+            while probe.slow_completed < 1 and time.monotonic() < deadline:
+                if task.done():
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+                    raise AssertionError(
+                        f"consumer finished during slow renewal: {task.result()!r}"
+                    )
+                await asyncio.sleep(0.005)
+            assert probe.slow_completed >= 1
+            assert not task.done()
+            assert await h.async_redis.exists(alive)
+
+            consumer.request_stop()
+            await task
 
     asyncio.run(go())
 
