@@ -224,7 +224,11 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   worker's config. The PEL writer already uses `StreamBroker.xadd`; a second
   broker must additionally account for the off-port completion-outbox writer,
   the two off-port `curie:runs` writers (`ResumeQueue.enqueue` and
-  `enqueue_owned`), and these two API-side readers.
+  `enqueue_owned`), and these two API-side readers. The worker's
+  `apps/worker/src/curie_worker/completion_health.py::_recent_terminal_count`
+  also reads the graveyard off-port (`xrevrange`, bounded by
+  `apps/worker/src/curie_worker/config.py::WorkerConfig.completion_sweep_batch`,
+  counting `dl_source=completion-outbox`).
 - **The redis-py exception surface leaks.** The ports type the verbs but not the error
   contract: `redis.exceptions` propagate through the callers unabstracted, so a non-redis
   broker must either raise redis-py-compatible exceptions or the call sites must learn its
