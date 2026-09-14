@@ -2094,3 +2094,133 @@ async def test_idle_publication_loop_does_not_page(
     messages = [record.getMessage() for record in caplog.records]
     assert not any("claim_next failed" in message for message in messages)
     assert not any("crashed; restarting" in message for message in messages)
+
+
+_JOB_FAILURE = (
+    "BackoffLimitExceeded: Job has reached the specified backoff limit; "
+    "container exited with exit code 128; "
+    "fatal: repository 'https://github.com/o/r.git/' not found"
+)
+_NO_PUSH_SENTENCE = (
+    "Nothing was pushed to acme-corp/acme-bot; "
+    "ask again to request a new publication approval."
+)
+
+
+def _failed_unmarked_job(module: Any) -> Any:
+    return module.PublicationJobObservation(
+        phase="failed",
+        pr_url=None,
+        pr_number=None,
+        commit_sha=None,
+        logs="fatal: repository 'https://github.com/o/r.git/' not found\n",
+        error=_JOB_FAILURE,
+    )
+
+
+def _assert_terminal_no_push_failure(
+    store: _Store, cluster: _Cluster, replies: _Replies
+) -> None:
+    assert store.retries == [], "a proven no-push failure must not burn retries"
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert len(store.failures) == 1
+    persisted = store.failures[0][1]
+    assert "BackoffLimitExceeded" in persisted
+    assert "fatal: repository" in persisted
+    assert _NO_PUSH_SENTENCE in persisted
+    assert cluster.applied == []
+    assert len(cluster.terminals_cleaned) == 1
+    assert len(replies.events) == 1
+    reply_text = replies.events[0][0].text
+    assert "BackoffLimitExceeded" in reply_text
+    assert _NO_PUSH_SENTENCE in reply_text
+
+
+async def test_failed_first_revision_job_with_no_push_terminalizes_on_first_reconcile(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    cluster.preexisting_observation = _failed_unmarked_job(publication)
+    github.branch_head = None
+
+    await loop.reconcile(_work(publication))
+
+    assert len(cluster.validated_existing) == 1
+    assert github.branch_calls == [("acme-corp/acme-bot", LINEAGE_BRANCH)]
+    _assert_terminal_no_push_failure(store, cluster, replies)
+
+    await loop.reconcile(_work(publication))
+    assert store.retries == []
+    assert len(replies.events) == 1
+
+
+async def test_failed_lineage_job_with_unmoved_pr_head_terminalizes_on_first_reconcile(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    cluster.preexisting_observation = _failed_unmarked_job(publication)
+    github.head_sha = PRIOR_HEAD
+
+    await loop.reconcile(_lineage_work(publication))
+
+    assert github.number_calls == [("acme-corp/acme-bot", 123)]
+    assert github.verify_calls == []
+    _assert_terminal_no_push_failure(store, cluster, replies)
+
+
+async def test_failed_job_with_complete_push_markers_still_publishes(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    cluster.preexisting_observation = publication.PublicationJobObservation(
+        phase="failed",
+        pr_url=PR_URL,
+        pr_number=123,
+        commit_sha=REVISION_HEAD,
+        logs=(
+            f"CURIE_PR_URL={PR_URL}\n"
+            f"CURIE_PR_NUMBER=123\nCURIE_COMMIT_SHA={REVISION_HEAD}\n"
+        ),
+        error="BackoffLimitExceeded: Job has reached the specified backoff limit",
+    )
+
+    await loop.reconcile(_work(publication))
+
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert store.failures == []
+    assert len(replies.events) == 1
+    assert PR_URL in replies.events[0][0].text
+    assert "Nothing was pushed" not in replies.events[0][0].text
+
+
+async def test_failed_job_whose_branch_was_pushed_recovers_instead_of_no_push_failure(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    cluster.preexisting_observation = _failed_unmarked_job(publication)
+    github.branch_head = REVISION_HEAD
+    github.allow_exact_revision(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
+
+    await loop.reconcile(_work(publication))
+
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert store.failures == []
+    assert all("Nothing was pushed" not in event.text for event, _ in replies.events)
+
+
+async def test_transient_observe_error_stays_bounded_not_terminal(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+
+    def unavailable(job_name: str) -> Any:
+        raise RuntimeError("apiserver temporarily unavailable")
+
+    cluster.observe = unavailable  # type: ignore[method-assign]
+
+    await loop.reconcile(_work(publication))
+
+    assert len(store.retries) == 1
+    assert "apiserver temporarily unavailable" in store.retries[0][1]
+    assert store.completed == {}
+    assert replies.events == []

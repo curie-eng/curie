@@ -1019,6 +1019,27 @@ class PublicationReconciler:
             # still names the expected prior head or no branch exists, preserve
             # the Job's terminal failure instead of attempting to mutate or
             # replace deterministic resources.
+            if observation.phase == "failed":
+                # GitHub just proved nothing was pushed, and a failed Job
+                # (backoffLimit 0) cannot change outcome, so bounded retries
+                # would only hide the reason. Terminalize once so the thread
+                # sees why and may request a new approval.
+                # The store caps error at 2000 chars; bound the reason so the
+                # ask-again instruction always survives.
+                reason = (observation.error or "publication Job failed")[:1800]
+                logger.warning(
+                    "publication Job failed before any push publication_id=%s reason=%s",
+                    work.publication_id,
+                    reason,
+                )
+                error = (
+                    f"{reason.rstrip('. ')}. Nothing was pushed to {work.repo_full_name}; "
+                    "ask again to request a new publication approval."
+                )
+                await self._terminalize(
+                    work, outcome="failed", error=error, names=names
+                )
+                return
             try:
                 await self._finish_observation(work, observation, names)
             except Exception as exc:
