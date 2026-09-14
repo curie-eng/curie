@@ -19,6 +19,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
@@ -124,6 +125,126 @@ impl Fixture {
         command.output().unwrap()
     }
 
+    /// Drive the public command with no `--chart`, from a caller-selected cwd.
+    ///
+    /// `release_channel` uses the debug-only channel switch to make the
+    /// resolver branch durable regression coverage. It does not stand in for
+    /// the separate build-stamped, checkout-free release-binary acceptance run.
+    fn run_without_chart_with(
+        &self,
+        scenario: &str,
+        to: &str,
+        current_dir: &Path,
+        release_channel: bool,
+        extra: &[&str],
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+        command
+            .args([
+                "--color=never",
+                "--json",
+                "cluster",
+                "upgrade",
+                "--to",
+                to,
+                "--namespace",
+                "ns",
+                "--release",
+                "rel",
+                "--yes",
+            ])
+            .args(extra)
+            .current_dir(current_dir)
+            .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env("UPGRADE_DRIVER_ROOT", self.0.path())
+            .env("UPGRADE_DRIVER_SCENARIO", scenario)
+            .env("XDG_CACHE_HOME", self.cache_home());
+        if release_channel {
+            command.env("CURIE_TEST_ARTIFACT_CHANNEL", "release");
+        } else {
+            command.env_remove("CURIE_TEST_ARTIFACT_CHANNEL");
+        }
+        command.output().unwrap()
+    }
+
+    /// Drive an explicit `--chart` in either artifact channel with an isolated,
+    /// initially absent cache. This is the override-precedence control for the
+    /// no-flag resolver tests above.
+    fn run_override_in_channel(
+        &self,
+        scenario: &str,
+        to: &str,
+        chart: &str,
+        release_channel: bool,
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+        command
+            .args([
+                "--color=never",
+                "--json",
+                "cluster",
+                "upgrade",
+                "--to",
+                to,
+                "--namespace",
+                "ns",
+                "--release",
+                "rel",
+                "--chart",
+                chart,
+                "--yes",
+            ])
+            .current_dir(self.0.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env("UPGRADE_DRIVER_ROOT", self.0.path())
+            .env("UPGRADE_DRIVER_SCENARIO", scenario)
+            .env("XDG_CACHE_HOME", self.cache_home());
+        if release_channel {
+            command.env("CURIE_TEST_ARTIFACT_CHANNEL", "release");
+        } else {
+            command.env_remove("CURIE_TEST_ARTIFACT_CHANNEL");
+        }
+        command.output().unwrap()
+    }
+
+    fn cache_home(&self) -> PathBuf {
+        self.0.path().join("cache")
+    }
+
+    fn target_chart_cache(&self, to: &str) -> PathBuf {
+        self.cache_home()
+            .join("curie")
+            .join(format!("v{to}"))
+            .join(format!("curie-{to}.tgz"))
+    }
+
+    /// Make the recording Helm process behave like real Helm for one explicit
+    /// local archive that is absent. The delegate still records the attempted
+    /// consumer command before the wrapper returns Helm's refusal.
+    fn reject_missing_chart(&self) -> PathBuf {
+        let helm = self.0.path().join("helm");
+        let recorder_dir = self.0.path().join("recorder");
+        fs::create_dir(&recorder_dir).unwrap();
+        let recorder = recorder_dir.join("helm");
+        fs::rename(&helm, &recorder).unwrap();
+        fs::write(
+            &helm,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "$UPGRADE_DRIVER_ROOT/missing-curie.tgz" ]; then
+    "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@" >/dev/null 2>&1
+    echo "Error: chart $arg not found" >&2
+    exit 1
+  fi
+done
+exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&helm, fs::Permissions::from_mode(0o755)).unwrap();
+        self.0.path().join("missing-curie.tgz")
+    }
+
     fn local(&self, scenario: &str) -> Output {
         self.run(scenario, "0.9.0", "charts/curie")
     }
@@ -157,6 +278,26 @@ impl Fixture {
             .filter(|call| {
                 call.first().map(String::as_str) == Some("helm")
                     && call.get(1).map(String::as_str) == Some("upgrade")
+            })
+            .collect()
+    }
+
+    /// The chart operand from every Helm command that consumes the target
+    /// chart: local metadata inspection, schema metadata render, and Apply.
+    fn consumed_charts(&self) -> Vec<String> {
+        self.argv()
+            .into_iter()
+            .filter_map(|call| {
+                if call.first().map(String::as_str) != Some("helm") {
+                    return None;
+                }
+                match call.get(1).map(String::as_str) {
+                    Some("show") if call.get(2).map(String::as_str) == Some("chart") => {
+                        call.get(3).cloned()
+                    }
+                    Some("template" | "upgrade") => call.get(3).cloned(),
+                    _ => None,
+                }
             })
             .collect()
     }
@@ -355,6 +496,453 @@ fn checkpoint_through(completed: &[&str], drain_completed: bool) -> Value {
         "fail_forward": null,
         "resumed": false,
     })
+}
+
+fn assert_only_consumed_chart(fixture: &Fixture, expected: &str, context: &str) {
+    let charts = fixture.consumed_charts();
+    assert!(
+        !charts.is_empty(),
+        "{context}: fixture must observe at least one chart-consuming Helm command: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        charts.iter().all(|chart| chart == expected),
+        "{context}: every chart-consuming Helm command must use {expected}: {:?}",
+        fixture.argv()
+    );
+}
+
+/// #2593 -- compiled-CLI fixture proof for the release resolver branch. The
+/// target archive is deliberately preseeded because this recording fixture is
+/// offline; the build-stamped release-binary run remains separate acceptance
+/// evidence. Running outside the checkout ensures the old literal fallback
+/// cannot accidentally resolve to a real local chart.
+#[test]
+fn release_channel_default_uses_target_chart_cache_outside_checkout() {
+    let fixture = Fixture::new(None);
+    let target = fixture.target_chart_cache("0.9.0");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "offline fixture archive; Helm is recorded, not executed\n",
+    )
+    .unwrap();
+
+    let output =
+        fixture.run_without_chart_with("schema-compatible", "0.9.0", fixture.0.path(), true, &[]);
+    assert!(
+        output.status.success(),
+        "preseeded target archive must complete the recording fixture: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let target = target.to_string_lossy().into_owned();
+    assert_only_consumed_chart(&fixture, &target, "release default");
+
+    let argv = fixture.argv();
+    let schema = argv
+        .iter()
+        .position(|call| is_schema_compat_template(call))
+        .unwrap_or_else(|| panic!("schema compatibility must render the resolved chart: {argv:?}"));
+    let apply = argv
+        .iter()
+        .position(|call| {
+            call.first().map(String::as_str) == Some("helm")
+                && call.get(1).map(String::as_str) == Some("upgrade")
+        })
+        .unwrap_or_else(|| panic!("one Helm upgrade must be recorded: {argv:?}"));
+    assert!(
+        schema < apply,
+        "schema compatibility must be evaluated before mutation: {argv:?}"
+    );
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "the cached target must be applied exactly once: {argv:?}"
+    );
+
+    let cli_version_cache = fixture
+        .cache_home()
+        .join("curie")
+        .join(format!("v{}", env!("CARGO_PKG_VERSION")))
+        .join(format!("curie-{}.tgz", env!("CARGO_PKG_VERSION")))
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        !argv.iter().flatten().any(|arg| arg == &cli_version_cache),
+        "upgrade resolution must key the cache by --to, not CLI version: {argv:?}"
+    );
+    assert!(
+        !argv.iter().flatten().any(|arg| arg == "charts/curie"),
+        "a release-channel default outside a checkout must not use the dev chart: {argv:?}"
+    );
+}
+
+/// #2593 -- the dev-channel positive control keeps the checkout-local default,
+/// including the #2588 schema render before the single Apply.
+#[test]
+fn dev_channel_default_uses_local_chart_from_checkout() {
+    let fixture = Fixture::new(None);
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let output =
+        fixture.run_without_chart_with("schema-compatible", "0.9.0", repo_root, false, &[]);
+    assert!(
+        output.status.success(),
+        "dev default must complete from the source checkout: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_only_consumed_chart(&fixture, "charts/curie", "dev default");
+    assert!(
+        fixture
+            .argv()
+            .iter()
+            .any(|call| is_schema_compat_template(call)),
+        "schema compatibility must still render the local target chart: {:?}",
+        fixture.argv()
+    );
+    assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+    assert!(
+        !fixture.cache_home().exists(),
+        "the dev local default must not consult or create the release cache"
+    );
+}
+
+/// #2593 -- a dev binary invoked outside a checkout has no implicit chart to
+/// validate or apply. It must refuse with the resolver's actionable remedy
+/// before reaching either recording process.
+#[test]
+fn dev_channel_without_local_default_refuses_before_helm() {
+    let fixture = Fixture::new(None);
+    let output =
+        fixture.run_without_chart_with("schema-compatible", "0.9.0", fixture.0.path(), false, &[]);
+    assert!(
+        !output.status.success(),
+        "dev without charts/curie must refuse: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let message = visible(&output);
+    assert!(
+        message.contains("dev build")
+            && message.contains("charts/curie")
+            && message.contains("--chart"),
+        "refusal must name the missing default and explicit remedy: {message}"
+    );
+    assert!(
+        fixture.argv().is_empty(),
+        "resolution must refuse before any Helm/Kubectl call: {:?}",
+        fixture.argv()
+    );
+}
+
+/// #2593 -- an explicit local archive is authoritative in both channels. The
+/// release-channel loop is fixture-only branch coverage, and the absent cache
+/// proves the override did not fall through to target artifact resolution.
+#[test]
+fn explicit_local_chart_wins_in_both_channels_without_cache() {
+    for release_channel in [false, true] {
+        let fixture = Fixture::new(None);
+        let chart = fixture.0.path().join("explicit-curie.tgz");
+        fs::write(
+            &chart,
+            "offline fixture archive; Helm is recorded, not executed\n",
+        )
+        .unwrap();
+        let chart = chart.to_string_lossy().into_owned();
+        let output =
+            fixture.run_override_in_channel("schema-compatible", "0.9.0", &chart, release_channel);
+        let channel = if release_channel { "release" } else { "dev" };
+        assert!(
+            output.status.success(),
+            "explicit local chart must complete in {channel}: {} / {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        assert_only_consumed_chart(&fixture, &chart, channel);
+        assert!(
+            !fixture.cache_home().exists(),
+            "explicit {channel} override must not consult or create the target cache"
+        );
+    }
+}
+
+/// #2593 / #2594 -- an explicit Helm-resolved ref also wins in both channels,
+/// stays uncached, and carries `--version <to>` through target schema render
+/// and Apply.
+#[test]
+fn explicit_chart_ref_wins_in_both_channels_without_cache() {
+    const CHART: &str = "oci://example.invalid/curie";
+    for release_channel in [false, true] {
+        let fixture = Fixture::new(None);
+        let output =
+            fixture.run_override_in_channel("schema-compatible", "0.9.0", CHART, release_channel);
+        let channel = if release_channel { "release" } else { "dev" };
+        assert!(
+            output.status.success(),
+            "explicit chart ref must complete in {channel}: {} / {}",
+            stdout(&output),
+            stderr(&output)
+        );
+        assert_only_consumed_chart(&fixture, CHART, channel);
+
+        let chart_calls: Vec<_> = fixture
+            .argv()
+            .into_iter()
+            .filter(|call| {
+                is_schema_compat_template(call)
+                    || (call.first().map(String::as_str) == Some("helm")
+                        && call.get(1).map(String::as_str) == Some("upgrade"))
+            })
+            .collect();
+        assert_eq!(
+            chart_calls.len(),
+            2,
+            "{channel} must render schema metadata and Apply: {:?}",
+            fixture.argv()
+        );
+        for call in chart_calls {
+            assert!(
+                call.windows(2)
+                    .any(|pair| pair[0] == "--version" && pair[1] == "0.9.0"),
+                "{channel} must pin the explicit ref to --to: {call:?}"
+            );
+        }
+        assert!(
+            !fixture.cache_home().exists(),
+            "explicit {channel} ref must not consult or create the target cache"
+        );
+    }
+}
+
+/// #2593 -- a cold release-channel dry-run is network-free and cannot inspect
+/// the absent target archive yet. It must say those target checks are pending,
+/// while still running the independent retained-configuration migration.
+#[test]
+fn release_channel_dry_run_plans_target_cache_and_url_without_fetching() {
+    let fixture = Fixture::new(Some(V084));
+    let target = fixture.target_chart_cache("0.9.0");
+    let url = "https://github.com/curie-eng/curie/releases/download/v0.9.0/curie-0.9.0.tgz";
+    let output = fixture.run_without_chart_with(
+        "schema-compatible",
+        "0.9.0",
+        fixture.0.path(),
+        true,
+        &["--dry-run"],
+    );
+    assert!(
+        output.status.success(),
+        "release dry-run must plan without downloading: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let target = target.to_string_lossy().into_owned();
+    let output_text = visible(&output);
+    assert!(
+        output_text.contains(url) && output_text.contains(&target),
+        "dry-run must report the target release URL and cache path: {output_text}"
+    );
+    assert!(
+        !fixture.cache_home().exists(),
+        "dry-run must not create the cache or fetch the target archive"
+    );
+    let plan = json(&output)["plan"].as_array().unwrap().clone();
+    let helm_line = plan
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|line| line.starts_with("helm upgrade "))
+        .unwrap_or_else(|| panic!("cold dry-run has no Helm plan line: {plan:?}"));
+    assert_eq!(
+        helm_line,
+        format!("helm upgrade rel {target} -n ns --wait"),
+        "the downloaded archive is a local chart at Apply, so the cold plan must omit --version"
+    );
+    assert!(
+        plan.iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.contains("pending")
+                && line.contains("chart metadata")
+                && line.contains("schema compatibility")),
+        "cold dry-run must name the unavailable target checks as pending: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.contains("config schema: 0.8.6 -> 0.9.0")),
+        "cold dry-run must still migrate retained configuration: {plan:?}"
+    );
+    assert_eq!(
+        fixture
+            .argv()
+            .iter()
+            .filter(|call| call.len() >= 3 && call[..3] == ["helm", "get", "values"])
+            .count(),
+        1,
+        "retained configuration must still be read exactly once: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture.consumed_charts().is_empty(),
+        "an absent archive cannot be inspected or rendered during a network-free dry-run: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "dry-run must not mutate: {:?}",
+        fixture.argv()
+    );
+}
+
+/// #2593 -- a cached release archive is available during dry-run, so the
+/// local metadata pin and target schema validation must both execute. Neither
+/// command nor the plan may carry the Helm version flag for a local archive.
+#[test]
+fn release_channel_cached_dry_run_checks_target_without_version_flag() {
+    let fixture = Fixture::new(Some(V084));
+    let target = fixture.target_chart_cache("0.9.0");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "offline fixture archive; Helm is recorded, not executed\n",
+    )
+    .unwrap();
+
+    let output = fixture.run_without_chart_with(
+        "schema-compatible",
+        "0.9.0",
+        fixture.0.path(),
+        true,
+        &["--dry-run"],
+    );
+    assert!(
+        output.status.success(),
+        "cached release dry-run must complete its checks: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let target = target.to_string_lossy().into_owned();
+    assert_only_consumed_chart(&fixture, &target, "cached release dry-run");
+    let chart_calls: Vec<_> = fixture
+        .argv()
+        .into_iter()
+        .filter(|call| {
+            (call.get(1).map(String::as_str) == Some("show")
+                && call.get(2).map(String::as_str) == Some("chart"))
+                || is_schema_compat_template(call)
+        })
+        .collect();
+    assert_eq!(
+        chart_calls.len(),
+        2,
+        "cached dry-run must inspect chart metadata and render target schema metadata: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        chart_calls
+            .iter()
+            .all(|call| !call.iter().any(|arg| arg == "--version")),
+        "local archive checks must not carry a version flag Helm ignores: {chart_calls:?}"
+    );
+    let plan = json(&output)["plan"].as_array().unwrap().clone();
+    assert!(
+        !plan
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.contains("pending")),
+        "available target checks must not be reported as pending: {plan:?}"
+    );
+    assert!(
+        plan.iter().filter_map(Value::as_str).any(|line| {
+            line == format!("helm upgrade rel {target} -n ns --wait") && !line.contains("--version")
+        }),
+        "cached plan must use the exact local-archive command head: {plan:?}"
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "cached dry-run must not mutate: {:?}",
+        fixture.argv()
+    );
+}
+
+/// #2593 -- pending target checks do not excuse an independent retained-value
+/// conflict. A cold dry-run must still surface the same Validate refusal while
+/// keeping chart inspection pending and the release cache absent.
+#[test]
+fn release_channel_cold_dry_run_still_reports_config_conflict() {
+    let fixture = Fixture::new(Some(&conflict_values("999").to_string()));
+    let output = fixture.run_without_chart_with(
+        "schema-compatible",
+        "0.9.0",
+        fixture.0.path(),
+        true,
+        &["--dry-run"],
+    );
+    assert!(
+        output.status.success(),
+        "dry-run reports refusals in its plan: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let plan = json(&output)["plan"].to_string();
+    assert!(
+        plan.contains("refusal at validate")
+            && plan.contains("CURIE_RUNNER_TOTAL_TIMEOUT_S")
+            && plan.contains("worker.runnerTotalTimeoutSeconds"),
+        "cold dry-run must preserve the retained-configuration refusal: {plan}"
+    );
+    assert!(
+        plan.contains("pending")
+            && plan.contains("chart metadata")
+            && plan.contains("schema compatibility"),
+        "the unrelated target checks must remain explicitly pending: {plan}"
+    );
+    assert!(
+        fixture.issued(&["helm", "get", "values"]),
+        "the conflict must come from the real retained-values consumer: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture.consumed_charts().is_empty(),
+        "cold target checks must not execute against an absent archive: {:?}",
+        fixture.argv()
+    );
+    assert!(!fixture.cache_home().exists());
+    assert!(fixture.helm_upgrades().is_empty());
+}
+
+/// #2593 -- an explicit operand never inherits the release resolver's pending
+/// download state. Real Helm refuses this absent local archive during target
+/// schema rendering, and that refusal must remain visible before mutation.
+#[test]
+fn explicit_missing_chart_refuses_without_becoming_pending_release_download() {
+    let fixture = Fixture::new(None);
+    let missing = fixture.reject_missing_chart();
+    let missing = missing.to_string_lossy().into_owned();
+    let output = fixture.run_with("schema-compatible", "0.9.0", &missing, &["--dry-run"]);
+    assert!(
+        output.status.success(),
+        "dry-run refusal belongs in the plan"
+    );
+    let plan = json(&output)["plan"].to_string();
+    assert!(
+        plan.contains("refusal at validate")
+            && plan.contains("could not render target schema compatibility metadata")
+            && plan.contains(&missing),
+        "the target consumer's missing-chart refusal must reach the plan: {plan}"
+    );
+    assert!(
+        !plan.contains("pending"),
+        "an explicit operand must never masquerade as a pending release asset: {plan}"
+    );
+    assert!(
+        !fixture.cache_home().exists(),
+        "an explicit operand must not consult or populate release cache"
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "missing explicit chart must refuse before mutation: {:?}",
+        fixture.argv()
+    );
 }
 
 // T1(a) -- #2301 "requires no direct Helm command or merge-flag choice", as

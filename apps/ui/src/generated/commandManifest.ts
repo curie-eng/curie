@@ -2837,7 +2837,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Helm chart. Default: the version-pinned chart for `--to` on release builds; local `charts/curie` on dev builds",
+              "help": "Helm chart. An explicit path or ref overrides the default. Default: the version-pinned release asset for `--to` on release builds; local `charts/curie` on dev builds",
               "id": "chart",
               "long": "chart",
               "positional": false,

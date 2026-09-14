@@ -10,7 +10,8 @@
 //! does not drain accepted work again.
 
 use curie::ops::{
-    run_lifecycle, ClusterUpgradeOutput, CommonOpts, FakeUpgradeHost, UpgradeOpts, UpgradePhase,
+    run_lifecycle, ClusterUpgradeOutput, CommonOpts, FakeUpgradeHost, UpgradeChart, UpgradeOpts,
+    UpgradePhase,
 };
 use curie::ui::CliOutput;
 
@@ -22,7 +23,7 @@ fn opts(to: &str) -> UpgradeOpts {
             dry_run: false,
         },
         to: to.into(),
-        chart: None,
+        chart: UpgradeChart::AvailableLocal("charts/curie".into()),
         yes: true,
         forward_only: false,
     }
@@ -32,6 +33,23 @@ fn dry_opts(to: &str) -> UpgradeOpts {
     let mut o = opts(to);
     o.common.dry_run = true;
     o
+}
+
+#[tokio::test]
+async fn real_upgrade_refuses_pending_release_before_tool_lookup() {
+    let mut pending = opts("0.9.0");
+    pending.chart = UpgradeChart::PendingRelease {
+        source_url: "https://example.com/curie-0.9.0.tgz".into(),
+        cache_path: "/cache/curie/v0.9.0/curie-0.9.0.tgz".into(),
+    };
+
+    let error = curie::ops::upgrade(pending)
+        .await
+        .expect_err("a real upgrade must never accept an unmaterialized release chart");
+    assert_eq!(
+        format!("{error:#}"),
+        "a pending release chart is only valid for a dry run; download the chart before starting a real upgrade"
+    );
 }
 
 fn output_json(out: &ClusterUpgradeOutput) -> serde_json::Value {
