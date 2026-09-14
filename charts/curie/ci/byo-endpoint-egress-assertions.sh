@@ -77,6 +77,12 @@
 #      at an external host with no peer, and render the dedicated endpoint
 #      policy when the matching egress key is set. A valueFrom extraEnv is
 #      treated as external because the chart cannot prove it is in-cluster.
+#  29-32. #2643: agentSandbox.connectorEgress entries pass the shared floor;
+#      allowedEgress keeps 0.0.0.0/0 and ::/0 but refuses `except: []`,
+#      port-less entries and excepts that miss a metadata address; the
+#      IPv4-mapped ::ffff:169.254.169.254 counts as metadata everywhere; and
+#      ::/0 renders exactly one IPv6 except, fd00:ec2::254/128, while an
+#      IPv4-mapped ::ffff:0:0/96 allowedEgress entry is refused.
 #  15. An in-chart dispatcher.apiBaseUrl (this release's API Service) is not
 #      external: api.deploy=true does not require api.egress.
 #
@@ -1256,6 +1262,115 @@ if tar -tzf "$PKG_TGZ" | grep -q '/ci/'; then
   fail "helm package still contains ci/ test scripts; add ci/ to charts/curie/.helmignore so the release Secret stays under 1MiB"
 fi
 echo "ok: helm package excludes ci/"
+
+echo "=== Assertion 29: agentSandbox.connectorEgress entries go through the shared floor (#2643) ==="
+conn_values() {
+  local name="$1"
+  local entry="$2"
+  local file="$TMP/conn-${name}.yaml"
+  cat > "$file" <<EOF
+agentSandbox:
+  connectorEgress:
+    bot:
+      - ${entry}
+EOF
+  printf '%s\n' "$file"
+}
+must_fail_naming "connectorEgress default route" "default or equivalently broad route" \
+  "$(conn_values slash0 '{ cidr: 0.0.0.0/0, ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "connectorEgress port-less" "agentSandbox.connectorEgress.bot entries must set ports" \
+  "$(conn_values noport '{ cidr: 10.20.0.2/32 }')"
+must_fail_naming "connectorEgress empty except" "empty except drops the cloud metadata carve-out" \
+  "$(conn_values emptyexcept '{ cidr: 10.20.0.2/32, except: [], ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "connectorEgress endPort" "must not set endPort" \
+  "$(conn_values endport '{ cidr: 10.20.0.2/32, ports: [{ protocol: TCP, port: 443, endPort: 500 }] }')"
+must_fail_naming "connectorEgress IPv4-mapped metadata host" "must not cover the cloud metadata endpoint" \
+  "$(conn_values mapped '{ cidr: "::ffff:169.254.169.254/128", ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "connectorEgress IPv4-mapped hex metadata host" "must not cover the cloud metadata endpoint" \
+  "$(conn_values mappedhex '{ cidr: "::ffff:a9fe:a9fe/128", ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "connectorEgress IPv4-mapped slash96" "must not cover the cloud metadata endpoint" \
+  "$(conn_values mapped96 '{ cidr: "::ffff:0:0/96", ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "connectorEgress unparseable IPv6" "is not a valid IPv6 CIDR" \
+  "$(conn_values badv6 '{ cidr: "2001:db8::zz/128", ports: [{ protocol: TCP, port: 443 }] }')"
+CONN_OK_OUT="$(render_dir conn-ok --values "$(conn_values ok '{ cidr: 10.20.0.2/32, ports: [{ protocol: TCP, port: 443 }] }')")" \
+  || fail "a valid connectorEgress /32 on port 443 must render"
+python3 - "$CONN_OK_OUT" "${RELEASE}-agent-bot-allow-egress" <<'PYEOF' || fail "valid connectorEgress entry must render the per-agent policy"
+import pathlib, sys, yaml
+out, name = sys.argv[1], sys.argv[2]
+for path in pathlib.Path(out).rglob("*.yaml"):
+    for doc in yaml.safe_load_all(path.read_text()):
+        if doc and doc.get("kind") == "NetworkPolicy" and doc["metadata"]["name"] == name:
+            egress = doc["spec"]["egress"]
+            assert egress == [{"to": [{"ipBlock": {"cidr": "10.20.0.2/32"}}], "ports": [{"protocol": "TCP", "port": 443}]}], egress
+            print(f"ok: {name} renders the declared /32 on 443")
+            sys.exit(0)
+sys.exit(f"{name} did not render")
+PYEOF
+
+echo "=== Assertion 30: allowedEgress keeps broad routes but refuses except: [], port-less entries, and uncovered excepts (#2643) ==="
+ae_values() {
+  local name="$1"
+  local entry="$2"
+  local file="$TMP/ae-${name}.yaml"
+  cat > "$file" <<EOF
+security:
+  networkPolicy:
+    allowedEgress:
+      - ${entry}
+EOF
+  printf '%s\n' "$file"
+}
+must_fail_naming "allowedEgress empty except" "empty except drops the cloud metadata carve-out" \
+  "$(ae_values emptyexcept '{ cidr: 0.0.0.0/0, except: [], ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "allowedEgress port-less" "security.networkPolicy.allowedEgress entries must set ports" \
+  "$(ae_values noport '{ cidr: 0.0.0.0/0 }')"
+must_fail_naming "allowedEgress except missing IPv6 metadata" "without covering the cloud metadata address fd00:ec2::254/128" \
+  "$(ae_values uncovered '{ cidr: "::/0", except: ["2001:db8::/32"], ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "allowedEgress IPv4-mapped slash96" "is an IPv4-mapped IPv6 range" \
+  "$(ae_values mapped96 '{ cidr: "::ffff:0:0/96", ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "allowedEgress unparseable IPv6" "is not a valid IPv6 CIDR" \
+  "$(ae_values badv6 '{ cidr: "::gg/0", ports: [{ protocol: TCP, port: 443 }] }')"
+
+echo "=== Assertion 31: IPv4-mapped metadata host is refused on the egressEntry-keyed lists (#2643) ==="
+MAPPED_API="$TMP/mapped-api.yaml"
+cat > "$MAPPED_API" <<EOF
+api:
+  deploy: false
+  egress:
+    - cidr: "::ffff:169.254.169.254/128"
+      ports: [{ protocol: TCP, port: 443 }]
+dispatcher:
+  apiBaseUrl: ${API_BASE_URL}
+ui:
+  apiBaseUrl: ${API_BASE_URL}
+EOF
+must_fail_naming "api.egress IPv4-mapped metadata host" "api.egress entry \"::ffff:169.254.169.254/128\" must not cover" "$MAPPED_API"
+
+echo "=== Assertion 32: allowedEgress ::/0 excepts only fd00:ec2::254/128 (a mapped except is not same-family); 0.0.0.0/0 still excepts 169.254.0.0/16 (#2643) ==="
+BROAD_VALUES="$TMP/broad.yaml"
+cat > "$BROAD_VALUES" <<EOF
+security:
+  networkPolicy:
+    allowedEgress:
+      - cidr: "::/0"
+        ports: [{ protocol: TCP, port: 443 }]
+      - cidr: 0.0.0.0/0
+        ports: [{ protocol: TCP, port: 443 }]
+EOF
+BROAD_OUT="$(render_dir broad --values "$BROAD_VALUES")" || fail "allowedEgress ::/0 and 0.0.0.0/0 on 443 must render"
+python3 - "$BROAD_OUT" "$ALLOW_EGRESS" <<'PYEOF' || fail "broad allowedEgress must carve out every metadata address"
+import pathlib, sys, yaml
+out, name = sys.argv[1], sys.argv[2]
+for path in pathlib.Path(out).rglob("*.yaml"):
+    for doc in yaml.safe_load_all(path.read_text()):
+        if doc and doc.get("kind") == "NetworkPolicy" and doc["metadata"]["name"] == name:
+            blocks = {r["to"][0]["ipBlock"]["cidr"]: r["to"][0]["ipBlock"].get("except") for r in doc["spec"]["egress"]}
+            assert blocks["::/0"] == ["fd00:ec2::254/128"], blocks
+            assert blocks["0.0.0.0/0"] == ["169.254.0.0/16"], blocks
+            print(f"ok: {name} excepts {blocks}")
+            sys.exit(0)
+sys.exit(f"{name} did not render")
+PYEOF
 
 echo
 echo "PASS: BYO collector and API egress are required and rendered as runner NetworkPolicies; the in-chart carve-outs are unchanged; the effective runner-facing endpoint fails closed without a declared peer; and no .deploy carve-out lacks a BYO branch."

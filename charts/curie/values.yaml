@@ -680,7 +680,7 @@ rustfs:
   # bundle-fetch or workspace enabled is refused at render until these CIDRs
   # are set. Each entry must set cidr and a concrete port (not protocol-only,
   # not endPort). Default routes, IPv4 prefixes shorter than /8, IPv6 prefixes
-  # shorter than /32, and CIDRs that reach 169.254.169.254 or fd00:ec2::254
+  # shorter than /32, and CIDRs that reach 169.254.169.254, fd00:ec2::254 or ::ffff:169.254.169.254
   # are refused: this is a store-endpoint list, not a second model allowlist.
   # On EKS the tight form is VPC interface endpoints
   # for s3 (and sts on the key-free path) with private DNS enabled, which
@@ -848,7 +848,7 @@ otelCollector:
   # flow, and only the sandbox's spans are silently dropped. Each entry must
   # set cidr and a concrete port (not protocol-only, not endPort). Default
   # routes, IPv4 prefixes shorter than /8, IPv6 prefixes shorter than /32, and
-  # CIDRs that reach 169.254.169.254 or fd00:ec2::254 are refused: this is one
+  # CIDRs that reach 169.254.169.254, fd00:ec2::254 or ::ffff:169.254.169.254 are refused: this is one
   # collector endpoint, not a second model allowlist.
   egress: []
   #  - cidr: 192.0.2.10/32
@@ -2065,6 +2065,10 @@ agentSandbox:
   # NetworkPolicy selecting curietech.ai/agent=<name>, so one agent's connector
   # host is not opened for every runner. Model-API CIDRs stay on
   # security.networkPolicy.allowedEgress (fleet-wide). Empty by default.
+  # Each entry passes the same floor as rustfs.egress: cidr and a concrete
+  # port are required; a default route, an IPv4 prefix shorter than /8, an IPv6
+  # prefix shorter than /32, endPort, `except: []`, and any CIDR reaching
+  # 169.254.169.254, fd00:ec2::254 or ::ffff:169.254.169.254 are refused.
   #   connectorEgress:
   #     acme-a:
   #       - cidr: 10.20.0.2/32
@@ -2367,6 +2371,12 @@ security:
     # denies ALL egress except DNS until the operator declares where the model API
     # and MCP servers live. Deliberately fail-closed -- an unset allowlist must never
     # mean "allow everything".
+    # Every entry must set a parseable cidr and ports naming a concrete port with
+    # no endPort. A broad route such as 0.0.0.0/0 or ::/0 is allowed here; the
+    # chart adds an except for each metadata address it contains
+    # (169.254.169.254, fd00:ec2::254). `except: []` is refused, an explicit
+    # except must cover those addresses, and an IPv4-mapped range such as
+    # ::ffff:0:0/96 is refused because no except can carve it.
     allowedEgress: []
     #  - cidr: 160.79.104.0/23           # e.g. api.anthropic.com
     #    ports: [{ protocol: TCP, port: 443 }]
