@@ -21,9 +21,11 @@ from curie_worker import run
 from curie_worker.config import WorkerConfig
 from curie_worker.run import (
     _MAX_TUNABLE_SECONDS,
+    _restart_delay_s,
     _sandbox_client,
     _substrate_config,
     _supervise,
+    _supervise_policy,
     main,
 )
 from curie_worker.sandbox import DockerSandboxClient, SubstrateConfig
@@ -752,6 +754,177 @@ def test_supervise_does_not_emit_restart_metric_after_shutdown(
         assert recorded == []
 
     asyncio.run(go())
+
+
+# -- _supervise: bounded restarts (#2637) ------------------------------------
+
+
+def test_restart_delay_doubles_from_base_and_caps() -> None:
+    schedule = [_restart_delay_s(n, base_s=1.0, max_s=60.0) for n in range(1, 10)]
+    assert schedule == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0]
+    # A very long streak stays at the cap rather than overflowing.
+    assert _restart_delay_s(10_000, base_s=1.0, max_s=60.0) == 60.0
+    assert _restart_delay_s(3, base_s=0.0, max_s=60.0) == 0.0
+
+
+def _capture_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, float, dict[str, str]]]:
+    recorded: list[tuple[str, float, dict[str, str]]] = []
+
+    def capture(
+        name: str, value: float = 1, *, attributes: Mapping[str, str] | None = None
+    ) -> None:
+        recorded.append((name, value, dict(attributes or {})))
+
+    monkeypatch.setattr(run, "record_metric", capture)
+    return recorded
+
+
+def test_supervise_waits_the_exponential_schedule_between_restarts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The observed waits between restarts are the capped doubling schedule,
+    not a fixed one-second backoff."""
+    _capture_metrics(monkeypatch)
+    waits: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def recording_wait_for(aw, timeout=None):  # type: ignore[no-untyped-def]
+        if timeout is not None and timeout >= 1:
+            waits.append(timeout)
+            aw.close()
+            raise TimeoutError
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(run.asyncio, "wait_for", recording_wait_for)
+
+    async def go() -> None:
+        shutdown = asyncio.Event()
+        calls = {"n": 0}
+
+        async def factory() -> None:
+            calls["n"] += 1
+            if calls["n"] <= 6:
+                raise RuntimeError("boom")
+
+        await real_wait_for(
+            _supervise(
+                "runs",
+                factory,
+                shutdown,
+                restart_backoff_s=1.0,
+                max_restart_backoff_s=8.0,
+                max_consecutive_failures=0,
+                clock=lambda: 0.0,
+            ),
+            timeout=2,
+        )
+        assert calls["n"] == 7
+
+    asyncio.run(go())
+    assert waits == [1.0, 2.0, 4.0, 8.0, 8.0, 8.0]
+
+
+def test_supervise_parks_task_after_consecutive_failures(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After N consecutive crashes the task is parked with a terminal give_up
+    event and is never started again, while shutdown was never requested."""
+    recorded = _capture_metrics(monkeypatch)
+
+    async def go() -> None:
+        shutdown = asyncio.Event()
+        calls = {"n": 0}
+
+        async def factory() -> None:
+            calls["n"] += 1
+            raise RuntimeError("crash loop")
+
+        with caplog.at_level(logging.ERROR, logger="curie_worker.run"):
+            await asyncio.wait_for(
+                _supervise(
+                    "publications",
+                    factory,
+                    shutdown,
+                    restart_backoff_s=0,
+                    max_consecutive_failures=4,
+                    clock=lambda: 0.0,
+                ),
+                timeout=2,
+            )
+        assert calls["n"] == 4
+        assert not shutdown.is_set()
+
+    asyncio.run(go())
+    outcomes = [attrs["outcome"] for _, _, attrs in recorded]
+    assert outcomes == ["restart", "restart", "restart", "give_up"]
+    assert recorded[-1] == (
+        "curie.worker.supervised.restart",
+        1,
+        {
+            "service.name": "curie-worker",
+            "operation": "publications",
+            "outcome": "give_up",
+        },
+    )
+    parked = [r for r in caplog.records if "parked, not restarting" in r.getMessage()]
+    assert len(parked) == 1
+    assert "publications" in parked[0].getMessage()
+    assert "crash loop" in parked[0].getMessage()
+
+
+def test_supervise_long_healthy_run_resets_the_failure_streak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash after a healthy run of at least the reset window starts a new
+    streak, so rare crashes over a long uptime never park the task."""
+    recorded = _capture_metrics(monkeypatch)
+    now = {"t": 0.0}
+
+    async def go() -> None:
+        shutdown = asyncio.Event()
+        calls = {"n": 0}
+
+        async def factory() -> None:
+            calls["n"] += 1
+            if calls["n"] > 6:
+                return
+            # Every attempt runs past the reset window before it crashes.
+            now["t"] += 1000.0
+            raise RuntimeError("rare")
+
+        await asyncio.wait_for(
+            _supervise(
+                "runs",
+                factory,
+                shutdown,
+                restart_backoff_s=0,
+                max_consecutive_failures=2,
+                failure_reset_s=300.0,
+                clock=lambda: now["t"],
+            ),
+            timeout=2,
+        )
+        assert calls["n"] == 7
+
+    asyncio.run(go())
+    assert [a["outcome"] for _, _, a in recorded] == ["restart"] * 6
+
+
+def test_supervise_policy_reads_worker_config() -> None:
+    config = WorkerConfig(
+        CURIE_WORKER_SUPERVISE_BACKOFF_BASE_S=2.0,
+        CURIE_WORKER_SUPERVISE_BACKOFF_MAX_S=30.0,
+        CURIE_WORKER_SUPERVISE_MAX_CONSECUTIVE_FAILURES=5,
+        CURIE_WORKER_SUPERVISE_FAILURE_RESET_S=120.0,
+    )
+    assert _supervise_policy(config) == {
+        "restart_backoff_s": 2.0,
+        "max_restart_backoff_s": 30.0,
+        "max_consecutive_failures": 5,
+        "failure_reset_s": 120.0,
+    }
 
 
 # -- #1751: the boot rekey is CALLED by _run, once, before any consumer reads --

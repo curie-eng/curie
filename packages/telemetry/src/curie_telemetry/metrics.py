@@ -273,7 +273,7 @@ _SUPERVISED_RESTART_ATTRIBUTES = {
         "publications",
         "other",
     ],
-    "outcome": ["restart"],
+    "outcome": ["restart", "give_up"],
 }
 
 

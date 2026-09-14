@@ -394,3 +394,58 @@ tests:
       - eval_time: 20m
         alertname: CurieDuplicateNodeExporter
         exp_alerts: []
+
+  - name: supervised restart loop fires on repeated restarts
+    interval: 5m
+    input_series:
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="publications",outcome="restart"}'
+        values: '0 1 2 3 4 5 6 7 8'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CurieWorkerSupervisedRestartLoop
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-worker
+              service_name: curie-worker
+              operation: publications
+              outcome: restart
+            exp_annotations:
+              summary: A supervised worker task is crash-looping
+              description: >-
+                curie_worker_supervised_restart_total with outcome restart
+                increased by three or more in 30 minutes for one operation.
+                The task is backing off and will be parked if it keeps
+                crashing.
+
+  - name: supervised restart loop stays quiet on a single restart
+    interval: 5m
+    input_series:
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="runs",outcome="restart"}'
+        values: '0 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CurieWorkerSupervisedRestartLoop
+        exp_alerts: []
+
+  - name: supervised task parked fires on give_up
+    interval: 5m
+    input_series:
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="runs",outcome="give_up"}'
+        values: '0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CurieWorkerSupervisedTaskParked
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-worker
+              service_name: curie-worker
+              operation: runs
+              outcome: give_up
+            exp_annotations:
+              summary: A supervised worker task was parked after repeated crashes
+              description: >-
+                curie_worker_supervised_restart_total with outcome give_up
+                increased. The named operation stopped restarting and stays
+                down until the worker pod restarts.
