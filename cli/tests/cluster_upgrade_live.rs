@@ -456,8 +456,87 @@ fn remote_chart_schema_template_pins_the_target_version() {
     );
 }
 
+// Helm v3.20 status removes release chart metadata and exposes its numeric
+// revision as `version`, while get metadata maps the installed chart version
+// to a string. These references pin the external boundary this test exercises:
+// https://github.com/helm/helm/blob/v3.20.0/cmd/helm/status.go
+// https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_metadata.go
+#[test]
+fn metadata_version_drives_startup_apply_canary_and_commit() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("healthy");
+    assert!(output.status.success(), "{}", visible(&output));
+    let result = json(&output);
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(result["phase"], "commit", "{result}");
+    assert_eq!(result["from_version"], "0.8.6", "{result}");
+    assert_eq!(result["target_version"], "0.9.0", "{result}");
+    assert_eq!(result["known_good_version"], "0.9.0", "{result}");
+
+    let calls = fixture.argv();
+    let upgrade = calls
+        .iter()
+        .position(|call| {
+            call.first().map(String::as_str) == Some("helm")
+                && call.get(1).map(String::as_str) == Some("upgrade")
+        })
+        .expect("Apply must invoke helm upgrade");
+    let workloads = calls
+        .iter()
+        .position(|call| {
+            call.first().map(String::as_str) == Some("kubectl")
+                && call.iter().any(|arg| arg == WORKLOADS)
+        })
+        .expect("Converge must observe workloads");
+    let metadata_reads: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, call)| {
+            call.iter()
+                .map(String::as_str)
+                .eq(["helm", "get", "metadata", "rel", "-n", "ns", "-o", "json"])
+                .then_some(index)
+        })
+        .collect();
+    assert_eq!(metadata_reads.len(), 4, "source, Apply, Canary, Commit");
+    assert!(metadata_reads[0] < upgrade, "source observation");
+    assert!(
+        upgrade < metadata_reads[1] && metadata_reads[1] < workloads,
+        "Apply observation"
+    );
+    assert!(workloads < metadata_reads[2], "Canary observation");
+    assert!(metadata_reads[2] < metadata_reads[3], "Commit observation");
+
+    assert_unusable_metadata_after_apply("stale-version", "still reports 0.8.6");
+    for scenario in [
+        "metadata-malformed-after",
+        "metadata-missing-after",
+        "metadata-numeric-after",
+    ] {
+        assert_unusable_metadata_after_apply(scenario, "release reports no version");
+    }
+}
+
+fn assert_unusable_metadata_after_apply(scenario: &str, expected: &str) {
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert!(!output.status.success(), "{scenario} must fail");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "Apply must run: {scenario}"
+    );
+    assert!(visible(&output).contains(expected));
+    for record in fixture.records() {
+        assert_ne!(record["known_good_version"], "0.9.0", "{record}");
+        assert!(!record["completed"]
+            .as_array()
+            .is_some_and(|done| { done.iter().any(|phase| phase == "commit") }));
+    }
+}
+
 // T2 -- #2301 "never reports success for an unconverged release": the observed
-// Helm revision, not the requested string, is the authority.
+// chart version, not the requested string, is the authority.
 //
 // The fixture's `helm show chart` reports 0.9.0, so Ruling 2's pre-mutation
 // refusal does NOT fire and Apply is genuinely entered -- asserted below,
@@ -499,7 +578,7 @@ fn observed_version_divergence_fails_apply() {
 }
 
 // T3 -- #2301 "a target-version canary". Apply's own post-condition read is
-// satisfied (`helm status` reports 0.9.0 immediately after the upgrade) and
+// satisfied (`helm get metadata` reports 0.9.0 after the upgrade) and
 // convergence is exact, THEN the release slips back to 0.8.6 before the canary.
 // Only a canary that re-reads the live version can catch that; a canary that
 // trusts `self.current` -- which Apply set from `--to` -- passes. This is the
