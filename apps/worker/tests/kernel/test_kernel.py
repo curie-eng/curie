@@ -1397,9 +1397,10 @@ def test_budget_exceeded_escalates_without_retry(make_harness) -> None:
 def test_connector_capability_failed_done_posts_diagnosis_not_escalate(
     make_harness,
 ) -> None:
-    # #2519: the runner short-circuits with ErrorEvent + DONE so the diagnosis
-    # reaches the message caller without a kernel.py change. Classified-failure
-    # would be overwritten by the escalate copy. This pins the DONE fork.
+    # #2519: a DONE final carrying the connector diagnosis reaches the message
+    # caller as-is, even when an ErrorEvent with this classification precedes
+    # it. Classified-failure would be overwritten by the escalate copy. This
+    # pins the DONE fork.
     async def go() -> None:
         async with make_harness() as h:
             diagnosis = (

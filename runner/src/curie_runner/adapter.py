@@ -16,10 +16,11 @@ this boundary and nothing above it is. ``aci-protocol`` is never mocked.
 from __future__ import annotations
 
 import contextlib
+import logging
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -34,6 +35,8 @@ from claude_agent_sdk.types import CanUseTool, McpSdkServerConfig, PermissionMod
 from .mcp_argv import install as install_mcp_argv_offload
 
 install_mcp_argv_offload()
+
+logger = logging.getLogger(__name__)
 
 _ALLOWED_PARTIAL_BOUNDARY_TYPES = frozenset(("message_start", "content_block_start"))
 
@@ -75,6 +78,22 @@ class ModelSession(Protocol):
 
     async def close(self) -> None:
         """Tear down the session."""
+        ...
+
+
+@runtime_checkable
+class McpServerReconnector(Protocol):
+    """A session whose own MCP connections the runner can check and repair (#2634).
+
+    Deliberately separate from ``ModelSession``: a side probe proving a
+    connector reachable says nothing about the long-lived session's own MCP
+    client, so before clearing a connector failure the runner asks the session
+    itself. Sessions that cannot answer (the offline fake, other harnesses)
+    simply do not implement this and keep the side-probe-only behavior.
+    """
+
+    async def ensure_mcp_server(self, name: str) -> bool:
+        """True when ``name`` is connected, reconnecting it once if it is not."""
         ...
 
 
@@ -207,3 +226,31 @@ class ClaudeAgentSession:
 
     async def close(self) -> None:
         await self._client.disconnect()
+
+    async def ensure_mcp_server(self, name: str) -> bool:
+        """Confirm the SDK session's own MCP connection to ``name`` (#2634).
+
+        Reads the CLI's live status; a server not ``connected`` gets one
+        ``reconnect_mcp_server`` and a re-read. Any exception is False, logged by
+        class only: the SDK's message text can carry a header value.
+        """
+
+        try:
+            if await self._mcp_server_status(name) == "connected":
+                return True
+            await self._client.reconnect_mcp_server(name)
+            return await self._mcp_server_status(name) == "connected"
+        except Exception as exc:  # noqa: BLE001 - an unconfirmed server stays excluded
+            logger.warning(
+                "mcp server reconnect check failed server=%s error_class=%s",
+                name,
+                type(exc).__name__,
+            )
+            return False
+
+    async def _mcp_server_status(self, name: str) -> str | None:
+        status = await self._client.get_mcp_status()
+        for server in status.get("mcpServers", []):
+            if server.get("name") == name:
+                return server.get("status")
+        return None

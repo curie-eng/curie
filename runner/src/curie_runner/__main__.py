@@ -58,19 +58,25 @@ from .history import (
     format_conversation_preamble,
     resolve_history,
 )
-from .hooks import _merge_pre_tool_use_hooks, load_bundle_hooks
+from .hooks import (
+    _merge_pre_tool_use_hooks,
+    build_gated_pre_tool_use_hooks,
+    load_bundle_hooks,
+)
 from .mcp_tool_capability import (
+    ConnectorAvailability,
     ConnectorCapabilityFailure,
     McpToolCapabilityProbe,
     diagnose_derived_connector_headers,
     probe_mcp_tool_capability,
+    reprobe_connector_failures,
 )
 from .memory import MemoryStore, format_memory_preamble, resolve_memory
 from .otel import RunTracer, build_tracer_provider
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
 from .server import create_app
-from .session import SessionRunner
+from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
@@ -313,13 +319,13 @@ def build_runner(
         raise
 
     # The gate's own PreToolUse matcher (#1852), MERGED with the bundle's rather
-    # than replacing it. Built here, after the boot refusal above has passed, so
-    # a bundle Curie is about to refuse never gets a hook registered against it.
-    # No gate -> no hook, which is what keeps an unconfigured agent's wiring
+    # than replacing it (the merge happens once the connector exclusion below is
+    # known). Built here, after the boot refusal above has passed, so a bundle
+    # Curie is about to refuse never gets a hook registered against it. No gate
+    # -> no hook, which is what keeps an unconfigured agent's wiring
     # byte-identical to before.
-    session_hooks = _merge_pre_tool_use_hooks(
-        build_approval_hook(approval_gate) if approval_gate is not None else None,
-        bundle_hooks,
+    approval_hooks = (
+        build_approval_hook(approval_gate) if approval_gate is not None else None
     )
 
     # The durable state store exposed to bundle code (#249): when the worker
@@ -355,6 +361,8 @@ def build_runner(
     real_options: ClaudeAgentOptions | None = None
     observed_readonly_tools: frozenset[str] = frozenset()
     capability = mcp_capability
+    connector_availability: ConnectorAvailability | None = None
+    connector_reprobe: ConnectorReprobe | None = None
     if not fake_model:
         # The bundle's live MCP ``tools/list`` response is the actual advertised
         # MCP surface. Probe even when an explicit gate already requires the
@@ -371,6 +379,33 @@ def build_runner(
                 sdk_env,
             )
         observed_readonly_tools = capability.readonly_tools
+        boot_connector_failures = connector_failures or capability.connector_failures
+        if boot_connector_failures:
+            # A failed declared connector no longer halts every turn (#2634).
+            # The model runs with that connector's tools denied by this hook,
+            # over an exclusion set the SessionRunner refreshes at each turn
+            # start by re-dialing the materialized server config. Re-probe is
+            # real-model only: the fake path's failures are expansion-only.
+            connector_availability = ConnectorAvailability(boot_connector_failures)
+            reprobe_servers = derived_mcp_servers
+            reprobe_env = sdk_env
+
+            async def reprobe(
+                failures: tuple[ConnectorCapabilityFailure, ...],
+            ) -> tuple[ConnectorCapabilityFailure, ...]:
+                return await reprobe_connector_failures(
+                    failures, reprobe_servers, reprobe_env
+                )
+
+            connector_reprobe = reprobe
+
+        # The connector exclusion FRONTS the approval hook in one callback
+        # (#2634) so an excluded gated tool never records a pending approval or
+        # spends a grant; bundle hooks stay siblings, as before.
+        session_hooks = _merge_pre_tool_use_hooks(
+            build_gated_pre_tool_use_hooks(approval_hooks, connector_availability),
+            bundle_hooks,
+        )
         carries_request_approval = (
             carries_explicit_action_gate or capability.has_potential_write_tool
         )
@@ -487,6 +522,8 @@ def build_runner(
             if capability is not None
             else ()
         ),
+        connector_reprobe=connector_reprobe,
+        connector_availability=connector_availability,
     )
 
 
