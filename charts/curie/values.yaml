@@ -2374,9 +2374,9 @@ security:
     # Every entry must set a parseable cidr and ports naming a concrete port with
     # no endPort. A broad route such as 0.0.0.0/0 or ::/0 is allowed here; the
     # chart adds an except for each metadata address it contains
-    # (169.254.169.254, fd00:ec2::254, ::ffff:169.254.169.254). `except: []` is
-    # refused, and an explicit except must cover every metadata address the cidr
-    # contains.
+    # (169.254.169.254, fd00:ec2::254). `except: []` is refused, an explicit
+    # except must cover those addresses, and an IPv4-mapped range such as
+    # ::ffff:0:0/96 is refused because no except can carve it.
     allowedEgress: []
     #  - cidr: 160.79.104.0/23           # e.g. api.anthropic.com
     #    ports: [{ protocol: TCP, port: 443 }]

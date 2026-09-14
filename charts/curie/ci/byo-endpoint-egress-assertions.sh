@@ -81,7 +81,8 @@
 #      allowedEgress keeps 0.0.0.0/0 and ::/0 but refuses `except: []`,
 #      port-less entries and excepts that miss a metadata address; the
 #      IPv4-mapped ::ffff:169.254.169.254 counts as metadata everywhere; and
-#      ::/0 renders one except per IPv6 metadata address.
+#      ::/0 renders exactly one IPv6 except, fd00:ec2::254/128, while an
+#      IPv4-mapped ::ffff:0:0/96 allowedEgress entry is refused.
 #  15. An in-chart dispatcher.apiBaseUrl (this release's API Service) is not
 #      external: api.deploy=true does not require api.egress.
 #
@@ -1323,8 +1324,10 @@ must_fail_naming "allowedEgress empty except" "empty except drops the cloud meta
   "$(ae_values emptyexcept '{ cidr: 0.0.0.0/0, except: [], ports: [{ protocol: TCP, port: 443 }] }')"
 must_fail_naming "allowedEgress port-less" "security.networkPolicy.allowedEgress entries must set ports" \
   "$(ae_values noport '{ cidr: 0.0.0.0/0 }')"
-must_fail_naming "allowedEgress except missing mapped metadata" "without covering the cloud metadata address ::ffff:169.254.169.254/128" \
-  "$(ae_values uncovered '{ cidr: "::/0", except: ["fd00::/8"], ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "allowedEgress except missing IPv6 metadata" "without covering the cloud metadata address fd00:ec2::254/128" \
+  "$(ae_values uncovered '{ cidr: "::/0", except: ["2001:db8::/32"], ports: [{ protocol: TCP, port: 443 }] }')"
+must_fail_naming "allowedEgress IPv4-mapped slash96" "is an IPv4-mapped IPv6 range" \
+  "$(ae_values mapped96 '{ cidr: "::ffff:0:0/96", ports: [{ protocol: TCP, port: 443 }] }')"
 must_fail_naming "allowedEgress unparseable IPv6" "is not a valid IPv6 CIDR" \
   "$(ae_values badv6 '{ cidr: "::gg/0", ports: [{ protocol: TCP, port: 443 }] }')"
 
@@ -1343,7 +1346,7 @@ ui:
 EOF
 must_fail_naming "api.egress IPv4-mapped metadata host" "api.egress entry \"::ffff:169.254.169.254/128\" must not cover" "$MAPPED_API"
 
-echo "=== Assertion 32: allowedEgress ::/0 excepts both IPv6 metadata forms; 0.0.0.0/0 still excepts 169.254.0.0/16 (#2643) ==="
+echo "=== Assertion 32: allowedEgress ::/0 excepts only fd00:ec2::254/128 (a mapped except is not same-family); 0.0.0.0/0 still excepts 169.254.0.0/16 (#2643) ==="
 BROAD_VALUES="$TMP/broad.yaml"
 cat > "$BROAD_VALUES" <<EOF
 security:
@@ -1362,7 +1365,7 @@ for path in pathlib.Path(out).rglob("*.yaml"):
     for doc in yaml.safe_load_all(path.read_text()):
         if doc and doc.get("kind") == "NetworkPolicy" and doc["metadata"]["name"] == name:
             blocks = {r["to"][0]["ipBlock"]["cidr"]: r["to"][0]["ipBlock"].get("except") for r in doc["spec"]["egress"]}
-            assert blocks["::/0"] == ["fd00:ec2::254/128", "::ffff:169.254.169.254/128"], blocks
+            assert blocks["::/0"] == ["fd00:ec2::254/128"], blocks
             assert blocks["0.0.0.0/0"] == ["169.254.0.0/16"], blocks
             print(f"ok: {name} excepts {blocks}")
             sys.exit(0)
