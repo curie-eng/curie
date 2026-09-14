@@ -4583,6 +4583,14 @@ async fn prepare_deploy_with_commit_sha(
     // long before anything is applied. `opts.plugin_dir` (not the canonicalized
     // copy) is the path they typed.
     let connector_decl = crate::connector_build::load(&plugin_dir)?;
+    if opts.tier == DeployTier::Local
+        && connector_decl
+            .connectors
+            .values()
+            .any(|spec| spec.url.is_none() && spec.unhosted_url.is_none())
+    {
+        connector_start_timeout_from_env()?;
+    }
     {
         let decl = &connector_decl;
         if decl.connectors.values().any(|spec| spec.build.is_some()) {
@@ -11155,6 +11163,66 @@ pub fn connectors_needing_rebuild(
 }
 
 // ---------------------------------------------------------------------------
+// Shared connector startup configuration
+// ---------------------------------------------------------------------------
+
+const CONNECTOR_START_TIMEOUT_ENV: &str = "CURIE_CONNECTOR_START_TIMEOUT_SECONDS";
+
+/// Default readiness observation window for both skill and local connectors.
+const DEFAULT_CONNECTOR_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Extra time for the Compose client to start and collect its own result. This
+/// does not extend the readiness value passed to Compose itself.
+const CONNECTOR_COMPOSE_CLIENT_ALLOWANCE: Duration = Duration::from_secs(5);
+
+fn invalid_connector_start_timeout() -> anyhow::Error {
+    anyhow::Error::from(
+        crate::exit::CliError::usage(format!(
+            "{CONNECTOR_START_TIMEOUT_ENV} must be a positive whole number of seconds small enough for the connector startup clock"
+        ))
+        .with_fix(format!(
+            "unset {CONNECTOR_START_TIMEOUT_ENV} to use the {} second default, or set it to a positive whole number of seconds that fits this system",
+            DEFAULT_CONNECTOR_START_TIMEOUT.as_secs()
+        )),
+    )
+}
+
+/// Read the connector startup window once for either local startup path.
+///
+/// Checking the Compose allowance here keeps every later deadline addition
+/// representable. Callers invoke this only when a bundle has a hosted
+/// connector, so an unrelated invalid setting cannot affect connectorless
+/// bundles.
+fn connector_start_timeout_from_env() -> Result<Duration> {
+    let Some(raw) = std::env::var_os(CONNECTOR_START_TIMEOUT_ENV) else {
+        return Ok(DEFAULT_CONNECTOR_START_TIMEOUT);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| invalid_connector_start_timeout())?;
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_connector_start_timeout());
+    }
+    let seconds = raw
+        .parse::<u64>()
+        .map_err(|_| invalid_connector_start_timeout())?;
+    if seconds == 0 {
+        return Err(invalid_connector_start_timeout());
+    }
+    let timeout = Duration::from_secs(seconds);
+    let complete_compose_window = timeout
+        .checked_add(CONNECTOR_COMPOSE_CLIENT_ALLOWANCE)
+        .ok_or_else(invalid_connector_start_timeout)?;
+    if Instant::now()
+        .checked_add(complete_compose_window)
+        .is_none()
+    {
+        return Err(invalid_connector_start_timeout());
+    }
+    Ok(timeout)
+}
+
+// ---------------------------------------------------------------------------
 // The local tier's connector bring-up
 // ---------------------------------------------------------------------------
 
@@ -11220,6 +11288,11 @@ pub async fn bring_up_local(
         .iter()
         .filter(|(_, spec)| spec.url.is_none() && spec.unhosted_url.is_none())
         .collect();
+    let connector_start_timeout = if hosted.is_empty() {
+        DEFAULT_CONNECTOR_START_TIMEOUT
+    } else {
+        connector_start_timeout_from_env()?
+    };
 
     // Fail closed BEFORE anything is reaped, staged, written, or started -- the
     // same refusal `skill up` performs, which this path used to skip. A declared
@@ -11294,31 +11367,27 @@ pub async fn bring_up_local(
     // The values reach the containers through the compose child's environment,
     // where `${NAME}` in the file above expands from -- never through the file,
     // never through argv, and masked in anything printed.
-    let command = cb::compose_up_command(&path, project, &secret_values);
-    // Compose itself retains its 60-second readiness limit. The client gets a
-    // separate five-second allowance for Compose process creation and polling
-    // overhead. The bounded ID lookup and fresh final readiness observation
-    // below make the local readiness stage at most 80 seconds; the shared
-    // skill-tier readiness budget remains 60 seconds.
-    let compose_client_deadline =
-        Instant::now() + docker::CONNECTOR_START_TIMEOUT + docker::CONNECTOR_DIAGNOSTIC_TIMEOUT;
+    let command = cb::compose_up_command(&path, project, &secret_values, connector_start_timeout);
+    // Compose receives the configured readiness limit exactly. The client gets
+    // a separate five second allowance for process creation and polling
+    // overhead. ID resolution and final diagnostics retain their own clocks.
+    let compose_client_timeout = connector_start_timeout
+        .checked_add(CONNECTOR_COMPOSE_CLIENT_ALLOWANCE)
+        .expect("the connector timeout parser validated the client allowance");
     let activation_context = "the API deployment was activated and was not rolled back, but starting the bundle's connectors failed";
-    let compose_succeeded = match tokio::time::timeout(
-        compose_client_deadline.saturating_duration_since(Instant::now()),
-        crate::ops::run_capture(&command),
-    )
-    .await
-    {
-        // `compose up --wait` can identify an exited or unhealthy service, but
-        // its text is not a stable connector diagnostic. The shared Docker
-        // waiter below reads the owned service IDs and reports the named reason
-        // without exposing Compose, container, or health check logs.
-        Ok(Ok((ok, _out, _err))) => ok,
-        Err(_) => false,
-        Ok(Err(err)) => return Err(err).context(activation_context),
-    };
-    // Compose can return ready at the end of its own 60-second readiness
-    // limit. Resolve the declared keys to actual Docker IDs in a separately
+    let compose_succeeded =
+        match tokio::time::timeout(compose_client_timeout, crate::ops::run_capture(&command)).await
+        {
+            // `compose up --wait` can identify an exited or unhealthy service, but
+            // its text is not a stable connector diagnostic. The shared Docker
+            // waiter below reads the owned service IDs and reports the named reason
+            // without exposing Compose, container, or health check logs.
+            Ok(Ok((ok, _out, _err))) => ok,
+            Err(_) => false,
+            Ok(Err(err)) => return Err(err).context(activation_context),
+        };
+    // Compose can return ready at the end of its configured readiness limit.
+    // Resolve the declared keys to actual Docker IDs in a separately
     // bounded window so that work cannot consume the five-second readiness
     // observation a no-health connector needs to prove uninterrupted running.
     let resolution_deadline = Instant::now() + docker::CONNECTOR_ID_RESOLUTION_TIMEOUT;
@@ -11329,11 +11398,11 @@ pub async fn bring_up_local(
         resolution_deadline,
     )
     .await;
-    // Start this fresh clock only after every ID lookup has completed. This
-    // never turns a failed Compose invocation into success.
-    let diagnostic_deadline = Instant::now() + docker::CONNECTOR_DIAGNOSTIC_TIMEOUT;
+    // The waiter starts this fresh clock only after every ID lookup has
+    // completed. This never turns a failed Compose invocation into success.
     let mut readiness =
-        docker::wait_for_connectors_ready(&readiness_targets, diagnostic_deadline).await;
+        docker::wait_for_connectors_ready(&readiness_targets, docker::CONNECTOR_DIAGNOSTIC_TIMEOUT)
+            .await;
     if !compose_succeeded && readiness.is_ok() {
         let connector_keys = connector_services
             .iter()
@@ -11443,11 +11512,11 @@ async fn start_skill_connectors(
 ) -> Result<Vec<String>> {
     use crate::connector_build as cb;
 
+    let readiness_timeout = connector_start_timeout_from_env()?;
     let lock = cb::load_lock(plugin_dir)?.unwrap_or_else(|| cb::ConnectorLockFileDecl {
         version: cb::LOCK_VERSION,
         connectors: std::collections::BTreeMap::new(),
     });
-    let readiness_deadline = Instant::now() + docker::CONNECTOR_START_TIMEOUT;
     let mut started = Vec::new();
     let mut readiness_targets = Vec::new();
     for (connector, image) in skill_connector_plan(decl, &lock)? {
@@ -11484,6 +11553,6 @@ async fn start_skill_connectors(
         readiness_targets.push((connector.to_string(), start.container_name.clone()));
         started.push(start.container_name);
     }
-    docker::wait_for_connectors_ready(&readiness_targets, readiness_deadline).await?;
+    docker::wait_for_connectors_ready(&readiness_targets, readiness_timeout).await?;
     Ok(started)
 }
