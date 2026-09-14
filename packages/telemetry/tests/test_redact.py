@@ -28,6 +28,17 @@ FAKE_DISCORD_BOT_TOKEN = (
 )
 FAKE_DISCORD_BOT_AUTHORIZATION = "Authorization: Bot " + FAKE_DISCORD_BOT_TOKEN
 FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT = "DISCORD_BOT_TOKEN=" + FAKE_DISCORD_BOT_TOKEN
+# Shape-valid synthetic bot token: first segment starts with M (a base64
+# snowflake id) and is 24 chars, middle is 6, last is 27.
+FAKE_SHAPED_DISCORD_BOT_TOKEN = (
+    "M" + "FAKEFAKEFAKEFAKEFAKE000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
+)
+# Discord executes webhooks at /webhooks/{webhook.id}/{webhook.token}:
+# https://docs.discord.com/developers/resources/webhook
+FAKE_DISCORD_WEBHOOK_ID = "100000000000000000"
+FAKE_DISCORD_WEBHOOK_TOKEN = (
+    "FAKE" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE-" + "FAKEFAKEFAKEFAKEFAKEFAKE_FAKE000"
+)
 # Delivery correlation id from the channel protocol tests, not a credential.
 BENIGN_EVENT_ID = "chn-7f3-a1b2c3d4e5f60718"
 
@@ -136,12 +147,104 @@ def test_discord_bot_token_assignments_are_redacted() -> None:
     )
 
 
-def test_bare_discord_bot_token_without_context_is_not_redacted() -> None:
+def test_three_segment_value_without_discord_shape_or_context_is_not_redacted() -> None:
+    # FAKE_DISCORD_BOT_TOKEN's first segment starts with F, so it lacks the
+    # bot-token shape (id segment starting M, N or O). With no Authorization or
+    # DISCORD_BOT_TOKEN= context either, nothing identifies it as a credential.
     for line in (
         FAKE_DISCORD_BOT_TOKEN,
         f"provider diagnostic value={FAKE_DISCORD_BOT_TOKEN}",
     ):
         assert redact_text(line) == line
+
+
+def test_bare_shaped_discord_bot_token_is_redacted() -> None:
+    assert redact_text(FAKE_SHAPED_DISCORD_BOT_TOKEN) == "[REDACTED:discord_bot_token]"
+    assert redact_text(
+        f"gateway login with {FAKE_SHAPED_DISCORD_BOT_TOKEN} failed."
+    ) == "gateway login with [REDACTED:discord_bot_token] failed."
+
+
+def test_shaped_discord_bot_token_in_dict_repr_is_redacted() -> None:
+    headers = {"Authorization": "Bot " + FAKE_SHAPED_DISCORD_BOT_TOKEN}
+
+    for text in (
+        str(headers),
+        repr(headers),
+        f"HTTPException: 401 Unauthorized request headers={headers!r}",
+    ):
+        redacted = redact_text(text)
+
+        assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
+        assert "[REDACTED:discord_bot_token]" in redacted
+        assert "'Authorization': 'Bot [REDACTED:discord_bot_token]'" in redacted
+
+
+def test_shaped_discord_bot_token_with_context_keeps_the_context_placeholder() -> None:
+    assert redact_text("Authorization: Bot " + FAKE_SHAPED_DISCORD_BOT_TOKEN) == (
+        "Authorization: Bot [REDACTED:discord_bot_authorization]"
+    )
+    assert redact_text("DISCORD_BOT_TOKEN=" + FAKE_SHAPED_DISCORD_BOT_TOKEN) == (
+        "DISCORD_BOT_TOKEN=[REDACTED:discord_bot_token_assignment]"
+    )
+
+
+def test_discord_bot_token_shape_near_matches_are_not_redacted() -> None:
+    first, middle, last = FAKE_SHAPED_DISCORD_BOT_TOKEN.split(".")
+    for line in (
+        # First segment must start with M, N or O.
+        "P" + first[1:] + "." + middle + "." + last,
+        # Middle segment must be exactly six characters.
+        first + "." + middle + "0" + "." + last,
+        first + "." + middle[:-1] + "." + last,
+        # First segment too short, last segment too short or too long.
+        first[:-1] + "." + middle + "." + last,
+        first + "." + middle + "." + last[:-1],
+        first + "." + middle + "." + last + "FAKEFAKEFAKE",
+        # Embedded in a longer run, or part of a four-segment value.
+        "FAKE" + FAKE_SHAPED_DISCORD_BOT_TOKEN,
+        "FAKE-" + FAKE_SHAPED_DISCORD_BOT_TOKEN,
+        FAKE_SHAPED_DISCORD_BOT_TOKEN + "." + "FAKE00",
+        "FAKE00" + "." + FAKE_SHAPED_DISCORD_BOT_TOKEN,
+    ):
+        assert redact_text(line) == line
+
+
+def test_discord_webhook_url_token_is_redacted_and_url_stays_diagnostic() -> None:
+    path = "/webhooks/" + FAKE_DISCORD_WEBHOOK_ID + "/"
+    for prefix, suffix in (
+        ("https://discord.com/api" + path, ""),
+        ("https://discordapp.com/api" + path, ""),
+        ("https://canary.discord.com/api/v10" + path, ""),
+        ("https://discord.com/api" + path, "?wait=true"),
+    ):
+        url = prefix + FAKE_DISCORD_WEBHOOK_TOKEN + suffix
+
+        redacted = redact_text(f"POST {url} returned 404")
+
+        assert FAKE_DISCORD_WEBHOOK_TOKEN not in redacted
+        assert redacted == (
+            f"POST {prefix}[REDACTED:discord_webhook_url]{suffix} returned 404"
+        )
+
+
+def test_non_discord_webhook_url_is_not_redacted() -> None:
+    for line in (
+        "https://example.com/api/webhooks/" + FAKE_DISCORD_WEBHOOK_ID + "/FAKE00",
+        "https://discord.com/api/webhooks/FAKE00/FAKE00",
+    ):
+        assert redact_text(line) == line
+
+
+def test_discord_shape_redaction_is_idempotent() -> None:
+    webhook = (
+        "https://discord.com/api/webhooks/"
+        + FAKE_DISCORD_WEBHOOK_ID
+        + "/"
+        + FAKE_DISCORD_WEBHOOK_TOKEN
+    )
+    for secret in (FAKE_SHAPED_DISCORD_BOT_TOKEN, webhook):
+        assert redact_text(redact_text(secret)) == redact_text(secret)
 
 
 def test_ordinary_three_segment_diagnostic_is_not_redacted() -> None:

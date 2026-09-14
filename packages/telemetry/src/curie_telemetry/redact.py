@@ -126,6 +126,36 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         r"\1[REDACTED:discord_bot_token_assignment]",
     ),
     RedactionRule(
+        "discord_webhook_url",
+        # Discord executes webhooks at ``/webhooks/{webhook.id}/{webhook.token}``
+        # and the token alone authorizes posting:
+        # https://docs.discord.com/developers/resources/webhook
+        # Scheme, host, path and id stay diagnostic; only the token is dropped.
+        re.compile(
+            r"(https?://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/api/(?:v\d+/)?webhooks/\d+/)"
+            r"(?!\[REDACTED:)[A-Za-z0-9_-]+",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED:discord_webhook_url]",
+    ),
+    RedactionRule(
+        "discord_bot_token",
+        # Shape rule for a bot token with no surrounding context (a dict repr,
+        # a bare value). Tokens are ``base64(user id).timestamp.hmac``; a
+        # snowflake id starts with 1-3, which base64-encodes to M, N or O. This
+        # is the shape TruffleHog's Discord detector keys on
+        # (https://github.com/trufflesecurity/trufflehog, pkg/detectors/discordbottoken),
+        # with the first segment widened to 28 chars for 19-20 digit ids. It
+        # runs after the context rules so those keep their named placeholders.
+        # Neither side may continue into another dotted segment.
+        re.compile(
+            r"(?<![A-Za-z0-9_-])(?<![A-Za-z0-9_-]\.)"
+            r"[MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,38}"
+            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
+        ),
+        _placeholder("discord_bot_token"),
+    ),
+    RedactionRule(
         "secret_assignment",
         # ``\b`` does not fire before ``token`` in ``CURIE_CHANNEL_TOKEN=``
         # because ``_`` is a word character. Require a non-alphanumeric

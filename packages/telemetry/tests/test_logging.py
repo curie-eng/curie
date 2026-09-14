@@ -24,14 +24,37 @@ _FAKE_DISCORD_BOT_AUTHORIZATION = (
 _FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT = (
     "DISCORD_BOT_TOKEN=" + _FAKE_DISCORD_BOT_TOKEN
 )
+_FAKE_SHAPED_DISCORD_BOT_TOKEN = (
+    "M" + "FAKEFAKEFAKEFAKEFAKE000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
+)
+_FAKE_DISCORD_WEBHOOK_PREFIX = (
+    "https://discord.com/api/webhooks/" + "100000000000000000/"
+)
+_FAKE_DISCORD_WEBHOOK_TOKEN = (
+    "FAKE" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE-" + "FAKEFAKEFAKEFAKEFAKEFAKE_FAKE000"
+)
+_FAKE_DISCORD_WEBHOOK_URL = _FAKE_DISCORD_WEBHOOK_PREFIX + _FAKE_DISCORD_WEBHOOK_TOKEN
+# vector -> (rule name, diagnostic carrier that must survive, secret that must not)
 _DISCORD_VECTOR_EXPECTATIONS = {
     _FAKE_DISCORD_BOT_AUTHORIZATION: (
         "discord_bot_authorization",
         "Authorization: Bot ",
+        _FAKE_DISCORD_BOT_TOKEN,
     ),
     _FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT: (
         "discord_bot_token_assignment",
         "DISCORD_BOT_TOKEN=",
+        _FAKE_DISCORD_BOT_TOKEN,
+    ),
+    _FAKE_SHAPED_DISCORD_BOT_TOKEN: (
+        "discord_bot_token",
+        "runner request failed value=",
+        _FAKE_SHAPED_DISCORD_BOT_TOKEN,
+    ),
+    _FAKE_DISCORD_WEBHOOK_URL: (
+        "discord_webhook_url",
+        _FAKE_DISCORD_WEBHOOK_PREFIX,
+        _FAKE_DISCORD_WEBHOOK_TOKEN,
     ),
 }
 
@@ -62,6 +85,8 @@ _SECRET_VECTORS = (
     "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000",
     _FAKE_DISCORD_BOT_AUTHORIZATION,
     _FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT,
+    _FAKE_SHAPED_DISCORD_BOT_TOKEN,
+    _FAKE_DISCORD_WEBHOOK_URL,
 )
 
 
@@ -330,8 +355,8 @@ def test_args_style_service_log_is_correlated_redacted_and_preserved_on_stderr(
         assert "[REDACTED:" in stderr_record["message"]
         discord_expectation = _DISCORD_VECTOR_EXPECTATIONS.get(redaction_probe)
         if discord_expectation is not None:
-            rule_name, carrier = discord_expectation
-            assert _FAKE_DISCORD_BOT_TOKEN not in stderr_record["message"]
+            rule_name, carrier, secret = discord_expectation
+            assert secret not in stderr_record["message"]
             assert f"[REDACTED:{rule_name}]" in stderr_record["message"]
             assert carrier in stderr_record["message"]
 
@@ -341,8 +366,8 @@ def test_args_style_service_log_is_correlated_redacted_and_preserved_on_stderr(
         assert redaction_probe not in exported_body
         assert "[REDACTED:" in exported_body
         if discord_expectation is not None:
-            rule_name, carrier = discord_expectation
-            assert _FAKE_DISCORD_BOT_TOKEN not in exported_body
+            rule_name, carrier, secret = discord_expectation
+            assert secret not in exported_body
             assert f"[REDACTED:{rule_name}]" in exported_body
             assert carrier in exported_body
         assert _trace_ids(exported) == (expected_trace_id, expected_span_id)
