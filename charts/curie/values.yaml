@@ -1070,6 +1070,8 @@ api:
   # Postgres responds, while process local /health keeps the process alive.
   # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.
   # Formula/rationale: ci/probe-window-assertions.sh header.
+  # Kubelet withdrawal of a bounce shorter than the 120s readiness cutoff is
+  # out of scope; the longer-outage proof covers endpoints.
   readinessProbe:
     initialDelaySeconds: 5
     periodSeconds: 5
