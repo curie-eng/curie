@@ -31,6 +31,10 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import CanUseTool, McpSdkServerConfig, PermissionMode
 
+from .mcp_argv import install as install_mcp_argv_offload
+
+install_mcp_argv_offload()
+
 _ALLOWED_PARTIAL_BOUNDARY_TYPES = frozenset(("message_start", "content_block_start"))
 
 
