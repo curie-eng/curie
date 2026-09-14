@@ -21,11 +21,9 @@ from curie_worker import run
 from curie_worker.config import WorkerConfig
 from curie_worker.run import (
     _MAX_TUNABLE_SECONDS,
-    _restart_delay_s,
     _sandbox_client,
     _substrate_config,
     _supervise,
-    _supervise_policy,
     main,
 )
 from curie_worker.sandbox import DockerSandboxClient, SubstrateConfig
@@ -760,11 +758,11 @@ def test_supervise_does_not_emit_restart_metric_after_shutdown(
 
 
 def test_restart_delay_doubles_from_base_and_caps() -> None:
-    schedule = [_restart_delay_s(n, base_s=1.0, max_s=60.0) for n in range(1, 10)]
+    schedule = [run._restart_delay_s(n, base_s=1.0, max_s=60.0) for n in range(1, 10)]
     assert schedule == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0]
     # A very long streak stays at the cap rather than overflowing.
-    assert _restart_delay_s(10_000, base_s=1.0, max_s=60.0) == 60.0
-    assert _restart_delay_s(3, base_s=0.0, max_s=60.0) == 0.0
+    assert run._restart_delay_s(10_000, base_s=1.0, max_s=60.0) == 60.0
+    assert run._restart_delay_s(3, base_s=0.0, max_s=60.0) == 0.0
 
 
 def _capture_metrics(
@@ -919,7 +917,7 @@ def test_supervise_policy_reads_worker_config() -> None:
         CURIE_WORKER_SUPERVISE_MAX_CONSECUTIVE_FAILURES=5,
         CURIE_WORKER_SUPERVISE_FAILURE_RESET_S=120.0,
     )
-    assert _supervise_policy(config) == {
+    assert run._supervise_policy(config) == {
         "restart_backoff_s": 2.0,
         "max_restart_backoff_s": 30.0,
         "max_consecutive_failures": 5,
