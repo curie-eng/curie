@@ -1477,7 +1477,121 @@ def test_observe_reads_terminal_status_from_dict_shaped_kubernetes_objects(
     observed = cluster.observe("curie-publication-22222222222242228222")
 
     assert observed.phase == "failed"
-    assert observed.error == "DeadlineExceeded"
+    assert observed.error == "DeadlineExceeded; pod logs were unavailable"
+
+
+def _real_client_pod_log(raw: bytes) -> Any:
+    """Mimic kubernetes-python 36.0.3's read_namespaced_pod_log shape.
+
+    Without ``_preload_content=False`` the generated client decodes the
+    urllib3 response body with ``str(bytes_body)``, i.e. the Python repr of
+    the raw bytes. With ``_preload_content=False`` it hands back the raw
+    HTTPResponse-like object whose ``.data`` is the actual bytes.
+    """
+
+    def read_log(
+        _name: str,
+        _namespace: str,
+        *_args: object,
+        _preload_content: bool = True,
+        **_kwargs: object,
+    ) -> Any:
+        if _preload_content is False:
+            return SimpleNamespace(data=raw)
+        return repr(raw)
+
+    return read_log
+
+
+def _owned_pod(name: str, job_uid: str) -> Any:
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            name=name,
+            owner_references=[SimpleNamespace(kind="Job", uid=job_uid)],
+        )
+    )
+
+
+def test_observe_parses_pr_markers_from_the_real_clients_pod_log_shape(
+    publication_k8s: Any,
+) -> None:
+    cluster = object.__new__(publication_k8s.KubernetesPublicationCluster)
+    cluster.namespace = "curie-publications"
+    job_uid = "job-uid-success"
+    cluster._batch = SimpleNamespace(
+        read_namespaced_job=lambda *_args: SimpleNamespace(
+            metadata=SimpleNamespace(uid=job_uid),
+            status=SimpleNamespace(succeeded=1, failed=0, conditions=[]),
+        )
+    )
+    raw = (
+        b"Cloning into 'repo'...\n"
+        b"CURIE_PR_URL=https://github.com/acme-corp/acme-bot/pull/123\n"
+        b"CURIE_PR_NUMBER=123\n"
+        + f"CURIE_COMMIT_SHA={REVISION_HEAD}\n".encode()
+    )
+    cluster._core = SimpleNamespace(
+        list_namespaced_pod=lambda *_args, **_kwargs: SimpleNamespace(
+            items=[_owned_pod("owned-pod", job_uid)]
+        ),
+        read_namespaced_pod_log=_real_client_pod_log(raw),
+    )
+
+    observed = cluster.observe("curie-publication-22222222222242228222")
+
+    assert observed.pr_url == "https://github.com/acme-corp/acme-bot/pull/123"
+    assert observed.pr_number == 123
+    assert observed.commit_sha == REVISION_HEAD
+
+
+def test_observe_failed_job_error_is_not_a_bytes_repr_on_the_real_client_shape(
+    publication_k8s: Any,
+) -> None:
+    cluster = object.__new__(publication_k8s.KubernetesPublicationCluster)
+    cluster.namespace = "curie-publications"
+    job_uid = "job-uid-failed"
+    cluster._batch = SimpleNamespace(
+        read_namespaced_job=lambda *_args: SimpleNamespace(
+            metadata=SimpleNamespace(uid=job_uid),
+            status=SimpleNamespace(
+                succeeded=0,
+                failed=1,
+                conditions=[
+                    SimpleNamespace(
+                        type="FailureTarget",
+                        status="True",
+                        reason="BackoffLimitExceeded",
+                        message="Job has reached the specified backoff limit",
+                    ),
+                    SimpleNamespace(
+                        type="Failed",
+                        status="True",
+                        reason="BackoffLimitExceeded",
+                        message="Job has reached the specified backoff limit",
+                    ),
+                ],
+            ),
+        )
+    )
+    raw = (
+        b"Cloning into 'repo'...\n"
+        b"fatal: Authentication failed for 'https://github.com/o/r.git/'\n"
+    )
+    cluster._core = SimpleNamespace(
+        list_namespaced_pod=lambda *_args, **_kwargs: SimpleNamespace(
+            items=[_owned_pod("owned-pod", job_uid)]
+        ),
+        read_namespaced_pod_log=_real_client_pod_log(raw),
+    )
+
+    observed = cluster.observe("curie-publication-22222222222242228222")
+
+    assert observed.error is not None
+    assert "fatal: Authentication failed" in observed.error
+    assert 'b"' not in observed.error
+    assert "b'" not in observed.error
+    assert "\\n" not in observed.error
+    assert observed.error.count("BackoffLimitExceeded") == 1
 
 
 def test_resource_builder_binds_clone_url_to_publication_repository(
@@ -1503,3 +1617,259 @@ def test_publication_cluster_has_no_legacy_combined_cleanup_shim(
     publication_k8s: Any,
 ) -> None:
     assert not hasattr(publication_k8s.KubernetesPublicationCluster, "cleanup")
+
+
+def _omitempty(value: Any) -> Any:
+    """Serialize like the apiserver: drop empty strings, lists and maps."""
+
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            projected = _omitempty(item)
+            if projected in ("", [], {}, None):
+                continue
+            result[key] = projected
+        return result
+    if isinstance(value, list):
+        return [_omitempty(item) for item in value]
+    return value
+
+
+def _apiserver_minimal_resources(module: Any) -> Any:
+    return module.build_publication_resources(
+        _payload(module),
+        credential=WRITE_CREDENTIAL,
+        settings=replace(
+            _settings(module), priority_class_name="", image_pull_secrets=()
+        ),
+    )
+
+
+def test_apiserver_omitempty_serialized_own_job_is_adopted(
+    publication_k8s: Any,
+) -> None:
+    resources = _apiserver_minimal_resources(publication_k8s)
+    observed = _omitempty(deepcopy(resources.job))
+    pod_spec = observed["spec"]["template"]["spec"]
+    assert "priorityClassName" not in pod_spec
+    assert "imagePullSecrets" not in pod_spec
+    env = pod_spec["containers"][0]["env"]
+    assert any("value" not in item for item in env)
+
+    publication_k8s.validate_adopted_resource("Job", resources.job, observed)
+    publication_k8s.validate_adopted_resource(
+        "ConfigMap",
+        resources.config_map,
+        _omitempty(deepcopy(resources.config_map)),
+    )
+
+
+def test_omitempty_tolerance_still_refuses_non_empty_where_empty_expected(
+    publication_k8s: Any,
+) -> None:
+    resources = _apiserver_minimal_resources(publication_k8s)
+
+    planted_env = _omitempty(deepcopy(resources.job))
+    for item in planted_env["spec"]["template"]["spec"]["containers"][0]["env"]:
+        if item["name"] == "PR_URL":
+            item["value"] = "https://evil.example/pull/1"
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, planted_env)
+
+    planted_priority = _omitempty(deepcopy(resources.job))
+    planted_priority["spec"]["template"]["spec"][
+        "priorityClassName"
+    ] = "system-node-critical"
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, planted_priority)
+
+    planted_pull = _omitempty(deepcopy(resources.job))
+    planted_pull["spec"]["template"]["spec"]["imagePullSecrets"] = [{"name": "x"}]
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, planted_pull)
+
+
+def test_omitempty_tolerance_refuses_differing_or_emptied_non_empty_values(
+    publication_k8s: Any,
+) -> None:
+    resources = _resources(publication_k8s)
+
+    differing = deepcopy(resources.job)
+    differing["spec"]["template"]["spec"]["priorityClassName"] = "other-class"
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, differing)
+
+    emptied = deepcopy(resources.job)
+    emptied["spec"]["template"]["spec"]["imagePullSecrets"] = []
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, emptied)
+
+    absent = deepcopy(resources.job)
+    del absent["spec"]["template"]["spec"]["imagePullSecrets"]
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, absent)
+
+    backoff_absent = deepcopy(resources.job)
+    del backoff_absent["spec"]["backoffLimit"]
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, backoff_absent)
+
+
+def test_omitempty_tolerance_refuses_valueFrom_secretKeyRef_on_omitted_env(
+    publication_k8s: Any,
+) -> None:
+    resources = _apiserver_minimal_resources(publication_k8s)
+    secret_name = resources.secret["metadata"]["name"]
+
+    planted = _omitempty(deepcopy(resources.job))
+    container = planted["spec"]["template"]["spec"]["containers"][0]
+    env = container["env"]
+    empty_items = [item for item in env if "value" not in item]
+    assert empty_items, "expected at least one omitted-value env entry to attack"
+    empty_items[0]["valueFrom"] = {
+        "secretKeyRef": {"name": secret_name, "key": "credential"}
+    }
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, planted)
+
+
+def test_omitempty_tolerance_refuses_valueFrom_configMapKeyRef_on_omitted_env(
+    publication_k8s: Any,
+) -> None:
+    resources = _apiserver_minimal_resources(publication_k8s)
+
+    planted = _omitempty(deepcopy(resources.job))
+    container = planted["spec"]["template"]["spec"]["containers"][0]
+    env = container["env"]
+    empty_items = [item for item in env if "value" not in item]
+    assert empty_items, "expected at least one omitted-value env entry to attack"
+    empty_items[0]["valueFrom"] = {
+        "configMapKeyRef": {"name": "attacker-configmap", "key": "credential"}
+    }
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, planted)
+
+
+def test_omitempty_tolerance_refuses_added_envFrom(
+    publication_k8s: Any,
+) -> None:
+    resources = _apiserver_minimal_resources(publication_k8s)
+    secret_name = resources.secret["metadata"]["name"]
+
+    planted = _omitempty(deepcopy(resources.job))
+    container = planted["spec"]["template"]["spec"]["containers"][0]
+    container["envFrom"] = [{"secretRef": {"name": secret_name}}]
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, planted)
+
+
+def _failed_job_cluster(
+    module: Any, *, pods: list[Any], logs: str, reason: str = "BackoffLimitExceeded"
+) -> Any:
+    cluster = object.__new__(module.KubernetesPublicationCluster)
+    cluster.namespace = "curie-publications"
+    cluster._batch = SimpleNamespace(
+        read_namespaced_job=lambda *_args: {
+            "metadata": {"uid": "job-uid-123"},
+            "status": {
+                "succeeded": 0,
+                "failed": 1,
+                "conditions": [
+                    {
+                        "type": "Failed",
+                        "status": "True",
+                        "reason": reason,
+                        "message": "Job has reached the specified backoff limit",
+                    }
+                ],
+            },
+        }
+    )
+    cluster._core = SimpleNamespace(
+        list_namespaced_pod=lambda *_args, **_kwargs: {"items": pods},
+        read_namespaced_pod_log=lambda *_args, **_kwargs: logs,
+    )
+    return cluster
+
+
+def _failed_owned_pod(exit_code: int = 128) -> dict[str, Any]:
+    return {
+        "metadata": {
+            "name": "owned-pod",
+            "ownerReferences": [{"kind": "Job", "uid": "job-uid-123"}],
+        },
+        "status": {
+            "containerStatuses": [
+                {
+                    "name": "publish",
+                    "state": {
+                        "terminated": {"reason": "Error", "exitCode": exit_code}
+                    },
+                }
+            ]
+        },
+    }
+
+
+def test_observe_failed_job_names_reason_exit_code_and_redacted_git_error(
+    publication_k8s: Any,
+) -> None:
+    logs = "\n".join(
+        [
+            "CURIE_PUBLICATION_STAGE=clone",
+            "Cloning into 'repo'...",
+            "Authorization: Bearer SECRETTOKEN",
+            "fatal: repository 'https://x-access-token:SECRETTOKEN@github.com/o/r.git/'"
+            " not found",
+            "CURIE_PUBLICATION_STAGE=failed",
+        ]
+    )
+    cluster = _failed_job_cluster(
+        publication_k8s, pods=[_failed_owned_pod(128)], logs=logs
+    )
+
+    observed = cluster.observe("curie-publication-22222222222242228222")
+
+    assert observed.phase == "failed"
+    error = observed.error or ""
+    assert "BackoffLimitExceeded" in error
+    assert "exit code 128" in error
+    assert "fatal: repository 'https://" in error
+    assert "github.com/o/r.git/' not found" in error
+    assert "CURIE_PUBLICATION_STAGE" not in error
+    assert "SECRETTOKEN" not in error
+    assert "SECRETTOKEN" not in observed.logs
+    assert len(error) <= 1500
+
+
+def test_observe_failed_job_error_is_bounded_for_huge_logs(
+    publication_k8s: Any,
+) -> None:
+    logs = "\n".join(f"fatal: line {index} " + "x" * 200 for index in range(60))
+    cluster = _failed_job_cluster(
+        publication_k8s, pods=[_failed_owned_pod(1)], logs=logs
+    )
+
+    observed = cluster.observe("curie-publication-22222222222242228222")
+
+    error = observed.error or ""
+    assert "BackoffLimitExceeded" in error
+    assert "fatal: line 59" in error
+    assert len(error) <= 1500
+
+
+def test_observe_failed_job_without_pod_says_logs_were_unavailable(
+    publication_k8s: Any,
+) -> None:
+    cluster = _failed_job_cluster(
+        publication_k8s, pods=[], logs="", reason="DeadlineExceeded"
+    )
+
+    observed = cluster.observe("curie-publication-22222222222242228222")
+
+    error = observed.error or ""
+    assert "DeadlineExceeded" in error
+    assert "pod logs were unavailable" in error

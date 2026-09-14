@@ -28,6 +28,21 @@ MAX_PATCH_BYTES = 900_000
 _AUTHORIZATION_LOG = re.compile(
     r"Authorization:\s*(?:Basic|Bearer|token)\s+[^\s]+", re.IGNORECASE
 )
+_URL_USERINFO = re.compile(r"(https?://)[^/\s@]+@", re.IGNORECASE)
+_MARKER_LOG_LINE = re.compile(r"^CURIE_[A-Z_]+=")
+# Failed Job text leaves the cluster into thread history; keep it bounded.
+_MAX_JOB_ERROR = 1500
+
+
+def _redact(text: str) -> str:
+    text = _AUTHORIZATION_LOG.sub("Authorization: [REDACTED]", text)
+    return _URL_USERINFO.sub(r"\1[REDACTED]@", text)
+
+
+def _field(obj: Any, name: str, attr: str | None = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, attr or name, None)
 
 
 class PublicationResourceError(RuntimeError):
@@ -665,7 +680,19 @@ def _as_serialized_mapping(obj: Any) -> dict[str, Any]:
 
 
 def _expected_projection(observed: Any, expected: Any) -> Any:
-    """Project API-defaulted state onto the immutable submitted contract."""
+    """Project API-defaulted state onto the immutable submitted contract.
+
+    The apiserver omits empty strings, lists and maps (omitempty), so an
+    absent observed field matches an exactly-empty expected one. Absent and
+    empty are identical to the kubelet; ``0``/``False`` never qualify.
+    """
+
+    if observed is None and (
+        (type(expected) is str and expected == "")
+        or (type(expected) is list and len(expected) == 0)
+        or (type(expected) is dict and len(expected) == 0)
+    ):
+        return expected
 
     if isinstance(expected, dict):
         if not isinstance(observed, dict):
@@ -760,6 +787,21 @@ def validate_adopted_resource(
             f"refusing to adopt Job {expected_metadata['name']!r}: spec mismatch"
         )
     pod_spec = ((actual.get("spec") or {}).get("template") or {}).get("spec") or {}
+    for container in pod_spec.get("containers") or []:
+        # The expected-shape projection ignores keys the expected side never
+        # set, so an omitted literal env "value" tolerates any actual key on
+        # that item -- including a planted valueFrom that redirects the
+        # container to read an attacker-chosen Secret/ConfigMap value. Refuse
+        # any env entry outside name/value, and any envFrom, explicitly.
+        for env_item in container.get("env") or []:
+            if set(env_item) - {"name", "value"}:
+                raise PublicationResourceError(
+                    f"refusing to adopt Job {expected_metadata['name']!r}: spec mismatch"
+                )
+        if container.get("envFrom"):
+            raise PublicationResourceError(
+                f"refusing to adopt Job {expected_metadata['name']!r}: spec mismatch"
+            )
     forbidden = {
         "hostNetwork": pod_spec.get("hostNetwork"),
         "hostPID": pod_spec.get("hostPID"),
@@ -948,28 +990,27 @@ class KubernetesPublicationCluster:
         elif status_value("failed", 0):
             phase = "failed"
             conditions = status_value("conditions", []) or []
-            error = (
-                "; ".join(
-                    str(
-                        (condition.get("message", "") or condition.get("reason", ""))
-                        if isinstance(condition, dict)
-                        else (
-                            getattr(condition, "message", "")
-                            or getattr(condition, "reason", "")
-                        )
+            seen_condition_texts: set[str] = set()
+            condition_text_parts = []
+            for condition in conditions:
+                if _field(condition, "status") != "True":
+                    continue
+                text = ": ".join(
+                    part
+                    for part in (
+                        str(_field(condition, "reason") or ""),
+                        str(_field(condition, "message") or ""),
                     )
-                    for condition in conditions
-                    if (
-                        condition.get("status")
-                        if isinstance(condition, dict)
-                        else getattr(condition, "status", None)
-                    )
-                    == "True"
+                    if part
                 )
-                or "publication Job failed"
-            )
+                if text and text not in seen_condition_texts:
+                    seen_condition_texts.add(text)
+                    condition_text_parts.append(text)
+            condition_text = "; ".join(condition_text_parts)
 
         logs = ""
+        selected: Any = None
+        logs_read = False
         try:
             pods = self._core.list_namespaced_pod(
                 self.namespace, label_selector=f"job-name={job_name}"
@@ -1027,18 +1068,55 @@ class KubernetesPublicationCluster:
                     raise PublicationResourceError(
                         f"publication Job {job_name!r} owns a pod without a name"
                     )
-                logs = str(
-                    self._core.read_namespaced_pod_log(
-                        pod_name,
-                        self.namespace,
-                        tail_lines=200,
-                        limit_bytes=65_536,
-                    )
+                raw_log = self._core.read_namespaced_pod_log(
+                    pod_name,
+                    self.namespace,
+                    tail_lines=200,
+                    limit_bytes=65_536,
+                    _preload_content=False,
                 )
-                logs = _AUTHORIZATION_LOG.sub("Authorization: [REDACTED]", logs)
+                data = getattr(raw_log, "data", raw_log)
+                logs = (
+                    data.decode("utf-8", errors="replace")
+                    if isinstance(data, bytes)
+                    else str(data)
+                )
+                logs = _redact(logs)
+                logs_read = True
         except k8s_client.ApiException as exc:
             if exc.status not in (400, 404):
                 raise
+        if phase == "failed":
+            parts = [condition_text] if condition_text else []
+            statuses = _field(_field(selected, "status"), "containerStatuses", "container_statuses")
+            for container in statuses or []:
+                terminated = _field(_field(container, "state"), "terminated")
+                if terminated is None:
+                    continue
+                exit_code = _field(terminated, "exitCode", "exit_code")
+                reason = _field(terminated, "reason")
+                parts.append(
+                    "container exited"
+                    + (f" ({reason})" if reason else "")
+                    + (f" with exit code {exit_code}" if exit_code is not None else "")
+                )
+            if logs_read:
+                # Keep the tail: git and shell failures print their cause last.
+                meaningful = [
+                    line.strip()
+                    for line in logs.splitlines()
+                    if line.strip() and not _MARKER_LOG_LINE.match(line.strip())
+                ]
+                if meaningful:
+                    parts.append("; ".join(meaningful[-5:]))
+            else:
+                parts.append("pod logs were unavailable")
+            error = _redact("; ".join(parts) or "publication Job failed")
+            if len(error) > _MAX_JOB_ERROR:
+                # Truncate after redaction; keep the head (reason) and the log tail.
+                head = _MAX_JOB_ERROR // 3
+                tail = _MAX_JOB_ERROR - head - len(" ... ")
+                error = error[:head] + " ... " + error[-tail:]
         match = re.search(
             r"^CURIE_PR_URL=(https://github\.com/[^\s]+/pull/\d+)$",
             logs,
