@@ -476,3 +476,71 @@ def test_exception_text_carrying_a_channel_token_assignment_is_redacted() -> Non
     assert "RuntimeError:" in redacted
     assert "CURIE_CHANNEL_TOKEN=" in redacted
     assert "[REDACTED:channel_token]" in redacted
+
+
+# Regression for the header-ordering bug: a Discord-shaped token embedded in a
+# header value, followed by trailing non-token text, must be redacted whole by
+# the whole-value header rule (bearer_token / x_api_key), which now runs
+# before the Discord rules. Previously the Discord rule ran first, replaced
+# only the token portion with a placeholder, and the placeholder's
+# ``(?!\[REDACTED:)`` guard then blocked the header rule from matching the
+# rest of the value -- leaking the trailing suffix.
+FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX = FAKE_SHAPED_DISCORD_BOT_TOKEN + "/FAKE_SUFFIX"
+
+
+def test_bearer_header_with_discord_shaped_token_and_suffix_is_fully_redacted() -> None:
+    redacted = redact_text(f"Bearer {FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}")
+
+    assert redacted == "[REDACTED:bearer_token]"
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
+    assert "FAKE_SUFFIX" not in redacted
+
+
+def test_x_api_key_header_with_discord_shaped_token_and_suffix_is_fully_redacted() -> None:
+    redacted = redact_text(f"X-API-Key: {FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX}")
+
+    assert redacted == "X-API-Key: [REDACTED:x_api_key]"
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in redacted
+    assert "FAKE_SUFFIX" not in redacted
+
+
+def test_bearer_header_with_discord_shaped_token_and_suffix_is_redacted_through_filter() -> None:
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactingLogFilter())
+    logger = logging.getLogger("curie.telemetry.redact.discord_bearer_suffix")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        logger.info("upstream Bearer %s rejected", FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX)
+    finally:
+        logger.removeHandler(handler)
+
+    out = stream.getvalue()
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in out
+    assert "FAKE_SUFFIX" not in out
+    assert "[REDACTED:bearer_token]" in out
+
+
+def test_x_api_key_header_with_discord_shaped_token_and_suffix_is_redacted_through_filter() -> (
+    None
+):
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactingLogFilter())
+    logger = logging.getLogger("curie.telemetry.redact.discord_x_api_key_suffix")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        logger.info("upstream X-API-Key: %s rejected", FAKE_DISCORD_TOKEN_WITH_TRAILING_SUFFIX)
+    finally:
+        logger.removeHandler(handler)
+
+    out = stream.getvalue()
+    assert FAKE_SHAPED_DISCORD_BOT_TOKEN not in out
+    assert "FAKE_SUFFIX" not in out
+    assert "[REDACTED:x_api_key]" in out

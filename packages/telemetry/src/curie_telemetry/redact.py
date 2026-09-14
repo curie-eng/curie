@@ -38,10 +38,38 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
         _placeholder("jwt"),
     ),
-    # The four Discord rules run before the prefix rules (api_key, github_pat,
-    # slack_token, etc.) so a token or webhook token segment that happens to
-    # contain an ``am_``/``sk-`` style prefix is matched whole by the Discord
-    # rule first, rather than being partly consumed by a narrower prefix rule.
+    RedactionRule(
+        "bearer_token",
+        re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+"),
+        _placeholder("bearer_token"),
+    ),
+    RedactionRule(
+        "basic_auth",
+        re.compile(r"\bBasic\s+[A-Za-z0-9+/=]+", re.IGNORECASE),
+        _placeholder("basic_auth"),
+    ),
+    RedactionRule(
+        "dsn_userinfo",
+        re.compile(
+            r"(\b[a-z][a-z0-9+.-]*://)[^/@\s:]+:[^/@\s]+@",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED:dsn_userinfo]@",
+    ),
+    RedactionRule(
+        "x_api_key",
+        # Opaque header values have no unique prefix; match the header
+        # name the mail adapter and channel clients send.
+        re.compile(r"(X-API-Key:\s*)(?!\[REDACTED:)\S+", re.IGNORECASE),
+        r"\1[REDACTED:x_api_key]",
+    ),
+    # The whole-value header rules above (bearer, basic, DSN userinfo,
+    # X-API-Key) run first so a header credential is removed whole. The four
+    # Discord rules then run before the generic prefix rules (api_key,
+    # github_pat, slack_token, etc.) so a token or webhook token segment that
+    # happens to contain an ``am_``/``sk-`` style prefix is matched whole by
+    # the Discord rule first, rather than being partly consumed by a
+    # narrower prefix rule.
     RedactionRule(
         "discord_bot_authorization",
         # Discord's API reference demonstrates bot credentials in an
@@ -95,24 +123,6 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         _placeholder("discord_bot_token"),
     ),
     RedactionRule(
-        "bearer_token",
-        re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]+"),
-        _placeholder("bearer_token"),
-    ),
-    RedactionRule(
-        "basic_auth",
-        re.compile(r"\bBasic\s+[A-Za-z0-9+/=]+", re.IGNORECASE),
-        _placeholder("basic_auth"),
-    ),
-    RedactionRule(
-        "dsn_userinfo",
-        re.compile(
-            r"(\b[a-z][a-z0-9+.-]*://)[^/@\s:]+:[^/@\s]+@",
-            re.IGNORECASE,
-        ),
-        r"\1[REDACTED:dsn_userinfo]@",
-    ),
-    RedactionRule(
         "api_key",
         # sk-/xai- are the in-tree model-key prefixes. AgentMail documents
         # ``am_`` (https://docs.agentmail.to/knowledge-base/getting-api-key.md).
@@ -126,13 +136,6 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         # ``chn-{id}-{digest}`` values are event ids, not credentials.
         re.compile(r"\bchn\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
         _placeholder("channel_token"),
-    ),
-    RedactionRule(
-        "x_api_key",
-        # Opaque header values have no unique prefix; match the header
-        # name the mail adapter and channel clients send.
-        re.compile(r"(X-API-Key:\s*)(?!\[REDACTED:)\S+", re.IGNORECASE),
-        r"\1[REDACTED:x_api_key]",
     ),
     RedactionRule(
         "aws_access_key_id",
