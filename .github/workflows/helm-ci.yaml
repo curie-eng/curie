@@ -75,16 +75,18 @@ jobs:
           # job is not coupled to the runner image.
           python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
 
-      # Lint the default values plus every e2e overlay the chart ships.
+      # Lint the default values plus every overlay the chart ships.
       # values-e2e-nogvisor.yaml is a partial overlay (it only forces gVisor
       # OFF), so it is layered on values-dev.yaml exactly as an e2e/scratch
-      # install applies it.
+      # install applies it. values-external.yaml is the canonical BYO store
+      # overlay and lints on top of chart defaults.
       - name: helm lint
         run: |
           set -euo pipefail
           helm lint "$CHART"
           helm lint "$CHART" -f "$CHART/values-dev.yaml"
           helm lint "$CHART" -f "$CHART/values-dev.yaml" -f "$CHART/values-e2e-nogvisor.yaml"
+          helm lint "$CHART" -f "$CHART/values-external.yaml"
 
       # Render each overlay and schema-validate the output with kubeconform.
       #
@@ -650,6 +652,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/object-store-byo-egress-assertions.sh
 
+      # Prove values-external.yaml is a complete non-secret BYO profile: every
+      # chart-owned store is off, consumers point at the overlay hosts and
+      # existingSecret references, and a missing host still fails closed (#2662).
+      - name: helm render assertions (external stateful services profile)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/external-values-profile-assertions.sh
+
       # Prove the same for the other two in-chart runner carve-outs: a BYO
       # collector or API endpoint renders its own ipBlock allow and is refused
       # at render without one. Assertion 10 is the class guard -- a future
@@ -689,6 +699,13 @@ jobs:
         run: |
           set -euo pipefail
           helm template "$CHART" -f "$CHART/values-dev.yaml" -f "$CHART/values-e2e-nogvisor.yaml" \
+            | python3 -c "import sys, yaml; yaml.safe_dump_all(yaml.safe_load_all(sys.stdin), sys.stdout)" \
+            | kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version "$KUBE_VERSION"
+
+      - name: helm template + kubeconform (external stateful services overlay)
+        run: |
+          set -euo pipefail
+          helm template "$CHART" -f "$CHART/values-external.yaml" \
             | python3 -c "import sys, yaml; yaml.safe_dump_all(yaml.safe_load_all(sys.stdin), sys.stdout)" \
             | kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version "$KUBE_VERSION"
 

@@ -1,0 +1,92 @@
+# Canonical overlay for Curie on operator-managed stateful services.
+#
+# Use this file as the baseline for an install whose PostgreSQL, Valkey,
+# ClickHouse, and S3-compatible object storage already exist outside the
+# chart. It flips every chart-owned backing store off and points consumers
+# at the existing deploy / host / TLS / identity / existingSecret fields.
+# It is not a new deployment mode.
+#
+#   helm install acme charts/curie -n acme --create-namespace \
+#     -f charts/curie/values-external.yaml
+#
+# Operator-provisioned before install (the chart does not create these):
+#   - PostgreSQL reachable at postgres.host, with postgres.auth.username
+#     able to use postgres.auth.database. api and worker always set
+#     DB_SCHEMA=curie (hardcoded, not a values key). Langfuse Prisma
+#     migrates that same database. There is no values key for a second
+#     database or for renaming the application schema.
+#   - Valkey or Redis-compatible store at valkey.host.
+#   - ClickHouse at clickhouse.host. The chart has no ClickHouse database
+#     values key; Langfuse uses its built-in database names.
+#     clickhouse.clusterEnabled stays false, the chart default.
+#   - Three buckets on the object-store endpoint: rustfs.bucket (Langfuse
+#     events and media), worker.workspace.bucket (workspace archives), and
+#     agentSandbox.runner.bundleFetch.bucket (plugin bundles). rustfs.deploy
+#     false also skips the in-chart bucket-bootstrap Job, so the buckets
+#     and their permissions must already exist.
+#   - Kubernetes Secrets in the release namespace, keys only, never values
+#     in this file:
+#       acme-postgres     postgresPassword
+#       acme-valkey       valkeyPassword
+#       acme-clickhouse   clickhousePassword
+#       acme-s3           rustfsSecretKey
+#
+# rustfs.auth.accessKey is the static access-key ID (not the secret). Match
+# it to the key that rustfsSecretKey belongs to. Narrow rustfs.egress is
+# required while Rail 1 is on: a hostname is not a NetworkPolicy peer.
+#
+# Placeholders only. Replace hosts, Secret names, CIDRs, bucket names, and
+# the access-key ID with the operator's own. Do not put credential values
+# here. Render success is not proof that the external services are healthy.
+
+postgres:
+  deploy: false
+  host: postgres.example.com
+  port: 5432
+  auth:
+    username: postgres
+    database: postgres
+  existingSecret: acme-postgres
+  sslMode: require
+
+valkey:
+  deploy: false
+  host: valkey.example.com
+  port: 6379
+  existingSecret: acme-valkey
+  tls: true
+
+clickhouse:
+  deploy: false
+  host: clickhouse.example.com
+  httpPort: 8443
+  nativePort: 9440
+  scheme: https
+  auth:
+    username: default
+  existingSecret: acme-clickhouse
+  clusterEnabled: false
+
+rustfs:
+  deploy: false
+  host: s3.example.com
+  port: 443
+  region: us-east-1
+  bucket: langfuse
+  auth:
+    accessKey: acme
+  existingSecret: acme-s3
+  egress:
+    - cidr: 192.0.2.10/32
+      ports:
+        - protocol: TCP
+          port: 443
+
+worker:
+  workspace:
+    bucket: curie-workspaces
+
+agentSandbox:
+  runner:
+    bundleFetch:
+      bucket: curie-bundles
