@@ -535,17 +535,26 @@ def test_blocked_turn_ends_awaiting_approval() -> None:
     anyio.run(go)
 
 
-def test_policy_gate_summary_outranks_gate_block() -> None:
-    """When the model explicitly called request_approval AND a permission gate
-    blocked a call in the same turn, the model-authored summary wins (it is
-    the intentional, richer statement of what needs approval)."""
+def test_permission_block_outranks_grantless_policy_request() -> None:
+    """#2657: one gated tool call is one permission card, even if the model
+    also called request_approval in the same turn.
+
+    A grantless policy summary must not drop the permission grant. Otherwise
+    resume has nothing to spend and PreToolUse raises a second card.
+    """
 
     async def go() -> None:
-        gate = ApprovalGate(required=frozenset({"Bash"}))
+        scale = "mcp__kubernetes__resources_scale"
+        # Match the shipped SRE bundle: scale is toolPolicy-only, so it has no
+        # approvalPolicy route. The card stays in the requesting thread (DEMO.md).
+        gate = ApprovalGate(required=frozenset({scale}))
 
         def factory() -> list:
-            gate.block("Bash", {"command": "x"})
-            return approval_turn("Explicit policy summary")
+            gate.block(scale, {"name": "acme-demo", "namespace": "sre-demo", "replicas": 2})
+            return approval_turn(
+                "Scale Deployment acme-demo in namespace sre-demo from 1 to 2 "
+                "replicas via Kubernetes resources_scale"
+            )
 
         session = FakeModelSession(factory)
         runner = SessionRunner(
@@ -559,8 +568,34 @@ def test_policy_gate_summary_outranks_gate_block() -> None:
         )
         await runner.start()
         frames = await _drain(runner, "gate this")
-        assert frames[-1]["status"] == "awaiting-approval"
-        assert frames[-1]["approval_summary"] == "Explicit policy summary"
+        final = frames[-1]
+        assert final["status"] == "awaiting-approval"
+        assert final["approval_gate_kind"] == "permission"
+        assert final["approval_granted_tool"] == scale
+        assert final["approval_route"] is None
+        assert str(final["approval_summary"]).startswith("Tool call awaiting approval: ")
+
+        # Resume is a cold rehydrate (ADR-0003): a new gate with the injected
+        # grant spends it once, then re-arms. The approved call must not raise
+        # a second card.
+        resume_gate = ApprovalGate(
+            required=frozenset({scale}),
+            grant_tool=str(final["approval_granted_tool"]),
+        )
+        callback = build_can_use_tool(resume_gate)
+        resume_gate.reset()
+        allowed = await callback(
+            scale,
+            {"name": "acme-demo", "namespace": "sre-demo", "replicas": 2},
+            ToolPermissionContext(),
+        )
+        assert isinstance(allowed, PermissionResultAllow)
+        denied = await callback(
+            scale,
+            {"name": "acme-demo", "namespace": "sre-demo", "replicas": 3},
+            ToolPermissionContext(),
+        )
+        assert isinstance(denied, PermissionResultDeny)
 
     anyio.run(go)
 

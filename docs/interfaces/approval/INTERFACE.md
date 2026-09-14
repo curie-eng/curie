@@ -71,11 +71,14 @@ in code now:
 - **The lifecycle (landed, #244; pager advertisement narrowed, #1444).** A skill raises a
   policy gate through the runner's in-process `mcp__curie__request_approval` tool
   (`runner/src/curie_runner/approval.py`) when that tool is present. The runner advertises
-  this generic pager only when the observed MCP surface has an action that may write — a
-  tool not explicitly `readOnlyHint=true`, including an unknown or unreachable surface — or
-  when an explicit actionable approval gate exists. A surface with no MCP tools or only
-  explicitly read-only tools carries no generic pager, because approval cannot unlock an
-  action it cannot perform. `readOnlyHint` is not authorization and does not change gates
+  this generic pager when a route is `grantableViaPolicy`, or when the observed MCP
+  surface has an action that may write (a tool not explicitly `readOnlyHint=true`,
+  including an unknown or unreachable surface) and no permission gate already pages.
+  An explicit `approvalPolicy` or `toolPolicy.approvalRequired` gate is already a pager;
+  keeping `request_approval` beside it raises a second card for the same action (#2657).
+  A surface with no MCP tools or only explicitly read-only tools and no grantable
+  policy route carries no generic pager, because approval cannot unlock an action it
+  cannot perform. `readOnlyHint` is not authorization and does not change gates
   or tool execution. A live probe that explicitly reports `readOnlyHint=true` also feeds
   the MCP tool's SDK-visible name to the read-only classifier, suppressing the side-effect
   flag, no-retry-after-side-effects classification, and therefore its receipt line. A

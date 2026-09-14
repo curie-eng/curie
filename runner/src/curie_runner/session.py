@@ -1378,10 +1378,13 @@ class SessionRunner:
           raw block is dropped; an acceptance carries the RESOLVED route (the
           bound sole route or the named valid one) rather than the raw argument.
         - **Permission block (#245):** the can_use_tool callback records a
-          blocked call on the shared gate; merging it here (only when no policy
-          summary already stands) lets ``_apply_approval_override`` treat both
-          trigger types identically, along with the durable provenance
-          (#544, Decision C) the worker branches on.
+          blocked call on the shared gate. A non-publication permission block
+          is the card even when the model also called request_approval (#2657):
+          the grantless policy summary must not drop ``pending_granted_tool``,
+          or resume has nothing to spend and PreToolUse raises a second card.
+          A publication request riding with a standing policy summary still
+          loses the slot (the model must ask to publish again). Policy-only
+          remains when there is no non-publish permission block.
         - **Approval halt (#1852):** a gated deny now asks the CLI to stop the
           turn, so the gate's ``pending_halt`` marker is carried onto the turn
           state for ``_apply_approval_override`` -- but only when the operator
@@ -1394,7 +1397,21 @@ class SessionRunner:
         if gate is None:
             return
 
-        if gate.policy_requested:
+        permission_is_actionable_tool = (
+            gate.pending_summary is not None
+            and gate.pending_granted_tool != PUBLISH_TOOL_NAME
+        )
+        if permission_is_actionable_tool:
+            # A gated tool call is the card. Copy it even when translate.py
+            # already captured a grantless policy summary from request_approval
+            # (#2657). Publication stays behind a standing policy request: that
+            # is a second intent and must not steal the business-decision card.
+            state.approval_summary = gate.pending_summary
+            state.approval_display = gate.pending_display
+            state.approval_route = gate.pending_route
+            state.approval_gate_kind = gate.pending_gate_kind
+            state.approval_granted_tool = gate.pending_granted_tool
+        elif gate.policy_requested:
             if gate.policy_rejected:
                 # The route could not be resolved: no approval exists, so the
                 # turn must not end awaiting-approval on it.

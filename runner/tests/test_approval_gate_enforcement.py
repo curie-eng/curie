@@ -100,6 +100,8 @@ def _bundle(
     root: Path,
     *,
     gates: list[str] | None = None,
+    grantable: bool = False,
+    tool_policy: dict[str, Any] | None = None,
     skill_allowed_tools: list[str] | None = None,
     manifest_hooks: dict[str, Any] | None = None,
 ) -> str:
@@ -117,7 +119,18 @@ def _bundle(
         "description": "A bundle for the gate-enforcement tests.",
     }
     if gates:
-        manifest["approvalPolicy"] = {"gates": [{"gate": g, "route": "ops"} for g in gates]}
+        manifest["approvalPolicy"] = {
+            "gates": [
+                {
+                    "gate": g,
+                    "route": "ops",
+                    **({"grantableViaPolicy": True} if grantable else {}),
+                }
+                for g in gates
+            ]
+        }
+    if tool_policy is not None:
+        manifest["toolPolicy"] = tool_policy
     if manifest_hooks is not None:
         manifest["hooks"] = manifest_hooks
     (root / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -895,6 +908,63 @@ def test_boot_keeps_request_approval_for_an_observed_write_capable_bundle(
 
     assert APPROVAL_SERVER_NAME in options.mcp_servers
     assert options.mcp_servers[APPROVAL_SERVER_NAME]["name"] == APPROVAL_SERVER_NAME
+    assert "request_approval" in anyio.run(
+        _mcp_tool_names,
+        options.mcp_servers[APPROVAL_SERVER_NAME],
+    )
+
+
+def test_boot_omits_request_approval_when_permission_gates_already_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2657: leftover permission gates must not keep the generic pager.
+
+    The SRE bundle still declares upgrade approvalPolicy gates after Kubernetes
+    mutations moved to toolPolicy. Mounting request_approval beside that
+    produces a grantless policy card, then a second PreToolUse card.
+    """
+
+    plugin_dir = _bundle(tmp_path, gates=["Bash"])
+    _add_capability_server(plugin_dir, "write")
+
+    options = _options_from_boot(monkeypatch, _config(plugin_dir))
+    names = anyio.run(_mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME])
+    assert names == {"publish_changes"}
+
+
+def test_boot_omits_request_approval_for_tool_policy_approval_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """toolPolicy.approvalRequired is a permission pager even with no legacy gates."""
+
+    plugin_dir = _bundle(
+        tmp_path,
+        tool_policy={
+            "enforcement": "curie/mcp-tool-policy@1",
+            "allow": [],
+            "approvalRequired": ["operations/*"],
+            "deny": [],
+        },
+    )
+    _add_capability_server(plugin_dir, "write")
+
+    options = _options_from_boot(monkeypatch, _config(plugin_dir))
+    names = anyio.run(_mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME])
+    assert names == {"publish_changes"}
+
+
+def test_boot_keeps_request_approval_when_gate_is_grantable_via_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#558 opt-in: a grantable policy route still needs the generic pager."""
+
+    plugin_dir = _bundle(tmp_path, gates=["Bash"], grantable=True)
+    _add_capability_server(plugin_dir, "write")
+
+    options = _options_from_boot(monkeypatch, _config(plugin_dir))
+    names = anyio.run(_mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME])
+    assert "request_approval" in names
+    assert "publish_changes" in names
 
 
 def test_explicit_gate_keeps_pager_and_annotations_classify_receipt_actions(
@@ -919,12 +989,15 @@ def test_explicit_gate_keeps_pager_and_annotations_classify_receipt_actions(
         session = runner._factory()
         assert isinstance(session, _CapturedSession)
 
-        # An explicit actionable gate retains the pager regardless of MCP hints.
+        # An explicit non-grantable permission gate is already the pager.
+        # Keeping request_approval beside it is the #2657 double card.
         assert APPROVAL_SERVER_NAME in session.options.mcp_servers
-        assert "request_approval" in anyio.run(
+        names = anyio.run(
             _mcp_tool_names,
             session.options.mcp_servers[APPROVAL_SERVER_NAME],
         )
+        assert "request_approval" not in names
+        assert "publish_changes" in names
 
         events = translate_message(
             AssistantMessage(
@@ -977,10 +1050,12 @@ def test_explicit_tool_gate_overrides_its_read_only_annotation(
         )
         session = runner._factory()
         assert isinstance(session, _CapturedSession)
-        assert "request_approval" in anyio.run(
+        names = anyio.run(
             _mcp_tool_names,
             session.options.mcp_servers[APPROVAL_SERVER_NAME],
         )
+        assert "request_approval" not in names
+        assert "publish_changes" in names
 
         events = translate_message(
             AssistantMessage(

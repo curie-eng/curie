@@ -28,13 +28,13 @@ from .adapter import (
 )
 from .approval import (
     APPROVAL_SERVER_NAME,
-    PUBLISH_TOOL_NAME,
     ApprovalPolicyError,
     assert_gates_not_shadowed,
     build_approval_gate,
     build_approval_hook,
     build_approval_server,
     build_can_use_tool,
+    include_generic_policy_pager,
     policy_disallowed_tools,
     resolve_approval_policy,
 )
@@ -300,26 +300,17 @@ def build_runner(
     if spawn_env is not os.environ:
         drop_connector_secret_names(os.environ, dropped)
 
-    # A configured permission gate is already positive evidence that the
-    # session carries an actionable approval boundary. Publication is excluded:
-    # its dedicated tool already raises its own approval and the sandbox cannot
-    # execute publication itself, so adding the generic pager beside it would
-    # recreate #1444 under a different tool name.
-    carries_explicit_action_gate = approval_gate is not None and bool(
-        approval_gate.required - {PUBLISH_TOOL_NAME}
-    )
-
     real_options: ClaudeAgentOptions | None = None
     observed_readonly_tools: frozenset[str] = frozenset()
     capability = mcp_capability
     if not fake_model:
         # The bundle's live MCP ``tools/list`` response is the actual advertised
-        # MCP surface. Probe even when an explicit gate already requires the
-        # generic pager: exact readOnlyHint=true observations also drive receipt
-        # and retry classification. Missing hints, uninspectable declarations,
-        # and probe failures preserve the historical fail-closed behavior. The
-        # annotation remains a non-authoritative hint: it never authorizes or
-        # denies tool execution.
+        # MCP surface. Probe even when an explicit gate already pages: exact
+        # readOnlyHint=true observations also drive receipt and retry
+        # classification. Missing hints, uninspectable declarations, and probe
+        # failures preserve the historical fail-closed behavior. The annotation
+        # remains a non-authoritative hint: it never authorizes or denies tool
+        # execution.
         if capability is None:
             capability = anyio.run(
                 probe_mcp_tool_capability,
@@ -333,13 +324,15 @@ def build_runner(
             if approval_gate is not None
             else ()
         )
-        carries_request_approval = (
-            carries_explicit_action_gate or capability.has_potential_write_tool
+        carries_request_approval = include_generic_policy_pager(
+            approval_gate,
+            has_potential_write_tool=capability.has_potential_write_tool,
         )
         if not carries_request_approval:
             logger.info(
-                "request_approval omitted: observed MCP surface has no actionable"
-                " tools tool_count=%d probe_complete=%s failures=%d",
+                "request_approval omitted: permission gates already page or"
+                " observed MCP surface has no actionable tools tool_count=%d"
+                " probe_complete=%s failures=%d",
                 capability.tool_count,
                 capability.complete,
                 len(capability.failures),
