@@ -47,6 +47,7 @@ fn patched_agent(routes_json: &str) -> String {
 fn stub(list_routes: &'static str, patch_echo: &'static str) -> MockServer {
     serve(move |req| match req.path.split('?').next().unwrap() {
         "/agents" => Response::json(200, &agents_list(list_routes)),
+        "/deployments" => Response::json(200, "[]"),
         p if p == format!("/agents/{AGENT_ID}") => Response::json(200, &patched_agent(patch_echo)),
         other => panic!("unexpected request: {other}"),
     })
@@ -83,6 +84,7 @@ fn router_stub(initial_routes: &str) -> MockServer {
             let current = render_routes(&state.lock().unwrap());
             Response::json(200, &agents_list(&current))
         }
+        "/deployments" => Response::json(200, "[]"),
         p if p.strip_prefix("/agents/") == Some(AGENT_ID) => {
             let body: serde_json::Value =
                 serde_json::from_slice(&req.body).expect("PATCH body must be valid JSON");

@@ -171,6 +171,18 @@ ran. An `approval_routes` write, including `--clear-routes` or an empty routes f
 would drop a route declared by any active deployment of the agent, in either environment,
 is refused on the same terms.
 
+The `curie` verbs check the same join locally first, so the gap is reported before
+anything is uploaded. `curie local deploy` and `curie cluster deploy` (including
+`--all-targets`, `deploy-local`, and the SRE bot installer) read the routes the bundle
+declares. After the agent is found or created, they refuse with exit 2 before a version
+or bundle is sent, naming the unbound routes, the bound ones, and the
+`curie <tier> approvals <agent> --route-resolution ...` command to run. A first deploy of
+a gated bundle therefore creates the agent and stops there: bind the routes, then deploy
+again. A route write (`--clear-routes`, `--route-resolution`, `--route-approvers`,
+`--routes-from`) likewise refuses before the PATCH when an active deployment declares a
+route it would remove. Both checks are advisory: when the CLI cannot read a manifest or a
+deployment, it warns and sends the request, and the API decides.
+
 Bind one from the CLI rather than by hand. A write REPLACES the whole map, so name
 every route it should keep:
 
@@ -372,6 +384,7 @@ case, the requesting channel is the card location.
 | `410 expired` | The record passed its deadline. The session was already woken down its timeout branch. |
 | Agent says a request is pending, no card anywhere | The named route is not bound for this agent, so the turn escalated instead of posting. Since #2436 this case is now caught before deploy for a newly declared route; the escalation remains the backstop for a binding removed after deployment. Add the binding. |
 | `422`, or a rejected push with code `approval_routes.unbound` | The bundle declares an approval route with no entry in this agent's `approval_routes`. Bind every route the bundle declares, then redeploy. |
+| deploy or route write exits 2: "declares approval route(s) ... with no entry in this agent's approval_routes" or "this write removes approval route(s)" | The CLI's local pre-check found the same gap before sending. Run the command in the error's fix, then re-run. |
 | Notification arrived, but it has no buttons | Expected: notification is visibility-only. Use its approval ID and go to the configured approval channel to find the verified Slack resolution card; the ping deliberately does not disclose that channel's identifier. |
 | Card resolved, but the agent never continued | The skill has no instruction for the `[approval resolved]` prefix. |
 

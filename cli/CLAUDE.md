@@ -129,8 +129,10 @@ Helm and the deployed release with `up`, `upgrade`, `status`, `down`, `comms`, `
   unaffected and keeps the zero-network guarantee as written above. `local deploy` and
   `cluster deploy` are the bundle shipping verbs that leave the machine: they
   package the bundle as
-  tar.gz and push to the platform API (find-or-create agent, create version,
-  upload bundle, create deployment) authenticated via
+  tar.gz and push to the platform API (find-or-create agent, refuse locally
+  if the bundle declares an approval route the agent does not bind (#2448,
+  advisory, the API is the gate), create version, upload bundle, create
+  deployment) authenticated via
   `--api-key`/`CURIE_API_KEY`. The packer skips a fixed set of names
   (`.curieignore`, `.curie`, `.git`, `.venv`, `venv`, `node_modules`,
   `__pycache__`, `.mypy_cache`, `.pytest_cache`) at any depth plus whatever an
