@@ -379,12 +379,12 @@ the chart that will actually be applied (`charts/curie` unless `--chart` says
 otherwise; this verb does not resolve a release artifact, issue #2593) and
 shows `--version <to>` exactly when a resolvable ref makes it a real pin.
 
-After Apply, the command re-reads the installed Helm revision and fails
-rather than reporting success if it is not the target version; the canary
-re-reads it again. Convergence (image digests, controller generations,
-replica counts, healthy hooks, the drained-queue gate, and the retained
-manifest comparison) is observed the same way `curie cluster up` observes
-it, not assumed.
+After Apply, the command reads the installed chart version from
+`helm get metadata` and fails rather than reporting success if it is not the
+target version; the canary reads it again. Convergence (image digests,
+controller generations, replica counts, healthy hooks, the drained-queue gate,
+and the retained manifest comparison) is observed the same way `curie cluster
+up` observes it, not assumed.
 
 `--json` reports the current phase, the last known-good version, whether
 the previous version is still serving, and at most one fail-forward

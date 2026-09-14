@@ -21,7 +21,7 @@ Optional per-test inputs read from the root directory:
   * ``checkpoint.json`` -- the record served as the upgrade checkpoint ConfigMap
 
 Three observable moments drive the fixtures, derived from the argv log rather
-than from a call ordinal (the number of `helm status` reads is an
+than from a call ordinal (the number of `helm get metadata` reads is an
 implementation detail of the observer):
 
   before    -- nothing has been mutated yet
@@ -51,9 +51,11 @@ REPO = "ghcr.io/curie-eng/curie-api"
 WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 
 # One dict, not a pile of branches. Keys:
-#   before/after      chart version `helm status` reports pre/post `helm upgrade`
-#   after_converge    chart version `helm status` reports once convergence has
-#                     observed the live workloads; defaults to `after`. Only a
+#   before/after      chart version `helm get metadata` reports before and after
+#                     `helm upgrade`
+#   after_converge    chart version `helm get metadata` reports once
+#                     convergence has observed the live workloads; defaults to
+#                     `after`. Only a
 #                     version that moves BETWEEN Apply and Canary can prove the
 #                     canary re-reads it instead of trusting its own bookkeeping.
 #   served_before/after  container image tag actually running pre/post upgrade
@@ -125,7 +127,8 @@ BASE = {
     "updated": 1,
     "unavailable": 0,
     "failed_hook": "",
-    "status_missing_before": False,
+    "metadata_missing_before": False,
+    "metadata_after_shape": "valid",
     "generation_drift": False,
     "workloads_fail": False,
     "values_fail": False,
@@ -149,6 +152,9 @@ SCENARIOS = {
     # release slips back to 0.8.6 before the canary. Isolates the canary's own
     # version read from Apply's.
     "canary-version-drift": {"after_converge": "0.8.6"},
+    "metadata-malformed-after": {"metadata_after_shape": "malformed"},
+    "metadata-missing-after": {"metadata_after_shape": "missing"},
+    "metadata-numeric-after": {"metadata_after_shape": "numeric"},
     # A resume whose Apply already happened: release and workloads are on 0.9.0.
     "resumed-applied": {"before": "0.9.0", "served_before": "0.9.0"},
     # The release reports the new revision and `helm get manifest` renders the
@@ -197,9 +203,9 @@ SCENARIOS = {
         "apply_fails": "after-converge",
     },
     # A local chart directory whose own metadata is not the requested --to.
-    # No release yet: `helm status` fails until something is installed, so the
-    # Drain phase is skipped for having nothing in flight.
-    "fresh-install": {"status_missing_before": True},
+    # No release yet: `helm get metadata` fails until something is installed,
+    # so the Drain phase is skipped for having nothing in flight.
+    "fresh-install": {"metadata_missing_before": True},
     "local-chart-mismatch": {"show_chart": "0.8.7"},
     # Live revision 0099 is not in the target graph: Validate must refuse
     # before `helm upgrade`.
@@ -216,7 +222,10 @@ SCENARIOS = {
     "schema-probe-fails": {"alembic_fail": True},
     # No Helm release and the API probe also fails. Retained for the
     # empty-DB vs missing-API distinction; live tests do not drive it yet.
-    "schema-fresh-empty": {"status_missing_before": True, "alembic_fail": True},
+    "schema-fresh-empty": {
+        "metadata_missing_before": True,
+        "alembic_fail": True,
+    },
 }
 
 root = Path(os.environ["UPGRADE_DRIVER_ROOT"])
@@ -369,21 +378,49 @@ for key, name in HOOK_NAMES.items():
     )
 
 if program == "helm":
+    # Helm v3.20 removes rel.Chart before serializing status and keeps the
+    # numeric release revision at version:
+    # https://github.com/helm/helm/blob/v3.20.0/cmd/helm/status.go
     if args[0] == "status":
-        if scenario["status_missing_before"] and not upgraded:
-            print('Error: release: not found', file=sys.stderr)
-            sys.exit(1)
         if "json" in args:
             emit(
                 {
-                    "version": 2,
-                    "info": {"status": "deployed"},
-                    "chart": {"metadata": {"name": "curie", "version": version}},
+                    "config": {},
                     "hooks": hooks,
+                    "info": {"status": "deployed"},
+                    "manifest": json.dumps(expected),
+                    "name": RELEASE,
+                    "namespace": NAMESPACE,
+                    "version": 2,
                 }
             )
         print("STATUS: deployed\nREVISION: 2")
         sys.exit(0)
+    if args[:2] == ["get", "metadata"]:
+        # Helm v3.20 maps this string from rel.Chart.Metadata.Version:
+        # https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_metadata.go
+        if scenario["metadata_missing_before"] and not upgraded:
+            print('Error: release: not found', file=sys.stderr)
+            sys.exit(1)
+        shape = scenario["metadata_after_shape"] if upgraded else "valid"
+        if shape == "malformed":
+            print("{")
+            sys.exit(0)
+        metadata = {
+            "name": RELEASE,
+            "chart": "curie",
+            "version": version,
+            "appVersion": version,
+            "namespace": NAMESPACE,
+            "revision": 2,
+            "status": "deployed",
+            "deployedAt": "2026-09-12T00:00:00Z",
+        }
+        if shape == "missing":
+            del metadata["version"]
+        elif shape == "numeric":
+            metadata["version"] = 2
+        emit(metadata)
     if args[:2] == ["get", "values"]:
         if scenario["values_fail"]:
             print('Error from server (NotFound): namespaces "ns" not found', file=sys.stderr)

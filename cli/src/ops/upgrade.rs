@@ -1364,12 +1364,14 @@ impl LiveHost {
     /// The chart version the release reports. `scripts/check-version-consistency.sh`
     /// is required on every PR and release and asserts Chart.yaml `version` ==
     /// `appVersion` == the CLI version, so this one field is the whole answer
-    /// and no appVersion branch is needed (driver Ruling 1).
+    /// and no appVersion branch is needed (driver Ruling 1). Helm status exposes
+    /// a numeric release revision, while Helm metadata exposes the chart version.
     fn inspect_version(&self) -> Option<String> {
         let cmd = OpsCommand::new(
             "helm",
             vec![
-                plain("status"),
+                plain("get"),
+                plain("metadata"),
                 plain(&self.opts.common.release),
                 plain("-n"),
                 plain(&self.opts.common.namespace),
@@ -1382,14 +1384,9 @@ impl LiveHost {
             return None;
         }
         let v: serde_json::Value = serde_json::from_str(&out).ok()?;
-        v.pointer("/chart/metadata/version")
+        v.pointer("/version")
             .and_then(|x| x.as_str())
             .map(ToOwned::to_owned)
-            .or_else(|| {
-                v.pointer("/version")
-                    .and_then(|x| x.as_str())
-                    .map(ToOwned::to_owned)
-            })
     }
 
     fn load_record(&self) -> Option<UpgradeRecord> {
