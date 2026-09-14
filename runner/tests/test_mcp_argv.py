@@ -13,7 +13,6 @@ from typing import Any
 import anyio
 import pytest
 from claude_agent_sdk import ClaudeAgentOptions
-from curie_runner.mcp_argv import CredentialSafeCLITransport, offload_mcp_config_argv
 
 _TMP_PREFIX = "curie-mcp-config-"
 
@@ -29,6 +28,8 @@ def _http_servers(headers: dict[str, str]) -> dict[str, Any]:
 
 
 def _assert_sentinel_off_argv(headers: dict[str, str], sentinel: str) -> None:
+    from curie_runner.mcp_argv import CredentialSafeCLITransport
+
     transport = CredentialSafeCLITransport(
         prompt="",
         options=ClaudeAgentOptions(cli_path="/bin/true", mcp_servers=_http_servers(headers)),
@@ -54,11 +55,13 @@ def test_spawned_process_cmdline_omits_hosted_bearer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # AC2 spawn observation: read /proc/<pid>/cmdline after connect() (#2635).
+    import claude_agent_sdk._internal.transport.subprocess_cli as subprocess_cli
+    import curie_runner.adapter  # noqa: F401
+
     fake = tmp_path / "claude"
-    fake.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdin.read()\n", encoding="utf-8")
-    fake.chmod(0o755)
+    fake.symlink_to("/bin/cat")
     monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
-    transport = CredentialSafeCLITransport(
+    transport = subprocess_cli.SubprocessCLITransport(
         prompt="",
         options=ClaudeAgentOptions(
             cli_path=str(fake),
@@ -76,9 +79,15 @@ def test_spawned_process_cmdline_omits_hosted_bearer(
         try:
             await transport.connect()
             pid = transport._process.pid
-            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+            cmdline = b""
+            for _ in range(50):
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+                if cmdline:
+                    break
+                await anyio.sleep(0.02)
+            assert cmdline, "spawned process cmdline was empty"
             assert b"ghp_sentinel" not in cmdline
-            args = cmdline.split(b"\0")
+            args = [a for a in cmdline.split(b"\0") if a]
             config_path = Path(args[args.index(b"--mcp-config") + 1].decode())
             assert config_path.is_file()
             assert config_path.stat().st_mode & 0o777 == 0o600
@@ -99,6 +108,8 @@ def test_basic_auth_absent_from_cli_argv() -> None:
 
 
 def test_mcp_config_path_argument_is_left_unchanged(tmp_path: Path) -> None:
+    from curie_runner.mcp_argv import offload_mcp_config_argv
+
     existing = tmp_path / "already.conf"
     existing.write_text("not-json-contents", encoding="utf-8")
     cmd = ["/bin/true", "--mcp-config", str(existing)]
@@ -113,11 +124,14 @@ def test_adapter_import_installs_the_transport_subclass() -> None:
     # check.py imports adapter.build_options then constructs ClaudeSDKClient (#2635).
     import claude_agent_sdk._internal.transport.subprocess_cli as subprocess_cli
     import curie_runner.adapter  # noqa: F401
+    from curie_runner.mcp_argv import CredentialSafeCLITransport
 
     assert subprocess_cli.SubprocessCLITransport is CredentialSafeCLITransport
 
 
 def test_offload_helper_rejects_sentinel_on_argv() -> None:
+    from curie_runner.mcp_argv import offload_mcp_config_argv
+
     payload = json.dumps(
         {"mcpServers": {"github": {"headers": {"Authorization": "Bearer ghp_sentinel"}}}}
     )
