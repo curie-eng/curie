@@ -249,6 +249,11 @@ pod: one BYO peer, declared explicitly, per pod that has an egress policy.
   security.gvisor.mode=require` to fail-hard.
 - **Production sizing:** the default `resources`/persistence blocks are a modest
   single-node footprint (fits an 8-16 GB node). Raise them for real load.
+- **External stateful services:** `-f charts/curie/values-external.yaml` is the
+  canonical overlay when PostgreSQL, Valkey, ClickHouse, and S3-compatible
+  object storage already exist outside the chart. Credentials stay in
+  operator-provisioned Kubernetes Secrets. See "Values surface and the BYO
+  idiom".
 
 **Local dev profile (offline, locally-built images).** `values-dev.yaml` repoints
 every image at a locally-built, cluster-imported tag with `imagePullPolicy: Never`
@@ -550,6 +555,43 @@ Keys are **camelCase** (Go templates cannot dot-index hyphenated keys). Every
 backing store is condition-gated by `<store>.deploy` and carries its BYO fields
 on the same block. To use an external instance, flip `deploy: false` and fill
 `host` / `port` / `auth` (or `existingSecret`):
+
+The checked-in canonical overlay is `values-external.yaml`. It sets every
+backing store to `deploy: false`, fills the existing host / TLS / identity /
+`existingSecret` fields, names the three object-store buckets, and includes
+narrow `rustfs.egress`. Use it as the baseline for a documented
+external-services install:
+
+```bash
+helm install acme charts/curie -n acme --create-namespace \
+  -f charts/curie/values-external.yaml
+```
+
+Replace the placeholder hosts, Secret names, CIDRs, bucket names, and
+`rustfs.auth.accessKey` with the operator's own. The overlay contains no
+credential values. A successful render is not proof that the external
+services are healthy.
+
+Create these before install; the chart does not provision them when
+`<store>.deploy` is false:
+
+- PostgreSQL at `postgres.host`, with `postgres.auth.username` able to use
+  `postgres.auth.database` (chart defaults: user `postgres`, database
+  `postgres`). api and worker always set `DB_SCHEMA=curie` (hardcoded, not a
+  values key). Langfuse Prisma migrates that same database. There is no
+  values key for a second database or for renaming the application schema.
+- Valkey or Redis-compatible store at `valkey.host`.
+- ClickHouse at `clickhouse.host`. The chart has no ClickHouse database
+  values key; Langfuse uses its built-in names. `clickhouse.clusterEnabled`
+  stays false, the chart default.
+- Three buckets on the object-store endpoint (`rustfs.bucket`,
+  `worker.workspace.bucket`, `agentSandbox.runner.bundleFetch.bucket`).
+  `rustfs.deploy: false` also skips the in-chart bucket-bootstrap Job.
+- Kubernetes Secrets in the release namespace carrying keys
+  `postgresPassword`, `valkeyPassword`, `clickhousePassword`, and
+  `rustfsSecretKey`.
+
+Single-store snippet, same fields:
 
 ```yaml
 # Use a managed Postgres instead of the in-cluster one

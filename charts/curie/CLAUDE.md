@@ -156,7 +156,10 @@ component and rail detail in `charts/curie/README.md`.
   to `false` repoints consumers (Langfuse env, the collector config) at the
   BYO `host`/`port`/`auth`/`existingSecret` fields on the same block. A new
   backing store must follow this exact pattern -- do not add a store with a
-  different enable/disable shape.
+  different enable/disable shape. `values-external.yaml` is the checked-in
+  canonical overlay for that shape (all four stores off, Secret references,
+  three buckets, narrow S3 egress). Pin it with
+  `ci/external-values-profile-assertions.sh`.
 - **Values keys are camelCase, not hyphenated.** Go templates cannot
   dot-index a hyphenated key. Keep this consistent across any new values
   additions.
