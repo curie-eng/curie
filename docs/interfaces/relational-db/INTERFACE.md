@@ -70,8 +70,7 @@ is a judgement call, not something derivable from the tree.
    `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **seventeen** columns:
    `behavior_packs`, `approval_required_tools`, `approval_routes`, `secrets`,
    `hook_partitions`, `source_bindings`, `changed_paths`, `evidence`, `arguments`,
-   `result`, `prior_state`, `target`, `post_state`, `feedback`, `turn`, and `value`.
-   The last one is
+   `result`, `prior_state`, `target`, `post_state`, `feedback`, `turn`, and `value`. The last one is
    `apps/api/src/curie_api/models.py::WorkflowStateEntry.value`; `evidence` is used
    by both approval and action audit rows. Three of them are
    load-bearing rather than incidental: the workflow-state store exists precisely because
