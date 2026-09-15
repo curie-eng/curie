@@ -130,7 +130,7 @@ if [ "$1" = "template" ]; then
 
     if [ "$show_only" = "templates/preflight-gvisor.yaml" ]; then
         if [ "$gvisor_mode" = "off" ] || { [ "$gvisor_mode" = "auto" ] && [ "$fake_model" = "true" ]; }; then
-            printf '%s\n' 'Error: could not find template templates/preflight-gvisor.yaml in chart' >&2
+            printf '%s\n' 'Error: could not find template "templates/preflight-gvisor.yaml" in chart' >&2
             exit 1
         fi
         if [ "$install_runtimeclass" = "true" ]; then

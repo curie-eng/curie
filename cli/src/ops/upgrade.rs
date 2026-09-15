@@ -19,6 +19,8 @@ use super::command::{mask_secret, plain, require_on_path, run_capture, CommonOpt
 const DRAIN_TIMEOUT_ENV: &str = "CURIE_UPGRADE_DRAIN_TIMEOUT_SECS";
 const DRAIN_TIMEOUT_DEFAULT_SECS: u64 = 30;
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TEST_FAIL_AT_ENV: &str = "CURIE_UPGRADE_TEST_FAIL_AT";
+const TEST_INTERRUPT_AFTER_ENV: &str = "CURIE_UPGRADE_TEST_INTERRUPT_AFTER";
 
 /// Durable phases of a cluster upgrade. Order is load-bearing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +62,39 @@ impl UpgradePhase {
             UpgradePhase::Canary => "canary",
             UpgradePhase::Commit => "commit",
         }
+    }
+
+    /// Parse the durable phase name used by test-only env hooks.
+    pub fn parse(raw: &str) -> Option<UpgradePhase> {
+        let raw = raw.trim();
+        Self::ALL.into_iter().find(|phase| phase.as_str() == raw)
+    }
+}
+
+fn is_soak_identity(namespace: &str, release: &str) -> bool {
+    matches!(namespace, "curie" | "default") || matches!(release, "curie" | "default")
+}
+
+/// Honor `CURIE_UPGRADE_TEST_*` only on a task-owned install. Soak identities
+/// refuse the hook before any phase runs.
+pub(crate) fn test_hook_phase(opts: &UpgradeOpts, env_name: &str) -> Result<Option<UpgradePhase>> {
+    let raw = match std::env::var(env_name) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    if is_soak_identity(&opts.common.namespace, &opts.common.release) {
+        bail!(
+            "refusing {env_name} against soak namespace '{}' or soak release '{}'; use a task-owned namespace and release",
+            opts.common.namespace,
+            opts.common.release
+        );
+    }
+    match UpgradePhase::parse(&raw) {
+        Some(phase) => Ok(Some(phase)),
+        None => bail!("unknown upgrade test phase '{}' in {env_name}", raw.trim()),
     }
 }
 
@@ -1091,6 +1126,8 @@ struct LiveHost {
     current: Option<String>,
     known_good: Option<String>,
     record: Option<UpgradeRecord>,
+    fail_at: Option<UpgradePhase>,
+    interrupt_after: Option<UpgradePhase>,
     secret: Option<String>,
     /// The migrated retained overlay Apply hands Helm via `-f`, computed ONCE
     /// before the lifecycle runs (Ruling 8.8): `refuse_config` takes `&self`,
@@ -1136,6 +1173,11 @@ fn helm_upgrade_argv(opts: &UpgradeOpts, to: &str) -> Vec<String> {
         "-n".into(),
         opts.common.namespace.clone(),
         "--wait".into(),
+        // Helm's --wait default timeout is 5m. A kind 0.9.1 -> 0.9.0 apply
+        // with the schema-migrate hook overruns that, apply bails, and the
+        // checkpoint stays in_progress so the next --to is refused.
+        "--timeout".into(),
+        "15m".into(),
     ];
     if opts.chart.uses_helm_version() {
         argv.push("--version".into());
@@ -1181,12 +1223,21 @@ fn merge_forward_only(overlay: Option<&str>) -> Result<String> {
 }
 
 impl LiveHost {
-    fn new(opts: UpgradeOpts) -> Self {
-        Self {
-            opts,
+    fn new(opts: UpgradeOpts) -> Result<Self> {
+        let fail_at = test_hook_phase(&opts, TEST_FAIL_AT_ENV)?;
+        let interrupt_after = test_hook_phase(&opts, TEST_INTERRUPT_AFTER_ENV)?;
+        if fail_at.is_some() || interrupt_after.is_some() {
+            eprintln!(
+                "curie upgrade test hook armed fail_at={fail_at:?} interrupt_after={interrupt_after:?}"
+            );
+        }
+        Ok(Self {
+            opts: opts.clone(),
             current: None,
             known_good: None,
             record: None,
+            fail_at,
+            interrupt_after,
             secret: None,
             overlay: None,
             config_refusal: None,
@@ -1198,7 +1249,7 @@ impl LiveHost {
             checkpoint_resource_version: None,
             checkpoint_data_present: false,
             checkpoint_record: None,
-        }
+        })
     }
 
     fn run(&self, cmd: &OpsCommand) -> Result<(bool, String, String)> {
@@ -2094,6 +2145,12 @@ impl UpgradeDriver for LiveHost {
             _ => true,
         }
     }
+    fn fail_at(&self) -> Option<UpgradePhase> {
+        self.fail_at
+    }
+    fn interrupt_after(&self) -> Option<UpgradePhase> {
+        self.interrupt_after
+    }
 }
 
 /// Live `curie cluster upgrade` entry point.
@@ -2103,7 +2160,7 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
     }
     if opts.common.dry_run {
         require_on_path("helm").ok();
-        let mut live = LiveHost::new(opts.clone());
+        let mut live = LiveHost::new(opts.clone())?;
         live.current = live.inspect_version();
         live.known_good = live.current.clone();
         // Retained configuration is available without the target chart, so a
@@ -2127,7 +2184,7 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         bail!("upgrade aborted");
     }
 
-    let mut live = LiveHost::new(opts.clone());
+    let mut live = LiveHost::new(opts.clone())?;
     live.acquire_ownership()?;
     let setup = live.parse_acquired_record();
     let result = match setup {
@@ -2226,5 +2283,106 @@ pub async fn load_upgrade_status(
     match serde_json::from_str::<UpgradeRecord>(&out) {
         Ok(record) => status_from_record(Some(&record), fallback_known_good),
         Err(_) => UpgradeStatusView::idle(fallback_known_good),
+    }
+}
+
+#[cfg(test)]
+mod hook_tests {
+    use super::*;
+
+    fn opts(namespace: &str, release: &str) -> UpgradeOpts {
+        UpgradeOpts {
+            common: CommonOpts {
+                namespace: namespace.into(),
+                release: release.into(),
+                dry_run: false,
+            },
+            to: "0.9.0".into(),
+            chart: UpgradeChart::AvailableLocal("charts/curie".into()),
+            yes: true,
+            forward_only: false,
+        }
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.key);
+        }
+    }
+
+    fn set_env(key: &'static str, value: &str) -> EnvGuard {
+        std::env::set_var(key, value);
+        EnvGuard { key }
+    }
+
+    #[tokio::test]
+    async fn unset_or_empty_hook_is_none() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        std::env::remove_var(TEST_FAIL_AT_ENV);
+        let owned = opts("acme-2590", "t2590");
+        assert!(test_hook_phase(&owned, TEST_FAIL_AT_ENV)
+            .expect("unset hook")
+            .is_none());
+        let _guard = set_env(TEST_FAIL_AT_ENV, "  ");
+        assert!(test_hook_phase(&owned, TEST_FAIL_AT_ENV)
+            .expect("empty hook")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn soak_namespace_refuses_fail_at() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = set_env(TEST_FAIL_AT_ENV, "apply");
+        let err = test_hook_phase(&opts("curie", "t2590"), TEST_FAIL_AT_ENV)
+            .expect_err("soak namespace must refuse FAIL_AT");
+        let shown = format!("{err:#}");
+        assert!(
+            shown.contains("soak") && shown.contains(TEST_FAIL_AT_ENV),
+            "{shown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn soak_release_refuses_interrupt_after() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = set_env(TEST_INTERRUPT_AFTER_ENV, "checkpoint");
+        let err = test_hook_phase(&opts("acme-2590", "curie"), TEST_INTERRUPT_AFTER_ENV)
+            .expect_err("soak release must refuse INTERRUPT_AFTER");
+        let shown = format!("{err:#}");
+        assert!(
+            shown.contains("soak") && shown.contains(TEST_INTERRUPT_AFTER_ENV),
+            "{shown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_namespace_is_soak() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = set_env(TEST_FAIL_AT_ENV, "apply");
+        test_hook_phase(&opts("default", "t2590"), TEST_FAIL_AT_ENV)
+            .expect_err("namespace default is soak");
+    }
+
+    #[tokio::test]
+    async fn owned_install_parses_fail_at_apply() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = set_env(TEST_FAIL_AT_ENV, "apply");
+        let phase = test_hook_phase(&opts("acme-2590", "t2590"), TEST_FAIL_AT_ENV)
+            .expect("owned FAIL_AT")
+            .expect("apply");
+        assert_eq!(phase, UpgradePhase::Apply);
+    }
+
+    #[tokio::test]
+    async fn unknown_phase_is_refused() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = set_env(TEST_FAIL_AT_ENV, "not-a-phase");
+        let err = test_hook_phase(&opts("acme-2590", "t2590"), TEST_FAIL_AT_ENV)
+            .expect_err("unknown phase");
+        assert!(format!("{err:#}").contains("unknown upgrade test phase"));
     }
 }

@@ -1118,6 +1118,26 @@ enum DevAction {
         #[arg(long)]
         self_test: bool,
     },
+    /// Isolated next-train `cluster upgrade` matrix (#2590,
+    /// `bash cli/scripts/cluster-upgrade-matrix.sh`): published v0.8.8 on a
+    /// task-owned kind install, packaged 0.9.0/0.9.1 charts, fail-at and
+    /// interrupt-after hooks, migration crash retry, image/object convergence,
+    /// and compatible plus published-window rollback. Refuses the permanent
+    /// soak. Checkout-only.
+    ClusterUpgradeMatrix {
+        /// Scenario to run, or `all`.
+        #[arg(long, default_value = "all")]
+        scenario: String,
+        /// Recreate a leftover task-owned kind cluster of the same name.
+        #[arg(long)]
+        force: bool,
+        /// Leave the kind cluster and Helm release running after the matrix.
+        #[arg(long)]
+        keep: bool,
+        /// Guard checks only: soak refusal, checksum pins, mutator verb.
+        #[arg(long)]
+        self_test: bool,
+    },
     /// Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points
     /// at, not merely that its NetworkPolicies are applied (#1153,
     /// `bash scripts/check-netpol-enforcement.sh`). Structured as a
@@ -3317,6 +3337,27 @@ async fn run(command: Option<Command>) -> Result<()> {
                     args.push("--json");
                 }
                 commands::dev_script("cli/scripts/upgrade-drill.sh", &args).await
+            }
+            DevAction::ClusterUpgradeMatrix {
+                scenario,
+                force,
+                keep,
+                self_test,
+            } => {
+                let mut args: Vec<&str> = vec!["--scenario", scenario.as_str()];
+                if force {
+                    args.push("--force");
+                }
+                if keep {
+                    args.push("--keep");
+                }
+                if self_test {
+                    args.push("--self-test");
+                }
+                if ui::ui().json() {
+                    args.push("--json");
+                }
+                commands::dev_script("cli/scripts/cluster-upgrade-matrix.sh", &args).await
             }
             DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
             DevAction::PluginCompat => {
@@ -6290,6 +6331,42 @@ mod tests {
                 assert!(!self_test);
             }
             _ => panic!("expected release-accept"),
+        }
+        let cli = Cli::try_parse_from(["curie", "dev", "cluster-upgrade-matrix"])
+            .expect("dev cluster-upgrade-matrix should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::ClusterUpgradeMatrix { .. }
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "curie",
+            "dev",
+            "cluster-upgrade-matrix",
+            "--scenario",
+            "fail-every-phase",
+            "--force",
+            "--keep",
+            "--self-test",
+        ])
+        .expect("dev cluster-upgrade-matrix flags should parse");
+        match cli.command {
+            Some(Command::Dev {
+                action:
+                    DevAction::ClusterUpgradeMatrix {
+                        scenario,
+                        force,
+                        keep,
+                        self_test,
+                    },
+            }) => {
+                assert_eq!(scenario, "fail-every-phase");
+                assert!(force);
+                assert!(keep);
+                assert!(self_test);
+            }
+            _ => panic!("expected cluster-upgrade-matrix"),
         }
     }
 
