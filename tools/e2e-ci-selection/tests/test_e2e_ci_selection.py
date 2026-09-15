@@ -457,6 +457,8 @@ AGGREGATE_EXPRESSIONS = {
     "local_release_result": "${{ needs.e2e-ladder-release.result }}",
     "cluster_result": "${{ needs.e2e-ladder-cluster.result }}",
     "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
+    "upgrade_matrix_result": "${{ needs.e2e-cluster-upgrade-matrix.result }}",
+    "is_next_train": "${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}",
 }
 
 
@@ -496,6 +498,33 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert jobs["e2e-released-upgrade"]["if"] == (
         "${{ needs.changes.outputs.released_upgrade == 'true' }}"
     )
+    assert jobs["e2e-cluster-upgrade-matrix"]["if"] == (
+        "${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}"
+    )
+
+
+def test_upgrade_matrix_workflow_is_always_on_next_and_runs_the_script() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    job = workflow["jobs"]["e2e-cluster-upgrade-matrix"]
+    needs = job["needs"]
+    if isinstance(needs, str):
+        needs = [needs]
+    assert set(needs) == {"rust-build"}
+    assert job["if"] == (
+        "${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}"
+    )
+    named_steps = {
+        step["name"]: step for step in job["steps"] if isinstance(step.get("name"), str)
+    }
+    run_step = named_steps["Run the cluster upgrade matrix"]
+    assert run_step["env"]["CURIE_BIN"] == "cli/target/release/curie"
+    assert run_step["env"]["CURIE_E2E_CANDIDATE_TAG"] == "matrix-candidate"
+    assert "cli/scripts/cluster-upgrade-matrix.sh" in run_step["run"]
+    assert "--scenario all" in run_step["run"]
+    teardown = named_steps["Tear down the owned upgrade matrix cluster"]
+    assert teardown["if"] == "always()"
+    assert "kind delete cluster --name curie-upgrade-matrix" in teardown["run"]
+    assert "kind delete cluster --name curie-upgrade " not in teardown["run"]
 
 
 def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
@@ -849,6 +878,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-ladder-release",
         "e2e-ladder-cluster",
         "e2e-released-upgrade",
+        "e2e-cluster-upgrade-matrix",
     }
     assert job["if"] == "${{ !cancelled() }}"
 
@@ -891,6 +921,8 @@ def _run_aggregate(
         "local_release_result": "skipped",
         "cluster_result": "skipped",
         "released_upgrade_result": "skipped",
+        "upgrade_matrix_result": "skipped",
+        "is_next_train": "false",
     }
     state.update(overrides)
     environment = os.environ.copy()
@@ -951,6 +983,15 @@ def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> Non
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_aggregate_requires_upgrade_matrix_success_on_next_train() -> None:
+    ok = _run_aggregate(is_next_train="true", upgrade_matrix_result="success")
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    skipped = _run_aggregate(is_next_train="true", upgrade_matrix_result="skipped")
+    assert skipped.returncode != 0
+    failed = _run_aggregate(is_next_train="true", upgrade_matrix_result="failure")
+    assert failed.returncode != 0
+
+
 @pytest.mark.parametrize(
     "state",
     [
@@ -963,6 +1004,8 @@ def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> Non
         {"skill_local_result": "success"},
         {"local_release_result": "success"},
         {"cluster_result": "success"},
+        {"upgrade_matrix_result": "success"},
+        {"is_next_train": "true", "upgrade_matrix_result": "skipped"},
     ],
 )
 def test_aggregate_rejects_inconsistent_outcomes(state: dict[str, str]) -> None:
