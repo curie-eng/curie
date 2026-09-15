@@ -808,7 +808,7 @@ only coverage it gets. It needs the release-pinned
 `ghcr.io/curie-eng/curie-api` and `-worker-local` images already built and
 tagged locally (it preflights and fails with a fix hint otherwise).
 
-Three env knobs configure it:
+Five env knobs configure it:
 
 - `CURIE_E2E_TIERS` -- which rungs to run. Defaults to `skill,local`
   (credential-free, CI-safe); `all` runs `skill,local,cluster`. A tier named
@@ -828,6 +828,12 @@ Three env knobs configure it:
   host -- notably a kind/minikube cluster whose API server binds loopback, where
   the auto-detected `127.0.0.1` is unreachable from a pod. CI's kind cluster job
   sets it to the kind Docker network gateway.
+- `CURIE_NAMESPACE` -- Kubernetes namespace the cluster rung targets. Defaults
+  to `curie` when unset. Forwarded as `--namespace` on every cluster verb.
+  Product observability still requires an explicit non-default value.
+- `CURIE_RELEASE` -- Helm release the cluster rung targets. Defaults to
+  `curie` when unset. Forwarded as `--release` on every cluster verb. Product
+  observability still requires an explicit non-default value.
 
 `CURIE_E2E_BUNDLE` is not a ladder knob: the ladder hardcodes `examples/weather`
 as its bundle source and sets the var itself when it invokes `cli/scripts/e2e.sh`

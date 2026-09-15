@@ -78,6 +78,18 @@
 #   CURIE_E2E_LIVE         1 = real model on every named rung, including
 #                            rung 1 (cli/scripts/e2e.sh reads this same var
 #                            itself rather than being told by the ladder).
+#   CURIE_NAMESPACE        Kubernetes namespace the cluster rung targets.
+#                            Default curie when unset on the regular path
+#                            (empty-but-set does not default). Forwarded as
+#                            --namespace on every cluster verb. Product
+#                            observability still requires an explicit
+#                            non-default value.
+#   CURIE_RELEASE          Helm release the cluster rung targets. Default
+#                            curie when unset on the regular path
+#                            (empty-but-set does not default). Forwarded as
+#                            --release on every cluster verb. Product
+#                            observability still requires an explicit
+#                            non-default value.
 #   CURIE_BIN              path to a prebuilt curie binary (skip cargo build)
 #   CURIE_E2E_CONNECTOR_BUNDLE
 #                          opt-in: path to a bundle that declares connectors
@@ -793,8 +805,8 @@ seed_cluster_missing_carrier_control() {
     local marker="curie-seed-cluster-missing-carrier-$$-$RANDOM"
     local stream_start stream_end out private_slice
     stream_start="$(capture_stream_cursor cluster)" || return 1
-    out="$("$BIN" --json cluster message --namespace "$CURIE_NAMESPACE" \
-        --release "$CURIE_RELEASE" "missing carrier compatibility $marker" || true)"
+    out="$("$BIN" --json cluster message "${ns_rel[@]}" \
+        "missing carrier compatibility $marker" || true)"
     assert_finalized_reply "cluster missing-carrier compatibility" "$out"
     stream_end="$(capture_stream_cursor cluster)" || return 1
     [[ "$stream_end" != "$stream_start" ]] || {
@@ -1034,8 +1046,8 @@ query_exact_seed_trace() {
         if [[ "$tier" == "local" ]]; then
             "$BIN" --json local observability run "$trace_id" > "$private_read" 2>/dev/null || code=$?
         elif [[ "$tier" == "cluster" ]]; then
-            "$BIN" --json cluster observability --namespace "$CURIE_NAMESPACE" \
-                --release "$CURIE_RELEASE" run "$trace_id" > "$private_read" 2>/dev/null || code=$?
+            "$BIN" --json cluster observability "${ns_rel[@]}" \
+                run "$trace_id" > "$private_read" 2>/dev/null || code=$?
         else
             rm -f "$private_read" "$safe_read"
             echo "seed-invalid: exact trace query tier is unknown" >&2
@@ -1797,11 +1809,23 @@ probe_local_fake_model() {
     printf '%s' "$value"
 }
 
+# Chart fullname worker: release if it contains "curie", else `{release}-curie`,
+# then trunc 63 and strip exactly one trailing dash, then `-worker`.
+cluster_worker_deploy() {
+    local release="${CURIE_RELEASE-curie}" fullname
+    case "$release" in
+        *curie*) fullname="$release" ;;
+        *) fullname="${release}-curie" ;;
+    esac
+    fullname="${fullname:0:63}"
+    fullname="${fullname%-}"
+    printf '%s' "${fullname}-worker"
+}
+
 probe_cluster_fake_model() {
-    # The release defaults to `curie` (cli/src/main.rs), which is what this rung
-    # runs against. Its namespace follows CURIE_NAMESPACE like the surrounding
-    # CLI calls; the deployment remains `deployment/<release>-worker`.
-    kubectl -n "${CURIE_NAMESPACE:-curie}" get deployment/curie-worker \
+    # Defaults remain curie when unset. The probe follows the selected
+    # namespace and the chart fullname worker.
+    kubectl -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
         -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_FAKE_MODEL")].value}'
 }
 
@@ -3003,7 +3027,7 @@ case_connector_registry_missing_cluster() {
     fi
     echo "cluster: tempo's locked image corrupted to '$bad' for this one deploy"
 
-    out="$("$BIN" --json cluster deploy --plugin-dir "$WORKDIR/bundle" 2>&1)" && code=0 || code=$?
+    out="$("$BIN" --json cluster deploy "${ns_rel[@]}" --plugin-dir "$WORKDIR/bundle" 2>&1)" && code=0 || code=$?
     printf '%s\n' "$out"
 
     # Restored BEFORE the assertions, so a red one cannot carry a corrupt lock
@@ -4813,8 +4837,7 @@ rung_cluster_product() {
     RAN_RUNGS="$RAN_RUNGS cluster"
     preflight_cluster_product_observability
     local deploy_json digest agent_id agent_name
-    deploy_json="$("$BIN" --json cluster deploy \
-        --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
+    deploy_json="$("$BIN" --json cluster deploy "${ns_rel[@]}" \
         --plugin-dir "$WORKDIR/bundle")"
     digest="$(deploy_field "cluster" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "cluster" "$deploy_json" agent.id)"
@@ -4823,9 +4846,54 @@ rung_cluster_product() {
     assert_bundle_identity "cluster" "$digest"
 }
 
+# DNS-1123 label: lowercase alphanumeric and hyphens, start and end
+# alphanumeric, at most 63 characters. Used for CURIE_NAMESPACE. Empty-but-set
+# is invalid; the regular cluster path defaults unset names to curie before
+# this runs.
+validate_cluster_dns_label() {
+    local var="$1" value="$2"
+    if [[ -z "$value" ]]; then
+        echo "error: $var is empty; the cluster rung needs a DNS-1123 Kubernetes namespace." >&2
+        echo "fix: set $var to a lowercase alphanumeric label with optional hyphens (start and end alphanumeric, at most 63 characters)." >&2
+        return 1
+    fi
+    local re='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+    if [[ ! "$value" =~ $re ]]; then
+        echo "error: $var='$value' is not a DNS-1123 label (lowercase alphanumeric and hyphens, start and end alphanumeric, at most 63 characters)." >&2
+        echo "fix: set $var to a valid Kubernetes namespace; '$value' is not one." >&2
+        return 1
+    fi
+}
+
+# Helm release name: DNS-1123 subdomain, at most 53 characters (Helm's cap so a
+# 10-character revision suffix still fits in 63). Dots are allowed.
+# Empty-but-set is invalid.
+validate_cluster_helm_release() {
+    local var="$1" value="$2"
+    if [[ -z "$value" ]]; then
+        echo "error: $var is empty; the cluster rung needs a Helm release name." >&2
+        echo "fix: set $var to a DNS-1123 subdomain of at most 53 characters (lowercase alphanumeric, hyphens, and dots; start and end alphanumeric)." >&2
+        return 1
+    fi
+    local re='^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+    if [[ ${#value} -gt 53 || ! "$value" =~ $re ]]; then
+        echo "error: $var='$value' is not a Helm release name (DNS-1123 subdomain, at most 53 characters)." >&2
+        echo "fix: set $var to a valid Helm release name; '$value' is not one." >&2
+        return 1
+    fi
+}
+
 # Rung 3: the deployed release. Requires one to already exist; it is never
 # installed or torn down here, because the cluster is shared.
 rung_cluster() {
+    if [[ "$PRODUCT_OBSERVABILITY" != "1" ]]; then
+        CURIE_NAMESPACE="${CURIE_NAMESPACE-curie}"
+        CURIE_RELEASE="${CURIE_RELEASE-curie}"
+    fi
+    validate_cluster_dns_label CURIE_NAMESPACE "${CURIE_NAMESPACE-}" || return 1
+    validate_cluster_helm_release CURIE_RELEASE "${CURIE_RELEASE-}" || return 1
+    ns_rel=(--namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE")
+
     if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; then
         rung_cluster_product
         return
@@ -4838,11 +4906,11 @@ rung_cluster() {
     echo "=== curie cluster status (gate) ==="
     # Gate on the PAYLOAD, not the exit code: `cluster status` is a read-only
     # report verb and exits 0 even when the release is absent (it just prints
-    # "release curie not found"), so an exit-code gate never fires and the
+    # "release $CURIE_RELEASE not found"), so an exit-code gate never fires and the
     # rung falls through into a confusing `cluster deploy` failure instead.
     # --json puts the object on stdout and human text on stderr.
     local status_json found
-    status_json="$("$BIN" --json cluster status 2>/dev/null || true)"
+    status_json="$("$BIN" --json cluster status "${ns_rel[@]}" 2>/dev/null || true)"
     printf '%s\n' "$status_json"
     found="$(printf '%s' "$status_json" | python3 -c '
 import json, sys
@@ -4854,8 +4922,8 @@ except Exception:
 print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
 ' || echo "no")"
     if [[ "$found" != "yes" ]]; then
-        echo "error: CURIE_E2E_TIERS named the cluster rung, but no installed release was reported by \`curie --json cluster status\`." >&2
-        echo "fix: install a release with \`curie cluster up --fake-model\` (or point kubectl at the right context), or drop cluster from CURIE_E2E_TIERS." >&2
+        echo "error: CURIE_E2E_TIERS named the cluster rung, but no installed release was reported by \`curie --json cluster status --namespace $CURIE_NAMESPACE --release $CURIE_RELEASE\`." >&2
+        echo "fix: install a release with \`curie cluster up --namespace $CURIE_NAMESPACE --release $CURIE_RELEASE --fake-model\` (or point kubectl at the right context), or drop cluster from CURIE_E2E_TIERS." >&2
         return 1
     fi
 
@@ -4867,7 +4935,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     # deploy receipt's bundle.sha256 is the only artifact-identity surface here
     # too.
     local deploy_json digest agent_id agent_name deployment_id deployment_status deployment_environment
-    deploy_json="$("$BIN" --json cluster deploy --plugin-dir "$WORKDIR/bundle")"
+    deploy_json="$("$BIN" --json cluster deploy "${ns_rel[@]}" --plugin-dir "$WORKDIR/bundle")"
     printf '%s\n' "$deploy_json"
     digest="$(deploy_field "cluster" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "cluster" "$deploy_json" agent.id)"
@@ -4928,9 +4996,9 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
         # -- it is the namespace the release is installed into -- which is why
         # the pinned entry set excludes it.
         local cluster_release cluster_namespace
-        cluster_release="$(kubectl -n "${CURIE_NAMESPACE:-curie}" get deployment/curie-worker \
+        cluster_release="$(kubectl -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
             -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_RELEASE")].value}')"
-        cluster_namespace="$(kubectl -n "${CURIE_NAMESPACE:-curie}" get deployment/curie-worker \
+        cluster_namespace="$(kubectl -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
             -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_NAMESPACE")].value}')"
         assert_connector_parity "cluster" kubectl "$cluster_release" "$agent_name" "$cluster_namespace"
         case_connector_registry_missing_cluster "$cluster_release" "$agent_name" "$cluster_namespace"
@@ -4957,7 +5025,9 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     # surface this rung exists to gate -- resolves. It is the documented
     # `--listen-host` operator escape hatch, not a test-only shortcut: the exact
     # value any loopback-API-server cluster needs.
-    local msg_args=(--json cluster message "$PROMPT")
+    local msg_args=(--json cluster message)
+    msg_args+=("${ns_rel[@]}")
+    msg_args+=("$PROMPT")
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
         echo "using --listen-host ${CURIE_E2E_LISTEN_HOST} (worker->stub reply host)"
         msg_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
@@ -4976,6 +5046,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     # plan here, an auditable green on the live/retention grades -- and passing
     # it once per call site is what keeps it from being passed twice at any.
     local eval_args=(cluster eval)
+    eval_args+=("${ns_rel[@]}")
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
         eval_args+=(--cases "$WORKDIR/bundle/evals/cases.json")
     fi
@@ -5019,7 +5090,9 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
             echo "cluster: retention eval suite $eval_i reported a failing case. Not failing the rung: this rung's grade is report only (#1603)." >&2
         fi
     done
-    local retention_args=(--json cluster message "$PROMPT")
+    local retention_args=(--json cluster message)
+    retention_args+=("${ns_rel[@]}")
+    retention_args+=("$PROMPT")
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
         retention_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
     fi
