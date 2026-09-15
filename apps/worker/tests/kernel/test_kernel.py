@@ -46,7 +46,7 @@ FAIL = SessionStatus.CLASSIFIED_FAILURE
 
 # #2659 reply texts, pinned as literals so a wording drift in the worker is a
 # visible test failure rather than a silently updated import.
-_ANNOUNCEMENT = "Working in acme-corp/acme-bot, from the repository URL in your message."
+_ANNOUNCEMENT = "Working in acme-corp/acme-bot, from the repository named in your message."
 _AMBIGUOUS_REFUSAL = (
     "This message names more than one GitHub repository, so no repository was "
     "attached and no work started. A thread works in only one repository."
@@ -483,6 +483,7 @@ def _updates_on(h: Any, placeholder: str) -> list[str]:
 
 
 _REPO_MESSAGE = "Make a change in https://github.com/acme-corp/acme-bot: add a note"
+_BARE_REPO_MESSAGE = "Make a change in acme-corp/acme-bot: add a note"
 
 
 def test_repository_url_turn_announces_the_inferred_repository(make_harness) -> None:
@@ -499,6 +500,28 @@ def test_repository_url_turn_announces_the_inferred_repository(make_harness) -> 
 
             # The model input is the message verbatim; the line is platform text.
             assert h.runner.opened == [_REPO_MESSAGE]
+            assert [s["repo_full_name"] for s in probe.selections] == [
+                "acme-corp/acme-bot"
+            ]
+            assert len(probe.claims) == 1
+            assert h.sink.last_text == f"changed\n\n{_ANNOUNCEMENT}"
+
+    asyncio.run(go())
+
+
+def test_repository_slug_turn_announces_the_inferred_repository(make_harness) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777d")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding) as h:
+            probe = _AttachingWorkspaceProbe(h.substrate)
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            h.runner.default_script = [Final(text="changed", status=DONE)]
+
+            await h.kernel.process_event(_qevent(_BARE_REPO_MESSAGE, thread="tAnnounceBare"))
+
+            assert h.runner.opened == [_BARE_REPO_MESSAGE]
             assert [s["repo_full_name"] for s in probe.selections] == [
                 "acme-corp/acme-bot"
             ]
@@ -1028,6 +1051,53 @@ def test_unallowlisted_runtime_repo_is_terminal_before_claim_or_model(
                 _qevent(
                     "Change https://github.com/attacker/other-bot",
                     thread="tUnallowlistedRepo",
+                )
+            )
+
+            assert probe.selection_calls == 1
+            assert h.runner.opened == []
+            assert h.fake_k8s.claim_envs == []
+            assert h.sink.last_text == (
+                "That repository is not in api.githubRepoAllowlist for this installation; "
+                "allow `owner/repo` or `owner/*` in the chart values."
+            )
+
+    asyncio.run(go())
+
+
+def test_unallowlisted_bare_runtime_repo_is_terminal_before_claim_or_model(
+    make_harness,
+) -> None:
+    deployment_id = uuid.UUID("55555555-5555-4555-8555-555555555556")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(
+            deployment_id,
+            workspace_enabled=False,
+        )
+        async with make_harness(binding=binding) as h:
+            class WorkspaceProbe:
+                selection_calls = 0
+
+                def select_repository(self, **kwargs: object) -> str:
+                    self.selection_calls += 1
+                    assert kwargs["deployment_id"] == deployment_id
+                    assert kwargs["repo_full_name"] == "attacker/other-bot"
+                    raise WorkspaceSelectionRefused(
+                        "That repository is not in api.githubRepoAllowlist for this installation; "
+                        "allow `owner/repo` or `owner/*` in the chart values."
+                    )
+
+                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                    raise AssertionError("a refused repository must not reach credential or claim")
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+
+            await h.kernel.process_event(
+                _qevent(
+                    "Change attacker/other-bot",
+                    thread="tUnallowlistedBareRepo",
                 )
             )
 

@@ -520,6 +520,96 @@ def test_runtime_repo_parser_rejects_non_root_or_credentialed_urls(
     assert workspace.parse_github_repo_fact(message) is None
 
 
+def test_runtime_repo_parser_accepts_a_bare_owner_repo(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Please update acme-corp/acme-bot and add a test."
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_deduplicates_bare_and_url_for_the_same_repo(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Update acme-corp/acme-bot and keep https://github.com/acme-corp/acme-bot current."
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_rejects_two_different_bare_names(workspace: Any) -> None:
+    with pytest.raises(
+        workspace.WorkspaceSelectionRefused, match="only one"
+    ) as excinfo:
+        workspace.parse_github_repo_fact(
+            "Compare acme-corp/acme-bot with acme-corp/acme-api before changing anything."
+        )
+    assert excinfo.value.public_detail == (
+        "This message names more than one GitHub repository, so no repository "
+        "was attached and no work started. A thread works in only one repository."
+    )
+
+
+def test_runtime_repo_parser_still_rejects_a_pull_request_url(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "https://github.com/acme-corp/acme-bot/pull/1"
+    ) is None
+
+
+def test_runtime_repo_parser_ignores_nested_source_paths(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Look at apps/worker/src/curie_worker/workspace.py"
+    ) is None
+
+
+def test_runtime_repo_parser_ignores_english_slash_pairs(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Use retries and/or a fallback when the clone fails."
+    ) is None
+
+
+def test_runtime_repo_parser_accepts_wrapped_bare_owner_repo(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Please update <acme-corp/acme-bot> and add a test."
+    ) == "acme-corp/acme-bot"
+    assert workspace.parse_github_repo_fact(
+        "Please update `acme-corp/acme-bot` and add a test."
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_keeps_a_bare_repo_when_a_two_segment_file_path_is_also_present(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Update acme-corp/acme-bot in src/main.py"
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_accepts_a_dotted_repository_name(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Update acme-corp/acme.bot"
+    ) == "acme-corp/acme.bot"
+
+
+def test_runtime_repo_parser_keeps_a_bare_repo_when_an_extensionless_file_path_is_also_present(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Update acme-corp/acme-bot in docs/README"
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_ignores_a_two_segment_markdown_path(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact("Read docs/agents.md") is None
+
+
+def test_runtime_repo_parser_keeps_a_url_when_a_two_segment_file_path_is_also_present(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Please update https://github.com/acme-corp/acme-bot in src/main.py"
+    ) == "acme-corp/acme-bot"
+
+
 def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
     workspace: Any,
 ) -> None:

@@ -236,7 +236,7 @@ First (and only opening) message:
 
 | Evidence | Expected |
 |---|---|
-| Slack reply | The thread is owned by this release. `/workspace` is a checkout of `acme-corp/acme-bot`. The bot edits README.md and asks to publish. The reply carries the line "Working in acme-corp/acme-bot, from the repository URL in your message." directly above the awaiting-approval notice |
+| Slack reply | The thread is owned by this release. `/workspace` is a checkout of `acme-corp/acme-bot`. The bot edits README.md and asks to publish. The reply carries the line "Working in acme-corp/acme-bot, from the repository named in your message." directly above the awaiting-approval notice |
 | Approval state | A publication approval card, distinct from the Kubernetes `resources_scale` cards. Approve it once. The sandbox never receives the GitHub credential |
 | Kubernetes | `acme-demo` remains 2/2 unless a new approved scale was requested |
 | Negative control | The refusal ``That repository is not in api.githubRepoAllowlist for this installation; allow `owner/repo` or `owner/*` in the chart values.`` means the allowlist omitted the repository. A GitHub credential problem (the App not installed on the repository, or no usable token) is not that refusal: workspace preparation fails and, after its retries, the thread reads `The run failed (workspace-error) after N attempt(s)` and flags a human. A reply that names the repository without the announcement line, a pull request against any other repository, or a push from inside the sandbox fails this scenario |

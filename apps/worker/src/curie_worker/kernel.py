@@ -370,7 +370,7 @@ def _workspace_inference_notice(repo: str | None) -> str | None:
 
     if not repo:
         return None
-    return f"Working in {repo}, from the repository URL in your message."
+    return f"Working in {repo}, from the repository named in your message."
 
 
 def _same_repo(left: str | None, right: str | None) -> bool:

@@ -1430,7 +1430,7 @@ def test_ordinary_approval_notice_keeps_the_announcement_above_it(make_harness) 
             assert h.sink.last_text is not None
             assert h.sink.last_text.split("\n\n") == [
                 "Requesting sign-off",
-                "Working in acme-corp/acme-bot, from the repository URL in your message.",
+                "Working in acme-corp/acme-bot, from the repository named in your message.",
                 "Awaiting approval (appr-1): Give ACME a 20% discount\n"
                 "The session is paused and will resume once an authorized member "
                 "resolves this request.",
@@ -1569,7 +1569,7 @@ def test_publication_notice_keeps_the_announcement_above_it(
             )
             assert marker >= 1, blocks
             assert blocks[marker - 1] == (
-                "Working in acme-corp/acme-private, from the repository URL in your message."
+                "Working in acme-corp/acme-private, from the repository named in your message."
             )
 
     asyncio.run(go())
