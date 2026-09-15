@@ -231,6 +231,23 @@ fn normalize_image(image: &str) -> String {
     image
 }
 
+/// Registry-normalized repository, with tag and digest stripped the same way
+/// manifest_identity strips a tag from the repository side of repo@digest.
+fn repository(image: &str) -> String {
+    let image = normalize_image(image);
+    let repository = if let Some((repo, _)) = image.split_once('@') {
+        repo
+    } else {
+        image.as_str()
+    };
+    let last_segment = repository.rsplit('/').next().unwrap_or(repository);
+    if let Some((_, tag)) = last_segment.split_once(':') {
+        repository[..repository.len() - tag.len() - 1].to_owned()
+    } else {
+        repository.to_owned()
+    }
+}
+
 /// A digest-qualified runtime reference can omit the requested tag. Compare
 /// the canonical repository and the exact manifest digest, never a config ID
 /// or an assumed equivalence between different registry digests.
@@ -254,11 +271,10 @@ fn needs_node_identity(expected: &str, status: &Value) -> bool {
         && normalize_image(text(status, "/image")) != normalize_image(expected)
 }
 
-/// Unique repo@digest bound to `reference` in this node's image inventory.
-/// containerd/kubelet may list each tag of one loaded image as its own
-/// Node.status.images entry; only an exact digest identity combines them.
-/// A missing name, a digest-less entry, or two distinct digests fail closed.
-fn unique_inventory_identity(node: &Value, reference: &str) -> Option<String> {
+/// Identities named on Node.status.images entries whose names list contains
+/// `reference`. None means the name is absent from the inventory.
+/// https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
+fn matching_inventory_identities(node: &Value, reference: &str) -> Option<BTreeSet<String>> {
     let wanted = normalize_image(reference);
     let mut found = false;
     let mut identities = BTreeSet::new();
@@ -281,12 +297,52 @@ fn unique_inventory_identity(node: &Value, reference: &str) -> Option<String> {
             }
         }
     }
-    if !found {
-        return None;
+    found.then_some(identities)
+}
+
+/// Unique repo@digest bound to `reference` in this node's image inventory.
+/// containerd/kubelet may list each tag of one loaded image as its own
+/// Node.status.images entry; only an exact digest identity combines them.
+/// A missing name, a digest-less entry, or two distinct digests fail closed.
+fn unique_inventory_identity(node: &Value, reference: &str) -> Option<String> {
+    let mut identities = matching_inventory_identities(node, reference)?.into_iter();
+    let identity = identities.next()?;
+    identities.next().is_none().then_some(identity)
+}
+
+/// Unique repo@digest on this node whose repository equals `repo`.
+fn unique_repository_identity(node: &Value, repo: &str) -> Option<String> {
+    let mut identities = BTreeSet::new();
+    for image in array(node, "/status/images") {
+        for name in array(image, "/names").iter().filter_map(Value::as_str) {
+            let Some(identity) = manifest_identity(name) else {
+                continue;
+            };
+            if repository(&identity) == repo {
+                identities.insert(identity);
+            }
+        }
     }
     let mut identities = identities.into_iter();
     let identity = identities.next()?;
     identities.next().is_none().then_some(identity)
+}
+
+/// Bind a tagged request or kubelet alias to the running imageID digest.
+/// Prefer a unique digest on matching inventory entries; if those entries are
+/// digest-less, a unique same-repository digest on the node that equals the
+/// running identity. A missing name is unbound. Do not infer across repositories.
+/// https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
+fn resolve_reference_identity(node: &Value, reference: &str, running: &str) -> Option<String> {
+    match matching_inventory_identities(node, reference) {
+        Some(identities) if identities.len() > 1 => None,
+        Some(identities) if identities.is_empty() => {
+            let identity = unique_repository_identity(node, &repository(reference))?;
+            (identity == running).then_some(identity)
+        }
+        Some(_) => unique_inventory_identity(node, reference),
+        None => None,
+    }
 }
 
 fn observed_image_matches(expected: &str, status: &Value, node: Option<&Value>) -> bool {
@@ -311,14 +367,11 @@ fn observed_image_matches(expected: &str, status: &Value, node: Option<&Value>) 
     ) else {
         return false;
     };
-    // Bind the requested tag and the kubelet-reported alias to the running
-    // imageID through unique same-digest inventory identities. Do not infer
-    // equivalence from tag or repository text, and do not require those names
-    // to share one names array.
-    let Some(expected_identity) = unique_inventory_identity(node, expected) else {
+    let Some(expected_identity) = resolve_reference_identity(node, expected, &identity) else {
         return false;
     };
-    let Some(alias_identity) = unique_inventory_identity(node, text(status, "/image")) else {
+    let Some(alias_identity) = resolve_reference_identity(node, text(status, "/image"), &identity)
+    else {
         return false;
     };
     expected_identity == identity && alias_identity == identity

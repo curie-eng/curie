@@ -13,10 +13,11 @@ import logging
 import math
 import os
 import signal
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import httpx
 import redis
@@ -29,6 +30,7 @@ from . import __version__
 from .actions import ActionClient
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
+from .attachments import AttachmentCoordinator, AttachmentLimits, SlackFileClient
 from .binding import BindingResolver
 from .bundle_store import BundleStore
 from .config import WorkerConfig
@@ -236,6 +238,16 @@ def _workspace_limits(config: WorkerConfig) -> WorkspaceLimits:
     )
 
 
+def _attachment_limits(config: WorkerConfig) -> AttachmentLimits:
+    """The operator-configured envelope for the inbound-attachment lane."""
+
+    return AttachmentLimits(
+        max_file_bytes=config.attachment_max_file_bytes,
+        reference_ttl_seconds=config.attachment_reference_ttl_seconds,
+        retention_ttl_seconds=config.attachment_retention_ttl_seconds,
+    )
+
+
 def _sandbox_client(
     config: WorkerConfig, env: Mapping[str, str], sub_config: SubstrateConfig
 ) -> SandboxClient:
@@ -291,6 +303,12 @@ def _sandbox_client(
             bundle_max_compression_ratio=config.bundle_max_compression_ratio,
             bundle_max_members=config.bundle_max_members,
             workspace_limits=_workspace_limits(config),
+            # The same operator envelope the Kubernetes lane gets. Without it
+            # this substrate would redeem attachment capabilities under library
+            # defaults while the cluster used the configured caps -- the two
+            # tiers disagreeing on how big a file may be is the kind of skew
+            # that only shows up as a refusal in one place and not the other.
+            attachment_limits=_attachment_limits(config),
         )
         # Prewarm the runner image once at startup so the first claim window is
         # not gated on a cold pull. Best-effort inside ensure_image.
@@ -350,6 +368,43 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         if config.workspace_enabled
         else None
     )
+    # The inbound-attachment lane (#2567). Wired only when the operator has
+    # switched the lane on AND this deployment holds the channel credential.
+    #
+    # ``attachment_enabled`` is the lane's single off switch and it ships off:
+    # off means the coordinator is never built, so no file is downloaded, no
+    # bytes are parked, no retention ledger is written and no capability is
+    # minted -- and because nothing is minted the claim carries no
+    # ``CURIE_ATTACHMENTS_REF``, so the k8s driver emits no Overrides entry
+    # naming an init container the chart did not render. The kernel treats an
+    # unwired lane as "the concept does not exist here" and leaves the turn
+    # otherwise untouched, so a message carrying files is answered exactly as
+    # v0.8.8 answers it. The chart's ``worker.attachments.enabled`` gates the
+    # sandbox half from the same value, so there is one knob and not two.
+    #
+    # The credential condition is separate and unchanged: the lane's single job
+    # is to download a referenced file with the bot token, and the kernel treats a wired lane as
+    # authoritative, so a credential-less install (compose smoke, a mail-only
+    # deployment) must keep running every turn exactly as it does today rather
+    # than failing on the first message that carries a file.
+    #
+    # It parks bytes in the PRIVATE workspace store, never the public bundle
+    # bucket -- under its own ``attachments/`` key prefix, with its retention
+    # ledger a sibling of ``_ownership/`` -- so an inbound file is reachable only
+    # through a short-lived one-object presigned URL redeemed by the sandbox's
+    # attachments-init container.
+    attachments = (
+        AttachmentCoordinator(
+            files=SlackFileClient(
+                token=config.slack_bot_token,
+                read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+            ),
+            objects=workspace_objects,
+            limits=_attachment_limits(config),
+        )
+        if config.attachment_enabled and config.slack_bot_token
+        else None
+    )
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
@@ -390,6 +445,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         config=config,
         binding=binding,
         workspace=workspace,
+        attachments=attachments,
         approvals=approval_client,
         # Publication is cluster-only in v1. A local request sees an actionable
         # refusal in the kernel before either durable row is created.
@@ -495,12 +551,48 @@ _SUPERVISED_OPERATIONS = frozenset(
 )
 
 
+def _restart_delay_s(
+    consecutive_failures: int, *, base_s: float, max_s: float
+) -> float:
+    """Delay before restart number ``consecutive_failures`` (1-based).
+
+    Doubles from ``base_s`` per consecutive crash and never exceeds ``max_s``
+    (#2637), so a hot crash loop settles at one attempt per ``max_s`` instead of
+    one per second.
+    """
+
+    if consecutive_failures < 1 or base_s <= 0:
+        return 0.0
+    # Clamp the exponent so a long streak cannot overflow the float math.
+    exponent = min(consecutive_failures - 1, 62)
+    return min(base_s * float(2**exponent), max_s)
+
+
+def _record_supervised(name: str, outcome: str) -> None:
+    try:
+        record_metric(
+            "curie.worker.supervised.restart",
+            1,
+            attributes={
+                "service.name": "curie-worker",
+                "operation": (name if name in _SUPERVISED_OPERATIONS else "other"),
+                "outcome": outcome,
+            },
+        )
+    except Exception:
+        logger.exception("worker task %s restart metric failed", name)
+
+
 async def _supervise(
     name: str,
     factory: Callable[[], Awaitable[None]],
     shutdown: asyncio.Event,
     *,
     restart_backoff_s: float = 1.0,
+    max_restart_backoff_s: float = 60.0,
+    max_consecutive_failures: int = 10,
+    failure_reset_s: float = 300.0,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """Run a worker task, restarting it if it crashes, until shutdown is requested.
 
@@ -513,42 +605,82 @@ async def _supervise(
     ``StreamConsumer._consume``. ``CancelledError`` is a ``BaseException`` and
     still propagates, so cooperative shutdown is unaffected.
 
+    Restarts are bounded (#2637). The delay before each restart doubles from
+    ``restart_backoff_s`` up to ``max_restart_backoff_s``. An attempt that ran
+    for at least ``failure_reset_s`` before crashing starts a fresh streak, so a
+    loop that fails once a day is never treated as a crash loop. After
+    ``max_consecutive_failures`` crashes in one streak the task is parked: it is
+    not restarted, a ``give_up`` outcome is recorded on the same metric, and an
+    error is logged. Siblings keep running; the ``CurieWorkerSupervisedTaskParked``
+    alert is what surfaces the parked task. ``max_consecutive_failures <= 0``
+    disables the give-up.
+
     ``factory`` is a thunk (e.g. a bound ``run`` method) so each restart gets a
     fresh coroutine; ``run()`` is re-entrant (group creation is BUSYGROUP-safe).
     Unknown task names map to catalog ``other`` so a test or new loop cannot
     crash the supervisor by emitting an undeclared operation.
     """
+    consecutive_failures = 0
     while not shutdown.is_set():
+        started = clock()
         try:
             await factory()
             return
         except Exception as exc:
             if shutdown.is_set():
                 return
+            if clock() - started >= failure_reset_s:
+                consecutive_failures = 0
+            consecutive_failures += 1
+            if 0 < max_consecutive_failures <= consecutive_failures:
+                logger.error(
+                    "worker task %s crashed %d consecutive times; parked, not "
+                    "restarting cause=%s: %s",
+                    name,
+                    consecutive_failures,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=exc,
+                )
+                _record_supervised(name, "give_up")
+                return
+            delay_s = _restart_delay_s(
+                consecutive_failures,
+                base_s=restart_backoff_s,
+                max_s=max_restart_backoff_s,
+            )
             logger.exception(
-                "worker task %s crashed; restarting cause=%s: %s",
+                "worker task %s crashed; restarting in %.1fs (consecutive "
+                "failure %d) cause=%s: %s",
                 name,
+                delay_s,
+                consecutive_failures,
                 type(exc).__name__,
                 exc,
             )
+            _record_supervised(name, "restart")
             try:
-                record_metric(
-                    "curie.worker.supervised.restart",
-                    1,
-                    attributes={
-                        "service.name": "curie-worker",
-                        "operation": (
-                            name if name in _SUPERVISED_OPERATIONS else "other"
-                        ),
-                        "outcome": "restart",
-                    },
-                )
-            except Exception:
-                logger.exception("worker task %s restart metric failed", name)
-            try:
-                await asyncio.wait_for(shutdown.wait(), timeout=restart_backoff_s)
+                await asyncio.wait_for(shutdown.wait(), timeout=delay_s)
             except TimeoutError:
                 pass
+
+
+class _SupervisePolicy(TypedDict):
+    restart_backoff_s: float
+    max_restart_backoff_s: float
+    max_consecutive_failures: int
+    failure_reset_s: float
+
+
+def _supervise_policy(config: WorkerConfig) -> _SupervisePolicy:
+    """The configured restart bounds, applied identically to every supervised task."""
+
+    return {
+        "restart_backoff_s": config.supervise_restart_backoff_base_s,
+        "max_restart_backoff_s": config.supervise_restart_backoff_max_s,
+        "max_consecutive_failures": config.supervise_max_consecutive_failures,
+        "failure_reset_s": config.supervise_failure_reset_s,
+    }
 
 
 def _build_connector_loop(
@@ -701,17 +833,19 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
         )
     except Exception:
         logger.exception("legacy approval card migration failed; continuing boot")
+    policy = _supervise_policy(config)
     try:
         # return_exceptions=True + per-task restart: a crash in one consumer must
         # not cancel its siblings (#673). Supervisors only return on shutdown.
         await asyncio.gather(
-            _supervise("runs", rt.consumer.run, shutdown),
-            _supervise("killswitch", rt.killswitch.run, shutdown),
-            _supervise("evals", rt.eval_consumer.run, shutdown),
+            _supervise("runs", rt.consumer.run, shutdown, **policy),
+            _supervise("killswitch", rt.killswitch.run, shutdown, **policy),
+            _supervise("evals", rt.eval_consumer.run, shutdown, **policy),
             _supervise(
                 "heartbeat",
                 lambda: run_heartbeat(config.heartbeat_file, config.heartbeat_interval_s, shutdown),
                 shutdown,
+                **policy,
             ),
             *(
                 [
@@ -719,6 +853,7 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                         "connectors",
                         lambda: rt.connector_loop.run_forever(shutdown),  # type: ignore[union-attr]
                         shutdown,
+                        **policy,
                     )
                 ]
                 if rt.connector_loop is not None
@@ -730,6 +865,7 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                         "publications",
                         lambda: rt.publication_loop.run_forever(shutdown),  # type: ignore[union-attr]
                         shutdown,
+                        **policy,
                     )
                 ]
                     if getattr(rt, "publication_loop", None) is not None

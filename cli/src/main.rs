@@ -1160,6 +1160,24 @@ enum DevAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read-only evaluator for the seven-day / 200-canary release gate (#2430).
+    ///
+    /// Scores a private evidence ledger against pinned window, candidate,
+    /// workload, and percentile-method fields. A synthetic qualifying fixture
+    /// passes `--self-test`; independently missing each campaign criterion
+    /// fails closed with that criterion id. Fixture or source proof cannot
+    /// qualify as a live release result. Does not start a seven-day campaign,
+    /// rotate credentials, mutate the permanent soak, merge, or close #2430.
+    /// Checkout-only.
+    ReleaseAccept {
+        /// JSON evidence ledger. Evaluated as a live release result.
+        #[arg(long, value_name = "PATH", conflicts_with = "self_test")]
+        ledger: Option<PathBuf>,
+        /// Run committed fixture controls: qualifying pass plus each
+        /// independent miss. Does not evaluate a live window.
+        #[arg(long)]
+        self_test: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3355,6 +3373,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::BumpVersion { version, dry_run } => {
                 commands::bump_version(&version, dry_run).await
             }
+            DevAction::ReleaseAccept { ledger, self_test } => {
+                curie::release_accept::run(ledger.as_deref(), self_test)
+            }
         },
         Some(Command::Skill { action }) => match action {
             SkillAction::Up {
@@ -3826,7 +3847,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
             LocalAction::Memory { target, add } => match add {
                 None => emit(commands::memory(target.into()).await?),
-                Some(content) => emit(commands::memory_add(target.into(), content).await?),
+                Some(content) => emit(commands::memory_add(target.into(), content, "local").await?),
             },
             LocalAction::Approvals {
                 target,
@@ -5121,7 +5142,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 };
                 match add {
                     None => emit(commands::memory(opts).await?),
-                    Some(content) => emit(commands::memory_add(opts, content).await?),
+                    Some(content) => emit(commands::memory_add(opts, content, "cluster").await?),
                 }
             }
             ClusterAction::Approvals {
@@ -6235,6 +6256,40 @@ mod tests {
                 assert!(self_test);
             }
             _ => panic!("expected upgrade-drill"),
+        }
+        let cli = Cli::try_parse_from(["curie", "dev", "release-accept"])
+            .expect("dev release-accept should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::ReleaseAccept {
+                    ledger: None,
+                    self_test: false
+                }
+            })
+        ));
+        let cli = Cli::try_parse_from(["curie", "dev", "release-accept", "--self-test"])
+            .expect("dev release-accept --self-test should parse");
+        match cli.command {
+            Some(Command::Dev {
+                action: DevAction::ReleaseAccept { ledger, self_test },
+            }) => {
+                assert!(ledger.is_none());
+                assert!(self_test);
+            }
+            _ => panic!("expected release-accept"),
+        }
+        let cli =
+            Cli::try_parse_from(["curie", "dev", "release-accept", "--ledger", "ledger.json"])
+                .expect("dev release-accept --ledger should parse");
+        match cli.command {
+            Some(Command::Dev {
+                action: DevAction::ReleaseAccept { ledger, self_test },
+            }) => {
+                assert_eq!(ledger.as_deref(), Some(std::path::Path::new("ledger.json")));
+                assert!(!self_test);
+            }
+            _ => panic!("expected release-accept"),
         }
     }
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/memory/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/memory/v2.json",
   "title": "curie <tier> memory --json",
   "description": "The agent-facing payload of `curie <tier> memory <agent>` and `curie <tier> memory <agent> --add <content>`: the dry-run plan, the learned-memory entries (an empty array when none exist), or the operator-seeded add result.",
   "$defs": {
@@ -78,6 +78,9 @@
         },
         "fresh_session_required": {
           "const": true
+        },
+        "next_command": {
+          "type": "string"
         }
       },
       "required": [
@@ -85,7 +88,8 @@
         "index",
         "content",
         "source",
-        "fresh_session_required"
+        "fresh_session_required",
+        "next_command"
       ]
     }
   ]

@@ -98,6 +98,18 @@ package) with `BundleStore` as its S3/RustFS backing.
   with no S3 client in the CLI itself. Also in-cluster-store only (it addresses the
   chart's own `minio`/`rustfs` StatefulSet and reads that store's password from the
   release Secret), so it likewise never sees the key-free path.
+- **Worker workspace/attachment store** — `WorkspaceObjectPort`
+  (`apps/worker/src/curie_worker/workspace.py::WorkspaceObjectPort`;
+  `put_stream` / `get_stream` / `presign_get` / `delete` / `list_keys`), backed
+  by `WorkspaceObjectStore`
+  (`apps/worker/src/curie_worker/workspace.py::WorkspaceObjectStore`) and built
+  in `apps/worker/src/curie_worker/run.py::build`. The inbound-attachment lane
+  reuses this same port
+  (`apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator`).
+- **Chart attachments-init** — `charts/curie/templates/agent-sandbox.yaml`
+  fetches each parked object through a presigned URL from
+  `apps/worker/src/curie_worker/workspace.py::WorkspaceObjectStore.presign_get`,
+  not through the AWS CLI bundle-fetch path.
 
 ## Known leakage
 
@@ -134,12 +146,22 @@ reproduce, and neither is expressible in the four-method Protocol. See
 `charts/curie/README.md` ("Key-free object store auth") for the operator-facing shape,
 including why the instance role and IMDS are deliberately unavailable.
 
-A second non-S3 backend is **two adapters, not one**: the API owns the full **async**
+**Workspace and attachment operations are a third adapter surface.**
+`WorkspaceObjectPort` is not a slice of `ObjectStore`: a non-S3 backend must also
+provide streaming put/get, delete, list, and presigned reads
+(`apps/worker/src/curie_worker/workspace.py::WorkspaceObjectStore.presign_get`).
+The Kubernetes `attachments-init` container (`charts/curie/templates/agent-sandbox.yaml`)
+redeems those URLs, so a backend that cannot mint a presigned GET also breaks that path.
+
+A second non-S3 backend is **three adapter surfaces, not one**: the API owns the full **async**
 `ObjectStore` port (`apps/api/src/curie_api/storage.py::ObjectStore`, `async` methods),
-while the worker reads through a separate **sync** `BundleReader` slice
+the worker reads bundles through a separate **sync** `BundleReader` slice
 (`apps/worker/src/curie_worker/bundle_store.py::BundleReader`, a plain `get`) because it
-deliberately does not import the API package. A GCS/Azure backend must therefore supply
-both an async and a sync implementation.
+deliberately does not import the API package, and the worker also talks to the same
+store through `WorkspaceObjectPort`
+(`apps/worker/src/curie_worker/workspace.py::WorkspaceObjectPort`). A GCS/Azure backend
+must therefore supply the async port, the sync bundle reader, and a
+streaming/presign/delete/list implementation.
 
 ## Cross-links
 

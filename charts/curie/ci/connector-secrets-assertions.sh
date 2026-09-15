@@ -163,9 +163,12 @@ egress_render="$(helm template curie "$CHART" \
   --set-string 'agentSandbox.connectorSecrets.acme-a.GITHUB_PERSONAL_ACCESS_TOKEN=agent-a-sentinel' \
   --set-string 'agentSandbox.connectorSecrets.acme-b.GITHUB_PERSONAL_ACCESS_TOKEN=agent-b-sentinel' \
   --set 'agentSandbox.connectorEgress.acme-a[0].cidr=10.0.0.10/32' \
+  --set 'agentSandbox.connectorEgress.acme-a[0].ports[0].protocol=TCP' --set 'agentSandbox.connectorEgress.acme-a[0].ports[0].port=443' \
   --set 'agentSandbox.connectorEgress.acme-b[0].cidr=10.0.0.20/32' \
+  --set 'agentSandbox.connectorEgress.acme-b[0].ports[0].protocol=TCP' --set 'agentSandbox.connectorEgress.acme-b[0].ports[0].port=443' \
   --set 'security.networkPolicy.enabled=true' \
   --set 'security.networkPolicy.allowedEgress[0].cidr=203.0.113.10/32' \
+  --set 'security.networkPolicy.allowedEgress[0].ports[0].protocol=TCP' --set 'security.networkPolicy.allowedEgress[0].ports[0].port=443' \
   2>/dev/null)"
 
 policy_a="$(require_resource "$egress_render" NetworkPolicy curie-agent-acme-a-allow-egress)"

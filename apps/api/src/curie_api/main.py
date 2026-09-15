@@ -24,10 +24,9 @@ from curie_telemetry import (
 )
 from fastapi import FastAPI, HTTPException, Request
 from opentelemetry.trace import SpanKind, StatusCode
-from sqlalchemy import text
 from starlette.routing import Match
 
-from . import __version__
+from . import __version__, crud
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
 from .db import create_engine, create_sessionmaker
@@ -358,7 +357,7 @@ def create_app() -> FastAPI:
         try:
             async with asyncio.timeout(2):
                 async with request.app.state.sessionmaker() as session:
-                    await session.execute(text("SELECT 1"))
+                    await crud.list_agents(session)
         except Exception:
             raise HTTPException(
                 status_code=503,

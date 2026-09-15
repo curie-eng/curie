@@ -12,8 +12,10 @@
 //! documented at <https://docs.docker.com/reference/dockerfile/#healthcheck>.
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -28,12 +30,14 @@ const E2E_API_URL: &str = "CURIE_E2E_API_URL";
 const E2E_API_KEY: &str = "CURIE_E2E_API_KEY";
 const DEFAULT_API_URL: &str = "http://localhost:28000";
 const DEFAULT_API_KEY: &str = "curie-dev-key";
+const CONNECTOR_START_TIMEOUT_ENV: &str = "CURIE_CONNECTOR_START_TIMEOUT_SECONDS";
 const CONNECTOR_COMPONENT_LABEL: &str = "curietech.ai/component=connector";
 const CONNECTOR_AGENT_LABEL: &str = "curietech.ai/agent";
 
 #[derive(Clone, Copy)]
 enum ConnectorCase {
     Healthy,
+    HealthyAt70Seconds,
     LateHealthy,
     SteadyWithoutHealthcheck,
     Exits17,
@@ -45,6 +49,7 @@ impl ConnectorCase {
     fn slug(self) -> &'static str {
         match self {
             Self::Healthy => "healthy",
+            Self::HealthyAt70Seconds => "healthy70",
             Self::LateHealthy => "late-healthy",
             Self::SteadyWithoutHealthcheck => "steady",
             Self::Exits17 => "exit17",
@@ -58,6 +63,14 @@ impl ConnectorCase {
             Self::Healthy => {
                 "FROM busybox:1.36.1\n\
                  HEALTHCHECK --interval=1s --timeout=1s --retries=1 CMD /bin/true\n\
+                 CMD [\"sh\", \"-c\", \"sleep 300\"]\n"
+            }
+            // Docker starts the first probe after the one second interval.
+            // That probe succeeds after another 69 seconds, so this connector
+            // first becomes healthy 70 seconds after its container starts.
+            Self::HealthyAt70Seconds => {
+                "FROM busybox:1.36.1\n\
+                 HEALTHCHECK --interval=1s --timeout=75s --retries=1 CMD [\"sh\", \"-c\", \"sleep 69; exit 0\"]\n\
                  CMD [\"sh\", \"-c\", \"sleep 300\"]\n"
             }
             // The first probe starts after its one-second interval, then takes
@@ -289,8 +302,58 @@ fn unique_connector(scope: &TestScope, case: ConnectorCase) -> String {
     format!("probe-{}-{}", case.slug(), &scope.id[..8])
 }
 
-fn skill_up(plugin_dir: &Path, runner: &str) -> Output {
-    Command::new(curie_bin())
+struct ConnectorStartDelay {
+    path: OsString,
+    real_docker: PathBuf,
+    marker: PathBuf,
+}
+
+fn connector_start_delay(scope: &TestScope, delay_seconds: u64) -> ConnectorStartDelay {
+    let original_path = env::var_os("PATH").unwrap_or_default();
+    let real_docker = env::split_paths(&original_path)
+        .map(|directory| directory.join("docker"))
+        .find(|candidate| candidate.is_file())
+        .expect("the gated test requires Docker on PATH")
+        .canonicalize()
+        .expect("canonicalize the real Docker binary");
+    let wrapper_dir = scope.scratch.path().join("delayed-docker");
+    fs::create_dir(&wrapper_dir).expect("create the private Docker wrapper directory");
+    let wrapper = wrapper_dir.join("docker");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\
+             set -eu\n\
+             if [ \"${{1:-}}\" = \"run\" ]; then\n\
+               for argument in \"$@\"; do\n\
+                 if [ \"$argument\" = \"{CONNECTOR_COMPONENT_LABEL}\" ]; then\n\
+                   : > \"$CURIE_TEST_DOCKER_DELAY_MARKER\"\n\
+                   sleep {delay_seconds}\n\
+                   break\n\
+                 fi\n\
+               done\n\
+             fi\n\
+             exec \"$CURIE_TEST_REAL_DOCKER\" \"$@\"\n"
+        ),
+    )
+    .expect("write the Docker preserving delay wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
+        .expect("make the Docker delay wrapper executable");
+    let path =
+        env::join_paths(std::iter::once(wrapper_dir).chain(env::split_paths(&original_path)))
+            .expect("prepend the private Docker wrapper to PATH");
+
+    ConnectorStartDelay {
+        path,
+        real_docker,
+        marker: scope.scratch.path().join("connector-start-delay-applied"),
+    }
+}
+
+fn skill_up_command(plugin_dir: &Path, runner: &str) -> Command {
+    let mut command = Command::new(curie_bin());
+    command
+        .env_remove(CONNECTOR_START_TIMEOUT_ENV)
         .args(["--json", "skill", "up", "--plugin-dir"])
         .arg(plugin_dir)
         .args([
@@ -301,13 +364,26 @@ fn skill_up(plugin_dir: &Path, runner: &str) -> Output {
             "--port",
             &free_port().to_string(),
             "--fake-model",
-        ])
+        ]);
+    command
+}
+
+fn skill_up(plugin_dir: &Path, runner: &str) -> Output {
+    skill_up_command(plugin_dir, runner)
         .output()
         .expect("run the built curie skill up command")
 }
 
+fn skill_up_with_timeout(plugin_dir: &Path, runner: &str, timeout: &str) -> Output {
+    skill_up_command(plugin_dir, runner)
+        .env(CONNECTOR_START_TIMEOUT_ENV, timeout)
+        .output()
+        .expect("run the built curie skill up command with a configured connector timeout")
+}
+
 fn skill_up_human(plugin_dir: &Path, runner: &str) -> Output {
     Command::new(curie_bin())
+        .env_remove(CONNECTOR_START_TIMEOUT_ENV)
         .args(["skill", "up", "--plugin-dir"])
         .arg(plugin_dir)
         .args([
@@ -331,8 +407,10 @@ fn skill_down(plugin_dir: &Path, runner: &str) -> Output {
         .expect("run the built curie skill down command")
 }
 
-fn local_deploy(plugin_dir: &Path, agent: &str, api: &ApiTarget, label: &str) -> Output {
-    Command::new(curie_bin())
+fn local_deploy_command(plugin_dir: &Path, agent: &str, api: &ApiTarget, label: &str) -> Command {
+    let mut command = Command::new(curie_bin());
+    command
+        .env_remove(CONNECTOR_START_TIMEOUT_ENV)
         .args(["--json", "local", "deploy", "--plugin-dir"])
         .arg(plugin_dir)
         .args([
@@ -344,13 +422,32 @@ fn local_deploy(plugin_dir: &Path, agent: &str, api: &ApiTarget, label: &str) ->
             &api.key,
             "--label",
             label,
-        ])
+        ]);
+    command
+}
+
+fn local_deploy(plugin_dir: &Path, agent: &str, api: &ApiTarget, label: &str) -> Output {
+    local_deploy_command(plugin_dir, agent, api, label)
         .output()
         .expect("run the built curie local deploy command")
 }
 
+fn local_deploy_with_timeout(
+    plugin_dir: &Path,
+    agent: &str,
+    api: &ApiTarget,
+    label: &str,
+    timeout: &str,
+) -> Output {
+    local_deploy_command(plugin_dir, agent, api, label)
+        .env(CONNECTOR_START_TIMEOUT_ENV, timeout)
+        .output()
+        .expect("run the built curie local deploy command with a configured connector timeout")
+}
+
 fn local_deploy_human(plugin_dir: &Path, agent: &str, api: &ApiTarget, label: &str) -> Output {
     Command::new(curie_bin())
+        .env_remove(CONNECTOR_START_TIMEOUT_ENV)
         .args(["local", "deploy", "--plugin-dir"])
         .arg(plugin_dir)
         .args([
@@ -465,6 +562,47 @@ fn assert_no_skill_success(plugin_dir: &Path) {
                     .is_none()),
         "a failed connector start must release the materialized #1087 snapshot"
     );
+}
+
+fn assert_no_owned_connectors(agent: &str, action: &str) {
+    let listing = Command::new("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label={CONNECTOR_COMPONENT_LABEL}"),
+            "--filter",
+            &format!("label={CONNECTOR_AGENT_LABEL}={agent}"),
+        ])
+        .output()
+        .expect("list only this test agent's hosted connectors");
+    assert!(
+        listing.status.success(),
+        "Docker must list the generated agent's connector labels after {action}: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&listing.stdout).trim().is_empty(),
+        "{action} must leave no hosted connector owned by {agent}"
+    );
+}
+
+fn assert_docker_object_absent(kind: &str, name: &str, action: &str) {
+    let inspected = Command::new("docker")
+        .args([kind, "inspect", name])
+        .output()
+        .unwrap_or_else(|error| panic!("inspect Docker {kind} {name} after {action}: {error}"));
+    assert!(
+        !inspected.status.success(),
+        "{action} must leave no Docker {kind} named {name}"
+    );
+}
+
+fn assert_skill_runtime_removed(plugin_dir: &Path, agent: &str, runner: &str, action: &str) {
+    assert_no_skill_success(plugin_dir);
+    assert_no_owned_connectors(agent, action);
+    assert_docker_object_absent("container", runner, action);
+    assert_docker_object_absent("network", &format!("{runner}-net"), action);
 }
 
 fn add_healthy_sibling_before_starting_connector(
@@ -615,6 +753,59 @@ fn skill_up_allows_healthy_and_steady_connectors() {
 }
 
 #[test]
+fn skill_up_accepts_first_health_at_seventy_seconds_with_an_eighty_second_timeout() {
+    if !docker_e2e_enabled() {
+        return;
+    }
+    let mut scope = TestScope::new();
+    let case = ConnectorCase::HealthyAt70Seconds;
+    let agent = unique_agent(&scope, case);
+    let connector = unique_connector(&scope, case);
+    let image = scope.image(case);
+    let plugin_dir = scope.bundle(&agent, &connector, Some(&image));
+    let runner = scope.runner(case);
+    // Install the wrapper only after the image build above. Its PATH reaches
+    // only this skill child, and every Docker command still executes through
+    // the absolute real binary. Only the connector labeled `docker run` waits.
+    let docker_delay = connector_start_delay(&scope, 15);
+
+    let started = Instant::now();
+    let output = skill_up_command(&plugin_dir, &runner)
+        .env(CONNECTOR_START_TIMEOUT_ENV, "80")
+        .env("PATH", &docker_delay.path)
+        .env("CURIE_TEST_REAL_DOCKER", &docker_delay.real_docker)
+        .env("CURIE_TEST_DOCKER_DELAY_MARKER", &docker_delay.marker)
+        .output()
+        .expect("run skill up through the delayed real Docker wrapper");
+    let elapsed = started.elapsed();
+    assert!(
+        docker_delay.marker.is_file(),
+        "the test must delay the connector container before judging deadline placement"
+    );
+    assert_succeeded(
+        &output,
+        "curie skill up with an eighty second connector timeout",
+    );
+    assert!(
+        elapsed >= Duration::from_secs(85),
+        "the command must include 15 seconds of preparation before the exact 70 second health probe: {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(115),
+        "the fresh 80 second readiness window must remain bounded after preparation: {elapsed:?}"
+    );
+    assert_skill_state(&plugin_dir, &connector);
+
+    assert_succeeded(&skill_down(&plugin_dir, &runner), "curie skill down");
+    assert_skill_runtime_removed(
+        &plugin_dir,
+        &agent,
+        &runner,
+        "skill down after the slow connector succeeds",
+    );
+}
+
+#[test]
 fn skill_up_refuses_an_exited_connector() {
     if !docker_e2e_enabled() {
         return;
@@ -703,6 +894,44 @@ fn skill_up_times_out_when_connector_stays_starting() {
 }
 
 #[test]
+fn skill_up_rejects_an_invalid_connector_timeout_before_startup() {
+    if !docker_e2e_enabled() {
+        return;
+    }
+    let mut scope = TestScope::new();
+    let case = ConnectorCase::Healthy;
+    let agent = unique_agent(&scope, case);
+    let connector = unique_connector(&scope, case);
+    let image = scope.image(case);
+    let plugin_dir = scope.bundle(&agent, &connector, Some(&image));
+    let runner = scope.runner(case);
+
+    let output = skill_up_with_timeout(&plugin_dir, &runner, "bogus");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an invalid connector timeout must be a usage error; stdout: {stdout}; stderr: {stderr}"
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout)
+        .expect("the JSON CLI must emit one recovery object for an invalid timeout");
+    assert!(
+        payload["error"].as_str().is_some_and(|error| {
+            !error.trim().is_empty() && error.contains(CONNECTOR_START_TIMEOUT_ENV)
+        }),
+        "the recovery error must name the invalid setting: {payload}"
+    );
+    assert!(
+        payload["fix"]
+            .as_str()
+            .is_some_and(|fix| !fix.trim().is_empty()),
+        "the recovery object must tell the operator how to fix the setting: {payload}"
+    );
+    assert_skill_runtime_removed(&plugin_dir, &agent, &runner, "the invalid timeout refusal");
+}
+
+#[test]
 fn skill_up_without_a_hosted_connector_is_unaffected() {
     if !docker_e2e_enabled() {
         return;
@@ -713,7 +942,7 @@ fn skill_up_without_a_hosted_connector_is_unaffected() {
     let runner = scope.runner(ConnectorCase::SteadyWithoutHealthcheck);
 
     assert_succeeded(
-        &skill_up(&plugin_dir, &runner),
+        &skill_up_with_timeout(&plugin_dir, &runner, "bogus"),
         "curie skill up without a hosted connector",
     );
     let state: Value = serde_json::from_slice(
@@ -727,6 +956,49 @@ fn skill_up_without_a_hosted_connector_is_unaffected() {
         "a bundle with no hosted connector must not gain one"
     );
     assert_succeeded(&skill_down(&plugin_dir, &runner), "curie skill down");
+}
+
+#[test]
+fn local_deploy_rejects_an_invalid_connector_timeout_before_api_access() {
+    let scratch = TempDir::new().expect("create the invalid timeout test directory");
+    let agent = format!(
+        "invalid-timeout-{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    );
+    let plugin_dir = scratch.path().join("bundle");
+    scaffold(&plugin_dir, &agent).expect("scaffold the invalid timeout bundle");
+    fs::write(
+        plugin_dir.join("connectors.yaml"),
+        "connectors:\n  probe:\n    image: busybox:1.36.1\n    port: 8000\n",
+    )
+    .expect("declare one image hosted connector");
+    let api = ApiTarget {
+        url: format!("http://127.0.0.1:{}", free_port()),
+        key: DEFAULT_API_KEY.to_string(),
+    };
+
+    let output = local_deploy_with_timeout(&plugin_dir, &agent, &api, "invalid-timeout", "bogus");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "invalid connector timeout validation must precede API access; stdout: {stdout}; stderr: {stderr}"
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout)
+        .expect("the JSON CLI must emit one recovery object for an invalid local timeout");
+    assert!(
+        payload["error"].as_str().is_some_and(|error| {
+            !error.trim().is_empty() && error.contains(CONNECTOR_START_TIMEOUT_ENV)
+        }),
+        "the recovery error must name the invalid setting: {payload}"
+    );
+    assert!(
+        payload["fix"]
+            .as_str()
+            .is_some_and(|fix| !fix.trim().is_empty()),
+        "the recovery object must give a nonempty fix: {payload}"
+    );
 }
 
 #[test]
@@ -864,4 +1136,39 @@ fn local_deploy_times_out_when_connector_stays_starting() {
         return;
     }
     run_local_failure_case(ConnectorCase::StartingPastDeadline);
+}
+
+#[test]
+fn local_deploy_uses_a_short_configured_connector_start_timeout() {
+    if !docker_e2e_enabled() {
+        return;
+    }
+    let mut scope = TestScope::new();
+    let api = local_api();
+    let case = ConnectorCase::StartingPastDeadline;
+    let agent = unique_agent(&scope, case);
+    let connector = unique_connector(&scope, case);
+    let image = scope.image(case);
+    let plugin_dir = scope.bundle(&agent, &connector, Some(&image));
+    let label = format!("short-timeout-{}", &scope.id[..8]);
+    scope.register_agent(agent.clone(), api.clone());
+
+    let started = Instant::now();
+    let output = local_deploy_with_timeout(&plugin_dir, &agent, &api, &label, "4");
+    let elapsed = started.elapsed();
+    let failure = assert_failed_naming_connector(&output, &connector, "curie local deploy");
+    assert!(
+        elapsed >= Duration::from_secs(3),
+        "Compose must apply the configured readiness wait instead of failing immediately: {elapsed:?}"
+    );
+    assert!(
+        elapsed <= Duration::from_secs(35),
+        "the four second Compose wait, fixed diagnostic allowances, and local API setup must stay well below the 60 second default: {elapsed:?}"
+    );
+    assert!(
+        failure["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timeout") || error.contains("timed out")),
+        "the short configured deadline must surface as a timeout: {failure}"
+    );
 }

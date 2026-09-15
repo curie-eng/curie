@@ -193,7 +193,7 @@
       "result": "MemoryOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": "1.1"
+      "version": "2.0"
     },
     {
       "result": "MessageDryRunOutput",
@@ -241,6 +241,12 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "ReleaseAcceptOutput",
+      "kind": "CliOutput",
+      "schema": "release-accept.schema.json",
       "version": "1.0"
     },
     {

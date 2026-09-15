@@ -8,10 +8,32 @@ import sys
 import time
 from pathlib import Path
 
+
+def read_chart_extract_image():
+    """Read the one scalar extract image without adding a YAML dependency."""
+    values = []
+    for line in (Path.cwd() / "charts/curie/values.yaml").read_text().splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("extractImage:"):
+            continue
+        value = stripped.partition(":")[2].partition("#")[0].strip()
+        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+            value = value[1:-1]
+        if not value:
+            raise RuntimeError("chart extractImage must be a nonempty scalar")
+        values.append(value)
+    if len(values) != 1:
+        raise RuntimeError("chart must declare exactly one extractImage scalar")
+    return values[0]
+
+
 root = Path(os.environ["CONVERGENCE_DRIVER_ROOT"])
 scenario = os.environ["CONVERGENCE_DRIVER_SCENARIO"]
 program = Path(sys.argv[0]).name
 args = sys.argv[1:]
+chart_extract_image = (
+    read_chart_extract_image() if scenario.startswith("chart-default-alias") else None
+)
 with (root / "calls.jsonl").open("a") as calls:
     calls.write(json.dumps([program, *args]) + "\n")
 
@@ -41,7 +63,8 @@ if scenario.startswith("pinned-"):
 alias_image = "example.com/custom-api:sibling"
 alias_id = "example.com/imported-api@sha256:" + "d" * 64
 # Observed 2026-09-09 on k3s/containerd: shorter kubelet aliases of the same
-# repo digest, each tag in its own Node.status.images entry.
+# repo digest. Live Node.status.images may omit BusyBox (50 image cap) or list
+# tag, shorter alias, and digest as three separate names arrays.
 # https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
 busybox_id = (
     "docker.io/library/busybox@sha256:"
@@ -51,7 +74,28 @@ clickhouse_id = (
     "docker.io/clickhouse/clickhouse-server@sha256:"
     "8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6"
 )
-if scenario.startswith("alias-shorter"):
+prewarm = None
+if scenario.startswith("chart-default-alias"):
+    deployment["spec"]["template"]["spec"]["initContainers"] = [
+        {"name": "extract", "image": chart_extract_image}
+    ]
+    prewarm = copy.deepcopy(deployment)
+    prewarm["kind"] = "DaemonSet"
+    prewarm["metadata"]["name"] = "acme-bot-runner-prewarm"
+    prewarm["spec"]["selector"]["matchLabels"]["component"] = "runner-prewarm"
+    prewarm["spec"]["template"]["spec"].pop("initContainers", None)
+    prewarm["spec"]["template"]["spec"]["containers"] = [
+        {"name": "prewarm-bundle-extract", "image": chart_extract_image}
+    ]
+    prewarm["status"] = {
+        "observedGeneration": prewarm["metadata"]["generation"],
+        "desiredNumberScheduled": 1,
+        "updatedNumberScheduled": 1,
+        "numberReady": 1,
+        "currentNumberScheduled": 1,
+        "numberUnavailable": 0,
+    }
+elif scenario.startswith("alias-shorter"):
     deployment["spec"]["template"]["spec"]["containers"][0]["image"] = "busybox:1.36.1"
     deployment["spec"]["template"]["spec"]["initContainers"] = [
         {"name": "extract", "image": "busybox:1.36.1"}
@@ -64,6 +108,8 @@ elif scenario.startswith("alias-"):
         {"name": "init-api", "image": "example.com/custom-api:target"}
     ]
 expected = [copy.deepcopy(deployment), copy.deepcopy(statefulset)]
+if prewarm is not None:
+    expected.append(copy.deepcopy(prewarm))
 for item in expected:
     item.pop("status", None)
     item["metadata"].pop("generation", None)
@@ -136,6 +182,12 @@ if program == "helm":
         if scenario == "helm-hook-fails":
             print("Error: pre-upgrade hook failed", file=sys.stderr)
             sys.exit(1)
+        if scenario in [
+            "chart-default-alias-missing-image-id",
+            "chart-default-alias-wrong-digest",
+        ]:
+            print("Error: recorded install did not converge", file=sys.stderr)
+            sys.exit(1)
         print("Release accepted")
         sys.exit(0)
     if args[:2] == ["show", "chart"]:
@@ -157,7 +209,9 @@ if program == "kubectl":
             images = []
         if scenario == "alias-no-reported-alias":
             images = [{"names": [names[0], names[2]]}]
-        if scenario.startswith("alias-shorter"):
+        if scenario.startswith("chart-default-alias"):
+            images = [{"names": ["docker.io/library/unrelated:1"]}]
+        elif scenario.startswith("alias-shorter"):
             busybox_alias = "docker.io/library/busybox:1.36"
             clickhouse_alias = "docker.io/clickhouse/clickhouse-server:25.12"
             images = [
@@ -166,6 +220,23 @@ if program == "kubectl":
                 {"names": ["docker.io/clickhouse/clickhouse-server:25.12.11.4", clickhouse_id]},
                 {"names": [clickhouse_alias, clickhouse_id]},
             ]
+            if scenario in [
+                "alias-shorter-omitted",
+                "alias-shorter-omitted-missing",
+                "alias-shorter-omitted-opaque",
+            ]:
+                # Live k3s Node.status.images cap omits BusyBox and ClickHouse.
+                # https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/#NodeStatus
+                images = [{"names": ["docker.io/library/unrelated:1"]}]
+            if scenario == "alias-shorter-separate-digest":
+                images = [
+                    {"names": ["docker.io/library/busybox:1.36.1"]},
+                    {"names": [busybox_alias]},
+                    {"names": [busybox_id]},
+                    {"names": ["docker.io/clickhouse/clickhouse-server:25.12.11.4"]},
+                    {"names": [clickhouse_alias]},
+                    {"names": [clickhouse_id]},
+                ]
             if scenario == "alias-shorter-missing":
                 images = [
                     {"names": ["docker.io/library/busybox:1.36.1", busybox_alias]},
@@ -266,6 +337,8 @@ if program == "kubectl":
         deployment["spec"]["replicas"] = 3
         deployment["status"].update(replicas=3, readyReplicas=3, updatedReplicas=3)
     workloads = [deployment, statefulset]
+    if prewarm is not None:
+        workloads.append(prewarm)
     pods = []
     for workload in workloads:
         containers = copy.deepcopy(workload["spec"]["template"]["spec"]["containers"])
@@ -328,7 +401,32 @@ if program == "kubectl":
             pods[1]["spec"]["containers"][0]["image"] = pinned_image.replace("a" * 64, "b" * 64)
         if scenario == "pinned-init-failed":
             pinned_statuses[0]["state"]["terminated"]["exitCode"] = 1
-    if scenario.startswith("alias-shorter"):
+    if scenario.startswith("chart-default-alias"):
+        prewarm_pod = next(
+            pod for pod in pods if pod["metadata"]["name"] == "acme-bot-runner-prewarm-new"
+        )
+        image_id = busybox_id
+        if scenario == "chart-default-alias-missing-image-id":
+            image_id = ""
+        if scenario == "chart-default-alias-wrong-digest":
+            image_id = "docker.io/library/busybox@sha256:" + "a" * 64
+        pods[0]["spec"]["nodeName"] = "acme-node"
+        pods[0]["spec"]["initContainers"] = copy.deepcopy(
+            deployment["spec"]["template"]["spec"]["initContainers"]
+        )
+        pods[0]["status"]["initContainerStatuses"] = [
+            {
+                "name": "extract",
+                "image": "docker.io/library/busybox:1.36",
+                "imageID": image_id,
+                "state": {"terminated": {"exitCode": 0}},
+            }
+        ]
+        prewarm_pod["spec"]["nodeName"] = "acme-node"
+        prewarm_pod["status"]["containerStatuses"][0].update(
+            image="docker.io/library/busybox:1.36", imageID=image_id
+        )
+    elif scenario.startswith("alias-shorter"):
         pods[0]["spec"]["nodeName"] = "acme-node"
         pods[1]["spec"]["nodeName"] = "acme-node"
         pods[0]["status"]["containerStatuses"][0].update(
@@ -348,6 +446,17 @@ if program == "kubectl":
         pods[1]["status"]["containerStatuses"][0].update(
             image="docker.io/clickhouse/clickhouse-server:25.12", imageID=clickhouse_id
         )
+        if scenario == "alias-shorter-omitted-missing":
+            pods[0]["status"]["containerStatuses"][0]["imageID"] = ""
+            pods[0]["status"]["initContainerStatuses"][0]["imageID"] = ""
+            pods[1]["status"]["containerStatuses"][0]["imageID"] = ""
+        if scenario == "alias-shorter-omitted-opaque":
+            # Opaque runtime id is not a repository digest.
+            # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#ContainerStatus
+            opaque_id = "containerd://sha256:" + "c" * 64
+            pods[0]["status"]["containerStatuses"][0]["imageID"] = opaque_id
+            pods[0]["status"]["initContainerStatuses"][0]["imageID"] = opaque_id
+            pods[1]["status"]["containerStatuses"][0]["imageID"] = opaque_id
     elif scenario.startswith("alias-"):
         pods[0]["spec"]["nodeName"] = "acme-node"
         pods[0]["status"]["containerStatuses"][0].update(image=alias_image, imageID=alias_id)

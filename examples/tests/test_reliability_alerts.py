@@ -31,6 +31,8 @@ REQUIRED_ALERTS = {
     "CurieNodeMemoryHeadroomLow",
     "CurieApplicationMetricsAbsent",
     "CurieDuplicateNodeExporter",
+    "CurieWorkerSupervisedRestartLoop",
+    "CurieWorkerSupervisedTaskParked",
 }
 
 FORBIDDEN_IDENTITY = (

@@ -38,6 +38,20 @@ fn v088_accepts_0044_and_refuses_an_unknown_newer_revision() {
     assert!(!live_in_window("0045", &window));
 }
 
+/// The next train's current appVersion is 0.8.9 and its Alembic head is 0044.
+/// Pin both the accepted live head and the fail-closed boundary for an unknown
+/// successor. Released 0.8.9 on main stays at 0039; this tree is the feature
+/// train carrying 0040 through 0044.
+#[test]
+fn v089_accepts_0044_and_refuses_an_unknown_newer_revision() {
+    let window = window_for("0.8.9").expect("0.8.9 is catalogued");
+    assert_eq!(window.schema_min, "0001");
+    assert_eq!(window.schema_head, "0044");
+    assert!(live_in_window("0044", &window));
+    assert!(live_in_window("0039", &window));
+    assert!(!live_in_window("0045", &window));
+}
+
 fn write_exec(dir: &Path, name: &str, body: &str) {
     let path = dir.join(name);
     fs::write(&path, body).expect("write fake executable");

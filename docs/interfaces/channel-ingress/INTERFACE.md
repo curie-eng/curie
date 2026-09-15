@@ -53,7 +53,10 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   a Pydantic model in the frozen ACI package with channel-neutral fields: `event_id`
   (idempotency key), `conversation_id` (the conversation/thread key routing keeps one live
   session per), `author`, `text`, `received_at`, `source` (`QueuedTurn.source`, what
-  started the turn: a person's message or a job), and `reply_handle` — a `ReplyHandle`
+  started the turn: a person's message or a job), `attachments`
+  (`QueuedTurn.attachments`, a list of `Attachment` file REFERENCES — an
+  adapter-scoped opaque `id` plus a `name`, never bytes and deliberately never a
+  url, so only the worker's `apps/worker/src/curie_worker/attachments.py::AttachmentFilePort` can resolve one), and `reply_handle` — a `ReplyHandle`
   (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying the required
   `kind` and `channel` routing pair, required nullable `placeholder`, an optional
   per-turn `endpoint`, and optional `adapter` (`ReplyHandle.adapter`, the egress
@@ -283,6 +286,15 @@ incomplete adapter coverage and conformance.
   bind under the generic non-empty rule. There is still no multi-channel adapter
   framework (#27). The routing pair removes the binding ambiguity; it does not by
   itself give other kinds a registered address shape.
+- **Still leaks — attachment resolution.** The only `AttachmentFilePort`
+  implementation is `SlackFileClient`
+  (`apps/worker/src/curie_worker/attachments.py::SlackFileClient`): Slack
+  `files.info` / `url_private` with the bot token, wired from
+  `apps/worker/src/curie_worker/run.py::build` regardless of the turn's channel
+  kind. The kernel (`apps/worker/src/curie_worker/kernel.py::Kernel._resolve_attachments`)
+  never checks `reply_handle.kind`. A missing `files:read` scope degrades
+  attachments only (4a71d99f). Discord and email simply do not emit attachments
+  today.
 
 ## Cross-links
 
