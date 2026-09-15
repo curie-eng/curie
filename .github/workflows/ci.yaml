@@ -2702,7 +2702,9 @@ jobs:
           CURIE_E2E_KIND_CLUSTER: curie-upgrade-matrix
         run: |
           set -euo pipefail
-          export CURIE_E2E_KUBECONFIG="${KUBECONFIG}"
+          if [[ -n "${KUBECONFIG:-}" ]]; then
+            export CURIE_E2E_KUBECONFIG="$KUBECONFIG"
+          fi
           bash cli/scripts/cluster-upgrade-matrix.sh --scenario all --json
       - name: Dump cluster upgrade matrix diagnostics on failure
         if: failure()
