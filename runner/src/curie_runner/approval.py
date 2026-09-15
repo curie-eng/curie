@@ -1453,14 +1453,10 @@ def build_approval_gate(
         normalized.extend(effective)
 
     operator = frozenset(name for name in normalized if name != PUBLISH_TOOL_NAME)
-    # The publication gate is platform-owned and requester-thread scoped. A
-    # bundle may mention the name, but it cannot attach its own audience route
-    # or cause publication to exist without a mounted managed workspace.
-    policy_routes = {
-        tool_name: route
-        for tool_name, route in policy_routes.items()
-        if tool_name != PUBLISH_TOOL_NAME
-    }
+    # PUBLISH_TOOL_NAME stays out of the operator-tools set so the platform
+    # adds the gate via managed_workspace, not as an operator list entry. A
+    # bundle may attach an audience route through policy_routes. The requester
+    # thread owns the card; publication still cannot consume a grant.
     redefined = sorted(operator & set(policy_routes))
     if redefined:
         logger.warning(
@@ -1470,8 +1466,8 @@ def build_approval_gate(
             redefined,
         )
     # Publication is a mandatory platform gate only for a managed checkout. It
-    # is additive to both operator and bundle policy, has no audience route of
-    # its own (the request thread owns the card), and cannot consume a grant.
+    # is additive to both operator and bundle policy. The requester thread
+    # still owns the card. Publication cannot consume a grant.
     gated_tools = operator | frozenset(policy_routes)
     if managed_workspace:
         gated_tools |= frozenset({PUBLISH_TOOL_NAME})

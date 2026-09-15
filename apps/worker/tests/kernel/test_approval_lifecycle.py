@@ -4011,3 +4011,259 @@ def test_a_legacy_thread_keyed_card_is_settled_after_the_boot_migration(
             assert not await h.async_redis.exists(h.config.approval_card_key("appr-1"))
 
     asyncio.run(go())
+
+
+def test_publication_with_bound_route_is_created_and_does_not_escalate_unexpected_route(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_worker.approvals import CreatedPublication
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    deployment_id = uuid.UUID("11111111-1111-4111-8111-111111112705")
+    thread = "1700000000.002705"
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+                approval_routes={
+                    "managers": {
+                        **_notification_route(),
+                        "approvers": {"users": ["U0EXAMPLE1"]},
+                    }
+                },
+            )
+
+    class PublicationApi:
+        def __init__(self) -> None:
+            self.creates: list[PublicationCreateRequest] = []
+
+        async def get_publication_lineage(
+            self, requested_deployment: uuid.UUID, conversation: str, repo: str
+        ) -> None:
+            return None
+
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
+            self.creates.append(request)
+            return CreatedPublication(
+                id="publication-example",
+                approval_id="approval-example",
+                status="pending",
+            )
+
+    class Workspace:
+        def __init__(self) -> None:
+            self.substrate = None
+
+        def select_repository(self, **kwargs: object) -> str:
+            return "acme-corp/acme-private"
+
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            assert self.substrate is not None
+            return SimpleNamespace(
+                handle=self.substrate.claim(
+                    str(kwargs["thread_key"]),
+                    env=kwargs["env"],
+                    agent_name=kwargs["agent_name"],
+                    workspace_repo=kwargs["repo_full_name"],
+                )
+            )
+
+        def release(self, _thread_identity: str) -> None:
+            return None
+
+        def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
+            del ttl_seconds
+
+    async def go() -> None:
+        publication_api = PublicationApi()
+        workspace = Workspace()
+        binding = Binding(grant_event_id="unused", grant_tool="unused")
+        async with make_harness(
+            binding=binding, publication_creator=publication_api
+        ) as h:
+            workspace.substrate = h.substrate
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            h.runner.default_script = [
+                Final(
+                    text="Ready to publish",
+                    status=AWAITING,
+                    approval_summary="Publish the prepared changes",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="mcp__curie__publish_changes",
+                    approval_route="managers",
+                )
+            ]
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                return RunnerWorkspaceSnapshot(
+                    repo_full_name="acme-corp/acme-private",
+                    base_sha="a" * 40,
+                    patch=b"diff --git a/README.md b/README.md\n",
+                    changed_paths=("README.md",),
+                    contains_workflow_files=False,
+                    publication_title="Update README",
+                    publication_body="Prepared by acme-bot.",
+                )
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            monkeypatch.setattr(
+                "curie_worker.kernel.validate_snapshot_against_base",
+                lambda *_args, **_kwargs: None,
+            )
+            await h.kernel.process_event(
+                _qevent(
+                    "Publish https://github.com/acme-corp/acme-private",
+                    thread=thread,
+                    channel="C0EXAMPLE1",
+                )
+            )
+
+            assert publication_api.creates, h.sink.last_text
+            assert getattr(publication_api.creates[0], "route", None) == "managers"
+            assert h.sink.last_text is not None
+            assert "unexpected approval route" not in h.sink.last_text
+            assert h.sink.posts == []
+            assert [
+                event
+                for event, _route, _best_effort in h.sink.events
+                if isinstance(event, ReplyPost) and event.message.interaction is None
+            ] == []
+
+    asyncio.run(go())
+
+
+def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_worker.approvals import CreatedPublication
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    deployment_id = uuid.UUID("22222222-2222-4222-8222-222222222705")
+    thread = "1700000000.002706"
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+                approval_routes={"operators": _resolution_route()},
+            )
+
+    class PublicationApi:
+        def __init__(self) -> None:
+            self.creates: list[PublicationCreateRequest] = []
+
+        async def get_publication_lineage(
+            self, requested_deployment: uuid.UUID, conversation: str, repo: str
+        ) -> None:
+            return None
+
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
+            self.creates.append(request)
+            return CreatedPublication(
+                id="publication-example",
+                approval_id="approval-example",
+                status="pending",
+            )
+
+    class Workspace:
+        def __init__(self) -> None:
+            self.substrate = None
+
+        def select_repository(self, **kwargs: object) -> str:
+            return "acme-corp/acme-private"
+
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            assert self.substrate is not None
+            return SimpleNamespace(
+                handle=self.substrate.claim(
+                    str(kwargs["thread_key"]),
+                    env=kwargs["env"],
+                    agent_name=kwargs["agent_name"],
+                    workspace_repo=kwargs["repo_full_name"],
+                )
+            )
+
+        def release(self, _thread_identity: str) -> None:
+            return None
+
+        def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
+            del ttl_seconds
+
+    async def go() -> None:
+        publication_api = PublicationApi()
+        workspace = Workspace()
+        binding = Binding(grant_event_id="unused", grant_tool="unused")
+        async with make_harness(
+            binding=binding, publication_creator=publication_api
+        ) as h:
+            workspace.substrate = h.substrate
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            h.runner.default_script = [
+                Final(
+                    text="Ready to publish",
+                    status=AWAITING,
+                    approval_summary="Publish the prepared changes",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="mcp__curie__publish_changes",
+                    approval_route="managers",
+                )
+            ]
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                return RunnerWorkspaceSnapshot(
+                    repo_full_name="acme-corp/acme-private",
+                    base_sha="a" * 40,
+                    patch=b"diff --git a/README.md b/README.md\n",
+                    changed_paths=("README.md",),
+                    contains_workflow_files=False,
+                    publication_title="Update README",
+                    publication_body="Prepared by acme-bot.",
+                )
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            monkeypatch.setattr(
+                "curie_worker.kernel.validate_snapshot_against_base",
+                lambda *_args, **_kwargs: None,
+            )
+            await h.kernel.process_event(
+                _qevent(
+                    "Publish https://github.com/acme-corp/acme-private",
+                    thread=thread,
+                    channel="C0EXAMPLE1",
+                )
+            )
+
+            assert publication_api.creates == []
+            assert h.sink.last_text is not None
+            assert "route is not bound" in h.sink.last_text
+            assert "unexpected approval route" not in h.sink.last_text
+
+    asyncio.run(go())
+

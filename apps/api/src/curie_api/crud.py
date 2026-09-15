@@ -1022,7 +1022,7 @@ async def create_publication(
         reply_adapter=data.reply_adapter,
         dedupe_key=data.dedupe_key,
         traceparent=traceparent,
-        route=None,
+        route=data.route,
         card_channel=data.reply_channel,
         gate_kind="permission",
         granted_tool="mcp__curie__publish_changes",

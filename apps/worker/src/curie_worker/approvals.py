@@ -126,6 +126,7 @@ class PublicationCreateRequest:
     reply_conversation_id: str | None = None
     max_patch_bytes: int = 900_000
     review_origin_key: str | None = None
+    route: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         if len(self.patch) > self.max_patch_bytes:
@@ -155,6 +156,8 @@ class PublicationCreateRequest:
             payload["reply_conversation_id"] = self.reply_conversation_id
         if self.review_origin_key is not None:
             payload["review_origin_key"] = self.review_origin_key
+        if self.route is not None:
+            payload["route"] = self.route
         return payload
 
 

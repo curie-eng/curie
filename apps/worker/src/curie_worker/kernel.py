@@ -3743,14 +3743,6 @@ class Kernel:
             outcome.approval_gate_kind,
             outcome.approval_granted_tool,
         )
-        if is_publication and route_name is not None:
-            await self._escalate(
-                qevent,
-                route,
-                "The platform publication request carried an unexpected approval route; "
-                "nothing was published and no approval was created.",
-            )
-            return
         # The card's destination is a (kind, address) PAIR, never an address on
         # its own: the schema permits the same address string under two kinds,
         # so an address-only comparison misreads an email turn whose address
@@ -3851,6 +3843,7 @@ class Kernel:
                         body=snapshot.publication_body,
                         max_patch_bytes=self._config.publication_patch_max_bytes,
                         review_origin_key=outcome.review_origin_key,
+                        route=route_name,
                     )
                 )
                 created = CreatedApproval(
