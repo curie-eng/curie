@@ -23,7 +23,7 @@ order: 7
 ## The black line
 
 On the write side, observability is swapped at the OTLP wire, not in code. The API,
-dispatcher, worker, eval worker, and runner emit OTLP traces, logs, and metrics to an
+dispatcher, worker, eval worker, mail adapter, and runner emit OTLP traces, logs, and metrics to an
 OpenTelemetry Collector; services never authenticate to or speak a storage backend
 directly. Standard `OTEL_EXPORTER_OTLP_*` endpoint, protocol, and header variables select
 the wire transport independently per signal. With no endpoint a process keeps its JSON
@@ -217,6 +217,10 @@ overlap with #1765. Instrumented workloads take a single chart-owned OTLP destin
 the in-cluster collector while `otelCollector.deploy` is true, `otelCollector.endpoint`
 when the operator brings an external collector, or no endpoint when telemetry is
 explicitly disabled. The production credential gate refuses a missing destination.
+Because the mail adapter is the one first-party workload behind an egress-restricting
+policy, an external `otelCollector.endpoint` (`curie.mailAdapter.otlpIsExternal` in
+`charts/curie/templates/_helpers.tpl`) requires the chart-declared mail-adapter egress
+peer, `mailAdapter.otelEgress.httpsCidrs`, or rendering fails.
 
 Collector self-metrics remain enabled on the chart's internal metrics port, including
 queue size/capacity and exporter accepted, sent, failed, and enqueue-failed counters used
@@ -236,7 +240,7 @@ create a recursive failure loop.
 One trace backend: Langfuse, reached through the OTel Collector (which authenticates and
 forwards over HTTP because Langfuse OTLP ingest is HTTP-only). Every producer knows only
 OTLP. The chart injects one destination into the API, dispatcher, worker, eval worker,
-and sandbox runner: the in-cluster collector, a chart-owned external endpoint, or nothing
+mail adapter, and sandbox runner: the in-cluster collector, a chart-owned external endpoint, or nothing
 when telemetry is explicitly disabled. The local Compose profiles do the same for the
 services they start. The read side (trace list and tree reconstruction) remains a
 separate API concern.

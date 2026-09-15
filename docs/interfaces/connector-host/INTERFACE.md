@@ -162,7 +162,8 @@ One production host plus a fake:
   (`apps/worker/src/curie_worker/connector_k8s.py::UnsupportedKind`).
 - **Fake:** an in-memory client in `apps/worker/tests/reconcile/test_connector_apply.py`,
   which is what lets the half that can delete a live connector be tested without
-  a cluster. There is no second production host.
+  a cluster. There is no second production host behind the port, but a dev-tier
+  Docker host exists in the CLI, outside it (see Known leakage).
 
 The loop that drives it is `ConnectorReconcileLoop`
 (`apps/worker/src/curie_worker/connector_loop.py::ConnectorReconcileLoop`) over
@@ -199,8 +200,17 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   that prunes another agent's connectors. None of that is expressible in the three
   method signatures, so a host without those semantics satisfies the `Protocol`
   and still behaves differently.
-- **There are two appliers, only one of them behind the port, and they
-  disagree.** The CLI applies the same rendered objects on the `cluster deploy`
+- **There are three appliers, only one of them behind the port, and they
+  disagree.** The third is a dev-tier Docker host: for the skill and local
+  tiers the CLI starts each hosted connector as a plain container
+  (`ConnectorStartSpec` in `cli/src/docker.rs`), tags it with its own
+  `CONNECTOR_COMPONENT_LABEL` and reaps undesired ones by that label, then
+  blocks on its own readiness wait, `wait_for_connectors_ready`, called from
+  `bring_up_local` and `start_skill_connectors` in `cli/src/commands.rs`. That
+  path goes around both `render` and `ConnectorClient`: it neither consumes the
+  rendered Kubernetes objects nor implements the port, so it is leakage, not a
+  second implementation. Of the two cluster appliers, the CLI applies the same
+  rendered objects on the `cluster deploy`
   path (`cli/src/connectors.rs`) with a plain client-side `kubectl apply`, prunes
   in one bulk labelled delete, mints and deletes the owned Secret, and stamps no
   drift hash; the reconciler server-side applies, prunes one object at a time,
