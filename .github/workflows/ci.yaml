@@ -2712,6 +2712,9 @@ jobs:
           kubectl get pods -A -o wide || true
           kubectl get events -n acme-2590 --sort-by=.lastTimestamp | tail -50 || true
           kubectl logs -n acme-2590 deploy/t2590-curie-api --tail=100 || true
+          ls -la .projects/2590-evidence 2>/dev/null || true
+          tail -c 4000 .projects/2590-evidence/last-upgrade.json 2>/dev/null || true
+          tail -c 2000 .projects/2590-evidence/last-upgrade.err 2>/dev/null || true
       - name: Tear down the owned upgrade matrix cluster
         if: always()
         run: |

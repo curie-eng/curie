@@ -700,6 +700,10 @@ run_same_version() {
 run_fail_every_phase() {
     local phase status=0
     for phase in plan validate drain checkpoint migrate apply converge canary commit; do
+        # Later phases (canary/commit) still run converge. Start each row
+        # from healthy 0.9.0 so a leftover 0.9.1 apply cannot fail converge
+        # before FAIL_AT is reached.
+        restore_n
         log "fail-every-phase FAIL_AT=$phase"
         FAIL_AT_HOOK="$phase"
         set +e
