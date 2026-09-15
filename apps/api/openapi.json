@@ -3539,6 +3539,17 @@
             ],
             "title": "Review Origin Key"
           },
+          "route": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route"
+          },
           "summary": {
             "minLength": 1,
             "title": "Summary",

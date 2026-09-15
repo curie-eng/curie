@@ -1475,6 +1475,7 @@ class PublicationCreate(BaseModel):
     reply_adapter: str | None = None
     dedupe_key: str = Field(min_length=1)
     review_origin_key: str | None = Field(default=None, min_length=1, max_length=180)
+    route: str | None = None
     base_sha: str
     patch_b64: str = Field(min_length=1)
     changed_paths: list[str] = Field(min_length=1, max_length=4096)

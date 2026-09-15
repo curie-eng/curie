@@ -1078,7 +1078,7 @@ def test_publish_gate_is_an_additive_exact_platform_member() -> None:
     assert gate.route_by_tool.get(PUBLISH_TOOL_NAME) is None
 
 
-def test_bundle_cannot_attach_a_route_to_platform_publish() -> None:
+def test_bundle_may_attach_a_route_to_platform_publish() -> None:
     gate = build_approval_gate(
         operator_tools=None,
         policy_routes={PUBLISH_TOOL_NAME: "bundle-selected-audience"},
@@ -1087,7 +1087,27 @@ def test_bundle_cannot_attach_a_route_to_platform_publish() -> None:
 
     assert gate is not None
     assert gate.required == frozenset({PUBLISH_TOOL_NAME})
-    assert PUBLISH_TOOL_NAME not in gate.route_by_tool
+    assert PUBLISH_TOOL_NAME in gate.route_by_tool
+    assert gate.route_by_tool[PUBLISH_TOOL_NAME] == "bundle-selected-audience"
+
+
+def test_publish_permission_block_carries_policy_route() -> None:
+    async def go() -> None:
+        gate = build_approval_gate(
+            operator_tools=None,
+            policy_routes={PUBLISH_TOOL_NAME: "bundle-selected-audience"},
+            managed_workspace=True,
+        )
+        assert gate is not None
+        result = await build_can_use_tool(gate)(
+            PUBLISH_TOOL_NAME,
+            {"title": "  Update documentation  ", "body": "Exact body\n" * 100},
+            ToolPermissionContext(),
+        )
+        assert isinstance(result, PermissionResultDeny)
+        assert gate.pending_route == "bundle-selected-audience"
+
+    anyio.run(go)
 
 
 def test_publish_gate_denial_has_exact_trusted_provenance_and_no_route() -> None:
