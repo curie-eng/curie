@@ -1933,7 +1933,10 @@ impl ApiClient {
     /// same PATCH; one already bound elsewhere is left alone. The third return
     /// value is the operator note, set when the repo binding did not end up
     /// where `--repo` asked and left `None` when it did.
-    async fn resolve_agent(
+    ///
+    /// Public so the command layer can judge the resolved agent (approval-route
+    /// pre-check, #2448) before any version is created.
+    pub async fn resolve_agent(
         &self,
         name: &str,
         slack_channel: Option<&str>,
@@ -2134,23 +2137,22 @@ impl ApiClient {
             .context("decoding created deployment")
     }
 
-    /// Prepare a deploy through bundle upload without creating its deployment.
+    /// Prepare a deploy for an already-resolved agent through bundle upload,
+    /// without creating its deployment. The caller resolves the agent first
+    /// ([`Self::resolve_agent`]) so it can refuse before any version exists.
     #[allow(clippy::too_many_arguments)] // one cohesive deploy call; a struct would not clarify it
     pub async fn prepare_deploy(
         &self,
-        agent_name: &str,
-        slack_channel: Option<&str>,
+        agent: Agent,
+        channel: ChannelOutcome,
+        repo_note: Option<String>,
         version_label: &str,
         created_by: &str,
         archive: Vec<u8>,
         secrets: &std::collections::BTreeMap<String, String>,
-        repo_full_name: Option<&str>,
         commit_sha: Option<&str>,
         workspace: WorkspaceIntent,
     ) -> Result<PreparedDeployOutcome> {
-        let (agent, channel, repo_note) = self
-            .resolve_agent(agent_name, slack_channel, repo_full_name)
-            .await?;
         // Bind per-agent connector secrets (ADR-0009, #429). A PATCH covers both
         // a freshly created agent and a redeploy that rotates a value; an empty
         // map leaves the agent's current secrets untouched.
@@ -2204,6 +2206,10 @@ impl ApiClient {
 
     /// The full deploy flow: resolve agent (create or channel-reconcile),
     /// version, bundle, deployment.
+    ///
+    /// Carries no approval-route pre-check: that is a `curie` verb concern
+    /// (`commands::prepare_deploy_with_commit_sha`); the platform API refuses an
+    /// unbound declared route regardless.
     #[allow(clippy::too_many_arguments)] // one cohesive deploy call; a struct would not clarify it
     pub async fn deploy(
         &self,
@@ -2218,15 +2224,18 @@ impl ApiClient {
         commit_sha: Option<&str>,
         workspace: WorkspaceIntent,
     ) -> Result<DeployOutcome> {
+        let (agent, channel, repo_note) = self
+            .resolve_agent(agent_name, slack_channel, repo_full_name)
+            .await?;
         let prepared = self
             .prepare_deploy(
-                agent_name,
-                slack_channel,
+                agent,
+                channel,
+                repo_note,
                 version_label,
                 created_by,
                 archive,
                 secrets,
-                repo_full_name,
                 commit_sha,
                 workspace,
             )
