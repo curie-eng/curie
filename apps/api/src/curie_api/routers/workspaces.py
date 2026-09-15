@@ -83,7 +83,10 @@ async def select_workspace_repository(
             },
         )
     _require_allowed(selected.repo_full_name)
-    return WorkspaceSelectionOut(repo_full_name=selected.repo_full_name)
+    return WorkspaceSelectionOut(
+        repo_full_name=selected.repo_full_name,
+        revision=selected.revision,
+    )
 
 
 @router.post(
@@ -190,4 +193,5 @@ async def redeem_workspace_credential(
         repo_full_name=repo,
         clone_url=clone_url,
         authorization_header=authorization_header,
+        revision=selected.revision,
     )

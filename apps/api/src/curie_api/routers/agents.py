@@ -240,6 +240,8 @@ async def update_agent(
         # `model_fields_set`: there is no platform default a null would clear
         # back to, which is the distinction `memory` already draws.
         agent = await crud.update_agent_hook_partitions(session, agent, data.hook_partitions)
+    if data.source_bindings is not None:
+        agent = await crud.update_agent_source_bindings(session, agent, data.source_bindings)
     return AgentOut.model_validate(agent)
 
 

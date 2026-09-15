@@ -161,6 +161,11 @@ class Agent(Base):
     # `hook_generation` comment's discipline): a pointer is configuration, and it
     # must not be extended into anything carrying a VALUE from the payload.
     hook_partitions: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # Operator-controlled workload to repository map for inbound hooks (#2572).
+    # Hook name -> ``{"workload_pointer": <RFC 6901>, "map": {workload: {repository,
+    # revision}}}``. NULL means no hook on this agent selects a coding target
+    # from a delivery: investigation may still run, coding does not guess a repo.
+    source_bindings: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Whether this agent's bindings share one workflow-state namespace or each
     # get their own (#1525 follow-up). Cardinality alone (ADR-0118 decision 2)
     # governs routing and agent-scoped controls (budget, kill state, bundle
@@ -330,6 +335,7 @@ class ThreadWorkspace(Base):
     )
     conversation_id: Mapped[str]
     repo_full_name: Mapped[str]
+    revision: Mapped[str | None] = mapped_column(default=None)
     selected_by: Mapped[str]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 

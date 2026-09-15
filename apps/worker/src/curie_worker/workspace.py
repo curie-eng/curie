@@ -154,6 +154,7 @@ class WorkspaceCredential:
     repo_full_name: str
     clone_url: str
     authorization_header: str
+    revision: str | None = None
 
     def __post_init__(self) -> None:
         if not self.repo_full_name or not self.clone_url or not self.authorization_header:
@@ -208,6 +209,26 @@ def parse_github_repo_fact(message: str) -> str | None:
             "was attached and no work started. A thread works in only one repository."
         )
     return next(iter(repositories.values()), None)
+
+
+def trusted_repository_fact(message: str, *, ignore_message: bool) -> str | None:
+    """Repository facts for workspace selection.
+
+    Job payloads (webhook/cron) and verified-review bodies are untrusted for
+    repository selection. A coding target comes from operator mapping or an
+    already sticky thread row, never from a URL inside those documents.
+    """
+
+    if ignore_message:
+        return None
+    return parse_github_repo_fact(message)
+
+
+def webhook_job_refuses_workspace(message: str) -> bool:
+    """True when platform text, not the payload, stopped coding for this job."""
+
+    trusted = message.split("<untrusted-hook-payload>", 1)[0]
+    return "Coding is stopped" in trusted
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -383,10 +404,14 @@ class WorkspaceCredentialClient:
             )
         try:
             payload = json.loads(response.body)
+            revision = payload.get("revision")
+            if revision is not None and not isinstance(revision, str):
+                raise TypeError("revision is not a string")
             return WorkspaceCredential(
                 repo_full_name=str(payload["repo_full_name"]),
                 clone_url=str(payload["clone_url"]),
                 authorization_header=str(payload["authorization_header"]),
+                revision=revision,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise WorkspacePreparationError(
@@ -959,7 +984,12 @@ class WorkspacePreparer:
                             self._real_remaining(real_started),
                         ),
                     )
-                    if detached_head is not None:
+                    pin = detached_head
+                    if pin is None and credential.revision and re.fullmatch(
+                        r"[0-9a-f]{40}", credential.revision
+                    ):
+                        pin = credential.revision
+                    if pin is not None:
                         self.commands.run(
                             [
                                 "git",
@@ -967,7 +997,7 @@ class WorkspacePreparer:
                                 "--depth=1",
                                 "--no-tags",
                                 "origin",
-                                detached_head,
+                                pin,
                             ],
                             cwd=checkout,
                             env=clone_env,
@@ -977,7 +1007,7 @@ class WorkspacePreparer:
                             ),
                         )
                         self.commands.run(
-                            ["git", "checkout", "--detach", detached_head],
+                            ["git", "checkout", "--detach", pin],
                             cwd=checkout,
                             timeout_seconds=min(
                                 self.limits.clone_timeout_seconds,

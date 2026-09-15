@@ -46,6 +46,7 @@ from .schemas import (
     PublicationCreate,
     PublicationLineageAdvance,
     ReviewRevisionReserve,
+    SourceBindingConfig,
     VersionCreate,
 )
 from .workspace_policy import repository_is_allowed
@@ -241,6 +242,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
             else None
         ),
         hook_partitions=_stored_hook_partitions(data.hook_partitions),
+        source_bindings=_stored_source_bindings(data.source_bindings),
         secrets=data.secrets,
         memory=data.memory,
     )
@@ -502,6 +504,25 @@ def _stored_hook_partitions(
     return {name: c.model_dump() for name, c in partitions.items()}
 
 
+def _stored_source_bindings(
+    bindings: dict[str, SourceBindingConfig] | None,
+) -> dict[str, Any] | None:
+    if not bindings:
+        return None
+    return {name: c.model_dump() for name, c in bindings.items()}
+
+
+async def update_agent_source_bindings(
+    session: AsyncSession, agent: Agent, bindings: dict[str, SourceBindingConfig]
+) -> Agent:
+    """Set the agent's workload-to-repository map (#2572). An empty dict clears it."""
+
+    agent.source_bindings = _stored_source_bindings(bindings)
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def update_agent_hook_partitions(
     session: AsyncSession, agent: Agent, partitions: dict[str, HookPartitionConfig]
 ) -> Agent:
@@ -698,10 +719,11 @@ async def select_thread_workspace(
     session: AsyncSession,
     *,
     agent_id: uuid.UUID,
-    deployment_id: uuid.UUID,
+    deployment_id: uuid.UUID | None,
     conversation_id: str,
     repo_full_name: str,
     selected_by: str,
+    revision: str | None = None,
 ) -> tuple[ThreadWorkspace, bool]:
     """Insert the first selection or atomically adopt the concurrent winner."""
 
@@ -714,6 +736,7 @@ async def select_thread_workspace(
             selected_by_deployment_id=deployment_id,
             conversation_id=conversation_id,
             repo_full_name=repo_full_name,
+            revision=revision,
             selected_by=selected_by,
         )
         .on_conflict_do_nothing(constraint="thread_workspaces_agent_conversation_key")

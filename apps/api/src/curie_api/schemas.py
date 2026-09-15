@@ -34,6 +34,11 @@ from .config import get_settings
 from .hook_partition import HOOK_NAME, validate_pointer_syntax
 from .models import GIT_FLOW_CREATED_BY, Environment
 from .repo_full_name import RepoFullName
+from .source_binding import (
+    validate_revision,
+    validate_source_binding_keys,
+    validate_workload_key,
+)
 from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_name
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
@@ -624,6 +629,59 @@ def _validate_hook_partitions(
     return value
 
 
+class SourceBindingEntry(BaseModel):
+    """One workload's allowlisted repository and deployed revision (#2572)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repository: str
+    revision: str
+
+    @field_validator("repository")
+    @classmethod
+    def _check_repository(cls, value: str) -> str:
+        if not valid_repository_name(value):
+            raise ValueError("repository must be one canonical owner/repository name")
+        return value
+
+    @field_validator("revision")
+    @classmethod
+    def _check_revision(cls, value: str) -> str:
+        return validate_revision(value)
+
+
+class SourceBindingConfig(BaseModel):
+    """How one hook maps a workload identity onto a coding target (#2572)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workload_pointer: str
+    map: dict[str, SourceBindingEntry]
+
+    @field_validator("workload_pointer")
+    @classmethod
+    def _check_pointer(cls, value: str) -> str:
+        return validate_pointer_syntax(value)
+
+    @field_validator("map")
+    @classmethod
+    def _check_map(cls, value: dict[str, SourceBindingEntry]) -> dict[str, SourceBindingEntry]:
+        if not value:
+            raise ValueError("source binding map must contain at least one workload")
+        for key in value:
+            validate_workload_key(key)
+        return value
+
+
+def _validate_source_bindings(
+    value: "dict[str, SourceBindingConfig] | None",
+) -> "dict[str, SourceBindingConfig] | None":
+    if value is None:
+        return value
+    validate_source_binding_keys(value)
+    return value
+
+
 def _validate_route_names(
     value: "dict[str, ApprovalRouteBinding] | None",
 ) -> "dict[str, ApprovalRouteBinding] | None":
@@ -1026,6 +1084,9 @@ class AgentCreate(BaseModel):
     # into the delivery body that names the thing each delivery is about. None
     # (the default) is the unpartitioned behavior: one thread per hook.
     hook_partitions: dict[str, HookPartitionConfig] | None = None
+    # Per-hook workload to repository mapping (#2572). None means no hook on
+    # this agent selects a coding target from a delivery.
+    source_bindings: dict[str, SourceBindingConfig] | None = None
     # Whether this agent's bindings share one workflow-state namespace (#1525
     # follow-up). False (the default) matches a single-binding agent's existing
     # behavior exactly, since there is nothing yet to share with.
@@ -1038,6 +1099,7 @@ class AgentCreate(BaseModel):
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
+    _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
 
 
@@ -1083,6 +1145,9 @@ class AgentUpdate(BaseModel):
     # there is no platform default for this field to be cleared back TO, so
     # reading None as "omitted" conflates nothing.
     hook_partitions: dict[str, HookPartitionConfig] | None = None
+    # New per-hook source mapping (#2572). Omitted leaves it unchanged; an
+    # explicit empty dict clears it.
+    source_bindings: dict[str, SourceBindingConfig] | None = None
     # Which repository's pushes deploy this agent (ADR-0091). PATCHable because
     # an agent created before its repo existed -- or, until migration 0018, the
     # SECOND agent of a repo, which the unique index forbade from carrying it --
@@ -1098,6 +1163,7 @@ class AgentUpdate(BaseModel):
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
+    _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
     # The update-only half: a withdrawn `channel` here is refused, while the
     # same key stays required on `AgentCreate`.
@@ -1125,6 +1191,7 @@ class AgentOut(BaseModel):
     # Which hooks fan out, and by what (ADR-0134). Null is the unpartitioned
     # posture and the value every pre-existing agent row carries.
     hook_partitions: dict[str, HookPartitionConfig] | None
+    source_bindings: dict[str, SourceBindingConfig] | None
     # Connector secret NAMES only (#429) -- values are never returned. The stored
     # column is a name->value map; expose just the sorted names so an operator can
     # see which secrets an agent has bound without the material leaving the API.
@@ -1365,6 +1432,7 @@ class RepositoryCredentialOut(BaseModel):
     repo_full_name: str
     clone_url: str
     authorization_header: str
+    revision: str | None = None
 
 
 class WorkspaceSelectionRequest(BaseModel):
@@ -1384,6 +1452,7 @@ class WorkspaceSelectionRequest(BaseModel):
 
 class WorkspaceSelectionOut(BaseModel):
     repo_full_name: str | None
+    revision: str | None = None
 
 
 class WorkspaceCredentialRequest(BaseModel):

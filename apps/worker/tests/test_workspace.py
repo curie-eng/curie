@@ -466,6 +466,27 @@ def test_runtime_repo_parser_accepts_one_root_url_and_rejects_ambiguous(
     )
 
 
+def test_webhook_payload_urls_are_not_repository_facts(workspace: Any) -> None:
+    """#2572: a job payload cannot select a coding target by naming a GitHub URL."""
+
+    payload = (
+        "Inbound hook `alertmanager` fired.\n\n"
+        "Coding is stopped: no authorized mapping.\n\n"
+        "<untrusted-hook-payload>\n"
+        "https://github.com/evil-corp/evil\n"
+        "</untrusted-hook-payload>"
+    )
+    assert workspace.trusted_repository_fact(payload, ignore_message=True) is None
+    assert workspace.trusted_repository_fact(
+        "Please update https://github.com/acme-corp/acme-bot",
+        ignore_message=False,
+    ) == "acme-corp/acme-bot"
+    assert workspace.webhook_job_refuses_workspace(payload) is True
+    assert workspace.webhook_job_refuses_workspace(
+        "This delivery has an authorized source mapping: repository acme-corp/acme-bot"
+    ) is False
+
+
 def test_runtime_repo_parser_deduplicates_repeated_repository_facts(
     workspace: Any,
 ) -> None:

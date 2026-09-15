@@ -119,6 +119,17 @@ The six Slack scenarios (read, approved scale, one-shot re-arm, configuration
 denial, RBAC ceiling, coding-agent pull request), the Slack app and GitHub
 prerequisites, and the expected evidence for each are in [DEMO.md](DEMO.md).
 
+## Alert source (opt-in)
+
+Alertmanager stays off in the default observability overlay. One supported
+signed source is opt-in: apply `observability/alertmanager-webhook.yaml`, run
+`observability/alert-signer/server.py` with `CURIE_HOOK_URL`,
+`CURIE_HOOK_SECRET`, and `CURIE_SIGNER_TOKEN`, and configure the agent's `source_bindings` for hook
+`alertmanager` (workload pointer `/commonLabels/curie_workload`, partition
+`/curie_partition`). A genuine signed alert creates one partitioned
+investigation. Missing, ambiguous, or unauthorized mappings visibly stop
+coding. Invalid signatures and replayed delivery ids do not multiply work.
+
 ## Verification
 
 Use the real pinned image and a disposable cluster. A complete pass proves:
