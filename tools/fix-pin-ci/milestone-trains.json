@@ -18,6 +18,7 @@
     "v0.8.4": "patch",
     "v0.8.5": "patch",
     "v0.8.6": "feature",
+    "v0.8.9": "feature",
     "v0.9.0": "feature"
   }
 }
