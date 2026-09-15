@@ -205,6 +205,22 @@ run_self_test() {
         log "self-test: mutator must be cluster upgrade"
         failed=1
     fi
+    if awk '/^restore_n\(\)/,/^}/' "$script_path" | grep -q '"$status" == "in_progress" && "$target" == "0.9.0"'; then
+        log "restore_n resumes leftover in_progress 0.9.0"
+    else
+        log "self-test: restore_n must resume leftover in_progress 0.9.0 instead of skipping"
+        failed=1
+    fi
+    if awk '/^restore_n\(\)/,/^}/' "$script_path" | awk '
+        /cluster_upgrade "0.9.0"/ { upgraded=1 }
+        /clear_upgrade_checkpoint/ { if (upgraded) after=1 }
+        END { exit after ? 0 : 1 }
+    '; then
+        log "restore_n clears leftover in_progress after restoring 0.9.0"
+    else
+        log "self-test: restore_n must clear the checkpoint after the 0.9.0 restore"
+        failed=1
+    fi
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
@@ -769,13 +785,57 @@ clear_upgrade_checkpoint() {
     fi
 }
 
+checkpoint_field() {
+    local field="$1"
+    local cm="${RELEASE}-upgrade-checkpoint"
+    kubectl_ns get configmap "$cm" -o jsonpath='{.data.record}' 2>/dev/null | python3 -c '
+import json,sys
+raw=sys.stdin.read().strip()
+if not raw:
+    raise SystemExit(0)
+try:
+    d=json.loads(raw)
+except Exception:
+    raise SystemExit(0)
+val=d.get(sys.argv[1])
+if val is None:
+    raise SystemExit(0)
+print(val)
+' "$field" || true
+}
+
+recover_helm_lock() {
+    local st
+    st="$(helm_release_status)"
+    case "$st" in
+        pending-upgrade|pending-rollback|pending-install)
+            log "helm status is $st; rolling back to last deployed revision"
+            helm_ns rollback "$RELEASE" --wait --timeout 180s >/dev/null 2>&1 || true
+            ;;
+    esac
+}
+
 restore_n() {
-    clear_upgrade_checkpoint
-    if [[ "$(helm_version)" != "0.9.0" ]]; then
-        log "restoring helm 0.9.0 (currently $(helm_version))"
+    # A leftover in_progress 0.9.1 is a foreign record: resume would keep
+    # going to 0.9.1. Delete only that. A leftover in_progress 0.9.0 is
+    # resumed below so converge/canary/commit can finish.
+    local target status
+    target="$(checkpoint_field target_version)"
+    status="$(checkpoint_field status)"
+    recover_helm_lock
+    if [[ "$status" == "in_progress" && "$target" == "0.9.1" ]]; then
+        clear_upgrade_checkpoint
+        target=""
+        status=""
+    fi
+    if [[ "$(helm_version)" != "0.9.0" || ( "$status" == "in_progress" && "$target" == "0.9.0" ) ]]; then
+        log "restoring helm 0.9.0 (currently $(helm_version), checkpoint_target=${target:-none} checkpoint_status=${status:-none})"
         cluster_upgrade "0.9.0" "$CHART_090" || true
         wait_rollout || true
     fi
+    # The restore upgrade itself writes a record. Wipe it so the next
+    # FAIL_AT 0.9.1 cannot be refused as "upgrade to 0.9.0 already in progress".
+    clear_upgrade_checkpoint
     [[ "$(helm_version)" == "0.9.0" ]] || die "restore_n left helm at $(helm_version)"
 }
 
