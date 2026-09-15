@@ -955,7 +955,7 @@ mod tests {
         let id = "00000000-0000-4000-8000-000000000000";
         let text = format!(
             "Answer.\n\n\
-             Working in acme-corp/acme-bot, from the repository URL in your message.\n\n\
+             Working in acme-corp/acme-bot, from the repository named in your message.\n\n\
              Awaiting approval ({id}): run the deploy\n\
              The session is paused and will resume once an authorized member \
              resolves this request."

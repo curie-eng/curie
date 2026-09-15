@@ -46,6 +46,83 @@ _REPO_FULL_NAME = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
     r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$"
 )
+# Two path segments, not glued to a longer path on either side. A following
+# slash is the nested-path case (`apps/worker/src/foo.py` is not a fact).
+_BARE_REPO = re.compile(
+    r"(?<![A-Za-z0-9._/-])"
+    r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+"
+    r"(?![A-Za-z0-9._/-])"
+)
+# Bare tokens that look like source-tree paths are not facts. URL-derived facts
+# skip this check.
+_BARE_REPO_SOURCE_ROOTS = frozenset(
+    {
+        "src",
+        "lib",
+        "docs",
+        "doc",
+        "bin",
+        "app",
+        "apps",
+        "test",
+        "tests",
+        "pkg",
+        "cmd",
+        "cli",
+        "scripts",
+        "script",
+        "examples",
+        "example",
+        "internal",
+        "vendor",
+        "dist",
+        "build",
+        "tmp",
+        "temp",
+        "include",
+        "assets",
+        "static",
+        "public",
+        "config",
+        "configs",
+        "tools",
+        "packages",
+        "package",
+    }
+)
+_BARE_REPO_SOURCE_EXTENSIONS = frozenset(
+    {
+        "py",
+        "md",
+        "rs",
+        "ts",
+        "js",
+        "go",
+        "json",
+        "toml",
+        "yaml",
+        "yml",
+        "txt",
+        "sh",
+        "c",
+        "h",
+        "cc",
+        "cpp",
+        "java",
+        "rb",
+        "php",
+        "css",
+        "html",
+        "xml",
+        "sql",
+        "lock",
+        "proto",
+        "kt",
+        "swift",
+    }
+)
+_ENGLISH_SLASH_PAIRS = frozenset({"and/or", "n/a", "w/o", "i/o", "y/n"})
+_TRAILING_PUNCTUATION = ".,;:!?)]}"
 # The terminal refusal for a message that names a repository while the worker-wide
 # workspace switch is off (#2659). It names no repository, so it neither echoes
 # untrusted message text nor reveals whether the allowlist permits one.
@@ -171,11 +248,11 @@ class WorkspaceCredential:
 
 
 def parse_github_repo_fact(message: str) -> str | None:
-    """Extract one canonical root GitHub repository URL from trusted turn text."""
+    """Extract one canonical GitHub repository from trusted turn text."""
 
     repositories: dict[str, str] = {}
     for matched in _GITHUB_URL.finditer(message):
-        raw = matched.group(0).rstrip(".,;:!?)]}")
+        raw = matched.group(0).rstrip(_TRAILING_PUNCTUATION)
         parsed = urlsplit(raw)
         try:
             invalid_authority = (
@@ -201,6 +278,28 @@ def parse_github_repo_fact(message: str) -> str | None:
         if repository.endswith(".git"):
             repository = repository[:-4]
         candidate = f"{owner}/{repository}"
+        if _REPO_FULL_NAME.fullmatch(candidate):
+            repositories.setdefault(candidate.casefold(), candidate)
+    # Mask every GitHub URL match, including non-root paths, so a pull/query
+    # URL cannot also be read as a bare owner/repo.
+    masked = _GITHUB_URL.sub(" ", message)
+    for matched in _BARE_REPO.finditer(masked):
+        raw = matched.group(0).rstrip(_TRAILING_PUNCTUATION)
+        parts = [part for part in raw.split("/") if part]
+        if len(parts) != 2:
+            continue
+        owner, repository = parts
+        if owner.casefold() in _BARE_REPO_SOURCE_ROOTS:
+            continue
+        if repository.endswith(".git"):
+            repository = repository[:-4]
+        if "." in repository:
+            suffix = repository.rsplit(".", 1)[-1].casefold()
+            if suffix in _BARE_REPO_SOURCE_EXTENSIONS:
+                continue
+        candidate = f"{owner}/{repository}"
+        if candidate.casefold() in _ENGLISH_SLASH_PAIRS:
+            continue
         if _REPO_FULL_NAME.fullmatch(candidate):
             repositories.setdefault(candidate.casefold(), candidate)
     if len(repositories) > 1:
