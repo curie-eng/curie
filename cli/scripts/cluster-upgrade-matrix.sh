@@ -388,7 +388,32 @@ prepare_candidate_images() {
     retag_candidate_versions "$src" "0.9.1"
     load_tag_images "0.8.8"
     load_tag_images "0.9.0"
-    load_tag_images "0.9.1"
+    # Do not load 0.9.0 and 0.9.1 together: they are the same digest in CI,
+    # and converge refuses a tagged alias with more than one name.
+    exclusive_kind_tag "0.9.0"
+}
+
+kind_node() {
+    kind get nodes --name "$KIND_CLUSTER" 2>/dev/null | head -1
+}
+
+exclusive_kind_tag() {
+    local keep="$1" node img tag ref
+    node="$(kind_node)"
+    [[ -n "$node" ]] || return 0
+    load_tag_images "$keep"
+    for img in "${IMAGES[@]}"; do
+        for tag in 0.9.0 0.9.1 matrix-candidate upgrade-candidate; do
+            [[ "$tag" == "$keep" ]] && continue
+            for ref in \
+                "ghcr.io/curie-eng/${img}:${tag}" \
+                "docker.io/library/${img}:${tag}" \
+                "${img}:${tag}"; do
+                docker exec "$node" crictl rmi "$ref" >/dev/null 2>&1 || true
+            done
+        done
+    done
+    log "kind node $node holds exclusive app tag $keep"
 }
 
 image_sets() {
@@ -561,6 +586,7 @@ helm_install_088() {
 cluster_up_n() {
     local chart="$1"
     refuse_soak "$NAMESPACE" "$RELEASE"
+    exclusive_kind_tag "0.9.0"
     local sets=()
     local line
     while IFS= read -r line; do
@@ -583,6 +609,9 @@ cluster_upgrade() {
     shift 2
     local extra=("$@")
     refuse_soak "$NAMESPACE" "$RELEASE"
+    if [[ "$to" == "0.9.0" || "$to" == "0.9.1" ]]; then
+        exclusive_kind_tag "$to"
+    fi
     local out status=0
     local saved_fail="${CURIE_UPGRADE_TEST_FAIL_AT-}"
     local saved_interrupt="${CURIE_UPGRADE_TEST_INTERRUPT_AFTER-}"
