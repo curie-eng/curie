@@ -986,15 +986,16 @@ true`, gated also on `agentSandbox.controller.deploy` (also default true).
 
 ## Single-node footprint (measured on a disposable single-node k3s cluster, 4 GB / 4 core)
 
-The dev profile fits the whole stack on one 4 GB node, but **tightly**: steady
-state is ~3.3 GB / ~82% node memory once Langfuse migrations settle. Langfuse
-web is the anchor (~950 MB resident with the heap cap raised to 1 GB; its Node
-default heap of ~512 MB OOM-crashes under a tight container limit, so the dev
-profile sets `NODE_OPTIONS=--max-old-space-size` and a 1536 MB web limit).
-ClickHouse settles around ~255 MB single-replica with cluster mode off. This
-matches the planned resize: everything runs in 4 GB for
-chart/security verification, and a resize to >=8 vCPU / 16-20 GB gives
-comfortable headroom for integration and soak testing.
+The ~3.3 GB / ~82% node memory figure was taken while rustfs was capped at
+512Mi and OOMKilling; HTTP /health still returned 200 between kubelet SIGKILLs,
+so the pod looked Ready. With the #2706 floor, rustfs resident size is ~1120Mi
+under ordinary Langfuse traffic and a 4 GB node is no longer an honest fit.
+Langfuse web is the other anchor (~950 MB resident with the heap cap raised to
+1 GB; its Node default heap of ~512 MB OOM-crashes under a tight container
+limit, so the dev profile sets `NODE_OPTIONS=--max-old-space-size` and a
+1536 MB web limit). ClickHouse settles around ~255 MB single-replica with
+cluster mode off. Resize to >=8 vCPU / 16-20 GB for integration and soak
+testing.
 
 ## High availability and PodDisruptionBudgets
 

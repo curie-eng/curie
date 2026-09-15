@@ -570,6 +570,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/tenant-capacity-assertions.sh
 
+      # Prove the in-chart rustfs resource floors (issue #2706). Presence is
+      # not the defect; the 512Mi memory ceiling is. The shipped default sat
+      # under a measured 1120Mi working set, so every install OOMKilled in a
+      # Ready loop. These pins are floors, not exact values.
+      - name: helm render assertions (rustfs resource floor)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/rustfs-resource-floor-assertions.sh
+
       # Prove the runner and both bundle init containers declare an
       # ephemeral-storage request AND limit (ADR-0059 decision 1, issue #755),
       # and that the ceiling is operator-overridable (decision 6). Before this,
