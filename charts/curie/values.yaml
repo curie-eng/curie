@@ -691,7 +691,7 @@ rustfs:
   # bundle-fetch or workspace enabled is refused at render until these CIDRs
   # are set. Each entry must set cidr and a concrete port (not protocol-only,
   # not endPort). Default routes, IPv4 prefixes shorter than /8, IPv6 prefixes
-  # shorter than /32, and CIDRs that reach 169.254.169.254 or fd00:ec2::254
+  # shorter than /32, and CIDRs that reach 169.254.169.254, fd00:ec2::254 or ::ffff:169.254.169.254
   # are refused: this is a store-endpoint list, not a second model allowlist.
   # On EKS the tight form is VPC interface endpoints
   # for s3 (and sts on the key-free path) with private DNS enabled, which
@@ -859,7 +859,7 @@ otelCollector:
   # flow, and only the sandbox's spans are silently dropped. Each entry must
   # set cidr and a concrete port (not protocol-only, not endPort). Default
   # routes, IPv4 prefixes shorter than /8, IPv6 prefixes shorter than /32, and
-  # CIDRs that reach 169.254.169.254 or fd00:ec2::254 are refused: this is one
+  # CIDRs that reach 169.254.169.254, fd00:ec2::254 or ::ffff:169.254.169.254 are refused: this is one
   # collector endpoint, not a second model allowlist.
   egress: []
   #  - cidr: 192.0.2.10/32
@@ -1081,6 +1081,8 @@ api:
   # Postgres responds, while process local /health keeps the process alive.
   # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.
   # Formula/rationale: ci/probe-window-assertions.sh header.
+  # Kubelet withdrawal of a bounce shorter than the 120s readiness cutoff is
+  # out of scope; the longer-outage proof covers endpoints.
   readinessProbe:
     initialDelaySeconds: 5
     periodSeconds: 5
@@ -1611,6 +1613,38 @@ worker:
     bucket: curie-workspaces
     cloneVolumeSize: 4Gi
     mountPath: /var/lib/curie/workspaces
+  # Inbound channel attachments (#2567). The worker downloads a referenced file
+  # with the channel bot token, parks it in the private workspace bucket and
+  # mints a short-lived one-object read capability that the sandbox's
+  # attachments-init container redeems. These three numbers are ONE envelope
+  # expressed twice: they become the worker's CURIE_ATTACHMENT_* env AND (for
+  # maxFileBytes) the literal cap inside the rendered init-container program, so
+  # the pod can never accept what the worker refused or refuse what it accepted.
+  # apps/worker/tests/test_config.py compares them against the Python defaults
+  # and ci/attachment-init-assertions.sh compares the rendered pair.
+  attachments:
+    # THE lane switch, and it is OFF for this release. Off means off everywhere:
+    # the worker does not download a referenced file, parks no bytes, writes no
+    # retention ledger and mints no capability, and the sandbox pod renders
+    # without the attachments volume, the attachments-init container and the
+    # runner's mount -- so an inbound message carrying files is answered exactly
+    # as it is today, text only, with the files ignored and no error. Turning it
+    # on is a deliberate operator action: the Slack-side download has not been
+    # exercised against a real workspace yet, and the app must have the
+    # `files:read` scope (a missing scope degrades to a WARNING at boot, it does
+    # not refuse). Gates agentSandbox.runner.attachments too; that key is only a
+    # sandbox-side sub-gate and cannot turn the lane on by itself.
+    enabled: false
+    # Per-file ceiling, enforced while streaming in the worker (nothing is
+    # buffered past the crossing chunk) and again in the init container. A zero
+    # is refused rather than read as "unlimited".
+    maxFileBytes: 33554432
+    # How long the minted presigned one-object URL stays redeemable. It only has
+    # to outlive a sandbox boot, so keep it short.
+    referenceTtlSeconds: 300
+    # How long the parked bytes are retained so a redelivery of the same turn can
+    # still fetch them. Swept by the worker's existing reap_orphans tick.
+    retentionTtlSeconds: 3600
   publication:
     enabled: true
     # Short-lived Jobs and their scoped token Secret live outside the platform
@@ -2054,6 +2088,10 @@ agentSandbox:
   # NetworkPolicy selecting curietech.ai/agent=<name>, so one agent's connector
   # host is not opened for every runner. Model-API CIDRs stay on
   # security.networkPolicy.allowedEgress (fleet-wide). Empty by default.
+  # Each entry passes the same floor as rustfs.egress: cidr and a concrete
+  # port are required; a default route, an IPv4 prefix shorter than /8, an IPv6
+  # prefix shorter than /32, endPort, `except: []`, and any CIDR reaching
+  # 169.254.169.254, fd00:ec2::254 or ::ffff:169.254.169.254 are refused.
   #   connectorEgress:
   #     acme-a:
   #       - cidr: 10.20.0.2/32
@@ -2185,6 +2223,24 @@ agentSandbox:
       sizeLimit: 1Gi
       fetchTimeoutSeconds: 45
       extractTimeoutSeconds: 45
+    # Inbound attachments arrive the same way a workspace does: a claim-scoped,
+    # one-object signed read reference redeemed by an init container, never an
+    # object-store identity in the sandbox. The mount is a SIBLING of the
+    # workspace, deliberately not inside it -- workspace-init deletes every
+    # child of its own root on entry, and anything under the checkout would show
+    # up in `git status` and could ride into a publication diff. mountPath is a
+    # cross-language seam with curie_runner.__main__.ATTACHMENTS_DIR (compiled
+    # in, because the reference env is scoped away from the runner container so
+    # nothing at runtime can tell the runner where the volume landed);
+    # runner/tests/test_attachments_mount.py compares the two.
+    attachments:
+      enabled: true
+      mountPath: /attachments
+      # ADR-0059 decision 2: every writable emptyDir in the sandbox pod carries
+      # a ceiling, so a hostile or broken store cannot fill the node. Sized
+      # above worker.attachments.maxFileBytes x the lane's 10-file set cap.
+      sizeLimit: 512Mi
+      fetchTimeoutSeconds: 45
     # Extra env for the runner container, list of {name, value}.
     # Per-workload OTEL_EXPORTER_OTLP_* overrides still win over the
     # chart-owned collector endpoint.
@@ -2214,7 +2270,7 @@ agentSandbox:
       # pair and the prewarm DaemonSet; ci/prewarm-bundle-fetch-assertions.sh
       # compares the two rendered objects.
       fetchImage: amazon/aws-cli:2.32.6
-      extractImage: busybox:1.36.1
+      extractImage: busybox:1.36.1@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
       # Shared bundle volume mount point in the sandbox pod. The plugin dir the
       # worker injects (CURIE_PLUGIN_DIR=/bundles/current) is `<mountPath>/current`.
       mountPath: /bundles
@@ -2338,6 +2394,12 @@ security:
     # denies ALL egress except DNS until the operator declares where the model API
     # and MCP servers live. Deliberately fail-closed -- an unset allowlist must never
     # mean "allow everything".
+    # Every entry must set a parseable cidr and ports naming a concrete port with
+    # no endPort. A broad route such as 0.0.0.0/0 or ::/0 is allowed here; the
+    # chart adds an except for each metadata address it contains
+    # (169.254.169.254, fd00:ec2::254). `except: []` is refused, an explicit
+    # except must cover those addresses, and an IPv4-mapped range such as
+    # ::ffff:0:0/96 is refused because no except can carve it.
     allowedEgress: []
     #  - cidr: 160.79.104.0/23           # e.g. api.anthropic.com
     #    ports: [{ protocol: TCP, port: 443 }]

@@ -23,7 +23,7 @@ import contextlib
 import hmac
 import logging
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 
 import anyio
 from aci_protocol import (
@@ -41,6 +41,7 @@ from curie_telemetry import record_metric
 from opentelemetry.context import Context
 
 from .adapter import (
+    McpServerReconnector,
     ModelSession,
     PartialMessageBoundary,
     StreamedToolUseBoundary,
@@ -58,7 +59,7 @@ from .history import (
     bound_turn_record,
     close_suspended_tool_calls,
 )
-from .mcp_tool_capability import ConnectorCapabilityFailure
+from .mcp_tool_capability import ConnectorAvailability, ConnectorCapabilityFailure
 from .memory import (
     ConsolidationResult,
     MemoryRecord,
@@ -75,6 +76,18 @@ from .translate import TurnState, translate_message
 logger = logging.getLogger(__name__)
 
 SessionFactory = Callable[[], ModelSession]
+# Upper bound on the turn-start side re-probe (#2634), our own cancel-safe MCP
+# client whose per-server probe already times out at 15 s. It does NOT cover
+# the SDK session confirmation that follows, which is bounded by the SDK's own
+# 60 s control-request timeout and must not be cancelled. On expiry the prior
+# failures stand and the turn runs with them.
+_CONNECTOR_RECOVERY_BUDGET_SECONDS = 20.0
+# Re-dials the connectors named by the current failures and returns the ones
+# still failing (#2634). Bound by ``build_runner`` over the materialized servers.
+ConnectorReprobe = Callable[
+    [tuple[ConnectorCapabilityFailure, ...]],
+    Awaitable[tuple[ConnectorCapabilityFailure, ...]],
+]
 
 # The SDK surfaces a provider auth rejection (HTTP 401/403 -- e.g. a placeholder,
 # revoked, or wrong model key) as an ``AssistantMessage.error`` of this code
@@ -111,11 +124,6 @@ FALSE_COMPLETION_CLASSIFICATION = "false-completion"
 # error+final pair, because a publication request that produced no approval
 # record must never finalize looking like a clean turn.
 PUBLICATION_UNRECORDED_CLASSIFICATION = "publication-unrecorded"
-# Declared-connector capability/auth failure (#2519). Distinct from a model
-# credential rejection: the session can still boot, but the connector's tools
-# are not available. Rides ErrorEvent.classification; the Final is DONE so the
-# worker posts the diagnosis text instead of overwriting it with escalate copy.
-CONNECTOR_CAPABILITY_FAILED = "connector-capability-failed"
 
 
 def _is_auth_rejection(message: object) -> bool:
@@ -218,6 +226,8 @@ class SessionRunner:
         false_completion_check: bool = False,
         history_resumed: bool = False,
         connector_failures: tuple[ConnectorCapabilityFailure, ...] = (),
+        connector_reprobe: ConnectorReprobe | None = None,
+        connector_availability: ConnectorAvailability | None = None,
     ) -> None:
         self._factory = session_factory
         self._ceiling = ceiling
@@ -253,10 +263,17 @@ class SessionRunner:
         self._false_completion_check = false_completion_check
         self._history_resumed = history_resumed
         self._resume_cache_metric_recorded = False
-        # Declared-connector probe/expansion failures (#2519). Empty means the
-        # model runs as usual. Non-empty short-circuits every turn before query
-        # so the agent cannot answer from memory with the connector's tools gone.
+        # Declared-connector probe/expansion failures (#2519). The model runs
+        # either way (#2634): each turn start re-dials the probe_failed ones via
+        # connector_reprobe, publishes what still fails to the shared
+        # availability the exclusion hook reads, and prefixes a one-line notice
+        # onto the turn's reply while any failure remains.
         self._connector_failures = connector_failures
+        self._connector_reprobe = connector_reprobe
+        self._connector_availability = connector_availability
+        # The notice for the turn in flight, or None. Set at turn start under
+        # the turn lock and applied to a DONE final in _drive_turn.
+        self._connector_notice: str | None = None
 
         self._session: ModelSession | None = None
         # One turn consumes the SDK generator at a time. This MUST be a
@@ -304,6 +321,7 @@ class SessionRunner:
         self._history_durable = True
         self._history_loss_observed = False
         self._active_state: TurnState | None = None
+        self._turn_ready = False
 
     @property
     def status(self) -> SessionStatus:
@@ -491,6 +509,7 @@ class SessionRunner:
             self._turn_epoch = None
             self._turn_open = False
             self._active_state = None
+            self._turn_ready = False
             self._status = SessionStatus.IDLE_AWAITING_INPUT
 
     async def steer(self, text: str) -> bool:
@@ -501,7 +520,7 @@ class SessionRunner:
         on the already-open turn's NDJSON stream.
         """
 
-        if self._session is None or not self._turn_open:
+        if self._session is None or not self._turn_open or not self._turn_ready:
             return False
         await self._session.query(text)
         if self._active_state is not None:
@@ -514,6 +533,10 @@ class SessionRunner:
         """Request a hard stop; the live turn's final is reclassified to idle."""
 
         self._interrupt_requested = True
+        if self._turn_open and not self._turn_ready:
+            # Accepted turn still in connector recovery: no query has been
+            # sent, and run_turn checks the flag before sending one.
+            return
         if self._session is not None:
             await self._session.interrupt()
 
@@ -539,6 +562,12 @@ class SessionRunner:
         timeout_interrupt_settled = anyio.Event()
         self._timeout_requested = True
         self._timeout_interrupt_settled = timeout_interrupt_settled
+        if not self._turn_ready:
+            # Accepted turn still in connector recovery (#2634): no query was
+            # sent, so there is nothing for an SDK interrupt to stop. run_turn
+            # checks the flag after recovery and emits the timeout terminal.
+            timeout_interrupt_settled.set()
+            return True
         try:
             await self._session.interrupt()
             # A delayed SDK acknowledgement can return after this turn has
@@ -595,6 +624,11 @@ class SessionRunner:
             self._turn_epoch = turn_epoch
             self._turn_open = True
             self._history_durable = False
+            # Not ready until turn-start connector recovery completes (#2634):
+            # the turn is accepted and owns its epoch, but no query has been
+            # sent, so steer is refused and a stop is recorded without an SDK
+            # interrupt that no query is there to receive.
+            self._turn_ready = False
             state = TurnState()
             self._active_state = state
             # A permission-gate block belongs to exactly one turn: clear any
@@ -639,26 +673,53 @@ class SessionRunner:
                     parent=parent,
                 ) as gen:
                     try:
-                        if self._connector_failures:
-                            message = " ".join(
-                                failure.caller_message()
-                                for failure in self._connector_failures
+                        await self._refresh_connector_failures()
+                        if self._timeout_requested:
+                            # Timed out during recovery: the same terminal as
+                            # the timeout path below, and the model is never
+                            # queried.
+                            self._turn_open = False
+                            self._turn_ready = False
+                            self._status = SessionStatus.CLASSIFIED_FAILURE
+                            metric_outcome = self._metric_outcome(tracker)
+                            gen.finish_turn(
+                                timeout_requested=True,
+                                interrupt_requested=self._interrupt_requested,
+                                classified_failure=True,
                             )
-                            state.final_text = message
-                            for line in self._connector_capability_halt_lines(gen, message):
-                                if isinstance(parse_ndjson_line(line), Final):
-                                    metric_outcome = self._metric_outcome(tracker)
-                                yield line
-                        else:
-                            async for line in self._drive_turn(
-                                event, state, tracker, gen
-                            ):
-                                if isinstance(parse_ndjson_line(line), Final):
-                                    # The terminal decision is authoritative once the
-                                    # Final reaches the consumer, even if it closes
-                                    # without requesting the generator's next item.
-                                    metric_outcome = self._metric_outcome(tracker)
-                                yield line
+                            yield to_ndjson_line(
+                                Final(
+                                    text="run timed out",
+                                    status=SessionStatus.CLASSIFIED_FAILURE,
+                                )
+                            )
+                            return
+                        if self._interrupt_requested:
+                            # Interrupted during recovery: the same idle
+                            # terminal as the interrupt path below, no query.
+                            self._turn_open = False
+                            self._turn_ready = False
+                            self._status = SessionStatus.IDLE_AWAITING_INPUT
+                            metric_outcome = "interrupted"
+                            gen.finish_turn(
+                                interrupt_requested=True,
+                                classified_failure=False,
+                            )
+                            yield to_ndjson_line(
+                                Final(
+                                    text="run interrupted",
+                                    status=SessionStatus.IDLE_AWAITING_INPUT,
+                                )
+                            )
+                            return
+                        self._turn_ready = True
+                        async for line in self._drive_turn(event, state, tracker, gen):
+                            if isinstance(parse_ndjson_line(line), Final):
+                                # The terminal decision is authoritative once the
+                                # Final reaches the consumer, even if it closes
+                                # without requesting the generator's next item.
+                                metric_outcome = self._metric_outcome(tracker)
+                            yield line
                         logger.info(
                             "turn end session=%s status=%s duration_ms=%d",
                             self._session_id,
@@ -677,6 +738,7 @@ class SessionRunner:
                         # is intentionally not caught here -- the finally handles
                         # that abandonment case.
                         self._turn_open = False
+                        self._turn_ready = False
                         if self._timeout_requested:
                             # The body-boundary timeout is a failure even when the
                             # SDK reports its interrupt as an iterator exception.
@@ -789,6 +851,7 @@ class SessionRunner:
                                         await self._session.interrupt()
                             finally:
                                 self._turn_open = False
+                                self._turn_ready = False
                                 self._turn_epoch = None
             finally:
                 self._active_state = None
@@ -796,6 +859,7 @@ class SessionRunner:
                     emit_completed_metrics()
                 finally:
                     self._turn_open = False
+                    self._turn_ready = False
                     self._turn_epoch = None
                     self._timeout_interrupt_settled = None
                     self._timeout_interrupt_delivered = False
@@ -976,6 +1040,7 @@ class SessionRunner:
                     final = self._reclassify(final)
                     self._status = final.status
                     self._turn_open = False
+                    self._turn_ready = False
                     gen.finish_turn(
                         timeout_requested=self._timeout_requested,
                         interrupt_requested=self._interrupt_requested,
@@ -993,7 +1058,7 @@ class SessionRunner:
                         SessionStatus.AWAITING_APPROVAL,
                     }:
                         state.final_text = final.text
-                    yield to_ndjson_line(final)
+                    yield to_ndjson_line(self._with_connector_notice(final))
                     return
                 yield to_ndjson_line(outbound)
 
@@ -1032,6 +1097,7 @@ class SessionRunner:
         final = self._reclassify(final)
         self._status = final.status
         self._turn_open = False
+        self._turn_ready = False
         gen.finish_turn(
             timeout_requested=self._timeout_requested,
             interrupt_requested=self._interrupt_requested,
@@ -1044,7 +1110,7 @@ class SessionRunner:
         # halt: its structured tool call and gate context must cross runners.
         if final.status is SessionStatus.AWAITING_APPROVAL:
             state.final_text = final.text or state.assistant_text
-        yield to_ndjson_line(final)
+        yield to_ndjson_line(self._with_connector_notice(final))
 
     def _observe_publication_calls(self, state: TurnState) -> None:
         """Record every publication call the runner sees on the stream (#2294).
@@ -1262,6 +1328,7 @@ class SessionRunner:
         )
         logger.error("publication request not recorded session=%s: %s", self._session_id, reason)
         self._turn_open = False
+        self._turn_ready = False
         self._status = SessionStatus.CLASSIFIED_FAILURE
         return [
             to_ndjson_line(
@@ -1452,6 +1519,7 @@ class SessionRunner:
 
         logger.warning("budget halt session=%s: output token budget exceeded", self._session_id)
         self._turn_open = False
+        self._turn_ready = False
         self._status = SessionStatus.CLASSIFIED_FAILURE
         return [
             to_ndjson_line(
@@ -1468,43 +1536,109 @@ class SessionRunner:
             ),
         ]
 
-    def _connector_capability_halt_lines(
-        self, gen: _GenerationSpan, message: str
-    ) -> list[str]:
-        """ErrorEvent + DONE so the diagnosis reaches the message caller (#2519).
+    async def _refresh_connector_failures(self) -> None:
+        """Re-probe failed connectors at turn start and publish what remains (#2634).
 
-        Does not query the model. Final is DONE, not classified-failure: the
-        worker's escalate path would replace the connector and credential names
-        with a generic human-flag. completed_without_result keeps the OTel span
-        from being marked abandoned. Logs names only, never values.
+        A boot probe that hit a transient network error must not remove the
+        connector for the life of the process. The reprobe callable decides
+        which failures are worth re-dialing (only ``probe_failed``); a reprobe
+        that itself raises keeps the prior failures, logged by class only.
         """
 
-        logger.error(
-            "declared connector capability failed session=%s connectors=%s credentials=%s",
-            self._session_id,
-            ",".join(failure.connector for failure in self._connector_failures),
-            ",".join(
-                name
-                for failure in self._connector_failures
-                for name in failure.credential_names
-            ),
-        )
-        self._turn_open = False
-        self._status = SessionStatus.DONE
-        gen.finish_turn(
-            interrupt_requested=False,
-            classified_failure=False,
-            completed_without_result=True,
-        )
-        return [
-            to_ndjson_line(
-                ErrorEvent(
-                    message=message,
-                    classification=CONNECTOR_CAPABILITY_FAILED,
+        self._connector_notice = None
+        if self._connector_failures and self._connector_reprobe is not None:
+            prior = self._connector_failures
+            remaining = prior
+            with anyio.move_on_after(_CONNECTOR_RECOVERY_BUDGET_SECONDS) as budget:
+                try:
+                    remaining = await self._connector_reprobe(prior)
+                except Exception as exc:  # noqa: BLE001 - keep prior failures; never fail the turn
+                    logger.warning(
+                        "connector re-probe raised session=%s error_class=%s",
+                        self._session_id,
+                        type(exc).__name__,
+                    )
+            if budget.cancelled_caught:
+                logger.warning(
+                    "connector re-probe exceeded budget session=%s connectors=%s",
+                    self._session_id,
+                    ",".join(failure.connector for failure in prior),
                 )
-            ),
-            to_ndjson_line(Final(text=message, status=SessionStatus.DONE)),
-        ]
+            # Deliberately outside the budget: cancelling an SDK control request
+            # leaks its pending entry and can leave a partial stdin write. The
+            # SDK's own control timeout bounds it, and ensure_mcp_server maps
+            # that to False.
+            self._connector_failures = await self._confirm_session_connectors(
+                prior, remaining
+            )
+        if self._connector_availability is not None:
+            self._connector_availability.failures = self._connector_failures
+        if self._connector_failures:
+            # Names only, never values, and only on a turn where a failure
+            # survived the re-probe. Deliberately no ErrorEvent: the worker
+            # keeps any ErrorEvent classification for the turn, so a later
+            # runner crash would be reported as this instead of a retryable
+            # runner-error. The DONE final's leading notice is the delivery.
+            logger.error(
+                "declared connector capability failed session=%s connectors=%s credentials=%s",
+                self._session_id,
+                ",".join(failure.connector for failure in self._connector_failures),
+                ",".join(
+                    name
+                    for failure in self._connector_failures
+                    for name in failure.credential_names
+                ),
+            )
+            self._connector_notice = " ".join(
+                failure.caller_message() for failure in self._connector_failures
+            )
+
+    async def _confirm_session_connectors(
+        self,
+        prior: tuple[ConnectorCapabilityFailure, ...],
+        remaining: tuple[ConnectorCapabilityFailure, ...],
+    ) -> tuple[ConnectorCapabilityFailure, ...]:
+        """Keep a side-probe recovery excluded until the session itself has it.
+
+        The re-probe dials with a temporary client. If the boot outage also
+        failed the long-lived session's own MCP connection, clearing the
+        failure would drop the exclusion and the notice while the model still
+        has no connector tools. So each cleared ``probe_failed`` failure is
+        confirmed (reconnecting once) on a session that can answer; one that
+        cannot be confirmed stays. Sessions without the reconnector (the fake)
+        keep the side-probe result.
+        """
+
+        session = self._session
+        if not isinstance(session, McpServerReconnector):
+            return remaining
+        kept = set(remaining)
+        for failure in prior:
+            if failure in kept or failure.reason != "probe_failed":
+                continue
+            if await session.ensure_mcp_server(failure.connector):
+                continue
+            logger.warning(
+                "connector reachable but not connected in session session=%s connector=%s",
+                self._session_id,
+                failure.connector,
+            )
+            kept.add(failure)
+        return tuple(failure for failure in prior if failure in kept)
+
+    def _with_connector_notice(self, final: Final) -> Final:
+        """Lead a DONE final's text with this turn's one-line connector notice.
+
+        Applied at emission only, after the status is decided, so the model's
+        real status stands and the durable transcript keeps the model's answer
+        without the notice. Non-DONE finals keep their own text.
+        """
+
+        notice = self._connector_notice
+        if notice is None or final.status is not SessionStatus.DONE:
+            return final
+        text = f"{notice}\n\n{final.text}" if final.text else notice
+        return final.model_copy(update={"text": text})
 
     def _auth_halt_lines(self) -> list[str]:
         """The error+final pair emitted when the provider rejects the credential.
@@ -1519,6 +1653,7 @@ class SessionRunner:
             "auth failure session=%s: model credential rejected by provider", self._session_id
         )
         self._turn_open = False
+        self._turn_ready = False
         self._status = SessionStatus.CLASSIFIED_FAILURE
         return [
             to_ndjson_line(

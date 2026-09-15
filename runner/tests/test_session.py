@@ -1,17 +1,24 @@
 """SessionRunner: turn streaming, interrupt reclassification, rehydrate options."""
 
 import asyncio
+import functools
 import logging
 
 import anyio
 import pytest
 from aci_protocol import ErrorEvent, Event, Interrupt, SessionStatus, parse_ndjson
+from aiohttp.test_utils import TestClient, TestServer
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
-from curie_runner import RunTracer, SideEffectClassifier, build_options
+from curie_runner import RunTracer, SideEffectClassifier, build_options, create_app
 from curie_runner import session as session_module
+from curie_runner.adapter import ClaudeAgentSession, McpServerReconnector
 from curie_runner.fake import FakeModelSession, default_turn
-from curie_runner.mcp_tool_capability import ConnectorCapabilityFailure
-from curie_runner.session import CONNECTOR_CAPABILITY_FAILED, SessionRunner
+from curie_runner.hooks import build_gated_pre_tool_use_hooks
+from curie_runner.mcp_tool_capability import (
+    ConnectorAvailability,
+    ConnectorCapabilityFailure,
+)
+from curie_runner.session import SessionRunner
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -1442,55 +1449,75 @@ def _connector_failure() -> ConnectorCapabilityFailure:
     )
 
 
-def test_declared_connector_failure_short_circuits_every_turn_before_query(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    planted = "ghp-must-not-appear-PLACEHOLDER"
+def _connector_runner(
+    tracer: RunTracer | None = None, **kwargs
+) -> tuple[SessionRunner, FakeModelSession]:
     fake = FakeModelSession(default_turn)
     runner = SessionRunner(
         session_factory=lambda: fake,
         ceiling=0,
-        tracer=RunTracer(None),
+        tracer=tracer or RunTracer(None),
         classifier=SideEffectClassifier(),
         trace_name="t",
-        connector_failures=(_connector_failure(),),
+        **kwargs,
     )
+    return runner, fake
 
+
+def _two_turns(runner: SessionRunner) -> tuple[list, list]:
     async def go() -> tuple[list, list]:
         await runner.start()
-        first = parse_ndjson(
-            "".join(
-                [
-                    line
-                    async for line in runner.run_inbound(
-                        Event(type="message", text="go", user="U", ts="1")
+        turns = []
+        for text, ts in (("go", "1"), ("again", "2")):
+            turns.append(
+                parse_ndjson(
+                    "".join(
+                        [
+                            line
+                            async for line in runner.run_inbound(
+                                Event(type="message", text=text, user="U", ts=ts)
+                            )
+                        ]
                     )
-                ]
+                )
             )
-        )
-        second = parse_ndjson(
-            "".join(
-                [
-                    line
-                    async for line in runner.run_inbound(
-                        Event(type="message", text="again", user="U", ts="2")
-                    )
-                ]
-            )
-        )
-        return first, second
+        return turns[0], turns[1]
+
+    return anyio.run(go)
+
+
+def _exclusion_callback(availability: ConnectorAvailability):
+    hooks = build_gated_pre_tool_use_hooks(None, availability)
+    assert hooks is not None
+    return hooks["PreToolUse"][0].hooks[0]
+
+
+def _hook_decision(availability: ConnectorAvailability, tool_name: str) -> dict:
+    callback = _exclusion_callback(availability)
+    return anyio.run(callback, {"tool_name": tool_name}, None, None)
+
+
+def test_declared_connector_failure_runs_the_model_with_a_notice(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #2634: a persistent expansion failure no longer halts the turn. The model
+    # is queried on every turn and the DONE final leads with the notice. No
+    # ErrorEvent: the worker would keep its classification for the whole turn.
+    planted = "ghp-must-not-appear-PLACEHOLDER"
+    notice = _connector_failure().caller_message()
+    runner, fake = _connector_runner(connector_failures=(_connector_failure(),))
 
     with caplog.at_level(logging.ERROR, logger="curie_runner.session"):
-        first, second = anyio.run(go)
+        first, second = _two_turns(runner)
 
-    assert fake.queries == []
+    assert fake.queries == ["go", "again"]
     for events in (first, second):
-        assert [e.type for e in events] == ["error", "final"]
-        assert events[0].classification == CONNECTOR_CAPABILITY_FAILED
-        assert events[0].message == _connector_failure().caller_message()
+        assert not any(isinstance(e, ErrorEvent) for e in events)
+        assert "text_delta" in [e.type for e in events]
+        assert events[-1].type == "final"
         assert events[-1].status == SessionStatus.DONE
-        assert events[-1].text == _connector_failure().caller_message()
-        assert planted not in events[0].message
+        assert events[-1].text.startswith(notice)
+        assert events[-1].text.endswith("all done")
         assert planted not in events[-1].text
     assert any(
         record.levelno == logging.ERROR
@@ -1505,14 +1532,8 @@ def test_declared_connector_failure_does_not_abandon_the_otel_span() -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    fake = FakeModelSession(default_turn)
-    runner = SessionRunner(
-        session_factory=lambda: fake,
-        ceiling=0,
-        tracer=RunTracer(provider),
-        classifier=SideEffectClassifier(),
-        trace_name="t",
-        connector_failures=(_connector_failure(),),
+    runner, fake = _connector_runner(
+        tracer=RunTracer(provider), connector_failures=(_connector_failure(),)
     )
 
     async def go() -> None:
@@ -1525,7 +1546,371 @@ def test_declared_connector_failure_does_not_abandon_the_otel_span() -> None:
     root = _span_named(list(exporter.get_finished_spans()), "agent.run")[0]
     assert root.attributes["curie.terminal.cause"] == "completed"
     assert root.attributes["curie.terminal.status"] == "succeeded"
+    assert fake.queries == ["go"]
+
+
+def test_reprobe_that_raises_keeps_prior_failures_and_still_queries() -> None:
+    async def broken(_failures):
+        raise RuntimeError("reprobe exploded")
+
+    availability = ConnectorAvailability()
+    runner, fake = _connector_runner(
+        connector_failures=(_connector_failure(),),
+        connector_reprobe=broken,
+        connector_availability=availability,
+    )
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert fake.queries == ["go"]
+    assert availability.failures == (_connector_failure(),)
+    assert not any(isinstance(e, ErrorEvent) for e in events)
+    assert events[-1].status == SessionStatus.DONE
+    assert events[-1].text.startswith(_connector_failure().caller_message())
+    assert _hook_decision(availability, "mcp__github__search")["hookSpecificOutput"][
+        "permissionDecision"
+    ] == "deny"
+
+
+class _ReconnectingFakeSession(FakeModelSession):
+    """A fake session that also answers the MCP reconnector protocol."""
+
+    def __init__(self, answers: list[bool]) -> None:
+        super().__init__(default_turn)
+        self.answers = answers
+        self.ensured: list[str] = []
+
+    async def ensure_mcp_server(self, name: str) -> bool:
+        self.ensured.append(name)
+        return self.answers.pop(0)
+
+
+def _probe_failed() -> ConnectorCapabilityFailure:
+    return ConnectorCapabilityFailure(
+        connector="github", credential_names=("GITHUB_TOKEN",), reason="probe_failed"
+    )
+
+
+def _reconnect_runner(
+    answers: list[bool],
+) -> tuple[SessionRunner, _ReconnectingFakeSession, ConnectorAvailability, list[int]]:
+    session = _ReconnectingFakeSession(answers)
+    availability = ConnectorAvailability((_probe_failed(),))
+    reprobes: list[int] = []
+
+    async def reprobe(failures):
+        # Turn 1 the side probe still fails; turn 2 it succeeds.
+        reprobes.append(len(failures))
+        return failures if len(reprobes) == 1 else ()
+
+    runner = SessionRunner(
+        session_factory=lambda: session,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+        connector_failures=(_probe_failed(),),
+        connector_reprobe=reprobe,
+        connector_availability=availability,
+    )
+    return runner, session, availability, reprobes
+
+
+def test_side_probe_recovery_is_kept_when_the_session_is_not_connected() -> None:
+    runner, session, availability, _ = _reconnect_runner([False])
+    notice = _probe_failed().caller_message()
+
+    first, second = _two_turns(runner)
+
+    assert session.queries == ["go", "again"]
+    assert session.ensured == ["github"]
+    for events in (first, second):
+        assert events[-1].status == SessionStatus.DONE
+        assert events[-1].text.startswith(notice)
+    assert availability.failures == (_probe_failed(),)
+    assert _hook_decision(availability, "mcp__github__search")["hookSpecificOutput"][
+        "permissionDecision"
+    ] == "deny"
+
+
+def test_side_probe_recovery_clears_when_the_session_is_connected() -> None:
+    runner, session, availability, _ = _reconnect_runner([True])
+
+    first, second = _two_turns(runner)
+
+    assert session.ensured == ["github"]
+    assert first[-1].text.startswith(_probe_failed().caller_message())
+    assert second[-1].text == "all done"
+    assert availability.failures == ()
+    assert _hook_decision(availability, "mcp__github__search") == {}
+
+
+class _StubMcpClient:
+    def __init__(self, statuses: list[str], *, raises: bool = False) -> None:
+        self.statuses = statuses
+        self.raises = raises
+        self.reconnected: list[str] = []
+
+    async def get_mcp_status(self) -> dict:
+        if self.raises:
+            raise RuntimeError("status failed with Bearer ghp-must-not-log-PLACEHOLDER")
+        return {
+            "mcpServers": [
+                {"name": "linear", "status": "connected"},
+                {"name": "github", "status": self.statuses.pop(0)},
+            ]
+        }
+
+    async def reconnect_mcp_server(self, name: str) -> None:
+        self.reconnected.append(name)
+
+
+@pytest.mark.parametrize(
+    ("statuses", "raises", "expected", "reconnected"),
+    (
+        (["connected"], False, True, []),
+        (["failed", "connected"], False, True, ["github"]),
+        (["failed", "failed"], False, False, ["github"]),
+        ([], True, False, []),
+    ),
+)
+def test_claude_agent_session_ensure_mcp_server(
+    caplog: pytest.LogCaptureFixture,
+    statuses: list[str],
+    raises: bool,
+    expected: bool,
+    reconnected: list[str],
+) -> None:
+    client = _StubMcpClient(statuses, raises=raises)
+    session = ClaudeAgentSession.__new__(ClaudeAgentSession)
+    session._client = client  # type: ignore[assignment]
+
+    assert isinstance(session, McpServerReconnector)
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        assert anyio.run(session.ensure_mcp_server, "github") is expected
+    assert client.reconnected == reconnected
+    for record in caplog.records:
+        assert "ghp-must-not-log-PLACEHOLDER" not in record.getMessage()
+    if raises:
+        assert any("error_class=RuntimeError" in r.getMessage() for r in caplog.records)
+
+
+def test_fake_session_is_not_an_mcp_reconnector() -> None:
+    assert not isinstance(FakeModelSession(default_turn), McpServerReconnector)
+
+
+def _blocking_reprobe_runner(
+    release: anyio.Event, entered: anyio.Event
+) -> tuple[SessionRunner, FakeModelSession]:
+    async def reprobe(failures):
+        entered.set()
+        await release.wait()
+        return failures
+
+    return _connector_runner(
+        connector_failures=(_probe_failed(),), connector_reprobe=reprobe
+    )
+
+
+async def _during_recovery(
+    runner: SessionRunner,
+    release: anyio.Event,
+    entered: anyio.Event,
+    action,
+    *,
+    turn_epoch: str | None = None,
+) -> list:
+    """Drive one turn, run ``action`` while recovery is blocked, then release."""
+
+    lines: list[str] = []
+    await runner.start()
+
+    async def drive() -> None:
+        async for line in runner.run_turn(
+            Event(type="message", text="go", user="U", ts="1"), turn_epoch=turn_epoch
+        ):
+            lines.append(line)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(drive)
+        await entered.wait()
+        await action()
+        release.set()
+    return parse_ndjson("".join(lines))
+
+
+def test_interrupt_during_connector_recovery_never_queries_the_model() -> None:
+    release, entered = anyio.Event(), anyio.Event()
+    runner, fake = _blocking_reprobe_runner(release, entered)
+
+    async def stop() -> None:
+        assert runner.turn_active is True
+        await runner.interrupt()
+
+    events = anyio.run(_during_recovery, runner, release, entered, stop)
+
     assert fake.queries == []
+    assert fake.interrupts == 0
+    assert [e.type for e in events] == ["final"]
+    assert events[-1].status == SessionStatus.IDLE_AWAITING_INPUT
+    assert events[-1].text == "run interrupted"
+    assert runner.status == SessionStatus.IDLE_AWAITING_INPUT
+    assert runner.turn_active is False
+
+
+def test_timeout_during_connector_recovery_is_accepted_and_never_queries() -> None:
+    release, entered = anyio.Event(), anyio.Event()
+    runner, fake = _blocking_reprobe_runner(release, entered)
+    accepted: list[bool] = []
+
+    async def stop() -> None:
+        accepted.append(await runner.timeout("epoch-1"))
+
+    events = anyio.run(
+        functools.partial(
+            _during_recovery, runner, release, entered, stop, turn_epoch="epoch-1"
+        )
+    )
+
+    assert accepted == [True]
+    assert fake.queries == []
+    assert fake.interrupts == 0
+    assert [e.type for e in events] == ["final"]
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert events[-1].text == "run timed out"
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_status_reports_turn_active_during_connector_recovery() -> None:
+    release, entered = anyio.Event(), anyio.Event()
+    runner, fake = _blocking_reprobe_runner(release, entered)
+    observed: list[bool] = []
+
+    async def probe_status() -> None:
+        async with TestClient(TestServer(create_app(runner))) as client:
+            resp = await client.get("/status")
+            observed.append((await resp.json())["turn_active"])
+
+    events = anyio.run(_during_recovery, runner, release, entered, probe_status)
+
+    assert observed == [True]
+    assert fake.queries == ["go"]
+    assert events[-1].status == SessionStatus.DONE
+
+
+def test_steer_during_connector_recovery_is_refused_and_original_goes_first() -> None:
+    release, entered = anyio.Event(), anyio.Event()
+    runner, fake = _blocking_reprobe_runner(release, entered)
+    steered: list[bool] = []
+
+    async def steer() -> None:
+        steered.append(await runner.steer("followup"))
+        assert fake.queries == []
+
+    events = anyio.run(_during_recovery, runner, release, entered, steer)
+
+    assert steered == [False]
+    assert fake.queries == ["go"]
+    assert events[-1].status == SessionStatus.DONE
+    assert events[-1].text.startswith(_probe_failed().caller_message())
+
+
+def test_slow_session_confirmation_is_not_cancelled_by_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module, "_CONNECTOR_RECOVERY_BUDGET_SECONDS", 0.05)
+    completed: list[str] = []
+
+    class _SlowConfirmSession(FakeModelSession):
+        async def ensure_mcp_server(self, name: str) -> bool:
+            await anyio.sleep(0.3)
+            completed.append(name)
+            return True
+
+    session = _SlowConfirmSession(default_turn)
+    availability = ConnectorAvailability()
+
+    async def recovered(_failures):
+        return ()
+
+    runner = SessionRunner(
+        session_factory=lambda: session,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+        connector_failures=(_probe_failed(),),
+        connector_reprobe=recovered,
+        connector_availability=availability,
+    )
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert completed == ["github"]
+    assert availability.failures == ()
+    assert session.queries == ["go"]
+    assert events[-1].text == "all done"
+
+
+def test_connector_recovery_over_budget_keeps_failure_and_runs_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module, "_CONNECTOR_RECOVERY_BUDGET_SECONDS", 0.05)
+    availability = ConnectorAvailability()
+
+    async def slow(_failures):
+        await anyio.sleep(5)
+        return ()
+
+    runner, fake = _connector_runner(
+        connector_failures=(_probe_failed(),),
+        connector_reprobe=slow,
+        connector_availability=availability,
+    )
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert fake.queries == ["go"]
+    assert availability.failures == (_probe_failed(),)
+    assert events[-1].status == SessionStatus.DONE
+    assert events[-1].text.startswith(_probe_failed().caller_message())
+
+
+def test_failed_model_turn_with_failed_connector_is_not_prefixed() -> None:
+    # The notice leads only a DONE final. A classified failure keeps its own
+    # text, and nothing on the stream carries a connector classification that
+    # could mask the turn's real (possibly retryable) failure in the worker.
+    def failing_turn() -> list:
+        return [
+            AssistantMessage(content=[TextBlock(text="trying")], model="fake-model"),
+            ResultMessage(
+                subtype="error_during_execution",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=True,
+                num_turns=1,
+                session_id="fake-session",
+                result="model blew up",
+            ),
+        ]
+
+    fake = FakeModelSession(failing_turn)
+    runner = SessionRunner(
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+        connector_failures=(_connector_failure(),),
+    )
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert fake.queries == ["go"]
+    final = events[-1]
+    assert final.status == SessionStatus.CLASSIFIED_FAILURE
+    assert not final.text.startswith(_connector_failure().caller_message())
+    assert _connector_failure().caller_message() not in final.text
+    assert not any(
+        isinstance(e, ErrorEvent) and "connector" in (e.classification or "")
+        for e in events
+    )
 
 
 def test_healthy_connector_still_queries_the_model() -> None:

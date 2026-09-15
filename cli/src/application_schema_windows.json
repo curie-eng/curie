@@ -81,6 +81,10 @@
     "0.8.8": {
       "schema_min": "0001",
       "schema_head": "0043"
+    },
+    "0.8.9": {
+      "schema_min": "0001",
+      "schema_head": "0044"
     }
   }
 }

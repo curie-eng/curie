@@ -71,6 +71,7 @@ Set `base=next` when your worktree targets `next`.
   uv lock --check
   uv sync
   uv run python scripts/check-alembic-revisions.py
+  uv run python scripts/check-schema-window.py
   uv run ruff check .
   uv run mypy
   uv run lint-imports

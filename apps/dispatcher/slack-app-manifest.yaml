@@ -42,6 +42,15 @@ oauth_config:
       # APP to the workspace -- an existing installation keeps its old grant
       # until then, and a route with a declared approver group fails closed.
       - usergroups:read
+      # Required to download the bytes of a file someone uploads to the bot
+      # (#2567). The dispatcher records attachment REFERENCES only; the worker
+      # resolves each one against Slack with this same bot token, and without
+      # this scope that fetch is refused and an inbound attachment is silently
+      # lost. The boot preflight proves it with a bounded files.list call, so a
+      # workspace that has not reinstalled fails loudly instead. ADDING A SCOPE
+      # REQUIRES REINSTALLING THE APP to the workspace -- an existing
+      # installation keeps its old grant until then.
+      - files:read
 settings:
   socket_mode_enabled: true
   event_subscriptions:

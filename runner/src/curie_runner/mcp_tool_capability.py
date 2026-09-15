@@ -79,6 +79,28 @@ class ConnectorCapabilityFailure:
         )
 
 
+class ConnectorAvailability:
+    """The live set of declared connectors whose tools are excluded (#2634).
+
+    Shared, mutable, runner-owned state: ``build_runner`` creates one instance
+    and hands it to both the connector exclusion PreToolUse hook and the
+    ``SessionRunner``. The runner replaces ``failures`` after each turn-start
+    re-probe, so a recovered connector's tools become callable again on the
+    very next tool call without rebuilding the SDK session.
+    """
+
+    def __init__(self, failures: tuple[ConnectorCapabilityFailure, ...] = ()) -> None:
+        self.failures = failures
+
+    def failure_for_tool(self, tool_name: str) -> ConnectorCapabilityFailure | None:
+        """The failure excluding ``tool_name``, or None when the tool is available."""
+
+        for failure in self.failures:
+            if tool_name.startswith(connector_tool_prefix(failure.connector)):
+                return failure
+        return None
+
+
 @dataclass(frozen=True)
 class McpToolCapabilityProbe:
     """The conservative capability conclusion for one session's MCP surface."""
@@ -442,4 +464,61 @@ async def probe_mcp_tool_capability(
         observed_tools=observed_tools,
         readonly_tools=readonly_tools,
         connector_failures=tuple(connector_failures),
+    )
+
+
+async def reprobe_connector_failures(
+    failures: tuple[ConnectorCapabilityFailure, ...],
+    derived_servers: Mapping[str, Mapping[str, Any]],
+    inherited_env: Mapping[str, str] | None = None,
+) -> tuple[ConnectorCapabilityFailure, ...]:
+    """Re-dial the connectors a boot probe could not reach; return what still fails.
+
+    Only ``probe_failed`` is re-dialed: a transient network error at boot must
+    not remove a connector for the life of the process (#2634). Expansion
+    failures (``empty_expansion`` / ``missing_credential``) are deterministic
+    within the process and are carried through unchanged without dialing,
+    because after ``materialize_hosted_bearer_headers`` an empty value is a
+    literal empty Bearer and #2519 forbids sending it to ``/mcp``.
+
+    A re-probe that still fails keeps the prior failure, credential names
+    included (the materialized config no longer carries the placeholder names).
+    The exception is logged by class only; its text can carry a header value.
+    """
+
+    env = {**os.environ, **dict(inherited_env or {})}
+    still_failing: list[ConnectorCapabilityFailure] = []
+
+    async def redial(failure: ConnectorCapabilityFailure) -> None:
+        config = derived_servers.get(failure.connector)
+        if not isinstance(config, Mapping):
+            still_failing.append(failure)
+            return
+        try:
+            await _probe_server(
+                config,
+                tool_prefix=connector_tool_prefix(failure.connector),
+                plugin_dir=None,
+                inherited_env=env,
+            )
+        except Exception as exc:  # noqa: BLE001 - any probe failure keeps the exclusion
+            logger.warning(
+                "connector re-probe failed server=%s error_class=%s",
+                failure.connector,
+                type(exc).__name__,
+            )
+            still_failing.append(failure)
+            return
+        logger.info("connector re-probe recovered server=%s", failure.connector)
+
+    async with anyio.create_task_group() as task_group:
+        for failure in failures:
+            if failure.reason == "probe_failed":
+                task_group.start_soon(redial, failure)
+    unrecovered = set(still_failing)
+    # Preserve the boot order so the caller-visible notice is stable turn to turn.
+    return tuple(
+        failure
+        for failure in failures
+        if failure.reason != "probe_failed" or failure in unrecovered
     )

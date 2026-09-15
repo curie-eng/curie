@@ -39,8 +39,8 @@ subscriptions are correct from the start.
 
    - Socket Mode on
    - the bot scopes (`app_mentions:read`, `chat:write`, `channels:read`,
-     `channels:history`, `groups:history`, `im:history`, `im:read`, and
-     `assistant:write`)
+     `channels:history`, `groups:history`, `im:history`, `im:read`,
+     `assistant:write`, and `files:read`)
    - the `app_mention` and `message.im` event subscriptions
    - interactivity on (so button and block-action clicks arrive over Socket
      Mode)
@@ -49,8 +49,11 @@ subscriptions are correct from the start.
    `SLACK_APP_TOKEN`, used for the Socket Mode connection.
 3. **Install to Workspace** (Install App), then copy the **Bot User OAuth
    Token**. This `xoxb-...` value is your `SLACK_BOT_TOKEN`, used by the Web API
-   to post replies. If this app was installed before `channels:read` was added,
-   reinstall it to the workspace so the existing bot-token grant is refreshed.
+   to post replies. If this app was installed before `channels:read` or
+   `files:read` was added, reinstall it to the workspace so the existing
+   bot-token grant is refreshed. A stale `channels:read` grant is what the boot
+   preflight below refuses on; a stale `files:read` grant costs you attachments
+   and a warning, not the boot.
 4. `SLACK_SIGNING_SECRET` is optional and unused in Socket Mode (kept only for
    Bolt app construction); leave it empty.
 
@@ -158,10 +161,29 @@ with an integer timeout derived from the remaining phase budget and capped at
 two seconds. The phase budget stops new attempts; a final already-started call
 can extend it only by that bounded timeout.
 
-The only boot-fatal Slack metadata responses are `missing_scope` and
+The boot-fatal Slack metadata responses are `missing_scope` and
 `invalid_types` from that fixed public-channel capability request. Both use the
 same missing-public-permission recovery:
 `Slack channel capability preflight failed: bot token is missing required scope channels:read. Add channels:read under OAuth & Permissions > Bot Token Scopes, then reinstall the app to the workspace.`
+
+A second bounded call, `files.list` with `count=1`, proves `files:read` -- the
+scope the worker needs to fetch the bytes of a file someone uploads to the bot.
+It names no file, so a workspace holding no files still passes; an empty listing
+is a full pass, because the question is whether the token may ask. A
+`missing_scope` on that call is definitive but, unlike `channels:read`, it is
+**not** boot-fatal. It logs its own one-scope recovery at WARNING and the stack
+starts:
+`Slack attachment capability unavailable: bot token is missing scope files:read, so inbound uploads cannot be fetched. Add files:read under OAuth & Permissions > Bot Token Scopes, then reinstall the app to the workspace. Messages are answered normally in the meantime.`
+The asymmetry is deliberate. `channels:read` is what routing itself needs, so a
+stack without it cannot answer anyone and should refuse to start. `files:read`
+only fetches an upload, so refusing to boot for it would stop every message in
+the workspace over a capability nobody had yesterday -- and would take down every
+existing installation on upgrade until an admin reinstalled the app. The bot
+keeps answering and attachments degrade instead, loudly: the summary line below
+names which probe degraded, so this is not the silent per-upload denial the
+probe exists to prevent. Any other outcome from that call (a rate limit, a
+transport fault, an org-token refusal) is likewise non-terminal and only raises
+the level of that summary line.
 The preflight logs only a safe public capability state (`verified` or
 `unverified`) and aggregate checked or unverified destination counts. Other
 capability-call failures, plus private, stale, or transient per-destination

@@ -1359,10 +1359,11 @@
           "other"
         ],
         "outcome": [
-          "restart"
+          "restart",
+          "give_up"
         ]
       },
-      "cardinality_bound": 7
+      "cardinality_bound": 14
     }
   }
 }

@@ -46,7 +46,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
+from aci_protocol import Attachment, QueuedTurn, ReplyHandle, TurnSource
 from curie_telemetry import operation_span
 from opentelemetry.trace import SpanKind
 from slack_bolt import App
@@ -72,6 +72,7 @@ from .approval_actions import (
     this_release_owns_action,
 )
 from .config import DispatcherConfig, release_identity
+from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .queue import claim_event, enqueue, release_event
 from .relevance import DropReason, Lane, classify, drop, missing_envelope_fields
@@ -204,6 +205,7 @@ def _mint_turn(
     delivery_kind: str,
     author: str,
     text: str,
+    attachments: list[Attachment],
     channel: str,
     thread_ts: str,
 ) -> str:
@@ -225,6 +227,12 @@ def _mint_turn(
 
     ``delivery_kind`` names what arrived ("slack event", "block action") for the
     enqueue log line -- the one thing that still differs downstream of here.
+
+    ``attachments`` is a required parameter with no default even though the model
+    defaults it to the empty list (#2567): a lane that carries no files says so
+    at the call site, for the same reason ``source`` and ``adapter`` are stated
+    rather than defaulted. A silent default here is how the next lane to grow
+    files would quietly keep dropping them.
     """
     placeholder = _post_placeholder(
         web_client=web_client,
@@ -266,6 +274,10 @@ def _mint_turn(
             kind="slack", channel=channel, placeholder=placeholder_ts, adapter=None
         ),
         received_at=clock(),
+        # Refs only, and derived BESIDE the text rather than folded into it: see
+        # `inbound_attachments`. The empty list means "this delivery reported no
+        # files I can reference", never "attachments are unsupported here".
+        attachments=attachments,
     )
     stream_id = enqueue(redis_client, config, queued)
     log.info(
@@ -358,6 +370,11 @@ def process_event(
             # burning a placeholder (#2006). `derive_text` returns a non-empty
             # top-level text byte-identically, so existing enqueues are unchanged.
             text=_strip_self_mention(derive_text(event), bot_user_id),
+            # Read from the SAME event and deliberately not from `derive_text`,
+            # whose non-empty-text passthrough is byte-identical by decision
+            # (#2006) and must stay that way. A comment plus an upload therefore
+            # carries both halves: the comment as Slack sent it, and the refs.
+            attachments=derive_attachments(event),
             channel=channel,
             thread_ts=thread_ts,
         )
@@ -477,6 +494,11 @@ def process_action(
             delivery_kind="block action",
             author=user,
             text=command,
+            # A Block Kit click carries no upload: its payload has a `message`
+            # and an `actions` array, never a `files` array. Stated as empty
+            # rather than left to the model default, so this lane's answer is
+            # visible at the call site (ADR-0096 D4.4's rule for `adapter`).
+            attachments=[],
             channel=channel,
             thread_ts=thread_ts,
         )

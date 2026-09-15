@@ -156,6 +156,11 @@ pub fn synthetic_turn(
         // rather than left to serde's default for the same reason `kind` is --
         // the operator lane should say what it produces.
         source: TurnSource::Slack,
+        // No upload lane here: `local message` and `cluster message` carry text
+        // typed on the command line and nothing else, so this operator turn has
+        // no attachment REFERENCES to carry (#2567). Empty, and said out loud
+        // for the same reason `source` is.
+        attachments: Vec::new(),
     }
 }
 
@@ -564,6 +569,11 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                // #2567: inbound attachment REFERENCES (ids, not bytes and not
+                // a url). Empty on this lane -- the CLI stub uploads no files --
+                // but present on the wire, so the golden bytes above and these
+                // key names stay one shape across both lanes.
+                "attachments",
                 "author",
                 "conversation_id",
                 "event_id",
@@ -660,6 +670,7 @@ mod tests {
             },
             received_at: "2026-07-21T00:00:00Z".into(),
             source: TurnSource::Slack,
+            attachments: Vec::new(),
         };
         (stream_id.to_string(), payload_json(&turn).unwrap())
     }

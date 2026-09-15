@@ -232,11 +232,6 @@ pub async fn docker_capture_with_env(
     ))
 }
 
-/// The complete startup window shared by every connector that one command
-/// starts. Keeping it here prevents one boot with multiple connectors from
-/// granting each container a separate sixty second wait.
-pub(crate) const CONNECTOR_START_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// The bounded window for resolving the actual Docker IDs of local Compose
 /// connector services after `compose up` completes. It is separate from the
 /// final readiness observation because resolution scales with connector count.
@@ -404,7 +399,7 @@ async fn inspect_connector_runtime_state(
 /// the timed-out future is dropped by `ops::run_capture`.
 pub(crate) async fn wait_for_connectors_ready(
     containers: &[(String, String)],
-    deadline: Instant,
+    timeout: Duration,
 ) -> Result<()> {
     if containers.is_empty() {
         return Ok(());
@@ -416,6 +411,10 @@ pub(crate) async fn wait_for_connectors_ready(
         .iter()
         .map(|(display_name, _)| display_name.clone())
         .collect();
+    // Arm the one shared clock only when readiness observation begins. Secret
+    // staging and sequential container startup therefore consume none of the
+    // configured readiness window.
+    let deadline = Instant::now() + timeout;
 
     loop {
         if Instant::now() >= deadline {

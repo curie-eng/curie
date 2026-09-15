@@ -245,9 +245,9 @@ def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
             "publications",
             "other",
         ],
-        "outcome": ["restart"],
+        "outcome": ["restart", "give_up"],
     }
-    assert definition["cardinality_bound"] == 7
+    assert definition["cardinality_bound"] == 14
 
 
 def test_supervised_restart_metric_rejects_undeclared_operation_by_execution(

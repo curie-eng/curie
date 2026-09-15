@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import HookMatcher
 from plugin_format import HookMatcherConfig, PluginManifest, resolve_manifest
 from pydantic import TypeAdapter, ValidationError
+
+from .mcp_tool_capability import ConnectorAvailability
 
 _HOOKS_ADAPTER = TypeAdapter(dict[str, list[HookMatcherConfig]])
 
@@ -190,6 +193,75 @@ def load_bundle_hooks(plugin_dir: str | None) -> dict[str, list[HookMatcher]] | 
     if not matchers:
         return None
     return {"PreToolUse": matchers}
+
+
+def build_gated_pre_tool_use_hooks(
+    approval_hooks: dict[str, list[HookMatcher]] | None,
+    availability: ConnectorAvailability | None,
+) -> dict[str, list[HookMatcher]] | None:
+    """Compose the connector exclusion (#2634) in FRONT of the approval hook.
+
+    A failed declared connector no longer halts the turn: the model runs, and
+    this keeps it from calling ``mcp__<connector>__*`` while the connector is
+    in the runner-owned exclusion set, read at call time so a connector the
+    turn-start re-probe recovers is callable again with no session rebuild.
+
+    Composed, never merged as a sibling matcher: the CLI dispatches matchers on
+    one event concurrently, so a sibling approval hook would still record a
+    pending approval and stop the turn, or spend the one-shot grant, on a call
+    the exclusion denies. Here an excluded tool returns the connector deny
+    WITHOUT reaching the approval callbacks, so no gate state is touched; every
+    other tool is delegated to them unchanged. The deny carries the caller-safe
+    ``caller_message()`` (names only) and no ``continue_: False``: the turn
+    should carry on and answer with the tools it still has.
+
+    ``availability`` None returns ``approval_hooks`` as-is, so an agent with no
+    failed connector keeps its wiring byte-identical. The approval hooks must
+    be ``matcher=None`` (every tool), which is what ``build_approval_hook``
+    registers; a named matcher cannot be delegated to faithfully and raises.
+    """
+
+    if availability is None:
+        return approval_hooks
+    delegates: list[Any] = []
+    for matcher in (approval_hooks or {}).get("PreToolUse", []):
+        if matcher.matcher is not None:
+            raise ValueError("connector exclusion can only front a matcher=None hook")
+        delegates.extend(matcher.hooks)
+
+    async def connector_exclusion_hook(
+        hook_input: Any,
+        tool_use_id: str | None,
+        context: Any,
+    ) -> dict[str, Any]:
+        tool_name = (
+            hook_input.get("tool_name")
+            if isinstance(hook_input, Mapping)
+            else getattr(hook_input, "tool_name", None)
+        )
+        failure = (
+            availability.failure_for_tool(tool_name)
+            if isinstance(tool_name, str) and tool_name
+            else None
+        )
+        if failure is not None:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": failure.caller_message(),
+                }
+            }
+        for delegate in delegates:
+            result: dict[str, Any] = await delegate(hook_input, tool_use_id, context)
+            if result:
+                return result
+        return {}
+
+    callback: Any = connector_exclusion_hook
+    composed = {event: list(matchers) for event, matchers in (approval_hooks or {}).items()}
+    composed["PreToolUse"] = [HookMatcher(matcher=None, hooks=[callback])]
+    return composed
 
 
 def _merge_pre_tool_use_hooks(

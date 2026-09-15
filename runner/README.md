@@ -94,7 +94,10 @@ hits `/healthz`); replacement authority comes only from authenticated
   expands `Authorization: Bearer ${NAME}` into the in-memory MCP catalog at
   boot and drops `NAME` from the process environment (and from
   `CURIE_CONNECTOR_SECRET_KEYS`) before the session accepts turns, so `Bash`
-  cannot read the PAT. The on-disk catalog keeps the placeholder. Residual:
+  cannot read the PAT. #2635 keeps that in-memory catalog off the claude CLI
+  argv by writing `--mcp-config` JSON to a 0600 tempfile; same-uid `Bash` can
+  still cat the file, and that is accepted. The on-disk catalog keeps the
+  placeholder. Residual:
   kubelet / `docker -e` still injects the value onto the container until the
   runner process unsets it. ADR-0009 `--secret` names that are not a hosted
   Bearer stay in the environment, because stdio / remote MCP clients still

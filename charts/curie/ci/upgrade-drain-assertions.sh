@@ -29,7 +29,9 @@ trap 'rm -rf "$TMP"' EXIT
 helm template t "$CHART" > "$TMP/default.yaml"
 helm template t "$CHART" > "$TMP/fresh-second.yaml"
 helm template t "$CHART" --is-upgrade > "$TMP/client-upgrade.yaml"
+# A model credential only reaches the worker on a real-model render (#2640).
 helm template t "$CHART" \
+  --set agentSandbox.runner.fakeModel=false \
   --set-string postgres.existingSecret=acme-postgres-credentials \
   --set-string valkey.existingSecret=acme-valkey-credentials \
   --set-string agentSandbox.runner.credentialsExistingSecret=acme-model-credentials \

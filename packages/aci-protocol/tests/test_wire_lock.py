@@ -179,5 +179,7 @@ def test_event_session_context_contract_uses_patch_version_0_4_5() -> None:
     lock_path = schema_export.schema_path().parent / "wire.lock"
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
 
-    assert PROTOCOL_VERSION == "0.4.5"
-    assert lock["protocol_version"] == "0.4.5"
+    major, minor, patch = (int(part) for part in PROTOCOL_VERSION.split("."))
+    assert (major, minor) == (0, 4)
+    assert patch >= 5
+    assert lock["protocol_version"] == PROTOCOL_VERSION

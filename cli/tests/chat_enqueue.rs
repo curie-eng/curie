@@ -88,6 +88,13 @@ async fn xadd_lands_the_exact_seam_shape_on_real_valkey() {
     assert_eq!(
         keys,
         vec![
+            // Sorted, so `attachments` leads. It joined the seam in #2567 as an
+            // OPTIONAL field defaulting to the empty list, which is what makes
+            // the bump a PATCH under the change-class table: a pre-upgrade
+            // consumer ignores a key it does not model. It appears here because
+            // this list's job is to make a wire change deliberate rather than
+            // incidental -- an emitter that stops writing it should fail here.
+            "attachments",
             "author",
             "conversation_id",
             "event_id",

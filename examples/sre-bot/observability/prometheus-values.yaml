@@ -220,6 +220,38 @@ serverFiles:
                 Turns are being accepted, but curie_completion_outbox is
                 missing. Absent completion-delivery telemetry is a failure
                 signal.
+          - alert: CurieWorkerSupervisedRestartLoop
+            expr: |
+              increase(
+                curie_worker_supervised_restart_total{outcome="restart"}[30m]
+              ) >= 3
+            for: 5m
+            labels:
+              severity: page
+              component: curie-worker
+            annotations:
+              summary: A supervised worker task is crash-looping
+              description: >-
+                curie_worker_supervised_restart_total with outcome restart
+                increased by three or more in 30 minutes for one operation.
+                The task is backing off and will be parked if it keeps
+                crashing.
+          - alert: CurieWorkerSupervisedTaskParked
+            # A level check, not increase(): a parked task emits give_up once
+            # and its series first appears already at 1 with no zero sample, so
+            # increase() would never see it. The series leaves with the worker
+            # process, which is also what un-parks the task.
+            expr: |
+              curie_worker_supervised_restart_total{outcome="give_up"} > 0
+            labels:
+              severity: page
+              component: curie-worker
+            annotations:
+              summary: A supervised worker task was parked after repeated crashes
+              description: >-
+                curie_worker_supervised_restart_total with outcome give_up
+                is present. The named operation stopped restarting and stays
+                down until the worker pod restarts.
           - alert: CurieReplyDeliveryRefused
             expr: |
               increase(

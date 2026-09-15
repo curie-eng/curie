@@ -704,6 +704,7 @@ fn memory_output_json_shape_is_pinned() {
             content: "ask first".to_string(),
             source: "operator".to_string(),
             fresh_session_required: true,
+            message_verb: "local".to_string(),
         }
         .to_json(),
         json!({
@@ -712,6 +713,7 @@ fn memory_output_json_shape_is_pinned() {
             "content": "ask first",
             "source": "operator",
             "fresh_session_required": true,
+            "next_command": r#"curie local message "...""#,
         })
     );
 }
