@@ -1,0 +1,21 @@
+# Opt-in Alertmanager receiver for the one supported Curie hook source (#2572).
+# Default sre-bot observability keeps Alertmanager off. Apply this overlay only
+# when an operator has configured source_bindings and a derived hook secret.
+#
+# The signer sits in front of POST /hooks/{agent}/alertmanager because
+# Alertmanager cannot HMAC the body. Partition pointer: /curie_partition.
+alertmanager:
+  enabled: true
+  config:
+    route:
+      receiver: curie-sre
+      group_by: ["alertname", "curie_workload"]
+    receivers:
+      - name: curie-sre
+        webhook_configs:
+          - url: "http://alert-signer:8080/"
+            send_resolved: true
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /etc/alert-signer/token

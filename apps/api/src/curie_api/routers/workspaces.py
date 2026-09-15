@@ -83,7 +83,10 @@ async def select_workspace_repository(
             },
         )
     _require_allowed(selected.repo_full_name)
-    return WorkspaceSelectionOut(repo_full_name=selected.repo_full_name)
+    return WorkspaceSelectionOut(
+        repo_full_name=selected.repo_full_name,
+        revision=selected.revision,
+    )
 
 
 @router.post(
@@ -119,8 +122,11 @@ async def redeem_workspace_credential(
         agent_id=deployment.agent_id,
         conversation_id=data.conversation_id,
     )
-    repo = selected.repo_full_name if selected is not None else None
-    if repo is None:
+    if selected is None:
+        repo = None
+    else:
+        repo = selected.repo_full_name
+    if repo is None or selected is None:
         await crud.append_credential_redemption_audit(
             session,
             purpose="workspace_clone",
@@ -190,4 +196,5 @@ async def redeem_workspace_credential(
         repo_full_name=repo,
         clone_url=clone_url,
         authorization_header=authorization_header,
+        revision=selected.revision,
     )

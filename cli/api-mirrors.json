@@ -32,6 +32,10 @@
         {
           "field": "hook_partitions",
           "why": "No CLI verb reads or prints an agent's hook partition map; it is configured through the API write surface and surfaced back on the hook receipt, which the CLI never calls."
+        },
+        {
+          "field": "source_bindings",
+          "why": "No CLI verb reads or prints an agent's source-binding map; the operator writes it through the API and the hook path consumes it after HMAC, so the CLI never deserializes the field."
         }
       ]
     },

@@ -124,6 +124,8 @@ from .workspace import (
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
     parse_github_repo_fact,
+    trusted_repository_fact,
+    webhook_job_refuses_workspace,
 )
 
 logger = logging.getLogger(__name__)
@@ -2907,26 +2909,39 @@ class Kernel:
                 # parser's own terminal ambiguity refusal from here unchanged. A
                 # turn naming no repository keeps today's retryable wiring fault
                 # (#2683), because changing it changes turns that never asked.
-                if verified_review is None and parse_github_repo_fact(event.text) is not None:
+                ignore_message = (
+                    verified_review is not None or source is TurnSource.WEBHOOK
+                )
+                if trusted_repository_fact(
+                    event.text, ignore_message=ignore_message
+                ) is not None:
                     raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
                 raise WorkspacePreparationError(
                     "wiring", "workspace-enabled deployment has no trusted coordinator"
                 )
             # The API already bound a verified review to its persisted thread
             # workspace. Links in the untrusted review body are context, not a
-            # request to select another repository.
-            repo_fact = (
-                None
-                if verified_review is not None
-                else parse_github_repo_fact(event.text)
+            # request to select another repository. Webhook jobs (#2572) likewise
+            # never parse a GitHub URL from the payload; the operator map is the
+            # only coding target.
+            repo_fact = trusted_repository_fact(
+                event.text,
+                ignore_message=(
+                    verified_review is not None or source is TurnSource.WEBHOOK
+                ),
             )
-            workspace_repo = await asyncio.to_thread(
-                self._workspace.select_repository,
-                thread_key=thread_key,
-                deployment_id=workspace_deployment_id,
-                author=event.user,
-                repo_full_name=repo_fact,
-            )
+            if source is TurnSource.WEBHOOK and webhook_job_refuses_workspace(
+                event.text
+            ):
+                workspace_repo = None
+            else:
+                workspace_repo = await asyncio.to_thread(
+                    self._workspace.select_repository,
+                    thread_key=thread_key,
+                    deployment_id=workspace_deployment_id,
+                    author=event.user,
+                    repo_full_name=repo_fact,
+                )
             if (
                 lineage_branch is None
                 and workspace_repo is not None

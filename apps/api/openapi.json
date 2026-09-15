@@ -603,6 +603,20 @@
             ],
             "title": "Secrets"
           },
+          "source_bindings": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/SourceBindingConfig"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Bindings"
+          },
           "thinking": {
             "anyOf": [
               {
@@ -739,6 +753,20 @@
             ],
             "title": "Secrets"
           },
+          "source_bindings": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/SourceBindingConfig"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Bindings"
+          },
           "thinking": {
             "anyOf": [
               {
@@ -762,6 +790,7 @@
           "approval_required_tools",
           "approval_routes",
           "hook_partitions",
+          "source_bindings",
           "secrets",
           "memory",
           "created_at"
@@ -863,6 +892,20 @@
               }
             ],
             "title": "Secrets"
+          },
+          "source_bindings": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/SourceBindingConfig"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Bindings"
           },
           "thinking": {
             "anyOf": [
@@ -4093,6 +4136,17 @@
           "repo_full_name": {
             "title": "Repo Full Name",
             "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
           }
         },
         "required": [
@@ -4624,6 +4678,49 @@
         "title": "SettingsPackConfig",
         "type": "object"
       },
+      "SourceBindingConfig": {
+        "additionalProperties": false,
+        "description": "How one hook maps a workload identity onto a coding target (#2572).",
+        "properties": {
+          "map": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SourceBindingEntry"
+            },
+            "title": "Map",
+            "type": "object"
+          },
+          "workload_pointer": {
+            "title": "Workload Pointer",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workload_pointer",
+          "map"
+        ],
+        "title": "SourceBindingConfig",
+        "type": "object"
+      },
+      "SourceBindingEntry": {
+        "additionalProperties": false,
+        "description": "One workload's allowlisted repository and deployed revision (#2572).",
+        "properties": {
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "revision"
+        ],
+        "title": "SourceBindingEntry",
+        "type": "object"
+      },
       "SourceTraceOut": {
         "description": "One resolved source trace: its id plus a link to view it in Langfuse.",
         "properties": {
@@ -5125,6 +5222,17 @@
               }
             ],
             "title": "Repo Full Name"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
           }
         },
         "required": [
