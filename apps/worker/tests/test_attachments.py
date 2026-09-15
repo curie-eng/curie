@@ -28,7 +28,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -440,9 +443,9 @@ def test_the_slack_file_client_sends_the_bot_token_and_never_leaks_it_onward(
 ) -> None:
     """The token authenticates the fetch and appears nowhere the sandbox can see.
 
-    Slack's file object exposes ``url_private``, which is NOT public: the
-    download must carry ``Authorization: Bearer <token>``, and Slack answers an
-    unauthenticated request with an HTML sign-in page rather than the bytes.
+    Slack's file object exposes ``url_private_download``, which is NOT public:
+    the download must carry ``Authorization: Bearer <token>``, and Slack answers
+    an unauthenticated request with an HTML sign-in page rather than the bytes.
     https://docs.slack.dev/reference/objects/file-object
 
     The half that matters for ADR-0075 is the second one: whatever the client did
@@ -459,7 +462,9 @@ def test_the_slack_file_client_sends_the_bot_token_and_never_leaks_it_onward(
         if "files.info" in request["url"]:
             body = (
                 b'{"ok":true,"file":{"id":"F1","name":"report.csv",'
-                b'"url_private":"https://files.slack.com/files-pri/T1-F1/report.csv"}}'
+                b'"url_private":"https://files.slack.com/files-pri/T1-F1/report.csv",'
+                b'"url_private_download":'
+                b'"https://files.slack.com/files-pri/T1-F1/download/report.csv"}}'
             )
             return attachments.SlackFileResponse(
                 status=200,
@@ -478,12 +483,302 @@ def test_the_slack_file_client_sends_the_bot_token_and_never_leaks_it_onward(
     prepared = _resolve(coordinator, [_ref("F1", "report.csv")])
 
     download = calls[-1]
-    assert download["url"].startswith("https://files.slack.com/files-pri/")
+    assert download["url"].startswith("https://files.slack.com/files-pri/T1-F1/download/")
     assert download["headers"]["Authorization"] == f"Bearer {token}"
     assert objects.objects[prepared.object_keys[0]] == payload
     assert all(token not in key for key in prepared.object_keys)
     assert all(token not in value for value in prepared.claim_env().values())
     assert all(token not in ref.url for ref in prepared.refs)
+
+
+def test_a_pdfs_url_private_302_is_bypassed_by_downloading_url_private_download(
+    attachments: Any,
+) -> None:
+    """The PDF regression pin (#2715).
+
+    Measured live against Slack on 2026-09-15 with a real bot token:
+    ``url_private`` answers a PDF request with ``HTTP 302`` to
+    ``slack-files.com`` and ``Content-Type: text/html``, while
+    ``url_private_download`` answers ``200 application/pdf`` for the same
+    file. Every other tested type (.docx, .pptx, .png, plain text) answers
+    ``200`` on ``url_private`` itself, which is why this bug reached
+    production unnoticed until a PDF was attached.
+
+    On the code before this fix, resolving this fixture raises
+    ``slack file download failed: HTTP 302`` -- the exact log line filed
+    against the issue -- because the client read ``url_private`` and the
+    no-redirect transport refuses to follow Slack's 302. Reading
+    ``url_private_download`` instead lands the real bytes.
+    """
+
+    token = "xoxb-not-a-real-bot-token"
+    pdf_bytes = b"%PDF-1.4 not a real pdf but bytes all the same"
+    private_url = "https://files.slack.com/files-pri/T1-F1/incident.pdf"
+    download_url = "https://files.slack.com/files-pri/T1-F1/download/incident.pdf"
+    calls: list[dict[str, Any]] = []
+
+    def transport(**request: Any) -> Any:
+        calls.append(request)
+        if "files.info" in request["url"]:
+            body = json.dumps(
+                {
+                    "ok": True,
+                    "file": {
+                        "id": "F1",
+                        "name": "incident.pdf",
+                        "url_private": private_url,
+                        "url_private_download": download_url,
+                    },
+                }
+            ).encode()
+            return attachments.SlackFileResponse(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                chunks=iter([body]),
+            )
+        if request["url"] == private_url:
+            return attachments.SlackFileResponse(
+                status=302,
+                headers={"Content-Type": "text/html", "Location": "https://slack-files.com/x"},
+                chunks=iter([b"<html>redirecting</html>"]),
+            )
+        assert request["url"] == download_url
+        return attachments.SlackFileResponse(
+            status=200,
+            headers={"Content-Type": "application/pdf"},
+            chunks=iter([pdf_bytes]),
+        )
+
+    client = attachments.SlackFileClient(token=token, transport=transport)
+    coordinator, objects = _coordinator(attachments, client)
+
+    prepared = _resolve(coordinator, [_ref("F1", "incident.pdf", mime_type="application/pdf")])
+
+    assert objects.objects[prepared.object_keys[0]] == pdf_bytes
+    download_call = calls[-1]
+    assert download_call["url"] == download_url
+
+
+def test_a_download_url_that_itself_redirects_still_refuses_rather_than_following(
+    attachments: Any,
+) -> None:
+    """The no-redirect transport policy is unchanged by this fix.
+
+    Reading ``url_private_download`` instead of ``url_private`` must not
+    quietly start following redirects: if Slack's download endpoint itself
+    ever answered 302, the client still refuses with the status named and
+    never issues a request to the redirect target, because a followed
+    redirect would carry ``Authorization`` to a host Slack chose rather than
+    one this worker chose.
+
+    This pins ``SlackFileClient`` turning a 302 into a ``SlackFileError`` that
+    names the status, and nothing more: the transport is injected here, so the
+    no-redirect policy itself is pinned by
+    ``test_the_real_slack_transport_surfaces_a_redirect_instead_of_following_it``
+    below, which drives the real ``_slack_transport``.
+    """
+
+    token = "xoxb-not-a-real-bot-token"
+    download_url = "https://files.slack.com/files-pri/T1-F1/download/report.csv"
+    redirect_target = "https://slack-files.com/somewhere-else"
+    calls: list[dict[str, Any]] = []
+
+    def transport(**request: Any) -> Any:
+        calls.append(request)
+        if "files.info" in request["url"]:
+            body = json.dumps(
+                {
+                    "ok": True,
+                    "file": {
+                        "id": "F1",
+                        "name": "report.csv",
+                        "url_private_download": download_url,
+                    },
+                }
+            ).encode()
+            return attachments.SlackFileResponse(
+                status=200,
+                headers={"Content-Type": "application/json"},
+                chunks=iter([body]),
+            )
+        return attachments.SlackFileResponse(
+            status=302,
+            headers={"Content-Type": "text/html", "Location": redirect_target},
+            chunks=iter([b"<html>redirecting</html>"]),
+        )
+
+    client = attachments.SlackFileClient(token=token, transport=transport)
+    coordinator, _objects = _coordinator(attachments, client)
+
+    with pytest.raises(attachments.AttachmentFetchError) as refusal:
+        _resolve(coordinator, [_ref("F1", "report.csv")])
+
+    assert isinstance(refusal.value.__cause__, attachments.SlackFileError)
+    assert "302" in str(refusal.value.__cause__)
+    assert all(call["url"] != redirect_target for call in calls), (
+        "the client must never issue a request to the redirect target"
+    )
+
+
+def test_the_real_slack_transport_surfaces_a_redirect_instead_of_following_it(
+    attachments: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard demonstration AGENTS.md "Guards are outcome-tested" requires.
+
+    The sibling fake-transport test above injects a ``transport`` callable, so
+    it never runs ``_slack_transport`` and cannot detect ``_NoRedirect`` being
+    deleted: it would stay green while production quietly started following
+    redirects. This one drives the real transport against a real loopback HTTP
+    server that answers 302 with a ``Location`` pointing at a second path on
+    the same server, standing in for the ``slack-files.com`` host Slack hands
+    back for a PDF's ``url_private``. A followed redirect would carry the bot
+    token in ``Authorization`` to that Slack-chosen host, so the assertions are
+    about what the server was really asked for and what headers really arrived,
+    not about any internal field. Nothing leaves the box: 127.0.0.1 on an
+    ephemeral port, with the ambient proxy settings cleared so a developer's
+    proxy cannot decide where the request goes.
+    """
+
+    for var in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setenv("NO_PROXY", "*")
+
+    token = "xoxb-not-a-real-bot-token"
+    source_path = "/files-pri/T1-F1/download/report.pdf"
+    redirect_path = "/slack-chosen-host/somewhere-else"
+    received: list[dict[str, Any]] = []
+    redirect_to: list[str] = []
+
+    class _Redirecting(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler's contract)
+            received.append({"path": self.path, "headers": dict(self.headers.items())})
+            if self.path == source_path:
+                self.send_response(302)
+                self.send_header("Location", redirect_to[0])
+                self.send_header("Content-Length", "0")
+                # Belt and braces: urllib already sends Connection: close, and
+                # ThreadingHTTPServer.daemon_threads is already True. Setting
+                # both explicitly means this test's teardown does not silently
+                # depend on those stdlib defaults holding.
+                self.send_header("Connection", "close")
+                self.end_headers()
+                return
+            body = b"the redirect target must never be reached"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Redirecting)
+    # Belt and braces, see the note above; pinned explicitly here too.
+    server.daemon_threads = True
+    port = int(server.server_address[1])
+    redirect_to.append(f"http://127.0.0.1:{port}{redirect_path}")
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    try:
+        response = attachments._slack_transport(
+            method="GET",
+            url=f"http://127.0.0.1:{port}{source_path}",
+            headers={"Authorization": f"Bearer {token}"},
+            chunk_bytes=64 * 1024,
+        )
+
+        assert response.status == 302, (
+            "the transport must surface the redirect rather than follow it"
+        )
+        assert [call["path"] for call in received] == [source_path], (
+            "the redirect destination must never be requested"
+        )
+        assert not [
+            call
+            for call in received
+            if call["path"] == redirect_path and "Authorization" in call["headers"]
+        ], "the bot token must never reach a host Slack chose"
+    finally:
+        server.shutdown()
+        server.server_close()
+        serving.join(timeout=5)
+
+
+def test_a_files_info_payload_missing_url_private_download_names_the_field(
+    attachments: Any,
+) -> None:
+    """No fallback to ``url_private``: exactly one field is read.
+
+    AGENTS.md forbids a compatibility path that keeps an old caller or
+    fixture working when a signature changes -- there is exactly one way to
+    resolve a download URL, and a payload missing it is unusable rather than
+    silently downgraded to the redirecting field. The envelope here parses
+    fine and is ``ok``, so the refusal must name the missing field rather than
+    reuse the generic unparseable-envelope message.
+    """
+
+    token = "xoxb-not-a-real-bot-token"
+
+    def transport(**request: Any) -> Any:
+        body = json.dumps(
+            {
+                "ok": True,
+                "file": {
+                    "id": "F1",
+                    "name": "report.csv",
+                    "url_private": "https://files.slack.com/files-pri/T1-F1/report.csv",
+                },
+            }
+        ).encode()
+        return attachments.SlackFileResponse(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            chunks=iter([body]),
+        )
+
+    client = attachments.SlackFileClient(token=token, transport=transport)
+    coordinator, objects = _coordinator(attachments, client)
+
+    with pytest.raises(attachments.AttachmentFetchError) as refusal:
+        _resolve(coordinator, [_ref("F1", "report.csv")])
+
+    assert isinstance(refusal.value.__cause__, attachments.SlackFileError)
+    assert "url_private_download" in str(refusal.value.__cause__)
+    assert objects.objects == {}
+
+
+def test_a_malformed_files_info_payload_is_an_unusable_envelope(
+    attachments: Any,
+) -> None:
+    """A genuinely unparseable payload keeps the generic envelope message.
+
+    Distinct from the missing-field case above: here the JSON itself does not
+    decode, so there is no ``ok`` flag and no file object to name a field on,
+    and the refusal must say so rather than claim a specific field is absent.
+    """
+
+    token = "xoxb-not-a-real-bot-token"
+
+    def transport(**request: Any) -> Any:
+        return attachments.SlackFileResponse(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            chunks=iter([b"not json"]),
+        )
+
+    client = attachments.SlackFileClient(token=token, transport=transport)
+    coordinator, objects = _coordinator(attachments, client)
+
+    with pytest.raises(attachments.AttachmentFetchError) as refusal:
+        _resolve(coordinator, [_ref("F1", "report.csv")])
+
+    assert isinstance(refusal.value.__cause__, attachments.SlackFileError)
+    assert "unusable envelope" in str(refusal.value.__cause__)
+    assert objects.objects == {}
 
 
 # --- Bounds and keys -----------------------------------------------------------
