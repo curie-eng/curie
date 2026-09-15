@@ -54,6 +54,11 @@ from claude_agent_sdk.types import (
 )
 
 from .history import ConversationMessage, HarnessReplayState
+from .mcp_argv import install as install_mcp_argv_offload
+
+install_mcp_argv_offload()
+
+logger = logging.getLogger(__name__)
 
 _SDK_SESSION_NAMESPACE = uuid.UUID("83efb74f-f09e-4db6-b898-9ed8d7084ba8")
 
@@ -257,11 +262,6 @@ def model_message_to_conversation(message: object) -> ConversationMessage | None
         )
     return None
 
-from .mcp_argv import install as install_mcp_argv_offload
-
-install_mcp_argv_offload()
-
-logger = logging.getLogger(__name__)
 
 _ALLOWED_PARTIAL_BOUNDARY_TYPES = frozenset(("message_start", "content_block_start"))
 
