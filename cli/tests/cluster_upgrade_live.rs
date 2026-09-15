@@ -1,9 +1,10 @@
-//! `curie cluster upgrade` against the LIVE host (#2299 / #2301).
+//! `curie cluster upgrade` against the recording process boundary (#2299 / #2301).
 //!
 //! `cluster_upgrade.rs` drives `FakeUpgradeHost`, which satisfies the lifecycle
 //! contract by construction. These tests instead drive the real binary against
 //! recording `helm`/`kubectl` processes, so they pin what `LiveHost` actually
-//! issues and actually observes -- the surface the fake cannot reach.
+//! issues and observes. They do not prove real Kubernetes concurrency. The
+//! separate cluster acceptance run owns that evidence.
 //!
 //! Fixture shapes follow the Kubernetes workload/pod references used by
 //! `cluster_convergence.rs`. `PATH` is process-global, so every child gets its
@@ -24,6 +25,12 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 
+const HOLDER_ANNOTATION: &str = "curietech.ai/upgrade-holder";
+const ACTION_ANNOTATION: &str = "curietech.ai/upgrade-action";
+const CREATE_WINNER: &str = "00000000-0000-4000-8000-000000000701";
+const PATCH_WINNER: &str = "00000000-0000-4000-8000-000000000702";
+const RELEASE_WINNER: &str = "00000000-0000-4000-8000-000000000703";
+
 /// The exact resource selector `convergence::workloads_command` issues. The
 /// recording `kubectl` serves ONLY this string, so a narrower `deploy,sts,ds`
 /// read fails outright instead of quietly satisfying a fixture.
@@ -40,8 +47,8 @@ const FACETS: [&str; 7] = [
     "manifest_matches",
 ];
 
-/// One isolated fake cluster: a TempDir holding `helm`, `kubectl`, the argv log
-/// and every captured payload.
+/// One isolated recording harness holding `helm`, `kubectl`, the argv log, and
+/// every captured payload.
 struct Fixture(tempfile::TempDir);
 
 impl Fixture {
@@ -62,17 +69,26 @@ impl Fixture {
         Self(temp)
     }
 
-    /// Seed the upgrade checkpoint ConfigMap `kubectl get` will return.
+    /// Seed the complete upgrade checkpoint ConfigMap `kubectl get` returns.
     fn seed_checkpoint(&self, record: &Value) {
+        self.seed_config_map(&checkpoint_config_map("41", None, Some(record)));
+    }
+
+    fn seed_config_map(&self, config_map: &Value) {
         fs::write(
             self.0.path().join("checkpoint.json"),
-            serde_json::to_string(record).unwrap(),
+            serde_json::to_string(config_map).unwrap(),
         )
         .unwrap();
     }
 
     fn checkpoint(self, record: &Value) -> Self {
         self.seed_checkpoint(record);
+        self
+    }
+
+    fn config_map(self, config_map: &Value) -> Self {
+        self.seed_config_map(config_map);
         self
     }
 
@@ -308,25 +324,16 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
             .unwrap_or_else(|error| panic!("values-{index}.yaml: {error}"))
     }
 
-    /// Every checkpoint manifest `kubectl apply` received, concatenated.
-    fn applied(&self) -> String {
-        let mut all = String::new();
-        for path in self.applied_paths() {
-            all.push_str(&fs::read_to_string(&path).unwrap());
-        }
-        all
-    }
-
-    fn applied_paths(&self) -> Vec<std::path::PathBuf> {
+    fn captured_paths(&self, prefix: &str) -> Vec<std::path::PathBuf> {
+        let prefix = format!("{prefix}-");
         let mut paths: Vec<_> = fs::read_dir(self.0.path())
             .unwrap()
             .filter_map(|entry| {
                 let path = entry.unwrap().path();
                 let name = path.file_name()?.to_string_lossy().into_owned();
-                name.starts_with("applied-").then_some(path)
+                name.starts_with(&prefix).then_some(path)
             })
             .collect();
-        // applied-10 must sort after applied-9, so key on the index.
         paths.sort_by_key(|path| {
             path.file_stem()
                 .and_then(|stem| {
@@ -341,18 +348,39 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
         paths
     }
 
-    /// Every persisted `UpgradeRecord`, parsed out of the ConfigMap manifests
-    /// `kubectl apply` received, in write order. This is the durable state a
-    /// resume would read, so it -- not the process exit code -- is where
-    /// "known-good did not advance" and "Commit never ran" are decided.
-    fn records(&self) -> Vec<Value> {
-        self.applied_paths()
+    fn persisted_payloads(&self) -> String {
+        let mut all = String::new();
+        for path in self.captured_paths("patch") {
+            all.push_str(&fs::read_to_string(&path).unwrap());
+        }
+        all
+    }
+
+    fn patches(&self) -> Vec<Value> {
+        self.captured_paths("patch")
             .iter()
-            .filter_map(|path| {
-                let manifest: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
-                let record = manifest.pointer("/data/record")?.as_str()?;
-                serde_json::from_str(record).ok()
+            .map(|path| serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap())
+            .collect()
+    }
+
+    fn created(&self) -> Vec<Value> {
+        self.captured_paths("created")
+            .iter()
+            .map(|path| serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap())
+            .collect()
+    }
+
+    /// Every persisted `UpgradeRecord`, parsed from the sole JSON Patch path.
+    fn records(&self) -> Vec<Value> {
+        self.patches()
+            .iter()
+            .flat_map(|patch| patch.as_array().into_iter().flatten())
+            .filter_map(|operation| match operation["path"].as_str()? {
+                "/data" => operation.pointer("/value/record")?.as_str(),
+                "/data/record" => operation["value"].as_str(),
+                _ => None,
             })
+            .filter_map(|record| serde_json::from_str(record).ok())
             .collect()
     }
 
@@ -360,6 +388,85 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
         self.records()
             .pop()
             .unwrap_or_else(|| panic!("no checkpoint record was ever persisted"))
+    }
+
+    fn config_map_state(&self) -> Value {
+        serde_json::from_str(
+            &fs::read_to_string(self.0.path().join("checkpoint.json"))
+                .expect("checkpoint ConfigMap state"),
+        )
+        .expect("checkpoint ConfigMap JSON")
+    }
+
+    fn sentinel_record(&self) -> String {
+        fs::read_to_string(self.0.path().join("sentinel-record.txt"))
+            .expect("external sentinel record")
+    }
+
+    fn acquired_holder(&self) -> String {
+        for created in self.created() {
+            if let Some(holder) = created
+                .pointer("/metadata/annotations/curietech.ai~1upgrade-holder")
+                .and_then(Value::as_str)
+            {
+                return holder.to_string();
+            }
+        }
+        for patch in self.patches() {
+            for operation in patch.as_array().into_iter().flatten() {
+                if operation["op"] != "add" {
+                    continue;
+                }
+                if operation["path"] == "/metadata/annotations" {
+                    if let Some(holder) = operation
+                        .pointer("/value/curietech.ai~1upgrade-holder")
+                        .and_then(Value::as_str)
+                    {
+                        return holder.to_string();
+                    }
+                }
+                if operation["path"] == "/metadata/annotations/curietech.ai~1upgrade-holder" {
+                    return operation["value"]
+                        .as_str()
+                        .expect("holder value")
+                        .to_string();
+                }
+            }
+        }
+        panic!("no ownership acquisition was captured")
+    }
+
+    fn acquired_action(&self) -> String {
+        for created in self.created() {
+            if let Some(action) = created
+                .pointer("/metadata/annotations/curietech.ai~1upgrade-action")
+                .and_then(Value::as_str)
+            {
+                return action.to_string();
+            }
+        }
+        for patch in self.patches() {
+            for operation in patch.as_array().into_iter().flatten() {
+                if operation["op"] != "add" {
+                    continue;
+                }
+                if operation["path"] == "/metadata/annotations" {
+                    if let Some(action) = operation
+                        .pointer("/value/curietech.ai~1upgrade-action")
+                        .and_then(Value::as_str)
+                    {
+                        return action.to_string();
+                    }
+                }
+                if operation["path"] == "/metadata/annotations/curietech.ai~1upgrade-action" {
+                    return operation["value"]
+                        .as_str()
+                        .expect("action value")
+                        .to_string();
+                }
+            }
+        }
+        panic!("no ownership action was captured")
     }
 }
 
@@ -945,6 +1052,82 @@ fn explicit_missing_chart_refuses_without_becoming_pending_release_download() {
     );
 }
 
+fn checkpoint_config_map(
+    resource_version: &str,
+    annotations: Option<Value>,
+    record: Option<&Value>,
+) -> Value {
+    let mut metadata = serde_json::json!({
+        "name": "rel-upgrade-checkpoint",
+        "namespace": "ns",
+        "resourceVersion": resource_version,
+        "labels": {
+            "app.kubernetes.io/managed-by": "curie",
+            "curietech.ai/upgrade": "checkpoint",
+        },
+    });
+    if let Some(annotations) = annotations {
+        metadata["annotations"] = annotations;
+    }
+    let mut config_map = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": metadata,
+    });
+    if let Some(record) = record {
+        config_map["data"] = serde_json::json!({
+            "record": serde_json::to_string(record).unwrap(),
+        });
+    }
+    config_map
+}
+
+fn is_checkpoint_get(call: &[String]) -> bool {
+    call.len() >= 3
+        && call[0] == "kubectl"
+        && call[1] == "get"
+        && call[2] == "configmap"
+        && call.iter().any(|arg| arg == "rel-upgrade-checkpoint")
+}
+
+fn argv_starts(call: &[String], prefix: &[&str]) -> bool {
+    call.len() >= prefix.len()
+        && call
+            .iter()
+            .zip(prefix)
+            .all(|(actual, expected)| actual == expected)
+}
+
+fn is_checkpoint_patch(call: &[String]) -> bool {
+    call.len() >= 3
+        && call[0] == "kubectl"
+        && call[1] == "patch"
+        && call[2] == "configmap"
+        && call.iter().any(|arg| arg == "rel-upgrade-checkpoint")
+}
+
+fn patch_has(patch: &Value, operation: &str, path: &str) -> bool {
+    patch.as_array().is_some_and(|operations| {
+        operations
+            .iter()
+            .any(|item| item["op"] == operation && item["path"] == path)
+    })
+}
+
+fn is_record_patch(patch: &Value) -> bool {
+    patch_has(patch, "add", "/data")
+        || patch_has(patch, "add", "/data/record")
+        || patch_has(patch, "replace", "/data/record")
+}
+
+fn is_release_patch(patch: &Value) -> bool {
+    patch_has(
+        patch,
+        "remove",
+        "/metadata/annotations/curietech.ai~1upgrade-holder",
+    )
+}
+
 // T1(a) -- #2301 "requires no direct Helm command or merge-flag choice", as
 // amended by driver Ruling 2: a local chart path is never pinned with
 // `--version` (Helm silently ignores it there).
@@ -964,6 +1147,757 @@ fn local_chart_upgrade_does_not_pass_a_version_flag() {
         !upgrades[0].iter().any(|arg| arg == "--version"),
         "a local chart path must not carry a --version pin Helm ignores: {:?}",
         upgrades[0]
+    );
+}
+
+/// Helm keeps release status and chart metadata on separate command surfaces.
+/// The v3.16.4 sources are:
+/// https://github.com/helm/helm/blob/v3.16.4/cmd/helm/status.go
+/// https://github.com/helm/helm/blob/v3.16.4/cmd/helm/get_metadata.go
+/// A prior runtime observation returned metadata with string version `0.9.0`,
+/// numeric revision `2`, chart `acme-upgrade`, and appVersion `0.9.0`.
+#[test]
+fn installed_chart_version_comes_from_helm_metadata() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("healthy");
+    assert!(
+        output.status.success(),
+        "the real metadata shape must complete the upgrade: {:?} / {}",
+        fixture.argv(),
+        visible(&output)
+    );
+    let expected = ["helm", "get", "metadata", "rel", "-n", "ns", "-o", "json"];
+    let reads: Vec<_> = fixture
+        .argv()
+        .into_iter()
+        .filter(|call| call.len() >= 3 && call[..3] == ["helm", "get", "metadata"])
+        .collect();
+    assert!(!reads.is_empty(), "chart metadata was never read");
+    assert!(
+        reads
+            .iter()
+            .all(|call| { call.iter().map(String::as_str).collect::<Vec<_>>() == expected }),
+        "chart version reads must use the real Helm metadata command: {reads:?}"
+    );
+    let result = json(&output);
+    assert_eq!(result["from_version"], "0.8.6", "{result}");
+    assert_eq!(result["known_good_version"], "0.9.0", "{result}");
+}
+
+/// Helm metadata's top-level chart version is a string. A numeric value cannot
+/// become the installed chart version.
+#[test]
+fn numeric_metadata_version_is_not_accepted_as_the_chart_version() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("numeric-metadata-version");
+    assert!(
+        fixture.issued(&["helm", "get", "metadata"]),
+        "the version decision must read Helm metadata: {:?}",
+        fixture.argv()
+    );
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "Apply must run before the postcondition rejects numeric metadata: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        !output.status.success(),
+        "a numeric metadata version must not satisfy target 0.9.0: {}",
+        stdout(&output)
+    );
+    assert!(
+        visible(&output).contains("release reports no version"),
+        "numeric metadata must preserve the absent version behavior: {}",
+        visible(&output)
+    );
+    let records = fixture.records();
+    assert!(
+        !records.is_empty(),
+        "the run must persist pre Apply phases before the postcondition fails"
+    );
+    for record in records {
+        assert_ne!(
+            record["known_good_version"], "0.9.0",
+            "known good must not advance from numeric metadata: {record}"
+        );
+        assert!(
+            !record["completed"]
+                .as_array()
+                .is_some_and(|done| done.iter().any(|phase| phase == "commit")),
+            "Commit must not run after numeric metadata was rejected: {record}"
+        );
+    }
+}
+
+/// Kubernetes documents ConfigMap metadata and optional data here:
+/// https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/config-map-v1/
+/// Kubernetes documents resourceVersion conflict detection here:
+/// https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-versions
+/// The recording server omits empty annotations and data just as the observed
+/// Kubernetes API did. Real race acceptance remains in the cluster run.
+#[test]
+fn ownership_create_precedes_every_upgrade_snapshot_and_has_server_state() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("healthy");
+    assert!(
+        output.status.success(),
+        "healthy create path must complete: {:?} / {}",
+        fixture.argv(),
+        visible(&output)
+    );
+
+    let argv = fixture.argv();
+    assert!(
+        is_checkpoint_get(&argv[0]),
+        "ownership read must be first: {argv:?}"
+    );
+    assert!(
+        argv[0].windows(2).any(|pair| pair == ["-o", "json"])
+            && !argv[0].iter().any(|arg| arg.contains("jsonpath")),
+        "acquisition must read the complete ConfigMap object: {:?}",
+        argv[0]
+    );
+    let first_snapshot = argv
+        .iter()
+        .position(|call| {
+            argv_starts(call, &["helm", "get", "metadata"])
+                || argv_starts(call, &["helm", "get", "values"])
+                || argv_starts(call, &["helm", "show", "chart"])
+                || argv_starts(call, &["helm", "template"])
+                || (call.first().map(String::as_str) == Some("kubectl")
+                    && call.iter().any(|arg| arg == "exec"))
+        })
+        .expect("upgrade snapshot command");
+    let create_position = argv
+        .iter()
+        .position(|call| argv_starts(call, &["kubectl", "create"]))
+        .expect("ownership create");
+    assert!(
+        create_position < first_snapshot,
+        "the server must return ownership before any metadata, values, or schema snapshot: {argv:?}"
+    );
+
+    let created = fixture.created();
+    assert_eq!(created.len(), 1, "one create payload expected: {argv:?}");
+    let annotations = created[0]["metadata"]["annotations"]
+        .as_object()
+        .expect("ownership annotations");
+    assert_eq!(
+        annotations.len(),
+        2,
+        "create must carry only ownership annotations"
+    );
+    assert!(annotations.contains_key(HOLDER_ANNOTATION));
+    assert!(
+        annotations[ACTION_ANNOTATION]
+            .as_str()
+            .is_some_and(|action| action.contains("0.9.0")),
+        "the redacted action must name the requested target: {annotations:?}"
+    );
+    assert!(
+        created[0].get("data").is_none(),
+        "the API can omit empty data, so acquisition must not invent it: {}",
+        created[0]
+    );
+    assert_eq!(
+        created[0]["metadata"]["labels"],
+        serde_json::json!({
+            "app.kubernetes.io/managed-by": "curie",
+            "curietech.ai/upgrade": "checkpoint",
+        }),
+        "the created owner must retain the checkpoint labels"
+    );
+    assert!(
+        created[0].pointer("/metadata/resourceVersion").is_none(),
+        "resourceVersion must come from the server response: {}",
+        created[0]
+    );
+    assert!(
+        argv[create_position]
+            .windows(2)
+            .any(|pair| pair == ["-o", "json"]),
+        "create must request the complete server object: {:?}",
+        argv[create_position]
+    );
+    assert!(
+        fixture
+            .helm_upgrades()
+            .iter()
+            .all(|call| !call.iter().any(|arg| arg == "--create-namespace")),
+        "ownership cannot be established in a namespace Helm creates later: {argv:?}"
+    );
+    assert!(
+        !argv
+            .iter()
+            .any(|call| argv_starts(call, &["kubectl", "apply"])),
+        "checkpoint writes have one JSON Patch path: {argv:?}"
+    );
+}
+
+#[test]
+fn existing_unowned_checkpoint_with_omitted_annotations_adds_the_complete_map() {
+    let fixture = Fixture::new(None).config_map(&checkpoint_config_map("41", None, None));
+    let output = fixture.local("healthy");
+    assert!(output.status.success(), "{}", visible(&output));
+    let holder = fixture.acquired_holder();
+    let action = fixture.acquired_action();
+    assert_eq!(
+        fixture.patches()[0],
+        serde_json::json!([
+            {"op": "test", "path": "/metadata/resourceVersion", "value": "41"},
+            {
+                "op": "add",
+                "path": "/metadata/annotations",
+                "value": {
+                    (HOLDER_ANNOTATION): holder,
+                    (ACTION_ANNOTATION): action,
+                }
+            }
+        ]),
+        "an omitted parent map requires one complete map add"
+    );
+}
+
+#[test]
+fn existing_unowned_checkpoint_tests_the_full_annotation_map_before_child_adds() {
+    let observed = serde_json::json!({
+        "example.com/keep": "yes",
+        "example.com/second": "still-here",
+    });
+    let fixture =
+        Fixture::new(None).config_map(&checkpoint_config_map("57", Some(observed.clone()), None));
+    let output = fixture.local("healthy");
+    assert!(output.status.success(), "{}", visible(&output));
+    let holder = fixture.acquired_holder();
+    let action = fixture.acquired_action();
+    assert_eq!(
+        fixture.patches()[0],
+        serde_json::json!([
+            {"op": "test", "path": "/metadata/resourceVersion", "value": "57"},
+            {"op": "test", "path": "/metadata/annotations", "value": observed},
+            {
+                "op": "add",
+                "path": "/metadata/annotations/curietech.ai~1upgrade-holder",
+                "value": holder,
+            },
+            {
+                "op": "add",
+                "path": "/metadata/annotations/curietech.ai~1upgrade-action",
+                "value": action,
+            },
+        ]),
+        "a present map requires a complete observed map test before escaped child adds"
+    );
+    assert_eq!(
+        fixture.config_map_state()["metadata"]["annotations"],
+        serde_json::json!({
+            "example.com/keep": "yes",
+            "example.com/second": "still-here",
+        }),
+        "normal release must preserve unrelated annotations"
+    );
+}
+
+#[test]
+fn malformed_annotations_fail_closed_before_snapshots_or_writes() {
+    let fixture = Fixture::new(None).config_map(&checkpoint_config_map(
+        "61",
+        Some(serde_json::json!("malformed")),
+        None,
+    ));
+    let output = fixture.local("healthy");
+    assert!(
+        !output.status.success(),
+        "malformed annotations must refuse"
+    );
+    assert!(
+        visible(&output).to_lowercase().contains("annotation"),
+        "the malformed field must be named: {}",
+        visible(&output)
+    );
+    assert!(
+        fixture.patches().is_empty(),
+        "no patch is safe: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture.created().is_empty(),
+        "the existing object must not be recreated"
+    );
+    assert!(
+        !fixture
+            .argv()
+            .iter()
+            .any(|call| call.first().map(String::as_str) == Some("helm")),
+        "ownership parsing must precede all Helm snapshots: {:?}",
+        fixture.argv()
+    );
+}
+
+#[test]
+fn existing_holder_refusal_names_holder_and_action_without_helm_writes() {
+    let holder = "00000000-0000-4000-8000-000000000601";
+    let action = "upgrade to 0.9.0 by another current CLI";
+    let fixture = Fixture::new(None).config_map(&checkpoint_config_map(
+        "63",
+        Some(serde_json::json!({
+            (HOLDER_ANNOTATION): holder,
+            (ACTION_ANNOTATION): action,
+        })),
+        None,
+    ));
+    let output = fixture.local("healthy");
+    let message = visible(&output);
+    assert!(!output.status.success(), "an existing holder must refuse");
+    assert!(
+        message.contains(holder),
+        "refusal must name the holder: {message}"
+    );
+    assert!(
+        message.contains(action),
+        "refusal must name its action: {message}"
+    );
+    assert!(
+        message.contains("wait") || message.contains("stopped"),
+        "refusal must give a safe next action: {message}"
+    );
+    assert!(fixture.patches().is_empty(), "the loser must write nothing");
+    assert!(
+        fixture.created().is_empty(),
+        "the loser must create nothing"
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "the loser must not reach Helm mutation"
+    );
+}
+
+#[test]
+fn create_race_loser_reads_one_diagnostic_and_names_the_winner() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("acquire-create-conflict");
+    let message = visible(&output);
+    assert!(!output.status.success(), "the create loser must refuse");
+    assert!(
+        message.contains(CREATE_WINNER),
+        "winner holder missing: {message}"
+    );
+    assert!(
+        message.contains("upgrade to 0.9.0"),
+        "winner action missing: {message}"
+    );
+    assert!(
+        message.contains("wait") || message.contains("stopped"),
+        "the loser needs safe recovery guidance: {message}"
+    );
+    assert_eq!(fixture.created().len(), 1, "create must not retry");
+    assert_eq!(
+        fixture
+            .argv()
+            .iter()
+            .filter(|call| is_checkpoint_get(call))
+            .count(),
+        2,
+        "one initial read and one diagnostic read are allowed: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture.patches().is_empty(),
+        "the create loser must not switch to patch"
+    );
+    assert!(
+        !fixture
+            .argv()
+            .iter()
+            .any(|call| call.first().map(String::as_str) == Some("helm")),
+        "the loser must stop before Helm snapshots: {:?}",
+        fixture.argv()
+    );
+}
+
+#[test]
+fn patch_race_loser_reads_one_diagnostic_and_never_retries() {
+    let fixture = Fixture::new(None).config_map(&checkpoint_config_map("70", None, None));
+    let output = fixture.local("acquire-patch-conflict");
+    let message = visible(&output);
+    assert!(!output.status.success(), "the patch loser must refuse");
+    assert!(
+        message.contains(PATCH_WINNER),
+        "winner holder missing: {message}"
+    );
+    assert!(
+        message.contains("upgrade to 0.9.0"),
+        "winner action missing: {message}"
+    );
+    assert!(
+        message.contains("wait") || message.contains("stopped"),
+        "the loser needs safe recovery guidance: {message}"
+    );
+    assert_eq!(
+        fixture.patches().len(),
+        1,
+        "acquisition patch must not retry"
+    );
+    assert_eq!(
+        fixture
+            .argv()
+            .iter()
+            .filter(|call| is_checkpoint_get(call))
+            .count(),
+        2,
+        "one initial read and one diagnostic read are allowed: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture.created().is_empty(),
+        "the patch loser must not switch to create"
+    );
+    assert!(
+        !fixture
+            .argv()
+            .iter()
+            .any(|call| call.first().map(String::as_str) == Some("helm")),
+        "the loser must stop before Helm snapshots: {:?}",
+        fixture.argv()
+    );
+}
+
+/// kubectl sends JSON Patch as documented here:
+/// https://kubernetes.io/docs/tasks/manage-kubernetes-objects/update-api-object-kubectl-patch/
+#[test]
+fn record_and_release_patches_chain_server_resource_versions_and_holder() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("healthy");
+    assert!(output.status.success(), "{}", visible(&output));
+    let holder = fixture.acquired_holder();
+    let patches = fixture.patches();
+    assert!(
+        patches.len() > 3,
+        "the lifecycle must persist several phases: {patches:?}"
+    );
+    let argv = fixture.argv();
+    let patch_calls: Vec<_> = argv
+        .iter()
+        .filter(|call| is_checkpoint_patch(call))
+        .collect();
+    assert_eq!(
+        patch_calls.len(),
+        patches.len(),
+        "every captured patch needs one command"
+    );
+    assert!(
+        patch_calls.iter().all(|call| {
+            call.iter().any(|arg| arg == "--type=json")
+                && call.iter().any(|arg| arg == "--patch-file")
+                && call.windows(2).any(|pair| pair == ["-o", "json"])
+        }),
+        "every write must request one server returned JSON object: {patch_calls:?}"
+    );
+
+    for (index, patch) in patches.iter().enumerate() {
+        let operations = patch.as_array().expect("JSON Patch array");
+        assert_eq!(
+            operations[0],
+            serde_json::json!({
+                "op": "test",
+                "path": "/metadata/resourceVersion",
+                "value": (100 + index).to_string(),
+            }),
+            "each write must use the prior server returned resourceVersion: {patch}"
+        );
+        assert_eq!(
+            operations[1],
+            serde_json::json!({
+                "op": "test",
+                "path": "/metadata/annotations/curietech.ai~1upgrade-holder",
+                "value": holder,
+            }),
+            "each write must test this invocation's holder: {patch}"
+        );
+    }
+
+    let record_patches: Vec<_> = patches
+        .iter()
+        .filter(|patch| is_record_patch(patch))
+        .collect();
+    assert!(!record_patches.is_empty(), "no record patch captured");
+    assert_eq!(
+        record_patches[0].as_array().unwrap()[2]["op"],
+        "add",
+        "an omitted data parent requires add"
+    );
+    assert_eq!(
+        record_patches[0].as_array().unwrap()[2]["path"],
+        "/data",
+        "the record cannot be added beneath an omitted parent"
+    );
+    assert!(
+        record_patches.iter().skip(1).all(|patch| {
+            let operation = &patch.as_array().unwrap()[2];
+            operation["path"] == "/data/record"
+                && (operation["op"] == "add" || operation["op"] == "replace")
+        }),
+        "once data exists, later writes must target only data.record: {record_patches:?}"
+    );
+
+    let releases: Vec<_> = patches
+        .iter()
+        .filter(|patch| is_release_patch(patch))
+        .collect();
+    assert_eq!(releases.len(), 1, "normal completion releases exactly once");
+    let release = releases[0].as_array().unwrap();
+    assert_eq!(
+        release.len(),
+        4,
+        "release is two tests and two removes: {release:?}"
+    );
+    assert!(release.iter().any(|operation| {
+        operation["op"] == "remove"
+            && operation["path"] == "/metadata/annotations/curietech.ai~1upgrade-action"
+    }));
+    assert!(release.iter().any(|operation| {
+        operation["op"] == "remove"
+            && operation["path"] == "/metadata/annotations/curietech.ai~1upgrade-holder"
+    }));
+    assert!(
+        fixture.config_map_state()["metadata"]
+            .get("annotations")
+            .is_none(),
+        "the API omits the empty annotations map after normal release"
+    );
+}
+
+#[test]
+fn stale_record_cas_preserves_the_external_sentinel_without_retry_or_reacquire() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("stale-record-cas");
+    assert!(!output.status.success(), "stale persistence must fail");
+    assert!(
+        visible(&output).contains("resourceVersion") || visible(&output).contains("checkpoint"),
+        "the stale checkpoint failure must surface: {}",
+        visible(&output)
+    );
+    let patches = fixture.patches();
+    assert_eq!(
+        patches.len(), 2,
+        "one stale record attempt and one release attempt are the complete write budget: {patches:?}"
+    );
+    assert_eq!(
+        patches
+            .iter()
+            .filter(|patch| is_record_patch(patch))
+            .count(),
+        1,
+        "a stale record write must never retry: {patches:?}"
+    );
+    assert_eq!(
+        patches
+            .iter()
+            .filter(|patch| is_release_patch(patch))
+            .count(),
+        1,
+        "ordinary error cleanup gets one CAS release attempt: {patches:?}"
+    );
+    assert_eq!(
+        fixture.created().len(),
+        1,
+        "ownership must not be reacquired"
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "stale persistence precedes Helm mutation"
+    );
+    assert_eq!(
+        fixture.config_map_state()["data"]["record"],
+        fixture.sentinel_record(),
+        "the external record must remain byte identical"
+    );
+}
+
+#[test]
+fn release_conflict_after_success_is_nonzero_and_reports_the_observed_holder() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("release-conflict");
+    let holder = fixture.acquired_holder();
+    let message = visible(&output);
+    assert!(
+        !output.status.success(),
+        "a failed release cannot report success"
+    );
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "the lifecycle itself must complete"
+    );
+    assert!(
+        message.contains("release"),
+        "release failure missing: {message}"
+    );
+    assert!(
+        message.contains(RELEASE_WINNER),
+        "diagnostic must name the holder actually observed: {message}"
+    );
+    assert!(
+        !message.contains(&format!("holder {holder} remains"))
+            && !message.contains(&format!("{holder} still holds")),
+        "the diagnostic must not claim the original holder remains: {message}"
+    );
+    assert_eq!(
+        fixture.config_map_state()["metadata"]["annotations"][HOLDER_ANNOTATION],
+        RELEASE_WINNER
+    );
+    assert_eq!(
+        fixture
+            .patches()
+            .iter()
+            .filter(|patch| is_release_patch(patch))
+            .count(),
+        1,
+        "release must not retry"
+    );
+    assert_eq!(
+        fixture
+            .argv()
+            .iter()
+            .filter(|call| is_checkpoint_get(call))
+            .count(),
+        2,
+        "release failure permits one diagnostic read"
+    );
+}
+
+#[test]
+fn release_failure_preserves_the_structured_lifecycle_failure() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("converge-then-release-conflict");
+    assert!(
+        !output.status.success(),
+        "both failures require a nonzero exit"
+    );
+    let report = json(&output);
+    assert_eq!(report["status"], "failed", "{report}");
+    assert_eq!(report["phase"], "converge", "{report}");
+    assert_eq!(report["convergence"]["images"], false, "{report}");
+    assert!(report["fail_forward"].is_object(), "{report}");
+    assert!(
+        visible(&output).contains(RELEASE_WINNER),
+        "the release diagnostic must accompany the lifecycle report: {}",
+        visible(&output)
+    );
+}
+
+#[test]
+fn absent_namespace_guides_cluster_up_without_a_namespace_read_or_helm_write() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("namespace-absent");
+    assert!(!output.status.success(), "an absent namespace must refuse");
+    let report = json(&output);
+    let error = report["error"]
+        .as_str()
+        .expect("namespace refusal error string");
+    assert!(
+        error.contains("curie cluster up"),
+        "the recovery guidance must establish the install first: {error}"
+    );
+    assert!(
+        error.contains("namespaces \"ns\" not found"),
+        "the real ConfigMap GET failure must remain visible: {error}"
+    );
+    let argv = fixture.argv();
+    assert!(
+        !argv.iter().any(|call| {
+            argv_starts(call, &["kubectl", "get", "namespace"])
+                || argv_starts(call, &["kubectl", "get", "namespaces"])
+        }),
+        "ownership must not add a cluster scoped Namespace read: {argv:?}"
+    );
+    assert!(
+        fixture.created().is_empty(),
+        "a namespace NotFound from ConfigMap GET must not be mistaken for an absent object"
+    );
+    assert!(fixture.patches().is_empty(), "no object exists to patch");
+    assert!(
+        !argv
+            .iter()
+            .any(|call| call.first().map(String::as_str) == Some("helm")),
+        "namespace refusal must precede all Helm snapshots: {argv:?}"
+    );
+    assert!(
+        !argv.iter().flatten().any(|arg| arg == "--create-namespace"),
+        "cluster upgrade must never ask Helm to create the namespace: {argv:?}"
+    );
+}
+
+#[test]
+fn namespace_disappearing_before_create_guides_cluster_up_without_helm_write() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("namespace-disappears");
+    assert!(
+        !output.status.success(),
+        "a disappeared namespace must refuse"
+    );
+    let report = json(&output);
+    let message = report["error"]
+        .as_str()
+        .expect("namespace disappearance error string");
+    assert!(
+        message.contains("Error from server (NotFound): error when creating \""),
+        "the real create failure prefix must remain visible: {message}"
+    );
+    assert!(
+        message.contains("curie cluster up"),
+        "the recovery guidance must establish the install first: {message}"
+    );
+    assert!(
+        message.contains("error when creating") && message.contains("namespaces \"ns\" not found"),
+        "the real create failure shape must remain visible: {message}"
+    );
+    let argv = fixture.argv();
+    assert!(
+        !argv.iter().any(|call| {
+            argv_starts(call, &["kubectl", "get", "namespace"])
+                || argv_starts(call, &["kubectl", "get", "namespaces"])
+        }),
+        "ownership must not add a cluster scoped Namespace read: {argv:?}"
+    );
+    assert_eq!(fixture.created().len(), 1, "create must run exactly once");
+    assert!(fixture.patches().is_empty(), "no object exists to patch");
+    assert!(
+        !argv
+            .iter()
+            .any(|call| call.first().map(String::as_str) == Some("helm")),
+        "namespace refusal must precede all Helm snapshots: {argv:?}"
+    );
+}
+
+#[test]
+fn dry_run_does_not_acquire_or_mutate_cluster_ownership() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run_with("healthy", "0.9.0", "charts/curie", &["--dry-run"]);
+    assert!(output.status.success(), "{}", visible(&output));
+    let argv = fixture.argv();
+    assert!(
+        !argv.iter().any(|call| is_checkpoint_get(call)),
+        "dry run must not enter the ownership protocol: {argv:?}"
+    );
+    assert!(
+        fixture.created().is_empty(),
+        "dry run must not create ownership"
+    );
+    assert!(
+        fixture.patches().is_empty(),
+        "dry run must not patch ownership"
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "dry run must not mutate Helm"
+    );
+    assert!(
+        !argv
+            .iter()
+            .any(|call| argv_starts(call, &["kubectl", "apply"])),
+        "dry run must issue no legacy checkpoint apply: {argv:?}"
     );
 }
 
@@ -1625,7 +2559,7 @@ fn resumed_upgrade_remigrates_its_own_output_without_change() {
 fn upgrade_output_contains_no_credential_value() {
     let fixture = Fixture::new(Some(V084));
     let output = fixture.local("healthy");
-    let reachable = format!("{}{}", visible(&output), fixture.applied());
+    let reachable = format!("{}{}", visible(&output), fixture.persisted_payloads());
     for secret in [SLACK_TOKEN, "sk-ant-test-must-not-leak"] {
         assert!(
             !reachable.contains(secret),

@@ -1016,6 +1016,76 @@ fn checkpoint_name(release: &str) -> String {
     format!("{release}-upgrade-checkpoint")
 }
 
+const UPGRADE_HOLDER_ANNOTATION: &str = "curietech.ai/upgrade-holder";
+const UPGRADE_ACTION_ANNOTATION: &str = "curietech.ai/upgrade-action";
+const UPGRADE_HOLDER_POINTER: &str = "/metadata/annotations/curietech.ai~1upgrade-holder";
+const UPGRADE_ACTION_POINTER: &str = "/metadata/annotations/curietech.ai~1upgrade-action";
+
+struct CheckpointObservation {
+    resource_version: String,
+    annotations: Option<serde_json::Map<String, serde_json::Value>>,
+    data_present: bool,
+    record: Option<serde_json::Value>,
+}
+
+fn parse_checkpoint_observation(output: &str, operation: &str) -> Result<CheckpointObservation> {
+    let object: serde_json::Value = serde_json::from_str(output)
+        .with_context(|| format!("{operation} returned malformed ConfigMap JSON"))?;
+    let metadata = object
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+        .with_context(|| format!("{operation} returned no ConfigMap metadata object"))?;
+    let resource_version = metadata
+        .get("resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .filter(|version| !version.is_empty())
+        .with_context(|| format!("{operation} returned no usable resourceVersion"))?
+        .to_string();
+    let annotations = match metadata.get("annotations") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_object()
+                .with_context(|| format!("{operation} returned malformed annotations"))?
+                .clone(),
+        ),
+    };
+    let (data_present, record) = match object.get("data") {
+        None => (false, None),
+        Some(value) => {
+            let data = value
+                .as_object()
+                .with_context(|| format!("{operation} returned malformed ConfigMap data"))?;
+            (true, data.get("record").cloned())
+        }
+    };
+    Ok(CheckpointObservation {
+        resource_version,
+        annotations,
+        data_present,
+        record,
+    })
+}
+
+fn checkpoint_is_absent(stderr: &str, name: &str) -> bool {
+    super::verbs::failure_reason(stderr)
+        == format!("Error from server (NotFound): configmaps \"{name}\" not found")
+}
+
+fn namespace_is_absent(stderr: &str, namespace: &str) -> bool {
+    let reason = super::verbs::failure_reason(stderr);
+    reason.contains("(NotFound)")
+        && reason.contains(&format!("namespaces \"{namespace}\" not found"))
+}
+
+fn create_lost_race(stderr: &str) -> bool {
+    let reason = super::verbs::failure_reason(stderr).to_ascii_lowercase();
+    reason.contains("conflict")
+        || reason.contains("alreadyexists")
+        || reason.contains("already exists")
+        || reason.contains("object has been modified")
+}
+
 struct LiveHost {
     opts: UpgradeOpts,
     current: Option<String>,
@@ -1036,6 +1106,10 @@ struct LiveHost {
     schema_decision: Option<serde_json::Value>,
     /// Why the target schema was refused, if it was.
     schema_refusal: Option<String>,
+    holder: String,
+    checkpoint_resource_version: Option<String>,
+    checkpoint_data_present: bool,
+    checkpoint_record: Option<serde_json::Value>,
 }
 
 /// Ruling 2: Helm SILENTLY IGNORES `--version` for a local directory or
@@ -1120,6 +1194,10 @@ impl LiveHost {
             schema_plan: None,
             schema_decision: None,
             schema_refusal: None,
+            holder: uuid::Uuid::new_v4().to_string(),
+            checkpoint_resource_version: None,
+            checkpoint_data_present: false,
+            checkpoint_record: None,
         }
     }
 
@@ -1129,6 +1207,295 @@ impl LiveHost {
 
     fn chart_ref(&self) -> &str {
         chart_ref(&self.opts)
+    }
+
+    fn ownership_action(&self) -> String {
+        format!("upgrade to {}", self.opts.to)
+    }
+
+    fn checkpoint_get_command(&self) -> OpsCommand {
+        OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("get"),
+                plain("configmap"),
+                plain(checkpoint_name(&self.opts.common.release)),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-o"),
+                plain("json"),
+            ],
+        )
+    }
+
+    fn checkpoint_diagnostic(&self) -> String {
+        let (ok, out, err) = match self.run(&self.checkpoint_get_command()) {
+            Ok(result) => result,
+            Err(error) => {
+                return format!("current checkpoint could not be read: {error:#}");
+            }
+        };
+        if !ok {
+            return format!(
+                "current checkpoint could not be read: {}",
+                super::verbs::failure_reason(&err)
+            );
+        }
+        let object: serde_json::Value = match serde_json::from_str(&out) {
+            Ok(object) => object,
+            Err(_) => return "current checkpoint response is malformed".into(),
+        };
+        let display = |value: Option<&serde_json::Value>| match value {
+            Some(serde_json::Value::String(value)) => value.clone(),
+            Some(_) => "<malformed>".into(),
+            None => "<absent>".into(),
+        };
+        let version = display(object.pointer("/metadata/resourceVersion"));
+        let holder = display(
+            object
+                .pointer("/metadata/annotations")
+                .and_then(|annotations| annotations.get(UPGRADE_HOLDER_ANNOTATION)),
+        );
+        let action = display(
+            object
+                .pointer("/metadata/annotations")
+                .and_then(|annotations| annotations.get(UPGRADE_ACTION_ANNOTATION)),
+        );
+        format!("current checkpoint resourceVersion {version}, holder {holder}, action {action}")
+    }
+
+    fn validate_owned_observation(
+        &self,
+        observation: &CheckpointObservation,
+        operation: &str,
+        expected_record: Option<&str>,
+    ) -> Result<()> {
+        let annotations = observation
+            .annotations
+            .as_ref()
+            .with_context(|| format!("{operation} returned no ownership annotations"))?;
+        let holder = annotations
+            .get(UPGRADE_HOLDER_ANNOTATION)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("{operation} returned no valid holder annotation"))?;
+        if holder != self.holder {
+            bail!(
+                "{operation} returned holder {holder}, not this invocation holder {}",
+                self.holder
+            );
+        }
+        let action = annotations
+            .get(UPGRADE_ACTION_ANNOTATION)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("{operation} returned no valid action annotation"))?;
+        if action != self.ownership_action() {
+            bail!("{operation} returned an unexpected ownership action");
+        }
+        if let Some(expected_record) = expected_record {
+            if !observation.data_present {
+                bail!("{operation} returned no ConfigMap data after the record write");
+            }
+            let observed_record = observation
+                .record
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .with_context(|| format!("{operation} returned no valid checkpoint record"))?;
+            if observed_record != expected_record {
+                bail!("{operation} returned a different checkpoint record");
+            }
+        }
+        Ok(())
+    }
+
+    fn adopt_checkpoint_observation(&mut self, observation: CheckpointObservation) {
+        self.checkpoint_resource_version = Some(observation.resource_version);
+        self.checkpoint_data_present = observation.data_present;
+        self.checkpoint_record = observation.record;
+    }
+
+    fn parse_acquired_record(&self) -> Result<Option<UpgradeRecord>> {
+        let Some(value) = &self.checkpoint_record else {
+            return Ok(None);
+        };
+        let record = value
+            .as_str()
+            .context("upgrade checkpoint record is not a string")?;
+        serde_json::from_str(record)
+            .context("upgrade checkpoint record is malformed")
+            .map(Some)
+    }
+
+    fn run_checkpoint_patch(&self, patch: &serde_json::Value) -> Result<(bool, String, String)> {
+        let tmp = tempfile::NamedTempFile::new().context("upgrade checkpoint patch tempfile")?;
+        std::fs::write(tmp.path(), serde_json::to_vec_pretty(patch)?)?;
+        let cmd = OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("patch"),
+                plain("configmap"),
+                plain(checkpoint_name(&self.opts.common.release)),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("--type=json"),
+                plain("--patch-file"),
+                plain(tmp.path().to_string_lossy().into_owned()),
+                plain("-o"),
+                plain("json"),
+            ],
+        );
+        self.run(&cmd)
+    }
+
+    fn acquire_ownership(&mut self) -> Result<()> {
+        let checkpoint = checkpoint_name(&self.opts.common.release);
+        let (ok, out, err) = self.run(&self.checkpoint_get_command())?;
+        if !ok {
+            if namespace_is_absent(&err, &self.opts.common.namespace) {
+                let reason = super::verbs::failure_reason(&err);
+                bail!(
+                    "namespace {} does not exist, so upgrade ownership cannot be created: {reason}; establish the install with `curie cluster up` first",
+                    self.opts.common.namespace,
+                );
+            }
+            if !checkpoint_is_absent(&err, &checkpoint) {
+                bail!(
+                    "could not read upgrade ownership: {}",
+                    super::verbs::failure_reason(&err)
+                );
+            }
+            return self.create_ownership();
+        }
+
+        let observed = parse_checkpoint_observation(&out, "upgrade ownership read")?;
+        let patch = match observed.annotations.as_ref() {
+            None => serde_json::json!([
+                {
+                    "op": "test",
+                    "path": "/metadata/resourceVersion",
+                    "value": observed.resource_version,
+                },
+                {
+                    "op": "add",
+                    "path": "/metadata/annotations",
+                    "value": {
+                        (UPGRADE_HOLDER_ANNOTATION): self.holder,
+                        (UPGRADE_ACTION_ANNOTATION): self.ownership_action(),
+                    },
+                },
+            ]),
+            Some(annotations) => {
+                if let Some(holder) = annotations.get(UPGRADE_HOLDER_ANNOTATION) {
+                    let holder = holder
+                        .as_str()
+                        .context("upgrade holder annotation is malformed")?;
+                    let action = match annotations.get(UPGRADE_ACTION_ANNOTATION) {
+                        Some(value) => value
+                            .as_str()
+                            .context("upgrade action annotation is malformed")?,
+                        None => "<unspecified>",
+                    };
+                    bail!(
+                        "upgrade ownership is held by {holder} for action {action}; wait for that upgrade to finish, or verify that holder has stopped before manual recovery"
+                    );
+                }
+                serde_json::json!([
+                    {
+                        "op": "test",
+                        "path": "/metadata/resourceVersion",
+                        "value": observed.resource_version,
+                    },
+                    {
+                        "op": "test",
+                        "path": "/metadata/annotations",
+                        "value": annotations,
+                    },
+                    {
+                        "op": "add",
+                        "path": UPGRADE_HOLDER_POINTER,
+                        "value": self.holder,
+                    },
+                    {
+                        "op": "add",
+                        "path": UPGRADE_ACTION_POINTER,
+                        "value": self.ownership_action(),
+                    },
+                ])
+            }
+        };
+        let (ok, out, err) = self.run_checkpoint_patch(&patch)?;
+        if !ok {
+            let diagnostic = self.checkpoint_diagnostic();
+            bail!(
+                "could not acquire upgrade ownership: {}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery",
+                super::verbs::failure_reason(&err)
+            );
+        }
+        let observation = parse_checkpoint_observation(&out, "upgrade ownership patch")
+            .context("ownership may remain because the server response cannot be trusted")?;
+        self.validate_owned_observation(&observation, "upgrade ownership patch", None)
+            .context("ownership may remain because the server response cannot be trusted")?;
+        self.adopt_checkpoint_observation(observation);
+        Ok(())
+    }
+
+    fn create_ownership(&mut self) -> Result<()> {
+        let manifest = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": checkpoint_name(&self.opts.common.release),
+                "namespace": self.opts.common.namespace,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "curie",
+                    "curietech.ai/upgrade": "checkpoint",
+                },
+                "annotations": {
+                    (UPGRADE_HOLDER_ANNOTATION): self.holder,
+                    (UPGRADE_ACTION_ANNOTATION): self.ownership_action(),
+                },
+            },
+        });
+        let tmp = tempfile::NamedTempFile::new().context("upgrade ownership tempfile")?;
+        std::fs::write(tmp.path(), serde_json::to_vec_pretty(&manifest)?)?;
+        let cmd = OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("create"),
+                plain("-f"),
+                plain(tmp.path().to_string_lossy().into_owned()),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-o"),
+                plain("json"),
+            ],
+        );
+        let (ok, out, err) = self.run(&cmd)?;
+        if !ok {
+            if namespace_is_absent(&err, &self.opts.common.namespace) {
+                let reason = super::verbs::failure_reason(&err);
+                bail!(
+                    "namespace {} does not exist, so upgrade ownership cannot be created: {reason}; establish the install with `curie cluster up` first",
+                    self.opts.common.namespace,
+                );
+            }
+            if create_lost_race(&err) {
+                let diagnostic = self.checkpoint_diagnostic();
+                bail!(
+                    "could not acquire upgrade ownership: {}; {diagnostic}; wait for the current upgrade to finish, or verify that its holder has stopped before manual recovery",
+                    super::verbs::failure_reason(&err)
+                );
+            }
+            bail!(
+                "could not create upgrade ownership: {}",
+                super::verbs::failure_reason(&err)
+            );
+        }
+        let observation = parse_checkpoint_observation(&out, "upgrade ownership create")
+            .context("ownership may remain because the server response cannot be trusted")?;
+        self.validate_owned_observation(&observation, "upgrade ownership create", None)
+            .context("ownership may remain because the server response cannot be trusted")?;
+        self.adopt_checkpoint_observation(observation);
+        Ok(())
     }
 
     /// The version an available local chart declares for itself.
@@ -1433,62 +1800,111 @@ impl LiveHost {
             .map(ToOwned::to_owned)
     }
 
-    fn load_record(&self) -> Option<UpgradeRecord> {
-        let cmd = OpsCommand::new(
-            "kubectl",
-            vec![
-                plain("get"),
-                plain("configmap"),
-                plain(checkpoint_name(&self.opts.common.release)),
-                plain("-n"),
-                plain(&self.opts.common.namespace),
-                plain("-o"),
-                plain("jsonpath={.data.record}"),
-            ],
-        );
-        let (ok, out, _) = self.run(&cmd).ok()?;
-        if !ok || out.trim().is_empty() {
-            return None;
-        }
-        serde_json::from_str(&out).ok()
-    }
-
-    fn persist_record(&self, record: &UpgradeRecord) -> Result<()> {
+    fn persist_record(&mut self, record: &UpgradeRecord) -> Result<()> {
         let json = serde_json::to_string(record)?;
         if let Some(secret) = &self.secret {
             if json.contains(secret) {
                 bail!("refusing to persist an unredacted credential in the upgrade checkpoint");
             }
         }
-        let manifest = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "name": checkpoint_name(&self.opts.common.release),
-                "namespace": self.opts.common.namespace,
-                "labels": {
-                    "app.kubernetes.io/managed-by": "curie",
-                    "curietech.ai/upgrade": "checkpoint",
-                }
+        let resource_version = self
+            .checkpoint_resource_version
+            .as_ref()
+            .context("upgrade checkpoint ownership has no trusted resourceVersion")?;
+        let record_operation = if self.checkpoint_data_present {
+            serde_json::json!({
+                "op": "add",
+                "path": "/data/record",
+                "value": json,
+            })
+        } else {
+            serde_json::json!({
+                "op": "add",
+                "path": "/data",
+                "value": {"record": json},
+            })
+        };
+        let patch = serde_json::json!([
+            {
+                "op": "test",
+                "path": "/metadata/resourceVersion",
+                "value": resource_version,
             },
-            "data": { "record": json }
-        });
-        let tmp = tempfile::NamedTempFile::new().context("upgrade checkpoint tempfile")?;
-        std::fs::write(tmp.path(), serde_json::to_vec_pretty(&manifest)?)?;
-        let cmd = OpsCommand::new(
-            "kubectl",
-            vec![
-                plain("apply"),
-                plain("-f"),
-                plain(tmp.path().to_string_lossy().into_owned()),
-                plain("-n"),
-                plain(&self.opts.common.namespace),
-            ],
-        );
-        let (ok, _, err) = self.run(&cmd)?;
+            {
+                "op": "test",
+                "path": UPGRADE_HOLDER_POINTER,
+                "value": self.holder,
+            },
+            record_operation,
+        ]);
+        let (ok, out, err) = self.run_checkpoint_patch(&patch)?;
         if !ok {
-            bail!("could not persist the upgrade checkpoint: {}", err.trim());
+            let reason = self.redact(super::verbs::failure_reason(&err));
+            let diagnostic = self.redact(&self.checkpoint_diagnostic());
+            bail!("could not persist the upgrade checkpoint: {reason}; {diagnostic}");
         }
+        let observation = parse_checkpoint_observation(&out, "upgrade checkpoint persistence")?;
+        self.validate_owned_observation(
+            &observation,
+            "upgrade checkpoint persistence",
+            Some(&json),
+        )?;
+        self.adopt_checkpoint_observation(observation);
+        Ok(())
+    }
+
+    fn release_ownership(&mut self) -> Result<()> {
+        let resource_version = self
+            .checkpoint_resource_version
+            .as_ref()
+            .context("upgrade ownership has no trusted resourceVersion for release")?;
+        let patch = serde_json::json!([
+            {
+                "op": "test",
+                "path": "/metadata/resourceVersion",
+                "value": resource_version,
+            },
+            {
+                "op": "test",
+                "path": UPGRADE_HOLDER_POINTER,
+                "value": self.holder,
+            },
+            {
+                "op": "remove",
+                "path": UPGRADE_ACTION_POINTER,
+            },
+            {
+                "op": "remove",
+                "path": UPGRADE_HOLDER_POINTER,
+            },
+        ]);
+        let (ok, out, err) = self.run_checkpoint_patch(&patch)?;
+        if !ok {
+            let reason = self.redact(super::verbs::failure_reason(&err));
+            let diagnostic = self.redact(&self.checkpoint_diagnostic());
+            bail!("could not release upgrade ownership: {reason}; {diagnostic}");
+        }
+        let observation = match parse_checkpoint_observation(&out, "upgrade ownership release") {
+            Ok(observation) => observation,
+            Err(error) => {
+                let diagnostic = self.redact(&self.checkpoint_diagnostic());
+                bail!(
+                    "could not confirm upgrade ownership release from the server response: {error:#}; {diagnostic}"
+                );
+            }
+        };
+        if let Some(annotations) = observation.annotations.as_ref() {
+            if annotations.contains_key(UPGRADE_HOLDER_ANNOTATION)
+                || annotations.contains_key(UPGRADE_ACTION_ANNOTATION)
+            {
+                let diagnostic = self.redact(&self.checkpoint_diagnostic());
+                bail!(
+                    "could not confirm upgrade ownership release because the server response still contains ownership annotations; {diagnostic}"
+                );
+            }
+        }
+        self.adopt_checkpoint_observation(observation);
+        self.checkpoint_resource_version = None;
         Ok(())
     }
 
@@ -1500,7 +1916,6 @@ impl LiveHost {
             .collect();
         if self.current.is_none() {
             args.push(plain("--install"));
-            args.push(plain("--create-namespace"));
         }
         let tmp = tempfile::NamedTempFile::new().context("upgrade values tempfile")?;
         if let Some(overlay) = &self.overlay {
@@ -1620,8 +2035,9 @@ impl UpgradeDriver for LiveHost {
         self.record.clone()
     }
     fn store_record(&mut self, record: UpgradeRecord) -> Result<()> {
-        self.record = Some(record.clone());
-        self.persist_record(&record)
+        self.persist_record(&record)?;
+        self.record = Some(record);
+        Ok(())
     }
     fn schema_plan(&self) -> Option<String> {
         self.schema_plan.clone()
@@ -1696,7 +2112,7 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         // a cold release asset records those checks as pending instead (#2301).
         live.compute_pre_mutation();
         let result = run_lifecycle_inner(opts, &mut live).await;
-        return wrap_schema_refusal(live, result);
+        return wrap_schema_refusal(&live, result);
     }
 
     require_on_path("helm")?;
@@ -1712,20 +2128,28 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
     }
 
     let mut live = LiveHost::new(opts.clone());
-    live.current = live.inspect_version();
-    live.record = live.load_record();
-    live.known_good = live
-        .record
-        .as_ref()
-        .and_then(|r| r.known_good_version.clone())
-        .or_else(|| live.current.clone());
-    live.compute_pre_mutation();
-    let result = run_lifecycle_inner(opts, &mut live).await;
-    wrap_schema_refusal(live, result)
+    live.acquire_ownership()?;
+    let setup = live.parse_acquired_record();
+    let result = match setup {
+        Ok(record) => {
+            live.record = record;
+            live.current = live.inspect_version();
+            live.known_good = live
+                .record
+                .as_ref()
+                .and_then(|record| record.known_good_version.clone())
+                .or_else(|| live.current.clone());
+            live.compute_pre_mutation();
+            run_lifecycle_inner(opts, &mut live).await
+        }
+        Err(error) => Err(error),
+    };
+    let result = wrap_schema_refusal(&live, result);
+    finish_owned_upgrade(&mut live, result)
 }
 
 fn wrap_schema_refusal(
-    live: LiveHost,
+    live: &LiveHost,
     result: Result<ClusterUpgradeOutput>,
 ) -> Result<ClusterUpgradeOutput> {
     match result {
@@ -1734,6 +2158,43 @@ fn wrap_schema_refusal(
             Err(crate::ui::ui().failed_report(&live.failed_schema_output(), err))
         }
         Err(err) => Err(err),
+    }
+}
+
+fn finish_owned_upgrade(
+    live: &mut LiveHost,
+    result: Result<ClusterUpgradeOutput>,
+) -> Result<ClusterUpgradeOutput> {
+    let release = live.release_ownership();
+    match (result, release) {
+        (Ok(output), Ok(())) => Ok(output),
+        (Ok(mut output), Err(error)) => {
+            let failed = matches!(
+                &output,
+                ClusterUpgradeOutput::Completed { status, .. } if status == "failed"
+            );
+            if failed {
+                if let ClusterUpgradeOutput::Completed {
+                    fail_forward: Some(fail_forward),
+                    ..
+                } = &mut output
+                {
+                    fail_forward.reason = format!("{}; {error:#}", fail_forward.reason);
+                }
+                Err(crate::ui::ui().failed_report(&output, error))
+            } else {
+                Err(error)
+            }
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(release_error)) => {
+            let (message, remedy) = crate::exit::present_error(&error);
+            Err(crate::exit::operator_context(
+                error,
+                format!("{message}; additionally, {release_error:#}"),
+                remedy,
+            ))
+        }
     }
 }
 
