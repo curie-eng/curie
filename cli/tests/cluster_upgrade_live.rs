@@ -861,7 +861,7 @@ fn release_channel_dry_run_plans_target_cache_and_url_without_fetching() {
         .unwrap_or_else(|| panic!("cold dry-run has no Helm plan line: {plan:?}"));
     assert_eq!(
         helm_line,
-        format!("helm upgrade rel {target} -n ns --wait"),
+        format!("helm upgrade rel {target} -n ns --wait --timeout 15m"),
         "the downloaded archive is a local chart at Apply, so the cold plan must omit --version"
     );
     assert!(
@@ -960,7 +960,8 @@ fn release_channel_cached_dry_run_checks_target_without_version_flag() {
     );
     assert!(
         plan.iter().filter_map(Value::as_str).any(|line| {
-            line == format!("helm upgrade rel {target} -n ns --wait") && !line.contains("--version")
+            line == format!("helm upgrade rel {target} -n ns --wait --timeout 15m")
+                && !line.contains("--version")
         }),
         "cached plan must use the exact local-archive command head: {plan:?}"
     );

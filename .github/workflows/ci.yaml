@@ -2573,6 +2573,7 @@ jobs:
   e2e-cluster-upgrade-matrix:
     name: E2E cluster upgrade matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     needs: [rust-build]
     if: ${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}
     steps:

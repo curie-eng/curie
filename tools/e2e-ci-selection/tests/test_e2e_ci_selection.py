@@ -513,6 +513,7 @@ def test_upgrade_matrix_workflow_is_always_on_next_and_runs_the_script() -> None
     assert job["if"] == (
         "${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}"
     )
+    assert job["timeout-minutes"] == 180
     named_steps = {
         step["name"]: step for step in job["steps"] if isinstance(step.get("name"), str)
     }

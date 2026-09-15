@@ -221,6 +221,12 @@ run_self_test() {
         log "self-test: restore_n must clear the checkpoint after the 0.9.0 restore"
         failed=1
     fi
+    if awk '/^run_n_to_n1\(\)/,/^}/' "$script_path" | grep -q '^[[:space:]]*restore_n$'; then
+        log "n-to-n1 restores 0.9.0 through restore_n"
+    else
+        log "self-test: n-to-n1 must call restore_n so leftover in_progress 0.9.0 cannot refuse 0.9.1"
+        failed=1
+    fi
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
@@ -886,10 +892,9 @@ run_interrupt_resume() {
 }
 
 run_n_to_n1() {
-    if [[ "$(helm_version)" != "0.9.0" ]]; then
-        cluster_upgrade "0.9.0" "$CHART_090" || true
-        wait_rollout || true
-    fi
+    # interrupt-resume ends on 0.9.1. A leftover in_progress 0.9.0 from a
+    # helm --wait timeout refuses --to 0.9.1. restore_n resumes or clears it.
+    restore_n
     local status=0
     cluster_upgrade "0.9.1" "$CHART_091" || status=$?
     record_upgrade_json "n-to-n1"

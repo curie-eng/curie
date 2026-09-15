@@ -1173,6 +1173,11 @@ fn helm_upgrade_argv(opts: &UpgradeOpts, to: &str) -> Vec<String> {
         "-n".into(),
         opts.common.namespace.clone(),
         "--wait".into(),
+        // Helm's --wait default timeout is 5m. A kind 0.9.1 -> 0.9.0 apply
+        // with the schema-migrate hook overruns that, apply bails, and the
+        // checkpoint stays in_progress so the next --to is refused.
+        "--timeout".into(),
+        "15m".into(),
     ];
     if opts.chart.uses_helm_version() {
         argv.push("--version".into());
