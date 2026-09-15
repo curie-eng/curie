@@ -67,10 +67,11 @@ is a judgement call, not something derivable from the tree.
    column is a native Postgres `Enum(Environment, name="environment", schema=SCHEMA)`
    (`apps/api/src/curie_api/models.py::Deployment`), which materializes as a `CREATE TYPE` in the `curie` schema.
 3. **`JSONB` column type** — `apps/api/src/curie_api/models.py::JSONB` is imported from
-   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **sixteen** columns:
+   `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on **seventeen** columns:
    `behavior_packs`, `approval_required_tools`, `approval_routes`, `secrets`,
-   `hook_partitions`, `changed_paths`, `evidence`, `arguments`, `result`, `prior_state`,
-   `target`, `post_state`, `feedback`, `turn`, and `value`. The last one is
+   `hook_partitions`, `source_bindings`, `changed_paths`, `evidence`, `arguments`,
+   `result`, `prior_state`, `target`, `post_state`, `feedback`, `turn`, and `value`.
+   The last one is
    `apps/api/src/curie_api/models.py::WorkflowStateEntry.value`; `evidence` is used
    by both approval and action audit rows. Three of them are
    load-bearing rather than incidental: the workflow-state store exists precisely because
@@ -79,8 +80,10 @@ is a judgement call, not something derivable from the tree.
    a connector wrote to, which no column type can know in advance (ADR-0117), and
    `hook_partitions` holds per-hook delivery partitioning — hook name to the JSON Pointer
    into a delivery body naming the thing each delivery is about; NULL means one thread
-   per hook (ADR-0134, Draft). The review-feedback outbox likewise stores a normalized
-   `feedback` object and credential-free serialized `turn` as JSONB.
+   per hook (ADR-0134, Draft). `source_bindings` holds the operator-controlled
+   workload-to-allowlisted-repository map for inbound hooks (#2572). The review-feedback
+   outbox likewise stores a normalized `feedback` object and credential-free serialized
+   `turn` as JSONB.
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
    is written by hand in `apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL` (executed
    through `text(...)` in `apps/api/src/curie_api/commitpoller.py::CommitPoller.poll_once`)
