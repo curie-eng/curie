@@ -87,6 +87,14 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin cluster upgrade as the mutator\n{text}"
     );
     assert!(
+        text.contains("restore_n resumes leftover in_progress 0.9.0"),
+        "self-test must pin restore_n resuming leftover in_progress 0.9.0\n{text}"
+    );
+    assert!(
+        text.contains("restore_n clears leftover in_progress after restoring 0.9.0"),
+        "self-test must pin restore_n clearing the checkpoint after the 0.9.0 restore\n{text}"
+    );
+    assert!(
         text.contains("schema heads published=0039"),
         "self-test must pin the published 0.8.8 alembic head\n{text}"
     );
