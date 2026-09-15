@@ -287,6 +287,31 @@ mod tests {
     }
 
     #[test]
+    fn packaged_n_and_n1_share_this_tree_head_so_rollback_is_compatible() {
+        let n = window_for("0.9.0").expect("0.9.0 is catalogued for the next-train matrix");
+        let n1 = window_for("0.9.1").expect("0.9.1 is catalogued for the next-train matrix");
+        assert_eq!(n.schema_min, n1.schema_min);
+        assert_eq!(n.schema_head, n1.schema_head);
+        check_target_schema(
+            "0.9.0",
+            &n.schema_head,
+            &["0.9.0".to_string(), "0.9.1".to_string()],
+        )
+        .expect("N+1 to N is the same schema window");
+        let err = check_target_schema(
+            "0.8.7",
+            &n.schema_head,
+            &["0.8.7".to_string(), "0.9.0".to_string()],
+        )
+        .expect_err("0.8.7 cannot start on this tree's head");
+        assert!(
+            err.message.contains("0.8.7") && err.message.contains("schema"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
     fn catalog_head_matches_this_tree() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()

@@ -3021,3 +3021,81 @@ fn unreadable_live_revision_on_existing_release_refuses_empty_db_shortcut() {
         fixture.argv()
     );
 }
+
+/// #2590 -- LiveHost env hooks refuse soak identities before helm mutates.
+#[test]
+fn fail_at_apply_against_soak_namespace_is_refused_without_helm() {
+    let fixture = Fixture::new(None);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    let output = command
+        .args([
+            "--json",
+            "cluster",
+            "upgrade",
+            "--to",
+            "0.9.0",
+            "--namespace",
+            "curie",
+            "--release",
+            "t2590",
+            "--chart",
+            "charts/curie",
+            "--yes",
+        ])
+        .current_dir(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap(),
+        )
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", fixture.0.path().display()),
+        )
+        .env("UPGRADE_DRIVER_ROOT", fixture.0.path())
+        .env("UPGRADE_DRIVER_SCENARIO", "happy")
+        .env("CURIE_UPGRADE_TEST_FAIL_AT", "apply")
+        .output()
+        .expect("run soak FAIL_AT");
+    assert!(
+        !output.status.success(),
+        "soak FAIL_AT must exit nonzero: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let text = visible(&output);
+    assert!(
+        text.contains("soak") && text.contains("CURIE_UPGRADE_TEST_FAIL_AT"),
+        "refusal must name the soak hook: {text}"
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "soak FAIL_AT must not call helm upgrade: {:?}",
+        fixture.argv()
+    );
+}
+
+#[test]
+fn fail_at_plan_on_owned_namespace_fails_before_helm() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &[],
+        &[("CURIE_UPGRADE_TEST_FAIL_AT", "plan")],
+    );
+    let payload = json(&output);
+    assert_eq!(
+        payload["status"],
+        "failed",
+        "owned FAIL_AT=plan must be structured failed: {} / {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(payload["phase"], "plan", "{payload}");
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "owned FAIL_AT=plan must not call helm upgrade: {:?}",
+        fixture.argv()
+    );
+}

@@ -365,3 +365,18 @@ async fn sequential_different_target_is_refused_without_mutation() {
         "the refused run must not have mutated"
     );
 }
+
+#[test]
+fn upgrade_phase_parse_matches_as_str_and_rejects_unknown() {
+    for phase in UpgradePhase::ALL {
+        assert_eq!(UpgradePhase::parse(phase.as_str()), Some(phase));
+        assert_eq!(
+            UpgradePhase::parse(&format!("  {}  ", phase.as_str())),
+            Some(phase),
+            "parse must trim {}",
+            phase.as_str()
+        );
+    }
+    assert_eq!(UpgradePhase::parse("not-a-phase"), None);
+    assert_eq!(UpgradePhase::parse(""), None);
+}
