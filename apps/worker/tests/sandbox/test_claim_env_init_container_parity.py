@@ -27,7 +27,9 @@ import re
 from pathlib import Path
 
 import pytest
+from curie_worker.attachments import ATTACHMENTS_REF_ENV
 from curie_worker.sandbox.k8s import (
+    ATTACHMENT_INIT_CONTAINERS,
     BUNDLE_INIT_CONTAINERS,
     BUNDLE_REF_ENV,
     WORKSPACE_INIT_CONTAINERS,
@@ -67,6 +69,7 @@ _TARGETED: dict[str, frozenset[str]] = {
         c: frozenset({WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV})
         for c in WORKSPACE_INIT_CONTAINERS
     },
+    **{c: frozenset({ATTACHMENTS_REF_ENV}) for c in ATTACHMENT_INIT_CONTAINERS},
 }
 
 # CURIE_ env an init container reads that is deliberately NOT claim-settable
