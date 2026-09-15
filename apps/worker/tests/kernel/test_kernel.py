@@ -44,6 +44,20 @@ DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
 FAIL = SessionStatus.CLASSIFIED_FAILURE
 
+# #2659 reply texts, pinned as literals so a wording drift in the worker is a
+# visible test failure rather than a silently updated import.
+_ANNOUNCEMENT = "Working in acme-corp/acme-bot, from the repository URL in your message."
+_AMBIGUOUS_REFUSAL = (
+    "This message names more than one GitHub repository, so no repository was "
+    "attached and no work started. A thread works in only one repository."
+)
+_WORKSPACES_OFF_REFUSAL = (
+    "Repository workspaces are turned off on this installation, so no repository "
+    "was attached and no work started. An operator can turn them on with "
+    "agentSandbox.runner.workspace.enabled in the chart values "
+    "(CURIE_WORKSPACE_ENABLED on the worker)."
+)
+
 
 def _qevent(
     text: str,
@@ -419,6 +433,478 @@ def test_no_repository_selection_runs_on_a_generic_claim(make_harness) -> None:
             ]
             assert h.runner.opened == ["Triage this alert"]
             assert len(h.fake_k8s.claim_envs) == 1
+
+    asyncio.run(go())
+
+
+# --- #2659: a plain repository URL attaches and the reply names it -------------
+
+
+class _AttachingWorkspaceProbe:
+    """A coordinator double that selects stickily per thread and claims for real.
+
+    The claim passes ``workspace_repo`` so the route carries the repository, which
+    is what lets a later turn on the thread adopt it instead of handing off.
+    """
+
+    def __init__(self, substrate: Any) -> None:
+        self._substrate = substrate
+        self.selections: list[dict[str, object]] = []
+        self.claims: list[dict[str, object]] = []
+        self.selected: dict[str, str] = {}
+
+    def select_repository(self, **kwargs: object) -> str | None:
+        self.selections.append(dict(kwargs))
+        thread_key = str(kwargs["thread_key"])
+        requested = kwargs["repo_full_name"]
+        if thread_key not in self.selected and requested is not None:
+            self.selected[thread_key] = str(requested)
+        return self.selected.get(thread_key)
+
+    def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+        self.claims.append(dict(kwargs))
+        raw_env = kwargs.get("env")
+        assert raw_env is None or isinstance(raw_env, dict)
+        handle = self._substrate.claim(
+            str(kwargs["thread_key"]),
+            env=dict(raw_env or {}),
+            agent_name=str(kwargs.get("agent_name") or "test-agent"),
+            workspace_repo=str(kwargs["repo_full_name"]),
+        )
+        return SimpleNamespace(handle=handle, prepared=None)
+
+    def touch(self, _thread_key: str, *, ttl_seconds: int) -> bool:
+        return True
+
+
+def _updates_on(h: Any, placeholder: str) -> list[str]:
+    """Every reply text delivered onto one placeholder, in order."""
+    return [text for _address, ref, text in h.sink.updates if ref == placeholder]
+
+
+_REPO_MESSAGE = "Make a change in https://github.com/acme-corp/acme-bot: add a note"
+
+
+def test_repository_url_turn_announces_the_inferred_repository(make_harness) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-777777777771")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding) as h:
+            probe = _AttachingWorkspaceProbe(h.substrate)
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            h.runner.default_script = [Final(text="changed", status=DONE)]
+
+            await h.kernel.process_event(_qevent(_REPO_MESSAGE, thread="tAnnounce"))
+
+            # The model input is the message verbatim; the line is platform text.
+            assert h.runner.opened == [_REPO_MESSAGE]
+            assert [s["repo_full_name"] for s in probe.selections] == [
+                "acme-corp/acme-bot"
+            ]
+            assert len(probe.claims) == 1
+            assert h.sink.last_text == f"changed\n\n{_ANNOUNCEMENT}"
+
+    asyncio.run(go())
+
+
+def test_same_url_on_a_route_that_carries_the_workspace_is_not_announced(
+    make_harness,
+) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-777777777772")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding) as h:
+            probe = _AttachingWorkspaceProbe(h.substrate)
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            h.runner.default_script = [Final(text="changed", status=DONE)]
+
+            await h.kernel.process_event(
+                _qevent(_REPO_MESSAGE, thread="tRepeatUrl", placeholder="p-first")
+            )
+            await h.kernel.process_event(
+                _qevent(_REPO_MESSAGE, thread="tRepeatUrl", placeholder="p-second")
+            )
+
+            assert h.runner.opened == [_REPO_MESSAGE, _REPO_MESSAGE]
+            assert len(probe.claims) == 1
+            # The repeat is checked first: it holds on the base, so a failure on
+            # the first reply below is the missing announcement alone.
+            assert _updates_on(h, "p-second")[-1] == "changed"
+            assert _updates_on(h, "p-first")[-1] == f"changed\n\n{_ANNOUNCEMENT}"
+
+    asyncio.run(go())
+
+
+def test_turns_without_a_repository_fact_are_not_announced(make_harness) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-777777777773")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding) as h:
+            probe = _AttachingWorkspaceProbe(h.substrate)
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            h.runner.default_script = [Final(text="changed", status=DONE)]
+
+            # (a) A sticky thread's follow-up names no repository.
+            await h.kernel.process_event(
+                _qevent(_REPO_MESSAGE, thread="tSticky", placeholder="p-attach")
+            )
+            await h.kernel.process_event(
+                _qevent("continue", thread="tSticky", placeholder="p-continue")
+            )
+            assert _updates_on(h, "p-continue")[-1] == "changed"
+
+            # (b) A fresh generic thread with no selection.
+            h.runner.default_script = [Final(text="triaged", status=DONE)]
+            await h.kernel.process_event(
+                _qevent("Triage this alert", thread="tGeneric", placeholder="p-generic")
+            )
+            assert _updates_on(h, "p-generic")[-1] == "triaged"
+
+            # (c) A non-root GitHub link is not a repository fact (ADR 0126): no
+            # selection request, no refusal, no announcement.
+            h.runner.default_script = [Final(text="looked", status=DONE)]
+            deep_link = "Look at https://github.com/acme-corp/acme-bot/pull/7"
+            await h.kernel.process_event(
+                _qevent(deep_link, thread="tDeepLink", placeholder="p-deep")
+            )
+            deep_selections = [
+                s
+                for s in probe.selections
+                if s["thread_key"] == _thread_key("tDeepLink")
+            ]
+            assert [s["repo_full_name"] for s in deep_selections] == [None]
+            assert _updates_on(h, "p-deep")[-1] == "looked"
+            assert h.runner.opened[-1] == deep_link
+
+    asyncio.run(go())
+
+
+def test_late_workspace_handoff_announces_once(make_harness) -> None:
+    deployment_id = uuid.uuid4()
+    session_id = "agent-session-tLateAnnounce"
+    history_ref = "https://api.example.com/state/transcript/tLateAnnounce"
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_workspace_binding(
+                deployment_id,
+                boot_env_override={
+                    "CURIE_RUNNER_TOKEN": "workspace-test-token",
+                    "CURIE_SESSION_ID": session_id,
+                    "CURIE_HISTORY_REF": history_ref,
+                },
+            )
+        ) as h:
+            class WorkspaceProbe:
+                selected: str | None = None
+                handoffs = 0
+
+                def select_repository(self, **kwargs: object) -> str | None:
+                    requested = kwargs["repo_full_name"]
+                    if requested is not None:
+                        self.selected = str(requested)
+                    return self.selected
+
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    self.handoffs += 1
+                    old = kwargs["replace_handle"]
+                    assert old is not None
+                    raw_env = kwargs["env"]
+                    assert isinstance(raw_env, dict)
+                    handle = h.substrate.handoff(
+                        _thread_key("tLateAnnounce"),
+                        expected=old,
+                        env={
+                            **raw_env,
+                            "CURIE_WORKSPACE_REF": "workspace/private-base",
+                            "CURIE_WORKSPACE_SHA256": "d" * 64,
+                        },
+                        workspace_repo=str(kwargs["repo_full_name"]),
+                    )
+                    return SimpleNamespace(handle=handle, prepared=None)
+
+                def touch(self, _thread_key: str, *, ttl_seconds: int) -> bool:
+                    return ttl_seconds > 0
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            h.runner.default_script = [Final(text="answered", status=DONE)]
+
+            await h.kernel.process_event(
+                _qevent("hello", thread="tLateAnnounce", placeholder="p-hello")
+            )
+            await h.kernel.process_event(
+                _qevent(
+                    "Use https://github.com/acme-corp/acme-bot",
+                    thread="tLateAnnounce",
+                    placeholder="p-url",
+                )
+            )
+            await h.kernel.process_event(
+                _qevent(
+                    "continue in the repository",
+                    thread="tLateAnnounce",
+                    placeholder="p-continue",
+                )
+            )
+
+            assert probe.handoffs == 1
+            assert h.runner.opened == [
+                "hello",
+                "Use https://github.com/acme-corp/acme-bot",
+                "continue in the repository",
+            ]
+            assert _updates_on(h, "p-hello")
+            assert _updates_on(h, "p-continue")
+            assert not any("Working in" in t for t in _updates_on(h, "p-hello"))
+            assert not any("Working in" in t for t in _updates_on(h, "p-continue"))
+            assert _updates_on(h, "p-url")[-1].endswith(f"\n\n{_ANNOUNCEMENT}")
+
+    asyncio.run(go())
+
+
+def test_announcement_survives_a_retry_after_attach(make_harness) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-777777777775")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding, max_attempts=3) as h:
+            probe = _AttachingWorkspaceProbe(h.substrate)
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            # Attempt 1 drops mid-run with no final; attempt 2 completes on a
+            # route that already carries the workspace.
+            h.runner.turn_scripts = [
+                [TextDelta(text="partial")],
+                [Final(text="done", status=DONE)],
+            ]
+
+            await h.kernel.process_event(_qevent(_REPO_MESSAGE, thread="tRetryAttach"))
+
+            assert h.runner.opened == [_REPO_MESSAGE, _REPO_MESSAGE]
+            assert h.sink.last_text == f"done\n\n{_ANNOUNCEMENT}"
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("failing_call", ["start_turn", "steer"])
+def test_announcement_survives_a_startup_failure_after_attach(
+    make_harness, failing_call: str
+) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777b")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding, max_attempts=3) as h:
+            probe = _AttachingWorkspaceProbe(h.substrate)
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            if failing_call == "start_turn":
+                # The claim attaches the workspace, then the first /v1/event
+                # answers 500, which the runner client raises as RunnerError.
+                h.runner.event_fail_times = 1
+            else:
+                # The claim attaches the workspace, then the first steer probe
+                # raises a transient RunnerError before any turn opens.
+                real_steer = h.kernel._runner.steer
+                steer_calls = {"n": 0}
+
+                async def flaky_steer(*args: Any, **kwargs: Any) -> bool:
+                    steer_calls["n"] += 1
+                    if steer_calls["n"] == 1:
+                        raise RunnerError("/v1/steer -> 503: transient")
+                    return await real_steer(*args, **kwargs)
+
+                h.kernel._runner.steer = flaky_steer  # type: ignore[method-assign]
+
+            await h.kernel.process_event(_qevent(_REPO_MESSAGE, thread="tStartRetry"))
+
+            # Each attempt selects; only the first claims, and the retry adopts
+            # the route that claim attached.
+            assert [s["repo_full_name"] for s in probe.selections] == [
+                "acme-corp/acme-bot",
+                "acme-corp/acme-bot",
+            ]
+            assert len(probe.claims) == 1
+            expected_opened = (
+                [_REPO_MESSAGE, _REPO_MESSAGE]
+                if failing_call == "start_turn"
+                else [_REPO_MESSAGE]
+            )
+            # The model input is the message verbatim on every opened turn.
+            assert h.runner.opened == expected_opened
+            assert h.sink.last_text == f"done\n\n{_ANNOUNCEMENT}"
+
+    asyncio.run(go())
+
+
+def test_canned_greeting_with_a_url_is_not_announced(make_harness) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-777777777778")
+
+    # A greeting matches only a bare utterance, so "hi <url>" never matches a
+    # plain "hi" phrase. The phrase carries the URL so the canned path is really
+    # reached on a message that produced a repository fact.
+    class GreetingBinding(_BuiltInCodingBinding):
+        def packs_for(self, _resolved: object) -> BehaviorPacks:
+            return BehaviorPacks.from_config(
+                {
+                    "greeting": {
+                        "enabled": True,
+                        "phrases": ["hi https://github.com/acme-corp/acme-bot"],
+                        "reply": "Hello from the greeting pack.",
+                    }
+                }
+            )
+
+    async def go() -> None:
+        binding = GreetingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding) as h:
+            probe = _AttachingWorkspaceProbe(h.substrate)
+            h.kernel._workspace = probe  # type: ignore[assignment]
+
+            await h.kernel.process_event(
+                _qevent("hi https://github.com/acme-corp/acme-bot", thread="tGreetUrl")
+            )
+
+            assert [s["repo_full_name"] for s in probe.selections] == [
+                "acme-corp/acme-bot"
+            ]
+            assert h.sink.last_text == "Hello from the greeting pack."
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
+def test_no_edit_streaming_final_carries_the_announcement(make_harness) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-777777777779")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(slack_no_edit_streaming=True, binding=binding) as h:
+            probe = _AttachingWorkspaceProbe(h.substrate)
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            h.runner.default_script = [
+                TextDelta(text="chan"),
+                TextDelta(text="ged"),
+                Final(text="changed", status=DONE),
+            ]
+
+            await h.kernel.process_event(_qevent(_REPO_MESSAGE, thread="tNoEditAnnounce"))
+
+            assert [text for _a, _r, text in h.sink.updates] == [
+                f"changed\n\n{_ANNOUNCEMENT}"
+            ]
+
+    asyncio.run(go())
+
+
+def test_announcement_sits_between_answer_and_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A unit on the composition order: answer, announcement, receipt.
+    monkeypatch.setattr(kernel_module, "render_receipt", lambda rows: "RECEIPT")
+
+    announced = kernel_module._StreamAccumulator(
+        text_parts=["answer"],
+        receipt_rows=[{"x": 1}],
+        workspace_inferred_repo="acme-corp/acme-bot",
+    )
+    assert announced.rendered_with_receipt() == f"answer\n\n{_ANNOUNCEMENT}\n\nRECEIPT"
+
+    unannounced = kernel_module._StreamAccumulator(
+        text_parts=["answer"],
+        receipt_rows=[{"x": 1}],
+    )
+    assert unannounced.rendered_with_receipt() == "answer\n\nRECEIPT"
+
+
+def test_named_repository_with_workspaces_off_is_a_terminal_refusal(
+    make_harness,
+) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777a")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        # No workspace coordinator: the harness default is None, which is the
+        # worker-wide switch turned off.
+        async with make_harness(binding=binding, max_attempts=3) as h:
+            assert h.kernel._workspace is None
+            h.runner.default_script = [Final(text="changed", status=DONE)]
+            ev = _qevent(_REPO_MESSAGE, thread="tWorkspacesOff")
+
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == []
+            assert h.fake_k8s.claim_envs == []
+            assert h.sink.last_text == _WORKSPACES_OFF_REFUSAL
+            assert not any("workspace-error" in t for _a, _r, t in h.sink.updates)
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_no_repository_with_workspaces_off_still_escalates_as_workspace_error(
+    make_harness,
+) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777b")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding, max_attempts=1) as h:
+            assert h.kernel._workspace is None
+            await h.kernel.process_event(
+                _qevent("Triage this alert", thread="tWorkspacesOffGeneric")
+            )
+
+            assert h.runner.opened == []
+            assert h.sink.last_text is not None
+            assert "workspace-error" in h.sink.last_text, h.sink.last_text
+            assert "Flagging for a human" in h.sink.last_text
+
+    asyncio.run(go())
+
+
+def test_steered_follow_up_with_the_url_is_not_announced(make_harness) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777c")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding) as h:
+            probe = _AttachingWorkspaceProbe(h.substrate)
+            probe.selected[_thread_key("tSteerUrl")] = "acme-corp/acme-bot"
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            h.substrate.claim(
+                _thread_key("tSteerUrl"),
+                env={},
+                workspace_repo="acme-corp/acme-bot",
+            )
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=DONE)]
+
+            t1 = asyncio.create_task(
+                h.kernel.process_event(
+                    _qevent("first", thread="tSteerUrl", placeholder="p-live")
+                )
+            )
+            try:
+                await _wait_until(lambda: h.runner.turn_active)
+
+                await h.kernel.process_event(
+                    _qevent(_REPO_MESSAGE, thread="tSteerUrl", placeholder="p-steer")
+                )
+                assert h.runner.steers == [_REPO_MESSAGE]
+                assert h.runner.opened == ["first"]
+                steer_updates = _updates_on(h, "p-steer")
+                assert steer_updates[-1] == "Folded into the in-progress reply above."
+                assert not any("Working in" in t for t in steer_updates)
+            finally:
+                hold.set()
+                await t1
+            assert probe.claims == []
 
     asyncio.run(go())
 
@@ -1457,8 +1943,7 @@ def test_ambiguous_repo_is_terminal_before_selection_claim_or_model(
 
             assert h.runner.opened == []
             assert h.fake_k8s.claim_envs == []
-            assert h.sink.last_text is not None
-            assert "only one" in h.sink.last_text.lower()
+            assert h.sink.last_text == _AMBIGUOUS_REFUSAL
 
     asyncio.run(go())
 
@@ -3130,7 +3615,10 @@ def test_lock_acquire_timeout_is_a_retryable_turn_start_failure(make_harness) ->
                 released.append(True)
 
             qe = _qevent("go", thread=thread)
-            outcome = await h.kernel._attempt(qe, TargetRoute(), release_order)
+            outcome = await h.kernel._attempt(
+                qe, TargetRoute(), release_order,
+                workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+            )
 
             assert outcome.terminal_ok is False
             assert outcome.classification == "runner-error"  # retryable
@@ -3571,7 +4059,12 @@ def test_stream_timeout_classifies_as_runner_timeout_with_a_named_reason(
             qe = _qevent("go", thread="tStreamTimeout")
             try:
                 with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
-                    outcome = await h.kernel._attempt(qe, TargetRoute(), release_order)
+                    outcome = await h.kernel._attempt(
+                        qe,
+                        TargetRoute(),
+                        release_order,
+                        workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                    )
             finally:
                 hold.set()  # let the fake runner's handler unwind
 
@@ -3728,7 +4221,10 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
 
             qe = _qevent("go", thread="tReplyTimeout")
             with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
-                outcome = await h.kernel._attempt(qe, TargetRoute(), lambda: None)
+                outcome = await h.kernel._attempt(
+                    qe, TargetRoute(), lambda: None,
+                    workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                )
 
             assert outcome.terminal_ok is False
             assert outcome.classification == "runner-error"

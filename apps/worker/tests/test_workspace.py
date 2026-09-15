@@ -452,11 +452,18 @@ def test_runtime_repo_parser_accepts_one_root_url_and_rejects_ambiguous(
         "Keep working in this thread; the repository is already selected."
     ) is None
 
-    with pytest.raises(workspace.WorkspaceSelectionRefused, match="only one"):
+    with pytest.raises(
+        workspace.WorkspaceSelectionRefused, match="only one"
+    ) as excinfo:
         workspace.parse_github_repo_fact(
             "Compare https://github.com/acme-corp/acme-bot with "
             "https://github.com/acme-corp/acme-api before changing anything."
         )
+    # #2659: the refusal states the reason instead of asking for a rephrase.
+    assert excinfo.value.public_detail == (
+        "This message names more than one GitHub repository, so no repository "
+        "was attached and no work started. A thread works in only one repository."
+    )
 
 
 def test_runtime_repo_parser_deduplicates_repeated_repository_facts(

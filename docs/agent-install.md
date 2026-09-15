@@ -130,7 +130,8 @@ Return the final `INSTALL_RESULT` line unchanged with the command transcript.
 ## Runtime repository allowlist
 
 Managed `/workspace` checkouts are selected by one allowed root GitHub URL in
-the opening message. The chart default `api.githubRepoAllowlist: []` denies
+a thread's message, written in plain words; Curie's reply names the repository
+it inferred. The chart default `api.githubRepoAllowlist: []` denies
 every selection. Set it when you install or upgrade:
 
 ```bash

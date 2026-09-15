@@ -27,13 +27,15 @@ The chart default `api.githubRepoAllowlist: []` denies every runtime selection.
 `--workspace` flag is a deprecated compatibility no-op; the allowlist is the
 real control. `owner/*` allows every repository under that owner.
 
-Invite the bot to the channel. In the opening message, include the single
-allowed root repository URL, for example
-`https://github.com/acme-corp/acme-bot`, together with a focused change. Curie
-acquires that repository when it claims the sandbox and mounts the
-credential-free checkout at `/workspace`. A message without a usable root URL
-runs without a managed checkout; adding one after that sandbox is already
-running does not remount it.
+Invite the bot; ask for the change in plain words and include the single
+allowed root repository URL, for example "Make a focused change in
+https://github.com/acme-corp/acme-bot: ...". No special phrasing is needed. Curie
+acquires that repository when it claims the sandbox, mounts the credential-free
+checkout at `/workspace`, and says in its reply which repository it inferred from the
+URL. A message without a root URL runs without a managed checkout. A root URL in a
+later message of a thread with no repository yet moves the conversation onto a
+checkout once the thread is idle. A repository Curie cannot attach, such as one
+outside the allowlist, gets a refusal that names the reason.
 
 When the change is ready, ask the agent to publish. The built-in publication
 tool posts an approval card in the same thread, ends the turn while approval is

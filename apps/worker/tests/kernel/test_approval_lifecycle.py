@@ -32,6 +32,7 @@ from curie_worker.approvals import (
     PublicationCreateRequest,
     SettledApproval,
 )
+from curie_worker.kernel import _WorkspaceInferenceCarry
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError
 from curie_worker.sandbox.types import RouteState
@@ -400,6 +401,7 @@ def test_route_cas_loss_never_steers_or_starts_the_old_lineage_runner() -> None:
                 lineage_head="a" * 40,
                 force_lineage_replacement=True,
                 pending_publication_approval=False,
+                workspace_inference=_WorkspaceInferenceCarry(),
             )
 
         assert substrate.adopt_calls == 0
@@ -521,6 +523,7 @@ def test_verified_lineage_with_mismatched_route_state_cold_reconciles(
                 {},
                 workspace_deployment_id=deployment_id,
                 agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
             )
 
     asyncio.run(go())
@@ -638,6 +641,7 @@ def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
             {},
             workspace_deployment_id=deployment_id,
             agent_name="acme-bot",
+            workspace_inference=_WorkspaceInferenceCarry(),
         )
 
         assert substrate.adopt_calls == 1
@@ -783,6 +787,7 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
             {},
             workspace_deployment_id=deployment_id,
             agent_name="acme-bot",
+            workspace_inference=_WorkspaceInferenceCarry(),
         )
         runner.live = True
         second = await kernel._route_and_start(
@@ -791,6 +796,7 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
             {},
             workspace_deployment_id=deployment_id,
             agent_name="acme-bot",
+            workspace_inference=_WorkspaceInferenceCarry(),
         )
 
         assert first.steered is False
@@ -901,6 +907,7 @@ def test_api_pending_publication_work_is_fenced_before_lineage_handoff_probe(
                 {"CURIE_RUNNER_TOKEN": "runner-token"},
                 workspace_deployment_id=deployment_id,
                 agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
             )
 
         assert publication_api.reads == [
@@ -1072,6 +1079,7 @@ def test_api_stale_head_conflict_stops_before_workspace_or_model_for_private_rep
                 {},
                 workspace_deployment_id=deployment_id,
                 agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
             )
 
     asyncio.run(go())
@@ -1348,6 +1356,225 @@ def test_slack_publication_ownership_uses_scoped_key_but_replies_use_bare_thread
     asyncio.run(go())
 
 
+# --- #2659: the inferred repository line sits above the approval notice --------
+
+
+def test_ordinary_approval_notice_keeps_the_announcement_above_it(make_harness) -> None:
+    """The announcement is its own block before the notice, never in the record."""
+
+    deployment_id = uuid.UUID("22222222-2222-4222-8222-222222222659")
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+            )
+
+    class Workspace:
+        def __init__(self) -> None:
+            self.substrate = None
+            self.selections: list[object] = []
+
+        def select_repository(self, **kwargs: object) -> str | None:
+            self.selections.append(kwargs["repo_full_name"])
+            return "acme-corp/acme-bot"
+
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            assert self.substrate is not None
+            return SimpleNamespace(
+                handle=self.substrate.claim(
+                    str(kwargs["thread_key"]),
+                    env=kwargs["env"],
+                    agent_name=kwargs["agent_name"],
+                    workspace_repo=kwargs["repo_full_name"],
+                ),
+                prepared=None,
+            )
+
+        def release(self, _thread_identity: str) -> None:
+            return None
+
+        def touch(self, _thread_identity: str, *, ttl_seconds: int) -> bool:
+            return ttl_seconds > 0
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        workspace = Workspace()
+        binding = Binding(grant_event_id="unused", grant_tool="unused")
+        async with make_harness(binding=binding, approvals=approvals) as h:
+            workspace.substrate = h.substrate
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+
+            await h.kernel.process_event(
+                _qevent(
+                    "Make a change in https://github.com/acme-corp/acme-bot: discount",
+                    thread="tAnnounceApproval",
+                )
+            )
+
+            assert workspace.selections == ["acme-corp/acme-bot"]
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].summary == "Give ACME a 20% discount"
+            assert "Working in" not in approvals.requests[0].summary
+            assert h.sink.last_text is not None
+            assert h.sink.last_text.split("\n\n") == [
+                "Requesting sign-off",
+                "Working in acme-corp/acme-bot, from the repository URL in your message.",
+                "Awaiting approval (appr-1): Give ACME a 20% discount\n"
+                "The session is paused and will resume once an authorized member "
+                "resolves this request.",
+            ]
+
+    asyncio.run(go())
+
+
+def test_publication_notice_keeps_the_announcement_above_it(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The demo path: the publication notice keeps the announcement as its own block."""
+
+    from curie_worker.approvals import CreatedPublication
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    deployment_id = uuid.UUID("11111111-1111-4111-8111-111111112659")
+    thread = "1700000000.002659"
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+            )
+
+    class PublicationApi:
+        def __init__(self) -> None:
+            self.creates: list[PublicationCreateRequest] = []
+
+        async def get_publication_lineage(
+            self, requested_deployment: uuid.UUID, conversation: str, repo: str
+        ) -> None:
+            return None
+
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
+            self.creates.append(request)
+            return CreatedPublication(
+                id="publication-example",
+                approval_id="approval-example",
+                status="pending",
+            )
+
+    class Workspace:
+        def __init__(self) -> None:
+            self.substrate = None
+
+        def select_repository(self, **kwargs: object) -> str:
+            return "acme-corp/acme-private"
+
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            assert self.substrate is not None
+            return SimpleNamespace(
+                handle=self.substrate.claim(
+                    str(kwargs["thread_key"]),
+                    env=kwargs["env"],
+                    agent_name=kwargs["agent_name"],
+                    workspace_repo=kwargs["repo_full_name"],
+                )
+            )
+
+        def release(self, _thread_identity: str) -> None:
+            return None
+
+        def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
+            del ttl_seconds
+
+    async def go() -> None:
+        publication_api = PublicationApi()
+        workspace = Workspace()
+        binding = Binding(grant_event_id="unused", grant_tool="unused")
+        async with make_harness(
+            binding=binding, publication_creator=publication_api
+        ) as h:
+            workspace.substrate = h.substrate
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            h.runner.default_script = [
+                Final(
+                    text="Ready to publish",
+                    status=AWAITING,
+                    approval_summary="Publish the prepared changes",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="mcp__curie__publish_changes",
+                )
+            ]
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                return RunnerWorkspaceSnapshot(
+                    repo_full_name="acme-corp/acme-private",
+                    base_sha="a" * 40,
+                    patch=b"diff --git a/README.md b/README.md\n",
+                    changed_paths=("README.md",),
+                    contains_workflow_files=False,
+                    publication_title="Update README",
+                    publication_body="Prepared by acme-bot.",
+                )
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            monkeypatch.setattr(
+                "curie_worker.kernel.validate_snapshot_against_base",
+                lambda *_args, **_kwargs: None,
+            )
+            await h.kernel.process_event(
+                _qevent(
+                    "Publish https://github.com/acme-corp/acme-private",
+                    thread=thread,
+                    channel="C0EXAMPLE1",
+                )
+            )
+
+            assert len(publication_api.creates) == 1
+            assert "Working in" not in publication_api.creates[0].summary
+            notices = [
+                text
+                for _address, _ref, text in h.sink.updates
+                if "Awaiting approval (approval-example)" in text
+            ]
+            assert notices, h.sink.updates
+            blocks = notices[-1].split("\n\n")
+            marker = next(
+                index
+                for index, block in enumerate(blocks)
+                if block.startswith("Awaiting approval (approval-example)")
+            )
+            assert marker >= 1, blocks
+            assert blocks[marker - 1] == (
+                "Working in acme-corp/acme-private, from the repository URL in your message."
+            )
+
+    asyncio.run(go())
+
+
 def test_private_lineage_head_reaches_handoff_without_a_publication_credential() -> None:
     async def go() -> None:
         from curie_worker.approvals import PublicationLineage
@@ -1431,6 +1658,7 @@ def test_private_lineage_head_reaches_handoff_without_a_publication_credential()
                 {"CURIE_RUNNER_TOKEN": "runner-token"},
                 workspace_deployment_id=deployment_id,
                 agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
             )
 
         assert workspace.claim is not None
@@ -2393,6 +2621,7 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
                 TargetRoute(),
                 lambda: None,
                 remaining_s=17.25,
+                workspace_inference=_WorkspaceInferenceCarry(),
             )
 
             assert outcome.status is AWAITING
