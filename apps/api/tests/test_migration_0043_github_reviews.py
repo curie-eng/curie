@@ -31,10 +31,13 @@ def test_0043_refuses_active_work_and_allows_rollback_after_real_settlement(
     ]
     assert [row["status"] for row in before_feedback] == ([] if retryable else ["queued"])
     assert valkey.xlen(stream) == (0 if retryable else 1)
-    before_revision = review_rows("SELECT version_num FROM curie.alembic_version")
+    original_revision = review_rows("SELECT version_num FROM curie.alembic_version")
     api_dir = Path(__file__).resolve().parents[1]
     config = Config(str(api_dir / "alembic.ini"))
     config.set_main_option("script_location", str(api_dir / "alembic"))
+    command.downgrade(config, "0043")
+    before_revision = review_rows("SELECT version_num FROM curie.alembic_version")
+    assert before_revision == [{"version_num": "0043"}]
     try:
         with pytest.raises(RuntimeError, match="deliveries are active"):
             command.downgrade(config, "0042")
@@ -66,5 +69,5 @@ def test_0043_refuses_active_work_and_allows_rollback_after_real_settlement(
             "to_regclass('curie.github_review_deliveries') AS delivery"
         ) == [{"feedback": None, "delivery": None}]
     finally:
-        command.upgrade(config, before_revision[0]["version_num"])
-    assert review_rows("SELECT version_num FROM curie.alembic_version") == before_revision
+        command.upgrade(config, original_revision[0]["version_num"])
+    assert review_rows("SELECT version_num FROM curie.alembic_version") == original_revision

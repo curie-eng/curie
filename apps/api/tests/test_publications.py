@@ -2976,6 +2976,7 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
         "clone_url": "https://github.com/acme-corp/acme-bot.git",
         "authorization_header": "Basic "
         + base64.b64encode(b"x-access-token:ghp_publication_operator").decode(),
+        "revision": None,
     }
 
     audit = _rows(

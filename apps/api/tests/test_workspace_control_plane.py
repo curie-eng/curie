@@ -211,7 +211,7 @@ def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
     )
 
     assert selected.status_code == reused.status_code == 200
-    assert selected.json() == reused.json() == {"repo_full_name": REPO}
+    assert selected.json() == reused.json() == {"repo_full_name": REPO, "revision": None}
     assert conflict.status_code == 409
     assert conflict.json()["detail"]["code"] == "workspace.selection_conflict"
     assert _selection_rows() == [
@@ -245,7 +245,7 @@ def test_workspace_capability_without_repo_remains_an_unselected_generic_thread(
     )
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"repo_full_name": None}
+    assert response.json() == {"repo_full_name": None, "revision": None}
     assert _selection_rows() == []
 
 
@@ -275,7 +275,7 @@ def test_no_url_and_no_durable_selection_returns_null_without_redemption(
     )
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"repo_full_name": None}
+    assert response.json() == {"repo_full_name": None, "revision": None}
     assert _selection_rows() == []
     assert _audit_rows() == []
 
@@ -310,7 +310,7 @@ def test_selection_survives_redeployment_for_the_same_agent_thread(
     )
 
     assert reused.status_code == 200, reused.text
-    assert reused.json() == {"repo_full_name": REPO}
+    assert reused.json() == {"repo_full_name": REPO, "revision": None}
     assert len(_selection_rows()) == 1
 
 
@@ -426,6 +426,7 @@ def test_workspace_credential_is_worker_only_server_derived_and_no_store(
         "clone_url": "https://github.com/acme-corp/acme-bot.git",
         "authorization_header": "Basic "
         + base64.b64encode(b"x-access-token:ghp_operator_workspace").decode(),
+        "revision": None,
     }
     assert OTHER_REPO not in issued.text
     assert "evil.example" not in issued.text
@@ -629,7 +630,7 @@ def test_legacy_deployment_workspace_field_does_not_gate_selection_or_credential
     )
 
     assert selected.status_code == 200, selected.text
-    assert selected.json() == {"repo_full_name": REPO}
+    assert selected.json() == {"repo_full_name": REPO, "revision": None}
     assert response.status_code == 200, response.text
     assert response.headers["cache-control"] == "no-store"
     assert response.json()["repo_full_name"] == REPO
