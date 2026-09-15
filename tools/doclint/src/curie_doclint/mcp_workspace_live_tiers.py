@@ -2,7 +2,7 @@
 
 A pull request can change how the runner advertises MCP tools, how PreToolUse
 classifies them, or how a mounted workspace exposes coding and publication
-tools, then mark live-provider and Slack external-integration n/a because
+tools, then mark live-provider and external-integration n/a because
 "model routing did not change." The implement skill and AGENTS.md now forbid
 that classification. This check pins the contiguous rule sentences so a
 reword cannot keep the nouns and drop the prohibition.
@@ -31,7 +31,7 @@ WORKFLOW_SENTENCES = (
     "in-process platform MCP tools, workspace publication, and "
     "built-in coding-tool session capability",
     "A behavior-bearing change that reaches any of those reaches both "
-    "live-provider and Slack external-integration",
+    "live-provider and external-integration",
     '"No model routing change" is not a valid n/a reason',
     "Fake-model kind, skill ladder, and helper-only tests remain useful "
     "and are not sufficient",
@@ -43,7 +43,7 @@ TEMPLATE_SENTENCES = (
     "runner MCP catalog projection, unscoped PreToolUse, "
     "in-process platform MCP tools, workspace publication",
     "built-in coding-tool session capability must record live-provider plus "
-    "Slack external-integration evidence, or leave those required-tier "
+    "external-integration evidence, or leave those required-tier "
     "rows open",
     '"No model routing change" is not a valid n/a reason',
 )
