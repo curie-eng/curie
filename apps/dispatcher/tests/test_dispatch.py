@@ -5,11 +5,13 @@ API client (the only two things faked, per test discipline), and assert the full
 lifecycle step: envelope -> ack -> in-thread placeholder -> XADD to real Valkey.
 """
 
+import logging
 import threading
 import time
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 import redis
 from curie_dispatcher.app import build_app
 from curie_dispatcher.config import DispatcherConfig
@@ -130,6 +132,38 @@ def test_envelope_acked_placeholder_posted_and_enqueued(
     assert queued.text == "hi there"
     assert queued.conversation_id == "1700.0001"
     assert queued.reply_handle.placeholder == BOT_TS
+
+
+def test_enqueued_mention_log_includes_release_identity(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An accepted mention logs which Curie release enqueued it."""
+
+    identity = "curie-enqueue-identity-2660"
+    monkeypatch.setenv("CURIE_RELEASE_IDENTITY", identity)
+    logger = logging.getLogger("test-dispatch-identity")
+    web_client = WebClient(token="xoxb-test")
+    web_client.chat_postMessage = MagicMock(return_value={"ts": BOT_TS})  # type: ignore[method-assign]
+    app = build_app(
+        config,
+        web_client=web_client,
+        redis_client=redis_client,
+        authorize=_authorize,
+        logger=logger,
+    )
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    with caplog.at_level(logging.INFO, logger="test-dispatch-identity"):
+        handler.handle(sock, _events_api_request("env-id", "Ev-id", _mention_event()))
+        _drain(app)
+
+    assert redis_client.xlen(config.stream) == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("identity=" in message and identity in message for message in messages), messages
 
 
 def test_a_leading_self_mention_is_stripped_from_the_enqueued_text(

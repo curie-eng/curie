@@ -32,6 +32,7 @@ Env mapping:
 """
 
 import json
+import os
 from typing import Annotated
 
 from aci_protocol.service_config import (
@@ -49,6 +50,17 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
+
+
+def release_identity() -> str:
+    """Which Curie release this process is, for overlap logs.
+
+    Not a Settings field and not a chart env. Reads the environment at call
+    time so a test can set ``CURIE_RELEASE_IDENTITY`` or ``HOSTNAME`` without
+    reconstructing ``DispatcherConfig``. Kubernetes already supplies
+    ``HOSTNAME`` as the pod name.
+    """
+    return os.environ.get("CURIE_RELEASE_IDENTITY") or os.environ.get("HOSTNAME") or "unknown"
 
 
 class ThreadedBotAdmission(BaseModel):

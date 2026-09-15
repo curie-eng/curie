@@ -137,7 +137,15 @@ def is_release_ownership_miss(outcome: ResolveOutcome) -> bool:
     )
 
 
-def decline_unowned_envelope(ack: Any, *, approval_id: str, log: logging.Logger) -> None:
+def decline_unowned_envelope(
+    ack: Any,
+    *,
+    approval_id: str,
+    log: logging.Logger,
+    web_client: WebClient | None = None,
+    channel: str | None = None,
+    user: str | None = None,
+) -> None:
     """Leave the Socket Mode envelope unacked so Slack retries another connection.
 
     Bolt's SocketModeHandler only emits the envelope ack when the BoltResponse
@@ -145,6 +153,10 @@ def decline_unowned_envelope(ack: Any, *, approval_id: str, log: logging.Logger)
     Assigning a non-200 to ack.response unblocks the listener runner, which
     waits on ``ack.response is None``, without acknowledging. Slack then
     retries the same envelope on another connection of the same app.
+
+    When ``web_client``, ``channel``, and ``user`` are all present, also post
+    an ephemeral telling the clicker to disconnect the extra Socket Mode
+    client. That notice must not ack the envelope or mutate the card.
     """
 
     from slack_bolt.response import BoltResponse
@@ -154,6 +166,14 @@ def decline_unowned_envelope(ack: Any, *, approval_id: str, log: logging.Logger)
         approval_id,
     )
     ack.response = BoltResponse(status=404, body="")
+    if web_client is not None and channel and user:
+        _ephemeral(
+            web_client,
+            channel=channel,
+            user=user,
+            text=_refusal_text(ResolveOutcome(status_code=404, detail=_APPROVAL_NOT_FOUND_DETAIL)),
+            log=log,
+        )
 
 
 def this_release_owns_action(body: dict[str, Any], resolver: ApprovalResolveClient) -> bool | None:
@@ -836,7 +856,8 @@ def _refusal_text(outcome: ResolveOutcome) -> str:
         if outcome.detail.strip().casefold() == _APPROVAL_NOT_FOUND_DETAIL:
             return (
                 "This Curie release does not have this approval, so nothing was "
-                "changed. Try again so the owning release can handle it."
+                "changed. Another Socket Mode client is likely serving this Slack app. "
+                "Disconnect the extra client; do not retry from this side."
             )
         return "Resolving failed; try again shortly."
     return "Resolving failed; try again shortly."

@@ -205,6 +205,15 @@ def _drain(app: App) -> None:
     app.listener_runner.listener_executor.shutdown(wait=True)
 
 
+def _assert_ownership_miss_ephemeral(web_client: WebClient) -> None:
+    web_client.chat_postEphemeral.assert_called_once()
+    text = web_client.chat_postEphemeral.call_args.kwargs["text"]
+    folded = text.casefold()
+    assert "disconnect" in folded
+    assert "do not retry from this side" in folded
+    assert "try again" not in folded
+
+
 def _note_click(envelope_id: str, *, action_id: str, user: str = "U_MANAGER") -> SocketModeRequest:
     return SocketModeRequest(
         type="interactive",
@@ -381,9 +390,10 @@ def test_two_releases_only_the_owner_resolves_a_note_submission(
     assert owner.calls[0]["note"] == "approved for Q3"
     non_owner_web.conversations_replies.assert_not_called()
     non_owner_web.chat_update.assert_not_called()
-    non_owner_web.chat_postEphemeral.assert_not_called()
+    _assert_ownership_miss_ephemeral(non_owner_web)
     owner_web.chat_update.assert_called_once()
     assert "approved for Q3" in owner_web.chat_update.call_args.kwargs["text"]
+    owner_web.chat_postEphemeral.assert_not_called()
 
 
 def test_two_releases_only_the_owner_opens_a_note_dialog(
@@ -423,7 +433,9 @@ def test_two_releases_only_the_owner_opens_a_note_dialog(
     assert non_owner.calls == []
     assert owner.calls == []
     non_owner_web.views_open.assert_not_called()
+    _assert_ownership_miss_ephemeral(non_owner_web)
     owner_web.views_open.assert_called_once()
+    owner_web.chat_postEphemeral.assert_not_called()
 
 
 def test_an_unrelated_404_does_not_claim_cross_release_ownership() -> None:
@@ -436,12 +448,17 @@ def test_an_unrelated_404_does_not_claim_cross_release_ownership() -> None:
 
 
 def test_an_approval_record_miss_asks_for_the_owning_release() -> None:
-    """The exact API row miss is retryable when two releases share one app."""
+    """The exact API row miss is a durable misconfiguration, not a retry."""
 
     refusal = _refusal_text(ResolveOutcome(status_code=404, detail="approval not found"))
+    folded = refusal.casefold()
 
-    assert "nothing was changed" in refusal
-    assert "owning release" in refusal
+    assert "nothing was changed" in folded
+    assert "does not have this approval" in folded
+    assert "try again" not in folded
+    assert "disconnect" in folded
+    assert "socket mode" in folded
+    assert "do not retry from this side" in folded
 
 
 def test_modal_submit_posts_the_note_with_a_chat_principal(

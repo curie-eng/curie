@@ -12,6 +12,21 @@ const LOCAL_SLACK_STUB_URL: &str = "http://localhost:8155/api/";
 /// The worker's stub bot token (compose default); restored on disconnect.
 const LOCAL_SLACK_STUB_BOT_TOKEN: &str = "xoxb-dev";
 
+/// Shared connect-time copy: exactly one Curie release may own a Slack app.
+pub const SLACK_ONE_APP_PER_RELEASE_NOTE: &str =
+    "Exactly one Curie release may connect to one Slack app.";
+
+/// Success note after `comms --slack`. `local` is true for the compose path.
+pub fn slack_connected_note(local: bool) -> String {
+    if local {
+        format!(
+            "Slack connected to the local stack (dispatcher running, worker on real Slack). {SLACK_ONE_APP_PER_RELEASE_NOTE}"
+        )
+    } else {
+        format!("Slack connected. {SLACK_ONE_APP_PER_RELEASE_NOTE}")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CommsOpts {
     pub common: CommonOpts,
@@ -401,7 +416,7 @@ pub async fn comms(opts: CommsOpts) -> Result<CommsOutput> {
     if opts.disconnect {
         ui.note("Slack disconnected; dispatcher tokens cleared");
     } else {
-        ui.note("Slack connected");
+        ui.note(&slack_connected_note(false));
     }
     Ok(CommsOutput::Done {
         connected: !opts.disconnect,
@@ -446,7 +461,7 @@ pub async fn local_comms(opts: LocalCommsOpts) -> Result<CommsOutput> {
     if opts.disconnect {
         ui.note("Slack disconnected; worker back on the local stub");
     } else {
-        ui.note("Slack connected to the local stack (dispatcher running, worker on real Slack)");
+        ui.note(&slack_connected_note(true));
     }
     Ok(CommsOutput::Done {
         connected: !opts.disconnect,
@@ -1070,5 +1085,38 @@ mod tests {
                  OTEL_EXPORTER_OTLP_ENDPOINT; up={up_env:?} disconnect={disconnect_env:?}"
             );
         }
+    }
+
+    /// One Slack app belongs to one Curie release; the shared note must say so.
+    #[test]
+    fn slack_one_app_per_release_note_states_the_rule() {
+        let folded = SLACK_ONE_APP_PER_RELEASE_NOTE.to_ascii_lowercase();
+        assert!(
+            folded.contains("one slack app"),
+            "{SLACK_ONE_APP_PER_RELEASE_NOTE}"
+        );
+        assert!(
+            folded.contains("release"),
+            "{SLACK_ONE_APP_PER_RELEASE_NOTE}"
+        );
+    }
+
+    /// Cluster and local `comms --slack` success notes both carry the shared
+    /// one-app-one-release rule. `slack_connected_note` is the sibling helper
+    /// both `ui.note` paths must use.
+    #[test]
+    fn cluster_and_local_slack_connected_notes_include_the_one_app_rule() {
+        let cluster = slack_connected_note(false);
+        let local = slack_connected_note(true);
+        assert!(
+            cluster.contains(SLACK_ONE_APP_PER_RELEASE_NOTE),
+            "{cluster}"
+        );
+        assert!(local.contains(SLACK_ONE_APP_PER_RELEASE_NOTE), "{local}");
+        assert!(cluster.contains("Slack connected"), "{cluster}");
+        assert!(
+            local.contains("dispatcher running, worker on real Slack"),
+            "{local}"
+        );
     }
 }

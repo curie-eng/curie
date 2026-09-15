@@ -71,7 +71,7 @@ from .approval_actions import (
     resolve_note_submission,
     this_release_owns_action,
 )
-from .config import DispatcherConfig
+from .config import DispatcherConfig, release_identity
 from .inbound_text import derive_text
 from .queue import claim_event, enqueue, release_event
 from .relevance import DropReason, Lane, classify, drop, missing_envelope_fields
@@ -268,7 +268,13 @@ def _mint_turn(
         received_at=clock(),
     )
     stream_id = enqueue(redis_client, config, queued)
-    log.info("enqueued %s %s as stream entry %s", delivery_kind, slack_event_id, stream_id)
+    log.info(
+        "enqueued %s %s as stream entry %s identity=%s",
+        delivery_kind,
+        slack_event_id,
+        stream_id,
+        release_identity(),
+    )
     return stream_id
 
 
@@ -368,6 +374,14 @@ def action_command(action: dict[str, Any]) -> str:
 def _action_approval_id(body: dict[str, Any]) -> str:
     actions = body.get("actions") or []
     return str(actions[0].get("value") or "") if actions else ""
+
+
+def _action_channel_id(body: dict[str, Any]) -> str:
+    return str((body.get("channel") or {}).get("id") or "")
+
+
+def _action_user_id(body: dict[str, Any]) -> str:
+    return str((body.get("user") or {}).get("id") or "")
 
 
 def process_action(
@@ -563,7 +577,14 @@ def register_handlers(
             ack()
             return
         if is_release_ownership_miss(click.outcome):
-            decline_unowned_envelope(ack, approval_id=click.approval_id, log=log)
+            decline_unowned_envelope(
+                ack,
+                approval_id=click.approval_id,
+                log=log,
+                web_client=web_client,
+                channel=click.channel,
+                user=click.user,
+            )
             return
         ack()
         render_approval_action(click, web_client=web_client, logger=logger)
@@ -580,7 +601,14 @@ def register_handlers(
             ack()
             return
         if is_release_ownership_miss(click.outcome):
-            decline_unowned_envelope(ack, approval_id=click.approval_id, log=log)
+            decline_unowned_envelope(
+                ack,
+                approval_id=click.approval_id,
+                log=log,
+                web_client=web_client,
+                channel=click.channel,
+                user=click.user,
+            )
             return
         ack()
         render_approval_action(click, web_client=web_client, logger=logger)
@@ -594,7 +622,14 @@ def register_handlers(
     @app.action(APPROVE_NOTE_ACTION_ID)
     def _on_approve_with_note(ack: Callable[..., Any], body: dict[str, Any]) -> None:
         if this_release_owns_action(body, approval_resolver) is False:
-            decline_unowned_envelope(ack, approval_id=_action_approval_id(body), log=log)
+            decline_unowned_envelope(
+                ack,
+                approval_id=_action_approval_id(body),
+                log=log,
+                web_client=web_client,
+                channel=_action_channel_id(body),
+                user=_action_user_id(body),
+            )
             return
         ack()
         open_note_dialog(
@@ -608,7 +643,14 @@ def register_handlers(
     @app.action(REJECT_NOTE_ACTION_ID)
     def _on_reject_with_note(ack: Callable[..., Any], body: dict[str, Any]) -> None:
         if this_release_owns_action(body, approval_resolver) is False:
-            decline_unowned_envelope(ack, approval_id=_action_approval_id(body), log=log)
+            decline_unowned_envelope(
+                ack,
+                approval_id=_action_approval_id(body),
+                log=log,
+                web_client=web_client,
+                channel=_action_channel_id(body),
+                user=_action_user_id(body),
+            )
             return
         ack()
         open_note_dialog(
@@ -639,7 +681,14 @@ def register_handlers(
             ack()
             return
         if is_release_ownership_miss(submission.outcome):
-            decline_unowned_envelope(ack, approval_id=submission.approval_id, log=log)
+            decline_unowned_envelope(
+                ack,
+                approval_id=submission.approval_id,
+                log=log,
+                web_client=web_client,
+                channel=submission.channel,
+                user=submission.user,
+            )
             return
         response = submission.response_action
         if response is None:

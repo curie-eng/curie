@@ -3,7 +3,7 @@
 From nothing to a bot that answers in Slack and redeploys itself when you push.
 
 Four commands do the work. Everything else on this page is the accounts you
-need first and the six mistakes that actually cost people time.
+need first and the seven mistakes that actually cost people time.
 
 ---
 
@@ -72,6 +72,11 @@ curie cluster deploy --plugin-dir . --namespace my-agent --release my-agent \
   --repo <owner>/<repo> --slack-channel C0YOURCHANNEL
 ```
 
+Exactly one Curie release may connect to a given Slack app. Slack Socket Mode
+fans events across every connected client, so two releases sharing one app
+silently split mentions. Do not connect a second dispatcher, local or cluster,
+to this app.
+
 The plain install reads the exported `sk-ant-` credential and infers Anthropic
 egress. If admission reports that the cluster has no `gvisor` RuntimeClass,
 Curie shows that attempt as retrying, applies `security.gvisor.mode=off`, and
@@ -136,7 +141,7 @@ skill/local credentials. Issue #440 tracks the future per agent delivery path.
 
 ---
 
-## Six things that cost people an hour
+## Seven things that cost people an hour
 
 1. **Export the credential before `skill up`.** Otherwise the boot succeeds and
    the *next* command fails with `model-credential-rejected`.
@@ -151,6 +156,10 @@ skill/local credentials. Issue #440 tracks the future per agent delivery path.
 6. **One channel binds one agent.** An agent may serve several channels
    (`curie cluster surfaces <agent> --add slack=C0EXAMPLE2`), but pointing a
    SECOND agent at an occupied channel still returns 409.
+7. **Exactly one Curie release may connect to a given Slack app.** Slack Socket
+   Mode fans events across every connected client, so two releases sharing one
+   app silently split mentions. Give each long-lived release its own app; stop
+   extra dispatchers instead of retrying clicks or mentions.
 
 ## Which rung do I want?
 

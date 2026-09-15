@@ -194,19 +194,18 @@ own if you overrode it.
 
 ## Shared Socket Mode apps
 
-Slack allows an app to maintain up to ten Socket Mode connections and may send
-each payload to any connection, with no distribution pattern an application can
-assume ([Slack's Socket Mode documentation](https://docs.slack.dev/apis/events-api/using-socket-mode/#using-multiple-connections)).
-A local dispatcher and a cluster dispatcher can therefore connect with the same
-app token, but they do not both receive each interaction.
+Exactly one Curie release may connect to a given Slack app. Slack Socket Mode
+fans events across every connected client, so two releases sharing one app
+silently split mentions
+([Slack's Socket Mode documentation](https://docs.slack.dev/apis/events-api/using-socket-mode/#using-multiple-connections)).
+Do not run a local dispatcher and a cluster dispatcher on the same app.
 
-Prefer a separate Slack app per long-lived Curie release. When two Curie
-releases temporarily share one app, an approval interaction may first reach the
-release whose API does not contain that approval. That release leaves the
-Socket Mode envelope unacked so Slack retries the owner; it does not resolve
-the record or change the card. Stop the extra dispatcher after the overlap;
-the compose dispatcher remains off by default behind the Slack profile to make
-accidental overlap less likely.
+Give each long-lived Curie release its own Slack app. If a second dispatcher is
+already connected, stop the extra one. Do not retry mentions or approval clicks
+hoping Slack picks the owner. Leave-unacked approval routing is an internal
+delivery detail, not an operator retry procedure. The compose dispatcher
+remains off by default behind the Slack profile so accidental overlap is less
+likely.
 
 ## Teardown and return to Slack-free
 
