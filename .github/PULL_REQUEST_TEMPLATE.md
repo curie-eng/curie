@@ -81,7 +81,7 @@ Fix pin waiver: <reason>
      A change that reaches runner MCP catalog projection, unscoped PreToolUse,
      in-process platform MCP tools, workspace publication, or
      built-in coding-tool session capability must record live-provider plus
-     Slack external-integration evidence, or leave those required-tier rows open.
+     external-integration evidence, or leave those required-tier rows open.
      "No model routing change" is not a valid n/a reason. Fake-model kind,
      skill ladder, and helper-only tests are not sufficient. -->
 

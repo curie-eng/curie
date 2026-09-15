@@ -20,7 +20,7 @@ _WORKFLOW_RULE = """
 The path set is runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, and
 built-in coding-tool session capability. A behavior-bearing change that
-reaches any of those reaches both live-provider and Slack external-integration.
+reaches any of those reaches both live-provider and external-integration.
 Those two rows are required on that path. "No model routing change" is not a valid n/a reason.
 Fake-model kind, skill ladder, and helper-only tests remain useful and are
 not sufficient for those acceptance criteria. Leave the required-tier item
@@ -31,14 +31,14 @@ _TEMPLATE_RULE = """
 A change that reaches runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, or
 built-in coding-tool session capability must record live-provider plus
-Slack external-integration evidence, or leave those required-tier rows open.
+external-integration evidence, or leave those required-tier rows open.
 "No model routing change" is not a valid n/a reason.
 """
 
 _FORBIDDEN_NA = '"No model routing change" is not a valid n/a reason'
 _LIVE_SLACK = (
     "A behavior-bearing change that reaches any of those reaches both "
-    "live-provider and Slack external-integration"
+    "live-provider and external-integration"
 )
 
 
@@ -85,7 +85,7 @@ def test_scattered_nouns_without_the_contiguous_rule_fail(
         "in-process platform MCP tools, workspace publication, and "
         "built-in coding-tool session capability. "
         "No model routing change is a valid n/a reason for live-provider "
-        "and Slack external-integration. Fake-model kind, skill ladder, and "
+        "and external-integration. Fake-model kind, skill ladder, and "
         "helper-only tests remain useful and are not sufficient. Leave the "
         "required-tier item open when the evidence is missing.\n",
     )

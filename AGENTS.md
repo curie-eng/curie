@@ -519,6 +519,22 @@ drive the actual surface (the `curie` CLI, the deployed compose services, a
 real sandbox on-cluster) with realistic input and assert the real outcome, not
 just that unit tests pass.
 
+- **Pick the driver from the diff.** An end-to-end test is black-box testing of the
+  components that changed, so the box is the diff, not the whole system. A driving
+  surface is valid only if the path from it traverses every component you changed;
+  if it routes around one, it is not a valid driver for that change. Inside the box
+  nothing may be faked.
+- **Slack is a driver, not a requirement.** Approvals resolve equally through an
+  operator principal: `curie cluster approvals <agent> --mint-operator-principal
+  <USER>`, then export `CURIE_APPROVAL_PRINCIPAL_TOKEN` and `--resolve <id>` (or
+  `--reject`). Proven on a real cluster against an install with the dispatcher at
+  zero replicas and no bot token: the gated tool ran exactly once, the session
+  resumed, and the audit recorded `principal_kind: operator`. One setup constraint,
+  since `slack_approvers.py` sets `operator_eligible = False` on the channel-members
+  and user-group sets: bind `approvers.users` explicitly on any route you intend to
+  drive from the CLI, or resolution is refused 403. Reach for a real Slack pass only
+  when the change is in the Slack surface itself. Everything else drives from the
+  CLI, and an agent can run it unattended rather than handing a human a click list.
 - **In-repo tests are the durable net.** Prefer landing unit + integration tests
   (and a Playwright/e2e assertion where a UI or full-flow path changed) in the
   same PR. These are what keep the change working after you leave.
@@ -612,7 +628,7 @@ required and proved, not carried on the original classification.
 The path set is runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, and
 built-in coding-tool session capability. A behavior-bearing change that
-reaches any of those reaches both live-provider and Slack external-integration.
+reaches any of those reaches both live-provider and external-integration.
 Those two rows are required on that path. "No model routing change" is not a valid n/a reason.
 Fake-model kind, skill ladder, and helper-only tests remain useful and are
 not sufficient for those acceptance criteria. Leave the required-tier item

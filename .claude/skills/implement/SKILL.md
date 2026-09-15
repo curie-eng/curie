@@ -159,8 +159,16 @@ nothing.
 The path set is runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, and
 built-in coding-tool session capability. A behavior-bearing change that
-reaches any of those reaches both live-provider and Slack external-integration.
-Those two rows are required on that path. "No model routing change" is not a valid n/a reason.
+reaches any of those reaches both live-provider and external-integration.
+Those two rows are required on that path. The external-integration row is
+satisfied by a CLI-driven cluster run: `curie cluster message` starts a turn with
+no Slack app, and an operator principal
+(`curie cluster approvals <agent> --mint-operator-principal <USER>`, then
+`CURIE_APPROVAL_PRINCIPAL_TOKEN` and `--resolve`/`--reject`) resolves the approval,
+provided the route binds `approvers.users` explicitly. Require a real Slack click
+only where the Slack transport is itself the component under test, which today
+means the two-release Socket Mode ownership behavior and, until publication
+approvals carry a route, workspace publication. "No model routing change" is not a valid n/a reason.
 Fake-model kind, skill ladder, and helper-only tests remain useful and are
 not sufficient for those acceptance criteria. Leave the required-tier item
 open when the evidence is missing; do not close it by marking the row n/a.
