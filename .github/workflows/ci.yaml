@@ -65,6 +65,8 @@ jobs:
         run: uv sync
       - name: Alembic revision gate
         run: uv run python scripts/check-alembic-revisions.py
+      - name: Schema window gate
+        run: uv run python scripts/check-schema-window.py
       - name: Ruff
         run: uv run ruff check .
       - name: Mypy
@@ -400,6 +402,9 @@ jobs:
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           python-version: "3.13"
+      - name: Schema window gate
+        working-directory: ${{ github.workspace }}
+        run: uv run python scripts/check-schema-window.py
       - name: Install Helm for CLI consumer render tests
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
