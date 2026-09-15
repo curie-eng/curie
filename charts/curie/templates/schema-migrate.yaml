@@ -70,9 +70,15 @@ spec:
               max_attempts=60
               probe_error_class=""
               while [ "$attempt" -le "$max_attempts" ]; do
+                # Lift ssl= out of the DSN into the connect kwarg (#2431).
+                # asyncpg's DSN parser knows sslmode, not ssl, so an ssl=
+                # query arg is forwarded as a server setting. Pass the mode
+                # string through: ssl=True is verify-full; ssl="require"
+                # encrypts without a CA, matching SQLAlchemy's ?ssl=require.
                 if probe_error_class=$(python -c '
               import asyncio
               import os
+              from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
               try:
                   import asyncpg
@@ -81,7 +87,19 @@ spec:
                       database_url = os.environ["DATABASE_URL"].replace(
                           "postgresql+asyncpg://", "postgresql://", 1
                       )
-                      connection = await asyncpg.connect(database_url, timeout=2)
+                      parsed = urlparse(database_url)
+                      query = []
+                      ssl = None
+                      for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+                          if key == "ssl":
+                              ssl = value
+                          else:
+                              query.append((key, value))
+                      database_url = urlunparse(parsed._replace(query=urlencode(query)))
+                      connect_kwargs = {"timeout": 2}
+                      if ssl is not None:
+                          connect_kwargs["ssl"] = ssl
+                      connection = await asyncpg.connect(database_url, **connect_kwargs)
                       await connection.close()
 
                   asyncio.run(probe())
