@@ -71,6 +71,15 @@ _FAKE_DISCORD_BOT_TOKEN = (
 )
 FAKE_DISCORD_BOT_AUTHORIZATION = "Authorization: Bot " + _FAKE_DISCORD_BOT_TOKEN
 FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT = "DISCORD_BOT_TOKEN=" + _FAKE_DISCORD_BOT_TOKEN
+# Shape-valid bot token (id segment starts with M) carried with no context.
+FAKE_SHAPED_DISCORD_BOT_TOKEN = (
+    "M" + "FAKEFAKEFAKEFAKEFAKE000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
+)
+# The webhook URL keeps its scheme, host, path and id; only the token is secret.
+FAKE_DISCORD_WEBHOOK_PREFIX = "https://discord.com/api/webhooks/" + "100000000000000000/"
+FAKE_DISCORD_WEBHOOK_TOKEN = (
+    "FAKE" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE-" + "FAKEFAKEFAKEFAKEFAKEFAKE_FAKE000"
+)
 
 # The sensitive substring that must be absent from every boundary's output,
 # keyed by rule name. VECTORS is derived from this so the two cannot drift.
@@ -93,12 +102,20 @@ SECRET_LITERALS: dict[str, str] = {
     "x_api_key": FAKE_X_API_KEY_HEADER,
     "discord_bot_authorization": FAKE_DISCORD_BOT_AUTHORIZATION,
     "discord_bot_token_assignment": FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT,
+    "discord_bot_token": FAKE_SHAPED_DISCORD_BOT_TOKEN,
+    "discord_webhook_url": FAKE_DISCORD_WEBHOOK_TOKEN,
+}
+
+# Non-secret text that must precede a literal for its rule to apply, for rules
+# whose redacted secret is only part of the matched value.
+_LITERAL_CARRIERS: dict[str, str] = {
+    "discord_webhook_url": FAKE_DISCORD_WEBHOOK_PREFIX,
 }
 
 # One frozen vector per rule: a realistic runner output line carrying that class
 # of secret. The tripwire below binds this table to REDACTION_RULES.
 VECTORS: tuple[tuple[str, str], ...] = tuple(
-    (name, f"runner output carrying {literal} in context")
+    (name, f"runner output carrying {_LITERAL_CARRIERS.get(name, '')}{literal} in context")
     for name, literal in SECRET_LITERALS.items()
 )
 
