@@ -92,11 +92,13 @@ def _run_gate(repo_root: Path | None = None) -> subprocess.CompletedProcess[str]
 
 
 def test_real_tree_window_matches_alembic_head() -> None:
+    chart = yaml.safe_load((REPO_ROOT / "charts" / "curie" / "Chart.yaml").read_text())
+    app_version = str(chart["appVersion"])
     result = _run_gate()
 
     assert result.returncode == 0, result.stderr
     assert "0039" in result.stdout
-    assert "0.8.8" in result.stdout
+    assert f"appVersion {app_version}" in result.stdout
 
 
 def test_migration_without_window_move_fails(tmp_path: Path) -> None:
