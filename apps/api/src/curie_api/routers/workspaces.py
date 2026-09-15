@@ -122,8 +122,11 @@ async def redeem_workspace_credential(
         agent_id=deployment.agent_id,
         conversation_id=data.conversation_id,
     )
-    repo = selected.repo_full_name if selected is not None else None
-    if repo is None:
+    if selected is None:
+        repo = None
+    else:
+        repo = selected.repo_full_name
+    if repo is None or selected is None:
         await crud.append_credential_redemption_audit(
             session,
             purpose="workspace_clone",
