@@ -48,6 +48,9 @@ def test_0043_refuses_active_work_and_allows_rollback_after_real_settlement(
         assert review_rows("SELECT delivery_id,status FROM curie.github_review_deliveries") == (
             before_delivery
         )
+        # 0044 added thread_workspaces.revision. Leave the live TestClient on
+        # HEAD after the 0043 refuse so later API calls still match the schema.
+        command.upgrade(config, original_revision[0]["version_num"])
         if retryable:
             # Recovery is explicit signed redelivery, not assumed GitHub retry.
             truth.feedback_status = 200
