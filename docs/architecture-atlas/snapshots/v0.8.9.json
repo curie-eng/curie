@@ -4,8 +4,8 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "main",
-    "commit": "7a86d2951d407070f87a144a6a24254da915f686",
-    "shortCommit": "7a86d295",
+    "commit": "872e64d466c6ab3afed1aa4bd6686d27603c49c0",
+    "shortCommit": "872e64d4",
     "release": "v0.8.9"
   },
   "title": "Curie architecture atlas",
@@ -532,70 +532,70 @@
       "type": "code",
       "title": "Queued inbound attachment references",
       "path": "packages/aci-protocol/src/aci_protocol/turn.py",
-      "href": "https://github.com/curie-eng/curie/blob/7a86d2951d407070f87a144a6a24254da915f686/packages/aci-protocol/src/aci_protocol/turn.py"
+      "href": "https://github.com/curie-eng/curie/blob/872e64d466c6ab3afed1aa4bd6686d27603c49c0/packages/aci-protocol/src/aci_protocol/turn.py"
     },
     {
       "id": "attachment-dispatcher-code",
       "type": "code",
       "title": "Slack attachment reference normalization",
       "path": "apps/dispatcher/src/curie_dispatcher/inbound_attachments.py",
-      "href": "https://github.com/curie-eng/curie/blob/7a86d2951d407070f87a144a6a24254da915f686/apps/dispatcher/src/curie_dispatcher/inbound_attachments.py"
+      "href": "https://github.com/curie-eng/curie/blob/872e64d466c6ab3afed1aa4bd6686d27603c49c0/apps/dispatcher/src/curie_dispatcher/inbound_attachments.py"
     },
     {
       "id": "attachment-worker-code",
       "type": "code",
       "title": "Attachment resolution and retention",
       "path": "apps/worker/src/curie_worker/attachments.py",
-      "href": "https://github.com/curie-eng/curie/blob/7a86d2951d407070f87a144a6a24254da915f686/apps/worker/src/curie_worker/attachments.py"
+      "href": "https://github.com/curie-eng/curie/blob/872e64d466c6ab3afed1aa4bd6686d27603c49c0/apps/worker/src/curie_worker/attachments.py"
     },
     {
       "id": "chart-attachment-code",
       "type": "code",
       "title": "Kubernetes attachment init path",
       "path": "charts/curie/templates/agent-sandbox.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/7a86d2951d407070f87a144a6a24254da915f686/charts/curie/templates/agent-sandbox.yaml"
+      "href": "https://github.com/curie-eng/curie/blob/872e64d466c6ab3afed1aa4bd6686d27603c49c0/charts/curie/templates/agent-sandbox.yaml"
     },
     {
       "id": "release-accept-code",
       "type": "code",
       "title": "Release acceptance evaluator",
       "path": "cli/src/release_accept.rs",
-      "href": "https://github.com/curie-eng/curie/blob/7a86d2951d407070f87a144a6a24254da915f686/cli/src/release_accept.rs"
+      "href": "https://github.com/curie-eng/curie/blob/872e64d466c6ab3afed1aa4bd6686d27603c49c0/cli/src/release_accept.rs"
     },
     {
       "id": "schema-window-check-code",
       "type": "code",
       "title": "Migration and schema window consistency gate",
       "path": "scripts/check-schema-window.py",
-      "href": "https://github.com/curie-eng/curie/blob/7a86d2951d407070f87a144a6a24254da915f686/scripts/check-schema-window.py"
+      "href": "https://github.com/curie-eng/curie/blob/872e64d466c6ab3afed1aa4bd6686d27603c49c0/scripts/check-schema-window.py"
     },
     {
       "id": "api-readiness-code",
       "type": "code",
       "title": "Database aware API readiness",
       "path": "apps/api/src/curie_api/main.py",
-      "href": "https://github.com/curie-eng/curie/blob/7a86d2951d407070f87a144a6a24254da915f686/apps/api/src/curie_api/main.py"
+      "href": "https://github.com/curie-eng/curie/blob/872e64d466c6ab3afed1aa4bd6686d27603c49c0/apps/api/src/curie_api/main.py"
     },
     {
       "id": "runner-mcp-argv-code",
       "type": "code",
       "title": "Private MCP configuration file",
       "path": "runner/src/curie_runner/mcp_argv.py",
-      "href": "https://github.com/curie-eng/curie/blob/7a86d2951d407070f87a144a6a24254da915f686/runner/src/curie_runner/mcp_argv.py"
+      "href": "https://github.com/curie-eng/curie/blob/872e64d466c6ab3afed1aa4bd6686d27603c49c0/runner/src/curie_runner/mcp_argv.py"
     },
     {
       "id": "telemetry-event-id-code",
       "type": "code",
       "title": "Task local channel event correlation",
       "path": "packages/telemetry/src/curie_telemetry/tracing.py",
-      "href": "https://github.com/curie-eng/curie/blob/7a86d2951d407070f87a144a6a24254da915f686/packages/telemetry/src/curie_telemetry/tracing.py"
+      "href": "https://github.com/curie-eng/curie/blob/872e64d466c6ab3afed1aa4bd6686d27603c49c0/packages/telemetry/src/curie_telemetry/tracing.py"
     },
     {
       "id": "chart-external-values",
       "type": "code",
       "title": "External backing store values profile",
       "path": "charts/curie/values-external.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/7a86d2951d407070f87a144a6a24254da915f686/charts/curie/values-external.yaml"
+      "href": "https://github.com/curie-eng/curie/blob/872e64d466c6ab3afed1aa4bd6686d27603c49c0/charts/curie/values-external.yaml"
     },
     {
       "id": "adr-0144-doc",
