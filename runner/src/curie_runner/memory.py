@@ -268,23 +268,52 @@ def resolve_memory(memory_ref: str | None, env: Mapping[str, str]) -> MemoryStor
     )
 
 
+_OPERATOR_MEMORY_HEADING = "# Agent memory (provided by the operator)"
+_LEARNED_MEMORY_HEADING = "# Agent memory (learned from prior sessions)"
+
+
+def _is_operator_record(record: MemoryRecord) -> bool:
+    return record.provenance.source == "operator"
+
+
+def _memory_record_line(record: MemoryRecord) -> str:
+    prov = record.provenance
+    traces = ", ".join(prov.source_trace_ids) if prov.source_trace_ids else ""
+    suffix = f"  (learned from traces: {traces})" if traces else ""
+    return f"- {record.content}{suffix}"
+
+
+def _preamble_section(heading: str, records: Sequence[MemoryRecord]) -> list[str]:
+    lines = [heading, ""]
+    for record in records:
+        lines.append(_memory_record_line(record))
+    return lines
+
+
 def format_memory_preamble(records: Sequence[MemoryRecord]) -> str | None:
     """Render prior memory as a system-prompt preamble, or None when empty.
 
     This is how loaded memory is *delivered into the sandbox*: it is composed
     into the runner's effective system prompt at boot, so the model sees prior
     lessons as durable context. Provenance is summarized inline so a lesson is
-    traceable back to the turns it came from.
+    traceable back to the turns it came from. Operator-authored records are a
+    separate heading so they are not framed as lessons from prior sessions.
     """
 
     if not records:
         return None
-    lines = ["# Agent memory (learned from prior sessions)", ""]
-    for record in records:
-        prov = record.provenance
-        traces = ", ".join(prov.source_trace_ids) if prov.source_trace_ids else ""
-        suffix = f"  (learned from traces: {traces})" if traces else ""
-        lines.append(f"- {record.content}{suffix}")
+    operator = [record for record in records if _is_operator_record(record)]
+    learned = [record for record in records if not _is_operator_record(record)]
+    sections: list[list[str]] = []
+    if operator:
+        sections.append(_preamble_section(_OPERATOR_MEMORY_HEADING, operator))
+    if learned:
+        sections.append(_preamble_section(_LEARNED_MEMORY_HEADING, learned))
+    lines: list[str] = []
+    for section in sections:
+        if lines:
+            lines.append("")
+        lines.extend(section)
     return "\n".join(lines)
 
 

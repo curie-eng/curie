@@ -3758,7 +3758,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
             LocalAction::Memory { target, add } => match add {
                 None => emit(commands::memory(target.into()).await?),
-                Some(content) => emit(commands::memory_add(target.into(), content).await?),
+                Some(content) => emit(commands::memory_add(target.into(), content, "local").await?),
             },
             LocalAction::Approvals {
                 target,
@@ -5013,7 +5013,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 };
                 match add {
                     None => emit(commands::memory(opts).await?),
-                    Some(content) => emit(commands::memory_add(opts, content).await?),
+                    Some(content) => emit(commands::memory_add(opts, content, "cluster").await?),
                 }
             }
             ClusterAction::Approvals {
