@@ -713,9 +713,26 @@ rustfs:
   persistence:
     enabled: true
     size: 3Gi
+  # Measured rustfs/rustfs:1.0.0-beta.12 under ordinary Langfuse traffic
+  # (issue #2706): 1120Mi working set, 425m CPU. The shipped 512Mi / 500m
+  # ceiling OOMKilled every in-chart install in a silent loop: kubelet
+  # cgroup SIGKILL of a healthy process. HTTP /health returns 200 between
+  # kills, so the pod reports Ready; tightening probe thresholds cannot
+  # observe SIGKILL. The observable is lastState.terminated.reason=OOMKilled
+  # / restart count. Probes in templates/rustfs.yaml are out of scope.
+  #
+  # Memory request 1280Mi covers the measured 1120Mi working set so the
+  # scheduler packs against real resident size (same lesson as inference
+  # #2329). Memory limit 2Gi is ceil(1120Mi * 1.5 = 1680Mi) to the next Gi.
+  # That is the headroom, not the 2Gi that happened to work on one rig.
+  # CPU request 250m is below the 425m draw (burstable). CPU limit is "1",
+  # not 425m, not 500m, and not 2. Do not pin at the observed draw. Do not
+  # use 2: a CPU limit of 2 on a 2-vCPU node is the whole machine and
+  # starved sandbox 90s claim binds (clickhouse walked 2 to 1; inference
+  # copied that).
   resources:
-    requests: { cpu: 50m, memory: 128Mi }
-    limits: { cpu: 500m, memory: 512Mi }
+    requests: { cpu: 250m, memory: 1280Mi }
+    limits: { cpu: "1", memory: 2Gi }
   # RustFS supports a fixed nonroot identity when fsGroup owns the data volume.
   containerSecurityContext:
     runAsUser: 10001
