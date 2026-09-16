@@ -1249,6 +1249,12 @@ class WorkerConfig(BaseSettings):
         # settle it without sharing identity with another approval on the thread.
         return f"{self.key_prefix}:approval-card:{approval_id}"
 
+    def approval_notice_ref_key(self, approval_id: str) -> str:
+        # The reply ref a placeholderless pending notice minted AFTER its approval
+        # row was persisted without one (#2721). A distinct segment from the card
+        # key so the card store's legacy migration scan never sees these entries.
+        return f"{self.key_prefix}:approval-notice-ref:{approval_id}"
+
     def dead_letter_stream_name(self) -> str:
         """The graveyard stream: the explicit override, else derived ``<stream>:dead``.
 
