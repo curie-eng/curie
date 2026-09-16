@@ -2668,6 +2668,22 @@ jobs:
                   protocol: TCP
           EOF
       - name: Create the disposable kind cluster
+        id: create_kind_cluster
+        continue-on-error: true
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          cluster_name: curie-upgrade-matrix
+          config: kind-upgrade-matrix-config.yaml
+      - name: Back off before retrying Create the disposable kind cluster
+        if: steps.create_kind_cluster.outcome == 'failure'
+        run: |
+          echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
+          sleep 15
+      - name: Create the disposable kind cluster (retry)
+        if: steps.create_kind_cluster.outcome == 'failure'
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
           version: v0.24.0
