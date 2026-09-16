@@ -3466,7 +3466,7 @@ class Kernel:
         workspace_inference: _WorkspaceInferenceCarry,
         attachment_fresh_only: bool = False,
     ) -> _RouteResult:
-        # A repository-required thread must establish (or confirm) its repository
+        # A thread that requires a repository must establish (or confirm) it
         # before any platform response path. This deliberately precedes the
         # greeting/help shortcut: a canned reply must not create a thread whose
         # repository remains ambiguous, and a conflicting repository must be
@@ -3490,7 +3490,7 @@ class Kernel:
                 ),
             )
             if self._workspace is None:
-                # The coordinator is a worker-wide capability, not a condition
+                # The coordinator is available across the worker, not a condition
                 # on generic agent turns. Refuse only an event that requires a
                 # workspace: its own repository fact, a carried inference from
                 # this delivery, or verified feedback whose authority is bound to
@@ -3572,14 +3572,19 @@ class Kernel:
                 "The pull request changed after GitHub feedback verification; "
                 "no model turn started."
             )
-        existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
         if (
             workspace_deployment_id is not None
             and self._workspace is None
-            and existing_handle is not None
-            and existing_handle.workspace_repo is not None
+            and await asyncio.to_thread(
+                self._substrate.workspace_repository, thread_key
+            )
+            is not None
         ):
+            # lookup() intentionally hides suspended routes. The persistent
+            # repository record remains authority for this refusal, so an
+            # approval resume cannot rebuild a workspace route as generic.
             raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
+        existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
         # the thread has no existing route, it is provably a NEW turn (it cannot be

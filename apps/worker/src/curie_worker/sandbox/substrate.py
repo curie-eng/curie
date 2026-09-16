@@ -322,6 +322,12 @@ class SandboxSubstrate:
             lock_token=lock_token,
         )
 
+    def workspace_repository(self, thread_key: str) -> str | None:
+        """The persisted workspace repository for any route state on a thread."""
+
+        record = self._affinity.get(thread_key)
+        return None if record is None else record.handle.workspace_repo
+
     def adopt(self, thread_key: str) -> SandboxHandle | None:
         """Adopt an existing ready live route without ever creating one.
 

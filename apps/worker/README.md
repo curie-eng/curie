@@ -202,13 +202,17 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   A deliberate repository-selection refusal is the other half of that split and
   is NOT this: it is a decision rather than a fault, so it stays terminal,
   answers the user, and logs at INFO instead. A turn that names a repository
-  while the worker-wide coordinator is off is such a refusal (#2659). Generic
-  turns continue through the normal claim path while it is off. A retained route
-  that already has a repository workspace and verified review feedback are also
-  terminal refusals, because both require repository authority. A turn that
-  attaches a workspace because its own message named the repository ends its
-  reply with one platform line naming that repository, placed after the model's
-  answer and before the receipt or the awaiting-approval notice.
+  while the coordinator is off for the worker is such a refusal (#2659). Generic
+  turns continue through the normal claim path while it is off. A retained live
+  or suspended route that already has a repository workspace and verified review
+  feedback are also terminal refusals, because both require repository authority.
+  The disabled lane does not consult repository selections or webhook operator
+  mappings held only by the server. A turn with no repository message, verified
+  review, or retained route that carries a repository stays generic and runs
+  without a workspace.
+  A turn that attaches a workspace because its own message named the repository
+  ends its reply with one platform line naming that repository, placed after the
+  model's answer and before the receipt or the awaiting-approval notice.
 - **Idempotency + crash recovery.** The Slack event id gates a `done` marker, so
   a redelivered or reclaimed entry that already finished is skipped.
   A renewable worker lease distinguishes process death from ordinary consumer

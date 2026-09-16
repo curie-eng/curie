@@ -1012,8 +1012,17 @@ def test_retained_generic_route_with_workspaces_off_runs_each_turn_once(
     asyncio.run(go())
 
 
+@pytest.mark.parametrize(
+    ("suspended", "event_id"),
+    [
+        (False, None),
+        (True, "approval-suspended-workspace-resolved"),
+    ],
+)
 def test_retained_workspace_route_with_workspaces_off_refuses_without_adopting(
     make_harness,
+    suspended: bool,
+    event_id: str | None,
 ) -> None:
     deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777f")
 
@@ -1021,16 +1030,28 @@ def test_retained_workspace_route_with_workspaces_off_refuses_without_adopting(
         binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
         async with make_harness(binding=binding, max_attempts=3) as h:
             assert h.kernel._workspace is None
+            thread = "tSuspendedWorkspace" if suspended else "tRetainedWorkspace"
+            thread_key = _thread_key(thread)
             existing = h.substrate.claim(
-                _thread_key("tRetainedWorkspace"),
+                thread_key,
                 env={},
                 workspace_repo="acme-corp/acme-bot",
             )
-            event = _qevent("Continue the task", thread="tRetainedWorkspace")
+            if suspended:
+                await asyncio.to_thread(
+                    h.substrate.suspend,
+                    thread_key,
+                    history_ref="history-suspended-workspace",
+                )
+                assert h.substrate.lookup(thread_key) is None
+            event = _qevent("Continue the task", thread=thread, event_id=event_id)
 
             await h.kernel.process_event(event)
 
-            assert h.substrate.lookup(_thread_key("tRetainedWorkspace")) == existing
+            if suspended:
+                assert h.substrate.lookup(thread_key) is None
+            else:
+                assert h.substrate.lookup(thread_key) == existing
             assert h.runner.opened == []
             assert h.runner.steers == []
             assert h.fake_k8s.claim_envs == [{}]
