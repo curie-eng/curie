@@ -1169,12 +1169,13 @@ fn exact_seed_matcher_recovers_embedded_marker_once_and_rejects_background() {
 }
 
 #[test]
-fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt() {
+fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() {
     let text = ladder();
     for required in [
         "seed_ordinary_turn() {",
         "seed_mcp_read_turn() {",
         "seed_approval_resume_turn() {",
+        "seed_coding_tool_turn() {",
         "seed-invalid",
         "mcp_receipt_call_count() {",
         "discover_trace_id_for_seed",
@@ -1183,7 +1184,7 @@ fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt()
     ] {
         assert!(
             text.contains(required),
-            "the product observability oracle must pin independent ordinary, MCP, and approval seed evidence; missing {required}"
+            "the product observability oracle must pin independent ordinary, MCP, approval, and built-in coding-tool seed evidence; missing {required}"
         );
     }
 
@@ -1212,6 +1213,87 @@ fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt()
     assert!(
         !approval.contains("curie.approval.wait"),
         "the oracle must not invent a wait span that no current emitter produces"
+    );
+}
+
+#[test]
+fn coding_tool_seed_drives_a_builtin_tool_and_asserts_execute_tool_in_its_exact_trace() {
+    let coding = ladder_function("seed_coding_tool_turn");
+    assert!(
+        coding.contains("Bash"),
+        "the coding seed must drive a built-in coding tool by name, since the MCP seed only covers a hosted connector tool"
+    );
+    assert!(
+        coding.contains("--json local message"),
+        "the coding seed must issue a real product turn rather than inspect telemetry alone"
+    );
+    assert!(
+        coding.contains("assert_finalized_reply"),
+        "the coding seed must require a finalized reply before trusting its telemetry"
+    );
+    assert!(
+        coding.contains("expected_receipt"),
+        "the coding seed must carry an independent deterministic receipt the model cannot produce without executing the tool"
+    );
+    // A fixed product of two known primes is model-computable, and a DENIED
+    // tool call still emits its span, so that receipt proved neither execution
+    // nor success. Hash the run's own random marker instead: the digest is not
+    // derivable without actually running the tool.
+    assert!(
+        !coding.contains("100160063"),
+        "a literal arithmetic product is model-computable, so it cannot witness that the tool really executed"
+    );
+    assert!(
+        coding.contains("sha256"),
+        "the coding receipt must be a sha256, which a model cannot produce without running the tool"
+    );
+    let receipt_line = coding
+        .lines()
+        .find(|line| line.contains("expected_receipt="))
+        .expect("the coding seed must compute its expected receipt");
+    assert!(
+        receipt_line.contains("marker"),
+        "the receipt must hash this run's unique marker, so it is random per run and cannot be pinned or guessed: {receipt_line}"
+    );
+    assert!(
+        coding.contains("$expected_receipt") && coding.contains("seed-invalid"),
+        "the coding seed must check the reply against the expected literal receipt and fail closed when it is absent"
+    );
+    assert!(
+        coding.contains("discover_trace_id_for_seed"),
+        "the coding seed must derive the exact trace id of its own turn, never a newest-N or window query"
+    );
+    assert!(
+        coding.contains("query_exact_seed_trace") && coding.contains("execute_tool"),
+        "the coding seed must assert execute_tool membership in that exact trace"
+    );
+    assert!(
+        !coding.contains("newest") && !coding.contains("--limit"),
+        "a newest-N or windowed lookup would let an unrelated trace satisfy the coding seed"
+    );
+}
+
+#[test]
+fn coding_tool_seed_membership_gates_product_observability() {
+    let rung = ladder_function("rung_local");
+    assert!(
+        rung.contains("seed_coding_tool_turn"),
+        "the LIVE orchestration block must run the built-in coding-tool seed alongside the hosted MCP seed"
+    );
+    assert!(
+        rung.contains("LAST_CODING_MEMBERSHIP"),
+        "the coding seed must publish its membership result the way the MCP seed publishes LAST_MCP_MEMBERSHIP"
+    );
+    let gating = rung.lines().any(|line| {
+        line.contains("LAST_CODING_MEMBERSHIP") && line.contains("product_membership=\"false\"")
+    });
+    assert!(
+        gating,
+        "a coding seed that runs without gating product_membership is inert; its membership must force product_membership=false"
+    );
+    assert!(
+        ladder().contains("LAST_CODING_TRACE_ID=\"\""),
+        "the coding seed's exact trace id must be declared beside the other LAST_*_TRACE_ID seed results"
     );
 }
 
@@ -3726,4 +3808,227 @@ fn cluster_ladder_refuses_invalid_namespace_and_release() {
             "{variable}={value:?} must refuse before cluster status; invocations:\n{invocations}"
         );
     }
+}
+
+// Issue #2204: Langfuse 3.225.5 maps any OTel span carrying `gen_ai.tool.name`
+// to observation type `TOOL` and renames the observation to the tool name, so a
+// real tool call never arrives under an observation literally named
+// `execute_tool`. The sanitizer's name-keyed membership and its
+// SPAN/GENERATION/EVENT type allowlist therefore cannot see any tool call at
+// all. These regressions execute the ladder's own projection python against a
+// crafted Langfuse tree, because a text-only pin survives the weakening
+// mutation that caused the defect.
+
+/// Extract `sanitize_exact_trace_read`'s embedded python, the real consumer of
+/// the exact-trace response, so these assertions run the shipped projection
+/// rather than a Rust restatement of it.
+fn exact_trace_sanitizer_python() -> String {
+    let function = ladder_function("sanitize_exact_trace_read");
+    let (_, script) = function
+        .split_once("<<'PY'\n")
+        .expect("the exact-trace sanitizer must retain its Python heredoc");
+    script
+        .split_once("\nPY\n")
+        .expect("the exact-trace sanitizer heredoc must have a closing delimiter")
+        .0
+        .to_owned()
+}
+
+fn run_exact_trace_sanitizer(trace_id: &str, response: &serde_json::Value) -> Output {
+    let script = exact_trace_sanitizer_python();
+    let harness = tempfile::tempdir().expect("create exact-trace fixture directory");
+    let source = harness.path().join("exact-trace.json");
+    fs::write(
+        &source,
+        serde_json::to_string(response).expect("serialize exact-trace fixture"),
+    )
+    .expect("write exact-trace fixture");
+    let mut child = Command::new("python3")
+        .arg("-")
+        .arg(trace_id)
+        .arg(&source)
+        .arg("")
+        .arg("")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start extracted exact-trace sanitizer");
+    child
+        .stdin
+        .take()
+        .expect("open sanitizer stdin")
+        .write_all(script.as_bytes())
+        .expect("write extracted exact-trace sanitizer");
+    child.wait_with_output().expect("wait for sanitizer")
+}
+
+/// A realistic Langfuse read of one coding turn: the tool observation carries
+/// the TOOL type and is named for the tool itself, exactly as Langfuse renames
+/// it, with `execute_tool` surviving only inside the span attributes.
+fn langfuse_tool_trace(trace_id: &str, tool_name: &str) -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "trace": {"id": trace_id},
+        "tree": [{
+            "id": "01",
+            "type": "SPAN",
+            "name": "curie.queue.enqueue",
+            "children": [{
+                "id": "02",
+                "type": "SPAN",
+                "name": "curie.turn.process",
+                "children": [{
+                    "id": "03",
+                    "type": "SPAN",
+                    "name": "curie.sandbox.claim",
+                    "children": [{
+                        "id": "04",
+                        "type": "SPAN",
+                        "name": "curie.runner.rpc",
+                        "children": [{
+                            "id": "05",
+                            "type": "SPAN",
+                            "name": "agent.run",
+                            "children": [{
+                                "id": "06",
+                                "type": "TOOL",
+                                "name": tool_name,
+                                "toolName": tool_name,
+                                "metadata": {"attributes": {
+                                    "gen_ai.operation.name": "execute_tool",
+                                    "gen_ai.tool.name": tool_name,
+                                    "curie.phase": "tool_wait",
+                                }},
+                                "children": [],
+                            }],
+                        }],
+                    }],
+                }],
+            }],
+        }],
+    })
+}
+
+fn sanitized_evidence(trace_id: &str, response: &serde_json::Value) -> serde_json::Value {
+    let output = run_exact_trace_sanitizer(trace_id, response);
+    assert!(
+        output.status.success(),
+        "the exact-trace sanitizer must accept a real Langfuse tool observation; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "the sanitizer must print one JSON evidence object ({error}); stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+#[test]
+fn sanitizer_reports_execute_tool_for_a_renamed_langfuse_tool_observation() {
+    let trace_id = "00000000000000000000000000002204";
+    let evidence = sanitized_evidence(trace_id, &langfuse_tool_trace(trace_id, "Bash"));
+    let operations = evidence["operation"]
+        .as_array()
+        .expect("sanitized evidence must carry an operation array");
+    assert!(
+        operations.iter().any(|op| op == "execute_tool"),
+        "a TOOL observation renamed to its tool is the execute_tool operation, so name-keyed membership must not be the only path; evidence: {evidence}"
+    );
+    let services = evidence["service"]
+        .as_array()
+        .expect("sanitized evidence must carry a service array");
+    assert!(
+        services.iter().any(|service| service == "curie-runner"),
+        "an observed tool call must attribute the runner service; evidence: {evidence}"
+    );
+}
+
+#[test]
+fn sanitizer_allowlists_the_tool_observation_type() {
+    let trace_id = "00000000000000000000000000002204";
+    let evidence = sanitized_evidence(trace_id, &langfuse_tool_trace(trace_id, "Bash"));
+    let types = evidence["observation_type"]
+        .as_array()
+        .expect("sanitized evidence must carry an observation_type array");
+    assert!(
+        types.iter().any(|kind| kind == "TOOL"),
+        "TOOL is a real Langfuse observation type and must not be excluded from the type allowlist; evidence: {evidence}"
+    );
+}
+
+#[test]
+fn sanitizer_projects_the_observed_tool_identity() {
+    let trace_id = "00000000000000000000000000002204";
+    let evidence = sanitized_evidence(trace_id, &langfuse_tool_trace(trace_id, "Bash"));
+    let tools = evidence["tool_name"]
+        .as_array()
+        .expect("sanitized evidence must project the observed tool names under tool_name");
+    assert!(
+        tools.iter().any(|tool| tool == "Bash"),
+        "evidence must say WHICH tool ran, not merely that some tool observation existed; evidence: {evidence}"
+    );
+
+    let sanitizer = ladder_function("sanitize_exact_trace_read");
+    assert!(
+        sanitizer.contains("\"tool_name\""),
+        "tool_name must be an allowlisted evidence field, or the sanitizer's own closed-schema check rejects it"
+    );
+}
+
+#[test]
+fn sanitizer_and_exact_query_fail_closed_on_a_surviving_unrelated_tool() {
+    let trace_id = "00000000000000000000000000002204";
+    let evidence = sanitized_evidence(
+        trace_id,
+        &langfuse_tool_trace(trace_id, "mcp__receipt__receipt_read"),
+    );
+    let tools = evidence["tool_name"]
+        .as_array()
+        .expect("sanitized evidence must project the observed tool names under tool_name");
+    assert!(
+        !tools.iter().any(|tool| tool == "Bash"),
+        "dropping only the Bash span while another tool survives must not satisfy a required Bash tool; evidence: {evidence}"
+    );
+
+    let query = ladder_function("query_exact_seed_trace");
+    assert!(
+        query.contains("expected_tool"),
+        "the exact query must be able to require a specific tool identity in the exact trace"
+    );
+    assert!(
+        query.contains("tool_name"),
+        "the exact query must check its required tool against the sanitized tool_name evidence, not a raw private read"
+    );
+}
+
+#[test]
+fn coding_tool_seed_requires_the_bash_tool_by_name_in_its_exact_trace() {
+    let coding = ladder_function("seed_coding_tool_turn");
+    let query_line = coding
+        .lines()
+        .find(|line| line.contains("query_exact_seed_trace"))
+        .expect("the coding seed must query its own exact trace");
+    assert!(
+        query_line.contains("Bash"),
+        "the coding seed must require the Bash tool identity, since bare execute_tool existence is satisfied by any other tool: {query_line}"
+    );
+}
+
+#[test]
+fn cli_observation_node_carries_the_langfuse_tool_name() {
+    let api = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api.rs"))
+        .expect("read the CLI API module");
+    let (_, node) = api
+        .split_once("pub struct ObservationNode {")
+        .expect("the CLI must model the observation tree node");
+    let node = node
+        .split_once("\n}\n")
+        .expect("ObservationNode must close")
+        .0;
+    assert!(
+        node.contains(r#"rename = "toolName""#) && node.contains("tool_name"),
+        "the CLI must carry the hoisted toolName instead of silently stripping the tool identity the API now returns: {node}"
+    );
 }
