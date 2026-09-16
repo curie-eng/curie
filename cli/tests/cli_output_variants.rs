@@ -53,6 +53,7 @@ use curie::migrate_store::MigrateStoreOutput;
 use curie::observability::{Endpoint, ObservabilityMetricsOutput, ObservabilityOutput};
 use curie::ops::{
     ClusterDownOutput, ClusterRollbackOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput,
+    ClusterUpgradeOutput,
 };
 use curie::ui::{CliOutput, DryRunPlan};
 
@@ -73,16 +74,32 @@ mod schema_inventory;
 
 fn cli_srcs() -> Vec<(String, String)> {
     let dir = format!("{}/src", env!("CARGO_MANIFEST_DIR"));
+    let mut paths = Vec::new();
+    collect_rs_paths(std::path::Path::new(&dir), &mut paths);
+    paths.sort();
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("read cli/src") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            out.push((name, std::fs::read_to_string(&path).expect("read source")));
-        }
+    for path in paths {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        out.push((name, std::fs::read_to_string(&path).expect("read source")));
     }
     assert!(!out.is_empty(), "cli/src must contain .rs sources");
     out
+}
+
+/// Recursively collect every `.rs` file under `dir`, subdirectories included
+/// (`cli/src/ops/*.rs` since the ops module split).
+fn collect_rs_paths(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+    {
+        let entry = entry.unwrap_or_else(|e| panic!("read_dir entry in {}: {e}", dir.display()));
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_paths(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
 }
 
 /// Every `impl CliOutput for T` where T is declared as an `enum`, mapped to its
@@ -184,6 +201,7 @@ fn cluster_status() -> Box<ClusterStatus> {
         warnings: Vec::new(),
         pods_listed: true,
         urls: Vec::new(),
+        upgrade: curie::ops::UpgradeStatusView::idle(None),
         delivery: curie::completion_outbox::Report::unknown(),
     })
 }
@@ -233,14 +251,20 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         "ChannelsOutput",
         samples![
             "DryRun" => ChannelsOutput::DryRun(plan()),
-            // Two bindings, because one is the case that hid the whole defect
-            // class: a payload shaped right for a single binding says nothing
-            // about the plural surface ADR-0118 introduced.
+            // The single Done sample keeps plural coverage while deliberately
+            // exercising both row shapes for the optional signal: a legacy stored name
+            // carries a warning, while a valid channel ID omits it.
             "Done" => ChannelsOutput::Done {
                 agent: "a".to_string(),
                 channels: vec![
-                    ChannelBinding { kind: "slack".to_string(), address: "C0EXAMPLE1".to_string() },
-                    ChannelBinding { kind: "slack".to_string(), address: "C0EXAMPLE2".to_string() },
+                    ChannelBinding {
+                        kind: "slack".to_string(),
+                        address: "#legacy-alerts".to_string(),
+                    },
+                    ChannelBinding {
+                        kind: "slack".to_string(),
+                        address: "C0EXAMPLE1".to_string(),
+                    },
                 ],
                 changed: true,
             },
@@ -543,6 +567,36 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             },
         ],
     );
+    m.insert(
+        "ClusterUpgradeOutput",
+        samples![
+            "DryRun" => ClusterUpgradeOutput::DryRun(plan()),
+            "Completed" => ClusterUpgradeOutput::Completed {
+                status: "succeeded".into(),
+                phase: "commit".into(),
+                target_version: "0.9.0".into(),
+                from_version: Some("0.8.6".into()),
+                known_good_version: Some("0.9.0".into()),
+                resumed: false,
+                previous_serving: true,
+                unchanged: false,
+                plan: vec!["phase plan: 0.8.6 -> 0.9.0".into()],
+                convergence: Some(curie::ops::Convergence {
+                    exact: true,
+                    images: true,
+                    generations: true,
+                    replicas: true,
+                    unavailable_zero: true,
+                    hooks_healthy: true,
+                    queues_drained: true,
+                    manifest_matches: true,
+                }),
+                canary: Some(curie::ops::Canary { passed: true }),
+                fail_forward: None,
+                compatibility: None,
+            },
+        ],
+    );
 
     m
 }
@@ -598,6 +652,42 @@ fn every_variant_of_every_cli_output_enum_has_a_sample() {
         "variant(s) {failures:?} are declared in cli/src but have no sample (or name a \
          variant that no longer exists), so their `to_json()` never reaches the schema \
          gate (#965)"
+    );
+}
+
+#[test]
+fn channels_done_sample_covers_warning_present_and_absent_rows() {
+    let registry = registry();
+    let samples = registry
+        .get("ChannelsOutput")
+        .expect("ChannelsOutput has variant samples");
+    let done = samples
+        .iter()
+        .find_map(|(variant, value)| (*variant == "Done").then_some(value))
+        .expect("ChannelsOutput::Done has a sample");
+    let surfaces = done["surfaces"]
+        .as_array()
+        .expect("ChannelsOutput::Done carries surfaces");
+
+    let legacy = surfaces
+        .iter()
+        .find(|binding| binding["address"] == "#legacy-alerts")
+        .expect("the sample carries the legacy binding");
+    assert!(
+        legacy
+            .get("warning")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "the legacy row must carry a string warning: {legacy}"
+    );
+
+    let valid = surfaces
+        .iter()
+        .find(|binding| binding["address"] == "C0EXAMPLE1")
+        .expect("the sample carries the valid binding");
+    assert!(
+        valid.get("warning").is_none(),
+        "the valid row must omit the warning field: {valid}"
     );
 }
 

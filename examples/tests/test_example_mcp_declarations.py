@@ -134,10 +134,22 @@ def test_sre_bot_observability_connectors_ship_self_configured() -> None:
 
 def test_sre_bot_python_connectors_pin_the_mcp_2_runtime_their_servers_import() -> None:
     connector_root = EXAMPLES / "sre-bot" / "connectors"
-    connector_names = ("k8s-scale", "k8s-write", "self-upgrade", "tempo")
+    # Discovered, not hardcoded: the shipped connector set changes as the bot
+    # adopts upstream servers, and a stale name list would either fail on a
+    # retired connector or silently skip a new one. The count assertion is the
+    # anti-vacuity control, so an empty directory cannot report PASS.
+    connectors = sorted(
+        path.parent
+        for path in connector_root.glob("*/requirements.txt")
+        if (path.parent / "server.py").exists()
+    )
+    assert len(connectors) >= 2, (
+        f"expected the sre-bot to ship Python connectors; found {connectors}"
+    )
 
-    for name in connector_names:
-        requirements = (connector_root / name / "requirements.txt").read_text().splitlines()
+    for connector in connectors:
+        requirements = (connector / "requirements.txt").read_text().splitlines()
         assert "mcp==2.1.1" in requirements, (
-            f"{name} imports mcp.server.mcpserver but its image does not pin MCP 2.1.1"
+            f"{connector.name} imports mcp.server.mcpserver but its image "
+            "does not pin MCP 2.1.1"
         )

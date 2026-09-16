@@ -62,6 +62,7 @@ from redis.asyncio import Redis
 from ..binding import (
     BUDGET_ENV,
     BUNDLE_REF_ENV,
+    BUNDLE_VERSION_ENV,
     PLUGIN_DIR_ENV,
     RUNNER_TOKEN_ENV,
     SESSION_ID_ENV,
@@ -758,6 +759,8 @@ class EvalStreamConsumer(StreamConsumer):
         }
         if item.bundle_ref is not None:
             env[BUNDLE_REF_ENV] = item.bundle_ref
+        if item.sha:
+            env[BUNDLE_VERSION_ENV] = item.sha
         # Deliver the agent's connector secrets (#429) so an authed-MCP bundle
         # authenticates during eval exactly as it does on a bound run -- otherwise
         # its tool calls fail auth and the eval measures the wrong thing. The

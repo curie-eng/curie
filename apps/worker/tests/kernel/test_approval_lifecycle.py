@@ -14,6 +14,7 @@ import json
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import aiohttp
 import httpx
@@ -31,6 +32,7 @@ from curie_worker.approvals import (
     PublicationCreateRequest,
     SettledApproval,
 )
+from curie_worker.kernel import _WorkspaceInferenceCarry
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError
 from curie_worker.sandbox.types import RouteState
@@ -148,6 +150,1529 @@ def _awaiting_script(summary: str) -> list:
     ]
 
 
+def _awaiting_script_with_display(summary: str, display: str) -> list:
+    return [
+        TextDelta(text="Requesting sign-off"),
+        Final(
+            text="Requesting sign-off",
+            status=AWAITING,
+            approval_summary=summary,
+            approval_display=display,
+            approval_gate_kind="permission",
+            approval_granted_tool="Bash",
+        ),
+    ]
+
+
+class _LineageFenceRunner:
+    def __init__(self, status: dict[str, object]) -> None:
+        self._status = status
+        self.reads = 0
+
+    async def status(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+        self.reads += 1
+        return dict(self._status)
+
+
+def _lineage_route() -> object:
+    return SimpleNamespace(
+        base_url="http://runner.example.test",
+        token="route-token",
+    )
+
+
+def test_completed_lineage_can_replace_an_idle_durable_awaiting_runner() -> None:
+    """A failed publication suspend must not strand the dirty pre-publish route."""
+
+    async def go() -> None:
+        from curie_worker.kernel import Kernel
+
+        kernel = object.__new__(Kernel)
+        kernel._runner = _LineageFenceRunner(  # type: ignore[attr-defined]
+            {
+                "status": SessionStatus.AWAITING_APPROVAL.value,
+                "turn_active": False,
+                "history_durable": True,
+            }
+        )
+
+        assert await kernel._workspace_handoff_ready(
+            _lineage_route(),
+            lineage_reconciliation=True,
+            pending_publication_approval=False,
+        )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("status", "pending", "reason"),
+    [
+        (
+            {
+                "status": SessionStatus.AWAITING_APPROVAL.value,
+                "turn_active": True,
+                "history_durable": True,
+            },
+            False,
+            "active-turn",
+        ),
+        (
+            {
+                "status": SessionStatus.AWAITING_APPROVAL.value,
+                "turn_active": False,
+                "history_durable": False,
+            },
+            False,
+            "non-durable-history",
+        ),
+        (
+            {
+                "status": SessionStatus.AWAITING_APPROVAL.value,
+                "turn_active": False,
+                "history_durable": True,
+            },
+            True,
+            "pending-approval",
+        ),
+    ],
+)
+def test_lineage_handoff_keeps_busy_and_durability_fences(
+    status: dict[str, object], pending: bool, reason: str
+) -> None:
+    async def go() -> None:
+        from curie_worker.kernel import Kernel
+
+        kernel = object.__new__(Kernel)
+        kernel._runner = _LineageFenceRunner(status)  # type: ignore[attr-defined]
+
+        assert not await kernel._workspace_handoff_ready(
+            _lineage_route(),
+            lineage_reconciliation=True,
+            pending_publication_approval=pending,
+        ), reason
+
+    asyncio.run(go())
+
+
+def test_non_lineage_handoff_still_refuses_awaiting_approval() -> None:
+    """The AWAITING_APPROVAL waiver belongs only to completed publication lineage."""
+
+    async def go() -> None:
+        from curie_worker.kernel import Kernel
+
+        kernel = object.__new__(Kernel)
+        kernel._runner = _LineageFenceRunner(  # type: ignore[attr-defined]
+            {
+                "status": SessionStatus.AWAITING_APPROVAL.value,
+                "turn_active": False,
+                "history_durable": True,
+            }
+        )
+
+        assert not await kernel._workspace_handoff_ready(
+            _lineage_route(),
+            lineage_reconciliation=False,
+            pending_publication_approval=False,
+        )
+
+    asyncio.run(go())
+
+
+def test_open_lineage_bypasses_same_repo_adoption_and_surfaces_route_cas_loss() -> None:
+    async def go() -> None:
+        from curie_worker.kernel import Kernel
+
+        old_route = object()
+
+        class Substrate:
+            def adopt(self, _thread_key: str) -> object:
+                raise AssertionError("open lineage must not adopt the dirty live route")
+
+        class Workspace:
+            def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                assert kwargs["replace_handle"] is old_route
+                assert kwargs["lineage_branch"] == "curie/thread-lineage-example"
+                assert kwargs["lineage_head"] == "a" * 40
+                raise RuntimeError("late workspace handoff lost its route fence")
+
+        kernel = object.__new__(Kernel)
+        kernel._substrate = Substrate()  # type: ignore[attr-defined]
+        kernel._workspace = Workspace()  # type: ignore[attr-defined]
+
+        with pytest.raises(RuntimeError, match="lost its route fence"):
+            await kernel._claim_or_resume(
+                "slack:C0EXAMPLE1:1700000000.000100",
+                {},
+                workspace_deployment_id=uuid.UUID(
+                    "11111111-1111-4111-8111-111111111111"
+                ),
+                workspace_repo="acme-corp/acme-bot",
+                replace_handle=old_route,
+                lineage_branch="curie/thread-lineage-example",
+                lineage_head="a" * 40,
+                force_lineage_replacement=True,
+                agent_name="acme-bot",
+            )
+
+    asyncio.run(go())
+
+
+def test_route_cas_loss_never_steers_or_starts_the_old_lineage_runner() -> None:
+    async def go() -> None:
+        from curie_worker.kernel import Kernel
+        from curie_worker.sandbox.types import SandboxHandle
+
+        thread_key = "slack:C0EXAMPLE1:1700000000.000100"
+        old_route = SandboxHandle(
+            thread_key=thread_key,
+            claim_name="claim-old",
+            sandbox_name="sandbox-old",
+            namespace="test-ns",
+            service_fqdn="old-runner.example.test",
+            port=8080,
+            session_id="session-old",
+            token="route-token",
+            workspace_repo="acme-corp/acme-bot",
+        )
+
+        class Substrate:
+            adopt_calls = 0
+
+            def lookup(self, _thread_key: str) -> SandboxHandle:
+                return old_route
+
+            def adopt(self, _thread_key: str) -> object:
+                self.adopt_calls += 1
+                raise AssertionError("open lineage must bypass same-repo adoption")
+
+        class Workspace:
+            handoffs = 0
+
+            def select_repository(self, **_kwargs: object) -> str:
+                return "acme-corp/acme-bot"
+
+            def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                self.handoffs += 1
+                assert kwargs["replace_handle"] == old_route
+                raise RuntimeError("late workspace handoff lost its route fence")
+
+        class Runner(_LineageFenceRunner):
+            def __init__(self) -> None:
+                super().__init__(
+                    {
+                        "status": SessionStatus.AWAITING_APPROVAL.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                )
+                self.steers: list[object] = []
+                self.starts: list[object] = []
+
+            async def steer(self, *args: object, **kwargs: object) -> bool:
+                self.steers.append((args, kwargs))
+                return False
+
+            async def start_turn(self, *args: object, **kwargs: object) -> object:
+                self.starts.append((args, kwargs))
+                raise AssertionError("model start crossed a lost route fence")
+
+        substrate = Substrate()
+        workspace = Workspace()
+        runner = Runner()
+        kernel = object.__new__(Kernel)
+        kernel._substrate = substrate  # type: ignore[attr-defined]
+        kernel._workspace = workspace  # type: ignore[attr-defined]
+        kernel._runner = runner  # type: ignore[attr-defined]
+
+        with pytest.raises(RuntimeError, match="lost its route fence"):
+            await kernel._route_and_start(
+                thread_key,
+                SimpleNamespace(
+                    text="Continue https://github.com/acme-corp/acme-bot",
+                    user="U0REQUEST1",
+                ),
+                {},
+                workspace_deployment_id=uuid.UUID(
+                    "11111111-1111-4111-8111-111111111111"
+                ),
+                agent_name="acme-bot",
+                lineage_branch="curie/thread-lineage-example",
+                lineage_head="a" * 40,
+                force_lineage_replacement=True,
+                pending_publication_approval=False,
+                workspace_inference=_WorkspaceInferenceCarry(),
+            )
+
+        assert substrate.adopt_calls == 0
+        assert workspace.handoffs == 1
+        assert runner.steers == []
+        assert runner.starts == []
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("route_head", "lineage_head", "route_outcome_revision"),
+    [
+        (None, "b" * 40, 1),
+        ("c" * 40, "b" * 40, 1),
+        ("b" * 40, "b" * 40, 0),
+        ("a" * 40, None, 0),
+    ],
+)
+def test_verified_lineage_with_mismatched_route_state_cold_reconciles(
+    route_head: str | None,
+    lineage_head: str | None,
+    route_outcome_revision: int,
+) -> None:
+    async def go() -> None:
+        from curie_worker.approvals import PublicationLineage
+        from curie_worker.kernel import Kernel
+        from curie_worker.sandbox.types import SandboxHandle
+
+        thread_key = "slack:C0EXAMPLE1:1700000000.000100"
+        deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+        old_route = SandboxHandle(
+            thread_key=thread_key,
+            claim_name="claim-old",
+            sandbox_name="sandbox-old",
+            namespace="test-ns",
+            service_fqdn="old-runner.example.test",
+            port=8080,
+            session_id="session-old",
+            token="route-token",
+            workspace_repo="acme-corp/acme-bot",
+            workspace_materialized_head=route_head,
+            publication_visible_outcome_revision=route_outcome_revision,
+        )
+
+        class PublicationApi:
+            async def get_publication_lineage(
+                self, requested_deployment: uuid.UUID, conversation: str, repo: str
+            ) -> PublicationLineage:
+                assert (requested_deployment, conversation, repo) == (
+                    deployment_id,
+                    thread_key,
+                    "acme-corp/acme-bot",
+                )
+                return PublicationLineage(
+                    id=uuid.UUID("55555555-5555-4555-8555-555555555555"),
+                    deployment_id=deployment_id,
+                    conversation_id=conversation,
+                    repo_full_name=repo,
+                    base_sha="1" * 40,
+                    branch="curie/thread-lineage-example",
+                    pr_number=42 if lineage_head is not None else None,
+                    pr_url=(
+                        "https://github.com/acme-corp/acme-bot/pull/42"
+                        if lineage_head is not None
+                        else None
+                    ),
+                    head_sha=lineage_head,
+                    state="open",
+                    version=2,
+                    latest_revision=1,
+                    has_pending_revision=False,
+                    has_pending_outcome=False,
+                    visible_outcome_revision=1,
+                )
+
+        class Substrate:
+            def lookup(self, _thread_key: str) -> SandboxHandle:
+                return old_route
+
+            def adopt(self, _thread_key: str) -> object:
+                raise AssertionError("mismatched lineage head must not reuse the route")
+
+        class Workspace:
+            def select_repository(self, **_kwargs: object) -> str:
+                return "acme-corp/acme-bot"
+
+            def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                assert kwargs["replace_handle"] == old_route
+                assert kwargs["lineage_branch"] == (
+                    "curie/thread-lineage-example" if lineage_head is not None else None
+                )
+                assert kwargs["lineage_head"] == lineage_head
+                assert kwargs["lineage_base_sha"] == (
+                    "1" * 40 if lineage_head is None else None
+                )
+                assert kwargs["publication_visible_outcome_revision"] == 1
+                raise RuntimeError("captured cold lineage reconciliation")
+
+        kernel = object.__new__(Kernel)
+        kernel._substrate = Substrate()  # type: ignore[attr-defined]
+        kernel._workspace = Workspace()  # type: ignore[attr-defined]
+        kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
+        kernel._runner = _LineageFenceRunner(  # type: ignore[attr-defined]
+            {
+                "status": SessionStatus.DONE.value,
+                "turn_active": False,
+                "history_durable": True,
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="captured cold lineage reconciliation"):
+            await kernel._route_and_start(
+                thread_key,
+                SimpleNamespace(
+                    text="Continue https://github.com/acme-corp/acme-bot",
+                    user="U0REQUEST1",
+                ),
+                {},
+                workspace_deployment_id=deployment_id,
+                agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
+            )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("turn_active", [False, True])
+@pytest.mark.parametrize("lineage_head", ["b" * 40, None])
+def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
+    turn_active: bool,
+    lineage_head: str | None,
+) -> None:
+    async def go() -> None:
+        from curie_worker.approvals import PublicationLineage
+        from curie_worker.kernel import Kernel
+        from curie_worker.sandbox.types import SandboxHandle
+
+        thread_key = "slack:C0EXAMPLE1:1700000000.000100"
+        deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+        route = SandboxHandle(
+            thread_key=thread_key,
+            claim_name="claim-lineage",
+            sandbox_name="sandbox-lineage",
+            namespace="test-ns",
+            service_fqdn="lineage-runner.example.test",
+            port=8080,
+            session_id="session-lineage",
+            token="route-token",
+            workspace_repo="acme-corp/acme-bot",
+            workspace_materialized_head=lineage_head or "1" * 40,
+            publication_visible_outcome_revision=1,
+        )
+
+        class PublicationApi:
+            async def get_publication_lineage(
+                self, requested_deployment: uuid.UUID, conversation: str, repo: str
+            ) -> PublicationLineage:
+                return PublicationLineage(
+                    id=uuid.UUID("55555555-5555-4555-8555-555555555555"),
+                    deployment_id=requested_deployment,
+                    conversation_id=conversation,
+                    repo_full_name=repo,
+                    base_sha="1" * 40,
+                    branch="curie/thread-lineage-example",
+                    pr_number=42 if lineage_head is not None else None,
+                    pr_url=(
+                        "https://github.com/acme-corp/acme-bot/pull/42"
+                        if lineage_head is not None
+                        else None
+                    ),
+                    head_sha=lineage_head,
+                    state="open",
+                    version=2,
+                    latest_revision=1,
+                    has_pending_revision=False,
+                    has_pending_outcome=False,
+                    visible_outcome_revision=1,
+                )
+
+        class Substrate:
+            adopt_calls = 0
+
+            def lookup(self, _thread_key: str) -> SandboxHandle:
+                return route
+
+            def adopt(self, _thread_key: str) -> SandboxHandle:
+                self.adopt_calls += 1
+                return route
+
+        class Workspace:
+            touches: list[tuple[str, int]] = []
+
+            def select_repository(self, **_kwargs: object) -> str:
+                return "acme-corp/acme-bot"
+
+            def touch(self, requested_thread: str, *, ttl_seconds: int) -> bool:
+                self.touches.append((requested_thread, ttl_seconds))
+                return True
+
+            def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                raise AssertionError("matching lineage head must reuse the live route")
+
+        class Runner:
+            status_reads = 0
+            steers = 0
+            starts = 0
+
+            async def status(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+                self.status_reads += 1
+                return {"turn_active": turn_active}
+
+            async def steer(self, *_args: object, **_kwargs: object) -> bool:
+                self.steers += 1
+                return turn_active
+
+            async def start_turn(self, *_args: object, **_kwargs: object) -> object:
+                self.starts += 1
+                return SimpleNamespace()
+
+        substrate = Substrate()
+        workspace = Workspace()
+        runner = Runner()
+        kernel = object.__new__(Kernel)
+        kernel._substrate = substrate  # type: ignore[attr-defined]
+        kernel._workspace = workspace  # type: ignore[attr-defined]
+        kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
+        kernel._runner = runner  # type: ignore[attr-defined]
+        kernel._route_ttl_seconds = 60  # type: ignore[attr-defined]
+
+        result = await kernel._route_and_start(
+            thread_key,
+            SimpleNamespace(
+                text="Continue https://github.com/acme-corp/acme-bot",
+                user="U0REQUEST1",
+            ),
+            {},
+            workspace_deployment_id=deployment_id,
+            agent_name="acme-bot",
+            workspace_inference=_WorkspaceInferenceCarry(),
+        )
+
+        assert substrate.adopt_calls == 1
+        assert workspace.touches == [(thread_key, 60)]
+        assert runner.steers == 1
+        assert result.steered is turn_active
+        assert runner.starts == (0 if turn_active else 1)
+
+    asyncio.run(go())
+
+
+def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers() -> None:
+    async def go() -> None:
+        from curie_worker.approvals import PublicationLineage
+        from curie_worker.kernel import Kernel
+        from curie_worker.sandbox.types import SandboxHandle
+
+        thread_key = "slack:C0EXAMPLE1:1700000000.000100"
+        deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+        base_sha = "1" * 40
+        dirty_route = SandboxHandle(
+            thread_key=thread_key,
+            claim_name="claim-dirty",
+            sandbox_name="sandbox-dirty",
+            namespace="test-ns",
+            service_fqdn="dirty-runner.example.test",
+            port=8080,
+            session_id="session-lineage",
+            token="route-token",
+            workspace_repo="acme-corp/acme-bot",
+            workspace_materialized_head="d" * 40,
+        )
+        reconciled_route = SandboxHandle(
+            thread_key=thread_key,
+            claim_name="claim-reconciled",
+            sandbox_name="sandbox-reconciled",
+            namespace="test-ns",
+            service_fqdn="reconciled-runner.example.test",
+            port=8080,
+            session_id="session-lineage",
+            token="route-token",
+            workspace_repo="acme-corp/acme-bot",
+            workspace_materialized_head=base_sha,
+            publication_visible_outcome_revision=1,
+            generation=1,
+        )
+
+        class PublicationApi:
+            async def get_publication_lineage(
+                self, requested_deployment: uuid.UUID, conversation: str, repo: str
+            ) -> PublicationLineage:
+                return PublicationLineage(
+                    id=uuid.UUID("55555555-5555-4555-8555-555555555555"),
+                    deployment_id=requested_deployment,
+                    conversation_id=conversation,
+                    repo_full_name=repo,
+                    base_sha=base_sha,
+                    branch="curie/thread-lineage-example",
+                    pr_number=None,
+                    pr_url=None,
+                    head_sha=None,
+                    state="open",
+                    version=1,
+                    latest_revision=1,
+                    has_pending_revision=False,
+                    has_pending_outcome=False,
+                    visible_outcome_revision=1,
+                )
+
+        class Substrate:
+            current = dirty_route
+            adopts = 0
+
+            def lookup(self, _thread_key: str) -> SandboxHandle:
+                return self.current
+
+            def adopt(self, _thread_key: str) -> SandboxHandle:
+                self.adopts += 1
+                return self.current
+
+        class Workspace:
+            replacements = 0
+            touches = 0
+
+            def select_repository(self, **_kwargs: object) -> str:
+                return "acme-corp/acme-bot"
+
+            def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                self.replacements += 1
+                assert kwargs["replace_handle"] == dirty_route
+                assert kwargs["lineage_branch"] is None
+                assert kwargs["lineage_head"] is None
+                assert kwargs["lineage_base_sha"] == base_sha
+                substrate.current = reconciled_route
+                return SimpleNamespace(handle=reconciled_route)
+
+            def touch(self, _thread_key: str, *, ttl_seconds: int) -> bool:
+                assert ttl_seconds == 60
+                self.touches += 1
+                return True
+
+        class Runner:
+            live = False
+            starts = 0
+            steers = 0
+
+            async def status(
+                self, handle_url: str, **_kwargs: object
+            ) -> dict[str, object]:
+                if handle_url == dirty_route.base_url:
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                return {"turn_active": self.live}
+
+            async def steer(self, *_args: object, **_kwargs: object) -> bool:
+                self.steers += 1
+                return self.live
+
+            async def start_turn(self, *_args: object, **_kwargs: object) -> object:
+                self.starts += 1
+                return SimpleNamespace()
+
+        substrate = Substrate()
+        workspace = Workspace()
+        runner = Runner()
+        kernel = object.__new__(Kernel)
+        kernel._substrate = substrate  # type: ignore[attr-defined]
+        kernel._workspace = workspace  # type: ignore[attr-defined]
+        kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
+        kernel._runner = runner  # type: ignore[attr-defined]
+        kernel._route_ttl_seconds = 60  # type: ignore[attr-defined]
+        event = SimpleNamespace(
+            text="Continue https://github.com/acme-corp/acme-bot",
+            user="U0REQUEST1",
+        )
+
+        first = await kernel._route_and_start(
+            thread_key,
+            event,
+            {},
+            workspace_deployment_id=deployment_id,
+            agent_name="acme-bot",
+            workspace_inference=_WorkspaceInferenceCarry(),
+        )
+        runner.live = True
+        second = await kernel._route_and_start(
+            thread_key,
+            event,
+            {},
+            workspace_deployment_id=deployment_id,
+            agent_name="acme-bot",
+            workspace_inference=_WorkspaceInferenceCarry(),
+        )
+
+        assert first.steered is False
+        assert second.steered is True
+        assert workspace.replacements == 1
+        assert workspace.touches == 1
+        assert substrate.adopts == 1
+        assert runner.starts == 1
+        assert runner.steers == 2
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("has_pending_revision", "has_pending_outcome", "lineage_head"),
+    [(True, False, "b" * 40), (False, True, None)],
+)
+def test_api_pending_publication_work_is_fenced_before_lineage_handoff_probe(
+    has_pending_revision: bool,
+    has_pending_outcome: bool,
+    lineage_head: str | None,
+) -> None:
+    async def go() -> None:
+        from curie_worker.approvals import PublicationLineage
+        from curie_worker.kernel import Kernel, ThreadBusyError
+        from curie_worker.sandbox.types import SandboxHandle
+
+        thread_key = "slack:C0EXAMPLE1:1700000000.000100"
+        deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+        old_route = SandboxHandle(
+            thread_key=thread_key,
+            claim_name="claim-old",
+            sandbox_name="sandbox-old",
+            namespace="test-ns",
+            service_fqdn="old-runner.example.test",
+            port=8080,
+            session_id="session-old",
+            token="route-token",
+            workspace_repo="acme-corp/acme-private",
+        )
+
+        class PublicationApi:
+            reads: list[tuple[uuid.UUID, str, str]] = []
+
+            async def get_publication_lineage(
+                self, requested_deployment: uuid.UUID, conversation: str, repo: str
+            ) -> PublicationLineage:
+                self.reads.append((requested_deployment, conversation, repo))
+                return PublicationLineage(
+                    id=uuid.UUID("55555555-5555-4555-8555-555555555555"),
+                    deployment_id=deployment_id,
+                    conversation_id=conversation,
+                    repo_full_name=repo,
+                    base_sha="a" * 40,
+                    branch="curie/thread-lineage-example",
+                    pr_number=123 if lineage_head is not None else None,
+                    pr_url=(
+                        "https://github.com/acme-corp/acme-private/pull/123"
+                        if lineage_head is not None
+                        else None
+                    ),
+                    head_sha=lineage_head,
+                    state="open",
+                    version=3,
+                    latest_revision=2,
+                    has_pending_revision=has_pending_revision,
+                    has_pending_outcome=has_pending_outcome,
+                    visible_outcome_revision=0,
+                )
+
+        class Workspace:
+            handoffs = 0
+
+            def select_repository(self, **_kwargs: object) -> str:
+                return "acme-corp/acme-private"
+
+            def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                self.handoffs += 1
+                raise AssertionError("pending revision crossed the lineage fence")
+
+        class Substrate:
+            def lookup(self, _thread_key: str) -> SandboxHandle:
+                return old_route
+
+        publication_api = PublicationApi()
+        workspace = Workspace()
+        runner = _LineageFenceRunner(
+            {
+                "status": SessionStatus.AWAITING_APPROVAL.value,
+                "turn_active": False,
+                "history_durable": True,
+            }
+        )
+        kernel = object.__new__(Kernel)
+        kernel._workspace = workspace  # type: ignore[attr-defined]
+        kernel._substrate = Substrate()  # type: ignore[attr-defined]
+        kernel._runner = runner  # type: ignore[attr-defined]
+        kernel._publication_creator = publication_api  # type: ignore[attr-defined]
+
+        with pytest.raises(ThreadBusyError, match="pending publication revision"):
+            await kernel._route_and_start(
+                thread_key,
+                SimpleNamespace(
+                    text="Continue https://github.com/acme-corp/acme-private",
+                    user="U0REQUEST1",
+                    ts="1700000000.000100",
+                ),
+                {"CURIE_RUNNER_TOKEN": "runner-token"},
+                workspace_deployment_id=deployment_id,
+                agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
+            )
+
+        assert publication_api.reads == [
+            (
+                deployment_id,
+                "slack:C0EXAMPLE1:1700000000.000100",
+                "acme-corp/acme-private",
+            )
+        ]
+        assert workspace.handoffs == 0
+        assert runner.reads == 0
+
+    asyncio.run(go())
+
+
+def test_pending_first_revision_is_a_terminal_reply_before_dirty_route_adoption(
+    make_harness,
+) -> None:
+    """A headless first revision fences the failed-suspend runner immediately."""
+
+    from curie_worker.approvals import PublicationLineage
+    from curie_worker.sandbox.types import SandboxHandle
+
+    deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+    thread = "1700000000.000100"
+    thread_key = f"slack:C1:{thread}"
+    old_route = SandboxHandle(
+        thread_key=thread_key,
+        claim_name="claim-old",
+        sandbox_name="sandbox-old",
+        namespace="test-ns",
+        service_fqdn="old-runner.example.test",
+        port=8080,
+        session_id="session-old",
+        token="route-token",
+        workspace_repo="acme-corp/acme-private",
+    )
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+            )
+
+    class PublicationApi:
+        reads: list[tuple[uuid.UUID, str, str]] = []
+
+        async def get_publication_lineage(
+            self, requested_deployment: uuid.UUID, conversation: str, repo: str
+        ) -> PublicationLineage:
+            self.reads.append((requested_deployment, conversation, repo))
+            return PublicationLineage(
+                id=uuid.UUID("55555555-5555-4555-8555-555555555555"),
+                deployment_id=deployment_id,
+                conversation_id=conversation,
+                repo_full_name=repo,
+                base_sha="a" * 40,
+                branch="curie/thread-lineage-example",
+                pr_number=None,
+                pr_url=None,
+                head_sha=None,
+                state="open",
+                version=1,
+                latest_revision=1,
+                has_pending_revision=True,
+                has_pending_outcome=False,
+                visible_outcome_revision=0,
+            )
+
+    class Workspace:
+        def select_repository(self, **_kwargs: object) -> str:
+            return "acme-corp/acme-private"
+
+        def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+            raise AssertionError("pending first revision reached workspace preparation")
+
+    class Substrate:
+        lookup_calls = 0
+        adopt_calls = 0
+
+        def lookup(self, _thread_key: str) -> SandboxHandle:
+            self.lookup_calls += 1
+            return old_route
+
+        def adopt(self, _thread_key: str) -> object:
+            self.adopt_calls += 1
+            raise AssertionError("pending first revision adopted the dirty live route")
+
+    async def go() -> None:
+        publication_api = PublicationApi()
+        substrate = Substrate()
+        binding = Binding(grant_event_id="unused", grant_tool="unused")
+        async with make_harness(
+            binding=binding, publication_creator=publication_api
+        ) as h:
+            h.runner.session_status = SessionStatus.AWAITING_APPROVAL.value
+            h.kernel._workspace = Workspace()  # type: ignore[assignment]
+            h.kernel._substrate = substrate  # type: ignore[assignment]
+
+            await h.kernel.process_event(
+                _qevent(
+                    "Continue https://github.com/acme-corp/acme-private",
+                    thread=thread,
+                )
+            )
+
+            assert publication_api.reads == [
+                (deployment_id, thread_key, "acme-corp/acme-private")
+            ]
+            assert substrate.lookup_calls == 0
+            assert substrate.adopt_calls == 0
+            assert h.runner.opened == []
+            assert h.sink.last_text == (
+                "This thread already has a publication awaiting approval or completion. "
+                "Resolve it before continuing."
+            )
+            assert len(h.sink.completions) == 1
+
+    asyncio.run(go())
+
+
+def test_api_stale_head_conflict_stops_before_workspace_or_model_for_private_repo() -> None:
+    async def go() -> None:
+        from curie_worker.kernel import Kernel
+
+        deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+
+        class PublicationApi:
+            async def get_publication_lineage(self, *_args: object) -> object:
+                raise ApprovalBackendError(
+                    "publication lineage remote head conflicts with the stored head"
+                )
+
+        class Workspace:
+            def select_repository(self, **_kwargs: object) -> str:
+                return "acme-corp/acme-private"
+
+            def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                raise AssertionError("stale API truth reached workspace preparation")
+
+        class Substrate:
+            def lookup(self, _thread_key: str) -> object:
+                raise AssertionError("stale API truth reached sandbox routing")
+
+        kernel = object.__new__(Kernel)
+        kernel._workspace = Workspace()  # type: ignore[attr-defined]
+        kernel._substrate = Substrate()  # type: ignore[attr-defined]
+        kernel._runner = _LineageFenceRunner({})  # type: ignore[attr-defined]
+        kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
+
+        with pytest.raises(ApprovalBackendError, match="remote head conflicts"):
+            await kernel._route_and_start(
+                "slack:C0EXAMPLE1:1700000000.000100",
+                SimpleNamespace(
+                    text="Continue https://github.com/acme-corp/acme-private",
+                    user="U0REQUEST1",
+                    ts="1700000000.000100",
+                ),
+                {},
+                workspace_deployment_id=deployment_id,
+                agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
+            )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("response_status", "detail", "message"),
+    [
+        (
+            409,
+            {
+                "code": "publication.lineage_stale",
+                "message": "GitHub pull request head differs from the stored lineage; "
+                "restore the expected head or start a new thread.",
+            },
+            "GitHub pull request head differs from the stored lineage; restore the "
+            "expected head or start a new thread.",
+        ),
+        (
+            409,
+            {
+                "code": "publication.lineage_terminal",
+                "message": "The pull request for this thread is merged or closed; "
+                "start a new thread.",
+            },
+            "The pull request for this thread is merged or closed; start a new thread.",
+        ),
+        (
+            503,
+            {
+                "code": "publication.github_unavailable",
+                "message": "GitHub could not verify this thread's pull request. "
+                "Try again later; no model turn or publication was started.",
+            },
+            "GitHub could not verify this thread's pull request. Try again later; "
+            "no model turn or publication was started.",
+        ),
+        (
+            409,
+            "conversation has no selected repository workspace",
+            "conversation has no selected repository workspace",
+        ),
+        (
+            409,
+            "publication repository differs from the thread workspace",
+            "publication repository differs from the thread workspace",
+        ),
+        (
+            409,
+            "thread workspace repository is no longer allowed",
+            "thread workspace repository is no longer allowed",
+        ),
+    ],
+)
+def test_lineage_api_refusal_is_a_user_visible_terminal_process_event(
+    make_harness,
+    response_status: int,
+    detail: object,
+    message: str,
+) -> None:
+    """A safe API refusal answers the requester instead of retrying to dead-letter."""
+
+    deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+            )
+
+    async def go() -> None:
+        thread = "1700000000.000100"
+        thread_key = f"slack:C1:{thread}"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1/internal/publications/lineage"
+            assert request.url.params["conversation_id"] == thread_key
+            return httpx.Response(response_status, json={"detail": detail})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            publication_api = ApprovalClient(
+                api_base_url="https://api.example.com",
+                api_key="",
+                worker_token="worker-token",
+                client=client,
+                read_timeout_s=1,
+            )
+            binding = Binding(grant_event_id="unused", grant_tool="unused")
+            async with make_harness(
+                binding=binding, publication_creator=publication_api
+            ) as h:
+                class Substrate:
+                    lookup_calls = 0
+                    adopt_calls = 0
+
+                    def lookup(self, _thread_key: str) -> object:
+                        self.lookup_calls += 1
+                        raise AssertionError("lineage refusal reached route lookup")
+
+                    def adopt(self, _thread_key: str) -> object:
+                        self.adopt_calls += 1
+                        raise AssertionError("lineage refusal reached route adoption")
+
+                class Workspace:
+                    def select_repository(self, **kwargs: object) -> str:
+                        assert kwargs["thread_key"] == thread_key
+                        return "acme-corp/acme-private"
+
+                    def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                        raise AssertionError("lineage refusal reached workspace preparation")
+
+                substrate = Substrate()
+                h.kernel._workspace = Workspace()  # type: ignore[assignment]
+                h.kernel._substrate = substrate  # type: ignore[assignment]
+                await h.kernel.process_event(
+                    _qevent(
+                        "Continue https://github.com/acme-corp/acme-private",
+                        thread=thread,
+                    )
+                )
+
+                assert h.runner.opened == []
+                assert h.fake_k8s.claim_envs == []
+                assert substrate.lookup_calls == 0
+                assert substrate.adopt_calls == 0
+                assert h.sink.last_text == message
+                assert h.sink.completions[0].target.conversation_id == thread
+
+    asyncio.run(go())
+
+
+def test_slack_publication_ownership_uses_scoped_key_but_replies_use_bare_thread(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lineage ownership is canonical; the adapter thread id remains Slack-shaped."""
+
+    from curie_worker.approvals import CreatedPublication
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+    thread = "1700000000.000100"
+    thread_key = f"slack:C0EXAMPLE1:{thread}"
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+            )
+
+    class PublicationApi:
+        reads: list[tuple[uuid.UUID, str, str]] = []
+        creates: list[PublicationCreateRequest] = []
+
+        async def get_publication_lineage(
+            self, requested_deployment: uuid.UUID, conversation: str, repo: str
+        ) -> None:
+            self.reads.append((requested_deployment, conversation, repo))
+            return None
+
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
+            self.creates.append(request)
+            return CreatedPublication(
+                id="publication-example",
+                approval_id="approval-example",
+                status="pending",
+            )
+
+    class Workspace:
+        def __init__(self) -> None:
+            self.substrate = None
+            self.selected: list[str] = []
+            self.released: list[str] = []
+
+        def select_repository(self, **kwargs: object) -> str:
+            self.selected.append(str(kwargs["thread_key"]))
+            return "acme-corp/acme-private"
+
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            assert self.substrate is not None
+            return SimpleNamespace(
+                handle=self.substrate.claim(
+                    str(kwargs["thread_key"]),
+                    env=kwargs["env"],
+                    agent_name=kwargs["agent_name"],
+                    workspace_repo=kwargs["repo_full_name"],
+                )
+            )
+
+        def release(self, thread_identity: str) -> None:
+            self.released.append(thread_identity)
+
+        def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
+            del ttl_seconds
+
+    async def go() -> None:
+        publication_api = PublicationApi()
+        workspace = Workspace()
+        binding = Binding(grant_event_id="unused", grant_tool="unused")
+        async with make_harness(
+            binding=binding, publication_creator=publication_api
+        ) as h:
+            workspace.substrate = h.substrate
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            h.runner.default_script = [
+                Final(
+                    text="Ready to publish",
+                    status=AWAITING,
+                    approval_summary="Publish the prepared changes",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="mcp__curie__publish_changes",
+                )
+            ]
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                return RunnerWorkspaceSnapshot(
+                    repo_full_name="acme-corp/acme-private",
+                    base_sha="a" * 40,
+                    patch=b"diff --git a/README.md b/README.md\n",
+                    changed_paths=("README.md",),
+                    contains_workflow_files=False,
+                    publication_title="Update README",
+                    publication_body="Prepared by acme-bot.",
+                )
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            monkeypatch.setattr(
+                "curie_worker.kernel.validate_snapshot_against_base",
+                lambda *_args, **_kwargs: None,
+            )
+            await h.kernel.process_event(
+                _qevent(
+                    "Publish https://github.com/acme-corp/acme-private",
+                    thread=thread,
+                    channel="C0EXAMPLE1",
+                )
+            )
+
+            assert workspace.selected == [thread_key]
+            assert publication_api.reads == [
+                (deployment_id, thread_key, "acme-corp/acme-private")
+            ]
+            assert [request.conversation_id for request in publication_api.creates] == [
+                thread_key
+            ]
+            assert [request.reply_conversation_id for request in publication_api.creates] == [
+                thread
+            ]
+            assert workspace.released == [thread_key]
+            assert h.sink.completions[0].target.conversation_id == thread
+
+    asyncio.run(go())
+
+
+# --- #2659: the inferred repository line sits above the approval notice --------
+
+
+def test_ordinary_approval_notice_keeps_the_announcement_above_it(make_harness) -> None:
+    """The announcement is its own block before the notice, never in the record."""
+
+    deployment_id = uuid.UUID("22222222-2222-4222-8222-222222222659")
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+            )
+
+    class Workspace:
+        def __init__(self) -> None:
+            self.substrate = None
+            self.selections: list[object] = []
+
+        def select_repository(self, **kwargs: object) -> str | None:
+            self.selections.append(kwargs["repo_full_name"])
+            return "acme-corp/acme-bot"
+
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            assert self.substrate is not None
+            return SimpleNamespace(
+                handle=self.substrate.claim(
+                    str(kwargs["thread_key"]),
+                    env=kwargs["env"],
+                    agent_name=kwargs["agent_name"],
+                    workspace_repo=kwargs["repo_full_name"],
+                ),
+                prepared=None,
+            )
+
+        def release(self, _thread_identity: str) -> None:
+            return None
+
+        def touch(self, _thread_identity: str, *, ttl_seconds: int) -> bool:
+            return ttl_seconds > 0
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        workspace = Workspace()
+        binding = Binding(grant_event_id="unused", grant_tool="unused")
+        async with make_harness(binding=binding, approvals=approvals) as h:
+            workspace.substrate = h.substrate
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+
+            await h.kernel.process_event(
+                _qevent(
+                    "Make a change in https://github.com/acme-corp/acme-bot: discount",
+                    thread="tAnnounceApproval",
+                )
+            )
+
+            assert workspace.selections == ["acme-corp/acme-bot"]
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].summary == "Give ACME a 20% discount"
+            assert "Working in" not in approvals.requests[0].summary
+            assert h.sink.last_text is not None
+            assert h.sink.last_text.split("\n\n") == [
+                "Requesting sign-off",
+                "Working in acme-corp/acme-bot, from the repository named in your message.",
+                "Awaiting approval (appr-1): Give ACME a 20% discount\n"
+                "The session is paused and will resume once an authorized member "
+                "resolves this request.",
+            ]
+
+    asyncio.run(go())
+
+
+def test_publication_notice_keeps_the_announcement_above_it(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The demo path: the publication notice keeps the announcement as its own block."""
+
+    from curie_worker.approvals import CreatedPublication
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    deployment_id = uuid.UUID("11111111-1111-4111-8111-111111112659")
+    thread = "1700000000.002659"
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+            )
+
+    class PublicationApi:
+        def __init__(self) -> None:
+            self.creates: list[PublicationCreateRequest] = []
+
+        async def get_publication_lineage(
+            self, requested_deployment: uuid.UUID, conversation: str, repo: str
+        ) -> None:
+            return None
+
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
+            self.creates.append(request)
+            return CreatedPublication(
+                id="publication-example",
+                approval_id="approval-example",
+                status="pending",
+            )
+
+    class Workspace:
+        def __init__(self) -> None:
+            self.substrate = None
+
+        def select_repository(self, **kwargs: object) -> str:
+            return "acme-corp/acme-private"
+
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            assert self.substrate is not None
+            return SimpleNamespace(
+                handle=self.substrate.claim(
+                    str(kwargs["thread_key"]),
+                    env=kwargs["env"],
+                    agent_name=kwargs["agent_name"],
+                    workspace_repo=kwargs["repo_full_name"],
+                )
+            )
+
+        def release(self, _thread_identity: str) -> None:
+            return None
+
+        def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
+            del ttl_seconds
+
+    async def go() -> None:
+        publication_api = PublicationApi()
+        workspace = Workspace()
+        binding = Binding(grant_event_id="unused", grant_tool="unused")
+        async with make_harness(
+            binding=binding, publication_creator=publication_api
+        ) as h:
+            workspace.substrate = h.substrate
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            h.runner.default_script = [
+                Final(
+                    text="Ready to publish",
+                    status=AWAITING,
+                    approval_summary="Publish the prepared changes",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="mcp__curie__publish_changes",
+                )
+            ]
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                return RunnerWorkspaceSnapshot(
+                    repo_full_name="acme-corp/acme-private",
+                    base_sha="a" * 40,
+                    patch=b"diff --git a/README.md b/README.md\n",
+                    changed_paths=("README.md",),
+                    contains_workflow_files=False,
+                    publication_title="Update README",
+                    publication_body="Prepared by acme-bot.",
+                )
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            monkeypatch.setattr(
+                "curie_worker.kernel.validate_snapshot_against_base",
+                lambda *_args, **_kwargs: None,
+            )
+            await h.kernel.process_event(
+                _qevent(
+                    "Publish https://github.com/acme-corp/acme-private",
+                    thread=thread,
+                    channel="C0EXAMPLE1",
+                )
+            )
+
+            assert len(publication_api.creates) == 1
+            assert "Working in" not in publication_api.creates[0].summary
+            notices = [
+                text
+                for _address, _ref, text in h.sink.updates
+                if "Awaiting approval (approval-example)" in text
+            ]
+            assert notices, h.sink.updates
+            blocks = notices[-1].split("\n\n")
+            marker = next(
+                index
+                for index, block in enumerate(blocks)
+                if block.startswith("Awaiting approval (approval-example)")
+            )
+            assert marker >= 1, blocks
+            assert blocks[marker - 1] == (
+                "Working in acme-corp/acme-private, from the repository named in your message."
+            )
+
+    asyncio.run(go())
+
+
+def test_private_lineage_head_reaches_handoff_without_a_publication_credential() -> None:
+    async def go() -> None:
+        from curie_worker.approvals import PublicationLineage
+        from curie_worker.kernel import Kernel
+        from curie_worker.sandbox.types import SandboxHandle
+
+        thread_key = "slack:C0EXAMPLE1:1700000000.000100"
+        deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+        old_route = SandboxHandle(
+            thread_key=thread_key,
+            claim_name="claim-old",
+            sandbox_name="sandbox-old",
+            namespace="test-ns",
+            service_fqdn="old-runner.example.test",
+            port=8080,
+            session_id="session-old",
+            token="route-token",
+            workspace_repo="acme-corp/acme-private",
+        )
+
+        class PublicationApi:
+            async def get_publication_lineage(
+                self, _deployment: uuid.UUID, conversation: str, repo: str
+            ) -> PublicationLineage:
+                return PublicationLineage(
+                    id=uuid.UUID("55555555-5555-4555-8555-555555555555"),
+                    deployment_id=deployment_id,
+                    conversation_id=conversation,
+                    repo_full_name=repo,
+                    base_sha="a" * 40,
+                    branch="curie/thread-lineage-example",
+                    pr_number=123,
+                    pr_url="https://github.com/acme-corp/acme-private/pull/123",
+                    head_sha="b" * 40,
+                    state="open",
+                    version=3,
+                    latest_revision=2,
+                    has_pending_revision=False,
+                    has_pending_outcome=False,
+                    visible_outcome_revision=2,
+                )
+
+        class Workspace:
+            claim: dict[str, object] | None = None
+
+            def select_repository(self, **_kwargs: object) -> str:
+                return "acme-corp/acme-private"
+
+            def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                self.claim = dict(kwargs)
+                raise RuntimeError("captured safe lineage handoff")
+
+        class Substrate:
+            def lookup(self, _thread_key: str) -> SandboxHandle:
+                return old_route
+
+            def adopt(self, _thread_key: str) -> object:
+                raise AssertionError("open lineage reused the dirty same-repo route")
+
+        workspace = Workspace()
+        kernel = object.__new__(Kernel)
+        kernel._workspace = workspace  # type: ignore[attr-defined]
+        kernel._substrate = Substrate()  # type: ignore[attr-defined]
+        kernel._runner = _LineageFenceRunner(  # type: ignore[attr-defined]
+            {
+                "status": SessionStatus.AWAITING_APPROVAL.value,
+                "turn_active": False,
+                "history_durable": True,
+            }
+        )
+        kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
+
+        with pytest.raises(RuntimeError, match="captured safe lineage handoff"):
+            await kernel._route_and_start(
+                thread_key,
+                SimpleNamespace(
+                    text="Continue https://github.com/acme-corp/acme-private",
+                    user="U0REQUEST1",
+                    ts="1700000000.000100",
+                ),
+                {"CURIE_RUNNER_TOKEN": "runner-token"},
+                workspace_deployment_id=deployment_id,
+                agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
+            )
+
+        assert workspace.claim is not None
+        assert workspace.claim["lineage_branch"] == "curie/thread-lineage-example"
+        assert workspace.claim["lineage_head"] == "b" * 40
+        assert workspace.claim["replace_handle"] == old_route
+        serialized = json.dumps(workspace.claim, default=str).casefold()
+        assert "authorization" not in serialized
+        assert "publication-write" not in serialized
+        assert "github_pat" not in serialized
+
+    asyncio.run(go())
+
+
 # The settled record a resolved approval reads back as: the one verdict the
 # card-stamping tests below all pin their assertions to.
 _APPROVED = SettledApproval(
@@ -258,6 +1783,157 @@ def test_worker_approval_http_requests_carry_the_active_turn_parent() -> None:
     asyncio.run(go())
 
 
+def test_private_lineage_truth_is_read_from_api_without_publication_credentials() -> None:
+    """Routing gets refreshed PR truth from the trusted API, never GitHub directly."""
+
+    async def go() -> None:
+        seen: list[httpx.Request] = []
+        deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            assert request.url.path == "/v1/internal/publications/lineage"
+            return httpx.Response(
+                200,
+                json={
+                    "id": "55555555-5555-4555-8555-555555555555",
+                    "deployment_id": str(deployment_id),
+                    "conversation_id": "1700000000.000100",
+                    "repo_full_name": "acme-corp/acme-private",
+                    "base_sha": "a" * 40,
+                    "branch": "curie/thread-lineage-example",
+                    "pr_number": 123,
+                    "pr_url": "https://github.com/acme-corp/acme-private/pull/123",
+                    "head_sha": "b" * 40,
+                    "state": "open",
+                    "version": 3,
+                    "latest_revision": 2,
+                    "has_pending_revision": True,
+                    "has_pending_outcome": True,
+                    "visible_outcome_revision": 1,
+                },
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            client = ApprovalClient(
+                api_base_url="https://api.example.test",
+                api_key="platform-test-key",
+                client=http,
+                read_timeout_s=1.0,
+                worker_token="worker-test-token",
+            )
+            lineage = await client.get_publication_lineage(
+                deployment_id,
+                "1700000000.000100",
+                "acme-corp/acme-private",
+            )
+
+        assert lineage is not None
+        assert lineage.state == "open"
+        assert lineage.head_sha == "b" * 40
+        assert lineage.has_pending_revision is True
+        assert lineage.has_pending_outcome is True
+        assert lineage.visible_outcome_revision == 1
+        assert not hasattr(lineage, "authorization_header")
+        assert len(seen) == 1
+        request = seen[0]
+        assert request.headers["X-Curie-Worker-Token"] == "worker-test-token"
+        assert "Authorization" not in request.headers
+        assert "credential" not in request.url.query.decode().casefold()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["publication.lineage_stale", "publication.lineage_terminal"],
+)
+def test_private_lineage_conflict_is_translated_to_a_user_actionable_refusal(
+    code: str,
+) -> None:
+    async def go() -> None:
+        from curie_worker.workspace import WorkspaceSelectionRefused
+
+        message = "Restore the expected head or start a new thread."
+
+        def handle(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                409,
+                json={"detail": {"code": code, "message": message}},
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            client = ApprovalClient(
+                api_base_url="https://api.example.test",
+                api_key="",
+                client=http,
+                read_timeout_s=1.0,
+                worker_token="worker-test-token",
+            )
+            with pytest.raises(WorkspaceSelectionRefused) as excinfo:
+                await client.get_publication_lineage(
+                    uuid.UUID("11111111-1111-4111-8111-111111111111"),
+                    "1700000000.000100",
+                    "acme-corp/acme-private",
+                )
+
+        assert excinfo.value.public_detail == message
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "conversation has no selected repository workspace",
+        "publication repository differs from the thread workspace",
+        "thread workspace repository is no longer allowed",
+    ],
+)
+def test_publication_create_workspace_409_is_a_terminal_refusal(message: str) -> None:
+    """Workspace authorization failures must not retry an already-run model turn."""
+
+    async def go() -> None:
+        from curie_worker.workspace import WorkspaceSelectionRefused
+
+        def handle(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(409, json={"detail": message})
+
+        request = PublicationCreateRequest(
+            deployment_id=uuid.UUID("11111111-1111-4111-8111-111111111111"),
+            conversation_id="slack:C0EXAMPLE1:1700000000.000100",
+            repo_full_name="acme-corp/acme-private",
+            author="U0REQUEST1",
+            summary="Publish the bounded change",
+            reply_kind="slack",
+            reply_channel="C0EXAMPLE1",
+            reply_placeholder="1700000000.000001",
+            reply_endpoint=None,
+            reply_adapter=None,
+            dedupe_key="publication-example",
+            base_sha="a" * 40,
+            patch=b"diff --git a/README.md b/README.md\n",
+            changed_paths=("README.md",),
+            expires_in_seconds=600,
+            title="Update README",
+            body="Approved platform publication.",
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            client = ApprovalClient(
+                api_base_url="https://api.example.test",
+                api_key="",
+                client=http,
+                read_timeout_s=1.0,
+                worker_token="worker-test-token",
+            )
+            with pytest.raises(WorkspaceSelectionRefused) as excinfo:
+                await client.create_publication(request)
+
+        assert excinfo.value.public_detail == message
+
+    asyncio.run(go())
+
+
 def test_worker_approval_http_does_not_fabricate_a_parent() -> None:
     """A legacy/root call without an active trace stays a clean HTTP root."""
 
@@ -322,6 +1998,45 @@ def test_awaiting_approval_creates_record_and_suspends(make_harness) -> None:
             assert "Awaiting approval (appr-1)" in h.sink.last_text
             assert "Give ACME a 20% discount" in h.sink.last_text
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_templated_display_reaches_the_notice_and_card_not_the_record(
+    make_harness,
+) -> None:
+    """#2565: the sentence is what a person reads; the record keeps the machine string."""
+
+    sentence = "File FY26Q1: 11 workbooks into Approved, 25 cells going out blank. Approve?"
+    machine = (
+        "Tool call awaiting approval: mcp__plugin_demo_files__approve_batch "
+        '{"expected": {"a.xlsx": "aaa"}}'
+    )
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script_with_display(machine, sentence)
+            ev = _qevent("please file", event_id="ev-appr-display")
+            await h.kernel.process_event(ev)
+
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].summary == machine
+
+            assert h.sink.last_text is not None
+            notice_lines = [
+                line
+                for line in h.sink.last_text.splitlines()
+                if line.startswith("Awaiting approval (")
+            ]
+            assert notice_lines == [f"Awaiting approval (appr-1): {sentence}"]
+            assert machine not in h.sink.last_text
+
+            assert h.sink.posts
+            card_message = h.sink.posts[0][1]
+            assert card_message.text == sentence
+            assert isinstance(card_message.interaction, ConfirmIntent)
+            assert card_message.interaction.prompt == sentence
 
     asyncio.run(go())
 
@@ -906,6 +2621,7 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
                 TargetRoute(),
                 lambda: None,
                 remaining_s=17.25,
+                workspace_inference=_WorkspaceInferenceCarry(),
             )
 
             assert outcome.status is AWAITING
@@ -2295,3 +4011,259 @@ def test_a_legacy_thread_keyed_card_is_settled_after_the_boot_migration(
             assert not await h.async_redis.exists(h.config.approval_card_key("appr-1"))
 
     asyncio.run(go())
+
+
+def test_publication_with_bound_route_is_created_and_does_not_escalate_unexpected_route(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_worker.approvals import CreatedPublication
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    deployment_id = uuid.UUID("11111111-1111-4111-8111-111111112705")
+    thread = "1700000000.002705"
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+                approval_routes={
+                    "managers": {
+                        **_notification_route(),
+                        "approvers": {"users": ["U0EXAMPLE1"]},
+                    }
+                },
+            )
+
+    class PublicationApi:
+        def __init__(self) -> None:
+            self.creates: list[PublicationCreateRequest] = []
+
+        async def get_publication_lineage(
+            self, requested_deployment: uuid.UUID, conversation: str, repo: str
+        ) -> None:
+            return None
+
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
+            self.creates.append(request)
+            return CreatedPublication(
+                id="publication-example",
+                approval_id="approval-example",
+                status="pending",
+            )
+
+    class Workspace:
+        def __init__(self) -> None:
+            self.substrate = None
+
+        def select_repository(self, **kwargs: object) -> str:
+            return "acme-corp/acme-private"
+
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            assert self.substrate is not None
+            return SimpleNamespace(
+                handle=self.substrate.claim(
+                    str(kwargs["thread_key"]),
+                    env=kwargs["env"],
+                    agent_name=kwargs["agent_name"],
+                    workspace_repo=kwargs["repo_full_name"],
+                )
+            )
+
+        def release(self, _thread_identity: str) -> None:
+            return None
+
+        def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
+            del ttl_seconds
+
+    async def go() -> None:
+        publication_api = PublicationApi()
+        workspace = Workspace()
+        binding = Binding(grant_event_id="unused", grant_tool="unused")
+        async with make_harness(
+            binding=binding, publication_creator=publication_api
+        ) as h:
+            workspace.substrate = h.substrate
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            h.runner.default_script = [
+                Final(
+                    text="Ready to publish",
+                    status=AWAITING,
+                    approval_summary="Publish the prepared changes",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="mcp__curie__publish_changes",
+                    approval_route="managers",
+                )
+            ]
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                return RunnerWorkspaceSnapshot(
+                    repo_full_name="acme-corp/acme-private",
+                    base_sha="a" * 40,
+                    patch=b"diff --git a/README.md b/README.md\n",
+                    changed_paths=("README.md",),
+                    contains_workflow_files=False,
+                    publication_title="Update README",
+                    publication_body="Prepared by acme-bot.",
+                )
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            monkeypatch.setattr(
+                "curie_worker.kernel.validate_snapshot_against_base",
+                lambda *_args, **_kwargs: None,
+            )
+            await h.kernel.process_event(
+                _qevent(
+                    "Publish https://github.com/acme-corp/acme-private",
+                    thread=thread,
+                    channel="C0EXAMPLE1",
+                )
+            )
+
+            assert publication_api.creates, h.sink.last_text
+            assert getattr(publication_api.creates[0], "route", None) == "managers"
+            assert h.sink.last_text is not None
+            assert "unexpected approval route" not in h.sink.last_text
+            assert h.sink.posts == []
+            assert [
+                event
+                for event, _route, _best_effort in h.sink.events
+                if isinstance(event, ReplyPost) and event.message.interaction is None
+            ] == []
+
+    asyncio.run(go())
+
+
+def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_worker.approvals import CreatedPublication
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    deployment_id = uuid.UUID("22222222-2222-4222-8222-222222222705")
+    thread = "1700000000.002706"
+
+    class Binding(GrantBinding):
+        async def resolve(self, kind: str, channel: str):  # noqa: ANN201
+            from curie_worker.binding import ResolvedDeployment
+
+            return ResolvedDeployment(
+                agent_id=self.agent_id,
+                agent_name="acme-bot",
+                deployment_id=deployment_id,
+                workspace_enabled=True,
+                version_id=uuid.uuid4(),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+                approval_routes={"operators": _resolution_route()},
+            )
+
+    class PublicationApi:
+        def __init__(self) -> None:
+            self.creates: list[PublicationCreateRequest] = []
+
+        async def get_publication_lineage(
+            self, requested_deployment: uuid.UUID, conversation: str, repo: str
+        ) -> None:
+            return None
+
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
+            self.creates.append(request)
+            return CreatedPublication(
+                id="publication-example",
+                approval_id="approval-example",
+                status="pending",
+            )
+
+    class Workspace:
+        def __init__(self) -> None:
+            self.substrate = None
+
+        def select_repository(self, **kwargs: object) -> str:
+            return "acme-corp/acme-private"
+
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            assert self.substrate is not None
+            return SimpleNamespace(
+                handle=self.substrate.claim(
+                    str(kwargs["thread_key"]),
+                    env=kwargs["env"],
+                    agent_name=kwargs["agent_name"],
+                    workspace_repo=kwargs["repo_full_name"],
+                )
+            )
+
+        def release(self, _thread_identity: str) -> None:
+            return None
+
+        def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
+            del ttl_seconds
+
+    async def go() -> None:
+        publication_api = PublicationApi()
+        workspace = Workspace()
+        binding = Binding(grant_event_id="unused", grant_tool="unused")
+        async with make_harness(
+            binding=binding, publication_creator=publication_api
+        ) as h:
+            workspace.substrate = h.substrate
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            h.runner.default_script = [
+                Final(
+                    text="Ready to publish",
+                    status=AWAITING,
+                    approval_summary="Publish the prepared changes",
+                    approval_gate_kind="permission",
+                    approval_granted_tool="mcp__curie__publish_changes",
+                    approval_route="managers",
+                )
+            ]
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                return RunnerWorkspaceSnapshot(
+                    repo_full_name="acme-corp/acme-private",
+                    base_sha="a" * 40,
+                    patch=b"diff --git a/README.md b/README.md\n",
+                    changed_paths=("README.md",),
+                    contains_workflow_files=False,
+                    publication_title="Update README",
+                    publication_body="Prepared by acme-bot.",
+                )
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            monkeypatch.setattr(
+                "curie_worker.kernel.validate_snapshot_against_base",
+                lambda *_args, **_kwargs: None,
+            )
+            await h.kernel.process_event(
+                _qevent(
+                    "Publish https://github.com/acme-corp/acme-private",
+                    thread=thread,
+                    channel="C0EXAMPLE1",
+                )
+            )
+
+            assert publication_api.creates == []
+            assert h.sink.last_text is not None
+            assert "route is not bound" in h.sink.last_text
+            assert "unexpected approval route" not in h.sink.last_text
+
+    asyncio.run(go())
+

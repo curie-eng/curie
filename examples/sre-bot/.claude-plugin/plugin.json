@@ -1,7 +1,7 @@
 {
   "name": "sre-bot",
   "version": "0.1.0",
-  "description": "SRE triage assistant for plain-English production health and Kubernetes questions in Slack. Read-only by default: the Kubernetes read connector exposes only read tools, and its credential cannot read Secrets or mutate resources. Grafana and Tempo connectors add observability reads. The one declared write verb rolls a single allowlisted Deployment using a separate credential and the exact human approval gate mcp__k8s-write__restart_deployment. A second gated verb scales a single allowlisted Deployment through the `deployments/scale` subresource with its own credential and the gate mcp__k8s-scale__scale_deployment; it reports the replica count it read before writing, so the platform can offer an undo.",
+  "description": "SRE triage assistant for plain-English production health and Kubernetes questions in Slack. One pinned upstream Kubernetes MCP connector exposes the core toolset: reads execute immediately, six mutations require a fresh human approval, and unmatched tools fail closed. Kubernetes RBAC limits writes to disposable demo-namespace workloads and independently excludes credentials, identity, RBAC, cluster-scoped mutation, and platform upgrades.",
   "license": "Apache-2.0",
   "author": {
     "name": "CurieTech"
@@ -17,7 +17,7 @@
     "k8s",
     "cluster",
     "triage",
-    "read-only"
+    "approval-gated"
   ],
   "starterPrompts": [
     "Is anything broken right now?",
@@ -32,17 +32,95 @@
   "approvalPolicy": {
     "gates": [
       {
-        "gate": "mcp__k8s-write__restart_deployment",
-        "route": "sre-approvals"
-      },
-      {
-        "gate": "mcp__k8s-scale__scale_deployment",
-        "route": "sre-approvals"
-      },
-      {
         "gate": "mcp__self-upgrade__upgrade_self",
+        "route": "sre-approvals"
+      },
+      {
+        "gate": "mcp__self-upgrade__upgrade_platform",
         "route": "sre-approvals"
       }
     ]
+  },
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": [
+      "kubernetes/events_list",
+      "kubernetes/namespaces_list",
+      "kubernetes/projects_list",
+      "kubernetes/nodes_log",
+      "kubernetes/nodes_stats_summary",
+      "kubernetes/nodes_top",
+      "kubernetes/pods_list",
+      "kubernetes/pods_list_in_namespace",
+      "kubernetes/pods_get",
+      "kubernetes/pods_top",
+      "kubernetes/pods_log",
+      "kubernetes/resources_list",
+      "kubernetes/resources_get",
+      "self-upgrade/upgrade_self",
+      "self-upgrade/upgrade_platform",
+      "tempo/search_traces",
+      "tempo/get_trace",
+      "tempo/list_trace_tags",
+      "tempo/list_trace_tag_values",
+      "self-upgrade/latest_release",
+      "grafana/alerting_manage_routing",
+      "grafana/alerting_manage_rules",
+      "grafana/analyze_loki_labels",
+      "grafana/check_datasources_health",
+      "grafana/generate_deeplink",
+      "grafana/get_alert_group",
+      "grafana/get_annotation_tags",
+      "grafana/get_annotations",
+      "grafana/get_assertions",
+      "grafana/get_current_oncall_users",
+      "grafana/get_dashboard_by_uid",
+      "grafana/get_dashboard_panel_queries",
+      "grafana/get_dashboard_property",
+      "grafana/get_dashboard_summary",
+      "grafana/get_datasource",
+      "grafana/get_oncall_shift",
+      "grafana/get_query_examples",
+      "grafana/get_sift_analysis",
+      "grafana/get_sift_investigation",
+      "grafana/list_alert_groups",
+      "grafana/list_cloudwatch_dimensions",
+      "grafana/list_cloudwatch_metrics",
+      "grafana/list_cloudwatch_namespaces",
+      "grafana/list_datasources",
+      "grafana/list_loki_label_names",
+      "grafana/list_loki_label_values",
+      "grafana/list_oncall_schedules",
+      "grafana/list_oncall_teams",
+      "grafana/list_oncall_users",
+      "grafana/list_prometheus_label_names",
+      "grafana/list_prometheus_label_values",
+      "grafana/list_prometheus_metric_metadata",
+      "grafana/list_prometheus_metric_names",
+      "grafana/list_pyroscope_label_names",
+      "grafana/list_pyroscope_label_values",
+      "grafana/list_pyroscope_profile_types",
+      "grafana/list_sift_investigations",
+      "grafana/query_cloudwatch",
+      "grafana/query_loki_logs",
+      "grafana/query_loki_patterns",
+      "grafana/query_loki_stats",
+      "grafana/query_prometheus",
+      "grafana/query_prometheus_histogram",
+      "grafana/query_pyroscope",
+      "grafana/run_panel_query",
+      "grafana/search_dashboards",
+      "grafana/search_folders",
+      "grafana/suggest_loki_alloy_label_config"
+    ],
+    "approvalRequired": [
+      "kubernetes/pods_delete",
+      "kubernetes/pods_exec",
+      "kubernetes/pods_run",
+      "kubernetes/resources_create_or_update",
+      "kubernetes/resources_delete",
+      "kubernetes/resources_scale"
+    ],
+    "deny": []
   }
 }

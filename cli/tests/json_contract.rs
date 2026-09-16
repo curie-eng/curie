@@ -1064,7 +1064,7 @@ use curie::local::{
 };
 use curie::ops::{
     ClusterDownOutput, ClusterRollbackOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput,
-    PodRow,
+    ClusterUpgradeOutput, PodRow,
 };
 use curie::release_accept::ReleaseAcceptOutput;
 use curie::secrets::SecretsListOutput;
@@ -1177,6 +1177,7 @@ fn skill_message_awaiting_approval_output_preserves_final_approval_fields() {
         approval_route: Some("reviewers".to_string()),
         approval_gate_kind: Some("permission".to_string()),
         approval_granted_tool: Some("ExampleTool".to_string()),
+        approval_display: None,
         input_tokens: Some(10),
         output_tokens: Some(5),
     };
@@ -1209,6 +1210,7 @@ fn skill_message_awaiting_approval_output_is_not_finalized() {
         approval_route: Some("reviewers".to_string()),
         approval_gate_kind: Some("policy".to_string()),
         approval_granted_tool: None,
+        approval_display: None,
         input_tokens: None,
         output_tokens: None,
     };
@@ -1245,6 +1247,7 @@ fn skill_message_only_marks_awaiting_approval_as_not_finalized() {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_display: None,
             input_tokens: None,
             output_tokens: None,
         };
@@ -2438,24 +2441,51 @@ fn cluster_status_output_validates_both_variants() {
         warnings: vec![],
         pods_listed: true,
         urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
     };
     let out = ClusterStatusOutput::Status(Box::new(status));
     assert_valid("cluster-status.schema.json", &out.to_json());
-    let mut with_mail = out.to_json();
-    with_mail["pods"]["rows"][0]["mail_channel"] =
-        serde_json::to_value(curie::mail_channel::Report {
-            pod: "acme-mail-0".to_string(),
-            channel_token: Some(curie::mail_channel::Token {
-                present: true,
-                exp: Some(1_800_000_000),
-                state: curie::mail_channel::TokenState::Expired,
+    assert!(
+        out.to_json()["pods"]["rows"][0]["mail_channel"].is_null(),
+        "an unprobed row omits mail_channel so consumers read null"
+    );
+    let with_mail = ClusterStatus {
+        namespace: "curie".to_string(),
+        revision: "3".to_string(),
+        release_state: "deployed".to_string(),
+        release_found: true,
+        release_missing_note: None,
+        pods: vec![PodRow {
+            mail_channel: Some(curie::mail_channel::Report {
+                pod: "acme-mail-0".to_string(),
+                channel_token: Some(curie::mail_channel::Token {
+                    present: true,
+                    exp: Some(1_800_000_000),
+                    state: curie::mail_channel::TokenState::Expired,
+                }),
+                last_ingress_status: None,
+                detail: "mail channel token: expired".to_string(),
+                fix: Some("re-mint".to_string()),
             }),
-            last_ingress_status: None,
-            detail: "mail channel token: expired".to_string(),
-            fix: Some("re-mint".to_string()),
-        })
-        .unwrap();
+            name: "acme-mail-0".to_string(),
+            ready: "1/1".to_string(),
+            status: "Running".to_string(),
+        }],
+        ready: 1,
+        total: 1,
+        unhealthy: vec![],
+        warnings: vec![],
+        pods_listed: true,
+        urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
+        delivery: curie::completion_outbox::Report::unknown(),
+    };
+    let with_mail = ClusterStatusOutput::Status(Box::new(with_mail)).to_json();
+    assert_eq!(
+        with_mail["pods"]["rows"][0]["mail_channel"]["channel_token"]["state"],
+        "expired"
+    );
     assert_valid("cluster-status.schema.json", &with_mail);
 
     let dry = ClusterStatusOutput::DryRun(DryRunPlan {
@@ -2522,6 +2552,89 @@ fn cluster_rollback_output_validates_all_variants() {
         forced: true,
     };
     assert_valid("cluster-rollback.schema.json", &forced.to_json());
+}
+
+#[test]
+fn cluster_upgrade_output_validates_dry_run_success_and_failure() {
+    let dry = ClusterUpgradeOutput::DryRun(DryRunPlan {
+        lines: vec!["phase plan: 0.8.6 -> 0.9.0".to_string()],
+    });
+    assert_valid("cluster-upgrade.schema.json", &dry.to_json());
+    let succeeded = ClusterUpgradeOutput::Completed {
+        status: "succeeded".into(),
+        phase: "commit".into(),
+        target_version: "0.9.0".into(),
+        from_version: Some("0.8.6".into()),
+        known_good_version: Some("0.9.0".into()),
+        resumed: false,
+        previous_serving: true,
+        unchanged: false,
+        plan: vec!["phase plan: 0.8.6 -> 0.9.0".into()],
+        convergence: Some(curie::ops::Convergence {
+            exact: true,
+            images: true,
+            generations: true,
+            replicas: true,
+            unavailable_zero: true,
+            hooks_healthy: true,
+            queues_drained: true,
+            manifest_matches: true,
+        }),
+        canary: Some(curie::ops::Canary { passed: true }),
+        fail_forward: None,
+        compatibility: None,
+    };
+    assert_valid("cluster-upgrade.schema.json", &succeeded.to_json());
+    let failed = ClusterUpgradeOutput::Completed {
+        status: "failed".into(),
+        phase: "canary".into(),
+        target_version: "0.9.0".into(),
+        from_version: Some("0.8.6".into()),
+        known_good_version: Some("0.8.6".into()),
+        resumed: false,
+        previous_serving: true,
+        unchanged: false,
+        plan: vec!["phase plan: 0.8.6 -> 0.9.0".into()],
+        convergence: Some(curie::ops::Convergence {
+            exact: true,
+            images: true,
+            generations: true,
+            replicas: true,
+            unavailable_zero: true,
+            hooks_healthy: true,
+            queues_drained: true,
+            manifest_matches: true,
+        }),
+        canary: Some(curie::ops::Canary { passed: false }),
+        fail_forward: Some(curie::ops::FailForward {
+            command: "curie cluster rollback --yes".into(),
+            reason: "canary failed".into(),
+        }),
+        compatibility: None,
+    };
+    assert_valid("cluster-upgrade.schema.json", &failed.to_json());
+    let mut with_compat = succeeded.to_json();
+    with_compat["compatibility"] = serde_json::json!({
+        "decision": "refuse",
+        "current_revision": "0039",
+        "target_min": "0043",
+        "target_head": "0043",
+        "source_head": "0039",
+        "pending": [{"revision": "0041", "kind": "contract"}],
+        "rollback_compatible": false,
+        "forward_only": false,
+        "reason": "pending contract/irreversible migration 0041; pass --forward-only",
+        "outcome": "refused"
+    });
+    assert_valid("cluster-upgrade.schema.json", &with_compat);
+    let mut bad = succeeded.to_json();
+    bad["canary"]["passed"] = serde_json::json!(false);
+    let schema = load_schema("cluster-upgrade.schema.json");
+    let v = validator(&schema);
+    assert!(
+        !v.is_valid(&bad),
+        "success without a passing canary must not validate"
+    );
 }
 
 #[test]

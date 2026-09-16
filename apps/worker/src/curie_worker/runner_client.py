@@ -603,21 +603,27 @@ class RunnerClient:
                 raise RunnerError("/v1/snapshot returned an invalid bounded payload") from exc
 
     async def status(
-        self, base_url: str, *, remaining_s: float | None = None
+        self,
+        base_url: str,
+        *,
+        token: str | None = None,
+        remaining_s: float | None = None,
     ) -> dict[str, object]:
+        path = "/v1/status" if token else "/status"
+
         async def request(headers: dict[str, str] | None) -> tuple[dict[str, object], str]:
             async with self._session.get(
-                f"{base_url}/status",
+                f"{base_url}{path}",
                 headers=headers,
                 timeout=self._request_timeout(remaining_s),
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    raise RunnerError(f"/status -> {resp.status}: {body}")
+                    raise RunnerError(f"{path} -> {resp.status}: {body}")
                 data: dict[str, object] = await resp.json()
                 return data, "success"
 
-        return await self._rpc("status", None, request)
+        return await self._rpc("status", token, request)
 
     async def close(self) -> None:
         if self._own_session:

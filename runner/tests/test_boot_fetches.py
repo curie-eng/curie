@@ -1,8 +1,9 @@
 """Concurrent boot fetches: memory, history, and the MCP capability probe.
 
-The three results are independent. A delay on each fake endpoint must overlap
-so boot finishes in under twice one delay, and a failure in one must still
-degrade only that result.
+A delay on each fake endpoint must overlap so boot finishes in under twice one
+delay. Memory and the MCP probe degrade independently; a configured history
+ref is fail-loud because answering without prior tool context can duplicate
+an operation.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_runner import __main__ as boot
 from curie_runner.config import RunnerConfig
-from curie_runner.history import TurnRecord, format_conversation_preamble
+from curie_runner.history import HistoryError, TurnRecord, build_conversation_replay
 from curie_runner.mcp_tool_capability import probe_mcp_tool_capability
 from curie_runner.memory import MemoryError, MemoryRecord, format_memory_preamble
 
@@ -169,9 +170,10 @@ def test_boot_fetches_overlap_three_delayed_endpoints(tmp_path: Path) -> None:
             assert fetches.memory_preamble == format_memory_preamble(
                 [MemoryRecord.from_dict(_MEMORY_ITEM)]
             )
-            assert fetches.conversation_preamble == format_conversation_preamble(
+            expected_replay, _summary = build_conversation_replay(
                 [TurnRecord.from_dict(_HISTORY_ITEM)]
             )
+            assert fetches.conversation_replay == expected_replay
             assert fetches.mcp_capability is not None
             assert fetches.mcp_capability.complete
             assert not fetches.mcp_capability.has_potential_write_tool
@@ -192,10 +194,10 @@ def test_boot_fetches_match_sequential_same_inputs(tmp_path: Path) -> None:
                 history_ref=str(server.make_url("/agents/A/state/transcript/t1")),
             )
             memory_store, memory_preamble = await boot._load_memory(config)
-            history_store, conversation_preamble = await boot._load_history(config)
+            history_store, conversation_replay = await boot._load_history(config)
             capability = await probe_mcp_tool_capability(plugin_dir, {}, None)
             assert concurrent.memory_preamble == memory_preamble
-            assert concurrent.conversation_preamble == conversation_preamble
+            assert concurrent.conversation_replay == conversation_replay
             assert concurrent.mcp_capability == capability
             assert type(concurrent.memory_store) is type(memory_store)
             assert type(concurrent.history_store) is type(history_store)
@@ -217,9 +219,10 @@ def test_boot_fetches_memory_failure_degrades_independently(
         async with TestServer(app) as server:
             fetches = await _run_fetches(server, plugin_dir)
             assert fetches.memory_preamble is None
-            assert fetches.conversation_preamble == format_conversation_preamble(
+            expected_replay, _summary = build_conversation_replay(
                 [TurnRecord.from_dict(_HISTORY_ITEM)]
             )
+            assert fetches.conversation_replay == expected_replay
             assert fetches.mcp_capability is not None
             assert fetches.mcp_capability.complete
 
@@ -230,7 +233,7 @@ def test_boot_fetches_memory_failure_degrades_independently(
     )
 
 
-def test_boot_fetches_history_failure_degrades_independently(
+def test_boot_fetches_history_failure_fails_loud(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     plugin_dir = _bundle(tmp_path / "bundle", mcp_command=[sys.executable, str(_SERVER)])
@@ -238,23 +241,20 @@ def test_boot_fetches_history_failure_degrades_independently(
         history_status=500,
         memory_value=[_MEMORY_ITEM],
     )
-    caplog.set_level(logging.WARNING, logger="curie_runner")
+    caplog.set_level(logging.ERROR, logger="curie_runner")
 
     async def go() -> None:
         async with TestServer(app) as server:
-            fetches = await _run_fetches(server, plugin_dir)
-            assert fetches.conversation_preamble is None
-            assert fetches.memory_preamble == format_memory_preamble(
-                [MemoryRecord.from_dict(_MEMORY_ITEM)]
+            with pytest.raises(BaseExceptionGroup) as caught:
+                await _run_fetches(server, plugin_dir)
+            assert any(
+                isinstance(exc, HistoryError)
+                and "configured structured history could not be loaded" in str(exc)
+                for exc in caught.value.exceptions
             )
-            assert fetches.mcp_capability is not None
-            assert fetches.mcp_capability.complete
 
     anyio.run(go)
-    assert any(
-        "history load failed" in record.message and "booting without history" in record.message
-        for record in caplog.records
-    )
+    assert any("history load failed" in record.message for record in caplog.records)
 
 
 def test_boot_fetches_probe_failure_degrades_independently(tmp_path: Path) -> None:
@@ -270,9 +270,10 @@ def test_boot_fetches_probe_failure_degrades_independently(tmp_path: Path) -> No
             assert fetches.memory_preamble == format_memory_preamble(
                 [MemoryRecord.from_dict(_MEMORY_ITEM)]
             )
-            assert fetches.conversation_preamble == format_conversation_preamble(
+            expected_replay, _summary = build_conversation_replay(
                 [TurnRecord.from_dict(_HISTORY_ITEM)]
             )
+            assert fetches.conversation_replay == expected_replay
             assert fetches.mcp_capability is not None
             assert not fetches.mcp_capability.complete
             assert fetches.mcp_capability.has_potential_write_tool
@@ -344,6 +345,6 @@ def test_boot_fetches_skips_probe_on_fake_model(tmp_path: Path) -> None:
             fetches = await _run_fetches(server, plugin_dir, fake_model=True)
             assert fetches.mcp_capability is None
             assert fetches.memory_preamble is not None
-            assert fetches.conversation_preamble is not None
+            assert fetches.conversation_replay.present
 
     anyio.run(go)

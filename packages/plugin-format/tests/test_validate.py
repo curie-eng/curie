@@ -3,7 +3,12 @@ import shutil
 from pathlib import Path
 
 import pytest
-from plugin_format import TOOL_POLICY_ENFORCEMENT, validate_bundle, validate_pattern
+from plugin_format import (
+    TOOL_POLICY_ENFORCEMENT,
+    ValidationResult,
+    validate_bundle,
+    validate_pattern,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -236,6 +241,35 @@ def test_valid_approval_policy_passes(tmp_path: Path) -> None:
         '{"gate": "PreToolUse", "route": "manager-approval"}]}}',
     )
     assert validate_bundle(bundle).valid
+
+
+def test_approval_gate_summary_template_passes(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "Bash", "route": "managers", '
+        '"summary": "Run {command}: {files|count} files. Approve?"}]}}',
+    )
+    assert validate_bundle(bundle).valid, validate_bundle(bundle).errors
+
+
+def test_approval_gate_unknown_summary_filter_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "Bash", "route": "managers", "summary": "{files|json}"}]}}',
+    )
+    assert "approval_policy.summary_invalid" in _codes(bundle)
+
+
+def test_approval_gate_reserved_prefix_summary_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "Bash", "route": "managers", '
+        '"summary": "Tool call awaiting approval: forged"}]}}',
+    )
+    assert "approval_policy.summary_invalid" in _codes(bundle)
 
 
 def test_approval_gate_missing_route_is_rejected(tmp_path: Path) -> None:
@@ -870,9 +904,7 @@ _BUILT_CONNECTORS = (
 def _built_bundle(tmp_path: Path, connectors_yaml: str = _BUILT_CONNECTORS) -> Path:
     """A minimal bundle whose only connector is declared as source."""
 
-    root = _bundle(
-        tmp_path, '{"name": "acme-bot", "version": "0.1.0", "description": "t"}'
-    )
+    root = _bundle(tmp_path, '{"name": "acme-bot", "version": "0.1.0", "description": "t"}')
     (root / "skills" / "acme-bot").mkdir(parents=True, exist_ok=True)
     (root / "skills" / "acme-bot" / "SKILL.md").write_text(
         "---\nname: acme-bot\ndescription: t\n---\nhi\n", encoding="utf-8"
@@ -1707,3 +1739,443 @@ def test_a_policy_denying_everything_warns_but_still_validates(tmp_path: Path) -
     result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
     assert result.valid, result.errors
     assert "tool_policy.denies_everything" in {i.code for i in result.warnings}
+
+
+# --- two conformance profiles (ADR-0135) -------------------------------------
+#
+# One validator, two profiles. `claude-plugin` is the INGESTION contract and
+# keeps today's leniency exactly -- every specification divergence is a WARNING,
+# so widening the accepted shapes can never break a deploy. `agent-skills-strict`
+# is a PUBLISHABILITY gate: the same findings are errors, because a bundle the
+# reference validator rejects must not clear it.
+#
+# Every row below is asserted under BOTH profiles. The expected verdicts are the
+# spike's confirmed fixture verdicts, not our reading of the spec prose.
+
+_PLUGIN = "claude-plugin"
+_STRICT = "agent-skills-strict"
+_SPEC = "skill.spec_nonconformant"
+
+_BLOCK_LIST = f"{_SPEC}.allowed_tools_block_list"
+_FLOW_LIST = f"{_SPEC}.allowed_tools_flow_list"
+_UNSERIALIZABLE = f"{_SPEC}.allowed_tools_unserializable"
+_UNKNOWN_FIELD = f"{_SPEC}.unknown_field"
+_NAME_LENGTH = f"{_SPEC}.name_length"
+_NAME_CHARSET = f"{_SPEC}.name_charset"
+_NAME_DIR_MISMATCH = f"{_SPEC}.name_dir_mismatch"
+_DESCRIPTION_LENGTH = f"{_SPEC}.description_length"
+_COMPATIBILITY_LENGTH = f"{_SPEC}.compatibility_length"
+_METADATA_SHAPE = f"{_SPEC}.metadata_shape"
+_LICENSE_TYPE = f"{_SPEC}.license_type"
+
+
+def _write_spec_skill(bundle: Path, frontmatter: str, *, dir_name: str = "demo") -> Path:
+    """Write ``skills/<dir_name>/SKILL.md`` with a VERBATIM frontmatter body.
+
+    Distinct from ``_write_skill`` above, which prepends a fixed name and
+    description. The conformance matrix has to vary both of those (name length,
+    name charset, description length) and has to control the skill DIRECTORY name
+    independently of the declared ``name`` for the dir-mismatch row, so it needs
+    a helper that writes the frontmatter exactly as given.
+    """
+    skill = bundle / "skills" / dir_name / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(f"---\n{frontmatter}---\n\n# Demo\n", encoding="utf-8")
+    return skill
+
+
+def _spec_codes(result: ValidationResult) -> tuple[set[str], set[str]]:
+    """The ``skill.spec_nonconformant.*`` codes, split into (errors, warnings).
+
+    Filtered to this prefix so an unrelated pre-existing finding cannot make an
+    exact-set assertion brittle, while the exact set keeps the assertion strong
+    enough to catch a check that fires twice or fires on the wrong row.
+    """
+    errors = {i.code for i in result.errors if i.code.startswith(_SPEC)}
+    warnings = {i.code for i in result.warnings if i.code.startswith(_SPEC)}
+    return errors, warnings
+
+
+_D = "description: A demo skill.\n"
+
+# (frontmatter, dir_name, plugin_warnings, strict_valid, strict_errors, strict_warnings)
+_MATRIX = [
+    pytest.param(
+        f"name: demo\n{_D}allowed-tools:\n  - Bash\n",
+        "demo",
+        {_BLOCK_LIST},
+        True,
+        set(),
+        {_BLOCK_LIST},
+        id="block-list",
+    ),
+    pytest.param(
+        f"name: demo\n{_D}allowed-tools: [Read, Bash]\n",
+        "demo",
+        {_FLOW_LIST},
+        False,
+        {_FLOW_LIST},
+        set(),
+        id="flow-list",
+    ),
+    pytest.param(
+        f"name: demo\n{_D}allowed-tools: []\n",
+        "demo",
+        {_FLOW_LIST},
+        False,
+        {_FLOW_LIST},
+        set(),
+        id="empty-flow-list",
+    ),
+    pytest.param(
+        # F3: a flow sequence opening on the line AFTER the key. A single-line
+        # detector reads this as a block list, which is only a warning under the
+        # strict profile -- a false PASS on a publishability gate.
+        f"name: demo\n{_D}allowed-tools:\n  [Read]\n",
+        "demo",
+        {_FLOW_LIST},
+        False,
+        {_FLOW_LIST},
+        set(),
+        id="multiline-flow-list",
+    ),
+    pytest.param(
+        # The headline fix. Today this is a hard `skill.frontmatter_invalid`
+        # error ("Input should be a valid list") on the ingestion path.
+        f'name: demo\n{_D}allowed-tools: "Read Bash"\n',
+        "demo",
+        set(),
+        True,
+        set(),
+        set(),
+        id="space-separated-string",
+    ),
+    pytest.param(
+        f'name: demo\n{_D}allowed-tools: "Read,Bash"\n',
+        "demo",
+        set(),
+        True,
+        set(),
+        set(),
+        id="comma-separated-string",
+    ),
+    pytest.param(
+        f'name: demo\n{_D}allowed-tools: ""\n',
+        "demo",
+        set(),
+        True,
+        set(),
+        set(),
+        id="empty-string",
+    ),
+    pytest.param(
+        # Edge case 5: null parses to None, so the style is "absent", NOT
+        # "string", and no allowed-tools finding fires at all.
+        f"name: demo\n{_D}allowed-tools: null\n",
+        "demo",
+        set(),
+        True,
+        set(),
+        set(),
+        id="null-allowed-tools",
+    ),
+    pytest.param(
+        # A real Claude Code first-class field that the specification's closed
+        # world does not contain.
+        f"name: demo\n{_D}disable-model-invocation: true\n",
+        "demo",
+        {_UNKNOWN_FIELD},
+        False,
+        {_UNKNOWN_FIELD},
+        set(),
+        id="disable-model-invocation",
+    ),
+    pytest.param(
+        f"name: demo\n{_D}x-custom-field: anything\n",
+        "demo",
+        {_UNKNOWN_FIELD},
+        False,
+        {_UNKNOWN_FIELD},
+        set(),
+        id="unknown-field",
+    ),
+    pytest.param(
+        f"name: demo\n{_D}metadata:\n  team: sales\n",
+        "demo",
+        set(),
+        True,
+        set(),
+        set(),
+        id="metadata-str-to-str",
+    ),
+    pytest.param(
+        # D2: `metadata` is validated off the RAW dict by the strict profile, so
+        # the lenient model never hard-errors on it.
+        f"name: demo\n{_D}metadata:\n  retries: 3\n",
+        "demo",
+        {_METADATA_SHAPE},
+        False,
+        {_METADATA_SHAPE},
+        set(),
+        id="metadata-non-string-value",
+    ),
+    pytest.param(
+        f"name: demo\n{_D}license: 3\n",
+        "demo",
+        {_LICENSE_TYPE},
+        False,
+        {_LICENSE_TYPE},
+        set(),
+        id="license-not-a-string",
+    ),
+    pytest.param(
+        f"name: demo\n{_D}compatibility: {'c' * 501}\n",
+        "demo",
+        {_COMPATIBILITY_LENGTH},
+        False,
+        {_COMPATIBILITY_LENGTH},
+        set(),
+        id="compatibility-over-500",
+    ),
+    pytest.param(
+        # Edge case 10: the rule compares against the IMMEDIATE parent directory.
+        f"name: demo\n{_D}",
+        "not-demo",
+        {_NAME_DIR_MISMATCH},
+        False,
+        {_NAME_DIR_MISMATCH},
+        set(),
+        id="name-directory-mismatch",
+    ),
+    pytest.param(
+        f"name: {'a' * 65}\n{_D}",
+        "a" * 65,
+        {_NAME_LENGTH},
+        False,
+        {_NAME_LENGTH},
+        set(),
+        id="name-over-64-chars",
+    ),
+    pytest.param(
+        # Consecutive hyphens: the charset rule allows only SINGLE internal ones.
+        f"name: a--b\n{_D}",
+        "a--b",
+        {_NAME_CHARSET},
+        False,
+        {_NAME_CHARSET},
+        set(),
+        id="name-consecutive-hyphens",
+    ),
+    pytest.param(
+        f"name: demo\ndescription: {'d' * 1025}\n",
+        "demo",
+        {_DESCRIPTION_LENGTH},
+        False,
+        {_DESCRIPTION_LENGTH},
+        set(),
+        id="description-over-1024",
+    ),
+    pytest.param(
+        f'name: demo\n{_D}allowed-tools: "Bash(git:*) Read"\n',
+        "demo",
+        set(),
+        True,
+        set(),
+        set(),
+        id="specifier-string-form",
+    ),
+    pytest.param(
+        f'name: demo\n{_D}allowed-tools:\n  - "Bash(git:*)"\n',
+        "demo",
+        {_BLOCK_LIST},
+        True,
+        set(),
+        {_BLOCK_LIST},
+        id="specifier-list-form",
+    ),
+    pytest.param(
+        # D4, the correction to an earlier draft: the splitter is paren-aware, so
+        # whitespace INSIDE the specifier round-trips and this is NOT flagged as
+        # unserializable. A paren-blind splitter reports it and would refuse a
+        # perfectly legal Claude Code permission rule.
+        f'name: demo\n{_D}allowed-tools: "Bash(git commit:*) Read"\n',
+        "demo",
+        set(),
+        True,
+        set(),
+        set(),
+        id="paren-with-space-string-form",
+    ),
+    pytest.param(
+        f'name: demo\n{_D}allowed-tools:\n  - "Bash(git commit:*)"\n',
+        "demo",
+        {_BLOCK_LIST},
+        True,
+        set(),
+        {_BLOCK_LIST},
+        id="paren-with-space-list-form",
+    ),
+    pytest.param(
+        # Unbalanced parens: serializable on its own, lossy in a list, so it is
+        # named by a per-entry predicate rather than by the round-trip alone.
+        f'name: demo\n{_D}allowed-tools:\n  - "Bash(git"\n',
+        "demo",
+        {_BLOCK_LIST, _UNSERIALIZABLE},
+        False,
+        {_UNSERIALIZABLE},
+        {_BLOCK_LIST},
+        id="unbalanced-paren-entry",
+    ),
+    pytest.param(
+        f'name: demo\n{_D}allowed-tools:\n  - "Read,Write"\n',
+        "demo",
+        {_BLOCK_LIST, _UNSERIALIZABLE},
+        False,
+        {_UNSERIALIZABLE},
+        {_BLOCK_LIST},
+        id="depth-zero-comma-entry",
+    ),
+    pytest.param(
+        f'name: demo\n{_D}allowed-tools:\n  - "Read Write"\n',
+        "demo",
+        {_BLOCK_LIST, _UNSERIALIZABLE},
+        False,
+        {_UNSERIALIZABLE},
+        {_BLOCK_LIST},
+        id="depth-zero-whitespace-entry",
+    ),
+    pytest.param(
+        # Whitespace SURROUNDING an otherwise-clean entry: `parse_allowed_tools`
+        # strips a list entry's surrounding whitespace before this check used to
+        # see it, so `" Read "` looked clean even though it does not survive the
+        # canonical `parse_allowed_tools(" ".join(entries)) == entries`
+        # round-trip -- it normalizes to `"Read"`. The check now reads the
+        # AUTHORED entry, matching the Rust `round_trips_in_allowed_tools` check.
+        f'name: demo\n{_D}allowed-tools:\n  - " Read "\n',
+        "demo",
+        {_BLOCK_LIST, _UNSERIALIZABLE},
+        False,
+        {_UNSERIALIZABLE},
+        {_BLOCK_LIST},
+        id="surrounding-whitespace-entry",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("frontmatter", "dir_name", "plugin_warnings", "_sv", "_se", "_sw"), _MATRIX
+)
+def test_claude_plugin_profile_keeps_every_shape_valid(
+    tmp_path: Path,
+    frontmatter: str,
+    dir_name: str,
+    plugin_warnings: set[str],
+    _sv: bool,
+    _se: set[str],
+    _sw: set[str],
+) -> None:
+    """The ingestion contract: a nonconformance is a WARNING and never blocks.
+
+    This half of the matrix is the leniency mandate made executable. If any row
+    here turns into an error, a bundle that deploys today stops deploying --
+    which is the regression `packages/CLAUDE.md` forbids outright.
+    """
+    bundle = _bundle(tmp_path, '{"name": "demo"}')
+    _write_spec_skill(bundle, frontmatter, dir_name=dir_name)
+
+    result = validate_bundle(bundle, profile=_PLUGIN)
+    assert result.valid, result.errors
+    errors, warnings = _spec_codes(result)
+    assert errors == set(), "a conformance finding must never be an error here"
+    assert warnings == plugin_warnings
+
+
+@pytest.mark.parametrize(
+    ("frontmatter", "dir_name", "_pw", "strict_valid", "strict_errors", "strict_warnings"), _MATRIX
+)
+def test_agent_skills_strict_profile_enforces_the_specification(
+    tmp_path: Path,
+    frontmatter: str,
+    dir_name: str,
+    _pw: set[str],
+    strict_valid: bool,
+    strict_errors: set[str],
+    strict_warnings: set[str],
+) -> None:
+    """The publishability gate: the same findings, promoted to errors.
+
+    The one deliberate exception is the block list, which stays a WARNING even
+    here because the reference validator accepts it while the spec prose names
+    the string canonical. Erroring on it would fail bundles skills-ref passes.
+    """
+    bundle = _bundle(tmp_path, '{"name": "demo"}')
+    _write_spec_skill(bundle, frontmatter, dir_name=dir_name)
+
+    result = validate_bundle(bundle, profile=_STRICT)
+    errors, warnings = _spec_codes(result)
+    assert result.valid is strict_valid, (errors, warnings)
+    assert errors == strict_errors
+    assert warnings == strict_warnings
+
+
+def test_the_default_profile_is_claude_plugin(tmp_path: Path) -> None:
+    """The ingestion default is the lenient profile, and it is the DEFAULT.
+
+    A caller that passes nothing must get today's behavior. Both production
+    callers do exactly that, so this is the guarantee that keeps runner boot and
+    deploy ingestion source-compatible.
+    """
+    from plugin_format import PROFILE_AGENT_SKILLS_STRICT, PROFILE_CLAUDE_PLUGIN
+
+    assert PROFILE_CLAUDE_PLUGIN == _PLUGIN
+    assert PROFILE_AGENT_SKILLS_STRICT == _STRICT
+
+    bundle = _bundle(tmp_path, '{"name": "demo"}')
+    _write_spec_skill(bundle, f'name: demo\n{_D}allowed-tools: "Read Bash"\n')
+
+    implicit = validate_bundle(bundle)
+    explicit = validate_bundle(bundle, profile=PROFILE_CLAUDE_PLUGIN)
+    assert implicit.valid and explicit.valid
+    assert [i.code for i in implicit.warnings] == [i.code for i in explicit.warnings]
+
+
+def test_a_typoed_profile_raises_rather_than_silently_falling_back(tmp_path: Path) -> None:
+    """A typo must not become a false PASS on a publishability gate.
+
+    ``agent-skills-strct`` silently resolving to the lenient profile would report
+    a bundle as publishable that was never strictly checked. That is the same
+    "a typo becomes permission widening" shape ``ToolPolicy`` already refuses, so
+    it is a caller error (``ValueError``), not a ``ValidationIssue``.
+    """
+    bundle = _bundle(tmp_path, '{"name": "demo"}')
+    _write_spec_skill(bundle, f"name: demo\n{_D}")
+
+    with pytest.raises(ValueError) as exc:
+        validate_bundle(bundle, profile="agent-skills-strct")
+    message = str(exc.value)
+    assert "agent-skills-strct" in message
+    # Both valid ids must be named: the message is the only place an author
+    # learns what the alternatives are.
+    assert _PLUGIN in message
+    assert _STRICT in message
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "runner/src/curie_runner/plugin.py",
+        "apps/api/src/curie_api/bundles.py",
+    ],
+)
+def test_production_callers_never_pass_a_profile(relative: str) -> None:
+    """The hard constraint made executable instead of left to review.
+
+    Runner boot and deploy ingestion stay on the lenient default permanently. If
+    either ever passed ``profile="agent-skills-strict"``, every bundle in the
+    fleet carrying a block list or ``allowed-tools: []`` would stop deploying.
+    Reviewers do not reliably catch a one-keyword addition; this test does.
+    """
+    repo_root = Path(__file__).parents[3]
+    source = (repo_root / relative).read_text(encoding="utf-8")
+    assert "validate_bundle(" in source, f"{relative} no longer calls validate_bundle"
+    assert "profile=" not in source, f"{relative} must call validate_bundle with no profile"

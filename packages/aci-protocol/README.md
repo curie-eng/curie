@@ -24,9 +24,9 @@ string rather than a `const`. Artifact sync is enforced by the
 schema-compat gate (`tests/test_schema_compat.py`); an unbumped wire change is
 caught by the wire-lock gate (`tests/test_wire_lock.py`).
 
-## Contract surface (v0.4.3)
+## Contract surface (v0.4.6)
 
-`PROTOCOL_VERSION = "0.4.3"` is embedded in the schema and in every outbound
+`PROTOCOL_VERSION = "0.4.6"` is embedded in the schema and in every outbound
 event.
 
 **Session setup** (`SessionConfig`, with `to_env()` / `from_env()`):
@@ -45,7 +45,9 @@ event.
 
 **Inbound channel messages** (discriminated union on `kind`):
 
-- `Event` = `{kind: "event", type: message|job|eval_case, text, user, ts}`
+- `Event` = `{kind: "event", type: message|job|eval_case, text, user, ts, session_id?, history_ref?}`.
+  `session_id` and `history_ref` are nullable strings carrying conversation-scoped
+  identity after a sandbox is bound; older producers may omit either field.
 - `Interrupt` = `{kind: "interrupt", reason}`
 
 **Outbound NDJSON response events** (discriminated union on `type`, each carries

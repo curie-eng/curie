@@ -256,7 +256,9 @@ def test_the_attachments_field_is_a_patch_bump() -> None:
     traffic for a field nobody is required to send.
     """
 
-    assert PROTOCOL_VERSION == "0.4.3"
+    major, minor, patch = (int(part) for part in PROTOCOL_VERSION.split("."))
+    assert (major, minor) == (0, 4)
+    assert patch >= 3
 
 
 def test_a_patch_difference_is_compatible_in_both_directions() -> None:

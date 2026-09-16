@@ -289,8 +289,8 @@ for filename in ("postgres.yaml", "valkey.yaml", "clickhouse.yaml", "rustfs.yaml
     if path.is_file() and path.stat().st_size > 0:
         die_later(f"[3] {filename} still has content under deploy=false")
 
-# Postgres consumers: migrate init, api, worker, both Langfuse deployments.
-for container in ("migrate", "api", "worker"):
+# Postgres consumers: schema-migrate Job, api, worker, both Langfuse deployments.
+for container in ("schema-migrate", "api", "worker"):
     require_secret(docs, container, "POSTGRES_PASSWORD", PG_CREDS, "postgresPassword", "pg")
     require_contains(docs, container, "DATABASE_URL", PG_HOST, "pg")
     require_contains(docs, container, "DATABASE_URL", "?ssl=require", "pg-tls")

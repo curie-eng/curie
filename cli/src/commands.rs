@@ -4,7 +4,7 @@
 //! behavior and speaks only through the library modules (docker, runner, api,
 //! scaffold, state, evals, render).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -3022,6 +3022,32 @@ pub enum ChannelsOutput {
     },
 }
 
+const CHANNEL_BINDING_NEVER_RESOLVES_WARNING: &str =
+    "mentions match on the channel ID, not the name, so this binding never resolves";
+
+#[derive(Serialize)]
+struct ChannelBindingPresentation<'a> {
+    kind: &'a str,
+    address: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<&'static str>,
+}
+
+fn channel_binding_never_resolves(kind: &str, address: &str) -> bool {
+    kind == "slack" && address.trim_start().starts_with('#')
+}
+
+fn channel_binding_presentation(
+    binding: &crate::api::ChannelBinding,
+) -> ChannelBindingPresentation<'_> {
+    ChannelBindingPresentation {
+        kind: &binding.kind,
+        address: &binding.address,
+        warning: channel_binding_never_resolves(&binding.kind, &binding.address)
+            .then_some(CHANNEL_BINDING_NEVER_RESOLVES_WARNING),
+    }
+}
+
 impl crate::ui::CliOutput for ChannelsOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
@@ -3030,14 +3056,21 @@ impl crate::ui::CliOutput for ChannelsOutput {
                 agent,
                 channels,
                 changed,
-            } => serde_json::json!({
-                "agent": agent,
-                // Delegated to `Serialize` rather than hand-picked: a
-                // hand-projection could drop a field and would need its own
-                // `emits` declaration for the emit-parity gate (cli/CLAUDE.md).
-                "surfaces": serde_json::to_value(channels).unwrap_or(serde_json::Value::Null),
-                "changed": changed,
-            }),
+            } => {
+                let surfaces = channels
+                    .iter()
+                    .map(channel_binding_presentation)
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "agent": agent,
+                    // Serialize each CLI presentation row wholesale. The raw
+                    // API mirror remains unchanged while this output adds its
+                    // optional, derived warning without hand-projecting fields.
+                    "surfaces": serde_json::to_value(surfaces)
+                        .unwrap_or(serde_json::Value::Null),
+                    "changed": changed,
+                })
+            }
         }
     }
 
@@ -3060,6 +3093,14 @@ impl crate::ui::CliOutput for ChannelsOutput {
                         .join(", ")
                 };
                 ui.payload(&format!("surfaces for {agent}{verb}: {bound}"));
+                for channel in channels {
+                    if channel_binding_never_resolves(&channel.kind, &channel.address) {
+                        ui.warn(&format!(
+                            "{}:{}: {CHANNEL_BINDING_NEVER_RESOLVES_WARNING}",
+                            channel.kind, channel.address
+                        ));
+                    }
+                }
             }
         }
     }
@@ -4416,6 +4457,42 @@ pub enum DeployTier {
 
 pub use crate::api::WorkspaceIntent;
 
+pub const EMPTY_GITHUB_REPO_ALLOWLIST_WARNING: &str =
+    "api.githubRepoAllowlist is empty, so runtime workspace selection denies every repository. \
+     Allow `owner/repo` or `owner/*` in the chart values, for example \
+     `curie cluster up --set 'api.githubRepoAllowlist[0]=owner/repo'`";
+
+pub fn github_repo_allowlist_is_empty(values: &serde_json::Value) -> bool {
+    match values.pointer("/api/githubRepoAllowlist") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(items)) => items.iter().all(|item| {
+            item.as_str()
+                .map(|entry| entry.trim().is_empty())
+                .unwrap_or(true)
+        }),
+        Some(serde_json::Value::String(raw)) => {
+            let trimmed = raw.trim();
+            trimmed.is_empty() || trimmed == "[]"
+        }
+        Some(_) => false,
+    }
+}
+
+/// Best-effort warning when `--workspace` is passed against an empty chart allowlist.
+pub async fn warn_if_empty_github_repo_allowlist(namespace: &str, release: &str) {
+    let opts = crate::ops::CommonOpts {
+        namespace: namespace.to_string(),
+        release: release.to_string(),
+        dry_run: false,
+    };
+    let Ok(Some(values)) = crate::ops::fetch_release_computed_values(&opts).await else {
+        return;
+    };
+    if github_repo_allowlist_is_empty(&values) {
+        crate::ui::ui().warn(EMPTY_GITHUB_REPO_ALLOWLIST_WARNING);
+    }
+}
+
 /// The declared connector-secret NAMES not present in the operator's bound
 /// `--secret` set (#464). A non-empty result is a deploy-time gap: the bundle
 /// expects a secret nothing will bind, which would surface at runtime as an
@@ -4546,6 +4623,34 @@ pub struct PreparedDeploy {
     plugin_dir: PathBuf,
 }
 
+fn is_documentation_placeholder_channel(channel: &str) -> bool {
+    channel.strip_prefix("C0EXAMPLE").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn reject_documentation_placeholder_target(
+    target_name: &str,
+    target: &crate::api::ResolvedTarget,
+) -> Result<()> {
+    let Some(channel) = target.slack_channel.as_deref() else {
+        return Ok(());
+    };
+    if !is_documentation_placeholder_channel(channel) {
+        return Ok(());
+    }
+
+    Err(crate::exit::CliError::usage(format!(
+        "deploy target `{target_name}` uses documentation placeholder Slack channel `{channel}`; \
+         refusing before creating or changing an agent, version, or deployment"
+    ))
+    .with_fix(
+        "replace the target's slack_channel with a real Slack channel ID, or remove \
+         slack_channel from deploy.yaml",
+    )
+    .into())
+}
+
 impl PreparedDeploy {
     pub fn agent_id(&self) -> &str {
         &self.outcome.agent.id
@@ -4666,6 +4771,26 @@ async fn prepare_deploy_with_commit_sha(
         validate_channel_binding("slack", channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
+    // #2448: the bundle's declared approval routes, read from the PACKED
+    // archive -- the exact bytes `pack_tar_gz` just produced and that
+    // `deploy_prepared` uploads -- rather than the source tree. A manifest
+    // excluded from the archive (a root `.curieignore`, or one of the packer's
+    // own built-in exclusions) must never drive this judgment, and a manifest
+    // the archive packs from a different location than the naive source read
+    // would find must be the one judged instead. Fail-open: an unreadable or
+    // absent packed policy only warns, and the API's own fail-closed refusal
+    // decides.
+    let declared_routes: Option<BTreeSet<String>> = match read_packed_bundle_gates(&archive) {
+        Ok(gates) => Some(declared_approval_routes(&gates)),
+        Err(err) => {
+            ui.warn(&format!(
+                "could not read the bundle's approvalPolicy from the packed archive ({err:#}); \
+                 skipping the approval-route pre-check. The platform API still checks declared \
+                 routes on deploy"
+            ));
+            None
+        }
+    };
     let commit_sha = match installer_commit_sha {
         Some(commit_sha) => Some(commit_sha.to_string()),
         None => {
@@ -4739,7 +4864,9 @@ async fn prepare_deploy_with_commit_sha(
                     deploy_targets_path.display()
                 ))
             })?;
-            Some(client.resolve_deploy_target(content, name).await?)
+            let target = client.resolve_deploy_target(content, name).await?;
+            reject_documentation_placeholder_target(name, &target)?;
+            Some(target)
         }
         None => None,
     };
@@ -4793,37 +4920,57 @@ async fn prepare_deploy_with_commit_sha(
         .clone()
         .or_else(|| resolved.as_ref().and_then(|r| r.agent.clone()))
         .unwrap_or_else(|| plugin_name.clone());
+    let slack_channel = opts
+        .slack_channel
+        .as_deref()
+        .or_else(|| resolved.as_ref().and_then(|r| r.slack_channel.as_deref()));
+    let record_secrets = match opts.tier {
+        DeployTier::Local => secrets.clone(),
+        // Names-only placeholders over the EFFECTIVE set, not just
+        // the resolved `--secret` values: the worker keys
+        // `inject_connector_secrets` -- and with it the per-agent
+        // sandbox pool routing -- off this map, so a connector secret
+        // missing from it lands the claim on the generic pool with no
+        // connector env at all (#2503). The connector's own value is
+        // resolved cluster-scoped later (#1913) and reaches the pod
+        // through the per-agent Helm Secret, never through the record.
+        DeployTier::Cluster => {
+            crate::cluster_secrets::agent_record_secret_names(&effective_secret_names)
+        }
+    };
     let cl = ui.checklist();
     let step = cl.step(&format!("deploying {plugin_name} as {agent_name}"));
-    let outcome = match client
-        .prepare_deploy(
-            &agent_name,
-            opts.slack_channel
-                .as_deref()
-                .or_else(|| resolved.as_ref().and_then(|r| r.slack_channel.as_deref())),
-            &label,
-            &created_by,
-            archive,
-            &match opts.tier {
-                DeployTier::Local => secrets.clone(),
-                // Names-only placeholders over the EFFECTIVE set, not just
-                // the resolved `--secret` values: the worker keys
-                // `inject_connector_secrets` -- and with it the per-agent
-                // sandbox pool routing -- off this map, so a connector secret
-                // missing from it lands the claim on the generic pool with no
-                // connector env at all (#2503). The connector's own value is
-                // resolved cluster-scoped later (#1913) and reaches the pod
-                // through the per-agent Helm Secret, never through the record.
-                DeployTier::Cluster => {
-                    crate::cluster_secrets::agent_record_secret_names(&effective_secret_names)
-                }
-            },
-            opts.repo.as_deref(),
-            commit_sha.as_deref(),
-            opts.workspace,
-        )
-        .await
-    {
+    // Resolve the agent, judge its bound approval routes against the bundle's
+    // declared ones (#2448), then send secrets, version, and bundle. One async
+    // block so every failure, the local refusal included, reaches the single
+    // error arm below.
+    let prepared = async {
+        let (agent, channel, repo_note) = client
+            .resolve_agent(&agent_name, slack_channel, opts.repo.as_deref())
+            .await?;
+        check_deploy_routes_bound(
+            declared_routes.as_ref(),
+            &plugin_name,
+            &agent,
+            &channel,
+            opts.tier,
+        )?;
+        client
+            .prepare_deploy(
+                agent,
+                channel,
+                repo_note,
+                &label,
+                &created_by,
+                archive,
+                &record_secrets,
+                commit_sha.as_deref(),
+                opts.workspace,
+            )
+            .await
+    }
+    .await;
+    let outcome = match prepared {
         Ok(outcome) => outcome,
         Err(err) => {
             step.fail("failed");
@@ -6803,6 +6950,19 @@ pub async fn approvals(
         let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
         let agent = client.find_agent(&opts.agent).await?;
         let agent = if route_write {
+            // #2448: advisory pre-check against every active deployment's
+            // declared routes. Fail-open; the platform API remains the gate.
+            let (declaring, unreadable) = active_declared_routes(&client, &agent.id).await;
+            for reason in &unreadable {
+                ui.warn(&format!(
+                    "could not check this route write against every active deployment \
+                     ({reason}); sending it anyway. The platform API still refuses a write \
+                     that removes a declared route"
+                ));
+            }
+            if let Some(err) = route_write_refusal(&agent.name, &bindings, &declaring) {
+                return Err(err);
+            }
             let cl = ui.checklist();
             let step = cl.step(&format!("updating approval routes for {}", agent.name));
             match client.set_approval_routes(&agent.id, &bindings).await {
@@ -6997,7 +7157,7 @@ pub async fn observability(open: bool) -> Result<crate::observability::Observabi
 /// and never routes -- a silently dead binding. Fail the deploy up front
 /// instead.
 fn validate_channel_binding(kind: &str, address: &str) -> Result<()> {
-    if kind == "slack" && address.trim_start().starts_with('#') {
+    if channel_binding_never_resolves(kind, address) {
         return Err(crate::exit::usage(format!(
             "slack channel {address:?} is a name, not an ID: real Slack events carry the \
              channel ID (e.g. C0EXAMPLE1) and the worker routes on it, so a #name binding \
@@ -7071,6 +7231,10 @@ struct ApprovalGateDecl {
     #[allow(dead_code)]
     #[serde(default, rename = "grantableViaPolicy")]
     grantable_via_policy: bool,
+    /// Bundle-authored human sentence for the approval card (#2565).
+    #[allow(dead_code)]
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 /// The manifest `approvalPolicy` object; mirrors `plugin_format.models.ApprovalPolicy`.
@@ -7286,6 +7450,105 @@ fn read_bundle_gates(plugin_dir: &Path) -> Result<Vec<(String, String)>> {
     parse_manifest_gates(&body, &manifest_path.display().to_string())
 }
 
+/// Read the bundle's declared approval gates from a PACKED tar.gz archive
+/// (#2448), not the source tree -- the same bytes `pack_tar_gz` produces and
+/// `local`/`cluster deploy` upload. A source-tree read can name a manifest a
+/// root `.curieignore` (or one of the packer's built-in exclusions) keeps out
+/// of the archive entirely, or miss a manifest the archive packs from a
+/// location the source read never looked at; reading the archive itself is
+/// the only way the pre-check judges the exact manifest the platform will.
+///
+/// Mirrors the platform's `plugin_format.archive.bundle_root`: probes
+/// `MANIFEST_LOCATIONS` at the archive root first, and only when the root
+/// carries no manifest and the archive has exactly one top-level directory
+/// (root-level files do not count) does it probe that one directory for a
+/// manifest, matching `load_approval_policy`. Entry paths are normalized by
+/// stripping a leading `./` before matching, since a tar entry may carry one
+/// even though this crate's own `pack_tar_gz` does not emit it. Errors (an
+/// unreadable archive, or no manifest found by that resolution) are reported
+/// the same way `read_bundle_gates` reports a missing manifest, and the
+/// caller treats them identically: fail-open, warn, skip the pre-check.
+fn read_packed_bundle_gates(archive: &[u8]) -> Result<Vec<(String, String)>> {
+    let mut tar_archive = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    let entries = tar_archive
+        .entries()
+        .context("reading the packed bundle archive")?;
+    let mut manifests: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut top_level_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in entries {
+        let mut entry = entry.context("reading a packed bundle archive entry")?;
+        let raw_path = entry
+            .path()
+            .context("reading a packed bundle archive entry path")?
+            .to_string_lossy()
+            .into_owned();
+        let normalized = raw_path
+            .strip_prefix("./")
+            .unwrap_or(raw_path.as_str())
+            .trim_end_matches('/')
+            .to_string();
+        if normalized.is_empty() {
+            continue;
+        }
+        if let Some((top, _)) = normalized.split_once('/') {
+            top_level_dirs.insert(top.to_string());
+        } else if entry.header().entry_type().is_dir() {
+            top_level_dirs.insert(normalized.clone());
+        }
+        // Buffer any candidate manifest content, whether at the root or one
+        // level under a top-level directory: which one is actually consulted
+        // is decided below, once every entry has been walked.
+        let is_root_candidate = MANIFEST_LOCATIONS.contains(&normalized.as_str());
+        let nested_candidate = MANIFEST_LOCATIONS.iter().find_map(|loc| {
+            normalized
+                .strip_suffix(&format!("/{loc}"))
+                .filter(|prefix| !prefix.contains('/'))
+                .map(|prefix| format!("{prefix}/{loc}"))
+        });
+        if is_root_candidate || nested_candidate.is_some() {
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut content)
+                .with_context(|| format!("reading {normalized} from the packed bundle archive"))?;
+            manifests.insert(normalized, content);
+        }
+    }
+    // Mirror the platform's `plugin_format.archive.bundle_root`: prefer a
+    // manifest at the archive root; otherwise, when the archive has exactly
+    // one top-level directory (root-level files do not count) and that
+    // directory carries a manifest, descend into it; otherwise there is no
+    // manifest to read.
+    let root_manifest = MANIFEST_LOCATIONS.iter().find_map(|loc| {
+        manifests
+            .remove(*loc)
+            .map(|content| (loc.to_string(), content))
+    });
+    let resolved = match root_manifest {
+        Some(found) => Some(found),
+        None => match top_level_dirs.len() {
+            1 => {
+                let dir = top_level_dirs
+                    .iter()
+                    .next()
+                    .expect("top_level_dirs has exactly one entry")
+                    .clone();
+                MANIFEST_LOCATIONS.iter().find_map(|loc| {
+                    let key = format!("{dir}/{loc}");
+                    manifests.remove(&key).map(|content| (key, content))
+                })
+            }
+            _ => None,
+        },
+    };
+    let (location, content) = resolved.ok_or_else(|| {
+        crate::exit::usage(
+            "the packed bundle archive contains no plugin manifest \
+             (.claude-plugin/plugin.json or plugin.json)"
+                .to_string(),
+        )
+    })?;
+    parse_manifest_gates(&content, &format!("packed bundle manifest ({location})"))
+}
+
 /// Parse the `approvalPolicy` gates out of a plugin-manifest JSON body, mirroring
 /// the runner's `load_approval_policy` fail-closed semantics (#520): any declared
 /// gate the runner cannot arm exactly as declared -- a missing REQUIRED key, or a
@@ -7439,6 +7702,238 @@ async fn deployed_manifest_gate_names(client: &ApiClient, agent_id: &str) -> Res
     Ok(ManifestGates::Readable(
         gates.into_iter().map(|(gate, _route)| gate).collect(),
     ))
+}
+
+/// The distinct approval routes a bundle declares, from `parse_manifest_gates`
+/// output (#2448). That output is already trimmed and last-wins per gate, so this
+/// set equals the API's `set(route_by_tool.values())` (#2436). Pinned to
+/// `tests/vectors/approval-route-normalization.json` by an executed test.
+fn declared_approval_routes(gates: &[(String, String)]) -> BTreeSet<String> {
+    gates.iter().map(|(_gate, route)| route.clone()).collect()
+}
+
+/// The declared routes with no entry in `bound`, sorted. Comparison is verbatim
+/// and case-sensitive with no trimming of bound keys, like the API's lookup: a
+/// stored `" ops "` or `"Ops"` does not bind `ops`.
+fn unbound_approval_routes<'a>(
+    declared: &BTreeSet<String>,
+    bound: impl IntoIterator<Item = &'a String>,
+) -> Vec<String> {
+    let bound: BTreeSet<&String> = bound.into_iter().collect();
+    declared
+        .iter()
+        .filter(|route| !bound.contains(route))
+        .cloned()
+        .collect()
+}
+
+/// Route names joined as `"a", "b"`, Debug-quoted so padding stays visible.
+fn quoted_routes<'a>(names: impl IntoIterator<Item = &'a String>) -> String {
+    names
+        .into_iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Refuse a deploy whose bundle declares an approval route the resolved agent
+/// does not bind (#2448), before any secrets, version, or bundle request.
+///
+/// Advisory and fail-open: `None` (the local policy could not be read) or an
+/// empty declared set never refuses. The platform API remains the gate; it
+/// refuses the same gap on `POST /deployments` whether or not this ran. The
+/// refusal is a usage error whose fix is ONE full-replacement route write that
+/// lists every unbound and already-bound route.
+fn check_deploy_routes_bound(
+    declared: Option<&BTreeSet<String>>,
+    plugin_name: &str,
+    agent: &crate::api::Agent,
+    channel: &ChannelOutcome,
+    tier: DeployTier,
+) -> Result<()> {
+    let Some(declared) = declared.filter(|d| !d.is_empty()) else {
+        return Ok(());
+    };
+    let bound: Vec<&String> = agent
+        .approval_routes
+        .as_ref()
+        .map(|routes| routes.keys().collect())
+        .unwrap_or_default();
+    let unbound = unbound_approval_routes(declared, bound.iter().copied());
+    if unbound.is_empty() {
+        return Ok(());
+    }
+    let name = &agent.name;
+    let bound_clause = if bound.is_empty() {
+        "this agent binds no approval routes".to_string()
+    } else {
+        format!("bound routes are {}", quoted_routes(bound.iter().copied()))
+    };
+    let state_clause = match channel {
+        ChannelOutcome::Created(_) => format!(
+            "The agent {name} was created by this deploy so its routes can be bound; \
+             no version, bundle, or deployment was created."
+        ),
+        _ => "No version, bundle, or deployment was created.".to_string(),
+    };
+    let message = format!(
+        "refusing to deploy {plugin_name} as agent {name}: the bundle declares approval \
+         route(s) {} with no entry in this agent's approval_routes; {bound_clause}. \
+         {state_clause}",
+        quoted_routes(&unbound)
+    );
+    let tier_word = match tier {
+        DeployTier::Local => "local",
+        DeployTier::Cluster => "cluster",
+    };
+    let mut fix = format!(
+        "bind every declared route in ONE write, then re-run this deploy: curie {tier_word} \
+         approvals {name}"
+    );
+    for route in unbound.iter().chain(bound.iter().copied()) {
+        fix.push_str(&format!(" --route-resolution {route}=<channel>"));
+    }
+    if !bound.is_empty() {
+        fix.push_str(
+            " (a route write replaces the whole map, so this repeats the routes already bound; \
+             use --routes-from <file> instead to keep an existing notification or approver set)",
+        );
+    }
+    if tier == DeployTier::Cluster {
+        fix.push_str(" with the same --namespace/--release/--api-url you passed to this deploy");
+    }
+    Err(crate::exit::CliError::usage(message).with_fix(fix).into())
+}
+
+/// One deployed version with at least one active deployment, and the routes its
+/// stored manifest declares (#2448).
+struct DeclaringVersion {
+    version_id: String,
+    /// `(deployment id, environment)` for every active deployment on it.
+    deployments: Vec<(String, String)>,
+    routes: BTreeSet<String>,
+}
+
+/// The declared routes of every ACTIVE deployment in both environments, grouped
+/// by distinct version so each version's files are read once (#2448).
+///
+/// Best-effort input to an advisory check: a failed deployment list, an active
+/// row with no version id, a failed files read, or an unparseable manifest each
+/// becomes an unreadable reason in the second return value, never an error. The
+/// platform API remains the gate for a route write either way. The manifest is
+/// chosen by `MANIFEST_LOCATIONS` precedence; a bundle with no manifest declares
+/// nothing.
+async fn active_declared_routes(
+    client: &ApiClient,
+    agent_id: &str,
+) -> (Vec<DeclaringVersion>, Vec<String>) {
+    let mut unreadable = Vec::new();
+    let deployments = match client.list_deployments(agent_id).await {
+        Ok(d) => d,
+        Err(err) => {
+            return (
+                Vec::new(),
+                vec![format!("listing the agent's deployments failed: {err:#}")],
+            )
+        }
+    };
+    let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for deployment in deployments.iter().filter(|d| d.status == "active") {
+        let Some(version_id) = deployment.version_id.clone() else {
+            unreadable.push(format!(
+                "the active deployment {} reports no version id",
+                deployment.id
+            ));
+            continue;
+        };
+        let row = (deployment.id.clone(), deployment.environment.clone());
+        match groups.iter_mut().find(|(v, _)| *v == version_id) {
+            Some((_, rows)) => rows.push(row),
+            None => groups.push((version_id, vec![row])),
+        }
+    }
+    let mut declaring = Vec::new();
+    for (version_id, deployments) in groups {
+        let files = match client.bundle_files(agent_id, &version_id).await {
+            Ok(f) => f,
+            Err(err) => {
+                unreadable.push(format!(
+                    "fetching the files of version {version_id} failed: {err:#}"
+                ));
+                continue;
+            }
+        };
+        let manifest = MANIFEST_LOCATIONS
+            .iter()
+            .find_map(|loc| files.iter().find(|f| f.path == *loc));
+        let routes = match manifest {
+            None => BTreeSet::new(),
+            Some(manifest) => match parse_manifest_gates(
+                &manifest.content,
+                &format!("deployed bundle manifest (version {version_id})"),
+            ) {
+                Ok(gates) => declared_approval_routes(&gates),
+                Err(err) => {
+                    unreadable.push(format!("{err:#}"));
+                    continue;
+                }
+            },
+        };
+        declaring.push(DeclaringVersion {
+            version_id,
+            deployments,
+            routes,
+        });
+    }
+    (declaring, unreadable)
+}
+
+/// The local refusal for a route write that drops a route an active deployment
+/// still declares (#2448), or `None` when the proposed keys keep every one.
+///
+/// Pure and advisory: it judges only the versions the caller could read, and the
+/// platform API remains the gate for the PATCH itself.
+fn route_write_refusal(
+    agent_name: &str,
+    proposed: &BTreeMap<String, crate::api::ApprovalRouteBindingWrite>,
+    declaring: &[DeclaringVersion],
+) -> Option<anyhow::Error> {
+    let mut removed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for version in declaring {
+        for route in unbound_approval_routes(&version.routes, proposed.keys()) {
+            let by = removed.entry(route).or_default();
+            for (id, env) in &version.deployments {
+                by.push(format!(
+                    "deployment {id} ({env}, version {})",
+                    version.version_id
+                ));
+            }
+        }
+    }
+    if removed.is_empty() {
+        return None;
+    }
+    let routes: Vec<String> = removed.keys().cloned().collect();
+    let details = removed
+        .iter()
+        .map(|(route, by)| format!("{route:?} by {}", by.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let message = format!(
+        "refusing to write approval routes for {agent_name}: this write removes approval \
+         route(s) {} that active deployment(s) still declare: {details}. The platform API \
+         refuses this write, so nothing was sent.",
+        quoted_routes(&routes)
+    );
+    let example = routes.first().map(String::as_str).unwrap_or("<route>");
+    let fix = format!(
+        "keep every declared route in the write (for example add --route-resolution \
+         {example}=<channel>, or keep it in the --routes-from file), or first end every active \
+         deployment that declares it (DELETE /deployments/<id> on the platform API); deploying \
+         a version that declares no gates is not enough, because older active deployments keep \
+         declaring the route"
+    );
+    Some(crate::exit::CliError::usage(message).with_fix(fix).into())
 }
 
 /// POSIX-shell-quote a value for safe interpolation into emitted shell text.
@@ -7671,16 +8166,40 @@ pub fn skill_approval_routes_unavailable() -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        absent_container_note, merge_secret_env, model_credential_summary,
+        absent_container_note, check_deploy_routes_bound, declared_approval_routes,
+        github_repo_allowlist_is_empty, merge_secret_env, model_credential_summary,
         parse_credential_env_file, parse_manifest_gates, plan_recorded_state,
         plan_recorded_teardown, plan_skill_down, recorded_ids_match, replace_first_line,
-        report_sweep, resolve_cases_path, resolve_env_file_credentials, routing_warning,
-        seed_env_if_missing, select_in_force_deployment, select_passthrough_env, sweep_json_row,
-        sweep_table_row, validate_channel_binding, ApprovalGateDecl, DownPlan, EnvSeed,
-        RecordedStatePlan, RecordedStateQuery, RecordedTeardown, SweepRow,
+        report_sweep, resolve_cases_path, resolve_env_file_credentials, route_write_refusal,
+        routing_warning, seed_env_if_missing, select_in_force_deployment, select_passthrough_env,
+        sweep_json_row, sweep_table_row, unbound_approval_routes, validate_channel_binding,
+        ApprovalGateDecl, DeclaringVersion, DeployTier, DownPlan, EnvSeed, RecordedStatePlan,
+        RecordedStateQuery, RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
+    use serde_json::json;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn github_repo_allowlist_is_empty_for_missing_null_and_empty_values() {
+        assert!(github_repo_allowlist_is_empty(&json!({})));
+        assert!(github_repo_allowlist_is_empty(&json!({"api": {}})));
+        assert!(github_repo_allowlist_is_empty(
+            &json!({"api": {"githubRepoAllowlist": serde_json::Value::Null}})
+        ));
+        assert!(github_repo_allowlist_is_empty(
+            &json!({"api": {"githubRepoAllowlist": []}})
+        ));
+        assert!(github_repo_allowlist_is_empty(
+            &json!({"api": {"githubRepoAllowlist": ["", "  "]}})
+        ));
+        assert!(!github_repo_allowlist_is_empty(
+            &json!({"api": {"githubRepoAllowlist": ["acme-corp/acme-bot"]}})
+        ));
+        assert!(!github_repo_allowlist_is_empty(
+            &json!({"api": {"githubRepoAllowlist": ["acme-labs/*"]}})
+        ));
+    }
 
     // --- the eval exit-code contract (#2007) --------------------------------
     //
@@ -9152,6 +9671,294 @@ mod tests {
         );
     }
 
+    // --- the approval-route pre-check (#2448) ------------------------------
+
+    /// AC4: the CLI's declared-route reader executes the same frozen vector the
+    /// API reader and the runner loader execute (#2436), so the three readers of
+    /// one manifest cannot drift apart.
+    #[test]
+    fn cli_declared_route_reader_executes_the_frozen_vector() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/vectors/approval-route-normalization.json"
+        );
+        let vector: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path).expect("read the frozen route vector"),
+        )
+        .expect("the frozen route vector is JSON");
+        let cases = vector["cases"].as_array().expect("the vector has cases");
+        assert!(
+            !cases.is_empty(),
+            "the frozen vector must carry cases, or this test proves nothing"
+        );
+
+        for case in cases {
+            let id = case["id"].as_str().expect("every case has an id");
+            let mut manifest = json!({"name": "route-vector", "version": "0.1.0"});
+            if !case["gates"].is_null() {
+                manifest["approvalPolicy"] = json!({ "gates": case["gates"].clone() });
+            }
+            let parsed = parse_manifest_gates(&manifest.to_string(), &format!("vector case {id}"));
+
+            if case["expected"] == json!("rejected") {
+                assert!(
+                    parsed.is_err(),
+                    "case {id:?}: the vector says rejected, but the reader accepted {parsed:?}"
+                );
+                continue;
+            }
+            let expected: Vec<String> = serde_json::from_value(case["expected"].clone())
+                .unwrap_or_else(|e| panic!("case {id:?}: expected must be a route list: {e}"));
+            let gates = parsed
+                .unwrap_or_else(|e| panic!("case {id:?}: the vector declares {expected:?}: {e:#}"));
+            let declared: Vec<String> = declared_approval_routes(&gates).into_iter().collect();
+            assert_eq!(
+                declared, expected,
+                "case {id:?}: the CLI reader drifted from the frozen vector"
+            );
+        }
+    }
+
+    fn route_set(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn unbound_approval_routes_is_a_verbatim_case_sensitive_sorted_difference() {
+        let bound = ["finance".to_string(), "extra".to_string()];
+        assert_eq!(
+            unbound_approval_routes(&route_set(&["ops", "finance"]), bound.iter()),
+            vec!["ops".to_string()]
+        );
+
+        let padded = [" ops ".to_string()];
+        assert_eq!(
+            unbound_approval_routes(&route_set(&["ops"]), padded.iter()),
+            vec!["ops".to_string()],
+            "a padded bound key does not bind the trimmed declared route"
+        );
+
+        let cased = ["Ops".to_string()];
+        assert_eq!(
+            unbound_approval_routes(&route_set(&["ops"]), cased.iter()),
+            vec!["ops".to_string()],
+            "route names compare case-sensitively"
+        );
+
+        assert!(unbound_approval_routes(&route_set(&[]), bound.iter()).is_empty());
+
+        let none: [String; 0] = [];
+        assert_eq!(
+            unbound_approval_routes(&route_set(&["zeta", "alpha", "mid"]), none.iter()),
+            vec!["alpha".to_string(), "mid".to_string(), "zeta".to_string()],
+            "the unbound routes come back sorted"
+        );
+    }
+
+    fn precheck_agent(routes: &[&str]) -> crate::api::Agent {
+        let routes: Option<serde_json::Map<String, serde_json::Value>> = if routes.is_empty() {
+            None
+        } else {
+            Some(
+                routes
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.to_string(),
+                            json!({"resolution": {"kind": "slack", "address": "C0EXAMPLE1"}}),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        serde_json::from_value(json!({
+            "id": "ag_2448",
+            "name": "deal-desk",
+            "channels": [{"kind": "slack", "address": "C0EXAMPLE0"}],
+            "approval_routes": routes,
+            "memory": false,
+        }))
+        .expect("the fixture is a valid AgentOut")
+    }
+
+    fn deploy_refusal(result: anyhow::Result<()>) -> (String, String) {
+        let err = result.expect_err("an unbound declared route must refuse");
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage, "{err:#}");
+        (
+            format!("{err:#}"),
+            fix.unwrap_or_else(|| panic!("the refusal must carry a fix: {err:#}")),
+        )
+    }
+
+    #[test]
+    fn check_deploy_routes_bound_refuses_only_an_unbound_declared_route() {
+        use crate::api::ChannelOutcome;
+        let created = ChannelOutcome::Created("C0EXAMPLE0".to_string());
+        let unchanged = ChannelOutcome::Unchanged {
+            channels: vec!["C0EXAMPLE0".to_string()],
+            passed: false,
+        };
+        let unbound_agent = precheck_agent(&[]);
+
+        // Unreadable (None) or empty declared sets never refuse: fail-open.
+        assert!(check_deploy_routes_bound(
+            None,
+            "deal-desk",
+            &unbound_agent,
+            &created,
+            DeployTier::Local
+        )
+        .is_ok());
+        assert!(check_deploy_routes_bound(
+            Some(&route_set(&[])),
+            "deal-desk",
+            &unbound_agent,
+            &created,
+            DeployTier::Local
+        )
+        .is_ok());
+        // Everything declared is bound.
+        assert!(check_deploy_routes_bound(
+            Some(&route_set(&["ops"])),
+            "deal-desk",
+            &precheck_agent(&["ops", "legacy"]),
+            &unchanged,
+            DeployTier::Cluster
+        )
+        .is_ok());
+
+        // A just-created agent with no bindings, local tier.
+        let (message, fix) = deploy_refusal(check_deploy_routes_bound(
+            Some(&route_set(&["ops"])),
+            "deal-desk",
+            &unbound_agent,
+            &created,
+            DeployTier::Local,
+        ));
+        assert!(message.contains("\"ops\""), "{message}");
+        assert!(
+            message.contains("this agent binds no approval routes"),
+            "{message}"
+        );
+        assert!(message.contains("was created by this deploy"), "{message}");
+        assert!(
+            fix.contains("curie local approvals deal-desk --route-resolution ops=<channel>"),
+            "{fix}"
+        );
+        assert!(!fix.contains("curie cluster approvals"), "{fix}");
+        assert!(
+            !fix.contains("--namespace/--release/--api-url"),
+            "only the cluster tier repeats connection flags: {fix}"
+        );
+        assert!(
+            !fix.contains("--routes-from"),
+            "nothing is bound, so nothing needs preserving: {fix}"
+        );
+
+        // The same agent, not created by this deploy, on the cluster tier.
+        let (message, fix) = deploy_refusal(check_deploy_routes_bound(
+            Some(&route_set(&["ops"])),
+            "deal-desk",
+            &unbound_agent,
+            &unchanged,
+            DeployTier::Cluster,
+        ));
+        assert!(
+            message.contains("No version, bundle, or deployment was created"),
+            "{message}"
+        );
+        assert!(!message.contains("was created by this deploy"), "{message}");
+        assert!(fix.contains("curie cluster approvals deal-desk"), "{fix}");
+        assert!(!fix.contains("curie local approvals"), "{fix}");
+        assert!(fix.contains("--namespace/--release/--api-url"), "{fix}");
+
+        // A route already bound is repeated in the one full-replacement write.
+        let (message, fix) = deploy_refusal(check_deploy_routes_bound(
+            Some(&route_set(&["ops", "finance"])),
+            "deal-desk",
+            &precheck_agent(&["finance"]),
+            &unchanged,
+            DeployTier::Local,
+        ));
+        assert!(
+            message.contains("bound routes are \"finance\""),
+            "{message}"
+        );
+        assert!(fix.contains("--route-resolution ops=<channel>"), "{fix}");
+        assert!(
+            fix.contains("--route-resolution finance=<channel>"),
+            "{fix}"
+        );
+        assert!(fix.contains("--routes-from"), "{fix}");
+    }
+
+    #[test]
+    fn route_write_refusal_names_every_deployment_declaring_a_removed_route() {
+        use std::collections::BTreeMap;
+        let write = |routes: &[&str]| -> BTreeMap<String, crate::api::ApprovalRouteBindingWrite> {
+            routes
+                .iter()
+                .map(|r| {
+                    (
+                        r.to_string(),
+                        crate::api::ApprovalRouteBindingWrite {
+                            resolution: crate::api::ApprovalResolutionTargetWrite {
+                                kind: "slack".to_string(),
+                                address: "C0EXAMPLE1".to_string(),
+                            },
+                            notification: None,
+                            approvers: None,
+                        },
+                    )
+                })
+                .collect()
+        };
+        let declaring = vec![
+            DeclaringVersion {
+                version_id: "ver-a".to_string(),
+                deployments: vec![("dep-dev".to_string(), "dev".to_string())],
+                routes: route_set(&["ops", "finance"]),
+            },
+            DeclaringVersion {
+                version_id: "ver-b".to_string(),
+                deployments: vec![("dep-prod".to_string(), "prod".to_string())],
+                routes: route_set(&["ops"]),
+            },
+        ];
+
+        assert!(
+            route_write_refusal("deal-desk", &write(&["ops", "finance"]), &declaring).is_none()
+        );
+        assert!(route_write_refusal("deal-desk", &write(&[]), &[]).is_none());
+
+        let err = route_write_refusal("deal-desk", &write(&["finance"]), &declaring)
+            .expect("dropping a declared route must refuse");
+        let message = format!("{err:#}");
+        let (class, fix) = crate::exit::classify(&err);
+        assert_eq!(class, crate::exit::ExitClass::Usage, "{message}");
+        for needle in [
+            "deal-desk",
+            "\"ops\"",
+            "dep-dev",
+            "dep-prod",
+            "ver-a",
+            "ver-b",
+        ] {
+            assert!(message.contains(needle), "must name {needle:?}: {message}");
+        }
+        assert!(
+            !message.contains("\"finance\""),
+            "a route the write keeps is not reported: {message}"
+        );
+        let fix = fix.expect("the refusal carries a fix");
+        assert!(fix.contains("DELETE /deployments/"), "{fix}");
+        assert!(
+            fix.contains("deploying a version that declares no gates is not enough"),
+            "{fix}"
+        );
+    }
+
     #[test]
     fn parse_manifest_gates_extracts_gate_route_pairs() {
         // The shared parser (#546) recovers approvalPolicy gates from raw manifest
@@ -9298,6 +10105,15 @@ mod tests {
         )
         .expect("a gate with grantableViaPolicy:true parses");
         assert!(with.grantable_via_policy);
+
+        let templated: ApprovalGateDecl = serde_json::from_str(
+            r#"{"gate":"Bash","route":"managers","summary":"Run {command}. Approve?"}"#,
+        )
+        .expect("a gate with a summary template parses");
+        assert_eq!(
+            templated.summary.as_deref(),
+            Some("Run {command}. Approve?")
+        );
     }
 
     #[tokio::test]

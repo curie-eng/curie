@@ -8,7 +8,7 @@
 # command`. That exception is not classified by the kernel, so the turn hangs,
 # the entry is re-delivered to dead-letter, and every attempt leaks a sandbox.
 # `values.schema.json` makes helm refuse the value at install/template time so it
-# never reaches worker env at all. Eleven assertions:
+# never reaches worker env at all. Twelve assertions:
 #
 #   (a) POSITIVE, defaults: the render SUCCEEDS and the worker Deployment
 #       carries the three env vars at their shipped defaults.
@@ -76,6 +76,12 @@
 #       runnerTotalTimeoutSeconds=1700 / deliveryBudgetSeconds=600 and names
 #       both keys, values, inequality, and corrective actions in chart-owned
 #       output. This is the cross-field negative JSON Schema cannot express.
+#   (m) RETAINED extraEnv TIMEOUT, positive: a v0.8.4-era worker.extraEnv
+#       override of CURIE_RUNNER_TOTAL_TIMEOUT_S=1700 must not duplicate the
+#       first-class env. The rendered worker keeps exactly one copy at the
+#       first-class default (600) and still emits a non-colliding extraEnv
+#       entry. This is the 2026-09-04 soak: retained extraEnv plus first-class
+#       timeout made Kubernetes reject the worker patch (#2097).
 # SCHEMA WORDING IS NOT ASSERTED, AND MUST NOT BECOME ASSERTED. Every negative
 # below EXCEPT the relationship negatives in (j) and (k) checks only (1)
 # that helm exited non-zero and (2) that the captured output contains the bare
@@ -460,4 +466,9 @@ for token in \
   $(head -3 <<<"$K_RELATIONSHIP_OUT")"
 done
 
-echo "worker-ttl-bounds-assertions: all eleven assertions passed"
+# (m) A retained extraEnv copy of a chart-owned timeout is refused at render.
+# Fail-closed reserved-env (#2442) replaces the earlier silent drop.
+assert_refused m "CURIE_RUNNER_TOTAL_TIMEOUT_S" \
+  --set-json 'worker.extraEnv=[{"name":"CURIE_RUNNER_TOTAL_TIMEOUT_S","value":"1700"},{"name":"CURIE_UPGRADE_FIXTURE","value":"kept"}]'
+
+echo "worker-ttl-bounds-assertions: all twelve assertions passed"

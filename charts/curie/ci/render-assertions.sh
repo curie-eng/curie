@@ -1043,6 +1043,8 @@ expected = {
     # The pre-upgrade drain gate and its post-upgrade release (issue #2010).
     ("Job", f"{prefix}-upgrade-drain"): "hooks",
     ("Job", f"{prefix}-upgrade-drain-release"): "hooks",
+    # The single schema upgrade phase (#2300).
+    ("Job", f"{prefix}-schema-migrate"): "hooks",
     ("Job", f"{prefix}-grafana-token-updater"): "hooks",
     ("Job", f"{prefix}-grafana-token-cleanup"): "hooks",
     ("Job", f"{prefix}-mail-persistence-preflight"): "hooks",
@@ -1580,7 +1582,7 @@ if failures:
 print(f"  ok: DATATIER_TARGETS includes {expected!r} and excludes {forbidden!r}")
 PYEOF
 
-echo "=== Assertion 14: API migration waits quietly for Postgres before Alembic (#1762) ==="
+echo "=== Assertion 14: API schema-wait init waits quietly for Postgres then the upgrade phase (#2300) ==="
 API_MIGRATE_OUT="$TMP/api_migrate"
 helm template curie "$CHART" --output-dir "$API_MIGRATE_OUT" >/dev/null
 API_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/api.yaml"
@@ -1588,7 +1590,7 @@ API_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/api.yaml"
 
 API_MIGRATE_CHECK="$TMP/check_api_migrate_wait.py"
 cat > "$API_MIGRATE_CHECK" <<'PYEOF'
-"""Execute the rendered API migration init command with fake dependencies."""
+"""Execute the rendered API schema-wait init command with fake dependencies."""
 
 import os
 import pathlib
@@ -1614,9 +1616,12 @@ def migrate_container(manifest):
             .get("spec", {})
             .get("initContainers", [])
         )
-        matches.extend(item for item in containers if item.get("name") == "migrate")
+        matches.extend(item for item in containers if item.get("name") == "schema-wait")
+        alembic = [item for item in containers if item.get("name") == "migrate"]
+        if alembic:
+            fail("API init must not run a migrate container; Alembic belongs on the upgrade Job")
     if len(matches) != 1:
-        fail(f"expected exactly one migrate init container, found {len(matches)}")
+        fail(f"expected exactly one schema-wait init container, found {len(matches)}")
     return matches[0]
 
 
@@ -1624,20 +1629,22 @@ def shell_process(container):
     process = list(container.get("command") or []) + list(container.get("args") or [])
     if len(process) < 3 or pathlib.Path(process[0]).name not in {"sh", "bash"}:
         fail(
-            "migrate init container must use a shell readiness wait before "
-            "exec alembic; a direct Alembic command is not retry-safe"
+            "schema-wait init container must use a shell readiness wait before "
+            "the schema probe; a direct Alembic command is not retry-safe"
         )
     if process[1] != "-c":
-        fail("migrate init container shell command must use -c")
+        fail("schema-wait init container shell command must use -c")
     script = process[2]
-    migration = "exec alembic -c alembic.ini upgrade head"
-    if migration not in script:
-        fail(f"migrate init command must preserve {migration!r}")
-    if not any(token in script[: script.index(migration)] for token in ("python", "python3")):
-        fail("migrate init command has no supported Postgres readiness probe before Alembic")
+    if "alembic" in script:
+        fail("schema-wait init must not invoke Alembic; migrations belong on the upgrade Job")
+    wait = "exec python -m curie_api.schema_compat wait"
+    if wait not in script:
+        fail(f"schema-wait init command must preserve {wait!r}")
+    if not any(token in script[: script.index(wait)] for token in ("python", "python3")):
+        fail("schema-wait init command has no supported Postgres readiness probe before the wait")
     env_names = {item.get("name") for item in container.get("env", [])}
     if "DATABASE_URL" not in env_names:
-        fail("migrate init container must receive DATABASE_URL from the Postgres environment")
+        fail("schema-wait init container must receive DATABASE_URL from the Postgres environment")
     return process
 
 
@@ -1655,12 +1662,15 @@ def run_case(process, readiness_failures):
         fake_modules = root / "modules"
         fake_modules.mkdir()
         attempts = root / "readiness-attempts"
-        alembic_calls = root / "alembic-calls"
+        wait_calls = root / "wait-calls"
 
         write_program(fake_bin / "sleep", "exit 0\n")
-        write_program(
-            fake_bin / "alembic",
-            "printf '%s\\n' \"$*\" >> \"$ALEMBIC_CALLS\"\n",
+        compat_pkg = fake_modules / "curie_api"
+        compat_pkg.mkdir()
+        (compat_pkg / "__init__.py").write_text("")
+        (compat_pkg / "schema_compat.py").write_text(
+            "import os, pathlib, sys\n"
+            "pathlib.Path(os.environ['WAIT_CALLS']).write_text(' '.join(sys.argv[1:]) + '\\n')\n"
         )
         (fake_modules / "asyncpg.py").write_text(
             """\
@@ -1692,7 +1702,7 @@ async def connect(database_url, timeout):
         env = os.environ.copy()
         env.update(
             {
-                "ALEMBIC_CALLS": str(alembic_calls),
+                "WAIT_CALLS": str(wait_calls),
                 "DATABASE_URL": (
                     "postgresql+asyncpg://curie:EXAMPLE_NOT_A_SECRET@postgres:5432/curie"
                 ),
@@ -1719,7 +1729,7 @@ async def connect(database_url, timeout):
             fail("migrate readiness wait did not terminate within 60 seconds with fake sleep")
 
         attempt_lines = attempts.read_text().splitlines() if attempts.exists() else []
-        calls = alembic_calls.read_text().splitlines() if alembic_calls.exists() else []
+        calls = wait_calls.read_text().splitlines() if wait_calls.exists() else []
         return result, attempt_lines, calls
 
 
@@ -1731,16 +1741,16 @@ if ready.returncode != 0:
     fail(f"immediate readiness exited {ready.returncode}: {ready.stdout}{ready.stderr}")
 if len(ready_attempts) != 1:
     fail(f"immediate readiness ran the probe {len(ready_attempts)} times, expected once")
-if ready_calls != ["-c alembic.ini upgrade head"]:
-    fail(f"immediate readiness did not invoke the original Alembic command: {ready_calls!r}")
+if ready_calls != ["wait"]:
+    fail(f"immediate readiness did not invoke schema_compat wait: {ready_calls!r}")
 
 delayed, delayed_attempts, delayed_calls = run_case(process, 2)
 if delayed.returncode != 0:
     fail(f"delayed readiness exited {delayed.returncode}: {delayed.stdout}{delayed.stderr}")
 if len(delayed_attempts) != 3:
     fail(f"delayed readiness ran the probe {len(delayed_attempts)} times, expected three")
-if delayed_calls != ["-c alembic.ini upgrade head"]:
-    fail(f"delayed readiness did not invoke the original Alembic command: {delayed_calls!r}")
+if delayed_calls != ["wait"]:
+    fail(f"delayed readiness did not invoke schema_compat wait: {delayed_calls!r}")
 delayed_output = [
     line.strip()
     for line in (delayed.stdout + delayed.stderr).splitlines()
@@ -1755,7 +1765,7 @@ if exhausted.returncode == 0:
 if len(exhausted_attempts) != 60:
     fail(f"readiness exhaustion must make exactly 60 attempts; observed {len(exhausted_attempts)}")
 if exhausted_calls:
-    fail(f"readiness exhaustion must not invoke Alembic; got {exhausted_calls!r}")
+    fail(f"readiness exhaustion must not invoke schema wait; got {exhausted_calls!r}")
 
 output_lines = [
     line.strip()
@@ -1788,8 +1798,8 @@ if any(
     fail(f"readiness exhaustion exposed database credentials: {output_lines!r}")
 
 print(
-    "  ok: immediate and delayed readiness run the original migration; bounded "
-    "exhaustion stays concise, exits nonzero, and never invokes Alembic"
+    "  ok: immediate and delayed readiness run schema_compat wait; bounded "
+    "exhaustion stays concise, exits nonzero, and never invokes the wait"
 )
 PYEOF
 
@@ -1825,8 +1835,8 @@ if [[ "$api_migrate_bound_negative_output" != *"must make exactly 60 attempts"* 
 fi
 echo "  ok: a changed readiness bound is rejected (the boundedness assert can fail)"
 
-echo "=== Assertion 14 negative control: direct Alembic migration FAILS ==="
-# Mutate a temporary chart copy to the pre-fix command and require the same
+echo "=== Assertion 14 negative control: direct Alembic on the API init FAILS ==="
+# Mutate a temporary chart copy to the pre-#2300 command and require the same
 # rendered-command checker to reject it.
 API_MIGRATE_MUTANT="$TMP/mutant-api-migrate"
 cp -a "$CHART" "$API_MIGRATE_MUTANT"
@@ -1852,12 +1862,12 @@ API_MIGRATE_MUTANT_RENDER="$API_MIGRATE_MUTANT_OUT/curie/templates/api.yaml"
 [[ -f "$API_MIGRATE_MUTANT_RENDER" ]] || fail "mutant api.yaml did not render"
 api_migrate_negative_output=""
 if api_migrate_negative_output="$(python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_MUTANT_RENDER" 2>&1)"; then
-  fail "negative control did not fire: the pre-fix direct Alembic command passed the readiness contract."
+  fail "negative control did not fire: a direct Alembic API init passed the schema-wait contract."
 fi
 if [[ "$api_migrate_negative_output" != *"direct Alembic command is not retry-safe"* ]]; then
   fail "direct-Alembic negative control failed unexpectedly: $api_migrate_negative_output"
 fi
-echo "  ok: the reverted direct-Alembic command is rejected (the assert can fail)"
+echo "  ok: a direct Alembic API init is rejected (the assert can fail)"
 
 echo "=== Assertion 15: NOTES app-service images match Deployments and never end in a bare colon (#2323) ==="
 # helm template does not emit NOTES.txt. Render it through tpl so the
@@ -2050,4 +2060,4 @@ fi
 echo "  ok: a NOTES image interpolated from empty image.tag is rejected (the assert can fail)"
 
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; the API migration init command waits quietly with bounded retries before preserving the original Alembic upgrade, with readiness exhaustion proven to exit nonzero without invoking Alembic; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control)."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init command waits quietly with bounded retries before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control)."

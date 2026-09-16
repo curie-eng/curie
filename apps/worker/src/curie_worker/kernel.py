@@ -29,13 +29,13 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import aiohttp
 from aci_protocol import (
@@ -56,6 +56,7 @@ from channel_protocol import (
     Action,
     ConfirmIntent,
     OutboundMessage,
+    scoped_conversation_id,
 )
 from channel_protocol.reply import (
     REPLY_WIRE_VERSION,
@@ -83,6 +84,9 @@ from .approvals import (
     CreatedApproval,
     PublicationCreateRequest,
     PublicationCreator,
+    PublicationLineage,
+    ReviewAuthorityUnavailable,
+    VerifiedReviewFeedback,
 )
 from .attachments import AttachmentCoordinator
 from .behaviorpacks import (
@@ -117,10 +121,13 @@ from .sandbox.types import (
 )
 from .threadlock import ThreadLock
 from .workspace import (
+    WORKSPACES_DISABLED_REFUSAL,
     WorkspaceClaimCoordinator,
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
     parse_github_repo_fact,
+    trusted_repository_fact,
+    webhook_job_refuses_workspace,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,6 +137,14 @@ logger = logging.getLogger(__name__)
 _PUBLISH_TOOL_NAME = "mcp__curie__publish_changes"
 _PUBLISH_PROVENANCE = ("permission", _PUBLISH_TOOL_NAME)
 _PUBLICATION_EXPIRES_IN_SECONDS = 24 * 60 * 60
+_REVIEW_EVENT_ID_RE = re.compile(
+    r"github-feedback-"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+# The API cancels final reserve work at two seconds. This worker-side overall
+# deadline includes protocol doubles and ASGI transports whose HTTP timeouts do
+# not fire, while leaving the API enough time to return its retryable 503.
+_REVIEW_RESERVE_CONTROL_PLANE_TIMEOUT_S = 3.0
 
 
 def _is_publish_provenance(gate_kind: str | None, granted_tool: str | None) -> bool:
@@ -248,9 +263,10 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
     moving a separator. The key is only ever compared, never parsed back.
     """
     handle = qevent.reply_handle
-    return ":".join(
-        quote(part, safe="")
-        for part in (handle.kind, handle.channel, qevent.conversation_id)
+    return scoped_conversation_id(
+        handle.kind,
+        handle.channel,
+        qevent.conversation_id,
     )
 
 
@@ -342,6 +358,43 @@ def map_error_classification(raw: str | None) -> str:
     return UNCLASSIFIED_ERROR_CLASSIFICATION
 
 
+def _workspace_inference_notice(repo: str | None) -> str | None:
+    """The platform's one-line account of a repository it inferred (#2659).
+
+    Platform-authored, never model text. ``repo`` is only ever the repository
+    the server selected (allowlist-checked and shape-validated), never raw
+    message text, so it cannot carry a blank line or the CLI's approval marker.
+    It is appended after the model's answer as its own block, and never written
+    into the runner's event text or ``TurnOutcome.text``, so the model input,
+    the approval record summary and the approval card stay free of it. None when
+    nothing was inferred, which ``_join_reply_blocks`` skips.
+    """
+
+    if not repo:
+        return None
+    return f"Working in {repo}, from the repository named in your message."
+
+
+def _same_repo(left: str | None, right: str | None) -> bool:
+    """Whether two repository names are the same repository (#2659).
+
+    GitHub names compare case-insensitively; an absent side is never a match.
+    """
+
+    return left is not None and right is not None and left.casefold() == right.casefold()
+
+
+def _join_reply_blocks(*parts: str | None) -> str:
+    """Join reply blocks with one blank line, skipping empty or absent ones.
+
+    The one place reply blocks are composed, so the CLI's blank-line block parse
+    (``parse_approval_id`` splits on ``\\n\\n``) always sees whole blocks and never
+    an empty one.
+    """
+
+    return "\n\n".join(part for part in parts if part)
+
+
 def _escalation_text(
     qevent: QueuedTurn,
     *,
@@ -374,6 +427,14 @@ _MIN_ATTEMPT_BUDGET_S = 5.0
 # window is treated as an unreadable runner, which fails closed.
 _RECLAIM_PREFLIGHT_IDLE_TIMEOUT_S = 5.0
 _RECLAIM_PREFLIGHT_POLL_S = 0.05
+
+# ``WorkspaceClaimCoordinator`` performs blocking clone/archive/upload work on
+# a worker thread. Its final handoff guard schedules one bounded runner-status
+# read back onto the owning asyncio loop, then waits on that thread. The HTTP
+# request already has the runner client's delivery-clamped timeout; this small
+# grace covers scheduling and returning its result without leaving a worker
+# thread blocked forever if the loop stops servicing callbacks.
+_HANDOFF_REVALIDATION_BRIDGE_GRACE_S = 1.0
 
 
 class ReclaimPreflightUnsafe(RuntimeError):
@@ -607,27 +668,45 @@ class TurnOutcome:
     # Threaded onto the durable record. None from an older runner.
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    approval_display: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
+    review_origin_key: str | None = None
+    # The repository this turn attached because its own message named it
+    # (#2659). Read by `_pause_for_approval` for the notice composition. None on
+    # every other turn.
+    workspace_inferred_repo: str | None = None
 
 
 class ThreadBusyError(RuntimeError):
-    """A job arrived at a thread whose session is live, so it was not started.
+    """A non-steering turn found a live thread, so it was not started.
 
-    Raised INSTEAD of steering or blocking (ADR-0079: jobs are outputs, not
-    steering inputs). Deliberately not one of the classes ``_attempt`` converts
-    into a retryable outcome: this is not a failed turn to back off and retry
-    within the attempt budget, it is a turn that has not begun. Letting it escape
-    leaves the stream entry PENDING, so the existing reclaim redelivers it and the
-    job runs on a later pass once the conversation has finished.
+    Raised INSTEAD of steering or blocking for jobs (ADR-0079) and for verified
+    review feedback whose revision must remain attributable to its own origin.
+    Deliberately not one of the classes ``_attempt`` converts into a retryable
+    outcome: this is a turn that has not begun. Letting it escape leaves the
+    stream entry PENDING, so existing bounded reclaim redelivers it after the
+    conversation has finished.
 
     The redelivery interval is therefore ``reclaim_min_idle_ms`` and the give-up
     point is ``max_delivery``, which is a coarse instrument borrowed from crash
-    recovery rather than a scheduling policy: a job behind a conversation longer
-    than that budget dead-letters instead of running late. That is a visible,
-    bounded outcome rather than a silent one, and issue #268 owns replacing it
-    with a real idle-aware policy when cron schedules land.
+    recovery rather than a scheduling policy: a deferred turn behind a
+    conversation longer than that budget dead-letters instead of running late.
+    That is a visible, bounded outcome rather than a silent one, and issue #268
+    owns replacing it with a real idle-aware policy when cron schedules land.
     """
+
+
+class PendingPublicationError(ThreadBusyError):
+    """A thread-owned publication must settle before another turn can start."""
+
+    public_detail = (
+        "This thread already has a publication awaiting approval or completion. "
+        "Resolve it before continuing."
+    )
+
+    def __init__(self, thread_key: str) -> None:
+        super().__init__(f"thread {thread_key} has a pending publication revision")
 
 
 @dataclass
@@ -639,6 +718,24 @@ class _RouteResult:
     # route) under the route lock: the canned reply to deliver instead of
     # claiming a sandbox or starting a model turn. None on every other path.
     canned_reply: str | None = None
+    # Set only on the new-turn return, when this message's own repository fact
+    # selected a workspace the route snapshot taken under the lock did not
+    # already carry (#2659). The reply announces it; None on every other path.
+    workspace_inferred_repo: str | None = None
+
+
+@dataclass
+class _WorkspaceInferenceCarry:
+    """One delivery's record of the repository its message inferred (#2659).
+
+    Created in ``process_event``'s local scope and shared by every attempt of
+    that delivery. ``_route_and_start`` records the inference as soon as the
+    claim attaches the workspace, before any steer or turn start, so an
+    attempt that attaches and then fails still leaves the fact for the retry
+    that adopts the attached route. It is only ever set, never cleared.
+    """
+
+    repo: str | None = None
 
 
 @dataclass
@@ -663,6 +760,7 @@ class _StreamAccumulator:
     approval_route: str | None = None
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    approval_display: str | None = None
     # Call id -> the ledger record it opened. One CALL produces two ACI frames
     # (ADR-0117): the first opens a record, the second closes THAT record rather
     # than minting a second. A turn that calls the same tool twice is only
@@ -673,24 +771,32 @@ class _StreamAccumulator:
     # here, because ``undoable`` is derived on the record and a receipt built
     # from what the worker SENT could claim a reversibility the row lacks.
     receipt_rows: list[dict[str, Any]] = field(default_factory=list)
+    # The repository this turn attached from its own message (#2659), announced
+    # at finalize only. Intermediate streaming edits show `rendered()` alone.
+    workspace_inferred_repo: str | None = None
 
     def rendered(self) -> str:
         return self.final_text if self.final_text is not None else "".join(self.text_parts)
 
     def rendered_with_receipt(self) -> str:
-        """The turn's answer, then what it did to the world.
+        """The turn's answer, then the inferred repository, then what it did.
 
         Appended rather than replacing: the model's answer is what the person
         asked for, and the receipt is the platform's own account beneath it. A
         turn that changed nothing adds nothing, because most turns are reads and
         a receipt on every one of them is noise.
+
+        The inferred repository announcement (#2659) is a trailing block for the
+        same reason the receipt is: the final edit appends beneath a message the
+        person may already be reading, instead of rewriting its first line. It
+        sits directly after the answer so the receipt stays the last block.
         """
 
-        text = self.rendered()
-        receipt = render_receipt(self.receipt_rows)
-        if receipt is None:
-            return text
-        return f"{text}\n\n{receipt}" if text else receipt
+        return _join_reply_blocks(
+            self.rendered(),
+            _workspace_inference_notice(self.workspace_inferred_repo),
+            render_receipt(self.receipt_rows),
+        )
 
 
 class _ThrottledReply:
@@ -1413,30 +1519,13 @@ class Kernel:
                     thread_key,
                     **boot_env_kwargs,
                 )
-                if getattr(resolved, "workspace_enabled", False):
-                    workspace_deployment_id = getattr(resolved, "deployment_id", None)
-                    if workspace_deployment_id is None:
-                        # Outside _attempt's handlers, so this one has to name
-                        # itself: deployment_id is legitimately optional on a
-                        # resolved binding, making this a reachable
-                        # misconfiguration that would otherwise reach the
-                        # consumer as an anonymous processing exception (#2004).
-                        # Log first so the failure names the agent, then let the
-                        # raise stand unchanged: it leaves the stream entry
-                        # pending for reclaim rather than settling it -- only
-                        # the visibility changed here.
-                        binding_failure = WorkspacePreparationError(
-                            "binding", "workspace-enabled deployment has no deployment id"
-                        )
-                        self._log_workspace_start_failure(
-                            qevent,
-                            qevent.text,
-                            binding_failure,
-                            agent_id=agent_id,
-                            agent_name=agent_name,
-                            workspace_deployment_id=None,
-                        )
-                        raise binding_failure
+                # The deployment id is the server-side authority used to select
+                # and redeem a repository at initial claim time.  The legacy
+                # per-deployment workspace_enabled bit is deliberately not a
+                # runtime coding gate: the worker-wide coordinator switch is the
+                # operational kill switch, while a missing deployment id simply
+                # leaves this turn on the generic claim path.
+                workspace_deployment_id = getattr(resolved, "deployment_id", None)
                 # One-shot post-approval allowance (#430, ADR-0035): when THIS turn is the
                 # resume of a genuinely-approved permission-gate approval, deliver a single
                 # gated-tool grant so the approved action completes once; the gate re-arms
@@ -1517,6 +1606,11 @@ class Kernel:
             if _is_fenced(lease) and lease is not None and lease.generation > 1:
                 await self._preflight_reclaimed_delivery(thread_key, lease)
 
+            # Retry carry for the inferred repository announcement (#2659); see
+            # _WorkspaceInferenceCarry. Local to this delivery, never kernel state,
+            # so it cannot leak into another thread's turn. A reclaimed redelivery
+            # starts fresh.
+            workspace_inference = _WorkspaceInferenceCarry()
             attempt = 0
             while True:
                 attempt += 1
@@ -1568,6 +1662,7 @@ class Kernel:
                     workspace_deployment_id,
                     agent_name,
                     remaining_s=_remaining_budget(lease),
+                    workspace_inference=workspace_inference,
                 )
 
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
@@ -2415,11 +2510,8 @@ class Kernel:
         workspace start failure -- a clone, an archive, an upload, a missing
         coordinator -- falls into ``_attempt``'s broad start-failure clause,
         which used to log an event id and an anonymous ``repr``: naming neither
-        the agent, nor the deployment, nor the repository. A binding carrying no
-        deployment id is different again: it never reaches that clause at all,
-        because it is raised earlier, in ``_process_event``, before ``_attempt``
-        runs -- and had no log of its own before this ticket. The reported
-        symptom is what both cost -- the turn acks, creates no sandbox, and an
+        the agent, nor the deployment, nor the repository. The reported symptom
+        is what those faults cost -- the turn acks, creates no sandbox, and an
         operator has nothing to search on.
 
         So this emits one WARNING carrying everything needed to find the
@@ -2431,11 +2523,8 @@ class Kernel:
         decision the feature made on purpose, a preparation failure is a fault
         nobody chose.
 
-        It takes the turn TEXT rather than an ``Event`` because the earliest
-        workspace failure -- a workspace-enabled deployment carrying no
-        deployment id -- is raised before ``_attempt`` has built one, and a
-        failure this helper cannot be called from is exactly the silence #2004
-        is about.
+        It takes the turn TEXT rather than an ``Event`` so it can name the
+        repository fact independently of where preparation failed.
         """
         # Total by construction: parse_github_repo_fact RAISES
         # WorkspaceSelectionRefused on a multi-repository message. That refusal
@@ -2474,6 +2563,7 @@ class Kernel:
         agent_name: str | None = None,
         *,
         remaining_s: float | None = None,
+        workspace_inference: _WorkspaceInferenceCarry,
     ) -> TurnOutcome:
         thread_key = _thread_key_for(qevent)
 
@@ -2485,10 +2575,16 @@ class Kernel:
         # mode emits one final chat.update. A placeholderless approval is an
         # exception: its approval path posts the request text before persistence,
         # then updates that message with the approval notice.
-        # A placeholderless job must route first. Otherwise every busy redelivery
-        # posts a notice for a turn that never started.
+        # A placeholderless job or review candidate must route first. Otherwise
+        # every busy redelivery or authority outage posts a notice for a turn
+        # that never started. Reviews publish their receipt after reservation;
+        # jobs publish the deferred booting state below after routing succeeds.
+        review_candidate = _REVIEW_EVENT_ID_RE.fullmatch(qevent.event_id) is not None
         defer_job_booting = qevent.reply_handle.placeholder is None and qevent.source.is_job
-        if not self._config.slack_no_edit_streaming and not defer_job_booting:
+        defer_review_booting = qevent.reply_handle.placeholder is None and review_candidate
+        if not self._config.slack_no_edit_streaming and not (
+            defer_job_booting or defer_review_booting
+        ):
             try:
                 await self._reply_for(
                     qevent, route, self._config.booting_text, terminal=False
@@ -2513,13 +2609,50 @@ class Kernel:
         # next same-thread event can route, and release the Valkey lock before
         # streaming so a follow-up can steer.
         routed: _RouteResult | None = None
+        verified_review: VerifiedReviewFeedback | None = None
+        review_receipt: str | None = None
 
         def close_routed_turn() -> None:
+            # Unregister only a turn this attempt opened. A follow-up that
+            # failed during steer or lock acquire never registered; dropping
+            # the agent+thread key would hide the original live turn from kill.
+            # start_turn's BaseException path unregisters inside _route_and_start
+            # before routed is assigned here. Canned and steered leave turn None.
             if routed is not None and routed.turn is not None:
+                self._unregister_run(agent_id, thread_key)
                 routed.turn.close()
 
         try:
             try:
+                if review_candidate:
+                    verifier = getattr(
+                        self._publication_creator, "verify_review_feedback", None
+                    )
+                    if verifier is None or workspace_deployment_id is None:
+                        raise WorkspaceSelectionRefused(
+                            "GitHub feedback requires a configured trusted workspace "
+                            "verifier; no model turn started."
+                        )
+                    try:
+                        verified = await verifier(qevent, workspace_deployment_id)
+                    except (ApprovalBackendError, TimeoutError):
+                        # No runner turn exists yet. Preserve this delivery for
+                        # bounded reclaim instead of spending model attempts on
+                        # control-plane uncertainty.
+                        raise ReviewAuthorityUnavailable(
+                            "GitHub feedback verification is temporarily unavailable"
+                        ) from None
+                    if (
+                        not isinstance(verified, VerifiedReviewFeedback)
+                        or verified.agent_id != agent_id
+                        or verified.sender != qevent.author
+                        or verified.origin_key != qevent.event_id
+                    ):
+                        raise WorkspaceSelectionRefused(
+                            "GitHub feedback no longer belongs to this conversation."
+                        )
+                    verified_review = verified
+                    review_receipt = verified.receipt
                 async with self._lock.hold(self._config.lock_key(thread_key)):
                     routed = await self._route_and_start(
                         thread_key,
@@ -2530,6 +2663,10 @@ class Kernel:
                         agent_name=agent_name,
                         source=qevent.source,
                         remaining_s=remaining_s,
+                        agent_id=agent_id,
+                        verified_review=verified_review,
+                        review_turn=qevent if verified_review is not None else None,
+                        workspace_inference=workspace_inference,
                     )
             except BaseException:
                 # start_turn owns a live response as soon as it returns, which
@@ -2567,6 +2704,17 @@ class Kernel:
                     "another conversation finishes, so please try again shortly."
                 ),
             )
+            return TurnOutcome(terminal_ok=True)
+        except PendingPublicationError as exc:
+            release_order()
+            logger.info(
+                "pending publication refused a new turn for agent=%s deployment=%s "
+                "thread=%s",
+                agent_name,
+                workspace_deployment_id,
+                thread_key,
+            )
+            await self._reply_for(qevent, route, exc.public_detail)
             return TurnOutcome(terminal_ok=True)
         except WorkspaceSelectionRefused as exc:
             release_order()
@@ -2639,6 +2787,20 @@ class Kernel:
             close_routed_turn()
             raise
 
+        if review_receipt is not None:
+            try:
+                await self._reply_for(
+                    qevent, route, review_receipt, terminal=False
+                )
+            except asyncio.CancelledError:
+                close_routed_turn()
+                raise
+            except Exception:
+                # The result uses the existing durable completion path. A reply
+                # outage here must not start this already-reserved model turn a
+                # second time.
+                logger.warning("GitHub feedback receipt delivery unavailable")
+
         if not self._config.slack_no_edit_streaming and defer_job_booting:
             try:
                 # Routing succeeded, so this delivery owns a real turn. Adopt the
@@ -2689,7 +2851,18 @@ class Kernel:
                 and await self._killswitch.is_killed(agent_id)
             ):
                 await self.interrupt_thread(thread_key, f"agent {agent_id} killed by operator")
-            outcome = await self._consume(qevent, route, turn, nav, agent_id)
+            # #2659: this route's own inference wins; otherwise a retry honors the
+            # delivery's carried fact while the adopted handle still carries it.
+            carried = workspace_inference.repo
+            inferred = routed.workspace_inferred_repo or (
+                carried if _same_repo(routed.handle.workspace_repo, carried) else None
+            )
+            outcome = await self._consume(
+                qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
+            )
+            outcome.workspace_inferred_repo = inferred
+            if verified_review is not None:
+                outcome.review_origin_key = verified_review.origin_key
             if (
                 outcome.status is SessionStatus.AWAITING_APPROVAL
                 and _is_publish_provenance(
@@ -2777,24 +2950,125 @@ class Kernel:
         agent_name: str | None = None,
         source: TurnSource = TurnSource.SLACK,
         remaining_s: float | None = None,
+        agent_id: uuid.UUID | None = None,
+        lineage_branch: str | None = None,
+        lineage_head: str | None = None,
+        lineage_base_sha: str | None = None,
+        publication_visible_outcome_revision: int | None = None,
+        force_lineage_replacement: bool = False,
+        pending_publication_approval: bool = False,
+        verified_review: VerifiedReviewFeedback | None = None,
+        review_turn: QueuedTurn | None = None,
+        workspace_inference: _WorkspaceInferenceCarry,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
         # before any platform response path. This deliberately precedes the
         # greeting/help shortcut: a canned reply must not create a thread whose
         # repository remains ambiguous, and a conflicting repository must be
         # refused before an existing sandbox can be adopted or steered.
+        # Hoisted so the new-turn return can tell whether THIS message named the
+        # repository it attached (#2659); None when no selection ran.
+        repo_fact: str | None = None
+        workspace_repo: str | None = None
+        lineage: PublicationLineage | None = None
         if workspace_deployment_id is not None:
             if self._workspace is None:
+                # A named repository that cannot be attached is a decision the
+                # user must read (#2659, ADR 0126 terminal refusal), not a
+                # retryable fault. A message naming two repositories raises the
+                # parser's own terminal ambiguity refusal from here unchanged. A
+                # turn naming no repository keeps today's retryable wiring fault
+                # (#2683), because changing it changes turns that never asked.
+                ignore_message = (
+                    verified_review is not None or source is TurnSource.WEBHOOK
+                )
+                if trusted_repository_fact(
+                    event.text, ignore_message=ignore_message
+                ) is not None:
+                    raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
                 raise WorkspacePreparationError(
                     "wiring", "workspace-enabled deployment has no trusted coordinator"
                 )
-            repo_fact = parse_github_repo_fact(event.text)
-            await asyncio.to_thread(
-                self._workspace.select_repository,
-                thread_key=thread_key,
-                deployment_id=workspace_deployment_id,
-                author=event.user,
-                repo_full_name=repo_fact,
+            # The API already bound a verified review to its persisted thread
+            # workspace. Links in the untrusted review body are context, not a
+            # request to select another repository. Webhook jobs (#2572) likewise
+            # never parse a GitHub URL from the payload; the operator map is the
+            # only coding target.
+            repo_fact = trusted_repository_fact(
+                event.text,
+                ignore_message=(
+                    verified_review is not None or source is TurnSource.WEBHOOK
+                ),
+            )
+            if source is TurnSource.WEBHOOK and webhook_job_refuses_workspace(
+                event.text
+            ):
+                workspace_repo = None
+            else:
+                workspace_repo = await asyncio.to_thread(
+                    self._workspace.select_repository,
+                    thread_key=thread_key,
+                    deployment_id=workspace_deployment_id,
+                    author=event.user,
+                    repo_full_name=repo_fact,
+                )
+            if (
+                lineage_branch is None
+                and workspace_repo is not None
+                and getattr(self, "_publication_creator", None) is not None
+            ):
+                reader = getattr(
+                    self._publication_creator, "get_publication_lineage", None
+                )
+                if reader is not None:
+                    lineage = await reader(
+                        workspace_deployment_id, thread_key, workspace_repo
+                    )
+                    if lineage is not None and lineage.state != "open":
+                        raise WorkspaceSelectionRefused(
+                            "This pull request is already terminal. Start a new thread."
+                        )
+                    if lineage is not None and (
+                        lineage.has_pending_revision or lineage.has_pending_outcome
+                    ):
+                        # A first revision has no accepted head yet, but it still
+                        # owns the thread's publication boundary. Its terminal
+                        # outcome must also reach durable history before a later
+                        # turn can observe it. Refuse before lookup/adopt so a
+                        # failed suspend cannot reuse the dirty runner across
+                        # either boundary.
+                        if verified_review is None:
+                            raise PendingPublicationError(thread_key)
+                        if (
+                            lineage.has_pending_outcome
+                            or verified_review.reservation_id is None
+                        ):
+                            raise ThreadBusyError(
+                                f"thread {thread_key} is waiting before its queued review"
+                            )
+                        # A replay may adopt only its own still-reserved origin.
+                        # The final API operation below proves that identity
+                        # again under fresh provider truth before model input.
+                    if lineage is not None and lineage.head_sha is not None:
+                        lineage_branch = lineage.branch
+                        lineage_head = lineage.head_sha
+                    if lineage is not None:
+                        publication_visible_outcome_revision = (
+                            lineage.visible_outcome_revision
+                        )
+                        if (
+                            lineage.head_sha is None
+                            and lineage.visible_outcome_revision > 0
+                        ):
+                            lineage_base_sha = lineage.base_sha
+        if verified_review is not None and (
+            lineage is None
+            or lineage.head_sha != verified_review.head_sha
+            or lineage.version != verified_review.lineage_version
+        ):
+            raise WorkspaceSelectionRefused(
+                "The pull request changed after GitHub feedback verification; "
+                "no model turn started."
             )
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
@@ -2810,7 +3084,57 @@ class Kernel:
         # mere presence of an affinity record as proof that a live route was
         # retained.
         existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
-        if packs is not None:
+        materialized_lineage_head = lineage_head or lineage_base_sha
+        if (
+            materialized_lineage_head is not None
+            or publication_visible_outcome_revision is not None
+        ):
+            force_lineage_replacement = force_lineage_replacement or (
+                existing_handle is None
+                or (
+                    materialized_lineage_head is not None
+                    and existing_handle.workspace_materialized_head
+                    != materialized_lineage_head
+                )
+                or existing_handle.publication_visible_outcome_revision
+                != publication_visible_outcome_revision
+            )
+        if (
+            force_lineage_replacement
+            and existing_handle is not None
+            and not await self._workspace_handoff_ready(
+                existing_handle,
+                remaining_s=remaining_s,
+                lineage_reconciliation=True,
+                pending_publication_approval=pending_publication_approval,
+            )
+        ):
+            raise ThreadBusyError(
+                f"thread {thread_key} has not reached a durable lineage handoff boundary"
+            )
+        if (
+            not force_lineage_replacement
+            and workspace_repo is not None
+            and existing_handle is not None
+            and existing_handle.workspace_repo is not None
+            and existing_handle.workspace_repo != workspace_repo
+        ):
+            raise WorkspacePreparationError(
+                "route-fence", "live workspace route does not match sticky repository"
+            )
+        if (
+            not force_lineage_replacement
+            and workspace_repo is not None
+            and existing_handle is not None
+            and existing_handle.workspace_repo is None
+            and not await self._workspace_handoff_ready(
+                existing_handle, remaining_s=remaining_s
+            )
+        ):
+            raise ThreadBusyError(
+                f"thread {thread_key} has not reached a durable workspace handoff boundary"
+            )
+        if packs is not None and verified_review is None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None and existing_handle is None:
                 return _RouteResult(steered=False, canned_reply=reply)
@@ -2832,16 +3156,55 @@ class Kernel:
         handle = await self._claim_or_resume(
             thread_key,
             boot_env,
-            workspace_deployment_id=workspace_deployment_id,
+            workspace_deployment_id=(
+                workspace_deployment_id if workspace_repo is not None else None
+            ),
+            workspace_repo=workspace_repo,
+            replace_handle=(
+                existing_handle
+                if workspace_repo is not None and existing_handle is not None and (
+                    force_lineage_replacement or existing_handle.workspace_repo is None
+                )
+                else None
+            ),
+            lineage_branch=lineage_branch,
+            lineage_head=lineage_head,
+            lineage_base_sha=lineage_base_sha,
+            publication_visible_outcome_revision=(
+                publication_visible_outcome_revision or 0
+            ),
+            force_lineage_replacement=force_lineage_replacement,
+            pending_publication_approval=pending_publication_approval,
             agent_name=agent_name,
+            remaining_s=remaining_s,
         )
         retained_live_route = existing_handle is not None and handle == existing_handle
+        # #2659: announce a repository only when this message named it, the
+        # server selected that same repository, and the route snapshot taken
+        # under the lock did not already carry it (a fresh claim, a lost route,
+        # or the late handoff from a generic route). A sticky follow-up, a
+        # repeated URL on a route that already works there, and a verified
+        # review (whose repo_fact is None) all announce nothing. Decided right
+        # after the attach, before any steer or start_turn, and recorded into the
+        # delivery's holder (see _WorkspaceInferenceCarry).
+        inferred = (
+            workspace_repo
+            if _same_repo(repo_fact, workspace_repo)
+            and not _same_repo(
+                existing_handle.workspace_repo if existing_handle is not None else None,
+                workspace_repo,
+            )
+            else None
+        )
+        if inferred is not None:
+            workspace_inference.repo = inferred
         claim_ms = round((time.monotonic() - claim_started) * 1000)
         logger.info("claim latency for %s: %d ms", thread_key, claim_ms)
-        if source.is_job:
+        if source.is_job or verified_review is not None:
             # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
             # a webhook must never fold itself into whatever a person is currently
-            # saying, so this path does not attempt a steer at all.
+            # saying. A verified review likewise owns a separately reserved
+            # publication revision. Neither path attempts a steer.
             #
             # It also must not simply open a turn and block. The runner serializes
             # turns on a semaphore, so ``start_turn`` against a busy session waits
@@ -2856,8 +3219,10 @@ class Kernel:
             # what stops another turn on this thread from opening between the read
             # and the start.
             if await self._turn_active(handle, remaining_s=remaining_s):
+                deferred_kind = "review" if verified_review is not None else str(source)
                 raise ThreadBusyError(
-                    f"thread {thread_key} has a live session; deferring the {source} turn"
+                    f"thread {thread_key} has a live session; "
+                    f"deferring the {deferred_kind} turn"
                 )
         else:
             active_before_steer = False
@@ -2869,7 +3234,9 @@ class Kernel:
                     # (min(600, a 30-minute budget) is still 600). Routed
                     # separately; a committed test also doubles ``status`` with a
                     # base_url-only stub here.
-                    status = await self._runner.status(handle.base_url)
+                    status = await self._runner.status(
+                        handle.base_url, token=handle.token or None
+                    )
                 except Exception as exc:  # noqa: BLE001 -- steering still decides the route
                     logger.warning(
                         "could not read pre-steer turn liveness at %s: %r",
@@ -2900,15 +3267,62 @@ class Kernel:
             if retained_live_route and active_before_steer:
                 _record_route("finish-race")
                 _lifecycle_event("runner.finish_race", "finish-race")
+        if verified_review is not None:
+            reserver = getattr(
+                self._publication_creator, "reserve_review_feedback", None
+            )
+            if (
+                review_turn is None
+                or workspace_deployment_id is None
+                or verified_review.origin_key != review_turn.event_id
+                or reserver is None
+            ):
+                raise WorkspaceSelectionRefused(
+                    "GitHub feedback revision identity was refused."
+                )
+            try:
+                # This is deliberately independent of delivery `remaining_s`.
+                # The API freshly re-reads GitHub and CAS-reserves the lineage;
+                # bound the entire in-lock operation even for transports whose
+                # per-request timeout is ineffective.
+                async with asyncio.timeout(
+                    _REVIEW_RESERVE_CONTROL_PLANE_TIMEOUT_S
+                ):
+                    reservation_id = await reserver(
+                        review_turn, workspace_deployment_id, verified_review
+                    )
+            except (ApprovalBackendError, TimeoutError):
+                raise ReviewAuthorityUnavailable(
+                    "GitHub review reservation is temporarily unavailable"
+                ) from None
+            if not isinstance(reservation_id, uuid.UUID) or (
+                verified_review.reservation_id is not None
+                and reservation_id != verified_review.reservation_id
+            ):
+                raise WorkspaceSelectionRefused(
+                    "GitHub feedback revision identity was refused."
+                )
         # The per-request timeout is min(runner_total_timeout_s, remaining
         # delivery budget): the budget can only ever SHORTEN a request, never
         # grant one more time than the delivery has left (ADR-0131).
-        turn = await self._runner.start_turn(
-            handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
-        )
+        # Register before start_turn so a kill during the POST can find this
+        # thread. Canned and steered returns above never register. A failed
+        # start unregisters so a turn that never opened cannot leak an entry.
+        if agent_id is not None:
+            self._register_run(agent_id, thread_key)
+        try:
+            turn = await self._runner.start_turn(
+                handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
+            )
+        except BaseException:
+            self._unregister_run(agent_id, thread_key)
+            raise
         _record_route("start")
         _lifecycle_event("runner.turn.started", "start")
-        return _RouteResult(steered=False, handle=handle, turn=turn)
+        # The inference decided at the claim above is this route's own value.
+        return _RouteResult(
+            steered=False, handle=handle, turn=turn, workspace_inferred_repo=inferred
+        )
 
     async def _turn_active(
         self, handle: SandboxHandle, *, remaining_s: float | None = None
@@ -2939,7 +3353,11 @@ class Kernel:
             True when a turn is live, or when liveness could not be determined.
         """
         try:
-            status = await self._runner.status(handle.base_url, remaining_s=remaining_s)
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token or None,
+                remaining_s=remaining_s,
+            )
         except Exception as exc:  # noqa: BLE001 -- any unreadable answer means "assume busy"
             logger.warning("could not read turn liveness at %s: %r", handle.base_url, exc)
             return True
@@ -2949,13 +3367,99 @@ class Kernel:
             return True
         return active
 
+    async def _workspace_handoff_ready(
+        self,
+        handle: SandboxHandle,
+        *,
+        remaining_s: float | None = None,
+        lineage_reconciliation: bool = False,
+        pending_publication_approval: bool = False,
+    ) -> bool:
+        """Fail closed unless the old runner is idle with durable replay state."""
+
+        if not handle.token:
+            logger.warning(
+                "workspace handoff refused an unauthenticated legacy runner at %s",
+                handle.base_url,
+            )
+            return False
+        try:
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token,
+                remaining_s=remaining_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable is never safe to replace
+            logger.warning("could not read workspace handoff fence at %s: %r", handle.base_url, exc)
+            return False
+        return (
+            status.get("turn_active") is False
+            and status.get("history_durable") is True
+            and not pending_publication_approval
+            and (
+                status.get("status")
+                in {
+                    SessionStatus.DONE.value,
+                    SessionStatus.IDLE_AWAITING_INPUT.value,
+                }
+                or (
+                    lineage_reconciliation
+                    and status.get("status") == SessionStatus.AWAITING_APPROVAL.value
+                )
+            )
+        )
+
+    async def _workspace_candidate_ready(
+        self, handle: SandboxHandle, *, remaining_s: float | None = None
+    ) -> bool:
+        """Fail closed unless this exact candidate booted the managed checkout."""
+
+        if not handle.token:
+            logger.warning(
+                "workspace handoff refused an unauthenticated candidate runner at %s",
+                handle.base_url,
+            )
+            return False
+        try:
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token,
+                remaining_s=remaining_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable is never safe to expose
+            logger.warning(
+                "could not attest workspace handoff candidate at %s: %r",
+                handle.base_url,
+                exc,
+            )
+            return False
+        return (
+            status.get("session_id") == handle.session_id
+            and status.get("sandbox_id") == handle.sandbox_id
+            and status.get("managed_workspace") is True
+            and status.get("cwd") == "/workspace"
+            and status.get("ready") is True
+            and status.get("turn_active") is False
+            and status.get("history_durable") is True
+            and status.get("status") == SessionStatus.IDLE_AWAITING_INPUT.value
+        )
+
     async def _claim_or_resume(
         self,
         thread_key: str,
         boot_env: dict[str, str] | None,
         *,
         workspace_deployment_id: uuid.UUID | None = None,
+        workspace_repo: str | None = None,
+        replace_handle: SandboxHandle | None = None,
+        lineage_branch: str | None = None,
+        lineage_head: str | None = None,
+        lineage_base_sha: str | None = None,
+        publication_visible_outcome_revision: int = 0,
+        force_lineage_replacement: bool = False,
+        pending_publication_approval: bool = False,
         agent_name: str | None = None,
+        remaining_s: float | None = None,
     ) -> SandboxHandle:
         # A live route is an adopt/steer, not a session start. Preparing before
         # this check would clone on every threaded steer and could even replace
@@ -2965,18 +3469,113 @@ class Kernel:
         # lookup-then-claim gap, where the route could disappear and ``claim``
         # would create a sandbox without a freshly prepared workspace ref.
         if workspace_deployment_id is not None:
+            handoff_budget_started = time.monotonic()
+
+            def handoff_remaining() -> float | None:
+                if remaining_s is None:
+                    return None
+                return max(
+                    0.0,
+                    remaining_s - (time.monotonic() - handoff_budget_started),
+                )
+
             if self._workspace is None:
                 raise WorkspacePreparationError(
-                    "wiring", "workspace-enabled deployment has no trusted preparer"
+                    "wiring", "selected workspace has no trusted claim-time preparer"
                 )
-            existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
-            if existing is not None:
+            existing = None
+            if not force_lineage_replacement:
+                existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
+            if existing is not None and existing.workspace_repo == workspace_repo:
                 await asyncio.to_thread(
                     self._workspace.touch,
                     thread_key,
                     ttl_seconds=self._route_ttl_seconds,
                 )
                 return existing
+            handoff_revalidation: Callable[[], None] | None = None
+            candidate_validation: Callable[[SandboxHandle], None] | None = None
+            if replace_handle is not None:
+                loop = asyncio.get_running_loop()
+
+                def run_status_probe(
+                    probe_factory: Callable[
+                        [float | None], Coroutine[Any, Any, bool]
+                    ],
+                    *,
+                    failure: str,
+                ) -> bool:
+                    """Run one bounded runner probe from the coordinator thread."""
+
+                    probe_remaining_s = handoff_remaining()
+                    probe = asyncio.run_coroutine_threadsafe(
+                        probe_factory(probe_remaining_s), loop
+                    )
+                    request_ceiling = self._config.runner_total_timeout_s
+                    if probe_remaining_s is not None:
+                        request_ceiling = max(
+                            0.0, min(request_ceiling, probe_remaining_s)
+                        )
+                    try:
+                        return probe.result(
+                            timeout=(
+                                request_ceiling
+                                + _HANDOFF_REVALIDATION_BRIDGE_GRACE_S
+                            )
+                        )
+                    except Exception as exc:
+                        probe.cancel()
+                        raise ThreadBusyError(failure) from exc
+
+                def revalidate_before_handoff() -> None:
+                    """Bridge the coordinator thread back to the runner's loop.
+
+                    The coordinator invokes this after preparation and durable
+                    ownership staging, immediately before ``substrate.handoff``.
+                    Blocking here is safe: ``_claim_or_resume`` is awaiting the
+                    coordinator via ``to_thread``, so the owning event loop is
+                    free to service the authenticated status request.
+                    """
+
+                    ready = run_status_probe(
+                        lambda probe_remaining_s: self._workspace_handoff_ready(
+                            replace_handle,
+                            remaining_s=probe_remaining_s,
+                            lineage_reconciliation=force_lineage_replacement,
+                            pending_publication_approval=pending_publication_approval,
+                        ),
+                        failure=(
+                            f"thread {thread_key} workspace handoff fence "
+                            "could not be revalidated"
+                        ),
+                    )
+                    if not ready:
+                        raise ThreadBusyError(
+                            f"thread {thread_key} lost its durable workspace "
+                            "handoff boundary during preparation"
+                        )
+
+                handoff_revalidation = revalidate_before_handoff
+
+                def validate_candidate(candidate: SandboxHandle) -> None:
+                    """Attest the newly ready runner before the substrate route CAS."""
+
+                    ready = run_status_probe(
+                        lambda probe_remaining_s: self._workspace_candidate_ready(
+                            candidate, remaining_s=probe_remaining_s
+                        ),
+                        failure=(
+                            f"thread {thread_key} workspace handoff candidate "
+                            "could not be attested"
+                        ),
+                    )
+                    if not ready:
+                        raise ThreadBusyError(
+                            f"thread {thread_key} workspace handoff candidate "
+                            "did not attest the expected managed checkout"
+                        )
+
+                candidate_validation = validate_candidate
             # Prepare once, then let the substrate decide cold claim versus
             # suspended-route resume. Either branch materializes the same fresh,
             # verified archive before the runner can start.
@@ -2986,6 +3585,16 @@ class Kernel:
                 deployment_id=workspace_deployment_id,
                 env=boot_env,
                 agent_name=agent_name,
+                repo_full_name=workspace_repo,
+                replace_handle=replace_handle,
+                revalidate_before_handoff=handoff_revalidation,
+                validate_candidate=candidate_validation,
+                lineage_branch=lineage_branch,
+                lineage_head=lineage_head,
+                lineage_base_sha=lineage_base_sha,
+                publication_visible_outcome_revision=(
+                    publication_visible_outcome_revision
+                ),
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(
@@ -3186,13 +3795,13 @@ class Kernel:
         """
 
         # Both identities are live in this function and they are not
-        # interchangeable: ``thread`` is the BARE adapter conversation id, which
-        # the durable record persists and the resume turn carries back onto the
-        # wire; ``thread_key`` is the worker's scoped key, which names the
-        # sandbox this suspends and the card slot it remembers.
+        # interchangeable: ``thread`` is the BARE adapter conversation id used
+        # only for replies; ``thread_key`` is the canonical server identity that
+        # owns the workspace, publication lineage, sandbox, and card slot.
         thread = qevent.conversation_id
         thread_key = _thread_key_for(qevent)
         summary = outcome.approval_summary or outcome.text or "Approval requested"
+        display_summary = outcome.approval_display or summary
 
         # Resolve the manifest route NAME (#247) to its workspace channel. A named
         # route that resolves to no binding escalates instead of widening (#544).
@@ -3204,14 +3813,6 @@ class Kernel:
             outcome.approval_gate_kind,
             outcome.approval_granted_tool,
         )
-        if is_publication and route_name is not None:
-            await self._escalate(
-                qevent,
-                route,
-                "The platform publication request carried an unexpected approval route; "
-                "nothing was published and no approval was created.",
-            )
-            return
         # The card's destination is a (kind, address) PAIR, never an address on
         # its own: the schema permits the same address string under two kinds,
         # so an address-only comparison misreads an email turn whose address
@@ -3259,12 +3860,19 @@ class Kernel:
             return
 
         base = outcome.text.strip()
+        # #2659: the inferred repository is a reply block only. It is composed
+        # here, beside the text, and never into ``summary`` or ``outcome.text``,
+        # so the durable record, the card and the publication request stay free
+        # of it.
+        inference = _workspace_inference_notice(outcome.workspace_inferred_repo)
         if self._target_for(qevent).reply_ref is None:
             # A placeholderless approval must be addressable before persistence.
             # If this delivery fails, let the exception escape so the event stays
             # retryable instead of creating and suspending an approval whose
             # requester cannot see it.
-            ack = await self._reply_for(qevent, route, base or summary)
+            ack = await self._reply_for(
+                qevent, route, _join_reply_blocks(base or summary, inference)
+            )
             if ack.ref is None:
                 raise RuntimeError("approval reply ref was not minted")
 
@@ -3282,10 +3890,12 @@ class Kernel:
                         "publication requires a deployment-managed repository workspace"
                     )
                 summary = _publication_approval_summary(snapshot)
+                display_summary = summary
                 published = await publication_creator.create_publication(
                     PublicationCreateRequest(
                         deployment_id=deployment_id,
-                        conversation_id=thread,
+                        conversation_id=thread_key,
+                        reply_conversation_id=thread,
                         repo_full_name=snapshot.repo_full_name,
                         author=qevent.author,
                         summary=summary,
@@ -3302,6 +3912,8 @@ class Kernel:
                         title=snapshot.publication_title,
                         body=snapshot.publication_body,
                         max_patch_bytes=self._config.publication_patch_max_bytes,
+                        review_origin_key=outcome.review_origin_key,
+                        route=route_name,
                     )
                 )
                 created = CreatedApproval(
@@ -3348,6 +3960,16 @@ class Kernel:
                         granted_tool=outcome.approval_granted_tool,
                     )
                 )
+        except WorkspaceSelectionRefused as exc:
+            logger.info(
+                "publication refused for agent=%s deployment=%s thread=%s: %s",
+                agent_id,
+                deployment_id,
+                thread_key,
+                exc.public_detail,
+            )
+            await self._reply_for(qevent, route, exc.public_detail)
+            return
         except (ApprovalBackendError, ValidationError) as exc:
             # ValidationError: the shared model rejected the payload at
             # construction (#492) -- an unknown gate_kind, or an empty
@@ -3365,22 +3987,22 @@ class Kernel:
             return
 
         if self._workspace is not None:
-            async with self._lock.hold(self._config.lock_key(thread)):
+            async with self._lock.hold(self._config.lock_key(thread_key)):
                 retain_workspace = not is_publication
                 if is_publication:
                     try:
-                        await asyncio.to_thread(self._workspace.release, thread)
+                        await asyncio.to_thread(self._workspace.release, thread_key)
                     except Exception as exc:  # noqa: BLE001 - patch is already durable
                         retain_workspace = True
                         logger.warning(
                             "publication base-object cleanup failed for thread %s: %s",
-                            thread,
+                            thread_key,
                             exc,
                         )
                 if retain_workspace:
                     await asyncio.to_thread(
                         self._workspace.touch,
-                        thread,
+                        thread_key,
                         ttl_seconds=self._suspended_route_ttl_seconds,
                     )
         record_metric(
@@ -3440,7 +4062,10 @@ class Kernel:
         # resumed reply (#817), so collapse the interpolated summary to one
         # logical line -- the notice is always a single clean block. The durable
         # ``Approval`` record and the Block Kit card keep the original summary.
-        notice_summary = " ".join(summary.split())
+        # The inferred repository announcement (#2659) is its own block before
+        # the notice and never starts with the marker, so the notice stays the
+        # single marker-leading, trailing block the CLI expects.
+        notice_summary = " ".join(display_summary.split())
         if is_publication:
             notice = (
                 f"Awaiting approval ({created.id}): {notice_summary}\n"
@@ -3454,9 +4079,7 @@ class Kernel:
                 "The session is paused and will resume once an authorized member "
                 "resolves this request."
             )
-        await self._reply_for(
-            qevent, route, f"{base}\n\n{notice}" if base else notice
-        )
+        await self._reply_for(qevent, route, _join_reply_blocks(base, inference, notice))
 
         if is_publication:
             # The atomic Approval+Publication insert is also the durable initial
@@ -3465,7 +4088,7 @@ class Kernel:
             # never reclaimed through the model merely because Slack is down.
             logger.info(
                 "thread %s suspended awaiting publication approval %s; card queued",
-                thread,
+                thread_key,
                 created.id,
             )
             return
@@ -3508,11 +4131,11 @@ class Kernel:
         try:
             card_message = OutboundMessage(
                 version=MESSAGE_VERSION,
-                text=summary,
+                text=display_summary,
                 interaction=ConfirmIntent(
                     kind="confirm",
                     id=created.id,
-                    prompt=summary,
+                    prompt=display_summary,
                     confirm=Action(label="Approve", value=created.id),
                     cancel=Action(label="Reject", value=created.id),
                     # An approval decision may carry a reason (#1053). This says
@@ -3582,7 +4205,7 @@ class Kernel:
                         str(created.id),
                         channel=card_channel,
                         ts=card_ts,
-                        summary=summary,
+                        summary=display_summary,
                         endpoint=card_endpoint,
                         # The whole destination, not just the endpoint: the
                         # settle path posts to THIS card, so it must re-use the
@@ -3639,8 +4262,10 @@ class Kernel:
         turn: TurnStream,
         nav: NavAffordance | None = None,
         agent_id: uuid.UUID | None = None,
+        *,
+        workspace_inferred_repo: str | None,
     ) -> TurnOutcome:
-        acc = _StreamAccumulator()
+        acc = _StreamAccumulator(workspace_inferred_repo=workspace_inferred_repo)
         reply = _ThrottledReply(
             self._sink,
             target=self._target_for(qevent),
@@ -3767,6 +4392,7 @@ class Kernel:
             acc.approval_route = frame.approval_route
             acc.approval_gate_kind = frame.approval_gate_kind
             acc.approval_granted_tool = frame.approval_granted_tool
+            acc.approval_display = frame.approval_display
 
     async def _record_action(
         self,
@@ -3833,6 +4459,7 @@ class Kernel:
                 approval_route=acc.approval_route,
                 approval_gate_kind=acc.approval_gate_kind,
                 approval_granted_tool=acc.approval_granted_tool,
+                approval_display=acc.approval_display,
             )
         # classified-failure, or the stream ended with no final at all.
         return TurnOutcome(

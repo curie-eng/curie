@@ -5,12 +5,14 @@ trigger types, and this module is the runner half of both:
 
 - **Policy gate** (#244): the agent's own logic decides something needs a
   human decision. An in-process SDK MCP tool
-  (``mcp__curie__request_approval``) is carried when the live MCP surface has
-  a potentially mutating tool or an explicit approval gate. A fully observed
+  (``mcp__curie__request_approval``) is carried when a route is
+  ``grantableViaPolicy``, or when the live MCP surface has a potentially
+  mutating tool and no permission gate already pages. A fully observed
   surface whose tools all declare ``readOnlyHint=true`` omits it, so a model
-  cannot page a human for an action the session cannot perform. The call
-  executes no real-world action; it only marks the turn, and the session emits
-  its terminal ``final`` with ``status=awaiting-approval``.
+  cannot page a human for an action the session cannot perform. Mounting it
+  beside a permission gate produces a second card for one gated action
+  (#2657). The call executes no real-world action; it only marks the turn,
+  and the session emits its terminal ``final`` with ``status=awaiting-approval``.
 - **Permission gate** (#245): configuration marks a tool as
   approval-required, and the runner intercepts the model-initiated call
   proactively through the SDK ``can_use_tool`` callback -- the replacement
@@ -34,7 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -49,12 +51,23 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 from plugin_format import (
+    TOOL_POLICY_ENFORCEMENT,
     ApprovalPolicy,
     PluginManifest,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyInvalid,
+    ToolPolicyUnenforceable,
+    classify_tool,
     connector_server_names,
+    connector_tool_prefix,
     declared_mcp_server_names,
     effective_operator_gates,
+    effective_tool_prefix,
     grantable_routes,
+    load_tool_policy,
+    parse_allowed_tools,
+    render_gate_summary,
     resolve_manifest,
 )
 
@@ -217,10 +230,23 @@ _PUBLISH_TOOL = "publish_changes"
 PUBLISH_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_PUBLISH_TOOL}"
 
 _PUBLISH_DESCRIPTION = (
-    "Request publication of the current repository changes. The platform will"
-    " capture the patch, ask for human approval in the requesting thread, and"
-    " publish it from a separate trusted job only after approval. This tool"
-    " never publishes changes itself."
+    "When a managed repository is mounted, work only in /workspace and preserve"
+    " existing changes. Do not push with git. Before requesting publication,"
+    " identify the repository's own documented test or check command for the"
+    " area you changed, run it from /workspace, and report the exact command,"
+    " its exit status, and a concise result in the session thread. If you"
+    " cannot identify or run an appropriate command, report that and do not"
+    " publish. If the command fails, report the failure and do not publish. If"
+    " verification generates artifacts, do not publish unrequested artifacts:"
+    " use the repository's documented cleanup procedure when one exists and"
+    " remove only artifacts this verification created, never requested or"
+    " unrelated work; otherwise report the generated artifacts in the session"
+    " thread and do not publish. When the changes are ready, use"
+    " this tool to request human approval for publication. The platform will"
+    " capture the patch, ask for approval in the requesting thread, and publish"
+    " it from a separate trusted job only after approval. This tool never"
+    " publishes changes itself. After calling it, end your turn and tell the"
+    " user the publication request is pending."
 )
 _PUBLISH_SCHEMA = {
     "type": "object",
@@ -301,6 +327,43 @@ def _distinct_routes(gate: ApprovalGate | None) -> list[str]:
     return sorted({r for r in gate.route_by_tool.values() if r})
 
 
+def has_permission_pager(gate: ApprovalGate | None) -> bool:
+    """Whether ``gate`` already pauses a tool call for a human.
+
+    True when an approvalPolicy / operator gate names a tool other than
+    publication, or when ``toolPolicy.approvalRequired`` is non-empty.
+    Publication has its own dedicated tool and must not keep the generic
+    pager (#1444).
+    """
+
+    if gate is None:
+        return False
+    if gate.required - {PUBLISH_TOOL_NAME}:
+        return True
+    policy = gate.tool_policy
+    return policy is not None and bool(policy.approvalRequired)
+
+
+def include_generic_policy_pager(
+    gate: ApprovalGate | None,
+    *,
+    has_potential_write_tool: bool,
+) -> bool:
+    """Whether to mount ``mcp__curie__request_approval``.
+
+    A permission gate is already a pager. Mounting the generic policy tool
+    beside it produces a grantless policy card and then a second PreToolUse
+    card for the same action (#2657), unless the operator opted a route into
+    ``grantableViaPolicy`` (#558).
+    """
+
+    if gate is not None and gate.grantable_by_route:
+        return True
+    if has_permission_pager(gate):
+        return False
+    return has_potential_write_tool
+
+
 def build_approval_server(
     gate: ApprovalGate | None = None,
     *,
@@ -333,19 +396,27 @@ def build_approval_server(
         return process_approval_request(gate, args)
 
     tools = [request_approval] if include_request_approval else []
-    if managed_workspace:
 
-        @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
-        async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
-            # Defence in depth: the permission callback must deny the call before
-            # execution. If a harness bypasses that callback, the in-process tool
-            # still performs no action and grants no capability.
+    @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
+    async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
+        # Discovery is unconditional so every session carries the publication
+        # protocol. Authority is still mount-keyed in ``build_approval_gate``:
+        # an unmounted session cannot create a publication approval, and a
+        # direct invocation fails without mutating gate state.
+        if not managed_workspace:
             return _approval_error(
-                "Publication is performed only by the platform after human approval; "
-                "this sandbox tool cannot execute it directly."
+                "No managed repository workspace is mounted at /workspace; "
+                "publication cannot be requested from this session."
             )
+        # Defence in depth: the permission callback must deny the call before
+        # execution. If a harness bypasses that callback, the in-process tool
+        # still performs no action and grants no capability.
+        return _approval_error(
+            "Publication is performed only by the platform after human approval; "
+            "this sandbox tool cannot execute it directly."
+        )
 
-        tools.append(publish_changes)
+    tools.append(publish_changes)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,
@@ -493,8 +564,9 @@ def summarize_tool_call(tool_name: str, tool_input: dict[str, Any]) -> str:
     """A one-line, human-readable statement of the blocked call.
 
     This becomes the ``approval_summary`` on the awaiting-approval final and
-    therefore the durable record's summary a human resolves against, so it
-    names the tool and a compact rendering of its input.
+    therefore the durable record's summary an auditor reads. A bundle-authored
+    ``summary`` template (#2565) may replace what a person sees on the card;
+    this machine string stays on the record either way.
     """
 
     try:
@@ -549,7 +621,9 @@ class ApprovalGate:
     required: frozenset[str] = field(default_factory=frozenset)
     route_by_tool: dict[str, str] = field(default_factory=dict)
     pending_summary: str | None = None
+    pending_display: str | None = None
     pending_route: str | None = None
+    summary_by_tool: dict[str, str] = field(default_factory=dict)
     # Durable provenance (#544, Decision C), set by ``block()`` on a permission
     # gate: ``pending_gate_kind='permission'`` and ``pending_granted_tool`` is
     # the exact tool ``can_use_tool`` denied -- the trusted, runner-held value
@@ -577,6 +651,12 @@ class ApprovalGate:
     # ``SessionRunner`` knows the runner itself requested that stop. It is
     # runner-internal and is NEVER serialized onto the wire.
     pending_halt: bool = False
+    # A declared tool policy plus the bundle identity needed to translate live
+    # SDK MCP names back to the canonical "<server>/<tool>" policy surface.
+    tool_policy: ToolPolicy | None = None
+    bundle_name: str | None = None
+    mcp_servers: set[str] | None = None
+    connector_servers: set[str] | None = None
     _boot_turn_seen: bool = False
 
     def grantable_tool_for_route(self, route: str | None) -> str | None:
@@ -593,6 +673,7 @@ class ApprovalGate:
 
     def reset(self) -> None:
         self.pending_summary = None
+        self.pending_display = None
         self.pending_route = None
         self.pending_gate_kind = None
         self.pending_granted_tool = None
@@ -656,6 +737,10 @@ class ApprovalGate:
             self.publication_title = title.strip()
             self.publication_body = body
         self.pending_summary = summarize_tool_call(tool_name, tool_input)
+        template = self.summary_by_tool.get(tool_name)
+        self.pending_display = (
+            render_gate_summary(template, tool_input) if template else None
+        )
         self.pending_route = self.route_by_tool.get(tool_name)
         # Provenance for the permission gate (#544, Decision C): the tool
         # name here is the value ``can_use_tool`` itself denied -- the
@@ -719,6 +804,80 @@ class _GateDecision(NamedTuple):
 
     blocked: bool
     ungated: bool
+    refusal: str | None = None
+
+
+def is_mcp_tool(live_tool_name: str) -> bool:
+    """Return whether a live SDK name belongs to an MCP server."""
+
+    return live_tool_name.startswith("mcp__")
+
+
+def canonical_tool_name(
+    live_tool_name: str,
+    *,
+    bundle_name: str | None,
+    mcp_servers: set[str] | None,
+    connector_servers: set[str] | None,
+) -> str | None:
+    """Map a live SDK MCP name to the canonical policy name, if declared."""
+
+    if not is_mcp_tool(live_tool_name):
+        return None
+    for server in sorted(connector_servers or (), key=lambda name: (-len(name), name)):
+        prefix = connector_tool_prefix(server)
+        if live_tool_name.startswith(prefix):
+            tool = live_tool_name[len(prefix) :]
+            return f"{server}/{tool}" if tool else None
+    if bundle_name:
+        for server in sorted(mcp_servers or (), key=lambda name: (-len(name), name)):
+            prefix = effective_tool_prefix(bundle_name, server)
+            if live_tool_name.startswith(prefix):
+                tool = live_tool_name[len(prefix) :]
+                return f"{server}/{tool}" if tool else None
+    return None
+
+
+def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecision | None:
+    """Classify one live tool, preserving built-ins outside MCP policy."""
+
+    if gate.tool_policy is None or not is_mcp_tool(tool_name):
+        return None
+    # These exact tools belong to the platform-owned approval server, not to
+    # the bundle or one of its connectors.  Leave them to their existing
+    # permission/in-process gates; every other MCP name remains fail-closed.
+    if tool_name == APPROVAL_TOOL_NAME or tool_name == PUBLISH_TOOL_NAME:
+        return None
+    canonical = canonical_tool_name(
+        tool_name,
+        bundle_name=gate.bundle_name,
+        mcp_servers=gate.mcp_servers,
+        connector_servers=gate.connector_servers,
+    )
+    if canonical is None:
+        return ToolPolicyDecision.DENY
+    return classify_tool(gate.tool_policy, canonical)
+
+
+def policy_disallowed_tools(
+    gate: ApprovalGate, observed_tools: Iterable[str]
+) -> tuple[str, ...]:
+    """Project observed policy refusals into exact SDK-visible tool names.
+
+    Catalog visibility is not authorization. This projection therefore uses
+    only the side-effect-free policy classification and never consumes a grant
+    or records a pending approval on ``gate``.
+    """
+
+    return tuple(
+        sorted(
+            {
+                tool_name
+                for tool_name in observed_tools
+                if _tool_policy_outcome(gate, tool_name) is ToolPolicyDecision.DENY
+            }
+        )
+    )
 
 
 def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any]) -> _GateDecision:
@@ -733,6 +892,24 @@ def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any])
     flag) -- this function decides, it does not render.
     """
 
+    outcome = _tool_policy_outcome(gate, tool_name)
+    if outcome is ToolPolicyDecision.DENY:
+        return _GateDecision(
+            blocked=False,
+            ungated=False,
+            refusal=(
+                f"{tool_name} is denied by this agent's tool policy. This is not an "
+                "approval you can request -- the policy forbids the call. Do not retry "
+                "it; say what you were trying to do and stop."
+            ),
+        )
+    # Policy gates are additive to legacy/operator gates. A policy allow never
+    # removes a legacy gate, while approvalRequired joins the same one-shot path.
+    if outcome is ToolPolicyDecision.APPROVAL_REQUIRED and tool_name not in gate.required:
+        if gate.consume_grant(tool_name):
+            return _GateDecision(blocked=False, ungated=False)
+        gate.block(tool_name, tool_input)
+        return _GateDecision(blocked=True, ungated=False)
     if tool_name not in gate.required:
         return _GateDecision(blocked=False, ungated=True)
     # Publication is completed outside the sandbox after approval, so an
@@ -781,6 +958,8 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
                 message=f"Publication request was not recorded: {exc}. Correct it and retry.",
                 interrupt=True,
             )
+        if decision.refusal is not None:
+            return PermissionResultDeny(message=decision.refusal, interrupt=True)
         if decision.blocked:
             # ``interrupt`` is the SDK-native "deny AND stop the turn" flag
             # (``PermissionResultDeny.interrupt``, claude_agent_sdk/types.py:247-252),
@@ -895,7 +1074,9 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
             # gate would become a fail-open. Abstaining leaves ``can_use_tool``
             # as the backstop, which is strictly the pre-#1852 posture.
             return {}
-        if tool_name not in gate.required:
+        # A policy-bearing bundle must classify every MCP call in this hook;
+        # unlike can_use_tool, PreToolUse cannot be shadowed by another allow.
+        if gate.tool_policy is None and tool_name not in gate.required:
             return {}
 
         raw_input = _hook_field(hook_input, "tool_input")
@@ -917,6 +1098,18 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
                 "continue_": False,
                 "stopReason": reason,
             }
+        if decision.refusal is not None:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": decision.refusal,
+                },
+                "continue_": False,
+                "stopReason": decision.refusal,
+            }
+        if decision.ungated:
+            return {}
         if not decision.blocked:
             # Observability for #1852 (accepted, not fixed): the grant is spent
             # HERE, before the concurrently-dispatched bundle PreToolUse hook's
@@ -1004,6 +1197,8 @@ class ApprovalPolicyResolution:
     bundle_name: str | None = None
     mcp_servers: set[str] | None = None
     connector_servers: set[str] | None = None
+    tool_policy: ToolPolicy | None = None
+    summary_by_tool: dict[str, str] = field(default_factory=dict)
 
 
 def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
@@ -1062,6 +1257,19 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
     bundle_name = name if isinstance(name, str) else None
     mcp_servers = declared_mcp_server_names(root)
     connectors = connector_server_names(root)
+    tool_policy: ToolPolicy | None = None
+    if isinstance(raw, dict) and raw.get("toolPolicy") is not None:
+        try:
+            manifest_for_policy = PluginManifest.model_validate(raw)
+            tool_policy = load_tool_policy(
+                manifest_for_policy, enforces=TOOL_POLICY_ENFORCEMENT
+            )
+        except (ValueError, TypeError, ToolPolicyUnenforceable, ToolPolicyInvalid) as exc:
+            raise ApprovalPolicyError(
+                f"the bundle at {root} declares a toolPolicy this build cannot apply"
+                f" as written; refusing to boot with its tool surface unclassified"
+                f" ({exc})"
+            ) from exc
     if not isinstance(raw, dict) or raw.get("approvalPolicy") is None:
         return ApprovalPolicyResolution(
             {},
@@ -1069,6 +1277,7 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
             bundle_name=bundle_name,
             mcp_servers=mcp_servers,
             connector_servers=connectors,
+            tool_policy=tool_policy,
         )
     # An approvalPolicy IS declared. From here every failure is fail-closed:
     # the intent is established and a parse error cannot revoke it.
@@ -1085,6 +1294,18 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
         for gate in policy.gates
         if gate.gate and gate.gate.strip() and gate.route and gate.route.strip()
     }
+    # Last complete declaration wins, including a later gate that OMITS
+    # summary: an earlier template must not leak onto a no-template winner
+    # (the same last-wins rule ``routes`` uses).
+    summaries: dict[str, str] = {}
+    for gate in policy.gates:
+        if not (gate.gate and gate.gate.strip() and gate.route and gate.route.strip()):
+            continue
+        tool = gate.gate.strip()
+        if gate.summary and gate.summary.strip():
+            summaries[tool] = gate.summary.strip()
+        else:
+            summaries.pop(tool, None)
     # Compare DISTINCT declared names against armed names, not counts: two
     # entries for one tool are a last-wins duplicate that validate_bundle
     # accepts, and rejecting them here would crash-loop a deploy-valid bundle.
@@ -1106,6 +1327,8 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
         bundle_name=bundle_name,
         mcp_servers=mcp_servers,
         connector_servers=connectors,
+        tool_policy=tool_policy,
+        summary_by_tool=summaries,
     )
 
 
@@ -1127,10 +1350,12 @@ def build_approval_gate(
     policy_routes: dict[str, str],
     grant_tool: str | None = None,
     grantable_by_route: dict[str, str] | None = None,
+    summary_by_tool: dict[str, str] | None = None,
     bundle_name: str | None = None,
     mcp_servers: set[str] | None = None,
     connector_servers: set[str] | None = None,
     managed_workspace: bool = False,
+    tool_policy: ToolPolicy | None = None,
 ) -> ApprovalGate | None:
     """Merge the operator's gated tools with the bundle's declared gates.
 
@@ -1228,14 +1453,10 @@ def build_approval_gate(
         normalized.extend(effective)
 
     operator = frozenset(name for name in normalized if name != PUBLISH_TOOL_NAME)
-    # The publication gate is platform-owned and requester-thread scoped. A
-    # bundle may mention the name, but it cannot attach its own audience route
-    # or cause publication to exist without a mounted managed workspace.
-    policy_routes = {
-        tool_name: route
-        for tool_name, route in policy_routes.items()
-        if tool_name != PUBLISH_TOOL_NAME
-    }
+    # PUBLISH_TOOL_NAME stays out of the operator-tools set so the platform
+    # adds the gate via managed_workspace, not as an operator list entry. A
+    # bundle may attach an audience route through policy_routes. The requester
+    # thread owns the card; publication still cannot consume a grant.
     redefined = sorted(operator & set(policy_routes))
     if redefined:
         logger.warning(
@@ -1245,12 +1466,12 @@ def build_approval_gate(
             redefined,
         )
     # Publication is a mandatory platform gate only for a managed checkout. It
-    # is additive to both operator and bundle policy, has no audience route of
-    # its own (the request thread owns the card), and cannot consume a grant.
+    # is additive to both operator and bundle policy. The requester thread
+    # still owns the card. Publication cannot consume a grant.
     gated_tools = operator | frozenset(policy_routes)
     if managed_workspace:
         gated_tools |= frozenset({PUBLISH_TOOL_NAME})
-    if not gated_tools:
+    if not gated_tools and tool_policy is None:
         return None
     safe_grant_tool = None if grant_tool == PUBLISH_TOOL_NAME else grant_tool
     return ApprovalGate(
@@ -1258,6 +1479,11 @@ def build_approval_gate(
         route_by_tool=policy_routes,
         grant_tool=safe_grant_tool,
         grantable_by_route=grantable_by_route or {},
+        summary_by_tool=summary_by_tool or {},
+        tool_policy=tool_policy,
+        bundle_name=bundle_name,
+        mcp_servers=mcp_servers,
+        connector_servers=connector_servers,
     )
 
 
@@ -1343,19 +1569,27 @@ def _entry_tool(entry: str) -> str | None:
 
 
 def _skill_allowed_tools(root: Path) -> list[tuple[str, list[str]]]:
-    """Read every skill's ``allowed-tools`` list from a bundle directory.
+    """Read every skill's ``allowed-tools`` declaration from a bundle directory.
 
     Deliberately tolerant: a skill whose frontmatter is missing, unterminated,
     unparseable, or not a mapping contributes nothing. ``validate_bundle`` already
     reports those, and failing the gate check on a malformed skill would report
     the wrong defect and hide the real one.
 
+    Normalization (list or comma/space-delimited string) goes through
+    ``plugin_format.parse_allowed_tools``, the single shared boundary for this
+    field. #1852's commit noted that with one implementation there was no
+    second path to disagree with, so a shared-helper extraction did not yet
+    apply -- the dual-profile validator now reads this same field too, so a
+    second call site exists and the shared helper is the required form to keep
+    both readings in agreement.
+
     Args:
         root: The bundle root directory.
 
     Returns:
-        ``(skill_path_relative_to_root, entries)`` per skill that declares a list,
-        sorted by path so output is deterministic.
+        ``(skill_path_relative_to_root, entries)`` per skill that declares
+        allowed-tools, sorted by path so output is deterministic.
     """
 
     skills_dir = root / "skills"
@@ -1378,15 +1612,10 @@ def _skill_allowed_tools(root: Path) -> list[tuple[str, list[str]]]:
             continue
         if not isinstance(loaded, dict):
             continue
-        entries = loaded.get("allowed-tools")
-        if not isinstance(entries, list):
+        entries = parse_allowed_tools(loaded.get("allowed-tools"))
+        if not entries:
             continue
-        found.append(
-            (
-                str(skill_file.relative_to(root)),
-                [entry for entry in entries if isinstance(entry, str)],
-            )
-        )
+        found.append((str(skill_file.relative_to(root)), entries))
     return found
 
 

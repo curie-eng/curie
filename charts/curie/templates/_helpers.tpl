@@ -1728,6 +1728,35 @@ securityContext:
      This does NOT replace the worker's boot validator, which remains the
      backstop for the non-Helm substrates (Compose, bare env). It only moves the
      Helm-shaped failure from pod boot to render time, where it is actionable. */}}
+{{/* Drop extraEnv entries whose names collide with first-class worker timeout
+     and delivery-budget env. A v0.8.4 retained worker.extraEnv override of
+     CURIE_RUNNER_TOTAL_TIMEOUT_S used to render a second copy next to the
+     first-class key; Kubernetes then rejected the Deployment patch after Helm
+     had begun applying other resources (#2097, 2026-09-04 soak). First-class
+     values win. Non-colliding extraEnv entries still render. */}}
+{{- define "curie.worker.extraEnv" -}}
+{{- $reserved := dict
+  "CURIE_CLAIM_TIMEOUT_SECONDS" true
+  "CURIE_ROUTE_TTL_SECONDS" true
+  "CURIE_SUSPENDED_ROUTE_TTL_SECONDS" true
+  "CURIE_DELIVERY_BUDGET_S" true
+  "CURIE_RUNNER_TOTAL_TIMEOUT_S" true
+  "CURIE_DELIVERY_LEASE_TTL_S" true
+  "CURIE_DELIVERY_LEASE_HEARTBEAT_S" true
+  "CURIE_DELIVERY_SHUTDOWN_RESERVE_S" true
+  "CURIE_TERMINATION_GRACE_PERIOD_S" true
+-}}
+{{- $kept := list -}}
+{{- range .Values.worker.extraEnv }}
+{{- if and .name (not (hasKey $reserved .name)) -}}
+{{- $kept = append $kept . -}}
+{{- end -}}
+{{- end -}}
+{{- if $kept -}}
+{{- toYaml $kept -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.worker.validateDrainBudget" -}}
 {{- $grace := int64 .Values.worker.terminationGracePeriodSeconds -}}
 {{- $budget := int64 .Values.worker.deliveryBudgetSeconds -}}
@@ -2052,4 +2081,19 @@ carve-outs for ANY CIDR that contains a metadata address -- not just an exact /0
     {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- end }}
+{{- end -}}
+
+{{/* ---- Claim-env no-op notice for the sandbox init containers (#2612) ----
+     Every staging init container below takes a silent no-op path when its own
+     env is empty, which is correct for a warm or unbound pod and WRONG-looking
+     for a hand-written SandboxClaim: a `spec.env` entry with no `containerName`
+     is injected into the runner container only, so the init container keeps the
+     template's baked empty default, logs "nothing to do", and exits 0. Every
+     container reported success and the runner then crash-looped on an unrelated
+     [manifest.missing]. The no-op stays a no-op -- the pod must still boot warm
+     -- but it now names the one mistake that produces it, in the log of the
+     container that took it.
+     Args: dict "key" <env var name> "container" <this init container's name>. */}}
+{{- define "curie.sandbox.claimEnvNoOpNotice" -}}
+no {{ .key }} in this container's env: nothing to stage. This is expected for a warm or unbound pod. If you set {{ .key }} on a SandboxClaim and expected staging, note that a spec.env entry with no containerName reaches the RUNNER container only -- repeat it with containerName: {{ .container }}.
 {{- end -}}

@@ -70,13 +70,14 @@ does not change. The runner's conformance suite
 format. `packages/plugin-format` is the Claude Code plugin shape verbatim (a
 deliberate distribution wedge), so a non-Claude harness must interpret Claude
 Code plugin bundles or translate them into its own configuration; "implement
-the ACI server" understates that work. Resume, by contrast, is harness-agnostic:
-the boot path passes `resume=None`, and `CURIE_HISTORY_REF` is a durable
-state-store URL for the thread's transcript that the runner loads and replays as a
-boot-time system-prompt preamble
-(`runner/src/curie_runner/history.py::format_conversation_preamble`), not an
-SDK-native resume identifier (ADR-0029). A second harness rehydrates the same way
-by reusing that state-store contract.
+the ACI server" understates that work. Resume's durable contract, by contrast,
+is harness-agnostic: `CURIE_HISTORY_REF` is a durable state-store URL whose
+ordered role/content records the runner reconstructs through a declared harness
+capability (`runner/src/curie_runner/history.py::build_conversation_replay`). The
+Claude adapter prefers its optional opaque native checkpoint for cache fidelity
+and otherwise rebuilds an ephemeral SDK resume envelope from those messages;
+another harness must implement equivalent structured replay or fail visibly
+rather than render history into system instructions (ADR-0119).
 
 ### 2. Observability / OTel store (Langfuse today)
 

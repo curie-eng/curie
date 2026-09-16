@@ -14,9 +14,11 @@ import importlib.util
 import inspect
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -31,6 +33,7 @@ def load_module():
     spec = importlib.util.spec_from_file_location("release_authorize", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules["release_authorize"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -799,6 +802,19 @@ class TestMain:
         monkeypatch.setattr(authorize_module, "REQUIRED_CHECK_NAMES", TEST_REQUIRED_NAMES)
 
     @staticmethod
+    def _stub_green_nightly(monkeypatch) -> None:
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_latest_nightly_conclusion",
+            lambda repo, branch: "success",
+        )
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_associated_pr_bodies",
+            lambda sha, repo: [],
+        )
+
+    @staticmethod
     def _runs_with_gate_own_in_progress() -> list[dict]:
         return [
             GATE_OWN_IN_PROGRESS,
@@ -812,6 +828,7 @@ class TestMain:
         sha = run_git(git_repo, "rev-parse", "HEAD")
         self._use_test_required_names(monkeypatch)
         self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        self._stub_green_nightly(monkeypatch)
         monkeypatch.chdir(git_repo)
         monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
 
@@ -838,6 +855,7 @@ class TestMain:
         sha = run_git(git_repo, "rev-parse", "HEAD")
         self._use_test_required_names(monkeypatch)
         self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        self._stub_green_nightly(monkeypatch)
         monkeypatch.chdir(git_repo)
         monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
 
@@ -851,6 +869,57 @@ class TestMain:
                 "--tag",
                 "v0.7.0",
             ]
+        )
+
+        assert exit_code == 0
+
+    def test_main_refuses_a_red_nightly_without_a_pr_body_override(
+        self, git_repo, monkeypatch, capsys
+    ):
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        self._use_test_required_names(monkeypatch)
+        self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_latest_nightly_conclusion",
+            lambda repo, branch: "failure",
+        )
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_associated_pr_bodies",
+            lambda sha, repo: ["cut the release"],
+        )
+        monkeypatch.chdir(git_repo)
+        monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
+
+        exit_code = authorize_module.main(
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
+        )
+
+        assert exit_code == 1
+        assert "nightly" in capsys.readouterr().err.lower()
+
+    def test_main_authorizes_a_red_nightly_when_the_pr_body_records_the_override(
+        self, git_repo, monkeypatch
+    ):
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        self._use_test_required_names(monkeypatch)
+        self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_latest_nightly_conclusion",
+            lambda repo, branch: "failure",
+        )
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_associated_pr_bodies",
+            lambda sha, repo: ["--allow-red-nightly"],
+        )
+        monkeypatch.chdir(git_repo)
+        monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
+
+        exit_code = authorize_module.main(
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
         )
 
         assert exit_code == 0
@@ -918,6 +987,16 @@ class TestMain:
         git_repo, commits = reviewed_refs_repo
         self._use_test_required_names(monkeypatch)
         self._stub_fetch_check_runs(monkeypatch, self._runs_with_gate_own_in_progress())
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_latest_nightly_conclusion",
+            lambda repo, branch: "success",
+        )
+        monkeypatch.setattr(
+            authorize_module._nightly,
+            "fetch_associated_pr_bodies",
+            lambda sha, repo: [],
+        )
         monkeypatch.chdir(git_repo)
         monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
 
@@ -1078,6 +1157,61 @@ def ci_job_check_run_names() -> set[str]:
 
 def helm_ci_job_check_run_names() -> set[str]:
     return workflow_job_check_run_names(HELM_CI_YAML)
+
+
+def ci_connector_image_check_run_names() -> set[str]:
+    """The `(no push)` check-run names of ci.yaml's *connector* image rows (#1951).
+
+    Derived from `ci.yaml`, never from `REQUIRED_CHECK_NAMES`, for the same
+    reason `workflow_job_check_run_names` is: a set built from the constant can
+    only ever agree with itself, and the drift this guards is precisely a row
+    that exists in the workflow and nowhere in the constant.
+
+    A connector row is identified by its `dockerfile` path resolving under
+    `examples/`, not by its `context`. `dockerfile` is the discriminator
+    because it is not optional the way `context` is: the `images` job's build
+    step (`file: ${{ matrix.dockerfile }}`) has nothing to build without it, so
+    every row -- including `mail-adapter`, which has no `context` -- carries
+    one. A helper keyed on `context` would silently skip a connector row that
+    used an equivalent context-less form, exactly the drift this guard exists
+    to catch; keying on `dockerfile` closes that hole because there is no
+    context-less-but-valid way to omit it. The path is normalized
+    (`posixpath.normpath`, since workflow paths are always POSIX regardless of
+    the runner OS) before the prefix check so a form like `./examples/...`
+    still matches.
+
+    `mail-adapter` stays excluded under this rule too: its dockerfile is
+    `apps/mail-adapter/Dockerfile`, not under `examples/`, so the same row that
+    used to be excluded by missing `context` is now excluded on the merits --
+    it is a platform image, not a bundle connector.
+
+    A row with no `dockerfile` at all is not silently skipped: `dockerfile` is
+    the one field every row must have for the build step to do anything, so
+    its absence is a workflow defect in its own right, not an unrelated bug to
+    tolerate. Raising here surfaces that defect immediately instead of letting
+    this helper go quiet on a row that builds nothing.
+
+    The concrete name is produced by substituting the row into the job's own
+    `name:` template, so renaming the template moves both this set and the
+    constant's expected values together instead of silently emptying the guard.
+    """
+
+    doc = yaml.safe_load(CI_YAML.read_text())
+    job = doc["jobs"]["images"]
+    template = job["name"]
+    rows = ((job.get("strategy") or {}).get("matrix") or {}).get("include") or []
+    names: set[str] = set()
+    for row in rows:
+        dockerfile = row.get("dockerfile")
+        if not isinstance(dockerfile, str) or not dockerfile:
+            raise AssertionError(
+                f"ci.yaml images row {row!r} has no dockerfile -- the build "
+                "step has nothing to build for this row"
+            )
+        if not posixpath.normpath(dockerfile).startswith("examples/"):
+            continue
+        names.add(_MATRIX_REF.sub(lambda m, row=row: str(row[m.group(1)]), template))
+    return names
 
 
 class TestRustValkeyWorkflowContract:
@@ -1344,6 +1478,16 @@ class TestRequiredNamesMatchCiWorkflows:
     So renaming or splitting a required job in a CI workflow without updating
     `REQUIRED_CHECK_NAMES` fails here (with the drifted names listed), rather
     than silently dropping a release gate.
+
+    That subset relation is one-directional, and the second test closes the
+    other direction for the connector images (#1951). Subset means ADDING a job
+    to `ci.yaml` and never requiring it here keeps this class green forever --
+    which is how three of the four `examples/` connector image builds came to
+    be unrequired while `sre-bot-tempo` alone was named. An unrequired connector
+    build that goes red on `next` still authorizes the tag, then fails its
+    `release.yaml` `build` leg, and `merge` (`needs.build.result == 'success'`)
+    skips the multi-arch manifest for EVERY image while the CLI binaries and
+    the GitHub Release publish anyway.
     """
 
     def test_every_required_name_is_a_real_ci_workflow_check_run_name(self):
@@ -1353,6 +1497,30 @@ class TestRequiredNamesMatchCiWorkflows:
         assert authorize_module.REQUIRED_CHECK_NAMES <= ci_names, (
             "REQUIRED_CHECK_NAMES has drifted from the CI workflows -- these required "
             f"names match no current job check-run: {sorted(stale)}"
+        )
+
+    def test_every_connector_image_build_is_a_required_check(self):
+        connector_names = ci_connector_image_check_run_names()
+
+        # A guard that finds nothing passes vacuously. If a matrix restructure,
+        # a `dockerfile` convention change, or a rename of the `images` job
+        # empties this set, that must read as a broken guard rather than as
+        # compliance.
+        assert connector_names, (
+            "no connector image rows found in ci.yaml's `images` job -- the matrix "
+            "shape or the `dockerfile: examples/...` convention changed, and "
+            "ci_connector_image_check_run_names() now guards nothing"
+        )
+
+        unrequired = connector_names - authorize_module.REQUIRED_CHECK_NAMES
+
+        assert unrequired == set(), (
+            "ci.yaml builds connector images that no required check names, so a red "
+            f"connector build would still authorize a release: {sorted(unrequired)}. "
+            "Add each of those names to REQUIRED_CHECK_NAMES in release/authorize.py. "
+            "A connector build failing on next without this authorizes the tag, fails "
+            "release.yaml's `build` leg, and skips the manifest `merge` for every "
+            "image while the binaries and the GitHub Release publish anyway."
         )
 
 

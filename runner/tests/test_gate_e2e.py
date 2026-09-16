@@ -21,8 +21,14 @@ import json
 
 import anyio
 from aci_protocol import Event
+from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk.types import ToolPermissionContext
 from curie_runner.__main__ import build_runner
-from curie_runner.approval import PUBLISH_TOOL_NAME
+from curie_runner.approval import (
+    PUBLISH_TOOL_NAME,
+    build_approval_hook,
+    build_can_use_tool,
+)
 from curie_runner.config import RunnerConfig
 
 # A budget high enough that default_turn's 8 output tokens never trip the halt
@@ -98,6 +104,125 @@ def test_empty_policy_and_env_preserve_bypass_without_workspace_on_real_boot_pat
 
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
     assert gate is None
+
+
+def test_tool_policy_alone_constructs_both_live_interceptors(tmp_path) -> None:
+    """A policy is an enforcement source even when no legacy gate exists."""
+
+    plugin_dir = _write_manifest(
+        tmp_path,
+        {
+            "name": "acme-bot",
+            "toolPolicy": {
+                "enforcement": "curie/mcp-tool-policy@1",
+                "allow": ["kubernetes/pods_list"],
+                "approvalRequired": ["kubernetes/resources_scale"],
+                "deny": ["kubernetes/resources_delete"],
+            },
+        },
+    )
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  kubernetes:\n"
+        "    image: ghcr.io/example/kubernetes-mcp-server:0.0.1\n",
+        encoding="utf-8",
+    )
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True
+    )
+
+    gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
+    assert gate is not None
+    hook = build_approval_hook(gate)["PreToolUse"][0].hooks[0]
+    callback = build_can_use_tool(gate)
+
+    async def go() -> None:
+        allowed = "mcp__kubernetes__pods_list"
+        approval_required = "mcp__kubernetes__resources_scale"
+        denied = "mcp__kubernetes__resources_delete"
+        unclassified = "mcp__kubernetes__configuration_view"
+
+        assert await hook(
+            {"tool_name": allowed, "tool_input": {}}, None, None
+        ) == {}
+        assert isinstance(
+            await callback(allowed, {}, ToolPermissionContext()),
+            PermissionResultAllow,
+        )
+
+        hook_refusal = await hook(
+            {"tool_name": denied, "tool_input": {}}, None, None
+        )
+        assert hook_refusal["hookSpecificOutput"]["permissionDecision"] == "deny"
+        callback_refusal = await callback(denied, {}, ToolPermissionContext())
+        assert isinstance(callback_refusal, PermissionResultDeny)
+        assert gate.pending_summary is None
+
+        unclassified_refusal = await callback(
+            unclassified, {}, ToolPermissionContext()
+        )
+        assert isinstance(unclassified_refusal, PermissionResultDeny)
+        assert gate.pending_summary is None
+
+        hook_block = await hook(
+            {"tool_name": approval_required, "tool_input": {}}, None, None
+        )
+        assert hook_block["hookSpecificOutput"]["permissionDecision"] == "deny"
+        callback_block = await callback(
+            approval_required, {}, ToolPermissionContext()
+        )
+        assert isinstance(callback_block, PermissionResultDeny)
+        assert gate.pending_summary is not None
+
+    anyio.run(go)
+
+
+def test_tool_policy_allow_preserves_a_separate_legacy_connector_gate(
+    tmp_path,
+) -> None:
+    """An explicit policy allow cannot subtract an approvalPolicy gate."""
+
+    tool = "mcp__self-upgrade__upgrade_platform"
+    plugin_dir = _write_manifest(
+        tmp_path,
+        {
+            "name": "acme-bot",
+            "approvalPolicy": {
+                "gates": [{"gate": tool, "route": "sre-approvals"}]
+            },
+            "toolPolicy": {
+                "enforcement": "curie/mcp-tool-policy@1",
+                "allow": ["self-upgrade/upgrade_platform"],
+                "approvalRequired": [],
+                "deny": [],
+            },
+        },
+    )
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  self-upgrade:\n"
+        "    image: ghcr.io/example/self-upgrade:0.0.1\n",
+        encoding="utf-8",
+    )
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True
+    )
+    gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
+    assert gate is not None
+    hook = build_approval_hook(gate)["PreToolUse"][0].hooks[0]
+    callback = build_can_use_tool(gate)
+
+    async def go() -> None:
+        hook_result = await hook(
+            {"tool_name": tool, "tool_input": {}}, None, None
+        )
+        assert hook_result["hookSpecificOutput"]["permissionDecision"] == "deny"
+        callback_result = await callback(tool, {}, ToolPermissionContext())
+        assert isinstance(callback_result, PermissionResultDeny)
+        assert gate.pending_route == "sre-approvals"
+        assert gate.pending_granted_tool == tool
+
+    anyio.run(go)
 
 
 def test_managed_workspace_arms_mandatory_publish_on_fake_boot_path(tmp_path) -> None:

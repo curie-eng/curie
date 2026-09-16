@@ -1390,12 +1390,20 @@ enum CredentialEnvironment {
 }
 
 #[derive(Clone, Copy)]
+enum DeployTargetChannels {
+    RealisticFixtures,
+    DocumentationPlaceholders,
+    ApiRejectsDocumentationPlaceholder,
+}
+
+#[derive(Clone, Copy)]
 struct ClusterDeployFixture {
     all_targets: bool,
     deploy_failure: DeployFixtureFailure,
     connectors: ConnectorFixture,
     kubectl_failure: KubectlFixtureFailure,
     credentials: CredentialEnvironment,
+    target_channels: DeployTargetChannels,
 }
 
 impl Default for ClusterDeployFixture {
@@ -1406,6 +1414,7 @@ impl Default for ClusterDeployFixture {
             connectors: ConnectorFixture::Empty,
             kubectl_failure: KubectlFixtureFailure::None,
             credentials: CredentialEnvironment::Host,
+            target_channels: DeployTargetChannels::RealisticFixtures,
         }
     }
 }
@@ -1418,11 +1427,26 @@ fn target_from_agent(agent: &str) -> &'static str {
     }
 }
 
-fn target_config(target: &str) -> (&'static str, &'static str, &'static str) {
-    match target {
-        "dev" => ("acme-dev", "dev", "C0EXAMPLE2"),
-        "prod" => ("acme-prod", "prod", "C0EXAMPLE1"),
-        other => panic!("unexpected deploy target {other}"),
+fn target_config(
+    target: &str,
+    channels: DeployTargetChannels,
+) -> (&'static str, &'static str, &'static str) {
+    match (target, channels) {
+        ("dev", DeployTargetChannels::RealisticFixtures) => ("acme-dev", "dev", "C000000A01"),
+        ("prod", DeployTargetChannels::RealisticFixtures) => ("acme-prod", "prod", "C000000A02"),
+        ("dev", DeployTargetChannels::DocumentationPlaceholders) => {
+            ("acme-dev", "dev", "C0EXAMPLE2")
+        }
+        ("prod", DeployTargetChannels::DocumentationPlaceholders) => {
+            ("acme-prod", "prod", "C0EXAMPLE1")
+        }
+        ("dev", DeployTargetChannels::ApiRejectsDocumentationPlaceholder) => {
+            ("acme-dev", "dev", "C0EXAMPLE2")
+        }
+        ("prod", DeployTargetChannels::ApiRejectsDocumentationPlaceholder) => {
+            ("acme-prod", "prod", "C0EXAMPLE1")
+        }
+        (other, _) => panic!("unexpected deploy target {other}"),
     }
 }
 
@@ -1434,14 +1458,15 @@ fn deploy_api_response(
     req: &support::Request,
     failure: DeployFixtureFailure,
     connectors: ConnectorFixture,
+    target_channels: DeployTargetChannels,
 ) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("POST", "/deploy-targets/list") => response_json(
             200,
             json!({
                 "targets": [
-                    {"name": "dev", "agent": "acme-dev", "env": "dev", "slack_channel": "C0EXAMPLE2"},
-                    {"name": "prod", "agent": "acme-prod", "env": "prod", "slack_channel": "C0EXAMPLE1"}
+                    {"name": "dev", "agent": "acme-dev", "env": "dev", "slack_channel": target_config("dev", target_channels).2},
+                    {"name": "prod", "agent": "acme-prod", "env": "prod", "slack_channel": target_config("prod", target_channels).2}
                 ]
             }),
         ),
@@ -1449,7 +1474,20 @@ fn deploy_api_response(
             let body: serde_json::Value =
                 serde_json::from_slice(&req.body).expect("target request body is JSON");
             let target = body["target"].as_str().expect("target is a string");
-            let (agent, env, channel) = target_config(target);
+            let (agent, env, channel) = target_config(target, target_channels);
+            if matches!(
+                target_channels,
+                DeployTargetChannels::ApiRejectsDocumentationPlaceholder
+            ) {
+                return response_json(
+                    400,
+                    json!({
+                        "detail": format!(
+                            "deploy.placeholder_channel: targets.{target}.slack_channel is the documentation placeholder '{channel}'; replace it with a real Slack channel ID or remove slack_channel before deploying"
+                        )
+                    }),
+                );
+            }
             response_json(
                 200,
                 json!({"agent": agent, "env": env, "slack_channel": channel}),
@@ -1616,9 +1654,13 @@ fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
 fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<support::Request>) {
     let plugin = tempfile::tempdir().expect("plugin tempdir");
     curie::scaffold::scaffold(plugin.path(), "acme-bundle").expect("scaffold test bundle");
+    let dev_channel = target_config("dev", fixture.target_channels).2;
+    let prod_channel = target_config("prod", fixture.target_channels).2;
     fs::write(
         plugin.path().join("deploy.yaml"),
-        "targets:\n  dev: { agent: acme-dev, env: dev, slack_channel: C0EXAMPLE2 }\n  prod: { agent: acme-prod, env: prod, slack_channel: C0EXAMPLE1 }\n",
+        format!(
+            "targets:\n  dev: {{ agent: acme-dev, env: dev, slack_channel: {dev_channel} }}\n  prod: {{ agent: acme-prod, env: prod, slack_channel: {prod_channel} }}\n"
+        ),
     )
     .expect("write deploy targets");
 
@@ -1626,7 +1668,9 @@ fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<suppor
     write_kubectl_stub(tools.path());
     let deploy_failure = fixture.deploy_failure;
     let connectors = fixture.connectors;
-    let server = serve(move |req| deploy_api_response(req, deploy_failure, connectors));
+    let target_channels = fixture.target_channels;
+    let server =
+        serve(move |req| deploy_api_response(req, deploy_failure, connectors, target_channels));
     let empty_config_dir = tempfile::tempdir().expect("empty config tempdir");
 
     let mut command = Command::new(bin());
@@ -1716,7 +1760,8 @@ fn one_stdout_object(output: &Output) -> serde_json::Value {
 }
 
 fn expected_deploy(target: &str) -> serde_json::Value {
-    let (agent, environment, channel) = target_config(target);
+    let (agent, environment, channel) =
+        target_config(target, DeployTargetChannels::RealisticFixtures);
     json!({
         "plugin": "acme-bundle",
         "label": DEPLOY_LABEL,
@@ -1735,6 +1780,65 @@ fn expected_deploy(target: &str) -> serde_json::Value {
             "status": "active"
         }
     })
+}
+
+#[test]
+fn cluster_deploy_target_refuses_documentation_placeholder_before_mutation() {
+    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+        all_targets: false,
+        target_channels: DeployTargetChannels::DocumentationPlaceholders,
+        ..ClusterDeployFixture::default()
+    });
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a documentation placeholder must be a usage refusal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value = one_stdout_object(&output);
+    let diagnostic = format!("{} {}", value["error"], value["fix"]);
+    assert!(diagnostic.contains("C0EXAMPLE2"), "{value}");
+    assert!(diagnostic.contains("documentation placeholder"), "{value}");
+    assert!(diagnostic.contains("real Slack channel ID"), "{value}");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method != "POST" || request.path != "/deploy-targets/resolve"
+            })
+            .count(),
+        0,
+        "the refusal must happen immediately after target resolution and before any platform mutation: {requests:?}"
+    );
+}
+
+#[test]
+fn cluster_deploy_target_preserves_actionable_api_placeholder_refusal() {
+    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+        all_targets: false,
+        target_channels: DeployTargetChannels::ApiRejectsDocumentationPlaceholder,
+        ..ClusterDeployFixture::default()
+    });
+
+    assert_eq!(output.status.code(), Some(2));
+    let value = one_stdout_object(&output);
+    assert!(value["error"].as_str().is_some_and(|error| {
+        error.contains("C0EXAMPLE2") && error.contains("documentation placeholder")
+    }));
+    assert!(value["fix"]
+        .as_str()
+        .is_some_and(|fix| fix.contains("real Slack channel ID")));
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method != "POST" || request.path != "/deploy-targets/resolve"
+            })
+            .count(),
+        0,
+        "the API refusal must prevent every platform mutation: {requests:?}"
+    );
 }
 
 fn assert_failure_keys(value: &serde_json::Value, includes_failed_result: bool) {

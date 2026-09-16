@@ -19,6 +19,7 @@ from plugin_format import (
     DEFAULT_MAX_MEMBERS,
     DEFAULT_MAX_UNCOMPRESSED_BYTES,
     MANIFEST_LOCATIONS,
+    TOOL_POLICY_ENFORCEMENT,
     ApprovalPolicy,
     PluginManifest,
     UnsupportedArchive,
@@ -104,7 +105,19 @@ def extract_and_validate(
         max_compression_ratio=max_compression_ratio,
         max_members=max_members,
     )
-    result = validate_bundle(bundle_root(dest))
+    # Ingestion states the PLATFORM's contract, not this process's: the API does
+    # not run tool calls, the runner does, and the runner in this release applies
+    # a declared `toolPolicy` at both of its interception points. Refusing here
+    # instead would mean no policy-bearing bundle could ever be stored, which
+    # makes the extension undeployable rather than safe.
+    #
+    # Safe under skew, and only in one direction: a runner without the
+    # classification code passes no enforcement id to its own `validate_bundle`,
+    # so it refuses to BOOT a policy-bearing bundle. The failure mode of an old
+    # runner meeting a new bundle is "will not start", never "starts unfenced".
+    result = validate_bundle(
+        bundle_root(dest), enforces_tool_policy=TOOL_POLICY_ENFORCEMENT
+    )
     return extension, content_type, result
 
 

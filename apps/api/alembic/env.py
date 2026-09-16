@@ -47,16 +47,20 @@ def _relocate_legacy_version_table(connection: Connection) -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
+    # The app schema must exist before Alembic manages the version table in
+    # it, and any legacy public.alembic_version must be carried over first.
+    # Commit that setup so each later revision can open its own transaction
+    # (the crash-retry boundary in #2300).
+    with connection.begin():
+        connection.exec_driver_sql(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}"')
+        _relocate_legacy_version_table(connection)
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
         version_table_schema=SCHEMA,
+        transaction_per_migration=True,
     )
     with context.begin_transaction():
-        # The app schema must exist before Alembic manages the version table in
-        # it, and any legacy public.alembic_version must be carried over first.
-        connection.exec_driver_sql(f'CREATE SCHEMA IF NOT EXISTS "{SCHEMA}"')
-        _relocate_legacy_version_table(connection)
         context.run_migrations()
 
 

@@ -287,7 +287,8 @@ fn rejects_a_mis_namespaced_mcp_approval_gate() {
 }
 
 /// Every skill in a multi-skill spec becomes its own SKILL.md carrying that
-/// skill's name, description, allowed-tools (only when present), and body.
+/// skill's name, description, allowed-tools (only when present, as the single
+/// canonical space-separated scalar), and body.
 #[test]
 fn writes_one_skill_md_per_skill_with_frontmatter_and_body() {
     let dir = tempfile::tempdir().unwrap();
@@ -295,19 +296,29 @@ fn writes_one_skill_md_per_skill_with_frontmatter_and_body() {
     let spec = parse(valid_spec_json()).unwrap();
     scaffold_from_spec(&out, &spec).unwrap();
 
-    // Skill one: has allowed_tools -> allowed-tools YAML block with each tool.
-    // description and each tool are emitted as quoted YAML scalars (arbitrary
-    // agent-authored text must be a quoted scalar or it corrupts/invalidates the
-    // frontmatter `plugin_format.validate_bundle` parses with `yaml.safe_load`).
+    // Skill one: has allowed_tools -> ONE `allowed-tools` line carrying the
+    // space-joined entries, which is the shape the Agent Skills specification
+    // calls canonical (ADR-0135). description and the joined value are emitted as
+    // quoted YAML scalars (arbitrary agent-authored text must be a quoted scalar
+    // or it corrupts/invalidates the frontmatter `plugin_format.validate_bundle`
+    // parses with `yaml.safe_load`). The join is lossless because `spec::parse`
+    // refuses any entry that carries a depth-0 separator.
     let deal = std::fs::read_to_string(out.join("skills/deal-desk/SKILL.md")).unwrap();
     assert!(deal.starts_with("---\nname: deal-desk\n"), "{deal}");
     assert!(
         deal.contains("description: \"Invoke when a rep submits a pricing exception request.\""),
         "{deal}"
     );
-    assert!(deal.contains("allowed-tools:"), "{deal}");
-    assert!(deal.contains("  - \"WebSearch\""), "{deal}");
-    assert!(deal.contains("  - \"WebFetch\""), "{deal}");
+    assert!(
+        deal.contains("allowed-tools: \"WebSearch WebFetch\"\n"),
+        "the canonical single-line scalar, in spec order: {deal}"
+    );
+    // A bare `contains("allowed-tools:")` passes on BOTH shapes, so the block
+    // form has to be asserted absent or a regression to it goes unnoticed.
+    assert!(
+        !deal.contains("  - \""),
+        "the block list form must be gone entirely: {deal}"
+    );
     // Instructions body lands after the frontmatter.
     assert!(deal.contains("Deal desk skill body."), "{deal}");
     assert!(
@@ -812,4 +823,83 @@ fn cli_init_without_name_or_spec_errors_with_guidance() {
         "message must point at name or --from-spec\n{}",
         output_text(&output)
     );
+}
+
+// --- the canonical `allowed-tools` scalar and its entry rule (D4 / ADR-0135) --
+//
+// The emitted scalar is separator-delimited at paren depth 0, so an entry that
+// itself carries a depth-0 separator cannot round-trip: joining it and parsing it
+// back yields a DIFFERENT list. That is not cosmetic. The runner's #1852
+// gate-shadow check reads those entries, and `_entry_tool("Bash(git")` returns
+// None while `_entry_tool("commit:*)")` returns a garbage name -- so a corrupted
+// entry drops out of shadow detection entirely and the bundle boots reporting a
+// gate as armed while the tool runs unapproved. The spec refuses such an entry
+// before any byte is written.
+
+/// A specifier containing a SPACE is a legitimate Claude Code permission rule
+/// (`Bash(git commit:*)`), and the depth-aware join round-trips it, so the spec
+/// must ACCEPT it and the scaffold must emit it intact.
+#[test]
+fn accepts_a_specifier_containing_a_space_and_emits_it_intact() {
+    let body = r#"{
+      "name": "paren-desk",
+      "description": "Parens survive the join.",
+      "skills": [
+        {
+          "name": "paren-desk",
+          "description": "Invoke to commit.",
+          "allowed_tools": ["Bash(git commit:*)", "Read"],
+          "instructions": "Paren desk skill body.\n"
+        }
+      ],
+      "evals": [
+        { "id": "e1", "input": "go", "grader": { "kind": "contains", "expected": "ok" } }
+      ]
+    }"#;
+    let spec = parse(body).expect("a paren-bearing entry must be accepted");
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("bundle");
+    scaffold_from_spec(&out, &spec).unwrap();
+
+    let skill = std::fs::read_to_string(out.join("skills/paren-desk/SKILL.md")).unwrap();
+    assert!(
+        skill.contains("allowed-tools: \"Bash(git commit:*) Read\"\n"),
+        "the specifier must survive the join unsplit: {skill}"
+    );
+}
+
+/// A comma or space OUTSIDE parens, or an unbalanced paren, cannot survive the
+/// canonical join, so `parse` must Err and the message must name the entry --
+/// the author has to know which one to fix.
+#[test]
+fn rejects_an_allowed_tools_entry_that_cannot_round_trip() {
+    // A comma at depth 0; whitespace at depth 0; depth never returns to 0; a
+    // close paren at depth 0.
+    for entry in ["Read,Write", "Read Write", "Bash(git", "oops)"] {
+        let body = format!(
+            r#"{{
+              "name": "bad-desk",
+              "description": "An entry that cannot round-trip.",
+              "skills": [
+                {{
+                  "name": "bad-desk",
+                  "description": "Invoke never.",
+                  "allowed_tools": ["Read", {entry:?}],
+                  "instructions": "Bad desk skill body.\n"
+                }}
+              ],
+              "evals": [
+                {{ "id": "e1", "input": "go", "grader": {{ "kind": "contains", "expected": "ok" }} }}
+              ]
+            }}"#
+        );
+        let err = parse(&body)
+            .expect_err("an unserializable allowed_tools entry must error")
+            .to_string();
+        assert!(
+            err.contains(entry),
+            "message must name the offending entry {entry:?}: {err}"
+        );
+    }
 }

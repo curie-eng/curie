@@ -61,13 +61,17 @@ from .approval_actions import (
     REJECT_NOTE_ACTION_ID,
     ApprovalResolveClient,
     build_resolver,
+    decline_unowned_envelope,
     is_approval_action,
+    is_release_ownership_miss,
     open_note_dialog,
-    process_approval_action,
+    render_approval_action,
     render_note_submission,
+    resolve_approval_action,
     resolve_note_submission,
+    this_release_owns_action,
 )
-from .config import DispatcherConfig
+from .config import DispatcherConfig, release_identity
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .queue import claim_event, enqueue, release_event
@@ -276,7 +280,13 @@ def _mint_turn(
         attachments=attachments,
     )
     stream_id = enqueue(redis_client, config, queued)
-    log.info("enqueued %s %s as stream entry %s", delivery_kind, slack_event_id, stream_id)
+    log.info(
+        "enqueued %s %s as stream entry %s identity=%s",
+        delivery_kind,
+        slack_event_id,
+        stream_id,
+        release_identity(),
+    )
     return stream_id
 
 
@@ -376,6 +386,19 @@ def action_command(action: dict[str, Any]) -> str:
     command it runs)."""
     value = action.get("value")
     return str(value) if value else str(action.get("action_id", ""))
+
+
+def _action_approval_id(body: dict[str, Any]) -> str:
+    actions = body.get("actions") or []
+    return str(actions[0].get("value") or "") if actions else ""
+
+
+def _action_channel_id(body: dict[str, Any]) -> str:
+    return str((body.get("channel") or {}).get("id") or "")
+
+
+def _action_user_id(body: dict[str, Any]) -> str:
+    return str((body.get("user") or {}).get("id") or "")
 
 
 def process_action(
@@ -518,9 +541,7 @@ def register_handlers(
         )
 
     @app.event("message")
-    def _on_message(
-        body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]
-    ) -> None:
+    def _on_message(body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]) -> None:
         # ENVELOPE VALIDATION, not a relevance decision (#2006). The manifest at
         # `apps/dispatcher/slack-app-manifest.yaml` subscribes bot_events to
         # exactly `app_mention` and `message.im`, so a message on any other
@@ -567,26 +588,52 @@ def register_handlers(
     # approval created before the deploy that introduced the note variants --
     # checked per install, not assumed after some interval.
     @app.action(APPROVE_ACTION_ID)
-    def _on_approve(ack: Callable[..., None], body: dict[str, Any]) -> None:
-        ack()
-        process_approval_action(
+    def _on_approve(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        click = resolve_approval_action(
             body=body,
             decision="approved",
-            web_client=web_client,
             resolver=approval_resolver,
             logger=logger,
         )
+        if click is None:
+            ack()
+            return
+        if is_release_ownership_miss(click.outcome):
+            decline_unowned_envelope(
+                ack,
+                approval_id=click.approval_id,
+                log=log,
+                web_client=web_client,
+                channel=click.channel,
+                user=click.user,
+            )
+            return
+        ack()
+        render_approval_action(click, web_client=web_client, logger=logger)
 
     @app.action(REJECT_ACTION_ID)
-    def _on_reject(ack: Callable[..., None], body: dict[str, Any]) -> None:
-        ack()
-        process_approval_action(
+    def _on_reject(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        click = resolve_approval_action(
             body=body,
             decision="rejected",
-            web_client=web_client,
             resolver=approval_resolver,
             logger=logger,
         )
+        if click is None:
+            ack()
+            return
+        if is_release_ownership_miss(click.outcome):
+            decline_unowned_envelope(
+                ack,
+                approval_id=click.approval_id,
+                log=log,
+                web_client=web_client,
+                channel=click.channel,
+                user=click.user,
+            )
+            return
+        ack()
+        render_approval_action(click, web_client=web_client, logger=logger)
 
     # The note-collecting variants (#1053): a click OPENS a dialog and resolves
     # nothing; the submission below does the resolving. This is the pair EVERY
@@ -595,7 +642,17 @@ def register_handlers(
     # (#1076). The pair above is the migration entry point for older cards, not
     # a second live behavior; the earlier wording claimed otherwise.
     @app.action(APPROVE_NOTE_ACTION_ID)
-    def _on_approve_with_note(ack: Callable[..., None], body: dict[str, Any]) -> None:
+    def _on_approve_with_note(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        if this_release_owns_action(body, approval_resolver) is False:
+            decline_unowned_envelope(
+                ack,
+                approval_id=_action_approval_id(body),
+                log=log,
+                web_client=web_client,
+                channel=_action_channel_id(body),
+                user=_action_user_id(body),
+            )
+            return
         ack()
         open_note_dialog(
             body=body,
@@ -606,7 +663,17 @@ def register_handlers(
         )
 
     @app.action(REJECT_NOTE_ACTION_ID)
-    def _on_reject_with_note(ack: Callable[..., None], body: dict[str, Any]) -> None:
+    def _on_reject_with_note(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        if this_release_owns_action(body, approval_resolver) is False:
+            decline_unowned_envelope(
+                ack,
+                approval_id=_action_approval_id(body),
+                log=log,
+                web_client=web_client,
+                channel=_action_channel_id(body),
+                user=_action_user_id(body),
+            )
+            return
         ack()
         open_note_dialog(
             body=body,
@@ -635,6 +702,16 @@ def register_handlers(
             # Unusable private_metadata: nothing resolved, nothing to render.
             ack()
             return
+        if is_release_ownership_miss(submission.outcome):
+            decline_unowned_envelope(
+                ack,
+                approval_id=submission.approval_id,
+                log=log,
+                web_client=web_client,
+                channel=submission.channel,
+                user=submission.user,
+            )
+            return
         response = submission.response_action
         if response is None:
             ack()
@@ -648,11 +725,19 @@ def register_handlers(
         render_note_submission(submission, web_client=web_client, logger=logger)
 
     # Any other Block Kit button click (a reply's action) becomes a turn. The
-    # catch-all matches every action_id (including the approval ids above --
-    # Bolt runs all matching listeners -- so process_action skips those); ack
-    # first (Bolt's 3s budget), then normalize+enqueue.
+    # catch-all matcher fires on every action_id, including the approval ids
+    # above; process_action still skips those, and this listener must not ack
+    # them -- the dedicated approval listeners own ack-or-decline so a
+    # non-owning release can leave the envelope for Slack to retry (#2248).
     @app.action(re.compile(r".+"))
     def _on_action(ack: Callable[..., None], body: dict[str, Any]) -> None:
+        actions = body.get("actions") or []
+        action_id = str(actions[0].get("action_id", "")) if actions else ""
+        if is_approval_action(action_id):
+            # The dedicated approval listeners own ack-or-decline. Acking here
+            # would consume an envelope the non-owning release must leave for
+            # Slack to retry (#2248).
+            return
         ack()
         process_action(
             body=body,

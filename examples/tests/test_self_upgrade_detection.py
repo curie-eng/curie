@@ -30,6 +30,7 @@ from redeploy import (  # noqa: E402
     member_of,
     pin_build_connectors,
     replace_member,
+    upgrade_disposition,
 )
 
 
@@ -119,10 +120,8 @@ def test_a_symlink_inside_the_bundle_is_dropped() -> None:
 # every release-branch push tagged `sha-<commit>`, so the images that belong with
 # a bundle are derivable from the bundle's own commit.
 #
-# The second substitution is the one that is easy to forget: the declaration in
-# the repository ships PLACEHOLDER allowlists, and deploying those verbatim would
-# leave every write connector refusing every call -- which reads exactly like a
-# working bot that has decided not to act.
+# The second substitution carries runtime connector environment across the
+# immutable rebuild rather than reverting it to repository defaults.
 
 
 def _bundle(files: dict[str, bytes]) -> bytes:
@@ -147,11 +146,11 @@ def _read(bundle: bytes) -> dict[str, bytes]:
 DECLARATION = b"""connectors:
   kubernetes:
     image: ghcr.io/containers/kubernetes-mcp-server@sha256:aaa
-  k8s-write:
+  tempo:
     build:
-      context: connectors/k8s-write
+      context: connectors/tempo
     env:
-      K8S_WRITE_ALLOWLIST: <namespace>/<deployment>
+      TEMPO_URL: http://tempo.observability.svc.cluster.local:3200
 """
 
 
@@ -166,23 +165,71 @@ def offline_registry(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_a_build_connector_is_pinned_to_the_commits_published_image(
     offline_registry: None,
 ) -> None:
-    parsed = yaml.safe_load(pin_build_connectors(DECLARATION, "c" * 40, {"k8s-write": {}}))
-    write = parsed["connectors"]["k8s-write"]
-    assert "build" not in write, "a build declaration cannot reach a cluster deploy"
-    assert write["image"] == ("ghcr.io/curie-eng/curie-sre-bot-k8s-write@sha256:fixture")
+    parsed = yaml.safe_load(pin_build_connectors(DECLARATION, "c" * 40, {"tempo": {}}))
+    tempo = parsed["connectors"]["tempo"]
+    assert "build" not in tempo, "a build declaration cannot reach a cluster deploy"
+    assert tempo["image"] == ("ghcr.io/curie-eng/curie-sre-bot-tempo@sha256:fixture")
     # An already-pinned connector is left alone rather than re-resolved.
     assert parsed["connectors"]["kubernetes"]["image"].endswith("@sha256:aaa")
 
 
-def test_the_running_ceiling_survives_the_upgrade(offline_registry: None) -> None:
-    # The placeholder in the repository would refuse every call, and a bot that
-    # refuses everything looks exactly like a bot that chose not to act.
+def test_the_running_connector_environment_survives_the_upgrade(
+    offline_registry: None,
+) -> None:
     parsed = yaml.safe_load(
         pin_build_connectors(
-            DECLARATION, "c" * 40, {"k8s-write": {"K8S_WRITE_ALLOWLIST": "ns/one,ns/two"}}
+            DECLARATION,
+            "c" * 40,
+            {"tempo": {"TEMPO_URL": "http://tempo.custom.svc.cluster.local:3200"}},
         )
     )
-    assert parsed["connectors"]["k8s-write"]["env"]["K8S_WRITE_ALLOWLIST"] == "ns/one,ns/two"
+    assert parsed["connectors"]["tempo"]["env"]["TEMPO_URL"] == (
+        "http://tempo.custom.svc.cluster.local:3200"
+    )
+
+
+REVOKE = b"""connectors:
+  self-upgrade:
+    build:
+      context: connectors/self-upgrade
+    env:
+      SELF_UPGRADE_CRONJOB: sre-bot-self-upgrade
+      PLATFORM_UPGRADE_CRONJOB: ""
+      K8S_WRITE_ALLOWLIST: ns-a/deploy-a
+"""
+
+
+def test_a_carried_env_cannot_override_an_incoming_empty_value(
+    offline_registry: None,
+) -> None:
+    """A commit that revokes a grant by resetting env to empty must land.
+
+    connectors.yaml expresses "not granted" as an empty string. Carrying the
+    running value over that unconditionally made upgrade_self unable to
+    narrow a ceiling (curie#2292).
+    """
+
+    parsed = yaml.safe_load(
+        pin_build_connectors(
+            REVOKE,
+            "c" * 40,
+            {
+                "self-upgrade": {
+                    "PLATFORM_UPGRADE_CRONJOB": "sre-bot-platform-upgrade",
+                    "K8S_WRITE_ALLOWLIST": "ns-a/deploy-a,ns-b/deploy-b",
+                }
+            },
+        )
+    )
+    env = parsed["connectors"]["self-upgrade"]["env"]
+    assert env["PLATFORM_UPGRADE_CRONJOB"] == "", (
+        "a carried grant must not override an incoming empty value; empty is "
+        "how the declaration revokes the capability"
+    )
+    assert env["K8S_WRITE_ALLOWLIST"] == "ns-a/deploy-a", (
+        "a carried allowlist must not override a narrower incoming ceiling"
+    )
+    assert env["SELF_UPGRADE_CRONJOB"] == "sre-bot-self-upgrade"
 
 
 def test_replacing_one_member_leaves_the_others_byte_for_byte() -> None:
@@ -216,7 +263,7 @@ class _FakeApi:
         }
 
     def __call__(self, request, timeout=0):  # noqa: ANN001 - urlopen's shape
-        path = request.full_url.replace("http://api", "")
+        path = request.full_url.replace("http://api", "").split("?", 1)[0]
         import io as _io
 
         return _io.BytesIO(json.dumps(self.routes[path]).encode())
@@ -247,6 +294,7 @@ def test_the_served_version_wins_over_a_newer_undeployed_one(
                 "agent_id": "agent-1",
                 "version_id": "served",
                 "status": "active",
+                "environment": "prod",
                 "deployed_at": "2026-01-01T00:00:00",
                 "commit_sha": None,
             }
@@ -268,6 +316,73 @@ def test_the_served_version_wins_over_a_newer_undeployed_one(
 def test_no_active_deployment_reads_as_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     # Never "up to date". A job that cannot tell must not report success.
     api = _FakeApi(deployments=[], versions=[{"id": "v", "commit_sha": "c" * 40}])
+    _patched(monkeypatch, api)
+    _agent, commit, version_id = deployed_commit("http://api", "k", "sre-bot")
+    assert commit is None and version_id is None
+
+
+def test_the_prod_deployment_wins_over_a_newer_active_dev_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple active rows are normal; newest-across-environments is not prod.
+
+    create_deployment_row never stops the previous row, so an old active prod
+    row and a newer active dev row coexist. deployed_commit must match what
+    deploy() posts to (environment=prod), not the newest active row
+    (curie#2292).
+    """
+
+    api = _FakeApi(
+        deployments=[
+            {
+                "agent_id": "agent-1",
+                "version_id": "prod-v",
+                "status": "active",
+                "environment": "prod",
+                "deployed_at": "2026-01-01T00:00:00",
+                "commit_sha": "a" * 40,
+            },
+            {
+                "agent_id": "agent-1",
+                "version_id": "dev-v",
+                "status": "active",
+                "environment": "dev",
+                "deployed_at": "2026-09-01T00:00:00",
+                "commit_sha": "b" * 40,
+            },
+        ],
+        versions=[
+            {"id": "prod-v", "commit_sha": "a" * 40},
+            {"id": "dev-v", "commit_sha": "b" * 40},
+        ],
+    )
+    _patched(monkeypatch, api)
+
+    agent_id, commit, version_id = deployed_commit("http://api", "k", "sre-bot")
+
+    assert agent_id == "agent-1"
+    assert version_id == "prod-v"
+    assert commit == "a" * 40
+
+
+def test_an_active_dev_deployment_is_not_read_as_prod(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The falsifiable negative: no prod row must not report the dev commit."""
+
+    api = _FakeApi(
+        deployments=[
+            {
+                "agent_id": "agent-1",
+                "version_id": "dev-v",
+                "status": "active",
+                "environment": "dev",
+                "deployed_at": "2026-09-01T00:00:00",
+                "commit_sha": "b" * 40,
+            }
+        ],
+        versions=[{"id": "dev-v", "commit_sha": "b" * 40}],
+    )
     _patched(monkeypatch, api)
     _agent, commit, version_id = deployed_commit("http://api", "k", "sre-bot")
     assert commit is None and version_id is None
@@ -310,3 +425,32 @@ def test_the_bundle_is_uploaded_as_a_multipart_file(
     # And the order still holds: create, upload, then deploy -- so a failure
     # never leaves a version marked active with no bundle behind it.
     assert [c["path"].rsplit("/", 1)[-1] for c in seen] == ["versions", "bundle", "deployments"]
+
+
+def test_a_version_with_no_commit_is_still_upgradable() -> None:
+    """The regression that stuck: an installer-created version could never move.
+
+    `curie example sre-bot install` records no commit, so this job refused --
+    and told the reader to deploy through the installer, which is what produced
+    the state. An install deployed the supported way could never be upgraded by
+    the supported job (#2128).
+
+    Losing the commit loses the COMPARISON, not the ability to deploy.
+    """
+    assert upgrade_disposition(None, "a-version-id") == "deploy-unknown"
+    assert upgrade_disposition("", "a-version-id") == "deploy-unknown"
+
+
+def test_no_version_is_still_refused() -> None:
+    """The half that must stay fatal.
+
+    Without a version there is no running connector env to carry forward, so a
+    deploy ships the bundle's placeholder ceilings -- a bot that refuses every
+    write and looks exactly like one that chose not to act.
+    """
+    assert upgrade_disposition("c" * 40, None) == "refuse"
+    assert upgrade_disposition(None, None) == "refuse"
+
+
+def test_a_fully_known_version_deploys_normally() -> None:
+    assert upgrade_disposition("c" * 40, "a-version-id") == "deploy"

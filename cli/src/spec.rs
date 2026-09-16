@@ -22,6 +22,8 @@ pub struct SkillSpec {
     pub name: String,
     pub description: String,
     /// Verbatim Claude Code `allowed-tools` values; empty omits the key entirely.
+    /// The scaffold renders them as ONE canonical space-separated scalar
+    /// (ADR-0135), so `validate` refuses any entry that cannot survive that join.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     pub instructions: String,
@@ -39,6 +41,9 @@ pub struct ApprovalGateSpec {
     /// load-bearing, a bool with a safe default may collapse absent and false.
     #[serde(default, rename = "grantableViaPolicy")]
     pub grantable_via_policy: bool,
+    /// Bundle-authored human sentence for the approval card (#2565).
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// The `approvalPolicy` a spec declares. Mirrors `plugin_format.models.ApprovalPolicy`.
@@ -125,6 +130,40 @@ fn validate_gate_namespacing(
     bail!("spec approvalPolicy gate {gate:?} is not a fully-namespaced live tool name; {hint}")
 }
 
+/// Whether `entry` survives the canonical `allowed-tools` round-trip. The
+/// scaffold joins the entries with a space into one scalar, and every consumer
+/// splits that scalar back apart on whitespace or a comma at paren DEPTH 0
+/// (`plugin_format.parse_allowed_tools`). So an entry carrying a depth-0
+/// separator comes back as two, and an entry whose parens never balance swallows
+/// the entry after it -- either way the list a consumer reads is not the list the
+/// author wrote. Depth-awareness is what makes `Bash(git commit:*)`, a real
+/// Claude Code permission rule, ACCEPTABLE: its space sits at depth 1.
+///
+/// Why refuse rather than absorb: the runner's #1852 gate-shadow check reads
+/// these entries, and a corrupted one drops out of shadow detection entirely
+/// (`_entry_tool("Bash(git")` is `None`, `_entry_tool("commit:*)")` is a garbage
+/// tool name), so the bundle would boot reporting a gate as armed while the tool
+/// runs unapproved. Refused before any write, like the skill-name rule above.
+fn round_trips_in_allowed_tools(entry: &str) -> bool {
+    if entry.is_empty() {
+        return false;
+    }
+    let mut depth = 0usize;
+    for ch in entry.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            // A close paren at depth 0 is unbalanced; a comma or whitespace at
+            // depth 0 is a separator. Both are fine at depth >= 1 (`Bash(a,b)`).
+            ')' => return false,
+            ',' if depth == 0 => return false,
+            c if depth == 0 && c.is_whitespace() => return false,
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
 /// Deserialize the spec JSON (strict) then validate it. Returns actionable
 /// errors that name the offending value so an agent can self-correct.
 pub fn parse(json: &str) -> Result<AgentSpec> {
@@ -163,6 +202,24 @@ fn validate(spec: &AgentSpec) -> Result<()> {
                 "spec has two skills named {:?}; skill names must be unique",
                 skill.name
             );
+        }
+        // Same ethos, one field over: the emitted `allowed-tools` scalar is
+        // separator-delimited at paren depth 0, so an entry that cannot survive
+        // the join would be silently rewritten into a different list. Refuse it
+        // here, before any write, naming the entry the author has to fix.
+        for entry in &skill.allowed_tools {
+            if !round_trips_in_allowed_tools(entry) {
+                bail!(
+                    "spec skill {:?} allowed_tools entry {:?} cannot round-trip the canonical \
+                     `allowed-tools` scalar: entries are joined with a space and split back apart \
+                     on whitespace or a comma at paren depth 0, so each entry must be non-empty, \
+                     carry no whitespace or comma outside parentheses, and balance its \
+                     parentheses. A separator INSIDE a specifier is fine -- split the entry, or \
+                     close the parenthesis",
+                    skill.name,
+                    entry
+                );
+            }
         }
     }
 

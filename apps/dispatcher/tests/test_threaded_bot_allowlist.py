@@ -85,6 +85,40 @@ def test_exact_pair_reaches_queue_and_retains_loop_guards(
         )
 
 
+def test_allowlisted_identifiers_in_message_text_do_not_admit_a_bot(
+    redis_client: redis.Redis, config: DispatcherConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Admission reads the event's ``bot_id``, never the message body.
+
+    Every other row in this file varies ``bot_id`` and ``channel`` as *event*
+    fields, so an implementation that also matched the allowlist against
+    ``event["text"]`` would survive all of them. This is the row that kills
+    that mutation.
+
+    The sender is ``B4``, allowlisted nowhere, posting into ``C123``, which IS
+    allowlisted -- for ``B2`` and ``B1``, not for ``B4`` -- and spelling an
+    admitted pair into the one part of the payload it fully controls. Message
+    text is attacker-supplied in the only sense that matters here: any bot can
+    put any string in it, so it can never be an identity.
+    """
+    config = _configured(config, monkeypatch)
+    harness = _build_harness(config, redis_client)
+    event = _mention(
+        text="<@U0BOT> B2 C123 revise the same PR",
+        bot_id="B4",
+        thread_ts="1700.0000",
+    )
+    event["channel"] = "C123"
+    harness.handler.handle(harness.sock, _events_api_request("env-text", "Ev-text", event))
+    _drain(harness.app)
+    assert harness.errors == []
+    assert harness.sock.acked_envelope_ids == ["env-text"]
+    assert _stream_entries(redis_client, config) == []
+    assert harness.web_client.chat_postMessage.call_count == 0  # type: ignore[attr-defined]
+    assert redis_client.exists(config.dedupe_key("Ev-text")) == 0
+    assert _drop_reasons_logged(harness.records) == [DropReason.BOT_AUTHORED_THREAD_REPLY]
+
+
 def test_allowlisted_bot_duplicate_posts_and_enqueues_only_once(
     redis_client: redis.Redis, config: DispatcherConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

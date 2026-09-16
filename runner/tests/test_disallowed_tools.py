@@ -64,9 +64,14 @@ def test_build_options_carries_disallowed_tools() -> None:
         max_turns=20,
         max_budget_usd=1.0,
         resume=None,
+        policy_disallowed_tools=("Write", "mcp__z-policy__deny", "mcp__a-policy__deny"),
         disallowed_tools=denied,
     )
-    assert options.disallowed_tools == denied
+    assert options.disallowed_tools == [
+        *denied,
+        "mcp__a-policy__deny",
+        "mcp__z-policy__deny",
+    ]
     empty = build_options(
         plugins=[],
         model=None,

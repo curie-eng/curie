@@ -13,15 +13,11 @@ fn cli_src_dir() -> PathBuf {
 
 fn production_src_files() -> Vec<(String, String)> {
     let dir = cli_src_dir();
+    let mut paths = Vec::new();
+    collect_rs_paths(&dir, &mut paths);
+    paths.sort();
     let mut out = Vec::new();
-    for entry in
-        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
-    {
-        let entry = entry.unwrap_or_else(|e| panic!("read_dir entry: {e}"));
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
+    for path in paths {
         let name = path
             .file_name()
             .and_then(|n| n.to_string_lossy().into_owned().into())
@@ -38,6 +34,23 @@ fn production_src_files() -> Vec<(String, String)> {
         "expected cli/src/*.rs files; glob is misconfigured"
     );
     out
+}
+
+/// Recursively collect every `.rs` file under `dir`, subdirectories included
+/// (`cli/src/ops/*.rs` since the ops module split). `connector_build.rs` is
+/// still excluded by file name, wherever it lives.
+fn collect_rs_paths(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+    {
+        let entry = entry.unwrap_or_else(|e| panic!("read_dir entry: {e}"));
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_paths(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
 }
 
 /// Drop `#[cfg(test)]` modules so fixtures cannot satisfy or violate the gate.
@@ -319,6 +332,23 @@ fn runner_tags_are_one_identity_across_both_paths() {
     assert!(
         tags_fn.contains("source_image_ref(") || tags_fn.contains("SOURCE_IMAGE_TAG"),
         "platform_image_tags must name the --build runner identity"
+    );
+}
+
+/// The one-shot producer must use the same named running-stack resolver as the
+/// other recreating local verbs, not rebuild half of that chain in message.rs.
+#[test]
+fn one_shot_dispatcher_image_uses_the_shared_running_stack_resolver() {
+    let body = function_body("message.rs", "one_shot_dispatcher_image");
+    assert!(
+        body.contains("crate::local::running_stack_image("),
+        "one_shot_dispatcher_image must delegate to the shared named-image resolver; body: {body}"
+    );
+    assert!(
+        !body.contains("running_stack_tag(")
+            && !body.contains("image_ref(")
+            && !body.contains("image_present("),
+        "one_shot_dispatcher_image must not independently compose the tag and presence probes; body: {body}"
     );
 }
 

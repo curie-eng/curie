@@ -58,7 +58,7 @@ RUN apt-get update \
 RUN groupadd -g 1000 app && useradd -u 1000 -g app -m -d /home/app app
 WORKDIR /app
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
-# Migration tree so an init container can run `alembic -c alembic.ini upgrade head`
+# Migration tree so the schema-migrate Job can apply Alembic (#2300)
 # (env.py reads DATABASE_URL via Settings and imports models from the installed
 # package; script_location=alembic resolves relative to alembic.ini here).
 COPY --from=builder --chown=app:app /app/apps/api/alembic /app/alembic

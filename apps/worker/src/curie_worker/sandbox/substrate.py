@@ -26,7 +26,7 @@ import logging
 import secrets
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 
 from aci_protocol import BootEnv
@@ -160,6 +160,9 @@ class SandboxSubstrate:
         *,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        workspace_repo: str | None = None,
+        workspace_materialized_head: str | None = None,
+        publication_visible_outcome_revision: int = 0,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -193,7 +196,15 @@ class SandboxSubstrate:
                         self._evict_stale(thread_key, record)
                 if handle is None:
                     handle = self._claim_fresh(
-                        thread_key, env=env, state=RouteState.LIVE, agent_name=agent_name
+                        thread_key,
+                        env=env,
+                        state=RouteState.LIVE,
+                        agent_name=agent_name,
+                        workspace_repo=workspace_repo,
+                        workspace_materialized_head=workspace_materialized_head,
+                        publication_visible_outcome_revision=(
+                            publication_visible_outcome_revision
+                        ),
                     )
                     outcome = "claimed"
             except Exception as exc:
@@ -268,6 +279,68 @@ class SandboxSubstrate:
             return None
         return record.handle
 
+    def handoff(
+        self,
+        thread_key: str,
+        *,
+        expected: SandboxHandle,
+        env: dict[str, str],
+        workspace_repo: str,
+        workspace_materialized_head: str | None = None,
+        publication_visible_outcome_revision: int = 0,
+        agent_name: str | None = None,
+        validate_candidate: Callable[[SandboxHandle], None] | None = None,
+    ) -> SandboxHandle:
+        """Cold-create a workspace runner, then CAS it over one generic route.
+
+        The old route remains authoritative while the candidate binds. Losing
+        the claim+generation fence deletes only the unexposed candidate. After
+        a successful swap the old claim is cleanup-only; a failed deletion is
+        intentionally recoverable by the ordinary orphan reaper.
+        """
+
+        boot = dict(env)
+        boot[SESSION_ENV] = expected.session_id
+        if expected.history_ref is not None:
+            boot[HISTORY_ENV] = expected.history_ref
+        candidate = self._claim_fresh(
+            thread_key,
+            env=boot,
+            state=RouteState.LIVE,
+            session_id=expected.session_id,
+            history_ref=expected.history_ref,
+            agent_name=agent_name,
+            workspace_repo=workspace_repo,
+            workspace_materialized_head=workspace_materialized_head,
+            publication_visible_outcome_revision=publication_visible_outcome_revision,
+            generation=expected.generation + 1,
+            publish=False,
+        )
+        try:
+            if validate_candidate is not None:
+                validate_candidate(candidate)
+        except Exception:
+            # The candidate is ready but still unrouted. Refusal retires only
+            # that unexposed claim; the old route remains authoritative until
+            # the generation CAS below succeeds.
+            self._k8s.delete_claim(candidate.claim_name)
+            raise
+        record = RouteRecord(handle=candidate, state=RouteState.LIVE)
+        if not self._affinity.replace_if_generation(
+            thread_key,
+            expected_claim=expected.claim_name,
+            expected_generation=expected.generation,
+            record=record,
+            ttl_seconds=self._config.route_ttl_seconds,
+        ):
+            self._k8s.delete_claim(candidate.claim_name)
+            raise NoRouteError(f"late workspace handoff lost its route fence for {thread_key}")
+        try:
+            self._k8s.delete_claim(expected.claim_name)
+        except Exception:  # noqa: BLE001 - route already swapped; reaper owns cleanup
+            logger.exception("late workspace handoff left old claim for orphan reaping")
+        return candidate
+
     # -- suspend / resume -------------------------------------------------------
 
     def suspend(self, thread_key: str, *, history_ref: str | None) -> None:
@@ -318,6 +391,9 @@ class SandboxSubstrate:
         *,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        workspace_repo: str | None = None,
+        workspace_materialized_head: str | None = None,
+        publication_visible_outcome_revision: int | None = None,
     ) -> SandboxHandle:
         """Rehydrate a suspended thread into a fresh claim.
 
@@ -364,6 +440,16 @@ class SandboxSubstrate:
                     session_id=old.session_id,
                     history_ref=old.history_ref,
                     agent_name=agent_name,
+                    workspace_repo=workspace_repo or old.workspace_repo,
+                    workspace_materialized_head=(
+                        workspace_materialized_head or old.workspace_materialized_head
+                    ),
+                    publication_visible_outcome_revision=(
+                        publication_visible_outcome_revision
+                        if publication_visible_outcome_revision is not None
+                        else old.publication_visible_outcome_revision
+                    ),
+                    generation=old.generation + 1,
                 )
             except Exception as exc:
                 error = exc
@@ -606,6 +692,11 @@ class SandboxSubstrate:
         session_id: str | None = None,
         history_ref: str | None = None,
         agent_name: str | None = None,
+        workspace_repo: str | None = None,
+        workspace_materialized_head: str | None = None,
+        publication_visible_outcome_revision: int = 0,
+        generation: int = 0,
+        publish: bool = True,
     ) -> SandboxHandle:
         config = self._config
         nonce = uuid.uuid4().hex[:6]
@@ -636,10 +727,22 @@ class SandboxSubstrate:
             namespace=config.namespace,
             service_fqdn=bound.service_fqdn or "",
             port=bound.port if bound.port is not None else config.runner_port,
-            session_id=session_id or f"thread-{thread_hash}",
-            history_ref=history_ref,
+            # The route must describe the runner that actually booted.  Bound
+            # claims receive their authoritative identity in this exact env;
+            # the explicit values remain fallbacks for lifecycle callers that
+            # preserve identity without carrying those optional env entries.
+            session_id=(env or {}).get(SESSION_ENV)
+            or session_id
+            or f"thread-{thread_hash}",
+            history_ref=(env or {}).get(HISTORY_ENV) or history_ref,
             token=(env or {}).get(RUNNER_TOKEN_ENV, ""),
+            workspace_repo=workspace_repo,
+            workspace_materialized_head=workspace_materialized_head,
+            publication_visible_outcome_revision=publication_visible_outcome_revision,
+            generation=generation,
         )
+        if not publish:
+            return handle
         record = RouteRecord(handle=handle, state=state)
         for _ in range(3):
             if self._affinity.put_if_absent(thread_key, record, config.route_ttl_seconds):

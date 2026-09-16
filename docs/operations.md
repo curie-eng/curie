@@ -160,6 +160,7 @@ that release's retained values.
 | `--clear-github-token` | Remove the stored GitHub credential. Not a revocation: the running API keeps the old token until its pod restarts (`cluster up` prints the restart command), and the token itself stays valid at GitHub until you revoke it there. |
 | `--allow-egress-host <provider>` (repeatable) | Explicitly open runner egress on TCP 443 to one named model provider: `anthropic`, `openrouter`, `zhipu`, `moonshot`, or `deepseek`. Names are lowercase exact. An explicit list must include the provider detected from an `sk-ant-` or `sk-or-` credential. |
 | `--allow-web-egress <CIDR>` (repeatable) | Open runner egress on TCP 443 to an arbitrary CIDR (Classless Inter-Domain Routing block) -- for skill/tool web access, or a provider not covered above. |
+| `--forward-only` | Apply contract or irreversible schema migrations during this upgrade. The default refuses those migrations before mutation so a patch rollback window stays intact. Expand-only patch migrations do not need the flag. |
 
 A downloaded release binary needs no repo checkout; the chart resolves from
 the version-pinned release asset by default.
@@ -343,7 +344,152 @@ Reports whether the release is healthy, which pods are ready, and the URLs
 to reach it -- including the web console, where you can see your agents,
 their deployed versions, and their run history. That console URL includes a
 `?api=1` parameter; leave it as-is when you open it, it's just what points
-the console at this release's Curie API.
+the console at this release's Curie API. `--json` also reports the current
+upgrade phase and the last known-good version.
+
+### `curie cluster upgrade`
+
+```bash
+# release build: --chart defaults to the version-pinned release asset for --to
+curie cluster upgrade --to 0.9.0
+
+# local chart file (e.g. a downloaded release archive): same metadata-read
+# refusal path as a local directory
+curie cluster upgrade --to 0.9.0 --chart ./curie-0.9.0.tgz
+
+# resolvable ref: the command adds --version internally, do not pass it
+curie cluster upgrade --to 0.9.0 --chart oci://<your-registry>/curie
+```
+
+The chart and `--to` must agree. On a release build, omitting `--chart`
+resolves the GitHub release chart for the target version in `--to`. On a
+dev build, omitting it uses the local `charts/curie` chart. An explicit
+`--chart` override wins in either channel. Helm silently ignores `--version`
+on a local directory or file chart, so for that case the command reads the
+chart's own metadata instead of passing `--version`.
+For a chart ref Helm resolves itself (a repo or OCI ref), the command
+passes `--version <to>` internally and lets Helm enforce it; there is no
+`--version` operator flag.
+
+A release dry run still reads the cluster, but it does not download the default
+release chart archive or change the installed release. If its target archive is
+already cached, the command reads the chart version and renders its schema
+compatibility metadata exactly as a real upgrade does. If the archive is absent,
+the plan names the release URL and cache path and marks those two target checks
+pending. An explicit Helm repository or OCI reference may require Helm to fetch
+the chart while `helm template` renders its schema metadata. The command still
+reads and migrates retained configuration, including reporting an ambiguous
+configuration conflict. A real upgrade downloads the archive before Validate
+and runs every target check before mutation.
+
+| Flag | What it does |
+|---|---|
+| `--to <version>` | Target Curie version. Required. |
+| `--chart` | Chart path or ref override. |
+| `--yes` | Skip the confirmation prompt. |
+| `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download. |
+| `--forward-only` | Apply pending contract or irreversible schema migrations. Without this flag, Validate refuses those migrations before mutation so a patch rollback window stays intact. |
+
+One resumable lifecycle: inspect and plan, validate configuration and
+schema compatibility and refuse on an ambiguous migration conflict, drain
+accepted work, checkpoint, apply, wait for exact convergence, run a
+target-version canary, then record the new known-good version. There is no
+separate migration step in the command: configuration migration happens at
+Validate, and schema migration is the chart's pre-upgrade Job, which Apply
+fires. The command chooses the values overlay; do not pass `--reuse-values`
+or `--reset-then-reuse-values`. Configuration migration to the current
+schema happens at Validate, before any mutation. Database/application
+schema compatibility is also checked at Validate: an incompatible live
+revision or a pending contract/irreversible migration without
+`--forward-only` refuses before `helm upgrade`. `--forward-only` sets
+`api.migrate.forwardOnly=true` on the overlay Apply hands Helm. The
+`migrate` phase is a resumable checkpoint boundary only; it performs no
+migration of its own.
+
+The redacted plan names the configuration schema version the upgrade migrates
+from and to (`config schema: <from> -> <to>`). It never carries credential
+values. The plan's `helm upgrade` line is generated from the same chart
+resolution and the same `--version` decision the command executes, so it names
+the chart that will actually be applied: the target-version release asset on a
+release build, local `charts/curie` on a dev build, or the explicit `--chart`
+override. It shows `--version <to>` exactly when a resolvable ref makes it a
+real pin. A release asset is applied from its downloaded local archive, so its
+plan never shows `--version`, including when a cold dry run marks target checks
+pending.
+
+After Apply, the command reads the installed chart version from
+`helm get metadata` and fails rather than reporting success if it is not the
+target version; the canary reads it again. Convergence (image digests,
+controller generations, replica counts, healthy hooks, the drained-queue gate,
+and the retained manifest comparison) is observed the same way `curie cluster
+up` observes it, not assumed.
+
+`--json` reports the current phase, the last known-good version, whether
+the previous version is still serving, and at most one fail-forward
+command. Success is refused unless convergence is exact and the canary
+passed. After a normal command failure, run the same command to resume only
+when cleanup successfully released ownership.
+
+This composes configuration migration (issue 2299) with the drain gate
+(issue 2010): a resume after a completed drain does not drain accepted
+work again.
+
+After confirmation, the command claims the namespaced
+`<release>-upgrade-checkpoint` ConfigMap before it reads release snapshots or
+runs Helm. The claim records an opaque holder identifier and a redacted action
+that names the target version. Another current `curie cluster upgrade` process
+that finds the claim refuses immediately and reports both values, even when it
+requested the same target. Each checkpoint update and the ordinary holder
+release test both that holder and the exact Kubernetes `resourceVersion`
+returned by the preceding successful operation. A process that loses either
+comparison stops without replacing the newer checkpoint.
+
+This is cooperative ownership among concurrent `curie cluster upgrade`
+processes from a current Curie CLI version. The current `curie cluster up`,
+`curie cluster rollback`, and `curie cluster down` verbs do not participate. It
+also does not fence an older CLI, a raw Helm command, a direct Kubernetes write,
+or a cluster administrator. It does not make Helm and the other upgrade effects
+one transaction or guarantee that an external side effect happens exactly once.
+
+The checkpoint is namespaced. If its namespace does not exist, the command
+refuses before Helm mutation and directs the operator to establish the install
+with `curie cluster up` first. Ownership does not require a cluster scoped read
+of the Namespace object.
+
+Any interruption after ownership acquisition, including Ctrl C, SIGINT, and
+SIGTERM, leaves the holder in place. A normal exit that reports an ownership
+release CAS failure can also leave the holder. Do not rerun the upgrade in
+either case until the checked recovery below is complete. There is no expiry,
+heartbeat, or automatic takeover. First read the live checkpoint:
+
+```bash
+kubectl --context <context> -n <namespace> get configmap <release>-upgrade-checkpoint -o json
+```
+
+Record the exact `metadata.resourceVersion`,
+`metadata.annotations["curietech.ai/upgrade-holder"]`, and action from that
+response. Verify that the process identified by the holder has stopped and that
+its Helm action is no longer running. Clearing a live holder can let another
+upgrade overlap the original operation. Never delete the checkpoint as a
+recovery step because it also contains the resumable lifecycle record.
+
+Only after those checks, replace both values in this conditional patch with the
+exact values just observed:
+
+```bash
+kubectl --context <context> -n <namespace> patch configmap <release>-upgrade-checkpoint \
+  --type=json \
+  --patch='[
+    {"op":"test","path":"/metadata/resourceVersion","value":"<observed-resource-version>"},
+    {"op":"test","path":"/metadata/annotations/curietech.ai~1upgrade-holder","value":"<observed-holder>"},
+    {"op":"remove","path":"/metadata/annotations/curietech.ai~1upgrade-holder"},
+    {"op":"remove","path":"/metadata/annotations/curietech.ai~1upgrade-action"}
+  ]'
+```
+
+If either test fails, inspect the ConfigMap again and reassess its current
+holder. Do not retry with stale values or remove the annotations
+unconditionally.
 
 ### `curie cluster down`
 
@@ -537,6 +683,69 @@ promote:
    `GITHUB_CLONE_BASE` (or the chart's `api.githubCloneBase`) if your repos
    live elsewhere, such as GitHub Enterprise Server.
 
+### Accepting review feedback from GitHub
+
+Review feedback uses the same signed `/github/webhook` endpoint, but is a
+separate, default-off GitHub App path. Set
+`api.githubReviewIngressEnabled: true` (environment
+`GITHUB_REVIEW_INGRESS_ENABLED=true`) only after all of the following are
+configured:
+
+- `api.githubReviewReconcilerIntervalSeconds` is greater than zero (environment
+  `GITHUB_REVIEW_RECONCILER_INTERVAL_S`; the default is `5`).
+- `api.githubAppId` and an App private key are present. Prefer
+  `api.githubAppExistingSecret` and `api.githubAppExistingSecretKey` for the
+  key; `api.githubAppPrivateKey` is the inline alternative.
+- `api.githubWebhookSecret` is a non-default HMAC secret and matches the secret
+  configured on the GitHub webhook.
+
+The API refuses to start with review ingress enabled when any of those settings
+is missing, the webhook secret is still the development default, or the
+reconciler interval is not positive. Leaving
+`api.githubReviewIngressEnabled: false` keeps review events inert while
+preserving the existing push-webhook behavior.
+
+If the worker uses a custom `KEY_PREFIX`, give the API the same `KEY_PREFIX` so
+review reconciliation can find its exact completion and dead-letter markers.
+The API follows the worker configuration's `KEY_PREFIX` alias;
+`CURIE_KEY_PREFIX` is ignored.
+
+Configure the App webhook with these three subscriptions, using GitHub's event
+names exactly:
+
+- **Issue comments** for `issue_comment.created` on a pull request.
+- **Pull request review comments** for `pull_request_review_comment.created`.
+- **Pull request reviews** for `pull_request_review.submitted`; Curie acts only
+  on `commented` and `changes_requested` reviews.
+
+GitHub documents the payloads under [webhook events and
+payloads](https://docs.github.com/en/webhooks/webhook-events-and-payloads).
+Give the App **Issues: Read** and **Pull requests: Read** so Curie can re-read
+the pull request, issue comment, review comment, and review. Give it
+**Administration: Read** so Curie can call GitHub's [repository-permission
+lookup](https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user).
+That lookup must freshly match the sender's immutable user ID and report
+`write` or `admin`; `author_association` by itself is not authority. Keep the
+existing trusted publisher permissions, **Contents: Read and write** and **Pull
+requests: Read and write**, because only that publisher may advance the branch
+and pull request. The App's effective Pull requests permission is therefore
+Read and write when both feedback ingestion and publication are enabled.
+
+Only publication lineages created after authority capture are eligible. The
+lineage must retain its immutable App-observed installation, repository, pull
+request, base-ref, binding generation, and bare reply-conversation facts.
+Historical lineages, PAT-backed lineages, and lineages with null authority are
+not reconstructed and remain ineligible. Every accepted event routes to that
+exact owning conversation. Immediately before a model turn, Curie rechecks the
+open pull request, exact head, installation, repository, sender identity and
+current `write`/`admin` permission, then reserves the same lineage generation.
+
+Feedback never publishes automatically. The resulting revision must request a
+new human publication approval, and the trusted publisher may add exactly one
+tested commit to the same pull request only after that approval. This path
+reports receipt and outcome in the owning conversation. GitHub status or
+comment publication for review feedback is not configured and remains a no-op.
+
 **Deploying a PRIVATE repo needs one more thing: a clone credential.**
 Without it, git-flow can only deploy a public repository. A private one
 fails with `git.archive_failed` (#1058). Supply the API's GitHub credential
@@ -612,6 +821,10 @@ curie cluster comms --slack
 workspace: it stores the tokens you pass and restarts the affected pods so the
 change takes effect immediately. Connected `cluster message` replies go to the
 agent's bound Slack channel; disconnected releases use the terminal stub.
+Exactly one Curie release may connect to a given Slack app. Slack Socket Mode
+fans events across every connected client, so two releases sharing one app
+silently split mentions. Use a dedicated Slack app for this release; do not
+share it with a local dispatcher or another cluster install.
 
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).
@@ -949,6 +1162,14 @@ helm get values <release> -n <ns> -o yaml > values.yaml
 helm upgrade <release> <chart> -n <ns> -f values.yaml
 ```
 
+`curie cluster up` and `curie apply` do this without asking the operator to
+choose `--reuse-values` versus `--reset-then-reuse-values`. They persist
+`config.schemaVersion` on the release, run pure migrations from supported
+v0.8.x user values onto the v0.9.0 schema (legacy extraEnv entries with a
+first-class successor, external Secret references), and overlay the result so
+new chart defaults still apply. A second upgrade with no input change is a
+no-op. Plan and diff output stay redacted.
+
 ### Migrating the bundle store (0.5.x → 0.6.0, `minio` → `rustfs`)
 
 0.6.0 renamed the in-cluster object store. The chart cannot migrate it for you,
@@ -1043,11 +1264,82 @@ with anything. If such an approval expires, its message keeps its buttons.
 Edit or delete that Slack message by hand, or ignore it -- the approval itself
 is expired in the API either way, so a click on it cannot approve anything.
 
+## Which claim env reaches which sandbox container
+
+Almost nobody writes a `SandboxClaim` by hand -- the worker creates them. But
+reproducing a sandbox by hand is the normal way to build a proof, a bug repro,
+or a support investigation, and the claim's env has a shape that is easy to get
+wrong in a way that looks like success.
+
+A sandbox pod runs up to three staging **init containers** before the runner
+starts: `bundle-fetch` and `bundle-extract` pull the plugin bundle out of the
+object store into `CURIE_PLUGIN_DIR`, and `workspace-init` fetches and unpacks
+the repository workspace. Each one reads its own env.
+
+A `SandboxClaim` env entry carries an optional `containerName`. **An entry with
+no `containerName` is injected into the runner container only** -- the
+`envVarsInjectionPolicy: Overrides` on the SandboxTemplate governs which side
+wins for a container the entry names, not which containers it reaches. So an
+entry the init containers need must be repeated once per init container, each
+with an explicit `containerName`:
+
+```yaml
+spec:
+  env:
+    # Reaches the runner only -- correct for runner-side keys.
+    - name: CURIE_SESSION_ID
+      value: thread-42
+    # Staging keys must be repeated per init container.
+    - name: CURIE_BUNDLE_REF
+      value: bundles/my-agent-v7.tgz
+    - name: CURIE_BUNDLE_REF
+      value: bundles/my-agent-v7.tgz
+      containerName: bundle-fetch
+    - name: CURIE_BUNDLE_REF
+      value: bundles/my-agent-v7.tgz
+      containerName: bundle-extract
+```
+
+| Env | Claim-settable? | Who consumes it |
+|---|---|---|
+| `CURIE_BUNDLE_REF` | Yes -- runner **and** `containerName: bundle-fetch` **and** `containerName: bundle-extract` | The init pair fetches and extracts the bundle; the runner reads the ref only to diagnose a staging failure. |
+| `CURIE_WORKSPACE_REF` | Yes -- `containerName: workspace-init` only | `workspace-init`. Deliberately NOT injected into the runner: it is a short-lived signed URL and the claim is plaintext in etcd. |
+| `CURIE_WORKSPACE_SHA256` | Yes -- `containerName: workspace-init` only | `workspace-init`, to verify the fetched archive. |
+| `CURIE_SESSION_ID`, `CURIE_HISTORY_REF`, `CURIE_PLUGIN_DIR`, and the rest of the boot env | Yes -- runner, no `containerName` | The runner. |
+| `CURIE_CREDENTIALS` | Don't. Worker-filtered, not schema-rejected | The runner, from the chart Secret's `secretKeyRef`. The worker strips this key off every claim it writes; a claim you write yourself is not filtered, and the value would sit in plaintext in etcd. |
+| Per-agent connector secrets (the keys named by `CURIE_CONNECTOR_SECRET_KEYS`) | Don't. Worker-filtered, not schema-rejected | The runner, from the per-agent SandboxTemplate's `secretKeyRef`. Same plaintext-in-etcd caveat. |
+| `S3_ENDPOINT`, `BUNDLE_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `AWS_*` | Don't. Chart-managed defaults | `bundle-fetch`. Wired from values and Secrets, not a per-claim decision. An explicitly targeted claim entry would override them under `Overrides`. |
+
+**Nothing on this list is enforced by the CRD.** The vendored `SandboxClaim`
+schema accepts any env name, and `envVarsInjectionPolicy: Overrides` means a
+claim entry that names a container wins over the template's own value for it.
+The "Don't" rows above are the worker's discipline and the chart's wiring, both
+of which a hand-written claim bypasses entirely. Treat them as what you must not
+do, not as what you cannot do -- in particular, a credential you put on a claim
+is persisted in plaintext in etcd and nothing will stop you.
+
+**How the mistake shows up.** It does not look like a mistake. Every init
+container exits 0 -- an empty ref is its documented no-op path, which is what a
+warm or unbound pod needs. The claim reports `Pod is Running but not Ready`, and
+the runner crash-loops on `[manifest.missing]`, which reads like a broken
+bundle. Two things now name the real cause:
+
+- each staging init container logs, on its no-op path, that a `spec.env` entry
+  with no `containerName` reaches the runner only, and which `containerName` to
+  add (`kubectl logs <pod> -c bundle-fetch`);
+- the runner refuses to boot with `CURIE_BUNDLE_REF` set over an empty plugin
+  dir, and says so in those terms instead of blaming the bundle.
+
 ## Known gotchas
 
 Notes from the first installs of the chart on fresh clusters, kept for the
 next operator.
 
+- **A hand-written `SandboxClaim`'s `spec.env` reaches the runner container
+  only** unless each entry names a `containerName`. Staging a plugin bundle or a
+  workspace by hand therefore needs the entry repeated per init container --
+  see [Which claim env reaches which sandbox container](#which-claim-env-reaches-which-sandbox-container)
+  above. It used to fail silently: every init container exited 0 (#2612).
 - **The agent-sandbox controller is enabled by default.** The chart ships the
   agent-sandbox CRDs and deploys the vendored controller when
   `agentSandbox.controller.deploy=true`, which is the default. A cluster that
@@ -1063,13 +1355,12 @@ next operator.
 - **langfuse-web restarts ~2x during first boot** while ClickHouse and
   Postgres come up, then stabilizes. This is startup ordering, not a
   crashloop; do not treat the early restarts as a failure.
-- **Give long-lived releases separate Slack Socket Mode apps.** Slack permits
-  up to ten connections for one app and may send each payload to any connection
-  without a predictable distribution pattern. During a temporary overlap, a
-  non-owning Curie release leaves an absent approval unchanged and asks the
-  approver to retry; a retry may be needed before the owning release receives
-  the interaction. Stop the local dispatcher after testing rather than leaving
-  it competing with the in-cluster release. See
+- **Exactly one Curie release may connect to a given Slack app.** Slack Socket
+  Mode fans events across every connected client, so two releases sharing one
+  app silently split mentions. Give each long-lived release its own app. If a
+  second dispatcher is already connected, stop the extra client; do not retry
+  mentions or approval clicks hoping Slack picks the owner. Leave-unacked
+  approval routing is not an operator retry procedure. See
   [Slack's multiple-connections contract](https://docs.slack.dev/apis/events-api/using-socket-mode/#using-multiple-connections).
 - **kube-router applies NetworkPolicy a few seconds after pod start.** A
   brand-new pod can see open egress for the first seconds before the policy

@@ -215,6 +215,36 @@ pub enum ObservabilityQuery {
     },
 }
 
+/// Validate a present-but-empty agent filter value (#1948). An empty string is
+/// not an absent one: forwarded verbatim it reaches FastAPI as a falsey query
+/// value the API treats as no filter at all, so a "scoped" export silently
+/// returns every agent's data. A whitespace-only value is the same refusal.
+/// A non-empty value passes through VERBATIM: agent names are exact-match
+/// identifiers and the API intentionally accepts names with leading or
+/// trailing whitespace, so trimming here would resolve a different agent.
+/// `accepted` names the value forms the flag takes, so the refusal's fix stays
+/// complete per flag.
+fn non_empty_filter(raw: Option<&str>, flag: &str, accepted: &str) -> Result<Option<String>> {
+    match raw {
+        None => Ok(None),
+        Some(value) => {
+            if value.trim().is_empty() {
+                return Err(anyhow::Error::from(
+                    crate::exit::CliError::usage(format!(
+                        "--{flag} was given an empty value; a present-but-empty filter would \
+                         drop the scope and query every agent"
+                    ))
+                    .with_fix(format!(
+                        "--{flag} accepts {accepted}; pass a non-empty value or omit \
+                         --{flag} entirely"
+                    )),
+                ));
+            }
+            Ok(Some(value.to_string()))
+        }
+    }
+}
+
 /// Execute one read-only observability query through the Curie platform API.
 /// The returned trait object still flows through the single `Ui::emit` success
 /// decision in `main.rs`; this function never writes a success payload itself.
@@ -227,6 +257,8 @@ pub async fn query(
     let client = ApiClient::new(api_url, api_key)?;
     let output: Box<dyn CliOutput> = match query {
         ObservabilityQuery::Runs { limit, agent_id } => {
+            let agent_id =
+                non_empty_filter(agent_id.as_deref(), "agent-id", "a platform agent id")?;
             let mut runs = client
                 .list_observability_runs(limit, agent_id.as_deref())
                 .await
@@ -260,32 +292,76 @@ pub async fn query(
             end,
             environment,
             agent,
-        } => match metric {
-            Some(metric) => Box::new(ObservabilityMetricsOutput::Series(
-                client
-                    .observability_metric_series(
-                        &metric,
-                        &granularity,
-                        start.as_deref(),
-                        end.as_deref(),
-                        environment.as_deref(),
-                        agent.as_deref(),
-                    )
-                    .await
-                    .map_err(|error| classify_api_error(error, tier))?,
-            )),
-            None => Box::new(ObservabilityMetricsOutput::Summary(
-                client
-                    .observability_metrics_summary(
-                        start.as_deref(),
-                        end.as_deref(),
-                        environment.as_deref(),
-                        agent.as_deref(),
-                    )
-                    .await
-                    .map_err(|error| classify_api_error(error, tier))?,
-            )),
-        },
+        } => {
+            // #1948: the API's `agent` filter is a trace-name contains token
+            // `agent-<agent_id>` (apps/api/src/curie_api/metrics.py::
+            // agent_trace_filter), because production traces are named
+            // `curie-run:agent-<agent_id>-thread-<ts>`. Forwarding the
+            // human-readable name matched nothing and read as false zeroes, so
+            // the name is resolved to its agent record first, by name or by
+            // id, reusing the deploy flow's one resolution path.
+            let agent = non_empty_filter(
+                agent.as_deref(),
+                "agent",
+                "a platform agent's name or agent id",
+            )?;
+            let agent_filter = match agent {
+                None => None,
+                Some(name) => {
+                    let resolved =
+                        client
+                            .find_agent_observability(&name)
+                            .await
+                            .map_err(|error| {
+                                // Only a genuine no-match is operator input error. A
+                                // transport or availability failure keeps its own
+                                // transient/failure class instead of masquerading as
+                                // "no such agent" (#1948 review).
+                                if crate::api::is_agent_lookup_not_found(&error) {
+                                    anyhow::Error::from(
+                                        crate::exit::CliError::usage(format!(
+                                    "--agent {name:?} does not match any platform agent by \
+                                     name or agent id"
+                                ))
+                                        .with_fix(format!(
+                                    "--agent accepts a deployed agent's name or agent id; list \
+                                     agents with `curie {tier} versions`"
+                                )),
+                                    )
+                                } else {
+                                    classify_api_error(error, tier)
+                                }
+                            })?;
+                    Some(format!("agent-{}", resolved.id))
+                }
+            };
+            match metric {
+                Some(metric) => Box::new(ObservabilityMetricsOutput::Series(
+                    client
+                        .observability_metric_series(
+                            &metric,
+                            &granularity,
+                            start.as_deref(),
+                            end.as_deref(),
+                            environment.as_deref(),
+                            agent_filter.as_deref(),
+                        )
+                        .await
+                        .map_err(|error| classify_api_error(error, tier))?,
+                )),
+                None => Box::new(ObservabilityMetricsOutput::Summary(
+                    client
+                        .observability_metrics_summary(
+                            start.as_deref(),
+                            end.as_deref(),
+                            environment.as_deref(),
+                            agent_filter.as_deref(),
+                        )
+                        .await
+                        .map_err(|error| classify_api_error(error, tier))?,
+                )),
+            }
+        }
     };
     Ok(output)
 }

@@ -55,12 +55,17 @@ def _boot_options(
     config: RunnerConfig,
     *,
     potential_write: bool,
+    observed_tools: frozenset[str] | None = None,
+    readonly_tools: frozenset[str] | None = None,
 ) -> Any:
     async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        observed = observed_tools or frozenset()
         return McpToolCapabilityProbe(
             complete=True,
             has_potential_write_tool=potential_write,
-            tool_count=1 if potential_write else 0,
+            tool_count=len(observed) or (1 if potential_write else 0),
+            observed_tools=observed,
+            readonly_tools=readonly_tools or frozenset(),
         )
 
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
@@ -238,6 +243,7 @@ def _config_for(
     release: str | None = None,
     agent: str | None = None,
     namespace: str | None = None,
+    approval_grant_tool: str | None = None,
 ) -> RunnerConfig:
     """A RunnerConfig built the way a real boot builds one.
 
@@ -259,7 +265,106 @@ def _config_for(
         )
         | _SUBSTRATE_ENV
     )
+    if approval_grant_tool is not None:
+        env[BootEnv.env_key("approval_grant_tool")] = approval_grant_tool
     return RunnerConfig.from_env(env)
+
+
+def _approval_state(gate: Any) -> tuple[Any, ...]:
+    """Every mutable pending/grant value catalog projection must leave alone."""
+
+    return (
+        gate.pending_summary,
+        gate.pending_route,
+        gate.pending_gate_kind,
+        gate.pending_granted_tool,
+        gate.policy_requested,
+        gate.policy_rejected,
+        gate.policy_route,
+        gate.grant_tool,
+        tuple(sorted(gate.grantable_by_route.items())),
+        gate.publication_title,
+        gate.publication_body,
+        gate.pending_halt,
+        gate._boot_turn_seen,  # noqa: SLF001 - projection mutation is the assertion
+    )
+
+
+def test_boot_threads_only_policy_hidden_observations_without_spending_gate_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _bundle(
+        tmp_path,
+        mcp={"mcpServers": {"operations": {"command": "fixture-command"}}},
+    )
+    manifest_path = root / ".claude-plugin" / "plugin.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["toolPolicy"] = {
+        "enforcement": "curie/mcp-tool-policy@1",
+        "allow": ["operations/read_allowed"],
+        "approvalRequired": ["operations/write_approval"],
+        "deny": ["operations/write_denied"],
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    prefix = "mcp__plugin_b_operations__"
+    read_allowed = f"{prefix}read_allowed"
+    write_approval = f"{prefix}write_approval"
+    write_denied = f"{prefix}write_denied"
+    write_unmatched = f"{prefix}write_unmatched"
+    observed = frozenset(
+        {read_allowed, write_approval, write_denied, write_unmatched}
+    )
+
+    real_projection = boot.policy_disallowed_tools
+    projection_states: list[tuple[tuple[Any, ...], tuple[Any, ...]]] = []
+
+    def observe_projection(gate: Any, tools: frozenset[str]):
+        before = _approval_state(gate)
+        hidden = tuple(real_projection(gate, tools))
+        after = _approval_state(gate)
+        projection_states.append((before, after))
+        return hidden
+
+    monkeypatch.setattr(boot, "policy_disallowed_tools", observe_projection)
+    options = _boot_options(
+        monkeypatch,
+        _config_for(root, approval_grant_tool=write_approval),
+        potential_write=True,
+        observed_tools=observed,
+        readonly_tools=frozenset({read_allowed}),
+    )
+
+    assert set(options.disallowed_tools) == {write_denied, write_unmatched}
+    assert len(options.disallowed_tools) == 2
+    assert write_approval not in options.disallowed_tools
+    assert projection_states
+    assert all(before == after for before, after in projection_states)
+    assert projection_states[0][0][7] == write_approval
+
+
+def test_boot_with_no_policy_adds_no_observed_mcp_names_to_disallowed_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _bundle(
+        tmp_path,
+        mcp={"mcpServers": {"operations": {"command": "fixture-command"}}},
+    )
+    observed = frozenset(
+        {
+            "mcp__plugin_b_operations__write_denied",
+            "mcp__plugin_b_operations__write_unmatched",
+        }
+    )
+
+    options = _boot_options(
+        monkeypatch,
+        _config_for(root),
+        potential_write=True,
+        observed_tools=observed,
+    )
+
+    assert options.disallowed_tools == []
 
 
 def test_a_scope_rendered_by_the_worker_reaches_the_mounted_connector(tmp_path: Path) -> None:

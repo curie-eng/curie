@@ -28,11 +28,11 @@ targets:
   dev:
     agent: routing-dev
     env: dev
-    slack_channel: C0EXAMPLE1
+    slack_channel: C000000A01
   prod:
     agent: routing-prod
     env: prod
-    slack_channel: C0EXAMPLE2
+    slack_channel: C000000A02
 """
 
 

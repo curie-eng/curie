@@ -77,17 +77,14 @@ environment variables and secret references, and it will be stored in the contro
 plane. Some resources are honestly not snapshot-able: report those irreversible
 rather than storing credentials to make an undo button appear.
 
-## Worked example
+## Worked shape
 
-[`examples/sre-bot/connectors/k8s-scale/server.py`](../examples/sre-bot/connectors/k8s-scale/server.py)
-is the reference. It is worth reading alongside its neighbour
-[`k8s-write`](../examples/sre-bot/connectors/k8s-write/server.py), which is
-irreversible and says so — the pair is what a receipt reading "restarting pods
-cannot be undone" next to "scaled 3 to 10, undo" is made of.
-
-The scale connector is also the narrower grant of the two, which is not a
-coincidence: it writes through the `deployments/scale` subresource, so Kubernetes
-refuses an image change rather than the connector declining to make one.
+A reversible scale action first reads the workload's current replica count,
+writes through the Kubernetes `scale` subresource, and returns the prior count
+as its restore payload. An irreversible action returns no restore payload and
+says so explicitly. Keep the scale credential limited to the scale subresource;
+that makes Kubernetes refuse an image change instead of relying on connector
+code to decline it.
 
 ## What the platform does with it
 

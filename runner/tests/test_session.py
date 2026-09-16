@@ -139,6 +139,63 @@ def test_happy_turn_stream_shape() -> None:
     assert runner.status == SessionStatus.DONE
 
 
+def test_first_resumed_turn_records_cache_read_metric_once(monkeypatch) -> None:
+    calls: list[tuple[str, int | float | None, dict[str, object] | None]] = []
+
+    def record(name, value=None, *, attributes=None):
+        calls.append((name, value, attributes))
+
+    monkeypatch.setattr("curie_runner.session.record_metric", record)
+
+    def turn():
+        return [
+            AssistantMessage(content=[TextBlock(text="ok")], model="fake"),
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="sdk-session",
+                usage={
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 321,
+                    "cache_creation_input_tokens": 0,
+                },
+                result="ok",
+            ),
+        ]
+
+    runner = SessionRunner(
+        session_factory=lambda: FakeModelSession(turn),
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="resume-cache",
+        history_resumed=True,
+    )
+
+    async def go() -> None:
+        await runner.start()
+        for ts in ("1", "2"):
+            async for _ in runner.run_turn(
+                Event(type="message", text="continue", user="U", ts=ts)
+            ):
+                pass
+
+    anyio.run(go)
+
+    cache_calls = [call for call in calls if call[0] == "curie.history.resume.cache_read"]
+    assert cache_calls == [
+        (
+            "curie.history.resume.cache_read",
+            321,
+            {"service.name": "curie-runner", "source": "runner", "cache_hit": "true"},
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     ("session_type", "expected_phase", "expect_tool"),
     (

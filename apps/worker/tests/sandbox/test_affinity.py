@@ -56,6 +56,45 @@ def test_delete_if_claim_guards_against_stale_releaser(affinity: AffinityStore) 
     assert not affinity.delete_if_claim("T1", "claim-a")
 
 
+def test_replace_if_generation_is_an_atomic_claim_and_generation_fence(
+    affinity: AffinityStore,
+) -> None:
+    original = RouteRecord(handle=_handle(claim="claim-a"))
+    replacement = RouteRecord(
+        handle=SandboxHandle(
+            **{
+                **_handle(claim="claim-b").__dict__,
+                "workspace_repo": "acme-corp/acme-bot",
+                "generation": 1,
+            }
+        )
+    )
+    assert affinity.put_if_absent("T1", original, ttl_seconds=60)
+
+    assert not affinity.replace_if_generation(
+        "T1",
+        expected_claim="claim-stale",
+        expected_generation=0,
+        record=replacement,
+        ttl_seconds=60,
+    )
+    assert not affinity.replace_if_generation(
+        "T1",
+        expected_claim="claim-a",
+        expected_generation=1,
+        record=replacement,
+        ttl_seconds=60,
+    )
+    assert affinity.replace_if_generation(
+        "T1",
+        expected_claim="claim-a",
+        expected_generation=0,
+        record=replacement,
+        ttl_seconds=60,
+    )
+    assert affinity.get("T1") == replacement
+
+
 def test_mark_suspended_records_history_ref(affinity: AffinityStore) -> None:
     affinity.put_if_absent("T1", RouteRecord(handle=_handle()), ttl_seconds=60)
 

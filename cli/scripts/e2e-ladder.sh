@@ -69,16 +69,27 @@
 #                            `local-release` is a fourth, separately-named rung
 #                            (the same local round trip against the generated
 #                            compose.release.yaml instead of compose.dev.yaml);
-#                            it is NOT folded into `all` because it needs every
-#                            curie-owned image the generated compose artifact
-#                            names (derived by compose/release_images.py)
-#                            built and tagged locally first, a step `all`'s
-#                            existing skill/local/cluster rungs don't require --
-#                            name it explicitly, e.g.
+#                            it is NOT folded into `all` because it needs the
+#                            release-pinned images (ghcr.io/curie-eng/curie-api
+#                            and -worker-local) built and tagged locally first,
+#                            a step `all`'s existing skill/local/cluster rungs
+#                            don't require -- name it explicitly, e.g.
 #                            CURIE_E2E_TIERS=skill,local,local-release.
 #   CURIE_E2E_LIVE         1 = real model on every named rung, including
 #                            rung 1 (cli/scripts/e2e.sh reads this same var
 #                            itself rather than being told by the ladder).
+#   CURIE_NAMESPACE        Kubernetes namespace the cluster rung targets.
+#                            Default curie when unset on the regular path
+#                            (empty-but-set does not default). Forwarded as
+#                            --namespace on every cluster verb. Product
+#                            observability still requires an explicit
+#                            non-default value.
+#   CURIE_RELEASE          Helm release the cluster rung targets. Default
+#                            curie when unset on the regular path
+#                            (empty-but-set does not default). Forwarded as
+#                            --release on every cluster verb. Product
+#                            observability still requires an explicit
+#                            non-default value.
 #   CURIE_BIN              path to a prebuilt curie binary (skip cargo build)
 #   CURIE_E2E_CONNECTOR_BUNDLE
 #                          opt-in: path to a bundle that declares connectors
@@ -131,8 +142,8 @@ CONNECTOR_FIXTURE="$REPO_ROOT/cli/scripts/fixtures/sre-bot-connectors-enabled.ya
 # The connectors the fixture builds FROM SOURCE, and the tool set each must
 # serve. These two are the subject of the assertion; the fixture's third
 # connector is an ordinary `image:` one, hosted beside them as the control.
-CONNECTOR_BUILT=(k8s-write tempo)
-CONNECTOR_TOOLS_K8S_WRITE="restart_deployment"
+CONNECTOR_BUILT=(self-upgrade tempo)
+CONNECTOR_TOOLS_SELF_UPGRADE="latest_release,upgrade_platform,upgrade_self"
 CONNECTOR_TOOLS_TEMPO="get_trace,list_trace_tag_values,list_trace_tags,search_traces"
 # The port every connector in the fixture serves on (`ConnectorSpec.port`'s
 # default). Release, agent and namespace are deliberately NOT constants here:
@@ -794,8 +805,8 @@ seed_cluster_missing_carrier_control() {
     local marker="curie-seed-cluster-missing-carrier-$$-$RANDOM"
     local stream_start stream_end out private_slice
     stream_start="$(capture_stream_cursor cluster)" || return 1
-    out="$("$BIN" --json cluster message --namespace "$CURIE_NAMESPACE" \
-        --release "$CURIE_RELEASE" "missing carrier compatibility $marker" || true)"
+    out="$("$BIN" --json cluster message "${ns_rel[@]}" \
+        "missing carrier compatibility $marker" || true)"
     assert_finalized_reply "cluster missing-carrier compatibility" "$out"
     stream_end="$(capture_stream_cursor cluster)" || return 1
     [[ "$stream_end" != "$stream_start" ]] || {
@@ -1035,8 +1046,8 @@ query_exact_seed_trace() {
         if [[ "$tier" == "local" ]]; then
             "$BIN" --json local observability run "$trace_id" > "$private_read" 2>/dev/null || code=$?
         elif [[ "$tier" == "cluster" ]]; then
-            "$BIN" --json cluster observability --namespace "$CURIE_NAMESPACE" \
-                --release "$CURIE_RELEASE" run "$trace_id" > "$private_read" 2>/dev/null || code=$?
+            "$BIN" --json cluster observability "${ns_rel[@]}" \
+                run "$trace_id" > "$private_read" 2>/dev/null || code=$?
         else
             rm -f "$private_read" "$safe_read"
             echo "seed-invalid: exact trace query tier is unknown" >&2
@@ -1798,11 +1809,23 @@ probe_local_fake_model() {
     printf '%s' "$value"
 }
 
+# Chart fullname worker: release if it contains "curie", else `{release}-curie`,
+# then trunc 63 and strip exactly one trailing dash, then `-worker`.
+cluster_worker_deploy() {
+    local release="${CURIE_RELEASE-curie}" fullname
+    case "$release" in
+        *curie*) fullname="$release" ;;
+        *) fullname="${release}-curie" ;;
+    esac
+    fullname="${fullname:0:63}"
+    fullname="${fullname%-}"
+    printf '%s' "${fullname}-worker"
+}
+
 probe_cluster_fake_model() {
-    # Release and namespace both default to `curie` (cli/src/main.rs), which is
-    # what this rung runs against; the deployment name is built the same way the
-    # CLI builds it, as `deployment/<release>-worker`.
-    kubectl -n curie get deployment/curie-worker \
+    # Defaults remain curie when unset. The probe follows the selected
+    # namespace and the chart fullname worker.
+    kubectl -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
         -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_FAKE_MODEL")].value}'
 }
 
@@ -2096,28 +2119,27 @@ connector_mode() {
 # `curie secrets set` -- which writes the operator's real store -- is never run.
 #
 # The kubeconfigs need no cluster. These rungs assert HOSTING, not live
-# Kubernetes access: the write connector refuses to start without a kubeconfig
-# file and starts with a well-formed one, which is exactly the fail-closed
-# behavior under test.
+# Kubernetes access: connector bring-up refuses a missing declared kubeconfig,
+# while the MCP catalog probe never invokes an upgrade or contacts Kubernetes.
 provision_connector_credentials() {
     local creds="$WORKDIR/connector-creds"
     mkdir -p "$creds"
     chmod 700 "$creds"
 
     local name
-    for name in K8S_READONLY_KUBECONFIG K8S_WRITE_KUBECONFIG GRAFANA_SERVICE_ACCOUNT_TOKEN; do
+    for name in K8S_READONLY_KUBECONFIG SELF_UPGRADE_KUBECONFIG GRAFANA_SERVICE_ACCOUNT_TOKEN; do
         if [[ "$CONNECTOR_OMIT_SECRET" == "$name" ]]; then
             echo "connector credentials: SKIPPING $name deliberately (CURIE_E2E_CONNECTOR_OMIT_SECRET)."
             echo "connector credentials: the rung below MUST now fail closed on the missing credential. A rung that starts a connector anyway is the failure this run is looking for."
             continue
         fi
         case "$name" in
-            K8S_READONLY_KUBECONFIG|K8S_WRITE_KUBECONFIG)
+            K8S_READONLY_KUBECONFIG|SELF_UPGRADE_KUBECONFIG)
                 # A SEPARATE credential per connector, never one reused: that is
                 # the example's own rule (examples/sre-bot/connectors.yaml), and
                 # reusing one here would quietly assert the opposite shape.
                 local user="ladder-reader" file="$creds/readonly.kubeconfig"
-                if [[ "$name" == "K8S_WRITE_KUBECONFIG" ]]; then
+                if [[ "$name" == "SELF_UPGRADE_KUBECONFIG" ]]; then
                     user="ladder-writer"
                     file="$creds/writer.kubeconfig"
                 fi
@@ -2151,10 +2173,11 @@ prepare_connector_bundle() {
     local hosted_names
     cp "$CONNECTOR_FIXTURE" "$dir/connectors.yaml"
     # The fixture is a subset of the example's connectors. The scratch
-    # plugin.json still carries gates for connectors the fixture does not
-    # host; leaving those in place makes the owned copy fail
-    # approval_policy.gate_not_namespaced at skill up (#2423). This stage
-    # owns both files on the scratch copy.
+    # plugin.json still carries gates and toolPolicy entries for connectors
+    # the fixture does not host; leaving those in place makes the owned copy
+    # fail approval_policy.gate_not_namespaced or tool_policy.unknown_server
+    # at skill up (#2423, #2295). This stage owns both files on the scratch
+    # copy.
     hosted_names="$(mktemp)"
     awk '
         $0 == "connectors:" { inside = 1; next }
@@ -2185,6 +2208,20 @@ for gate in gates:
             continue
     kept.append(gate)
 policy["gates"] = kept
+tool_policy = data.get("toolPolicy")
+if isinstance(tool_policy, dict):
+    for key in ("allow", "approvalRequired", "deny"):
+        items = tool_policy.get(key)
+        if not isinstance(items, list):
+            continue
+        kept_items = []
+        for item in items:
+            if isinstance(item, str) and "/" in item:
+                server = item.split("/", 1)[0]
+                if server not in hosted and "*" not in server and "?" not in server:
+                    continue
+            kept_items.append(item)
+        tool_policy[key] = kept_items
 plugin_path.write_text(json.dumps(data, indent=2) + "\n")
 PY
     then
@@ -2648,7 +2685,7 @@ assert_connector_parity() {
         if [[ "$connector" == "tempo" ]]; then
             probe_args+=("$CONNECTOR_TOOLS_TEMPO" "get_trace")
         else
-            probe_args+=("$CONNECTOR_TOOLS_K8S_WRITE")
+            probe_args+=("$CONNECTOR_TOOLS_SELF_UPGRADE")
         fi
         if [[ "$kind" == "docker" ]]; then
             probe_out="$(docker exec -i "$host_ref" python - "${probe_args[@]}" < "$WORKDIR/mcp_probe.py")" || {
@@ -2990,7 +3027,7 @@ case_connector_registry_missing_cluster() {
     fi
     echo "cluster: tempo's locked image corrupted to '$bad' for this one deploy"
 
-    out="$("$BIN" --json cluster deploy --plugin-dir "$WORKDIR/bundle" 2>&1)" && code=0 || code=$?
+    out="$("$BIN" --json cluster deploy "${ns_rel[@]}" --plugin-dir "$WORKDIR/bundle" 2>&1)" && code=0 || code=$?
     printf '%s\n' "$out"
 
     # Restored BEFORE the assertions, so a red one cannot carry a corrupt lock
@@ -4345,20 +4382,31 @@ rung_local_release() {
     # ghcr.io/curie-eng/curie-worker-local image, and curie-api/-migrate
     # were already a pull, never a build) -- every curie-owned image it needs
     # must already exist locally under the tag the generator pinned, or `local
-    # up` will try to pull a private GHCR image with no credentials. Derive
-    # that set from this artifact (compose/release_images.py), including the
-    # slack profile: `curie local message` runs a one-shot dispatcher
-    # container from the same image with no slack profile (#1915, #2424).
-    # postgres/valkey/rustfs stay public and pulled on demand same as
-    # rung_local. Never pull a missing curie-owned tag.
+    # up` will try to pull a private GHCR image with no credentials. Check only
+    # the selected profile's images and
+    # only the curie-owned ones: postgres/valkey/rustfs are public and pulled
+    # on demand same as rung_local already assumes.
     local compose_profile="core"
     if [[ -f "$WORKDIR/bundle-release/evals/trajectory.json" ]]; then
         compose_profile="full"
     fi
-    if ! python3 "$REPO_ROOT/compose/release_images.py" \
-        --compose "$release_compose" \
-        --profiles "$compose_profile,slack" \
-        --check; then
+    python3 "$REPO_ROOT/compose/release_images.py" \
+        --compose "$release_compose" --profiles "$compose_profile" --check || return 1
+    # Derive the required GHCR refs from the generated compose plus the
+    # images `local message` still needs (dispatcher one-shot, runner env)
+    # rather than a hardcoded list that grows one missing image at a time
+    # (#2005, #2245).
+    local missing=0 image
+    while IFS= read -r image; do
+        [[ -n "$image" ]] || continue
+        if ! docker image inspect "$image" >/dev/null 2>&1; then
+            echo "error: image '$image' is required by compose.release.yaml's $compose_profile profile and is not present locally." >&2
+            missing=1
+        fi
+    done < <(python3 "$REPO_ROOT/compose/ensure_release_images.py" \
+        --compose-file "$release_compose" --profiles "$compose_profile" --list)
+    if (( missing )); then
+        echo "fix: python3 compose/ensure_release_images.py --profiles $compose_profile --build-missing, then re-run." >&2
         return 1
     fi
 
@@ -4789,8 +4837,7 @@ rung_cluster_product() {
     RAN_RUNGS="$RAN_RUNGS cluster"
     preflight_cluster_product_observability
     local deploy_json digest agent_id agent_name
-    deploy_json="$("$BIN" --json cluster deploy \
-        --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
+    deploy_json="$("$BIN" --json cluster deploy "${ns_rel[@]}" \
         --plugin-dir "$WORKDIR/bundle")"
     digest="$(deploy_field "cluster" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "cluster" "$deploy_json" agent.id)"
@@ -4799,9 +4846,54 @@ rung_cluster_product() {
     assert_bundle_identity "cluster" "$digest"
 }
 
+# DNS-1123 label: lowercase alphanumeric and hyphens, start and end
+# alphanumeric, at most 63 characters. Used for CURIE_NAMESPACE. Empty-but-set
+# is invalid; the regular cluster path defaults unset names to curie before
+# this runs.
+validate_cluster_dns_label() {
+    local var="$1" value="$2"
+    if [[ -z "$value" ]]; then
+        echo "error: $var is empty; the cluster rung needs a DNS-1123 Kubernetes namespace." >&2
+        echo "fix: set $var to a lowercase alphanumeric label with optional hyphens (start and end alphanumeric, at most 63 characters)." >&2
+        return 1
+    fi
+    local re='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+    if [[ ! "$value" =~ $re ]]; then
+        echo "error: $var='$value' is not a DNS-1123 label (lowercase alphanumeric and hyphens, start and end alphanumeric, at most 63 characters)." >&2
+        echo "fix: set $var to a valid Kubernetes namespace; '$value' is not one." >&2
+        return 1
+    fi
+}
+
+# Helm release name: DNS-1123 subdomain, at most 53 characters (Helm's cap so a
+# 10-character revision suffix still fits in 63). Dots are allowed.
+# Empty-but-set is invalid.
+validate_cluster_helm_release() {
+    local var="$1" value="$2"
+    if [[ -z "$value" ]]; then
+        echo "error: $var is empty; the cluster rung needs a Helm release name." >&2
+        echo "fix: set $var to a DNS-1123 subdomain of at most 53 characters (lowercase alphanumeric, hyphens, and dots; start and end alphanumeric)." >&2
+        return 1
+    fi
+    local re='^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+    if [[ ${#value} -gt 53 || ! "$value" =~ $re ]]; then
+        echo "error: $var='$value' is not a Helm release name (DNS-1123 subdomain, at most 53 characters)." >&2
+        echo "fix: set $var to a valid Helm release name; '$value' is not one." >&2
+        return 1
+    fi
+}
+
 # Rung 3: the deployed release. Requires one to already exist; it is never
 # installed or torn down here, because the cluster is shared.
 rung_cluster() {
+    if [[ "$PRODUCT_OBSERVABILITY" != "1" ]]; then
+        CURIE_NAMESPACE="${CURIE_NAMESPACE-curie}"
+        CURIE_RELEASE="${CURIE_RELEASE-curie}"
+    fi
+    validate_cluster_dns_label CURIE_NAMESPACE "${CURIE_NAMESPACE-}" || return 1
+    validate_cluster_helm_release CURIE_RELEASE "${CURIE_RELEASE-}" || return 1
+    ns_rel=(--namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE")
+
     if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]; then
         rung_cluster_product
         return
@@ -4814,11 +4906,11 @@ rung_cluster() {
     echo "=== curie cluster status (gate) ==="
     # Gate on the PAYLOAD, not the exit code: `cluster status` is a read-only
     # report verb and exits 0 even when the release is absent (it just prints
-    # "release curie not found"), so an exit-code gate never fires and the
+    # "release $CURIE_RELEASE not found"), so an exit-code gate never fires and the
     # rung falls through into a confusing `cluster deploy` failure instead.
     # --json puts the object on stdout and human text on stderr.
     local status_json found
-    status_json="$("$BIN" --json cluster status 2>/dev/null || true)"
+    status_json="$("$BIN" --json cluster status "${ns_rel[@]}" 2>/dev/null || true)"
     printf '%s\n' "$status_json"
     found="$(printf '%s' "$status_json" | python3 -c '
 import json, sys
@@ -4830,8 +4922,8 @@ except Exception:
 print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
 ' || echo "no")"
     if [[ "$found" != "yes" ]]; then
-        echo "error: CURIE_E2E_TIERS named the cluster rung, but no installed release was reported by \`curie --json cluster status\`." >&2
-        echo "fix: install a release with \`curie cluster up --fake-model\` (or point kubectl at the right context), or drop cluster from CURIE_E2E_TIERS." >&2
+        echo "error: CURIE_E2E_TIERS named the cluster rung, but no installed release was reported by \`curie --json cluster status --namespace $CURIE_NAMESPACE --release $CURIE_RELEASE\`." >&2
+        echo "fix: install a release with \`curie cluster up --namespace $CURIE_NAMESPACE --release $CURIE_RELEASE --fake-model\` (or point kubectl at the right context), or drop cluster from CURIE_E2E_TIERS." >&2
         return 1
     fi
 
@@ -4843,7 +4935,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     # deploy receipt's bundle.sha256 is the only artifact-identity surface here
     # too.
     local deploy_json digest agent_id agent_name deployment_id deployment_status deployment_environment
-    deploy_json="$("$BIN" --json cluster deploy --plugin-dir "$WORKDIR/bundle")"
+    deploy_json="$("$BIN" --json cluster deploy "${ns_rel[@]}" --plugin-dir "$WORKDIR/bundle")"
     printf '%s\n' "$deploy_json"
     digest="$(deploy_field "cluster" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "cluster" "$deploy_json" agent.id)"
@@ -4904,9 +4996,9 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
         # -- it is the namespace the release is installed into -- which is why
         # the pinned entry set excludes it.
         local cluster_release cluster_namespace
-        cluster_release="$(kubectl -n curie get deployment/curie-worker \
+        cluster_release="$(kubectl -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
             -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_RELEASE")].value}')"
-        cluster_namespace="$(kubectl -n curie get deployment/curie-worker \
+        cluster_namespace="$(kubectl -n "$CURIE_NAMESPACE" get "deployment/$(cluster_worker_deploy)" \
             -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_NAMESPACE")].value}')"
         assert_connector_parity "cluster" kubectl "$cluster_release" "$agent_name" "$cluster_namespace"
         case_connector_registry_missing_cluster "$cluster_release" "$agent_name" "$cluster_namespace"
@@ -4933,7 +5025,9 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     # surface this rung exists to gate -- resolves. It is the documented
     # `--listen-host` operator escape hatch, not a test-only shortcut: the exact
     # value any loopback-API-server cluster needs.
-    local msg_args=(--json cluster message "$PROMPT")
+    local msg_args=(--json cluster message)
+    msg_args+=("${ns_rel[@]}")
+    msg_args+=("$PROMPT")
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
         echo "using --listen-host ${CURIE_E2E_LISTEN_HOST} (worker->stub reply host)"
         msg_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
@@ -4952,6 +5046,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     # plan here, an auditable green on the live/retention grades -- and passing
     # it once per call site is what keeps it from being passed twice at any.
     local eval_args=(cluster eval)
+    eval_args+=("${ns_rel[@]}")
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
         eval_args+=(--cases "$WORKDIR/bundle/evals/cases.json")
     fi
@@ -4995,7 +5090,9 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
             echo "cluster: retention eval suite $eval_i reported a failing case. Not failing the rung: this rung's grade is report only (#1603)." >&2
         fi
     done
-    local retention_args=(--json cluster message "$PROMPT")
+    local retention_args=(--json cluster message)
+    retention_args+=("${ns_rel[@]}")
+    retention_args+=("$PROMPT")
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
         retention_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
     fi

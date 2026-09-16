@@ -44,10 +44,12 @@ reported as a failed case, so a server without this route fails every eval case
 that has not opted into shared history. The reference implementation is
 `runner/src/curie_runner/server.py`.
 
-Session setup is **not** on the wire — it comes from the environment. Read it once
-at startup with `SessionConfig.from_env()` (the `CURIE_*` mapping: `plugin_dir`,
-`session_id`, `sandbox_id`, `budget`, optional `memory_ref`, `credentials_ref`,
-`otel`).
+Startup configuration remains **environment-only**. Read it once with
+`SessionConfig.from_env()` (the `CURIE_*` mapping: `plugin_dir`, `session_id`,
+`sandbox_id`, `budget`, optional `memory_ref`, `credentials_ref`, `otel`). The
+inbound `Event` separately has optional `session_id` and `history_ref` fields for
+conversation-scoped identity after a sandbox is bound. They are wire metadata,
+not a replacement for `SessionConfig`, and older producers may omit either one.
 
 ## The wire contract in one screen
 
@@ -55,7 +57,9 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
 
 **Inbound** — a discriminated union on `kind` (`parse_inbound` decodes it):
 
-- `Event` = `{kind: "event", type: "message"|"job"|"eval_case", text, user, ts}`
+- `Event` = `{kind: "event", type: "message"|"job"|"eval_case", text, user, ts,
+  session_id?, history_ref?}`. The optional fields are nullable strings; either
+  may be omitted independently.
 - `Interrupt` = `{kind: "interrupt", reason}`
 
 **Outbound** — a discriminated union on `type`, each carrying `version`
@@ -71,7 +75,7 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
   made and once when its result arrives, joined on `call_id` (ADR-0117)
 
 **Version gate (strict producer, tolerant consumer).** Your producer emits its
-**exact build `PROTOCOL_VERSION`** (currently `0.4.3`) on every outbound event and
+**exact build `PROTOCOL_VERSION`** (currently `0.4.6`) on every outbound event and
 constructs strictly -- an unknown field is an error at construction, catching your
 mistakes at the source. A **consumer** decoding the wire is tolerant the other way:
 it accepts any version compatible with its own build (`major.minor` match under

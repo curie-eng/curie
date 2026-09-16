@@ -55,7 +55,12 @@ raising. The shapes it checks (`packages/plugin-format/src/plugin_format/models.
 `homepage`, `repository`, `license`, `keywords`, `commands`, `agents`, `hooks`, `mcpServers`;
 `SkillFrontmatter`
 (`packages/plugin-format/src/plugin_format/models.py::SkillFrontmatter`, a `SKILL.md` frontmatter)
-with `name`/`description` required and `allowed_tools` aliased to the verbatim `allowed-tools` key;
+with `name`/`description` required and `allowed_tools` aliased to the verbatim `allowed-tools` key,
+which accepts **either** a string or a list of strings — the canonical serialized shape is the
+space-separated string (`allowed-tools: Read Bash`), split on whitespace or a comma at parenthesis
+depth 0 so a specifier such as `Bash(git commit:*)` stays one entry, and the list forms are accepted
+for compatibility ([ADR-0135](../../adr/0135-a-skill-bundle-has-two-conformance-profiles.md), Draft,
+which also adds the second, non-default `agent-skills-strict` validation profile);
 `McpServer`/`McpConfig` (`packages/plugin-format/src/plugin_format/models.py::McpConfig`, the
 `.mcp.json` file) where the validator enforces each server define `command` (stdio) or `url`
 (remote).
@@ -281,7 +286,7 @@ trigger declarations) alongside this.
 Three of those Curie authoring extensions are **deploy-time validated** (shape enforced, malformed
 declarations rejected), but they differ in whether the runtime acts on them yet:
 
-- `approvalPolicy` (`{gates: [{gate, route, grantableViaPolicy}]}` approval declarations, #273) is **consumed at
+- `approvalPolicy` (`{gates: [{gate, route, grantableViaPolicy, summary}]}` approval declarations, #273) is **consumed at
   runtime**, not merely validated: the runner reads the gates at boot (`load_approval_policy`,
   #247 / ADR-0010) and arms each `{gate, route}` on the permission gate — so calling this
   "not-yet-built" is stale (see the [approval seam](../approval/INTERFACE.md)). A declared
@@ -296,7 +301,12 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   tool (`approval_policy.grant_route_ambiguous`), because the shared normalizer
   (`packages/plugin-format/src/plugin_format/approval_policy.py::grantable_routes`, the same helper
   the runner's loader calls) excludes an ambiguous route, so the policy would otherwise validate
-  green and arm no grant.
+  green and arm no grant. A fourth optional field, `summary` (#2565, Draft ADR-0151), is a
+  bundle-authored sentence template rendered from the blocked call's arguments (`{ident}`
+  scalars, `{ident|count}` / `{ident|length}`). The grammar lives in
+  `packages/plugin-format/src/plugin_format/gate_summary.py` so the deploy validator and the
+  runtime renderer cannot drift. A gate that omits `summary` keeps today's machine
+  `summarize_tool_call` string on the card and notice.
 - `triggers` (a list of `cron`/`webhook` declarations for waking the agent beyond chat, #273/#270 —
   see the [triggers seam](../triggers/INTERFACE.md)) is still **declaration-only**: its validator
   runs at deploy, but no runtime scheduler/ingress consumes a declared trigger yet (Epic #29).

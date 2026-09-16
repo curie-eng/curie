@@ -26,6 +26,70 @@ harness, from a released binary or someone else's bundle.
   on what commands exist.** It is hidden from `--help`, and it is real.
 - `curie schema-index`: the committed, versioned JSON Schemas for every `--json`
   result, so you can check that a payload field exists before you trust it.
+- [Repository toolchain in the managed sandbox](guides/repository-toolchain-in-the-managed-sandbox.md):
+  installing a repository's dependencies and running its checks inside a
+  managed sandbox. A live-registry install under the chart's fail-closed
+  egress default is a refusal, not a hang: about 368 seconds on pip's
+  unconfigured retry budget (measured 2026-09-11 on curie-runner:0.8.7). The
+  runner image now ships /etc/pip.conf with retries = 0 so the same command
+  fails on the first unreachable attempt.
+
+## Supported SRE bundle
+
+The source checkout's `examples/sre-bot` is a supported bundle under ADR-0041.
+Its [surface contract](../examples/sre-bot/supported-surface.json) requires the
+same capability decisions at skill, local, local-release and cluster tiers.
+Externally hosted connectors supply the declared unhosted URLs where the tier
+cannot host them. Missing hosting or credentials is an unproved tier, never an
+absent capability accepted as parity. Live provider and external integration
+observations additionally prove SDK gating, genuine decisions and upstream effects.
+
+From a source checkout, install the checker dependencies and validate declarations:
+
+```bash
+python -m pip install -r tools/sre-contract/requirements.txt -e packages/plugin-format
+python tools/sre-contract/check.py
+python -m pytest -q tools/sre-contract/tests
+```
+
+The [bundle schema](../examples/sre-bot/supported-surface.schema.json) governs
+the combined manifest, connectors and supported surface. The consumer compares
+the [permission map](../examples/sre-bot/docs/PERMISSION-MAP.md) and uses the
+product's policy classifier. A static pass proves declaration consistency only.
+The supported reads are classified explicitly. The complete image catalog and
+eight starter-prompt observations in #2285 remain separate acceptance evidence.
+
+For catalog verification, place every connector's real MCP URL in a protected
+JSON object keyed by connector name. Run the following with that file path:
+
+```bash
+python tools/sre-contract/check.py --endpoints "$SRE_CONNECTOR_ENDPOINTS"
+```
+
+It enumerates every catalog, including image-only connectors, rejects missing or
+empty catalogs, checks effective policy and executes the existing
+`assert-gates-are-live-tools.py` checker. The Plugin compat workflow runs
+the following against the declared images and built connector source:
+
+```bash
+python tools/sre-contract/catalog_ci.py
+```
+
+That job uses inert credentials and only lists tools; it does
+not prove an upstream API call, SDK model visibility, Slack approval or RBAC.
+Its prerequisite consistency failure remains red rather than allowing a skip to
+count as proof. HTTP fixtures are expressly separate from actual image catalogs.
+
+At each tier, record the exact bundle and eval digest, candidate and command,
+then prove a read, pending write, denied unchanged state, fresh approval and
+post-action readback. On cluster installs verify both upgrade CronJobs exist
+before arming them, and execute the RBAC ceiling refusal. Use the commands and
+expected observations in the [SRE demo contract](../examples/sre-bot/DEMO.md).
+Run the same applicable cases through `curie skill eval --json`,
+`curie local eval --json` and `curie cluster eval --json` with configured real
+connectors. A fake evaluation cannot close those observations. Record a causal
+mutation failure and restored healthy result for each guard; removing a required
+tier, a permission row, connector or gate must fail the source contract as well.
 
 ## Ask the human, or do it yourself
 
@@ -70,6 +134,35 @@ banned in this contract, so all three tiers are written out in full:
 - skill tier: `curie skill status --json` then `curie skill eval --json`
 - local tier: `curie local status --json` then `curie local eval --json`
 - cluster tier: `curie cluster status --json` then `curie cluster eval --json`
+
+**After `curie cluster upgrade --to 0.9.0 --json`:** `status` is `"succeeded"`
+only when `convergence.exact` is true and `canary.passed` is true. A failed
+attempt reports `previous_serving` or one `fail_forward.command`. The
+payload always includes a `compatibility` object (or `null`) with the
+redacted schema-compatibility decision. Resume a normal command failure by
+running the same command only when cleanup released ownership. `curie cluster
+status --json` reports the current upgrade phase and `known_good_version`.
+
+After confirmation, a current `curie cluster upgrade` claims the namespaced
+upgrade checkpoint before reading release snapshots or running Helm. A
+competing current `curie cluster upgrade` refuses and names the opaque holder
+and redacted target action. Each checkpoint write and ordinary release compares
+that holder and the last Kubernetes `resourceVersion`. A stale writer stops
+rather than overwriting the newer record. Current `curie cluster up`, `curie
+cluster rollback`, and `curie cluster down` processes do not participate. This
+cooperative check also does not cover older CLIs, raw Helm commands, direct
+Kubernetes writes, or cluster administrators, and it does not make all upgrade
+effects transactional or exactly once.
+
+Any interruption after ownership acquisition, including Ctrl C, SIGINT, and
+SIGTERM, leaves the holder in place. A normal exit that reports an ownership
+release CAS failure can also leave it. There is no expiry or automatic
+takeover. Verify that the old process and its Helm action have stopped before
+following the conditional recovery procedure in
+[`docs/operations.md`](operations.md), then rerun. Never delete the checkpoint
+to recover. Clearing a live holder can allow overlapping operations. If the
+release namespace is absent, establish it with `curie cluster up` first.
+Upgrade ownership is namespaced and does not read the Namespace object.
 
 At the skill tier the bundle is the session, so there is no separate deploy
 <!-- doclint:ignore-line -->

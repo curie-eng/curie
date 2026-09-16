@@ -248,7 +248,11 @@ mod tests {
     #[test]
     fn unknown_live_revision_is_outside_every_window() {
         let window = window_for("0.8.6").unwrap();
-        assert!(!live_in_window("0040", &window));
+        assert!(!live_in_window("0099", &window));
+        assert!(
+            !live_in_window("0040", &window),
+            "0.8.6's declared window ends at 0039; 0040 is this tree's later head"
+        );
     }
 
     #[test]
@@ -330,14 +334,21 @@ mod tests {
                 "catalog revisions missing alembic id {id}"
             );
         }
-        let heads: Vec<&String> = found
+        let mut heads: Vec<&String> = found
             .iter()
             .filter(|id| !down_of.iter().any(|down| down == *id))
             .collect();
+        heads.sort();
+        assert_eq!(heads.len(), 1, "expected one alembic head, got {heads:?}");
+        let tree_head = heads[0];
+        assert!(
+            catalog().revisions.iter().any(|item| item == tree_head),
+            "catalog revisions missing this tree's alembic head {tree_head}"
+        );
         assert_eq!(
-            heads.as_slice(),
-            &[&window.schema_head],
-            "Chart.yaml appVersion {app_version} window head must be this tree's alembic head"
+            window.schema_head,
+            *tree_head,
+            "Chart.yaml appVersion {app_version} window head must exactly match this tree's Alembic head {tree_head}; update the application schema window when the catalog revision list advances"
         );
     }
 }

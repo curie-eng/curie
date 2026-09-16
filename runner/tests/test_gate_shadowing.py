@@ -22,6 +22,7 @@ from curie_runner.approval import (
     ApprovalGate,
     ApprovalPolicyError,
     ApprovalPolicyResolution,
+    ShadowedGate,
     _entry_tool,
     _whole_tool_allowed,
     assert_gates_not_shadowed,
@@ -34,7 +35,7 @@ from curie_runner.approval import (
 def _bundle(
     root: Path,
     *,
-    skills: dict[str, list[str] | None],
+    skills: dict[str, list[str] | str | None],
     gates: list[str],
     mcp: dict[str, dict[str, object]] | None = None,
 ) -> str:
@@ -42,7 +43,10 @@ def _bundle(
 
     Args:
         root: Directory to build in.
-        skills: Skill name to its ``allowed-tools`` list, or None to omit the key.
+        skills: Skill name to its ``allowed-tools`` declaration -- a list (written
+            as a YAML block list), a **string** (written as one quoted scalar, the
+            shape the Agent Skills specification calls canonical), or None to omit
+            the key entirely.
         gates: Tool names the manifest's approvalPolicy gates.
         mcp: Optional ``.mcp.json`` server map.
 
@@ -67,7 +71,11 @@ def _bundle(
         skill_dir = root / "skills" / name
         skill_dir.mkdir(parents=True, exist_ok=True)
         lines = ["---", f"name: {name}", "description: A skill."]
-        if allowed is not None:
+        if isinstance(allowed, str):
+            # One canonical scalar. JSON-encoded so a specifier carrying parens,
+            # commas or a colon cannot corrupt the YAML the reader parses.
+            lines.append(f"allowed-tools: {json.dumps(allowed)}")
+        elif allowed is not None:
             lines.append("allowed-tools:")
             lines.extend(f"  - {entry}" for entry in allowed)
         lines += ["---", "", f"# {name}", ""]
@@ -263,3 +271,178 @@ def test_the_message_names_the_file_the_entry_and_the_remedy(tmp_path: Path) -> 
     # The reason has to travel with the message: read from a pod log by someone
     # who did not write the bundle, "conflict" alone is not actionable.
     assert "before the approval callback runs" in message
+
+
+# --- the string form of allowed-tools (#1852, D1/D4) --------------------------
+#
+# ``allowed-tools`` accepts a space- or comma-separated STRING, and the Agent
+# Skills specification calls that shape canonical. Until now the fail-open below
+# was masked only by accident: ``validate_bundle`` rejected a string BEFORE boot,
+# so ``_skill_allowed_tools``'s ``if not isinstance(entries, list): continue``
+# never saw one. Widening the model without normalizing here ARMS that path -- a
+# bundle whose skill preauthorizes Bash boots reporting its Bash gate as armed,
+# and every Bash call runs with no approval record.
+#
+# These tests write the string form on disk and assert detection. They do not
+# import ``parse_allowed_tools``, so they are the contract even before it exists.
+
+
+def test_a_narrowed_string_form_allowance_is_detected(tmp_path: Path) -> None:
+    """The #1852 regression in its canonical shape.
+
+    A string carrying a narrowed rule is skipped wholesale by the pre-fix reader.
+    Narrowing is not a remedy (see the block-list test above): ``Bash(ls:*)``
+    leaves every matching call ungated, which is a partial gate reporting as
+    whole.
+    """
+    plugin_dir = _bundle(tmp_path, skills={"demo": "Bash(ls:*) Read"}, gates=["Bash"])
+
+    conflicts = shadowed_gates(plugin_dir, frozenset({"Bash"}))
+    assert conflicts == (
+        ShadowedGate(skill="skills/demo/SKILL.md", entry="Bash(ls:*)", tool="Bash", whole=False),
+    )
+
+    gate = build_approval_gate(operator_tools=None, policy_routes={"Bash": "ops"})
+    assert gate is not None
+    with pytest.raises(ApprovalPolicyError) as exc:
+        assert_gates_not_shadowed(plugin_dir, gate)
+    assert "skills/demo/SKILL.md" in str(exc.value)
+
+
+def test_a_whole_tool_string_form_allowance_is_detected(tmp_path: Path) -> None:
+    """The bluntest shadow, in the shape the specification calls canonical."""
+    plugin_dir = _bundle(tmp_path, skills={"demo": "Bash"}, gates=["Bash"])
+
+    assert shadowed_gates(plugin_dir, frozenset({"Bash"})) == (
+        ShadowedGate(skill="skills/demo/SKILL.md", entry="Bash", tool="Bash", whole=True),
+    )
+
+    gate = build_approval_gate(operator_tools=None, policy_routes={"Bash": "ops"})
+    assert gate is not None
+    with pytest.raises(ApprovalPolicyError):
+        assert_gates_not_shadowed(plugin_dir, gate)
+
+
+def test_a_comma_separated_string_form_allowance_is_detected(tmp_path: Path) -> None:
+    """Claude Code documents "space- OR comma-separated"; both must be read.
+
+    A reader that split on whitespace alone would see the single entry
+    ``Bash,Read``, whose ``_entry_tool`` is the garbage name ``Bash,Read`` -- no
+    match against the armed ``Bash``, and the shadow is missed.
+    """
+    plugin_dir = _bundle(tmp_path, skills={"demo": "Bash,Read"}, gates=["Bash"])
+
+    assert shadowed_gates(plugin_dir, frozenset({"Bash"})) == (
+        ShadowedGate(skill="skills/demo/SKILL.md", entry="Bash", tool="Bash", whole=True),
+    )
+
+
+def test_a_specifier_containing_a_space_is_detected_intact(tmp_path: Path) -> None:
+    """The single most important test in this file (D4).
+
+    ``Bash(git commit:*)`` is an ordinary Claude Code permission rule, and Claude
+    Code's "space- or comma-separated string" routinely puts a space INSIDE the
+    specifier. A paren-blind splitter cuts it into ``Bash(git`` and ``commit:*)``:
+    ``_entry_tool("Bash(git")`` returns None (unterminated) so the fragment is
+    dropped, and ``_entry_tool("commit:*)")`` returns a name that matches nothing
+    armed. The rule preauthorizes Bash, the gate reports armed, and NOTHING is
+    reported -- the #1852 fail-open surviving in string form.
+
+    The entry must also survive VERBATIM into the message: an author told the
+    offender is ``Bash(git`` cannot find that line in their file.
+    """
+    plugin_dir = _bundle(tmp_path, skills={"demo": "Bash(git commit:*)"}, gates=["Bash"])
+
+    conflicts = shadowed_gates(plugin_dir, frozenset({"Bash"}))
+    assert conflicts == (
+        ShadowedGate(
+            skill="skills/demo/SKILL.md",
+            entry="Bash(git commit:*)",
+            tool="Bash",
+            whole=False,
+        ),
+    )
+    assert "Bash(git commit:*)" in describe_shadowed_gates(conflicts)
+
+    gate = build_approval_gate(operator_tools=None, policy_routes={"Bash": "ops"})
+    assert gate is not None
+    with pytest.raises(ApprovalPolicyError):
+        assert_gates_not_shadowed(plugin_dir, gate)
+
+
+def test_a_comma_inside_a_specifier_does_not_split_the_entry(tmp_path: Path) -> None:
+    """A comma at paren depth >= 1 is part of the rule, never a separator."""
+    plugin_dir = _bundle(tmp_path, skills={"demo": "Bash(ls,cat) Read"}, gates=["Bash"])
+
+    assert shadowed_gates(plugin_dir, frozenset({"Bash"})) == (
+        ShadowedGate(skill="skills/demo/SKILL.md", entry="Bash(ls,cat)", tool="Bash", whole=False),
+    )
+
+
+def test_an_mcp_shorthand_in_string_form_matches_the_armed_runtime_name(tmp_path: Path) -> None:
+    """Normalization still routes through ``effective_operator_gates``.
+
+    The string form must not become a second naming rule. One parser for one rule
+    is the #1495 / #1564 constraint, so the shorthand a skill author writes has to
+    reach the SAME normalization the list form reaches.
+    """
+    plugin_dir = _bundle(
+        tmp_path,
+        skills={"demo": "mcp__crm__send"},
+        gates=[],
+        mcp={"crm": {"command": "run-crm"}},
+    )
+    resolution = ApprovalPolicyResolution(
+        route_by_tool={},
+        grantable_by_route={},
+        bundle_name="demo",
+        mcp_servers={"crm"},
+        connector_servers=set(),
+    )
+    gate = build_approval_gate(
+        operator_tools=["mcp__crm__send"],
+        policy_routes={},
+        bundle_name="demo",
+        mcp_servers={"crm"},
+        connector_servers=set(),
+    )
+    assert gate is not None
+    assert gate.required == frozenset({"mcp__plugin_demo_crm__send"})
+    with pytest.raises(ApprovalPolicyError) as exc:
+        assert_gates_not_shadowed(plugin_dir, gate, resolution)
+    assert "mcp__plugin_demo_crm__send" in str(exc.value)
+
+
+def test_a_string_form_allowance_of_an_ungated_tool_stays_clean(tmp_path: Path) -> None:
+    """The negative control, so the tests above are not vacuously red.
+
+    A reader that reported EVERY string entry as a conflict would pass every
+    assertion above while refusing to boot any bundle with a canonical
+    ``allowed-tools``.
+    """
+    plugin_dir = _bundle(tmp_path, skills={"demo": "Read Write(docs/*)"}, gates=["Bash"])
+
+    assert shadowed_gates(plugin_dir, frozenset({"Bash"})) == ()
+    gate = build_approval_gate(operator_tools=None, policy_routes={"Bash": "ops"})
+    assert gate is not None
+    assert_gates_not_shadowed(plugin_dir, gate)
+
+
+def test_an_empty_string_form_declaration_contributes_nothing(tmp_path: Path) -> None:
+    """``allowed-tools: ""`` allows nothing, so it can shadow nothing."""
+    plugin_dir = _bundle(tmp_path, skills={"demo": ""}, gates=["Bash"])
+    assert shadowed_gates(plugin_dir, frozenset({"Bash"})) == ()
+
+
+@pytest.mark.parametrize("fixture", ["mcp_green", "mcp_red_pointer", "mcp_red_broken"])
+def test_the_empty_flow_list_fixtures_still_produce_no_conflicts(fixture: str) -> None:
+    """The shipped ``allowed-tools: []`` fixtures keep their observable behavior.
+
+    B2 changes the skip condition from "not a list" to "no entries". For these
+    three that is a behavior SHAPE change (they used to reach the found list with
+    an empty entry list; now they are skipped) with an identical outcome. Stating
+    it as a test keeps a reviewer from reading the change as a regression, and
+    keeps a future refactor from making an empty declaration mean something.
+    """
+    root = Path(__file__).parent / "fixtures" / fixture
+    assert shadowed_gates(root, frozenset({"Bash", "Read", "Write"})) == ()

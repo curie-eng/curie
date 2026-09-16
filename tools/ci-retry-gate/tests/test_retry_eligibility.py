@@ -89,6 +89,12 @@ PROTECTED_STEPS = frozenset(
         ("ci.yaml", "ui", "Lint"),
         ("ci.yaml", "ui", "Command manifest is current"),
         ("ci.yaml", "commit-messages", "Check the PR's commit messages"),
+        (
+            "ci.yaml",
+            "repo-toolchain-proof",
+            "Absent image fails in required mode (negative control)",
+        ),
+        ("ci.yaml", "repo-toolchain-proof", "Repository toolchain proof"),
         # Security gates. Retrying any of these reruns a scan or a verification
         # against the very same tree or the very same asset set, so a second
         # attempt cannot recover anything and can only bury a true positive.
@@ -124,6 +130,8 @@ PROTECTED_STEPS = frozenset(
             "verify-and-publish",
             "Every asset has provenance from this workflow and commit",
         ),
+        ("close-on-next.yaml", "reconcile", "Close-on-next self-test"),
+        ("close-on-next.yaml", "reconcile", "Reconcile issues"),
     }
 )
 

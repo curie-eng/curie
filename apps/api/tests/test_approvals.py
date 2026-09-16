@@ -951,6 +951,22 @@ def test_expired_approval_resolve_returns_410_and_resumes(
     assert _read_resumed_at(created["id"]) is not None
 
 
+_OWNERSHIP_VECTOR = (
+    Path(__file__).resolve().parents[3] / "tests" / "vectors" / "approval-ownership.json"
+)
+_EXPECTED_OWNERSHIP_VECTOR_KEYS = frozenset({"comment", "not_found_detail"})
+
+
+def test_api_ownership_detail_constant_matches_the_frozen_vector() -> None:
+    """The API constant is the dispatcher ownership-miss detail, frozen in the vector."""
+
+    from curie_api.routers.approvals import APPROVAL_NOT_FOUND_DETAIL
+
+    vector = json.loads(_OWNERSHIP_VECTOR.read_text(encoding="utf-8"))
+    assert set(vector) == _EXPECTED_OWNERSHIP_VECTOR_KEYS
+    assert APPROVAL_NOT_FOUND_DETAIL == vector["not_found_detail"]
+
+
 def test_unknown_approval_is_404(
     approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
@@ -961,6 +977,26 @@ def test_unknown_approval_is_404(
         headers=_operator_resolve_headers("U9", base=auth_headers),
     )
     assert missing.status_code == 404
+
+
+def test_unknown_approval_uses_the_frozen_ownership_detail(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """GET and resolve of a missing row share the dispatcher ownership-miss detail (#2248)."""
+
+    vector = json.loads(_OWNERSHIP_VECTOR.read_text(encoding="utf-8"))
+    assert set(vector) == _EXPECTED_OWNERSHIP_VECTOR_KEYS
+    missing_id = str(uuid.uuid4())
+    got = approvals_client.get(f"/approvals/{missing_id}", headers=auth_headers)
+    resolve = approvals_client.post(
+        f"/approvals/{missing_id}/resolve",
+        json={"decision": "approved"},
+        headers=_operator_resolve_headers("U9", base=auth_headers),
+    )
+    assert got.status_code == 404
+    assert resolve.status_code == 404
+    assert got.json()["detail"] == vector["not_found_detail"]
+    assert resolve.json()["detail"] == vector["not_found_detail"]
 
 
 def test_requires_api_key(

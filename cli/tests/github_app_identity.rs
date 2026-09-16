@@ -51,12 +51,55 @@ if [ "$tool" = "helm" ] && [ "$1" = "get" ] && [ "$2" = "values" ]; then
   echo "$FAKE_VALUES"
   exit 0
 fi
+if [ "$tool" = "helm" ] && [ "$1" = "history" ]; then
+  rev=1
+  if [ -f "$SHIM_LOG.rev" ]; then
+    rev=$(cat "$SHIM_LOG.rev")
+  fi
+  echo "[{\"revision\":$rev,\"status\":\"deployed\",\"chart\":\"curie-0.8.7\",\"app_version\":\"0.8.7\",\"description\":\"Install complete\"}]"
+  exit 0
+fi
+if [ "$tool" = "helm" ] && [ "$1" = "get" ] && [ "$2" = "manifest" ]; then
+  cat <<'MANIFEST'
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: curie-runner
+  labels:
+    app.kubernetes.io/component: agent-sandbox
+    app.kubernetes.io/instance: curie
+    app.kubernetes.io/managed-by: Helm
+spec:
+  service: true
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: curie-runner-pool
+  labels:
+    app.kubernetes.io/component: agent-sandbox
+    app.kubernetes.io/instance: curie
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: curie-runner
+MANIFEST
+  exit 0
+fi
 if [ "$tool" = "kubectl" ] && echo "$*" | grep -q " get secret "; then
   echo "$FAKE_SECRET_JSON"
   exit 0
 fi
+if [ "$tool" = "kubectl" ] && [ "$1" = "get" ] \
+  && [[ "$2" == sandboxtemplates.extensions.agents.x-k8s.io,* ]]; then
+  echo '{"items":[{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"SandboxTemplate","metadata":{"name":"curie-runner","labels":{"app.kubernetes.io/component":"agent-sandbox","app.kubernetes.io/instance":"curie","app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"curie","meta.helm.sh/release-namespace":"curie"}},"spec":{"service":true}},{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"SandboxWarmPool","metadata":{"name":"curie-runner-pool","labels":{"app.kubernetes.io/component":"agent-sandbox","app.kubernetes.io/instance":"curie","app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"curie","meta.helm.sh/release-namespace":"curie"}},"spec":{"replicas":0,"sandboxTemplateRef":{"name":"curie-runner"}}}]}'
+  exit 0
+fi
 if [ "$ALLOW_MUTATION" = "1" ]; then
   if [ "$tool" = "helm" ] && [ "$1" = "upgrade" ]; then
+    echo 2 > "$SHIM_LOG.rev"
     exit 0
   fi
   if [ "$tool" = "kubectl" ]; then

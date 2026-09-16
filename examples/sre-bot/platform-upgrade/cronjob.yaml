@@ -1,0 +1,101 @@
+# Move the Curie release to the newest published version, when asked.
+#
+#   kubectl -n <curie-namespace> create configmap platform-upgrade \
+#     --from-file=upgrade.sh=examples/sre-bot/platform-upgrade/upgrade.sh
+#   kubectl -n <curie-namespace> apply -f examples/sre-bot/manifests/platform-upgrade-role.yaml
+#   kubectl -n <curie-namespace> apply -f examples/sre-bot/platform-upgrade/cronjob.yaml
+#
+# EDIT BEFORE APPLYING: the namespace on both objects, and the three
+# PLATFORM_UPGRADE_* values naming your repository, release and namespace.
+#
+# SUSPENDED, AND STARTED BY ASKING. Like `self-upgrade/cronjob.yaml`, the
+# schedule exists because a CronJob must carry one; it never fires. The
+# `upgrade_platform` connector tool creates a Job from this template when a
+# human approves, and that is the only way it runs. Set `suspend: false` if you
+# also want it on a timer -- but read the next paragraph first, because a
+# platform upgrade is a materially worse thing to have happen unattended than a
+# bundle redeploy.
+#
+# WHY THE BOT DOES NOT HOLD THIS CREDENTIAL. `helm upgrade` rewrites nearly every
+# namespaced object the release owns, so the identity below is namespace-admin in
+# all but name (manifests/platform-upgrade-role.yaml says so plainly and
+# enumerates it). A connector holding that would hold it for the life of its pod.
+# A Job holds it for the ninety seconds it runs, and the bot holds it never: it
+# creates a Job from this template, which it cannot edit, with no arguments.
+#
+# WHAT THE BOT CANNOT CHOOSE. Not the version -- the script reads the newest
+# published release itself. Not the chart, the values, the timeout, or the
+# namespace. Every one of those is in this file, which is yours.
+#
+# THIS UPGRADES THE PLATFORM, NOT THE BOT. `self-upgrade/cronjob.yaml` redeploys
+# the agent bundle; this moves Curie itself. They are separate versions, separate
+# Jobs and separate credentials, and conflating them is the mistake this pair of
+# files exists to make hard.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: platform-upgrade
+  # CHANGE ME: the namespace the Curie release runs in.
+  namespace: curie
+spec:
+  # Never fires while suspended; a CronJob must still carry a valid schedule.
+  schedule: "43 4 * * *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: curie-platform-upgrader
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: upgrade
+              # Carries helm and kubectl, and is already used by this chart, so
+              # the upgrade path pulls nothing the cluster has not pulled before.
+              image: alpine/k8s:1.31.2
+              command: ["sh", "/opt/platform-upgrade/upgrade.sh"]
+              env:
+                # CHANGE ME: the project whose releases define "newest".
+                - name: PLATFORM_UPGRADE_REPO
+                  value: curie-eng/curie
+                # CHANGE ME: the Helm release name.
+                - name: PLATFORM_UPGRADE_RELEASE
+                  value: curie
+                # CHANGE ME: the namespace it lives in.
+                - name: PLATFORM_UPGRADE_NAMESPACE
+                  value: curie
+                - name: PLATFORM_UPGRADE_TIMEOUT
+                  value: 12m
+                # Helm keeps release state in Secrets in the namespace it is
+                # told about; HOME must be writable for its cache.
+                - name: HOME
+                  value: /tmp
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { cpu: 500m, memory: 512Mi }
+              volumeMounts:
+                - name: script
+                  mountPath: /opt/platform-upgrade
+                  readOnly: true
+                # readOnlyRootFilesystem, so the chart extraction and helm's
+                # cache both need a real writable path.
+                - name: scratch
+                  mountPath: /tmp
+          volumes:
+            - name: script
+              configMap:
+                name: platform-upgrade
+            - name: scratch
+              emptyDir: {}

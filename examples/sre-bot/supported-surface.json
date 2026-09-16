@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "connectors": {
+    "kubernetes": {
+      "tools": {
+        "events_list": "allow",
+        "namespaces_list": "allow",
+        "projects_list": "allow",
+        "nodes_log": "allow",
+        "nodes_stats_summary": "allow",
+        "nodes_top": "allow",
+        "pods_list": "allow",
+        "pods_list_in_namespace": "allow",
+        "pods_get": "allow",
+        "pods_top": "allow",
+        "pods_log": "allow",
+        "resources_list": "allow",
+        "resources_get": "allow",
+        "pods_delete": "approval-required",
+        "pods_exec": "approval-required",
+        "pods_run": "approval-required",
+        "resources_create_or_update": "approval-required",
+        "resources_delete": "approval-required",
+        "resources_scale": "approval-required"
+      },
+      "catalog": "exact"
+    },
+    "self-upgrade": {
+      "catalog": "exact",
+      "tools": {
+        "upgrade_self": "approval-required",
+        "upgrade_platform": "approval-required",
+        "latest_release": "allow"
+      }
+    },
+    "tempo": {
+      "catalog": "exact",
+      "tools": {
+        "search_traces": "allow",
+        "get_trace": "allow",
+        "list_trace_tags": "allow",
+        "list_trace_tag_values": "allow"
+      }
+    },
+    "grafana": {
+      "catalog": "exact",
+      "tools": {
+        "alerting_manage_routing": "allow",
+        "alerting_manage_rules": "allow",
+        "analyze_loki_labels": "allow",
+        "check_datasources_health": "allow",
+        "generate_deeplink": "allow",
+        "get_alert_group": "allow",
+        "get_annotation_tags": "allow",
+        "get_annotations": "allow",
+        "get_assertions": "allow",
+        "get_current_oncall_users": "allow",
+        "get_dashboard_by_uid": "allow",
+        "get_dashboard_panel_queries": "allow",
+        "get_dashboard_property": "allow",
+        "get_dashboard_summary": "allow",
+        "get_datasource": "allow",
+        "get_oncall_shift": "allow",
+        "get_query_examples": "allow",
+        "get_sift_analysis": "allow",
+        "get_sift_investigation": "allow",
+        "list_alert_groups": "allow",
+        "list_cloudwatch_dimensions": "allow",
+        "list_cloudwatch_metrics": "allow",
+        "list_cloudwatch_namespaces": "allow",
+        "list_datasources": "allow",
+        "list_loki_label_names": "allow",
+        "list_loki_label_values": "allow",
+        "list_oncall_schedules": "allow",
+        "list_oncall_teams": "allow",
+        "list_oncall_users": "allow",
+        "list_prometheus_label_names": "allow",
+        "list_prometheus_label_values": "allow",
+        "list_prometheus_metric_metadata": "allow",
+        "list_prometheus_metric_names": "allow",
+        "list_pyroscope_label_names": "allow",
+        "list_pyroscope_label_values": "allow",
+        "list_pyroscope_profile_types": "allow",
+        "list_sift_investigations": "allow",
+        "query_cloudwatch": "allow",
+        "query_loki_logs": "allow",
+        "query_loki_patterns": "allow",
+        "query_loki_stats": "allow",
+        "query_prometheus": "allow",
+        "query_prometheus_histogram": "allow",
+        "query_pyroscope": "allow",
+        "run_panel_query": "allow",
+        "search_dashboards": "allow",
+        "search_folders": "allow",
+        "suggest_loki_alloy_label_config": "allow"
+      }
+    }
+  },
+  "forbiddenTools": [
+    "kubernetes/configuration_view"
+  ],
+  "tiers": {
+    "skill": {
+      "required": true,
+      "setupAndProof": "Externally hosted connectors at the same pinned images and flags, unhosted URLs and protected credentials. Prove actual tools, read, pending mutation, denial and fresh approval."
+    },
+    "local": {
+      "required": true,
+      "setupAndProof": "Same immutable bundle and eval suite through Compose worker and API. Externally host connectors where local hosting is unavailable; preserve the same capabilities."
+    },
+    "local-release": {
+      "required": true,
+      "setupAndProof": "Repeat local observations using published binary and images; record bundle and eval digests and resource availability from the released installer."
+    },
+    "cluster": {
+      "required": true,
+      "setupAndProof": "Supported example install with disposable workloads and real connector identities. Verify CronJobs exist before arming either upgrade verb; prove RBAC refusal after approval."
+    },
+    "live provider": {
+      "required": true,
+      "setupAndProof": "Real SDK catalog visibility and approval scheduling on each applicable tier. Fake model and HTTP catalog fixtures never prove this row."
+    },
+    "external integration": {
+      "required": true,
+      "setupAndProof": "Real MCP tools and Slack cards, genuine human decisions, readback and fresh approval. Verify upstream state, refusal and unchanged state on denial."
+    }
+  }
+}

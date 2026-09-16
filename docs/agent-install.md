@@ -126,3 +126,19 @@ jq -cn \
    set to `doctor`.
 
 Return the final `INSTALL_RESULT` line unchanged with the command transcript.
+
+## Runtime repository allowlist
+
+Managed `/workspace` checkouts are selected by one allowed root GitHub URL in
+a thread's message, written in plain words; Curie's reply names the repository
+it inferred. The chart default `api.githubRepoAllowlist: []` denies
+every selection. Set it when you install or upgrade:
+
+```bash
+curie cluster up --set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'
+```
+
+`owner/*` allows every repository under that owner. `curie cluster deploy
+--workspace` warns when the allowlist is empty. The `--workspace` flag itself
+is a deprecated compatibility no-op; the allowlist is the real control. The
+SRE bot installer also accepts `--workspace-repo owner/repo` (repeatable).

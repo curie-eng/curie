@@ -69,12 +69,19 @@ BLANKS = ("", "   ")
 # silence -- and `wire.EvalJob` already carries a `model: str | None`. Discovery
 # asserts nothing routed sits outside this set, so the next body declared in a
 # new module forces a decision here instead of vanishing from the gate.
-# `curie_api.routers.channels` is the third: ADR-0096 phase 2 keeps the channel
-# ingress API's request models in its own router file (a deliberate file seam),
-# so registering the module here is the decision this alarm asks for -- it WIDENS
-# the sweep onto those bodies rather than exempting them.
+# `curie_api.routers.channels` and `curie_api.routers.github_reviews` keep their
+# request models in their router files (deliberate file seams). The GitHub review
+# bodies also nest `aci_protocol.turn.QueuedTurn`, so that module belongs in the
+# recursive sweep too. Registering each module is the decision this alarm asks
+# for -- it WIDENS the sweep onto those bodies rather than exempting them.
 KNOWN_BODY_MODULES = frozenset(
-    {"curie_api.schemas", "aci_protocol.wire", "curie_api.routers.channels"}
+    {
+        "curie_api.schemas",
+        "aci_protocol.turn",
+        "aci_protocol.wire",
+        "curie_api.routers.channels",
+        "curie_api.routers.github_reviews",
+    }
 )
 # FastAPI synthesises one wrapper model per multi-param body (`Body_<operation>`)
 # in its own module. It is only a container the walk descends THROUGH when every

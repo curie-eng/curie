@@ -181,6 +181,25 @@ def test_side_effect_halt_is_a_distinct_terminal_turn_class() -> None:
         assert "side_effect_halted" in manifest[name]["attributes"]["outcome"]
 
 
+def test_history_resume_cache_read_is_declared_and_rejects_unbounded_attributes(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    del metrics
+    attributes = {
+        "service.name": "curie-runner",
+        "source": "runner",
+        "cache_hit": "true",
+    }
+    record_metric("curie.history.resume.cache_read", 321, attributes=attributes)
+
+    with pytest.raises(ValueError, match="undeclared attribute"):
+        record_metric(
+            "curie.history.resume.cache_read",
+            321,
+            attributes={**attributes, "session.id": "session-example"},
+        )
+
+
 def test_deadline_halted_is_a_declared_terminal_turn_outcome(
     metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:

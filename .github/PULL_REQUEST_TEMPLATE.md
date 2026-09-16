@@ -8,6 +8,23 @@
 
 Closes #
 
+## Trigger
+
+<!-- Required for a patch release PR (title: Prepare the vX.Y.Z release
+     where Z is not 0). List the issue numbers of the defects that
+     triggered this patch, for example #2202. Other pull requests may
+     leave this comment in place.
+
+     If you moved an open issue out of this milestone within 24 hours of
+     the cut, that issue needs a comment naming the release it moved from. -->
+
+## Live proof
+
+<!-- Required for a patch release PR. Name a run URL that re-verified each
+     trigger on a live surface, or an explicit waiver of the form:
+     waiver: <reason>
+     Other pull requests may leave this comment in place. -->
+
 ## Fix pin verification
 
 <!-- Verification is required for declared fixes. For a fix pull request,
@@ -31,6 +48,14 @@ Fix pin: <supported selector>
      closed by deletion), use the escape hatch instead, with a non-empty
      reason:
 Fix pin: n/a - <reason>
+
+     The pin's tier is derived from the selector's location, not from prose:
+     unit tests, charts/curie/ci/* (cluster helm-render), or test_live.py
+     (live). If the closed issue carries found:unit, found:local,
+     found:cluster, or found:live and the pin is below that surface, add:
+Fix pin waiver: <reason>
+
+     A unit pin for a found:live issue fails without that waiver.
 
      For a non fix pull request that does not close a bug-labeled issue, leave
      this section empty. -->
@@ -56,7 +81,7 @@ Fix pin: n/a - <reason>
      A change that reaches runner MCP catalog projection, unscoped PreToolUse,
      in-process platform MCP tools, workspace publication, or
      built-in coding-tool session capability must record live-provider plus
-     Slack external-integration evidence, or leave those required-tier rows open.
+     external-integration evidence, or leave those required-tier rows open.
      "No model routing change" is not a valid n/a reason. Fake-model kind,
      skill ladder, and helper-only tests are not sufficient. -->
 

@@ -46,6 +46,92 @@ _REPO_FULL_NAME = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
     r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$"
 )
+# Two path segments, not glued to a longer path on either side. A following
+# slash is the nested-path case (`apps/worker/src/foo.py` is not a fact).
+_BARE_REPO = re.compile(
+    r"(?<![A-Za-z0-9._/-])"
+    r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+"
+    r"(?![A-Za-z0-9._/-])"
+)
+# Bare tokens that look like source-tree paths are not facts. URL-derived facts
+# skip this check.
+_BARE_REPO_SOURCE_ROOTS = frozenset(
+    {
+        "src",
+        "lib",
+        "docs",
+        "doc",
+        "bin",
+        "app",
+        "apps",
+        "test",
+        "tests",
+        "pkg",
+        "cmd",
+        "cli",
+        "scripts",
+        "script",
+        "examples",
+        "example",
+        "internal",
+        "vendor",
+        "dist",
+        "build",
+        "tmp",
+        "temp",
+        "include",
+        "assets",
+        "static",
+        "public",
+        "config",
+        "configs",
+        "tools",
+        "packages",
+        "package",
+    }
+)
+_BARE_REPO_SOURCE_EXTENSIONS = frozenset(
+    {
+        "py",
+        "md",
+        "rs",
+        "ts",
+        "js",
+        "go",
+        "json",
+        "toml",
+        "yaml",
+        "yml",
+        "txt",
+        "sh",
+        "c",
+        "h",
+        "cc",
+        "cpp",
+        "java",
+        "rb",
+        "php",
+        "css",
+        "html",
+        "xml",
+        "sql",
+        "lock",
+        "proto",
+        "kt",
+        "swift",
+    }
+)
+_ENGLISH_SLASH_PAIRS = frozenset({"and/or", "n/a", "w/o", "i/o", "y/n"})
+_TRAILING_PUNCTUATION = ".,;:!?)]}"
+# The terminal refusal for a message that names a repository while the worker-wide
+# workspace switch is off (#2659). It names no repository, so it neither echoes
+# untrusted message text nor reveals whether the allowlist permits one.
+WORKSPACES_DISABLED_REFUSAL = (
+    "Repository workspaces are turned off on this installation, so no repository "
+    "was attached and no work started. An operator can turn them on with "
+    "agentSandbox.runner.workspace.enabled in the chart values "
+    "(CURIE_WORKSPACE_ENABLED on the worker)."
+)
 _SELECTION_REFUSAL_MESSAGES = {
     "workspace.deployment_disabled": (
         "This deployment does not enable repository workspaces."
@@ -145,6 +231,7 @@ class WorkspaceCredential:
     repo_full_name: str
     clone_url: str
     authorization_header: str
+    revision: str | None = None
 
     def __post_init__(self) -> None:
         if not self.repo_full_name or not self.clone_url or not self.authorization_header:
@@ -161,11 +248,11 @@ class WorkspaceCredential:
 
 
 def parse_github_repo_fact(message: str) -> str | None:
-    """Extract one canonical root GitHub repository URL from trusted turn text."""
+    """Extract one canonical GitHub repository from trusted turn text."""
 
     repositories: dict[str, str] = {}
     for matched in _GITHUB_URL.finditer(message):
-        raw = matched.group(0).rstrip(".,;:!?)]}")
+        raw = matched.group(0).rstrip(_TRAILING_PUNCTUATION)
         parsed = urlsplit(raw)
         try:
             invalid_authority = (
@@ -193,11 +280,54 @@ def parse_github_repo_fact(message: str) -> str | None:
         candidate = f"{owner}/{repository}"
         if _REPO_FULL_NAME.fullmatch(candidate):
             repositories.setdefault(candidate.casefold(), candidate)
+    # Mask every GitHub URL match, including non-root paths, so a pull/query
+    # URL cannot also be read as a bare owner/repo.
+    masked = _GITHUB_URL.sub(" ", message)
+    for matched in _BARE_REPO.finditer(masked):
+        raw = matched.group(0).rstrip(_TRAILING_PUNCTUATION)
+        parts = [part for part in raw.split("/") if part]
+        if len(parts) != 2:
+            continue
+        owner, repository = parts
+        if owner.casefold() in _BARE_REPO_SOURCE_ROOTS:
+            continue
+        if repository.endswith(".git"):
+            repository = repository[:-4]
+        if "." in repository:
+            suffix = repository.rsplit(".", 1)[-1].casefold()
+            if suffix in _BARE_REPO_SOURCE_EXTENSIONS:
+                continue
+        candidate = f"{owner}/{repository}"
+        if candidate.casefold() in _ENGLISH_SLASH_PAIRS:
+            continue
+        if _REPO_FULL_NAME.fullmatch(candidate):
+            repositories.setdefault(candidate.casefold(), candidate)
     if len(repositories) > 1:
         raise WorkspaceSelectionRefused(
-            "Please name only one root GitHub repository URL in this thread."
+            "This message names more than one GitHub repository, so no repository "
+            "was attached and no work started. A thread works in only one repository."
         )
     return next(iter(repositories.values()), None)
+
+
+def trusted_repository_fact(message: str, *, ignore_message: bool) -> str | None:
+    """Repository facts for workspace selection.
+
+    Job payloads (webhook/cron) and verified-review bodies are untrusted for
+    repository selection. A coding target comes from operator mapping or an
+    already sticky thread row, never from a URL inside those documents.
+    """
+
+    if ignore_message:
+        return None
+    return parse_github_repo_fact(message)
+
+
+def webhook_job_refuses_workspace(message: str) -> bool:
+    """True when platform text, not the payload, stopped coding for this job."""
+
+    trusted = message.split("<untrusted-hook-payload>", 1)[0]
+    return "Coding is stopped" in trusted
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -269,7 +399,7 @@ class WorkspaceCredentialClient:
         conversation_id: str,
         author: str,
         repo_full_name: str | None,
-    ) -> str:
+    ) -> str | None:
         body = json.dumps(
             {
                 "conversation_id": conversation_id,
@@ -294,7 +424,8 @@ class WorkspaceCredentialClient:
             ) from exc
         if response.status == 403:
             raise WorkspaceSelectionRefused(
-                "That repository is not authorized for this installation."
+                "That repository is not in api.githubRepoAllowlist for this installation; "
+                "allow `owner/repo` or `owner/*` in the chart values."
             )
         if response.status == 409:
             try:
@@ -322,12 +453,14 @@ class WorkspaceCredentialClient:
                 "repository-selection", f"API returned HTTP {response.status}"
             )
         try:
-            selected = str(json.loads(response.body)["repo_full_name"])
+            selected = json.loads(response.body)["repo_full_name"]
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise WorkspacePreparationError(
                 "repository-selection", "API returned an invalid selection response"
             ) from exc
-        if not _REPO_FULL_NAME.fullmatch(selected):
+        if selected is None:
+            return None
+        if not isinstance(selected, str) or not _REPO_FULL_NAME.fullmatch(selected):
             raise WorkspacePreparationError(
                 "repository-selection", "API returned an invalid repository selection"
             )
@@ -370,10 +503,14 @@ class WorkspaceCredentialClient:
             )
         try:
             payload = json.loads(response.body)
+            revision = payload.get("revision")
+            if revision is not None and not isinstance(revision, str):
+                raise TypeError("revision is not a string")
             return WorkspaceCredential(
                 repo_full_name=str(payload["repo_full_name"]),
                 clone_url=str(payload["clone_url"]),
                 authorization_header=str(payload["authorization_header"]),
+                revision=revision,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise WorkspacePreparationError(
@@ -627,6 +764,7 @@ class PreparedWorkspace:
     clean_clone_url: str
     repo_full_name: str
     base_sha: str
+    materialized_head: str
     checkout_mode: int
     reference: WorkspaceRef
 
@@ -663,6 +801,7 @@ class _WorkspaceOwnership:
                     "clean_clone_url": prepared.clean_clone_url,
                     "repo_full_name": prepared.repo_full_name,
                     "base_sha": prepared.base_sha,
+                    "materialized_head": prepared.materialized_head,
                     "checkout_mode": prepared.checkout_mode,
                     "reference": prepared.reference.encode(),
                 },
@@ -692,6 +831,9 @@ class _WorkspaceOwnership:
                 clean_clone_url=str(prepared_raw["clean_clone_url"]),
                 repo_full_name=str(prepared_raw["repo_full_name"]),
                 base_sha=str(prepared_raw["base_sha"]),
+                materialized_head=str(
+                    prepared_raw.get("materialized_head", prepared_raw["base_sha"])
+                ),
                 checkout_mode=int(prepared_raw["checkout_mode"]),
                 reference=WorkspaceRef.decode(str(prepared_raw["reference"])),
             )
@@ -880,7 +1022,14 @@ class WorkspacePreparer:
         self.limiter = limiter or WorkspaceCloneLimiter(max_concurrent=limits.max_concurrent_clones)
 
     def prepare(
-        self, *, deployment_id: uuid.UUID, thread_key: str, generation: str
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        thread_key: str,
+        generation: str,
+        branch: str | None = None,
+        expected_head: str | None = None,
+        detached_head: str | None = None,
     ) -> PreparedWorkspace:
         started = self.clock()
         real_started = time.monotonic()
@@ -916,22 +1065,54 @@ class WorkspacePreparer:
                     "GIT_CONFIG_VALUE_1": f"Authorization: {credential.authorization_header}",
                 }
                 try:
+                    clone_argv = [
+                        "git",
+                        "clone",
+                        "--depth=1",
+                        "--single-branch",
+                        "--no-tags",
+                    ]
+                    if branch is not None:
+                        clone_argv.extend(["--branch", branch])
+                    clone_argv.extend([credential.clone_url, str(checkout)])
                     self.commands.run(
-                        [
-                            "git",
-                            "clone",
-                            "--depth=1",
-                            "--single-branch",
-                            "--no-tags",
-                            credential.clone_url,
-                            str(checkout),
-                        ],
+                        clone_argv,
                         env=clone_env,
                         timeout_seconds=min(
                             self.limits.clone_timeout_seconds,
                             self._real_remaining(real_started),
                         ),
                     )
+                    pin = detached_head
+                    if pin is None and credential.revision and re.fullmatch(
+                        r"[0-9a-f]{40}", credential.revision
+                    ):
+                        pin = credential.revision
+                    if pin is not None:
+                        self.commands.run(
+                            [
+                                "git",
+                                "fetch",
+                                "--depth=1",
+                                "--no-tags",
+                                "origin",
+                                pin,
+                            ],
+                            cwd=checkout,
+                            env=clone_env,
+                            timeout_seconds=min(
+                                self.limits.clone_timeout_seconds,
+                                self._real_remaining(real_started),
+                            ),
+                        )
+                        self.commands.run(
+                            ["git", "checkout", "--detach", pin],
+                            cwd=checkout,
+                            timeout_seconds=min(
+                                self.limits.clone_timeout_seconds,
+                                self._real_remaining(real_started),
+                            ),
+                        )
                 except TimeoutError as exc:
                     raise WorkspaceStageTimeout("clone", self.limits.clone_timeout_seconds) from exc
                 except WorkspacePreparationError as exc:
@@ -960,6 +1141,11 @@ class WorkspacePreparer:
                     cwd=checkout,
                     timeout_seconds=self.limits.archive_timeout_seconds,
                 ).stdout.strip()
+                if expected_head is not None and base_sha != expected_head:
+                    raise WorkspacePreparationError(
+                        "lineage-checkout",
+                        "checkout does not match the expected lineage head",
+                    )
 
                 checkout_bytes = self._checkout_size(checkout)
                 if checkout_bytes > self.limits.max_checkout_bytes:
@@ -1027,6 +1213,7 @@ class WorkspacePreparer:
                 clean_clone_url=credential.clone_url,
                 repo_full_name=credential.repo_full_name,
                 base_sha=base_sha,
+                materialized_head=base_sha,
                 checkout_mode=checkout.stat().st_mode,
                 reference=reference,
             )
@@ -1039,6 +1226,51 @@ class WorkspacePreparer:
             raise
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+
+    def prepare_lineage(
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        thread_key: str,
+        generation: str,
+        branch: str,
+        expected_head: str,
+    ) -> PreparedWorkspace:
+        """Materialize one stored lineage branch at its exact fenced head."""
+
+        if not branch or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
+            raise WorkspacePreparationError(
+                "lineage-checkout", "lineage branch or expected head is invalid"
+            )
+        return self.prepare(
+            deployment_id=deployment_id,
+            thread_key=thread_key,
+            generation=generation,
+            branch=branch,
+            expected_head=expected_head,
+        )
+
+    def prepare_lineage_base(
+        self,
+        *,
+        deployment_id: uuid.UUID,
+        thread_key: str,
+        generation: str,
+        expected_base: str,
+    ) -> PreparedWorkspace:
+        """Materialize a headless lineage at its proposal base without a branch."""
+
+        if re.fullmatch(r"[0-9a-f]{40}", expected_base) is None:
+            raise WorkspacePreparationError(
+                "lineage-checkout", "lineage base is invalid"
+            )
+        return self.prepare(
+            deployment_id=deployment_id,
+            thread_key=thread_key,
+            generation=generation,
+            expected_head=expected_base,
+            detached_head=expected_base,
+        )
 
     def _check_total(self, started: float) -> None:
         if self.clock() - started > self.limits.total_timeout_seconds:
@@ -1213,14 +1445,56 @@ class WorkspaceClaimCoordinator:
         deployment_id: uuid.UUID,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        repo_full_name: str | None = None,
+        replace_handle: Any | None = None,
+        revalidate_before_handoff: Callable[[], None] | None = None,
+        validate_candidate: Callable[[Any], None] | None = None,
+        lineage_branch: str | None = None,
+        lineage_head: str | None = None,
+        lineage_base_sha: str | None = None,
+        publication_visible_outcome_revision: int = 0,
     ) -> WorkspaceClaimResult:
-        """Prepare once, then cold-claim or resume a suspended route."""
+        """Prepare once, then cold-claim or resume a suspended route.
 
-        prepared = self.preparer.prepare(
-            deployment_id=deployment_id,
-            thread_key=thread_key,
-            generation=uuid.uuid4().hex,
-        )
+        ``revalidate_before_handoff`` is the late-replacement linearization
+        guard. It runs after the archive is verified and durably staged,
+        immediately before the substrate begins replacing the old route. A
+        refusal raises through the ordinary pre-exposure rollback path, so the
+        old route stays authoritative and the newly staged archive is not
+        orphaned. ``validate_candidate`` runs after the replacement runner is
+        ready but before its route CAS; refusal follows the same rollback path.
+        """
+
+        generation = uuid.uuid4().hex
+        if (lineage_branch is None) != (lineage_head is None):
+            raise WorkspacePreparationError(
+                "lineage-checkout", "lineage branch and head must be supplied together"
+            )
+        if lineage_base_sha is not None and lineage_head is not None:
+            raise WorkspacePreparationError(
+                "lineage-checkout", "lineage head and base are mutually exclusive"
+            )
+        if lineage_branch is not None and lineage_head is not None:
+            prepared = self.preparer.prepare_lineage(
+                deployment_id=deployment_id,
+                thread_key=thread_key,
+                generation=generation,
+                branch=lineage_branch,
+                expected_head=lineage_head,
+            )
+        elif lineage_base_sha is not None:
+            prepared = self.preparer.prepare_lineage_base(
+                deployment_id=deployment_id,
+                thread_key=thread_key,
+                generation=generation,
+                expected_base=lineage_base_sha,
+            )
+        else:
+            prepared = self.preparer.prepare(
+                deployment_id=deployment_id,
+                thread_key=thread_key,
+                generation=generation,
+            )
         previous_ownership: _WorkspaceOwnership | None = None
         ownership_staged = False
         sandbox_exposed = False
@@ -1234,18 +1508,57 @@ class WorkspaceClaimCoordinator:
             previous_ownership = self._stage_ownership(thread_key, prepared)
             ownership_staged = True
             claim_env = {**(env or {}), **prepared.claim_env()}
-            try:
-                handle = self.substrate.claim(
-                    thread_key, env=claim_env, agent_name=agent_name
+            if replace_handle is not None:
+                if repo_full_name is None:
+                    raise WorkspacePreparationError(
+                        "claim", "late workspace handoff requires a selected repository"
+                    )
+                if revalidate_before_handoff is not None:
+                    revalidate_before_handoff()
+                candidate_guard = (
+                    {"validate_candidate": validate_candidate}
+                    if validate_candidate is not None
+                    else {}
                 )
-            except Exception as exc:
-                # The substrate signal is injected to keep this worker-local
-                # port independent of the concrete Docker/Kubernetes package.
-                if not isinstance(exc, self._suspended_errors):
-                    raise
-                handle = self.substrate.resume(
-                    thread_key, env=claim_env, agent_name=agent_name
+                handle = self.substrate.handoff(
+                    thread_key,
+                    expected=replace_handle,
+                    env=claim_env,
+                    workspace_repo=repo_full_name,
+                    workspace_materialized_head=prepared.materialized_head,
+                    publication_visible_outcome_revision=(
+                        publication_visible_outcome_revision
+                    ),
+                    agent_name=agent_name,
+                    **candidate_guard,
                 )
+            else:
+                try:
+                    handle = self.substrate.claim(
+                        thread_key,
+                        env=claim_env,
+                        agent_name=agent_name,
+                        workspace_repo=repo_full_name,
+                        workspace_materialized_head=prepared.materialized_head,
+                        publication_visible_outcome_revision=(
+                            publication_visible_outcome_revision
+                        ),
+                    )
+                except Exception as exc:
+                    # The substrate signal is injected to keep this worker-local
+                    # port independent of the concrete Docker/Kubernetes package.
+                    if not isinstance(exc, self._suspended_errors):
+                        raise
+                    handle = self.substrate.resume(
+                        thread_key,
+                        env=claim_env,
+                        agent_name=agent_name,
+                        workspace_repo=repo_full_name,
+                        workspace_materialized_head=prepared.materialized_head,
+                        publication_visible_outcome_revision=(
+                            publication_visible_outcome_revision
+                        ),
+                    )
             sandbox_exposed = True
             self._commit_ownership(thread_key, prepared)
             return WorkspaceClaimResult(prepared=prepared, handle=handle)
@@ -1267,11 +1580,11 @@ class WorkspaceClaimCoordinator:
         deployment_id: uuid.UUID,
         author: str,
         repo_full_name: str | None,
-    ) -> str:
+    ) -> str | None:
         """Authorize or reuse the immutable server-side thread selection."""
 
         return cast(
-            "str",
+            "str | None",
             self.preparer.credentials.select(
                 deployment_id, thread_key, author, repo_full_name
             ),

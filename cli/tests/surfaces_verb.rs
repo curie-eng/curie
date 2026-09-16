@@ -33,6 +33,8 @@ const AGENT_ID: &str = "44444444-4444-4444-4444-444444444444";
 const AGENT_NAME: &str = "deal-desk";
 /// The binding the fixture agent already holds.
 const BOUND: &str = "C0EXAMPLE1";
+/// A binding stored by a release that predated channel-ID validation.
+const LEGACY_NAME: &str = "#legacy-alerts";
 /// A second binding, the one `--add` asks for.
 const OTHER: &str = "C0EXAMPLE2";
 
@@ -76,6 +78,17 @@ fn api(write: impl Fn(&str, &str) -> Option<Response> + Send + Sync + 'static) -
             // "no write happened" check vacuous (see `cli/tests/api_deploy.rs`).
             _ => Response::json(200, &agent_json(&[BOUND, OTHER])),
         }
+    })
+}
+
+/// A read-only platform fixture for rows already stored by an older release.
+fn read_api(channels: &[&str]) -> MockServer {
+    let agent = agent_json(channels);
+    let agents = format!("[{agent}]");
+    serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(200, &agents),
+        ("GET", p) if p == format!("/agents/{AGENT_ID}") => Response::json(200, &agent),
+        _ => Response::json(405, r#"{"detail":"read-only fixture"}"#),
     })
 }
 
@@ -318,6 +331,86 @@ fn local_surfaces_list_reads_without_writing() {
 }
 
 #[test]
+fn local_surfaces_legacy_name_warns_without_failing_human_or_json() {
+    let server = read_api(&[LEGACY_NAME, BOUND]);
+
+    let human = run(&[
+        "local",
+        "surfaces",
+        AGENT_NAME,
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        "k",
+    ]);
+    assert_eq!(
+        human.code,
+        0,
+        "a legacy binding must remain readable: {}",
+        human.output()
+    );
+    assert!(
+        human.stdout.contains(LEGACY_NAME),
+        "the human result must preserve the stored address: {}",
+        human.output()
+    );
+    let human_output = human.output();
+    assert!(
+        human_output.contains("warn") && human_output.contains("slack:#legacy-alerts"),
+        "the human result must mark the exact dead binding: {human_output}"
+    );
+    assert!(
+        human_output.contains("mentions match on the channel ID")
+            && human_output.contains("never resolves"),
+        "the warning must explain the runtime consequence: {human_output}"
+    );
+
+    let json = run(&[
+        "local",
+        "surfaces",
+        AGENT_NAME,
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        "k",
+        "--json",
+    ]);
+    assert_eq!(
+        json.code,
+        0,
+        "a legacy binding must remain readable under --json: {}",
+        json.output()
+    );
+    let value: serde_json::Value = serde_json::from_str(json.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "--json must emit exactly one JSON object: {e}; stdout: {}",
+            json.stdout
+        )
+    });
+    let surfaces = value["surfaces"]
+        .as_array()
+        .expect("the JSON result must carry a surfaces array");
+    let legacy = surfaces
+        .iter()
+        .find(|binding| binding["address"] == LEGACY_NAME)
+        .expect("the JSON result must preserve the legacy address");
+    assert_eq!(legacy["kind"], "slack");
+    assert_eq!(legacy["address"], LEGACY_NAME);
+    let warning = legacy["warning"]
+        .as_str()
+        .expect("the dead binding must carry a machine-readable warning");
+    assert!(
+        warning.contains("mentions match on the channel ID") && warning.contains("never resolves"),
+        "the JSON warning must explain the same consequence: {warning}"
+    );
+    assert!(
+        writes(&server).is_empty(),
+        "human and JSON reads must issue no write, got {:?}",
+        writes(&server)
+    );
+}
+
+#[test]
 fn local_surfaces_json_carries_the_agent_and_its_bindings() {
     let server = api(|m, p| {
         (m == "POST" && p == channels_path())
@@ -478,6 +571,76 @@ fn cluster_surfaces_add_posts_the_pair_to_the_subresource() {
     let body: serde_json::Value =
         serde_json::from_slice(&posts[0].body).expect("the add body should be JSON");
     assert_eq!(body, serde_json::json!({"kind": "slack", "address": OTHER}));
+}
+
+#[test]
+fn cluster_surfaces_valid_channel_id_has_no_warning_human_or_json() {
+    let server = read_api(&[BOUND]);
+
+    let human = run(&[
+        "cluster",
+        "surfaces",
+        AGENT_NAME,
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        "k",
+    ]);
+    assert_eq!(
+        human.code,
+        0,
+        "a valid binding must remain readable: {}",
+        human.output()
+    );
+    assert!(
+        human.stdout.contains(BOUND),
+        "the human result must preserve the channel ID: {}",
+        human.output()
+    );
+    let human_output = human.output();
+    assert!(
+        !human_output.to_ascii_lowercase().contains("warn")
+            && !human_output.contains("never resolves"),
+        "a valid binding must not produce a human warning: {human_output}"
+    );
+
+    let json = run(&[
+        "cluster",
+        "surfaces",
+        AGENT_NAME,
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        "k",
+        "--json",
+    ]);
+    assert_eq!(
+        json.code,
+        0,
+        "a valid binding must remain readable under --json: {}",
+        json.output()
+    );
+    let value: serde_json::Value = serde_json::from_str(json.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "--json must emit exactly one JSON object: {e}; stdout: {}",
+            json.stdout
+        )
+    });
+    let binding = value["surfaces"]
+        .as_array()
+        .and_then(|surfaces| surfaces.first())
+        .expect("the JSON result must carry the valid binding");
+    assert_eq!(binding["kind"], "slack");
+    assert_eq!(binding["address"], BOUND);
+    assert!(
+        binding.get("warning").is_none(),
+        "a valid binding must omit the JSON warning field: {binding}"
+    );
+    assert!(
+        writes(&server).is_empty(),
+        "human and JSON reads must issue no write, got {:?}",
+        writes(&server)
+    );
 }
 
 #[test]

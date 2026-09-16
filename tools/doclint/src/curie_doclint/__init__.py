@@ -8,9 +8,10 @@ Four phases run over the linted root (``docs/`` excluding ``docs/adr/``):
    runner modules import ``claude_agent_sdk``") against the tree itself, so
    prose numbers cannot silently re-drift (#938, see ``counts.py``).
 3. Commands: resolve every ``curie ...`` invocation the published verification
-   contract (``docs/agents.md``) names against the committed
-   ``cli/command-manifest.json``, so a contract cannot name a command that no
-   longer exists (#1041, see ``commands.py``).
+   contract (``docs/agents.md``) and the SRE demo runbook
+   (``examples/sre-bot/DEMO.md``) name against the committed
+   ``cli/command-manifest.json``, so those docs cannot name a command that no
+   longer exists (#1041, #2247, see ``commands.py``).
 4. Lint: walk every citation, assert no line coordinates, every path exists,
    every Python symbol resolves.
 

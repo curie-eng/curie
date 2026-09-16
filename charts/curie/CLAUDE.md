@@ -163,6 +163,14 @@ component and rail detail in `charts/curie/README.md`.
 - **Values keys are camelCase, not hyphenated.** Go templates cannot
   dot-index a hyphenated key. Keep this consistent across any new values
   additions.
+- **Worker `extraEnv` is appended through `curie.worker.extraEnv`; never
+  `toYaml` the list raw onto the container.** First-class timeout and
+  delivery-budget env names are reserved. A retained pre-first-class
+  `CURIE_RUNNER_TOTAL_TIMEOUT_S` extraEnv used to render a second copy;
+  Kubernetes then rejected the worker patch after Helm had begun applying
+  other resources (#2097). The helper drops colliding names so first-class
+  values win. A new first-class worker timeout env must be added to that
+  reserved dict, not only to `templates/worker.yaml`.
 - **Placement-class lookups go through `curie.placement.class`; never
   index `.Values.placement.<class>` directly in a template.** Helm's
   values coalescing deletes a key whose replayed value is YAML null, so

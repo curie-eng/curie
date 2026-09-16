@@ -148,17 +148,27 @@ def host_checking_connector() -> Iterator[Callable[[list[dict[str, object]], str
         server.server_close()
 
 
-def bundle(root: Path, gates: list[str]) -> Path:
+def bundle(
+    root: Path,
+    gates: list[str],
+    approval_required: list[str] | None = None,
+) -> Path:
     b = root / "bundle"
     (b / ".claude-plugin").mkdir(parents=True)
     (b / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps(
-            {
-                "name": "fixture",
-                "version": "0.0.1",
-                "approvalPolicy": {"gates": [{"gate": g} for g in gates]},
-            }
-        ),
+        json.dumps({
+            "name": "fixture",
+            "version": "0.0.1",
+            "approvalPolicy": {"gates": [{"gate": g} for g in gates]},
+            **({
+                "toolPolicy": {
+                    "enforcement": "curie/mcp-tool-policy@1",
+                    "allow": [],
+                    "approvalRequired": approval_required,
+                    "deny": [],
+                }
+            } if approval_required is not None else {}),
+        }),
         encoding="utf-8",
     )
     return b
@@ -182,6 +192,26 @@ def test_gate_naming_a_published_write_tool_passes(
     b = bundle(tmp_path, ["mcp__k8s-write__restart_deployment"])
     r = run(b, f"k8s-write={url}")
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_tool_policy_approval_pattern_gates_a_published_write_tool(
+    tmp_path: Path, connector: StartConnector
+) -> None:
+    url = connector([WRITE_TOOL, READ_TOOL])
+    b = bundle(tmp_path, [], ["kubernetes/restart_deployment"])
+    r = run(b, f"kubernetes={url}")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_tool_policy_approval_pattern_matching_no_tool_fails(
+    tmp_path: Path, connector: StartConnector
+) -> None:
+    url = connector([WRITE_TOOL])
+    b = bundle(tmp_path, [], ["kubernetes/scale_deployment"])
+    r = run(b, f"kubernetes={url}")
+    assert r.returncode == 1, r.stdout
+    assert "GATE ARMS NOTHING" in r.stderr
+    assert "kubernetes/scale_deployment" in r.stderr
 
 
 def test_gate_naming_no_published_tool_fails_and_suggests_the_closest(

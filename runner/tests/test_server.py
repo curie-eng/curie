@@ -1,9 +1,14 @@
 """The aiohttp ACI channel: health, status, event stream, interrupt, steer."""
 
+import json
+from pathlib import Path
+
 import anyio
 from aci_protocol import SessionStatus, parse_ndjson
 from aiohttp.test_utils import TestClient, TestServer
 from curie_runner import RunTracer, SideEffectClassifier, create_app
+from curie_runner.__main__ import build_runner
+from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
 from opentelemetry.sdk.trace import TracerProvider
@@ -55,6 +60,41 @@ def _runner() -> tuple[SessionRunner, FakeModelSession]:
     return runner, fake
 
 
+def _boot_runner(
+    tmp_path: Path, *, managed_workspace: bool
+) -> tuple[SessionRunner, Path | None]:
+    """Build the actual fake-model boot path with claim identity and workspace state."""
+
+    plugin_dir = tmp_path / "bundle"
+    manifest_dir = plugin_dir / ".claude-plugin"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "plugin.json").write_text(
+        json.dumps({"name": "acme-bot"}), encoding="utf-8"
+    )
+    workspace_path: Path | None = None
+    if managed_workspace:
+        workspace_path = tmp_path / "workspace"
+        (workspace_path / ".git").mkdir(parents=True)
+    config = RunnerConfig.from_env(
+        {
+            "CURIE_PLUGIN_DIR": str(plugin_dir),
+            "CURIE_SESSION_ID": "session-acme-workspace",
+            "CURIE_SANDBOX_ID": "sandbox-acme-workspace",
+            "CURIE_BUDGET": (
+                '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
+            ),
+        }
+    )
+    return (
+        build_runner(
+            config,
+            fake_model=True,
+            workspace_path=workspace_path,
+        ),
+        workspace_path,
+    )
+
+
 def test_healthz_status_and_event_round_trip() -> None:
     runner, _ = _runner()
 
@@ -69,6 +109,7 @@ def test_healthz_status_and_event_round_trip() -> None:
             body = await status.json()
             assert body["status"] == SessionStatus.IDLE_AWAITING_INPUT.value
             assert body["ready"] is True
+            assert body["history_durable"] is True
 
             frame = {"kind": "event", "type": "message", "text": "hi", "user": "U", "ts": "1"}
             resp = await client.post("/v1/event", json=frame)
@@ -242,6 +283,85 @@ def test_reset_requires_auth_when_a_token_is_configured() -> None:
             assert unauth.status == 401
             ok = await client.post("/v1/reset", headers=_AUTH)
             assert ok.status == 200
+
+    anyio.run(go)
+
+
+def test_control_status_requires_auth_while_probe_status_remains_open() -> None:
+    runner, _ = _runner()
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+            probe = await client.get("/status")
+            assert probe.status == 200
+            unauthenticated = await client.get("/v1/status")
+            assert unauthenticated.status == 401
+            authenticated = await client.get("/v1/status", headers=_AUTH)
+            assert authenticated.status == 200
+            assert (await authenticated.json())["history_durable"] is True
+
+    anyio.run(go)
+
+
+def test_authenticated_status_attests_actual_mounted_workspace_boot(tmp_path: Path) -> None:
+    runner, workspace_path = _boot_runner(tmp_path, managed_workspace=True)
+    assert workspace_path is not None
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+            # Boot identity and filesystem placement are control-plane facts. The
+            # unauthenticated probe remains useful without disclosing either.
+            probe = await client.get("/status")
+            probe_body = await probe.json()
+            assert probe.status == 200
+            assert "session_id" not in probe_body
+            assert "sandbox_id" not in probe_body
+            assert "managed_workspace" not in probe_body
+            assert "cwd" not in probe_body
+
+            unauthenticated = await client.get("/v1/status")
+            assert unauthenticated.status == 401
+            authenticated = await client.get("/v1/status", headers=_AUTH)
+            body = await authenticated.json()
+            assert authenticated.status == 200
+            # Preserve the pre-attestation status DTO while adding enough
+            # runner-observed state for a worker to reject a wrong replacement.
+            assert body["status"] == SessionStatus.IDLE_AWAITING_INPUT.value
+            assert body["ready"] is True
+            assert body["turn_active"] is False
+            assert body["history_durable"] is True
+            assert {
+                "session_id": "session-acme-workspace",
+                "sandbox_id": "sandbox-acme-workspace",
+                "managed_workspace": True,
+                "cwd": str(workspace_path),
+            }.items() <= body.items()
+
+    anyio.run(go)
+
+
+def test_authenticated_status_attests_unmounted_boot_without_cwd(tmp_path: Path) -> None:
+    runner, workspace_path = _boot_runner(tmp_path, managed_workspace=False)
+    assert workspace_path is None
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+            authenticated = await client.get("/v1/status", headers=_AUTH)
+            body = await authenticated.json()
+            assert authenticated.status == 200
+            assert body["status"] == SessionStatus.IDLE_AWAITING_INPUT.value
+            assert body["ready"] is True
+            assert body["turn_active"] is False
+            assert body["history_durable"] is True
+            assert {
+                "session_id": "session-acme-workspace",
+                "sandbox_id": "sandbox-acme-workspace",
+                "managed_workspace": False,
+                "cwd": None,
+            }.items() <= body.items()
 
     anyio.run(go)
 

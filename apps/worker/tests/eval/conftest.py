@@ -68,6 +68,7 @@ class FakeEvalRunner:
                 web.post("/v1/event", self._event),
                 web.post("/v1/reset", self._reset),
                 web.get("/status", self._status),
+                web.get("/v1/status", self._status),
             ]
         )
         self.responses: dict[str, str] = {}

@@ -1,0 +1,27 @@
+{
+  "_fixture": {
+    "releasedChart": "v0.8.4",
+    "source": "user-supplied helm values overlay from a released v0.8.4 chart, not current-chart defaults. extraEnv CURIE_RUNNER_TOTAL_TIMEOUT_S is the #2297 class: the first-class field exists on this chart but the operator still carried the legacy extraEnv."
+  },
+  "ui": { "deploy": false },
+  "worker": {
+    "extraEnv": [
+      { "name": "CURIE_RUNNER_TOTAL_TIMEOUT_S", "value": "120" },
+      { "name": "PROVIDER_BASE_URL", "value": "https://provider.example.com/v1" }
+    ]
+  },
+  "dispatcher": {
+    "slack": {
+      "botTokenExistingSecret": "acme-slack",
+      "botTokenExistingSecretKey": "botToken",
+      "botToken": "xoxb-test-token-must-not-leak"
+    }
+  },
+  "agentSandbox": {
+    "runner": {
+      "credentialsExistingSecret": "acme-model",
+      "credentialsExistingSecretKey": "agentCredentials",
+      "credentials": "sk-ant-test-must-not-leak"
+    }
+  }
+}

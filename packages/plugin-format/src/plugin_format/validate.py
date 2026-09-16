@@ -9,7 +9,7 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -31,6 +31,7 @@ from .connector_lock import (
 )
 from .connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from .deploy_targets import validate_deploy_targets
+from .gate_summary import check_gate_summary_template
 from .manifest import resolve_manifest
 from .models import (
     _TRIGGER_TYPES,
@@ -43,6 +44,16 @@ from .models import (
     TriggerDeclaration,
 )
 from .reserved_env import SECRET_NAME_RE, is_reserved_boot_env_name
+from .skills import (
+    PROFILE_AGENT_SKILLS_STRICT,
+    PROFILE_CLAUDE_PLUGIN,
+    PROFILES,
+    SKILL_NAME_RE,
+    SPEC_FIELDS,
+    allowed_tools_style,
+    parse_allowed_tools,
+    unserializable_entries,
+)
 from .tool_policy import (
     TOOL_POLICY_ENFORCEMENT,
     check_policy_patterns,
@@ -88,7 +99,10 @@ class _Collector:
 
 
 def validate_bundle(
-    path: str | Path, *, enforces_tool_policy: str | None = None
+    path: str | Path,
+    *,
+    enforces_tool_policy: str | None = None,
+    profile: str = PROFILE_CLAUDE_PLUGIN,
 ) -> ValidationResult:
     """Validate the plugin bundle at ``path`` and return a ValidationResult.
 
@@ -111,7 +125,38 @@ def validate_bundle(
     The keyword-only ``None`` default keeps every existing call site
     source-compatible, and a bundle that declares no ``toolPolicy`` is entirely
     unaffected -- it yields the same ``valid``/``errors``/``warnings`` as before.
+
+    Profiles (ADR-0135)
+    -------------------
+    ``profile`` selects which conformance contract the skill checks report
+    against. One rule set, two verdicts:
+
+    - ``"claude-plugin"`` (the DEFAULT, and the ingestion contract) keeps today's
+      leniency exactly. Every Agent Skills divergence is a
+      ``skill.spec_nonconformant.*`` WARNING, so no bundle that deploys today
+      stops deploying. Runner boot and deploy ingestion pass no ``profile`` and
+      stay on this permanently.
+    - ``"agent-skills-strict"`` is a PUBLISHABILITY gate: the same findings are
+      errors, because a bundle the reference validator rejects must not clear it.
+      It is never the ingestion default anywhere.
+
+    An unrecognized ``profile`` raises ``ValueError`` naming both valid ids. That
+    is a deliberate exception to this function's otherwise absolute "returns
+    errors instead of raising" contract: a typo'd ``"agent-skills-strct"``
+    silently falling back to the lenient profile would report a bundle as
+    publishable that was never strictly checked -- a false PASS on a gate, the
+    same "a typo becomes permission widening" shape ``ToolPolicy`` refuses. It is
+    a CALLER error rather than a bundle error, and neither production caller
+    passes a profile, so neither can trigger it.
     """
+
+    if profile not in PROFILES:
+        raise ValueError(
+            f"unknown validation profile {profile!r}: expected "
+            f"{PROFILE_CLAUDE_PLUGIN!r} (the ingestion default, which reports every "
+            f"specification divergence as a warning) or {PROFILE_AGENT_SKILLS_STRICT!r} "
+            "(the publishability gate, which reports them as errors)"
+        )
 
     root = Path(path)
     c = _Collector()
@@ -122,7 +167,7 @@ def validate_bundle(
 
     manifest = _validate_manifest(root, c)
     if manifest is not None:
-        _validate_skills(root, c)
+        _validate_skills(root, c, profile)
         mcp_servers = _validate_mcp(root, manifest, c)
         _validate_hooks(root, manifest, c)
         _validate_triggers(manifest, c)
@@ -396,7 +441,7 @@ def _validate_manifest(root: Path, c: _Collector) -> PluginManifest | None:
     return manifest
 
 
-def _validate_skills(root: Path, c: _Collector) -> None:
+def _validate_skills(root: Path, c: _Collector, profile: str) -> None:
     skills_dir = root / "skills"
     if not skills_dir.is_dir():
         return
@@ -408,15 +453,20 @@ def _validate_skills(root: Path, c: _Collector) -> None:
 
     for skill_file in skill_files:
         rel = str(skill_file.relative_to(root))
-        frontmatter = _read_frontmatter(skill_file, rel, c)
-        if frontmatter is None:
+        read = _read_frontmatter(skill_file, rel, c)
+        if read is None:
             continue
+        frontmatter, raw = read
         _check_tools_confusable(frontmatter, rel, c)
         try:
             SkillFrontmatter.model_validate(frontmatter)
         except ValidationError as exc:
             for issue in _explain(exc):
                 c.error("skill.frontmatter_invalid", issue, rel)
+        # Runs in BOTH profiles and always after the two checks above, so every
+        # error code and ordering this file produced before the profiles existed
+        # is unchanged; the conformance findings are strictly additive.
+        _check_spec_conformance(frontmatter, raw, skill_file, rel, profile, c)
 
 
 # Keys an author reaches for instead of the verbatim Claude Code ``allowed-tools``.
@@ -440,6 +490,195 @@ def _check_tools_confusable(frontmatter: dict[str, Any], rel: str, c: _Collector
                 rel,
             )
             return
+
+
+# Every conformance finding shares this prefix, so a consumer can filter the
+# whole tier with one startswith and no existing code is renamed or removed.
+_SPEC_NONCONFORMANT = "skill.spec_nonconformant"
+
+# The specification's bounds. Named rather than inlined so a finding's message
+# and its test can quote the same number.
+_MAX_SKILL_NAME = 64
+_MAX_DESCRIPTION = 1024
+_MAX_COMPATIBILITY = 500
+
+
+class _ReportFn(Protocol):
+    """Emits one conformance finding at the profile's severity.
+
+    ``always_warning`` is the block-list carve-out: a finding the strict profile
+    reports as a warning too, because the reference validator accepts the shape.
+    """
+
+    def __call__(self, suffix: str, message: str, *, always_warning: bool = False) -> None: ...
+
+
+def _check_spec_conformance(
+    frontmatter: dict[str, Any],
+    raw: str,
+    skill_file: Path,
+    rel: str,
+    profile: str,
+    c: _Collector,
+) -> None:
+    """Report every Agent Skills divergence, as a warning or an error (ADR-0135).
+
+    ONE rule set, two verdicts. Under ``claude-plugin`` each finding is a warning
+    so the ingestion path keeps accepting everything it accepts today; under
+    ``agent-skills-strict`` the same finding is an error, because that profile
+    answers "would the reference validator publish this bundle".
+
+    The one deliberate exception is the block list, which stays a WARNING in both
+    profiles: ``skills-ref`` accepts it while the specification prose names the
+    string canonical, so erroring on it would fail bundles the reference
+    validator passes.
+
+    These checks read the RAW frontmatter mapping rather than a validated
+    ``SkillFrontmatter``, which is what lets the strict profile apply strict types
+    to ``license``/``compatibility``/``metadata`` without adding fields to the
+    lenient model (D2) -- but it also means every value here is unvalidated, so
+    each check guards its own type before it reads.
+    """
+
+    strict = profile == PROFILE_AGENT_SKILLS_STRICT
+
+    def report(suffix: str, message: str, *, always_warning: bool = False) -> None:
+        code = f"{_SPEC_NONCONFORMANT}.{suffix}"
+        if strict and not always_warning:
+            c.error(code, message, rel)
+        else:
+            c.warn(code, message, rel)
+
+    # An ALLOWLIST, not a denylist of the known Claude Code extras: a denylist
+    # goes stale the next time Claude Code adds a field, and a publishability
+    # gate that silently passes an unknown field is a false PASS.
+    for key in frontmatter:
+        if key not in SPEC_FIELDS:
+            report(
+                "unknown_field",
+                f"frontmatter key {str(key)!r} is not one of the Agent Skills fields "
+                f"{list(SPEC_FIELDS)}. Claude Code accepts it, but the specification's "
+                "field set is closed, so a strictly conformant skill cannot carry it.",
+            )
+
+    name = frontmatter.get("name")
+    if isinstance(name, str):
+        if not 1 <= len(name) <= _MAX_SKILL_NAME:
+            report(
+                "name_length",
+                f"skill name is {len(name)} characters; the specification allows "
+                f"1-{_MAX_SKILL_NAME}.",
+            )
+        if not SKILL_NAME_RE.match(name):
+            report(
+                "name_charset",
+                f"skill name {name!r} must be lowercase letters and digits separated by "
+                "single hyphens.",
+            )
+        # The IMMEDIATE parent directory: the specification pairs a skill with its
+        # own directory, and `rglob` accepts a skill at any depth.
+        if name != skill_file.parent.name:
+            report(
+                "name_dir_mismatch",
+                f"skill name {name!r} does not match its directory "
+                f"{skill_file.parent.name!r}; the specification pairs a skill with the "
+                "directory it lives in.",
+            )
+
+    # A missing or non-string `description` is already a
+    # `skill.frontmatter_invalid` error from the model, so only the bounds are
+    # this check's to report.
+    description = frontmatter.get("description")
+    if isinstance(description, str) and not 1 <= len(description) <= _MAX_DESCRIPTION:
+        report(
+            "description_length",
+            f"skill description is {len(description)} characters; the specification "
+            f"allows 1-{_MAX_DESCRIPTION}.",
+        )
+
+    if "license" in frontmatter and not isinstance(frontmatter["license"], str):
+        report("license_type", "`license` must be a string (an SPDX identifier).")
+
+    if "compatibility" in frontmatter:
+        compatibility = frontmatter["compatibility"]
+        if not isinstance(compatibility, str) or len(compatibility) > _MAX_COMPATIBILITY:
+            report(
+                "compatibility_length",
+                f"`compatibility` must be a string of at most {_MAX_COMPATIBILITY} characters.",
+            )
+
+    if "metadata" in frontmatter:
+        metadata = frontmatter["metadata"]
+        if not isinstance(metadata, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in metadata.items()
+        ):
+            report(
+                "metadata_shape",
+                "`metadata` must be a mapping of string keys to STRING values; the "
+                "specification does not allow a number, a boolean or a nested object "
+                "as a value.",
+            )
+
+    _check_spec_allowed_tools(frontmatter, raw, report)
+
+
+def _check_spec_allowed_tools(
+    frontmatter: dict[str, Any],
+    raw: str,
+    report: _ReportFn,
+) -> None:
+    """The ``allowed-tools`` half of the conformance checks (D3/D4)."""
+
+    if "allowed-tools" not in frontmatter:
+        return
+    declared = frontmatter["allowed-tools"]
+    style = allowed_tools_style(raw, declared)
+    if style == "absent":
+        # `allowed-tools: null` declares no tools exactly as an absent key does,
+        # so there is no authored shape to report on.
+        return
+
+    if style == "block":
+        # A warning in BOTH profiles: the reference validator accepts a block
+        # list, so erroring here would fail a bundle skills-ref publishes.
+        report(
+            "allowed_tools_block_list",
+            "`allowed-tools` is a YAML block list. The Agent Skills specification's "
+            "canonical shape is one space-separated string (the reference validator "
+            "accepts the list, so this is advisory).",
+            always_warning=True,
+        )
+    elif style == "flow":
+        report(
+            "allowed_tools_flow_list",
+            "`allowed-tools` is a YAML flow sequence. The Agent Skills specification's "
+            "canonical shape is one space-separated string.",
+        )
+
+    # Applies to the STRING form too, not only to lists: an entry with unbalanced
+    # parens is one `_entry_tool` cannot read, so it contributes nothing to the
+    # #1852 gate-shadow check while looking like a declared tool.
+    #
+    # A LIST is checked against its AUTHORED entries, not `parse_allowed_tools`'s
+    # normalized ones: that helper strips whitespace and drops empties before this
+    # check would ever see them, so `[" Read "]` looked clean even though it does
+    # not survive the canonical `parse_allowed_tools(" ".join(entries)) == entries`
+    # round-trip (it normalizes to `["Read"]`). A string, by contrast, decomposes
+    # into entries that round-trip by construction, so `parse_allowed_tools` is
+    # still the right input there.
+    if isinstance(declared, list):
+        candidates = [entry for entry in declared if isinstance(entry, str)]
+    else:
+        candidates = parse_allowed_tools(declared)
+    offenders = unserializable_entries(candidates)
+    if offenders:
+        report(
+            "allowed_tools_unserializable",
+            f"`allowed-tools` entries {offenders} cannot survive the canonical "
+            "space-separated form: an entry may not be empty, carry a comma or "
+            "whitespace outside a `(...)` specifier, or leave a paren unbalanced. "
+            "`Bash(git commit:*)` is fine; `Bash(git` and `Read,Write` are not.",
+        )
 
 
 def _validate_mcp(root: Path, manifest: PluginManifest, c: _Collector) -> set[str] | None:
@@ -700,6 +939,10 @@ def _validate_approval_policy(
         # looks built-in on the raw string would arm a mis-namespaced tool at
         # runtime and silently never fire (#453).
         stripped_gate = gate.gate.strip()
+        if gate.summary is not None:
+            summary_err = check_gate_summary_template(gate.summary)
+            if summary_err is not None:
+                c.error("approval_policy.summary_invalid", summary_err, loc)
         if expected_prefixes is None or not stripped_gate.startswith("mcp__"):
             continue
 
@@ -1011,7 +1254,20 @@ def _validate_scripts(root: Path, c: _Collector) -> None:
         c.error("scripts.not_a_directory", "scripts must be a directory", "scripts")
 
 
-def _read_frontmatter(skill_file: Path, rel: str, c: _Collector) -> dict[str, Any] | None:
+def _read_frontmatter(
+    skill_file: Path, rel: str, c: _Collector
+) -> tuple[dict[str, Any], str] | None:
+    """The parsed frontmatter mapping AND the raw text it was parsed from.
+
+    The raw half is what ``allowed_tools_style`` needs: pyyaml parses a flow
+    sequence and a block list into the same list, so the authored shape survives
+    only in the source text (D3). It is ``parts[1]``, which is exactly the
+    frontmatter even when the body contains its own ``---`` rule, because the
+    split below is bounded at 2.
+
+    Every error code and message here is unchanged; only the success shape moved.
+    """
+
     text = skill_file.read_text(encoding="utf-8")
     if not text.startswith("---"):
         c.error("skill.frontmatter_missing", "SKILL.md has no YAML frontmatter block", rel)
@@ -1035,7 +1291,7 @@ def _read_frontmatter(skill_file: Path, rel: str, c: _Collector) -> dict[str, An
     if not isinstance(loaded, dict):
         c.error("skill.frontmatter_invalid", "frontmatter must be a YAML mapping", rel)
         return None
-    return loaded
+    return loaded, parts[1]
 
 
 def _explain(

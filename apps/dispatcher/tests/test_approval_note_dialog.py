@@ -44,7 +44,7 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient
 
-from .conftest import FakeSocketClient, _authorize, _black_hole_api
+from .conftest import FakeSocketClient, _authorize, _black_hole_api, deliver_until_acked
 
 APPROVAL_ID = "9a1e8a10-0000-0000-0000-000000001053"
 CARD_TS = "1700.0042"
@@ -89,6 +89,13 @@ class ScriptedResolver:
         )
         return self.outcome
 
+    def exists(self, approval_id: str) -> bool | None:
+        del approval_id
+        return not (
+            self.outcome.status_code == 404
+            and self.outcome.detail.strip().casefold() == "approval not found"
+        )
+
 
 class _CapturingHttpResponse:
     status_code = 200
@@ -107,7 +114,11 @@ class _CapturingHttpClient:
     def post(
         self, url: str, *, json: dict[str, Any], headers: dict[str, str]
     ) -> _CapturingHttpResponse:
-        self.requests.append({"url": url, "json": json, "headers": headers})
+        self.requests.append({"method": "POST", "url": url, "json": json, "headers": headers})
+        return _CapturingHttpResponse()
+
+    def get(self, url: str, *, headers: dict[str, str]) -> _CapturingHttpResponse:
+        self.requests.append({"method": "GET", "url": url, "headers": headers})
         return _CapturingHttpResponse()
 
 
@@ -192,6 +203,15 @@ def _build(
 
 def _drain(app: App) -> None:
     app.listener_runner.listener_executor.shutdown(wait=True)
+
+
+def _assert_ownership_miss_ephemeral(web_client: WebClient) -> None:
+    web_client.chat_postEphemeral.assert_called_once()
+    text = web_client.chat_postEphemeral.call_args.kwargs["text"]
+    folded = text.casefold()
+    assert "disconnect" in folded
+    assert "do not retry from this side" in folded
+    assert "try again" not in folded
 
 
 def _note_click(envelope_id: str, *, action_id: str, user: str = "U_MANAGER") -> SocketModeRequest:
@@ -333,46 +353,89 @@ def test_submitting_the_dialog_resolves_with_the_typed_note(
 def test_two_releases_only_the_owner_resolves_a_note_submission(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
-    """The non-owner keeps the modal live and performs no Slack mutation (#2202)."""
+    """One fake Slack app, two dispatchers: only the owner acks the submit (#2248)."""
 
-    non_owner = ScriptedResolver(
-        ResolveOutcome(status_code=404, detail="approval not found")
-    )
+    non_owner = ScriptedResolver(ResolveOutcome(status_code=404, detail="approval not found"))
     owner = ScriptedResolver(
         ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
     )
     non_owner_app, non_owner_web = _build(config, redis_client, non_owner)
     owner_app, owner_web = _build(config, redis_client, owner)
-
     non_owner_socket = FakeSocketClient()
-    SocketModeHandler(non_owner_app, app_token="xapp-test").handle(
-        non_owner_socket,
-        _note_submit("env-note-release-b", note="approved for Q3"),
-    )
-    _drain(non_owner_app)
-
-    refusal = non_owner_socket.ack_payload_for("env-note-release-b")
-    assert refusal is not None
-    assert refusal["response_action"] == "errors"
-    assert "nothing was changed" in refusal["errors"]["note"]
-    assert "owning release" in refusal["errors"]["note"]
-    assert len(non_owner.calls) == 1
-    non_owner_web.conversations_replies.assert_not_called()
-    non_owner_web.chat_update.assert_not_called()
-    non_owner_web.chat_postEphemeral.assert_not_called()
-
     owner_socket = FakeSocketClient()
-    SocketModeHandler(owner_app, app_token="xapp-test").handle(
-        owner_socket,
-        _note_submit("env-note-release-a", note="approved for Q3"),
-    )
-    _drain(owner_app)
+    submit = _note_submit("env-shared-note", note="approved for Q3")
 
-    assert owner_socket.ack_payload_for("env-note-release-a") is None
+    acked_by = deliver_until_acked(
+        [
+            (
+                SocketModeHandler(non_owner_app, app_token="xapp-test"),
+                non_owner_socket,
+                non_owner_app,
+            ),
+            (
+                SocketModeHandler(owner_app, app_token="xapp-test"),
+                owner_socket,
+                owner_app,
+            ),
+        ],
+        submit,
+    )
+
+    assert acked_by is owner_socket
+    assert non_owner_socket.acked_envelope_ids == []
+    assert owner_socket.acked_envelope_ids == ["env-shared-note"]
+    assert owner_socket.ack_payload_for("env-shared-note") is None
+    assert len(non_owner.calls) == 1
     assert len(owner.calls) == 1
     assert owner.calls[0]["note"] == "approved for Q3"
+    non_owner_web.conversations_replies.assert_not_called()
+    non_owner_web.chat_update.assert_not_called()
+    _assert_ownership_miss_ephemeral(non_owner_web)
     owner_web.chat_update.assert_called_once()
     assert "approved for Q3" in owner_web.chat_update.call_args.kwargs["text"]
+    owner_web.chat_postEphemeral.assert_not_called()
+
+
+def test_two_releases_only_the_owner_opens_a_note_dialog(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The non-owner must not ack a note click, so the owner opens the dialog."""
+
+    non_owner = ScriptedResolver(ResolveOutcome(status_code=404, detail="approval not found"))
+    owner = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    non_owner_app, non_owner_web = _build(config, redis_client, non_owner)
+    owner_app, owner_web = _build(config, redis_client, owner)
+    non_owner_socket = FakeSocketClient()
+    owner_socket = FakeSocketClient()
+    click = _note_click("env-shared-note-open", action_id=APPROVE_NOTE_ACTION_ID)
+
+    acked_by = deliver_until_acked(
+        [
+            (
+                SocketModeHandler(non_owner_app, app_token="xapp-test"),
+                non_owner_socket,
+                non_owner_app,
+            ),
+            (
+                SocketModeHandler(owner_app, app_token="xapp-test"),
+                owner_socket,
+                owner_app,
+            ),
+        ],
+        click,
+    )
+
+    assert acked_by is owner_socket
+    assert non_owner_socket.acked_envelope_ids == []
+    assert owner_socket.acked_envelope_ids == ["env-shared-note-open"]
+    assert non_owner.calls == []
+    assert owner.calls == []
+    non_owner_web.views_open.assert_not_called()
+    _assert_ownership_miss_ephemeral(non_owner_web)
+    owner_web.views_open.assert_called_once()
+    owner_web.chat_postEphemeral.assert_not_called()
 
 
 def test_an_unrelated_404_does_not_claim_cross_release_ownership() -> None:
@@ -385,14 +448,17 @@ def test_an_unrelated_404_does_not_claim_cross_release_ownership() -> None:
 
 
 def test_an_approval_record_miss_asks_for_the_owning_release() -> None:
-    """The exact API row miss is retryable when two releases share one app."""
+    """The exact API row miss is a durable misconfiguration, not a retry."""
 
-    refusal = _refusal_text(
-        ResolveOutcome(status_code=404, detail="approval not found")
-    )
+    refusal = _refusal_text(ResolveOutcome(status_code=404, detail="approval not found"))
+    folded = refusal.casefold()
 
-    assert "nothing was changed" in refusal
-    assert "owning release" in refusal
+    assert "nothing was changed" in folded
+    assert "does not have this approval" in folded
+    assert "try again" not in folded
+    assert "disconnect" in folded
+    assert "socket mode" in folded
+    assert "do not retry from this side" in folded
 
 
 def test_modal_submit_posts_the_note_with_a_chat_principal(
@@ -461,8 +527,8 @@ def test_failed_modal_open_falls_forward_with_the_same_chat_principal(
     )
     _drain(app)
 
-    assert len(captured.requests) == 1
-    request = captured.requests[0]
+    assert [request.get("method", "POST") for request in captured.requests] == ["GET", "POST"]
+    request = captured.requests[1]
     assert request["json"] == {"decision": "approved"}
     claims = _claims(request["headers"]["X-Curie-Approval-Principal"])
     expected_claims = {

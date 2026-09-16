@@ -117,14 +117,25 @@ pub fn resolve_chart(
     }
 
     match channel {
-        Channel::Release => Ok(Resolved::Fetch {
-            url: format!(
-                "https://github.com/curie-eng/curie/releases/download/v{version}/curie-{version}.tgz"
-            ),
-            cache_path: cache_root()?
-                .join(format!("v{version}"))
-                .join(format!("curie-{version}.tgz")),
-        }),
+        Channel::Release => {
+            if version.is_empty()
+                || !version.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')
+                })
+            {
+                return Err(anyhow!(
+                    "default release chart requires a safe target version component containing only ASCII letters, digits, '.', '-', and '+'; pass --chart <path-or-ref> to use an explicit chart"
+                ));
+            }
+            Ok(Resolved::Fetch {
+                url: format!(
+                    "https://github.com/curie-eng/curie/releases/download/v{version}/curie-{version}.tgz"
+                ),
+                cache_path: cache_root()?
+                    .join(format!("v{version}"))
+                    .join(format!("curie-{version}.tgz")),
+            })
+        }
         Channel::Dev if local_exists => Ok(Resolved::Local(PathBuf::from("charts/curie"))),
         Channel::Dev => Err(anyhow!(
             "dev build with no charts/curie in cwd; pass --chart <path-or-tgz> or use a released binary"
@@ -285,6 +296,104 @@ mod tests {
                     .to_string(),
                 cache_path: PathBuf::from("/tmp/xdgcache/curie/v0.1.0/curie-0.1.0.tgz"),
             }
+        );
+    }
+
+    #[test]
+    fn release_chart_rejects_unsafe_version_components_before_cache_resolution() {
+        for version in [
+            "",
+            "../outside",
+            r"0.9.0\outside",
+            "0.9.0?asset",
+            "0.9.0#asset",
+            "0.9.0%2Fasset",
+            "0.9.0 target",
+            "0.9.0\ncontrol",
+            "0.9.0-é",
+        ] {
+            let cache_called = std::cell::Cell::new(false);
+            let result = resolve_chart(
+                None,
+                Channel::Release,
+                version,
+                || {
+                    cache_called.set(true);
+                    Ok(PathBuf::from("/tmp/xdgcache/curie"))
+                },
+                false,
+            );
+
+            assert!(
+                !cache_called.get(),
+                "unsafe version reached cache resolution: {version:?}"
+            );
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains("safe target version component"),
+                "error was {message:?}"
+            );
+            assert!(
+                message.contains("ASCII letters, digits, '.', '-', and '+'"),
+                "error was {message:?}"
+            );
+            assert!(message.contains("--chart"), "error was {message:?}");
+            assert!(
+                !message.chars().any(char::is_control),
+                "error echoed a control byte: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_chart_accepts_prerelease_and_build_version_components() {
+        let version = "1.2.3-rc.1+build.7";
+
+        assert_eq!(
+            resolve_chart(
+                None,
+                Channel::Release,
+                version,
+                || Ok(PathBuf::from("/tmp/xdgcache/curie")),
+                false,
+            )
+            .unwrap(),
+            Resolved::Fetch {
+                url: format!(
+                    "https://github.com/curie-eng/curie/releases/download/v{version}/curie-{version}.tgz"
+                ),
+                cache_path: PathBuf::from(
+                    "/tmp/xdgcache/curie/v1.2.3-rc.1+build.7/curie-1.2.3-rc.1+build.7.tgz",
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn unused_version_does_not_change_explicit_override_or_dev_resolution() {
+        let unsafe_version = "../../outside?asset#fragment%2Fpath";
+
+        assert_eq!(
+            resolve_chart(
+                Some("charts/curie"),
+                Channel::Release,
+                unsafe_version,
+                || panic!("cache_root should not be called for a chart override"),
+                false,
+            )
+            .unwrap(),
+            Resolved::Local(PathBuf::from("charts/curie"))
+        );
+        assert_eq!(
+            resolve_chart(
+                None,
+                Channel::Dev,
+                unsafe_version,
+                || panic!("cache_root should not be called for a local dev chart"),
+                true,
+            )
+            .unwrap(),
+            Resolved::Local(PathBuf::from("charts/curie"))
         );
     }
 

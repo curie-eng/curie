@@ -5,8 +5,8 @@ agent is told to trust it. Nothing recomputed those names, so a renamed or
 dropped subcommand left the contract naming a command that no longer exists --
 the same defect class `counts.py` names for prose numbers, one noun over.
 
-Each `curie ...` invocation the contract writes inside a code construct is
-resolved against the committed `cli/command-manifest.json`, which
+Each `curie ...` invocation a gated command doc writes inside a code construct
+is resolved against the committed `cli/command-manifest.json`, which
 `cli/tests/command_surface.rs` already pins against the live clap grammar, so
 the manifest cannot silently drift from the real CLI. There are five ways to
 fail, all loud:
@@ -47,10 +47,11 @@ from typing import Any
 from .citation import find_code_spans, parse_markdown
 from .finding import Finding
 
-# Both are required artifacts. A missing one is a finding, never a skip: the
+# Required command docs. A missing one is a finding, never a skip: the
 # `_ROOT_DOCS` lesson is that filtering an absent required file out with
 # `.is_file()` is what lets it be deleted for zero findings and exit 0.
 CONTRACT_REL = "docs/agents.md"
+DEMO_RUNBOOK_REL = "examples/sre-bot/DEMO.md"
 MANIFEST_REL = "cli/command-manifest.json"
 
 # The token that opens an invocation, and the wrapping punctuation a doc puts
@@ -192,7 +193,11 @@ def _load_manifest(repo_root: Path) -> tuple[dict[str, Any] | None, Finding | No
 
 
 def _resolve_invocation(
-    tokens: list[str], start: int, root: dict[str, Any], unit: _Unit
+    tokens: list[str],
+    start: int,
+    root: dict[str, Any],
+    unit: _Unit,
+    doc_rel: str,
 ) -> tuple[int, list[Finding]]:
     """Resolve one invocation, returning where it ended and what it got wrong.
 
@@ -231,10 +236,10 @@ def _resolve_invocation(
         if token.startswith("<"):
             findings.append(
                 Finding(
-                    CONTRACT_REL,
+                    doc_rel,
                     cited,
-                    f"`{token}` is a placeholder, and placeholders are banned in the "
-                    "verification contract: an agent cannot run a shape. Write every "
+                    f"`{token}` is a placeholder, and placeholders are banned in a "
+                    "gated command doc: an agent cannot run a shape. Write every "
                     "command out in full, all three tiers included",
                     line=unit.line,
                 )
@@ -258,10 +263,10 @@ def _resolve_invocation(
             if arg is None:
                 findings.append(
                     Finding(
-                        CONTRACT_REL,
+                        doc_rel,
                         cited,
                         f"`{token}` is not an argument of `{' '.join(words[:-1])}` and is "
-                        "not a global flag; every flag the verification contract names "
+                        "not a global flag; every flag a gated command doc names "
                         f"must be declared in {MANIFEST_REL}",
                         line=unit.line,
                     )
@@ -285,10 +290,10 @@ def _resolve_invocation(
         if child is None:
             findings.append(
                 Finding(
-                    CONTRACT_REL,
+                    doc_rel,
                     cited,
                     f"`{token}` is not a subcommand of `{' '.join(words[:-1])}`; every "
-                    "command the verification contract names must resolve in "
+                    "command a gated command doc names must resolve in "
                     f"{MANIFEST_REL}",
                     line=unit.line,
                 )
@@ -302,7 +307,7 @@ def _resolve_invocation(
     if not failed and node is root:
         findings.append(
             Finding(
-                CONTRACT_REL,
+                doc_rel,
                 " ".join(words),
                 "names no subcommand, so nothing about it is verified; write the command "
                 f"out in full so it resolves in {MANIFEST_REL}",
@@ -313,7 +318,9 @@ def _resolve_invocation(
     return index, findings
 
 
-def _check_unit(unit: _Unit, root: dict[str, Any]) -> tuple[list[Finding], int]:
+def _check_unit(
+    unit: _Unit, root: dict[str, Any], doc_rel: str
+) -> tuple[list[Finding], int]:
     """Resolve every invocation in one unit; return the findings and how many there were."""
     stripped = (_strip_token(token) for token in unit.text.split())
     # A token that was pure punctuation (`$(` written detached) strips to
@@ -328,23 +335,53 @@ def _check_unit(unit: _Unit, root: dict[str, Any]) -> tuple[list[Finding], int]:
             index += 1
             continue
         invocations += 1
-        index, invocation_findings = _resolve_invocation(tokens, index, root, unit)
+        index, invocation_findings = _resolve_invocation(
+            tokens, index, root, unit, doc_rel
+        )
         findings.extend(invocation_findings)
 
     return findings, invocations
 
 
+def _check_command_doc(
+    repo_root: Path,
+    rel: str,
+    manifest: dict[str, Any] | None,
+    missing_citation: str,
+    missing_reason: str,
+    empty_reason: str,
+) -> list[Finding]:
+    """Resolve one gated command doc against the manifest, or report its absence."""
+    path = repo_root / rel
+    if not path.is_file():
+        return [Finding(rel, missing_citation, missing_reason)]
+    if manifest is None:
+        return []
+
+    text = path.read_text(encoding="utf-8")
+    findings: list[Finding] = []
+    invocations = 0
+    for unit in _scanned_units(text):
+        unit_findings, unit_invocations = _check_unit(unit, manifest, rel)
+        findings.extend(unit_findings)
+        invocations += unit_invocations
+
+    if invocations == 0:
+        findings.append(Finding(rel, missing_citation, empty_reason))
+    return findings
+
+
 def check_agent_contract(repo_root: Path) -> list[Finding]:
-    """Assert every command the verification contract names against the manifest (#1041).
+    """Assert every command the gated command docs name against the manifest (#1041, #2247).
 
     Args:
-        repo_root: The repository root the contract and the manifest resolve under.
+        repo_root: The repository root the docs and the manifest resolve under.
 
     Returns:
         One finding per offending invocation -- never deduplicated by line, so
         two bad commands on one line stay two readable findings -- plus a
         finding for a missing or unparseable required artifact and one for a
-        contract that names no command at all. An empty list when every command
+        doc that names no command at all. An empty list when every command
         resolves.
 
     Two limits are deliberate, and a reader should not over-trust the gate past
@@ -362,40 +399,36 @@ def check_agent_contract(repo_root: Path) -> list[Finding]:
     if manifest_finding is not None:
         findings.append(manifest_finding)
 
-    contract = repo_root / CONTRACT_REL
-    if not contract.is_file():
-        findings.append(
-            Finding(
-                CONTRACT_REL,
-                "agent-contract",
-                f"{CONTRACT_REL} is missing; it is a required artifact -- README.md, "
-                "llms.txt and `curie guide` all point an agent at it, and its absence "
-                "empties this gate rather than failing it. Restore the file, or retire "
-                "the contract deliberately",
-            )
+    findings.extend(
+        _check_command_doc(
+            repo_root,
+            CONTRACT_REL,
+            manifest,
+            "agent-contract",
+            f"{CONTRACT_REL} is missing; it is a required artifact -- README.md, "
+            "llms.txt and `curie guide` all point an agent at it, and its absence "
+            "empties this gate rather than failing it. Restore the file, or retire "
+            "the contract deliberately",
+            "no `curie` command appears inside a code construct any more, so the "
+            "contract is no longer verified against "
+            f"{MANIFEST_REL}. Commands are only checked inside backticks or a fenced "
+            "block; restore them, or retire the contract deliberately",
         )
-        return findings
-
-    if manifest is None:
-        return findings
-
-    text = contract.read_text(encoding="utf-8")
-    invocations = 0
-    for unit in _scanned_units(text):
-        unit_findings, unit_invocations = _check_unit(unit, manifest)
-        findings.extend(unit_findings)
-        invocations += unit_invocations
-
-    if invocations == 0:
-        findings.append(
-            Finding(
-                CONTRACT_REL,
-                "agent-contract",
-                "no `curie` command appears inside a code construct any more, so the "
-                "contract is no longer verified against "
-                f"{MANIFEST_REL}. Commands are only checked inside backticks or a fenced "
-                "block; restore them, or retire the contract deliberately",
-            )
+    )
+    findings.extend(
+        _check_command_doc(
+            repo_root,
+            DEMO_RUNBOOK_REL,
+            manifest,
+            "sre-demo-runbook",
+            f"{DEMO_RUNBOOK_REL} is missing; it is a required artifact -- the SRE "
+            "demo names `curie` flags an operator is told to run, and its absence "
+            "empties this gate rather than failing it. Restore the file, or retire "
+            "the runbook deliberately",
+            "no `curie` command appears inside a code construct any more, so the "
+            "runbook is no longer verified against "
+            f"{MANIFEST_REL}. Commands are only checked inside backticks or a fenced "
+            "block; restore them, or retire the runbook deliberately",
         )
-
+    )
     return findings

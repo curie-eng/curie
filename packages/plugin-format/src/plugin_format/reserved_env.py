@@ -91,6 +91,7 @@ _CURIE_BOOT_KEYS = frozenset(
         "CURIE_BUDGET",
         "CURIE_SESSION_ID",
         "CURIE_BUNDLE_REF",
+        "CURIE_BUNDLE_VERSION",
         "CURIE_PLUGIN_DIR",
         "CURIE_MEMORY_REF",
         "CURIE_MEMORY_TOKEN",

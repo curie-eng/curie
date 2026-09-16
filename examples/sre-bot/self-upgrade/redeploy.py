@@ -81,6 +81,11 @@ BUNDLE_MEMBERS = (
 )
 BUNDLE_TREES = ("skills/", "manifests/")
 
+# deploy() always posts this environment. deployed_commit must read the same
+# one: git-flow leaves a previous environment's active row in place, so the
+# newest active deployment across environments is not what prod is serving.
+DEPLOY_ENVIRONMENT = "prod"
+
 
 class SelfUpgradeError(RuntimeError):
     """Something the operator has to fix, phrased for the operator."""
@@ -156,11 +161,12 @@ def _api(
 def deployed_commit(api_url: str, api_key: str, agent: str) -> tuple[str, str | None, str | None]:
     """``(agent_id, commit_sha, version_id)`` for the version this agent is SERVING.
 
-    The active deployment, not the newest version row. Those are different facts
-    and confusing them is how this job read a version that was created and never
-    deployed -- then tried to read a connector surface out of it and got "no
-    bundle stored for this version", which reads like a broken agent rather than
-    like a question asked about the wrong row.
+    The active deployment in ``DEPLOY_ENVIRONMENT``, not the newest version row
+    and not the newest active row across environments. Those are different
+    facts: git-flow never stops the previous environment's row, so an old
+    active prod deployment and a newer active dev deployment coexist, and
+    taking the newest ``deployed_at`` reports the dev commit as what prod is
+    serving.
 
     ``None`` for the sha when the deployed version records none: a version
     deployed by hand from a working copy has no commit, and that must read as
@@ -186,8 +192,10 @@ def deployed_commit(api_url: str, api_key: str, agent: str) -> tuple[str, str | 
 
     active = [
         d
-        for d in get("/deployments")
-        if d.get("agent_id") == agent_id and d.get("status") == "active"
+        for d in get(f"/deployments?agent_id={agent_id}")
+        if d.get("agent_id") == agent_id
+        and d.get("status") == "active"
+        and d.get("environment") == DEPLOY_ENVIRONMENT
     ]
     if not active:
         return agent_id, None, None
@@ -307,17 +315,40 @@ def resolve_digest(connector: str, commit: str) -> str:
     return str(digest)
 
 
+_MISSING = object()
+
+
+def _carried_overrides_declaration(key: str, declared: object, carried: str) -> bool:
+    """Whether a running env value may replace the incoming declaration.
+
+    Operator customizations of a still-granted value survive. An incoming empty
+    string is how connectors.yaml revokes a grant, and a narrower ``*_ALLOWLIST``
+    is a lowered ceiling: neither may be overwritten by the value currently
+    running.
+    """
+
+    if declared is _MISSING:
+        return True
+    if declared is None or (isinstance(declared, str) and declared.strip() == ""):
+        return False
+    if key.endswith("_ALLOWLIST"):
+        incoming = {part.strip() for part in str(declared).split(",") if part.strip()}
+        running = {part.strip() for part in carried.split(",") if part.strip()}
+        if incoming < running:
+            return False
+    return True
+
+
 def pin_build_connectors(
     declaration: bytes, commit: str, carried: dict[str, dict[str, str]]
 ) -> bytes:
     """Turn every `build:` connector into a digest-pinned `image:`.
 
-    Two substitutions, and the second is the one that is easy to forget. A
-    `build:` block records a LOCAL image id, which the cluster tier refuses. And
-    the declaration in the repository ships PLACEHOLDER allowlists -- deploying
-    those verbatim would leave every write connector refusing every call, which
-    reads exactly like a working bot that has decided not to act. So the ceilings
-    the install is actually running are carried across.
+    Two substitutions: a `build:` block records a LOCAL image id, which the
+    cluster tier refuses, and runtime connector environment may differ from the
+    repository defaults. Resolve the image and carry the running environment
+    across the immutable rebuild, except where the incoming declaration
+    narrows or revokes it.
     """
 
     import yaml
@@ -327,8 +358,13 @@ def pin_build_connectors(
         if "build" in spec:
             spec.pop("build")
             spec["image"] = f"ghcr.io/curie-eng/curie-sre-bot-{name}@{resolve_digest(name, commit)}"
+        env = spec.setdefault("env", {})
+        if not isinstance(env, dict):
+            env = {}
+            spec["env"] = env
         for key, value in (carried.get(name) or {}).items():
-            spec.setdefault("env", {})[key] = value
+            if _carried_overrides_declaration(key, env.get(key, _MISSING), value):
+                env[key] = value
     return yaml.safe_dump(parsed, sort_keys=False).encode()
 
 
@@ -454,12 +490,38 @@ def deploy(
             {
                 "agent_id": agent_id,
                 "version_id": version_id,
-                "environment": "prod",
+                "environment": DEPLOY_ENVIRONMENT,
                 "commit_sha": commit,
             }
         ).encode(),
     )
     return version_id
+
+
+def upgrade_disposition(current: str | None, version_id: str | None) -> str:
+    """What to do about a deployed version, given what is known about it.
+
+    Two different absences, and only one is fatal:
+
+    - No VERSION means nothing to read the running connector env off, so a deploy
+      would ship the bundle's placeholder allowlists and produce a bot that
+      refuses every write while looking healthy. Refuse.
+    - No COMMIT means only the comparison is lost. "Am I behind?" becomes
+      unanswerable; "can I deploy?" does not.
+
+    Refusing on a missing commit was wrong, and stuck: `curie example sre-bot
+    install` creates versions with no commit, so an install deployed the
+    supported way could never be upgraded by this job again -- and the refusal
+    advised deploying through the installer, which is what caused it (#2128).
+
+    Returns one of ``refuse``, ``deploy-unknown``, ``deploy``.
+    """
+
+    if not version_id:
+        return "refuse"
+    if not current:
+        return "deploy-unknown"
+    return "deploy"
 
 
 def main() -> int:
@@ -497,14 +559,37 @@ def main() -> int:
         print("dry run: would deploy the bundle at the tip", flush=True)
         return 0
 
-    if not current or not version_id:
+    # Two different absences, and only one of them is fatal.
+    #
+    # Without a VERSION there is nothing to read the running connector env off,
+    # so a deploy would ship the bundle's placeholder allowlists and produce a
+    # bot that refuses every write while looking healthy. That is worth refusing.
+    #
+    # Without a COMMIT the only thing lost is the comparison -- "am I behind?"
+    # becomes unanswerable, not "I cannot deploy". Refusing there was wrong, and
+    # wrong in a way that stuck: `curie example sre-bot install` creates versions
+    # with no commit, so an install deployed the supported way could never be
+    # upgraded by this job again, and the message told the reader to do the very
+    # thing that caused it (#2128).
+    #
+    # Deploying the tip is the safe answer to an unknown current: it is where the
+    # repository is, and the alternative is an install that can never move.
+    disposition = upgrade_disposition(current, version_id)
+    if disposition == "refuse":
         print(
-            "the deployed version records no commit, so there is nothing to compare "
-            "against and no connector declaration to carry forward. Deploy once "
-            "through the installer first.",
+            "the deployed version cannot be identified, so there is no connector "
+            "declaration to carry forward and a deploy would ship the bundle's "
+            "placeholder ceilings. Refusing.",
             flush=True,
         )
         return 1
+    if disposition == "deploy-unknown":
+        print(
+            "the deployed version records no commit, so whether this install is "
+            "behind cannot be determined. Deploying the tip, which is the only "
+            "answer that leaves it somewhere known.",
+            flush=True,
+        )
 
     try:
         archive = _get(

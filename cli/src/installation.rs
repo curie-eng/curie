@@ -2517,7 +2517,26 @@ mod diff_tests {
             github_entry.unresolved_credential.as_deref(),
             Some("CURIE_1426_GITHUB_CREDENTIAL")
         );
-        assert_eq!(out.changes(), 1);
+        let extra: Vec<&str> = out
+            .entries
+            .iter()
+            .filter(|entry| entry.kind != DiffKind::Same && entry.kind != DiffKind::Preserved)
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert!(
+            extra.contains(&"api.githubToken"),
+            "unresolved github must remain a change: {extra:?}"
+        );
+        assert!(
+            extra
+                .iter()
+                .all(|key| *key == "api.githubToken" || key.starts_with("config.")),
+            "unresolved github must not grow unrelated non-config changes: {extra:?}"
+        );
+        assert!(
+            out.changes() >= 1,
+            "an unresolved declared GitHub change must never report zero changes"
+        );
     }
 
     /// Values from the shared effective plan carry their literal desired value

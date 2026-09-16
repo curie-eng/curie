@@ -12,8 +12,6 @@ use std::io::{Cursor, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use flate2::read::GzDecoder;
 use serde_json::{json, Value};
@@ -26,11 +24,6 @@ const REQUIRED_MIB: u64 = 1376;
 const TEMPO_TAGGED_IMAGE: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo:0.8.0";
 const REGISTRY_INDEX: &str =
     r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
-/// Mirrors `examples::RUNTIME_PLUGIN_WRITE_DESCRIPTION`. Duplicated deliberately:
-/// the constant is private to the CLI crate, and an integration test asserting the
-/// uploaded bundle should read the wire, not the producer's own constant.
-const RUNTIME_PLUGIN_WRITE_DESCRIPTION_TEXT: &str = "SRE triage assistant for plain English production health and Kubernetes questions in Slack. This installer deploys read only Kubernetes, Grafana, and Tempo connectors, plus one approval-gated Kubernetes restart tool scoped to the Deployments named at install time. Every restart requires a human approval; no other write verb is available.";
-
 const REGISTRY_INDEX_WITHOUT_REQUIRED_FIELDS: &str =
     r#"{"mediaType":"application/vnd.oci.image.index.v1+json"}"#;
 const AGENT_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -88,18 +81,10 @@ struct Fixture {
     helm_mode: &'static str,
     grafana_secret_mode: &'static str,
     reader_token_mode: &'static str,
-    /// Whether the `sre-bot-writer` ServiceAccount already exists, i.e. fresh
-    /// install (`absent`, the default) versus re-install (`existing`).
-    writer_identity_mode: &'static str,
     helm_values: String,
     api: MockServer,
     registry: MockServer,
     registry_endpoint: String,
-    /// Flips `POST /deployments` to a 500. Shared with the mock API's handler
-    /// closure rather than baked in at construction, because the server thread
-    /// is already running by the time a builder method is called -- the handler
-    /// reads it per request, and the CLI is not launched until `run()`.
-    deploy_fails: Arc<AtomicBool>,
 }
 
 impl Fixture {
@@ -187,23 +172,6 @@ case " $* " in
     *" get priorityclass "*|*" get priorityclasses "*)
         exit 0
         ;;
-    # Existence probe for the writer identity, which is what decides the ORDER of
-    # the write-RBAC apply relative to the deploy. Absent (the default) means a
-    # fresh install and the deferred, post-deploy ordering every other test in
-    # this file asserts; `existing` means a re-install, where the ceiling must be
-    # tightened BEFORE the new version activates.
-    #
-    # Mirrors `--ignore-not-found`: absent is empty stdout and exit 0, never a
-    # NotFound failure. Deliberately placed ABOVE every `get secret` arm, and
-    # keyed on a token none of those arms contain, so neither group can shadow
-    # the other in either direction.
-    *" get serviceaccount "*)
-        case "$CURIE_TEST_WRITER_IDENTITY_MODE" in
-            existing) printf '%s\n' 'serviceaccount/sre-bot-writer' ;;
-            absent) ;;
-        esac
-        exit 0
-        ;;
     *" get secret grafana-admin "*)
         case "$CURIE_TEST_GRAFANA_SECRET_MODE" in
             existing) printf '%s\n' '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"grafana-admin"}}' ;;
@@ -230,7 +198,7 @@ case " $* " in
         printf '%s\n' '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"grafana"},"data":{"admin-user":"bWlncmF0ZWQtYWRtaW4=","admin-password":"cHc="}}'
         exit 0
         ;;
-    *" wait "*" secret/sre-bot-reader-token "*)
+    *" wait "*" secret/sre-bot-kubernetes-token "*)
         case "$CURIE_TEST_READER_TOKEN_MODE" in
             success|read-failure) exit 0 ;;
             timeout)
@@ -239,45 +207,14 @@ case " $* " in
                 ;;
         esac
         ;;
-    *" get secret sre-bot-reader-token "*)
+    *" get secret sre-bot-kubernetes-token "*)
         case "$CURIE_TEST_READER_TOKEN_MODE" in
             success)
                 printf '%s\n' '{"apiVersion":"v1","kind":"Secret","data":{"ca.crt":"Zml4dHVyZS1jYQ==","token":"enp6enp6enp6enp6"}}'
                 exit 0
                 ;;
             read-failure)
-                printf '%s\n' 'Error from server (Forbidden): secrets "sre-bot-reader-token" is forbidden' >&2
-                exit 1
-                ;;
-        esac
-        ;;
-    # The write identity is part of the DEFAULT install now, so the stub answers
-    # for it the way it does for the reader. The writer is reached only after the
-    # DEPLOY succeeds -- the identity is minted last on purpose, so a failed
-    # install cannot strand a live write credential (#1946).
-    #
-    # Keyed on the same mode variable regardless: a reader-token timeout or read
-    # failure aborts before the deploy is ever attempted, so there is no reachable
-    # run in which the reader path fails and the writer path is still consulted.
-    # One switch still describes the whole token path, and a second knob would
-    # only be able to express states the installer cannot produce.
-    *" wait "*" secret/sre-bot-writer-token "*)
-        case "$CURIE_TEST_READER_TOKEN_MODE" in
-            success|read-failure) exit 0 ;;
-            timeout)
-                printf '%s\n' 'error: timed out waiting for the condition' >&2
-                exit 1
-                ;;
-        esac
-        ;;
-    *" get secret sre-bot-writer-token "*)
-        case "$CURIE_TEST_READER_TOKEN_MODE" in
-            success)
-                printf '%s\n' '{"apiVersion":"v1","kind":"Secret","data":{"ca.crt":"Zml4dHVyZS1jYQ==","token":"eXl5eXl5eXl5eXl5"}}'
-                exit 0
-                ;;
-            read-failure)
-                printf '%s\n' 'Error from server (Forbidden): secrets "sre-bot-writer-token" is forbidden' >&2
+                printf '%s\n' 'Error from server (Forbidden): secrets "sre-bot-kubernetes-token" is forbidden' >&2
                 exit 1
                 ;;
         esac
@@ -407,8 +344,6 @@ exit 64
 "#,
         );
 
-        let deploy_fails = Arc::new(AtomicBool::new(false));
-        let handler_deploy_fails = Arc::clone(&deploy_fails);
         let api = serve(
             move |request| match (request.method.as_str(), request.path.as_str()) {
                 ("GET", "/agents") => Response::json(200, "[]"),
@@ -434,17 +369,6 @@ exit 64
                         ),
                     )
                 }
-                // The deploy-failure knob fails HERE and nowhere earlier. This
-                // leg runs after agent creation, version creation, and the
-                // bundle upload, so the fixture reproduces the case the ticket
-                // describes: a genuine deploy failure with the bundle already
-                // on the platform. Failing the upload instead would also make
-                // the test pass while proving far less -- an abort that early
-                // never reaches the window where a write credential could be
-                // stranded.
-                ("POST", "/deployments") if handler_deploy_fails.load(Ordering::SeqCst) => {
-                    Response::json(500, r#"{"error":"fixture deploy failure"}"#)
-                }
                 ("POST", "/deployments") => Response::json(
                     201,
                     &format!(
@@ -458,7 +382,7 @@ exit 64
                 {
                     Response::json(
                         200,
-                        r#"{"manifests":[{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"curie-sre-bot-kubernetes"}}],"owned_secret_name":"curie-sre-bot-connector-secrets","owned_secret_keys":["K8S_READONLY_KUBECONFIG"],"mcp_entries":{"kubernetes":{"url":"http://curie-sre-bot-kubernetes.curie.svc.cluster.local:8000/mcp"}}}"#,
+                        r#"{"manifests":[{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"curie-sre-bot-kubernetes"}}],"owned_secret_name":"curie-sre-bot-connector-secrets","owned_secret_keys":["K8S_KUBECONFIG"],"mcp_entries":{"kubernetes":{"url":"http://curie-sre-bot-kubernetes.curie.svc.cluster.local:8000/mcp"}}}"#,
                     )
                 }
                 _ => Response::json(500, r#"{"error":"unexpected API request"}"#),
@@ -522,14 +446,10 @@ exit 64
             helm_mode,
             grafana_secret_mode: "existing",
             reader_token_mode: "success",
-            // Fresh install by default, so every existing test keeps asserting
-            // the deferred post-deploy ordering it was written against.
-            writer_identity_mode: "absent",
             helm_values: "absent".to_string(),
             api,
             registry,
             registry_endpoint,
-            deploy_fails,
         }
     }
 
@@ -550,20 +470,6 @@ exit 64
 
     fn with_reader_token_mode(mut self, mode: &'static str) -> Self {
         self.reader_token_mode = mode;
-        self
-    }
-
-    /// Present the cluster as one where the writer identity already exists, i.e.
-    /// a RE-INSTALL rather than a first install.
-    fn with_writer_identity_mode(mut self, mode: &'static str) -> Self {
-        self.writer_identity_mode = mode;
-        self
-    }
-
-    /// Make the platform API refuse the deployment after it has accepted the
-    /// agent, the version, and the uploaded bundle.
-    fn with_deploy_failure(self) -> Self {
-        self.deploy_fails.store(true, Ordering::SeqCst);
         self
     }
 
@@ -617,7 +523,6 @@ exit 64
             .env("CURIE_TEST_HELM_VALUES", &self.helm_values)
             .env("CURIE_TEST_GRAFANA_SECRET_MODE", self.grafana_secret_mode)
             .env("CURIE_TEST_READER_TOKEN_MODE", self.reader_token_mode)
-            .env("CURIE_TEST_WRITER_IDENTITY_MODE", self.writer_identity_mode)
             .env(
                 "CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT",
                 &self.registry_endpoint,
@@ -715,24 +620,6 @@ fn uploaded_bundle_archive(fixture: &Fixture) -> Vec<u8> {
         .position(|window| window == [0x1f, 0x8b])
         .expect("multipart upload must contain a gzip archive");
     upload.body[gzip_start..].to_vec()
-}
-
-/// Every path the uploaded archive carries, in archive order.
-///
-/// The absence of a file is as much a bundle property as its contents -- a
-/// `connectors.lock.yaml` that should not exist cannot be asserted by reading
-/// one named entry.
-fn uploaded_bundle_paths(fixture: &Fixture) -> Vec<String> {
-    let decoder = GzDecoder::new(Cursor::new(uploaded_bundle_archive(fixture)));
-    let mut archive = tar::Archive::new(decoder);
-    archive
-        .entries()
-        .expect("read uploaded bundle archive")
-        .map(|entry| {
-            let entry = entry.expect("read uploaded bundle entry");
-            entry.path().expect("bundle path").display().to_string()
-        })
-        .collect()
 }
 
 /// Unpack the WHOLE uploaded archive into a temporary directory.
@@ -934,6 +821,10 @@ fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credenti
         text.contains("--slack-channel"),
         "the install surface must permit the optional Slack binding: {text}"
     );
+    assert!(
+        text.contains("--workspace-repo"),
+        "the install surface must expose the runtime GitHub allowlist flag: {text}"
+    );
     for required in ["--namespace", "--release", "--observability-namespace"] {
         assert!(
             text.contains(required),
@@ -1074,14 +965,14 @@ fn json_dry_run_is_one_object_and_orders_apply_before_bundle_deploy() {
     let read_access = lines
         .iter()
         .position(|line| {
-            line.contains("kubectl apply") && line.contains("manifests/read-access.yaml")
+            line.contains("kubectl apply") && line.contains("manifests/kubernetes-access.yaml")
         })
         .unwrap_or_else(|| panic!("plan must apply the read only connector RBAC: {lines:?}"));
     let token_wait = lines
         .iter()
         .position(|line| {
             line.contains("kubectl wait")
-                && line.contains("secret/sre-bot-reader-token")
+                && line.contains("secret/sre-bot-kubernetes-token")
                 && line.contains("--timeout=2m")
         })
         .unwrap_or_else(|| panic!("plan must wait boundedly for the reader token: {lines:?}"));
@@ -1423,7 +1314,7 @@ fn tempo_resolution_rejects_an_incomplete_index_before_cluster_mutation() {
 }
 
 #[test]
-fn successful_install_uploads_only_the_resolved_tempo_index_digest() {
+fn successful_install_uploads_the_pinned_upstream_kubernetes_connector_and_tool_policy() {
     let fixture = Fixture::with_modes(
         nodes(vec![node("node-a", "4Gi", true)]),
         pods(vec![]),
@@ -1440,51 +1331,42 @@ fn successful_install_uploads_only_the_resolved_tempo_index_digest() {
 
     let connectors = String::from_utf8(uploaded_bundle_file(&fixture, "connectors.yaml"))
         .expect("uploaded connectors are UTF-8");
-    let pinned = format!(
+    let pinned_tempo = format!(
         "ghcr.io/curie-eng/curie-sre-bot-tempo@{}",
         expected_tempo_digest()
-    );
-    assert!(
-        connectors.contains(&pinned),
-        "resolved digest must reach deploy"
-    );
-    assert!(
-        !connectors.contains(TEMPO_TAGGED_IMAGE),
-        "the declared mutable tag must never reach deploy"
     );
     let declaration: Value =
         serde_norway::from_str(&connectors).expect("uploaded connectors must remain valid YAML");
     assert_eq!(
-        declaration["connectors"]["tempo"]["image"], pinned,
-        "the runtime bundle must replace the local build declaration with the release image"
+        declaration["connectors"]["tempo"]["image"], pinned_tempo,
+        "the runtime bundle must replace Tempo's local build with the released image"
     );
-    assert!(
-        declaration["connectors"]["tempo"].get("build").is_none(),
-        "the uploaded runtime declaration must not ask the cluster deploy path to build Tempo"
-    );
-    // The default install now KEEPS the gated write connector (it is what the bot
-    // can be asked to do), and closes its ceiling instead of removing the tool.
-    // Same digest treatment as Tempo, for the same reason: a `build:` declaration
-    // records a local image id the cluster tier refuses.
-    let write = &declaration["connectors"]["k8s-write"];
-    assert!(
-        !write.is_null(),
-        "the default install must ship the gated write connector"
-    );
-    assert!(
-        write.get("build").is_none(),
-        "the uploaded declaration must not ask the cluster deploy path to build the write connector"
-    );
-    assert!(
-        write["image"]
-            .as_str()
-            .is_some_and(|image| image.contains("@sha256:")),
-        "the write connector must be pinned by digest, got {:?}",
-        write["image"]
+    assert!(declaration["connectors"]["tempo"].get("build").is_none());
+
+    let kubernetes = &declaration["connectors"]["kubernetes"];
+    assert_eq!(
+        kubernetes["image"],
+        "ghcr.io/containers/kubernetes-mcp-server@sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423"
     );
     assert_eq!(
-        write["env"]["K8S_WRITE_ALLOWLIST"], "",
-        "with no targets named the ceiling must be empty, so every call is refused"
+        kubernetes["args"],
+        json!([
+            "--port",
+            "8000",
+            "--bind-address",
+            "0.0.0.0",
+            "--toolsets",
+            "core",
+            "--disable-multi-cluster",
+            "--stateless",
+            "--kubeconfig",
+            "/secrets/kubeconfig"
+        ])
+    );
+    assert!(
+        declaration["connectors"].get("k8s-write").is_none()
+            && declaration["connectors"].get("k8s-scale").is_none(),
+        "the bespoke writer connectors must not reach the uploaded bundle: {connectors}"
     );
 
     let plugin: Value = serde_json::from_slice(&uploaded_bundle_file(
@@ -1492,70 +1374,28 @@ fn successful_install_uploads_only_the_resolved_tempo_index_digest() {
         ".claude-plugin/plugin.json",
     ))
     .expect("uploaded plugin manifest must remain valid JSON");
-    // The gate ships WITH the connector: keeping the tool and dropping the gate is
-    // the pairing that produced an ungated write path downstream, so the two are
-    // decided together and neither can arrive alone.
-    let gates = plugin["approvalPolicy"]["gates"]
-        .as_array()
-        .expect("the default install must declare its write gate");
-    assert_eq!(
-        gates.len(),
-        1,
-        "exactly the restart gate, and nothing that names an absent connector"
+    assert!(
+        plugin.get("toolPolicy").is_some(),
+        "the tri-state Kubernetes policy must reach the deployed bundle"
     );
-    assert_eq!(gates[0]["gate"], "mcp__k8s-write__restart_deployment");
-    assert_eq!(
-        plugin["description"], RUNTIME_PLUGIN_WRITE_DESCRIPTION_TEXT,
-        "the runtime manifest must describe the surface it actually ships"
+    assert!(
+        plugin.get("approvalPolicy").is_none(),
+        "self-upgrade gates must be stripped when the connector is not installed"
     );
 
-    // GitHub documents anonymous public GHCR pulls, and the Distribution token
-    // specification defines the service and repository pull scope exchange:
-    // https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry
-    // https://distribution.github.io/distribution/spec/auth/token/
     let registry = fixture.registry.recorded();
-    // Two connectors are resolved now -- Tempo and the gated write connector --
-    // and each costs a scoped token plus an index request.
     assert_eq!(
         registry.len(),
-        4,
-        "each resolved connector must use token then index requests"
+        2,
+        "only Tempo needs runtime resolution; the Kubernetes image is already digest-pinned"
     );
-    // Asserted by repository rather than by position: the count alone would pass
-    // if one connector were resolved twice.
-    for repository in ["curie-sre-bot-tempo", "curie-sre-bot-k8s-write"] {
-        let scope = format!("repository%3Acurie-eng%2F{repository}%3Apull");
-        assert!(
-            registry
-                .iter()
-                .any(|request| request.path.starts_with("/token?")
-                    && request.path.contains(&scope)),
-            "{repository} must be resolved through its own scoped pull token"
-        );
-        assert!(
-            registry.iter().any(|request| request
-                .path
-                .starts_with(&format!("/v2/curie-eng/{repository}/manifests/"))),
-            "{repository} must be resolved to an index digest before any cluster mutation"
-        );
-    }
-    for request in registry
-        .iter()
-        .filter(|request| request.path.contains("/manifests/"))
-    {
-        assert_eq!(
-            request.header("authorization"),
-            Some("Bearer anonymous-pull-token")
-        );
-        assert!(
-            request
-                .header("accept")
-                .is_some_and(|accept| accept.contains("application/vnd.oci.image.index.v1+json")),
-            "manifest request must require a multi-platform image index"
-        );
-    }
+    assert!(
+        registry
+            .iter()
+            .all(|request| !request.path.contains("curie-sre-bot-k8s-write")),
+        "the removed writer image must never be resolved: {registry:?}"
+    );
 }
-
 #[test]
 fn install_records_the_current_commit_sha_on_the_created_version() {
     let fixture = Fixture::with_modes(
@@ -1687,14 +1527,15 @@ fn guarded_platform_apply_precedes_additive_integration_and_reader_access() {
     let read_access = actions
         .iter()
         .position(|call| {
-            call.starts_with("KUBECTL apply -f ") && call.ends_with("manifests/read-access.yaml")
+            call.starts_with("KUBECTL apply -f ")
+                && call.ends_with("manifests/kubernetes-access.yaml")
         })
         .unwrap_or_else(|| panic!("the installer must apply the reader RBAC: {actions:?}"));
     let token_wait = actions
         .iter()
         .position(|call| {
             call.contains("KUBECTL wait")
-                && call.contains("secret/sre-bot-reader-token")
+                && call.contains("secret/sre-bot-kubernetes-token")
                 && call.contains("--timeout=2m")
         })
         .unwrap_or_else(|| {
@@ -1767,7 +1608,7 @@ fn reader_kubeconfig_is_owned_secret_stdin_and_connectors_reconcile_after_deploy
         secret["metadata"]["name"],
         "curie-sre-bot-connector-secrets"
     );
-    let kubeconfig = secret["stringData"]["K8S_READONLY_KUBECONFIG"]
+    let kubeconfig = secret["stringData"]["K8S_KUBECONFIG"]
         .as_str()
         .expect("the owned Secret must carry the generated kubeconfig");
     let config: Value = serde_json::from_str(kubeconfig).expect("kubeconfig is structured JSON");
@@ -1821,7 +1662,10 @@ fn reader_kubeconfig_is_owned_secret_stdin_and_connectors_reconcile_after_deploy
 fn reader_token_timeout_and_read_failure_are_bounded_and_stop_before_deploy() {
     for (mode, expected) in [
         ("timeout", "was not populated within 2m"),
-        ("read-failure", "could not read Secret sre-bot-reader-token"),
+        (
+            "read-failure",
+            "could not read Secret sre-bot-kubernetes-token",
+        ),
     ] {
         let fixture = Fixture::with_modes(
             nodes(vec![node("node-a", "4Gi", true)]),
@@ -1840,7 +1684,7 @@ fn reader_token_timeout_and_read_failure_are_bounded_and_stop_before_deploy() {
         );
         assert!(
             text.contains(expected)
-                && text.contains("kubectl get secret sre-bot-reader-token -n curie"),
+                && text.contains("kubectl get secret sre-bot-kubernetes-token -n curie"),
             "reader token failure must be actionable: {text}"
         );
         let wait = fixture
@@ -2214,6 +2058,58 @@ fn assert_no_default_curie_or_observability_targets(lines: &[String]) {
 }
 
 #[test]
+fn workspace_repo_flags_set_github_repo_allowlist_in_the_dry_run_plan() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let output = fixture.run(&[
+        "--dry-run",
+        "--json",
+        "--workspace-repo",
+        "acme-corp/acme-bot",
+        "--workspace-repo",
+        "acme-labs/*",
+    ]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "workspace-repo dry run must succeed: {text}"
+    );
+    let lines = dry_run_plan_lines(&output);
+    let plan = lines.join("\n");
+    assert!(
+        plan.contains("api.githubRepoAllowlist[0]=acme-corp/acme-bot"),
+        "first --workspace-repo must become allowlist index 0: {lines:?}"
+    );
+    assert!(
+        plan.contains("api.githubRepoAllowlist[1]=acme-labs/*"),
+        "second --workspace-repo must become allowlist index 1: {lines:?}"
+    );
+}
+
+#[test]
+fn workspace_repo_flag_rejects_a_malformed_entry_before_cluster_reads() {
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    );
+    let output = fixture.run(&["--workspace-repo", "not a repo"]);
+    let text = shown(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "malformed --workspace-repo must be a usage error: {text}"
+    );
+    assert!(
+        text.contains("owner/repo") || text.contains("allowlist"),
+        "usage error must name the expected allowlist shape: {text}"
+    );
+    assert!(fixture.kubectl_calls().is_empty());
+    assert!(fixture.helm_calls().is_empty());
+}
+
+#[test]
 fn no_flag_dry_run_preserves_curie_and_observability_defaults() {
     let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
     let output = fixture.run(&["--dry-run", "--json"]);
@@ -2251,7 +2147,7 @@ fn no_flag_dry_run_preserves_curie_and_observability_defaults() {
     assert!(
         lines.iter().any(|line| {
             line.contains("kubectl wait --namespace curie ")
-                && line.contains("secret/sre-bot-reader-token")
+                && line.contains("secret/sre-bot-kubernetes-token")
         }),
         "no-flag token wait must keep the Curie namespace: {lines:?}"
     );
@@ -2312,7 +2208,7 @@ fn custom_target_dry_run_reports_and_uses_only_the_selected_identities() {
     assert!(
         lines.iter().any(|line| {
             line.contains("kubectl wait --namespace soak ")
-                && line.contains("secret/sre-bot-reader-token")
+                && line.contains("secret/sre-bot-kubernetes-token")
         }),
         "reader token wait must use the selected Curie namespace: {lines:?}"
     );
@@ -2321,6 +2217,44 @@ fn custom_target_dry_run_reports_and_uses_only_the_selected_identities() {
             "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace soak --release soak-rel"
         )),
         "deploy plan must report the selected Curie identity: {lines:?}"
+    );
+}
+
+#[test]
+fn platform_upgrade_dry_run_discloses_the_applied_role_verbs() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let output = fixture.run(&["--dry-run", "--json", "--platform-upgrade"]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "platform-upgrade dry run must succeed: {text}"
+    );
+    let lines = dry_run_plan_lines(&output);
+    let role_line = lines
+        .iter()
+        .find(|line| line.contains("platform-upgrade-role.yaml"))
+        .unwrap_or_else(|| panic!("plan must disclose the Job Role: {lines:?}"));
+    assert!(
+        role_line.contains(r#"["get", "list", "watch", "create", "update", "patch", "delete"]"#),
+        "plan must name the verbs this build would apply: {role_line}"
+    );
+    assert!(
+        !role_line.contains("namespace-admin"),
+        "plan must not describe the grant in canned words: {role_line}"
+    );
+    let without = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let without_output = without.run(&["--dry-run", "--json"]);
+    assert!(
+        without_output.status.success(),
+        "default dry run must succeed: {}",
+        shown(&without_output)
+    );
+    let without_lines = dry_run_plan_lines(&without_output);
+    assert!(
+        without_lines
+            .iter()
+            .all(|line| !line.contains("platform-upgrade")),
+        "omitting the flag must keep the upgrade path out of the plan: {without_lines:?}"
     );
 }
 
@@ -2398,13 +2332,14 @@ fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_con
         kubectl.iter().any(|call| {
             call.contains("wait")
                 && call.contains("--namespace soak")
-                && call.contains("secret/sre-bot-reader-token")
+                && call.contains("secret/sre-bot-kubernetes-token")
         }),
         "reader token wait must use soak: {kubectl:?}"
     );
     assert!(
         kubectl.iter().any(|call| {
-            call.contains("get secret sre-bot-reader-token") && call.contains("--namespace soak")
+            call.contains("get secret sre-bot-kubernetes-token")
+                && call.contains("--namespace soak")
         }),
         "reader token read must use soak: {kubectl:?}"
     );
@@ -2441,7 +2376,7 @@ fn custom_targets_thread_through_helm_kubectl_manifests_secret_discovery_and_con
     assert_eq!(grafana["kind"], "Secret");
     assert_eq!(grafana["metadata"]["namespace"], CUSTOM_OBS_NAMESPACE);
 
-    let read_access = fixture.applied_file("read-access.yaml");
+    let read_access = fixture.applied_file("kubernetes-access.yaml");
     assert!(
         read_access.contains("namespace: soak"),
         "read-access must render the selected Curie namespace: {read_access}"
@@ -2675,291 +2610,14 @@ fn helm_timeout_recovery_names_the_selected_observability_namespace() {
     );
 }
 
-/// AC3: the `--write-allowlist` path must upload a bundle the CLUSTER tier will
-/// accept, and it must mint its write identity only after the deploy landed.
-///
-/// Issue #1946's evidence block is this bundle being refused: a connector that
-/// declares only `build:` records a LOCAL image id, and `BUNDLE_FILES` carries
-/// no `connectors/` build context, so the cluster preflight had nothing to pull
-/// and nothing to build. Nothing pinned that, which is why it regressed once and
-/// could regress again the next time a connector is added.
-///
-/// This is the assertion that NEVER SKIPS. It is a pure-Rust mirror of what
-/// `lock_preflight` enforces at `DeployTier::Cluster`, so it holds the same
-/// property as the bundle validator below without needing `uv` on PATH -- so the
-/// property stays gated on a local run where that validator test skips.
-///
-/// The connector properties are asserted by ITERATING the uploaded declaration
-/// rather than by naming `k8s-write`. A per-connector assertion is what makes a
-/// future connector fail this test instead of slipping past it; naming the one
-/// we already know about would pin the incident and not the class.
+/// The authoritative bundle validator must accept the exact runtime bundle the
+/// installer uploads, including the digest-pinned upstream connector and the
+/// policy-only gate shape.
 #[test]
-fn write_allowlist_install_uploads_a_bundle_the_cluster_tier_accepts() {
-    let fixture = Fixture::with_modes(
-        nodes(vec![node("node-a", "4Gi", true)]),
-        pods(vec![]),
-        "success",
-        "success",
-        "success",
-    );
-    let output = fixture.run(&["--write-allowlist", "prod/api"]);
-    let text = shown(&output);
-    assert!(
-        output.status.success(),
-        "the named-target write install must complete: {text}"
-    );
-
-    let connectors_yaml = String::from_utf8(uploaded_bundle_file(&fixture, "connectors.yaml"))
-        .expect("uploaded connectors are UTF-8");
-    let declaration: Value = serde_norway::from_str(&connectors_yaml)
-        .expect("uploaded connectors must remain valid YAML");
-    let connectors = declaration["connectors"].as_object().unwrap_or_else(|| {
-        panic!("the uploaded bundle must declare connectors: {connectors_yaml}")
-    });
-    assert!(
-        !connectors.is_empty(),
-        "an empty connector map would satisfy every loop below vacuously: {connectors_yaml}"
-    );
-    for (name, connector) in connectors {
-        assert!(
-            connector.get("build").is_none(),
-            "connector {name} still asks the cluster deploy path to build it; a `build:` \
-             declaration records a local image id the cluster tier refuses, and the bundle \
-             carries no build context to fall back on: {connector:?}"
-        );
-        if let Some(image) = connector.get("image") {
-            let image = image
-                .as_str()
-                .unwrap_or_else(|| panic!("connector {name} image must be a string: {image:?}"));
-            assert!(
-                image.contains("@sha256:"),
-                "connector {name} must be pinned by digest rather than by a mutable tag, got \
-                 {image}"
-            );
-        }
-    }
-    let write = &declaration["connectors"]["k8s-write"];
-    let write_image = write["image"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the write connector must carry a resolved image: {write:?}"));
-    assert!(
-        write_image.starts_with("ghcr.io/curie-eng/curie-sre-bot-k8s-write@sha256:"),
-        "the write connector must run the PUBLISHED image, pinned by digest, got {write_image}"
-    );
-    assert_eq!(
-        write["env"]["K8S_WRITE_ALLOWLIST"], "prod/api",
-        "the connector-side ceiling must state exactly the targets named at install time"
-    );
-    // Correct precisely BECAUSE no connector declares `build:`: a lock file
-    // exists to record the image id of something that had to be built, so a
-    // fully digest-pinned declaration needs none. If one ever appears here it
-    // means a build declaration came back with it.
-    let paths = uploaded_bundle_paths(&fixture);
-    assert!(
-        !paths.iter().any(|path| path == "connectors.lock.yaml"),
-        "a fully digest-pinned declaration needs no connector lock: {paths:?}"
-    );
-
-    // The API-server-side half of the ceiling. #1886's incident was these two
-    // allowlists drifting apart, which is a 403 AFTER a human approved the call.
-    let write_role = fixture.applied_file("write-role.yaml");
-    let documents = manifest_documents(&write_role);
-    let role = documents
-        .iter()
-        .find(|document| document["kind"] == "Role")
-        .unwrap_or_else(|| panic!("named targets must render a Role: {write_role}"));
-    assert_eq!(
-        role["metadata"]["namespace"], "prod",
-        "the Role must live in the target's namespace: {write_role}"
-    );
-    assert_eq!(
-        role["rules"][0]["resourceNames"],
-        json!(["api"]),
-        "the Role must be scoped to exactly the named Deployment: {write_role}"
-    );
-    let binding = documents
-        .iter()
-        .find(|document| document["kind"] == "RoleBinding")
-        .unwrap_or_else(|| panic!("named targets must render a RoleBinding: {write_role}"));
-    assert_eq!(binding["metadata"]["namespace"], "prod");
-    assert_eq!(binding["roleRef"]["name"], "sre-bot-writer");
-    assert_eq!(binding["subjects"][0]["name"], "sre-bot-writer");
-    // The occurrence the shipped manifest's own comment warns is easy to miss:
-    // a RoleBinding whose subject namespace is wrong still applies cleanly and
-    // grants nothing.
-    assert_eq!(
-        binding["subjects"][0]["namespace"], "curie",
-        "the RoleBinding must bind the ServiceAccount in the Curie namespace: {write_role}"
-    );
-
-    // AC2, pinned in one log. The writer is a NON-EXPIRING ServiceAccount token
-    // carrying `get,patch` on `apps/deployments`, so it must not exist until the
-    // deploy it belongs to has landed. Before #1946 the apply ran before the
-    // release API key was even discovered, which put the whole deploy inside the
-    // window where a failure stranded a live write credential.
-    let kubectl = fixture.kubectl_calls();
-    let write_role_apply = kubectl
-        .iter()
-        .position(|call| {
-            call.starts_with("apply -f ") && call.ends_with("manifests/write-role.yaml")
-        })
-        .unwrap_or_else(|| {
-            panic!("the installer must apply the rendered write identity: {kubectl:?}")
-        });
-    let api_key_discovery = kubectl
-        .iter()
-        .rposition(|call| {
-            call.contains("get secret") && call.contains("app.kubernetes.io/instance=curie")
-        })
-        .unwrap_or_else(|| panic!("the deploy must discover the release API key: {kubectl:?}"));
-    let reader_token_read = kubectl
-        .iter()
-        .position(|call| call.contains("get secret sre-bot-reader-token"))
-        .unwrap_or_else(|| panic!("the installer must read the reader token: {kubectl:?}"));
-    assert!(
-        write_role_apply > api_key_discovery && write_role_apply > reader_token_read,
-        "the write identity must be minted AFTER the deploy: write-role apply at \
-         {write_role_apply}, API key discovery at {api_key_discovery}, reader token read at \
-         {reader_token_read}: {kubectl:?}"
-    );
-}
-
-/// The MIRROR IMAGE of the ordering above, for the re-install path.
-///
-/// The incident this pins: an operator NARROWS the allowlist on a re-install
-/// (`prod/admin` -> `prod/api`). `sync_deployed_version` reconciles the connector
-/// Deployment and its kubeconfig Secret only after the deploy has ACTIVATED the
-/// new version, so if the write RBAC were also deferred past the deploy there
-/// would be a window in which the new version is live while BOTH the old, wider
-/// Role and the old connector's wider env are still in force. A `patch` on
-/// `prod/admin` succeeds in that window -- the install fails OPEN on precisely
-/// the change an operator made to close something down.
-///
-/// So the ordering is keyed on whether the writer identity already exists, and
-/// the invariant has two halves: never create a NEW privileged identity before
-/// the deploy, and always tighten an EXISTING one before the deploy. This test
-/// and `a_failed_deploy_leaves_no_write_rbac_or_writer_token_behind` are THE SAME
-/// SCENARIO -- `--write-allowlist prod/api` against a deploy the platform
-/// refuses -- differing in exactly one input, whether the writer
-/// ServiceAccount already existed. The opposite outcomes ARE the invariant:
-/// there the apply must be absent, here it must be present.
-///
-/// Why the oracle is a failed deploy rather than a position in the kubectl log.
-/// `deploy_embedded_sre_bot` is API-driven and emits no kubectl calls at all, so
-/// the log has no marker for "the deploy happened". On BOTH orderings the
-/// write-role apply lands after the connection-setup lookups (API key discovery
-/// belongs to `resolve_embedded_cluster_connection`, which is setup, not
-/// activation) and before the post-deploy connector sync. Any index comparison
-/// therefore either passes on both paths or fails on both, and proves nothing.
-/// Failing the deploy makes the causal relationship itself observable: the apply
-/// can only appear in the log of a run whose deploy failed if it ran BEFORE that
-/// deploy. Nothing is stranded by applying early on this path, because every
-/// object the apply touches already exists.
-#[test]
-fn an_existing_writer_identity_is_tightened_before_the_deploy_that_can_fail() {
-    let fixture = Fixture::with_modes(
-        nodes(vec![node("node-a", "4Gi", true)]),
-        pods(vec![]),
-        "success",
-        "success",
-        "success",
-    )
-    .with_writer_identity_mode("existing")
-    .with_deploy_failure();
-    let output = fixture.run(&["--write-allowlist", "prod/api"]);
-    let text = shown(&output);
-    assert!(
-        !output.status.success(),
-        "a refused deployment must fail the install: {text}"
-    );
-
-    let kubectl = fixture.kubectl_calls();
-    assert!(
-        kubectl.iter().any(|call| {
-            call.contains("get serviceaccount sre-bot-writer")
-                && call.contains("--ignore-not-found")
-        }),
-        "the ordering can only be chosen if the installer probes for the existing writer \
-         identity: {kubectl:?}"
-    );
-    // THE LOAD-BEARING ASSERTION. The deploy failed, so this call exists only if
-    // the narrowed ceiling was applied before it -- the exact call the
-    // fresh-install twin proves is absent under the same failure.
-    assert!(
-        kubectl.iter().any(|call| {
-            call.starts_with("apply -f ") && call.ends_with("manifests/write-role.yaml")
-        }),
-        "on a re-install the narrowed ceiling must land BEFORE the deploy, so a FAILED deploy \
-         must still have applied it: {kubectl:?}"
-    );
-    // `apply_write_access` mints the kubeconfig in the same step, so the token
-    // half of the identity moves with the RBAC half and is asserted with it.
-    assert!(
-        kubectl
-            .iter()
-            .any(|call| call.contains("wait") && call.contains("secret/sre-bot-writer-token")),
-        "the tightening step must have waited for the writer token: {kubectl:?}"
-    );
-    assert!(
-        kubectl
-            .iter()
-            .any(|call| call.contains("get secret sre-bot-writer-token")),
-        "the tightening step must have read the writer token: {kubectl:?}"
-    );
-
-    // ANTI-VACUITY. "The apply is present in a failed run" is only evidence of
-    // ordering if the run actually reached and attempted the deploy. Without
-    // this the test would pass on any earlier abort -- a capacity refusal, a
-    // registry failure -- which is how a reordering bug would hide behind green.
-    let requests = fixture.api.recorded();
-    let version = requests
-        .iter()
-        .position(|request| {
-            request.method == "POST" && request.path == format!("/agents/{AGENT_ID}/versions")
-        })
-        .unwrap_or_else(|| panic!("the run must have created a version: {requests:?}"));
-    let upload = requests
-        .iter()
-        .position(|request| request.method == "PUT" && request.path.ends_with("/bundle"))
-        .unwrap_or_else(|| panic!("the run must have uploaded the bundle: {requests:?}"));
-    let deployment = requests
-        .iter()
-        .position(|request| request.method == "POST" && request.path == "/deployments")
-        .unwrap_or_else(|| panic!("the run must have attempted the deployment: {requests:?}"));
-    assert!(
-        version < upload && upload < deployment,
-        "the failure must be the DEPLOY, reached after the bundle was already uploaded: \
-         version at {version}, upload at {upload}, deployment at {deployment}"
-    );
-}
-
-/// AC3, the bundle-validator leg: hand the uploaded bundle to the authoritative
-/// `plugin_format.validate_bundle` and take its verdict rather than a
-/// re-derivation of it.
-///
-/// SKIPS WHEN `uv` IS ABSENT, which now follows the same posture as the
-/// `chart_check.rs` precedent it is borrowed from rather than diverging from it:
-/// `chart_check.rs` skips locally but its assertions run in `helm-ci`, which
-/// installs `uv`. The `rust:` job in `.github/workflows/ci.yaml` now installs
-/// `uv` too, so this test RUNS in CI and its verdict gates there; the skip is
-/// left in place only for a local developer who has no `uv` on PATH.
-///
-/// The skip branch is still a real hole in local runs, so it is not the only
-/// thing standing behind this property.
-/// `write_allowlist_install_uploads_a_bundle_the_cluster_tier_accepts` above is
-/// the backstop: its properties are written to stand alone without Python for
-/// exactly that reason, so they never skip anywhere.
-///
-/// Negative control, recorded so the skip is not mistaken for a test that
-/// cannot bite: if `build:` survived into the uploaded bundle, this validator
-/// reports `connectors.build_context_missing`, because the bundle allowlist
-/// carries no `connectors/` directory. That is issue #1946's own evidence
-/// block.
-#[test]
-fn write_allowlist_bundle_passes_the_real_bundle_validator() {
+fn uploaded_vanilla_kubernetes_bundle_passes_the_real_bundle_validator() {
     if Command::new("uv").arg("--version").output().is_err() {
         eprintln!(
-            "skipping write_allowlist_bundle_passes_the_real_bundle_validator: uv is not on PATH"
+            "skipping uploaded_vanilla_kubernetes_bundle_passes_the_real_bundle_validator: uv is not on PATH"
         );
         return;
     }
@@ -2971,12 +2629,9 @@ fn write_allowlist_bundle_passes_the_real_bundle_validator() {
         "success",
         "success",
     );
-    let output = fixture.run(&["--write-allowlist", "prod/api"]);
+    let output = fixture.run(&[]);
     let text = shown(&output);
-    assert!(
-        output.status.success(),
-        "the named-target write install must complete: {text}"
-    );
+    assert!(output.status.success(), "install must complete: {text}");
 
     let bundle = unpacked_uploaded_bundle(&fixture);
     let validation = Command::new("uv")
@@ -2988,7 +2643,7 @@ fn write_allowlist_bundle_passes_the_real_bundle_validator() {
             "-c",
             "import sys\n\
              from plugin_format import validate_bundle\n\
-             print(validate_bundle(sys.argv[1]).model_dump_json())\n",
+             print(validate_bundle(sys.argv[1], enforces_tool_policy='curie/mcp-tool-policy@1').model_dump_json())\n",
         ])
         .arg(bundle.path())
         .output()
@@ -2997,220 +2652,50 @@ fn write_allowlist_bundle_passes_the_real_bundle_validator() {
     let stderr = String::from_utf8_lossy(&validation.stderr).to_string();
     assert!(
         validation.status.success(),
-        "the bundle validator must run: stdout:\n{stdout}\nstderr:\n{stderr}"
+        "bundle validator must run: stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let reported = stdout
         .lines()
         .rev()
         .find(|line| !line.trim().is_empty())
-        .unwrap_or_else(|| panic!("the validator must report a result: stderr:\n{stderr}"));
+        .unwrap_or_else(|| panic!("validator must report a result: stderr:\n{stderr}"));
     let result: Value = serde_json::from_str(reported)
         .unwrap_or_else(|error| panic!("validator output must be JSON ({error}): {reported}"));
-    assert_eq!(
-        result["errors"],
-        json!([]),
-        "the uploaded bundle must carry no validation errors: {reported}"
-    );
-    assert_eq!(
-        result["valid"],
-        json!(true),
-        "the uploaded bundle must be valid: {reported}"
-    );
+    assert_eq!(result["errors"], json!([]), "{reported}");
+    assert_eq!(result["valid"], json!(true), "{reported}");
 }
 
-/// AC2: a failed deploy must leave NO write RBAC and NO writer token behind.
-///
-/// The writer identity is a non-expiring `kubernetes.io/service-account-token`
-/// plus, with named targets, `get,patch` on `apps/deployments` -- and `patch` on
-/// a Deployment is `set image` and `set env`, not just a restart. Creating it
-/// before the deploy meant any failure in between (unreachable API server,
-/// rate-limited RBAC, a dead port-forward) left that credential standing with no
-/// bot attached and no teardown path.
-///
-/// The remedy is DEFERRAL, not rollback, so this test looks for the apply never
-/// having happened rather than for a compensating delete: a rollback needs the
-/// same cluster API call that just failed.
+/// The old bespoke-writer flags must not remain as silent aliases for a broader
+/// vanilla Kubernetes capability.
 #[test]
-fn a_failed_deploy_leaves_no_write_rbac_or_writer_token_behind() {
-    let fixture = Fixture::with_modes(
-        nodes(vec![node("node-a", "4Gi", true)]),
-        pods(vec![]),
-        "success",
-        "success",
-        "success",
-    )
-    .with_deploy_failure();
-    let output = fixture.run(&["--write-allowlist", "prod/api"]);
-    let text = shown(&output);
-    assert!(
-        !output.status.success(),
-        "a refused deployment must fail the install: {text}"
-    );
-
-    let kubectl = fixture.kubectl_calls();
-    assert!(
-        !kubectl
-            .iter()
-            .any(|call| call.contains("manifests/write-role.yaml")),
-        "a failed deploy must not have applied the write RBAC: {kubectl:?}"
-    );
-    assert!(
-        !kubectl
-            .iter()
-            .any(|call| call.contains("sre-bot-writer-token")),
-        "a failed deploy must neither wait for nor read the writer token: {kubectl:?}"
-    );
-    // Asserted as an absent file rather than through `applied_file`, which
-    // panics on a miss and would report the wrong thing.
-    assert!(
-        !fixture.applied_dir.join("write-role.yaml").exists(),
-        "a failed deploy must leave no rendered write identity behind: {:?}",
-        fs::read_dir(&fixture.applied_dir).map(|entries| entries
-            .flatten()
-            .map(|entry| entry.file_name())
-            .collect::<Vec<_>>())
-    );
-
-    // ANTI-VACUITY. Without this the test passes trivially on any early abort --
-    // a capacity refusal, a registry failure, a reader-token timeout -- which is
-    // exactly how a reordering bug would hide behind a green run. The assertions
-    // above only mean something if this run really did get as far as the deploy.
-    assert!(
-        fixture.applied_dir.join("read-access.yaml").exists(),
-        "the run must have reached the reader RBAC apply"
-    );
-    assert!(
-        kubectl
-            .iter()
-            .any(|call| call.contains("get secret sre-bot-reader-token")),
-        "the run must have read the reader token: {kubectl:?}"
-    );
-    let requests = fixture.api.recorded();
-    let version = requests
-        .iter()
-        .position(|request| {
-            request.method == "POST" && request.path == format!("/agents/{AGENT_ID}/versions")
-        })
-        .unwrap_or_else(|| panic!("the run must have created a version: {requests:?}"));
-    let upload = requests
-        .iter()
-        .position(|request| request.method == "PUT" && request.path.ends_with("/bundle"))
-        .unwrap_or_else(|| panic!("the run must have uploaded the bundle: {requests:?}"));
-    let deployment = requests
-        .iter()
-        .position(|request| request.method == "POST" && request.path == "/deployments")
-        .unwrap_or_else(|| panic!("the run must have attempted the deployment: {requests:?}"));
-    assert!(
-        version < upload && upload < deployment,
-        "the failure must be the DEPLOY, reached after the bundle was already uploaded: \
-         version at {version}, upload at {upload}, deployment at {deployment}"
-    );
-}
-
-/// AC4a: `--no-write` stays behaviourally read only, asserted on the wire.
-///
-/// `read_only_install_is_unchanged_by_the_new_flag` and
-/// `opting_out_leaves_the_write_connector_absent` prove this at helper level;
-/// both stay, because they are cheaper and they localise a failure. This lifts
-/// the same property to what the platform actually receives, which is where a
-/// regression would be visible to an operator.
-#[test]
-fn no_write_install_stays_behaviourally_read_only() {
-    let fixture = Fixture::with_modes(
-        nodes(vec![node("node-a", "4Gi", true)]),
-        pods(vec![]),
-        "success",
-        "success",
-        "success",
-    );
-    let output = fixture.run(&["--no-write"]);
-    let text = shown(&output);
-    assert!(
-        output.status.success(),
-        "the read only install must complete: {text}"
-    );
-
-    let connectors_yaml = String::from_utf8(uploaded_bundle_file(&fixture, "connectors.yaml"))
-        .expect("uploaded connectors are UTF-8");
-    let declaration: Value = serde_norway::from_str(&connectors_yaml)
-        .expect("uploaded connectors must remain valid YAML");
-    let connectors = declaration["connectors"].as_object().unwrap_or_else(|| {
-        panic!("the uploaded bundle must declare connectors: {connectors_yaml}")
-    });
-    for absent in ["k8s-write", "k8s-scale"] {
-        assert!(
-            !connectors.contains_key(absent),
-            "the read only install must not ship connector {absent}: {connectors_yaml}"
+fn removed_bespoke_writer_flags_fail_before_cluster_reads_or_mutation() {
+    for args in [vec!["--write-allowlist", "prod/api"], vec!["--no-write"]] {
+        let fixture = Fixture::with_modes(
+            nodes(vec![node("node-a", "4Gi", true)]),
+            pods(vec![]),
+            "success",
+            "success",
+            "success",
         );
+        let output = fixture.run(&args);
+        let text = shown(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "removed flag {args:?} must be a usage error: {text}"
+        );
+        assert!(
+            text.contains("unexpected argument"),
+            "clap must refuse the removed surface: {text}"
+        );
+        assert!(fixture.kubectl_calls().is_empty());
+        assert!(fixture.helm_calls().is_empty());
+        assert!(fixture.api.recorded().is_empty());
     }
-
-    let plugin: Value = serde_json::from_slice(&uploaded_bundle_file(
-        &fixture,
-        ".claude-plugin/plugin.json",
-    ))
-    .expect("uploaded plugin manifest must remain valid JSON");
-    // A gate naming a connector this install removed fails bundle validation for
-    // everyone, so the policy leaves WITH the connectors it guards.
-    assert!(
-        plugin.get("approvalPolicy").is_none(),
-        "a bundle with no write verbs must declare no approval policy: {plugin}"
-    );
-
-    assert!(
-        !fixture.applied_dir.join("write-role.yaml").exists(),
-        "the read only install must render and apply no write identity"
-    );
-    let kubectl = fixture.kubectl_calls();
-    assert!(
-        !kubectl
-            .iter()
-            .any(|call| call.contains("sre-bot-writer-token")),
-        "the read only install must never touch the writer token: {kubectl:?}"
-    );
-
-    // The registry count is the observable proof that the connector was dropped
-    // BEFORE its image was resolved -- a `--no-write` install must make no
-    // registry call for an image it will never run. Counted rather than merely
-    // absent, and asserted here rather than by relaxing the count in
-    // `successful_install_uploads_only_the_resolved_tempo_index_digest`, which
-    // pins the four-request default.
-    let registry = fixture.registry.recorded();
-    assert_eq!(
-        registry.len(),
-        2,
-        "only Tempo may be resolved, at one scoped token plus one index request: {:?}",
-        registry
-            .iter()
-            .map(|request| request.path.clone())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        !registry
-            .iter()
-            .any(|request| request.path.contains("curie-sre-bot-k8s-write")),
-        "the read only install must make no registry request for the write image: {:?}",
-        registry
-            .iter()
-            .map(|request| request.path.clone())
-            .collect::<Vec<_>>()
-    );
 }
 
-/// AC4b: the no-flag default keeps the connector with an EMPTY ceiling and
-/// renders NO Role.
-///
-/// This is #1886's load-bearing invariant and no integration test pinned it. An
-/// RBAC rule whose `resourceNames` is empty or absent does not grant nothing --
-/// it grants the verb on EVERY resource of that type. So the empty case must
-/// OMIT the Role rather than render one with no names, and a nameless Role would
-/// hand the bot patch on every Deployment in the namespace: the opposite of what
-/// an empty allowlist reads like, and it would look correct in review.
-///
-/// The identity is still minted, because bring-up refuses without
-/// `K8S_WRITE_KUBECONFIG`; an identity that can do nothing is what makes
-/// "installed, ceiling empty" a state the platform can boot.
 #[test]
-fn default_install_keeps_the_empty_ceiling_and_renders_no_role() {
+fn default_install_applies_one_identity_with_a_fixed_demo_namespace_ceiling() {
     let fixture = Fixture::with_modes(
         nodes(vec![node("node-a", "4Gi", true)]),
         pods(vec![]),
@@ -3220,39 +2705,36 @@ fn default_install_keeps_the_empty_ceiling_and_renders_no_role() {
     );
     let output = fixture.run(&[]);
     let text = shown(&output);
-    assert!(
-        output.status.success(),
-        "the default install must complete: {text}"
-    );
+    assert!(output.status.success(), "install must complete: {text}");
 
-    let connectors_yaml = String::from_utf8(uploaded_bundle_file(&fixture, "connectors.yaml"))
-        .expect("uploaded connectors are UTF-8");
-    let declaration: Value = serde_norway::from_str(&connectors_yaml)
-        .expect("uploaded connectors must remain valid YAML");
-    assert_eq!(
-        declaration["connectors"]["k8s-write"]["env"]["K8S_WRITE_ALLOWLIST"], "",
-        "with no targets named the connector-side ceiling must be empty, so every call is \
-         refused: {connectors_yaml}"
-    );
-
-    let write_role = fixture.applied_file("write-role.yaml");
-    let kinds: Vec<String> = manifest_documents(&write_role)
+    let access = fixture.applied_file("kubernetes-access.yaml");
+    let documents = manifest_documents(&access);
+    let service_accounts: Vec<&Value> = documents
         .iter()
-        .filter_map(|document| document["kind"].as_str().map(str::to_string))
+        .filter(|document| document["kind"] == "ServiceAccount")
         .collect();
-    assert!(
-        kinds.iter().any(|kind| kind == "ServiceAccount"),
-        "the identity is minted either way: {write_role}"
+    assert_eq!(
+        service_accounts.len(),
+        1,
+        "the general connector must use one additive-RBAC identity: {access}"
+    );
+    assert_eq!(
+        service_accounts[0]["metadata"]["name"],
+        "sre-bot-kubernetes"
+    );
+    let workload_role = documents
+        .iter()
+        .find(|document| {
+            document["kind"] == "Role"
+                && document["metadata"]["name"] == "sre-bot-kubernetes-workloads"
+        })
+        .unwrap_or_else(|| panic!("fixed workload Role missing: {access}"));
+    assert_eq!(
+        workload_role["metadata"]["namespace"], "sre-demo",
+        "write authority must stay in the disposable namespace"
     );
     assert!(
-        kinds.iter().any(|kind| kind == "Secret"),
-        "the non-expiring token Secret rides with the ServiceAccount: {write_role}"
-    );
-    assert!(
-        !kinds
-            .iter()
-            .any(|kind| kind == "Role" || kind == "RoleBinding"),
-        "an empty ceiling must render NO Role -- an empty resourceNames grants every \
-         Deployment, not none: {kinds:?} in {write_role}"
+        !access.contains("sre-bot-writer") && !access.contains("sre-bot-scaler"),
+        "removed bespoke identities must not survive in rendered RBAC: {access}"
     );
 }

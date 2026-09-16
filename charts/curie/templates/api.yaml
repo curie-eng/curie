@@ -58,11 +58,12 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- if .Values.api.migrate.enabled }}
-      # Bring the schema to head before the server boots. The init container
-      # waits quietly for Postgres before migrating. Kubernetes restarts remain
-      # the backstop after bounded readiness attempts or migration failure.
+      # Wait for the upgrade Job / install migrate phase to bring the schema
+      # to a revision this image can serve. This init never runs Alembic:
+      # applying migrations in every API pod is what made patch rollback
+      # refuse an additive newer revision (#2300).
       initContainers:
-        - name: migrate
+        - name: schema-wait
           image: {{ include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) | quote }}
           imagePullPolicy: {{ .Values.api.image.pullPolicy }}
           {{- with .Values.api.containerSecurityContext }}
@@ -112,7 +113,12 @@ spec:
                   print(type(error).__name__)
                   raise SystemExit(1)
               ' 2>/dev/null); then
-                  exec alembic -c alembic.ini upgrade head
+                  if python -c 'import curie_api.schema_compat' >/dev/null 2>&1; then
+                    exec python -m curie_api.schema_compat wait
+                  fi
+                  # Image predates #2300 (retained digest on helm upgrade).
+                  # Do not run Alembic here: that is the rollback defect.
+                  exit 0
                 fi
                 if [ "$attempt" -eq 1 ]; then
                   echo "Waiting for Postgres readiness"
@@ -161,6 +167,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: githubWebhookSecret
+            - name: GITHUB_REVIEW_INGRESS_ENABLED
+              value: {{ .Values.api.githubReviewIngressEnabled | quote }}
+            - name: GITHUB_REVIEW_RECONCILER_INTERVAL_S
+              value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the

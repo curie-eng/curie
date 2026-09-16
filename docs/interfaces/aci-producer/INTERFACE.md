@@ -78,11 +78,11 @@ CI-guarded by `packages/aci-protocol/tests/test_schema_compat.py`.
 Plugin-format entanglement: the ACI server must interpret Claude Code plugin bundles mounted at
 `CURIE_PLUGIN_DIR` (see the [bundle-format seam](../bundle-format/INTERFACE.md)), so a genuinely
 foreign harness inherits that shape too — the A- is docked for exactly this. Rehydration is no
-longer a second dock: ADR-0029 retired the SDK-shaped resume, so the boot path passes
-`resume=None` (`runner/src/curie_runner/__main__.py`) and the thread's transcript arrives from
-the durable state store named by `CURIE_HISTORY_REF`, replayed as a boot-time system-prompt
-preamble (`runner/src/curie_runner/history.py::format_conversation_preamble`). A second harness
-rehydrates by reusing that state-store contract, with nothing SDK-specific in the path.
+longer a second dock: ADR-0119 keeps the durable contract provider-neutral as ordered role/content
+messages from the state store named by `CURIE_HISTORY_REF`. Each harness must materialize that
+prefix structurally (the Claude adapter may consume its optional opaque native checkpoint, or
+rebuild an ephemeral SDK resume envelope from portable messages), or declare
+the capability absent and fail the resume; rendered system-prompt fallback is forbidden.
 Otherwise the line is clean and frozen: a producer constructs strictly (stray
 keys are rejected at construction), while a consumer tolerates unknown fields and rejects only an
 **incompatible** wire version, raising `ProtocolVersionError` naming both versions (see ADR-0036).

@@ -4,6 +4,10 @@ Date: 2026-08-20
 
 Status: Accepted
 
+Decision 2's per-pod pool-token minting clause is superseded by
+[ADR-0122](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md).
+The rest of this decision remains Accepted.
+
 Extends [ADR-0059](0059-sandbox-is-a-bounded-resource-envelope.md) into the
 dimension it deliberately left out of scope -- **throughput and the wall-clock
 deadline on the claim path** -- and revisits the resume framing of

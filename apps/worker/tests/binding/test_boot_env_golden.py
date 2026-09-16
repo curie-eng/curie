@@ -84,6 +84,7 @@ def test_plain_bound_run_renders_the_frozen_boot_env() -> None:
         "CURIE_SESSION_ID": f"agent-{_AGENT}-thread-{_THREAD}",
         "CURIE_PLUGIN_DIR": "/bundles/current",
         "CURIE_BUNDLE_REF": "bundles/x.zip",
+        "CURIE_BUNDLE_VERSION": "v1",
         "CURIE_MEMORY_REF": _MEMORY_REF,
         "CURIE_HISTORY_REF": _HISTORY_REF,
         "CURIE_STATE_URL": _STATE_URL,
@@ -177,6 +178,7 @@ def test_fully_loaded_run_renders_the_frozen_boot_env() -> None:
         "CURIE_SESSION_ID": f"agent-{_AGENT}-thread-{_THREAD}",
         "CURIE_PLUGIN_DIR": "/bundles/current",
         "CURIE_BUNDLE_REF": "bundles/x.zip",
+        "CURIE_BUNDLE_VERSION": "v1",
         "CURIE_APPROVAL_REQUIRED_TOOLS": "Bash,Write",
         "CURIE_MEMORY_REF": _MEMORY_REF,
         "CURIE_HISTORY_REF": _HISTORY_REF,
@@ -208,11 +210,29 @@ def test_no_api_key_path_mints_no_state_token() -> None:
         "CURIE_SESSION_ID": f"agent-{_AGENT}-thread-{_THREAD}",
         "CURIE_PLUGIN_DIR": "/bundles/current",
         "CURIE_BUNDLE_REF": "bundles/x.zip",
+        "CURIE_BUNDLE_VERSION": "v1",
         "CURIE_MEMORY_REF": _MEMORY_REF,
         "CURIE_HISTORY_REF": _HISTORY_REF,
         "CURIE_STATE_URL": _STATE_URL,
     }
     assert set(minted) == {"CURIE_RUNNER_TOKEN"}
+
+
+def test_boot_env_forwards_version_label_as_bundle_version() -> None:
+    """#2174: the platform-tracked version_label is readable inside the sandbox.
+
+    CURIE_BUNDLE_REF stays the RustFS object key the substrate fetches with;
+    CURIE_BUNDLE_VERSION is the agent-facing identity. A blank label is omitted
+    so an empty string cannot masquerade as a version.
+    """
+
+    env = _boot_env(WorkerConfig(), _resolved(version_label="abc123def456"))
+    assert env["CURIE_BUNDLE_VERSION"] == "abc123def456"
+    assert env["CURIE_BUNDLE_REF"] == "bundles/x.zip"
+
+    omitted = _boot_env(WorkerConfig(), _resolved(version_label=""))
+    assert "CURIE_BUNDLE_VERSION" not in omitted
+    assert omitted["CURIE_BUNDLE_REF"] == "bundles/x.zip"
 
 
 def test_boot_env_omits_agent_id() -> None:

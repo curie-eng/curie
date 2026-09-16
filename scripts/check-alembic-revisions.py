@@ -1,5 +1,7 @@
 import argparse
 import ast
+import hashlib
+import json
 import re
 import sys
 from collections import defaultdict
@@ -11,6 +13,19 @@ FILENAME_PATTERN = re.compile(r"^(\d+[a-z]?)_.+\.py$")
 DEFAULT_SCRIPT_LOCATION = (
     Path(__file__).resolve().parents[1] / "apps" / "api" / "alembic"
 )
+DEFAULT_KINDS_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "apps"
+    / "api"
+    / "src"
+    / "curie_api"
+    / "revision_kinds.json"
+)
+DEFAULT_WINDOW_FILE = DEFAULT_KINDS_FILE.with_name("schema_compat.json")
+DEFAULT_CHART_METADATA = (
+    Path(__file__).resolve().parents[1] / "charts/curie/files/schema-compat.json"
+)
+_VALID_KINDS = {"expand", "contract", "irreversible"}
 
 
 def _revision_id(path: Path) -> str | None:
@@ -52,8 +67,18 @@ def main() -> int:
         default=DEFAULT_SCRIPT_LOCATION,
         help="Alembic script directory to validate.",
     )
+    parser.add_argument(
+        "--write-upgrade-metadata",
+        action="store_true",
+        help="Regenerate the chart's schema metadata from the API window and graph.",
+    )
     args = parser.parse_args()
     script_location: Path = args.script_location
+    if (
+        args.write_upgrade_metadata
+        and script_location.resolve() != DEFAULT_SCRIPT_LOCATION.resolve()
+    ):
+        parser.error("--write-upgrade-metadata requires the authoritative API migration tree")
     versions = script_location / "versions"
 
     if not script_location.is_dir():
@@ -189,6 +214,83 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    if script_location.resolve() == DEFAULT_SCRIPT_LOCATION.resolve():
+        try:
+            kinds_payload = json.loads(DEFAULT_KINDS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(
+                f"Alembic revision gate failed: could not read {DEFAULT_KINDS_FILE}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        graph_ids = {
+            rev.revision
+            for rev in ScriptDirectory(str(script_location)).walk_revisions()
+        }
+        declared = set(kinds_payload)
+        missing = sorted(graph_ids - declared)
+        extra = sorted(declared - graph_ids)
+        invalid = sorted(
+            f"{rev}={kind}"
+            for rev, kind in kinds_payload.items()
+            if kind not in _VALID_KINDS
+        )
+        if missing or extra or invalid:
+            print(
+                "Alembic revision gate failed: revision_kinds.json must classify "
+                "every revision as expand, contract, or irreversible (#2300).",
+                file=sys.stderr,
+            )
+            if missing:
+                print(f"  missing kinds: {', '.join(missing)}", file=sys.stderr)
+            if extra:
+                print(f"  extra kinds: {', '.join(extra)}", file=sys.stderr)
+            if invalid:
+                print(f"  invalid kinds: {', '.join(invalid)}", file=sys.stderr)
+            return 1
+
+        # ADR-0142: the API remains the sole schema authority. The chart copy
+        # lets the CLI inspect the target before creating any cluster resource
+        # or relying on a container runtime on the operator's machine.
+        try:
+            window = json.loads(DEFAULT_WINDOW_FILE.read_text(encoding="utf-8"))
+            if window["schema_head"] != heads[0] or window["schema_min"] not in graph_ids:
+                raise ValueError("API compatibility window does not name the current graph")
+            revisions = []
+            for revision in ScriptDirectory(str(script_location)).walk_revisions():
+                parent = revision.down_revision
+                parents = (
+                    list(parent)
+                    if isinstance(parent, (list, tuple))
+                    else [parent] if parent else []
+                )
+                revisions.append(
+                    {
+                        "revision": revision.revision,
+                        "parents": parents,
+                        "kind": kinds_payload[revision.revision],
+                        "sha256": hashlib.sha256(Path(revision.path).read_bytes()).hexdigest(),
+                    }
+                )
+            metadata = {
+                "schema_min": window["schema_min"],
+                "schema_head": window["schema_head"],
+                "revisions": sorted(revisions, key=lambda revision: revision["revision"]),
+            }
+            expected = json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+            if args.write_upgrade_metadata:
+                DEFAULT_CHART_METADATA.parent.mkdir(parents=True, exist_ok=True)
+                DEFAULT_CHART_METADATA.write_text(expected, encoding="utf-8")
+            if DEFAULT_CHART_METADATA.read_text(encoding="utf-8") != expected:
+                raise ValueError("packaged copy differs from the API window or revision graph")
+        except (OSError, ValueError, KeyError) as error:
+            print(
+                f"Alembic revision gate failed: schema compatibility metadata: {error}. "
+                "Run uv run python scripts/check-alembic-revisions.py --write-upgrade-metadata.",
+                file=sys.stderr,
+            )
+            return 1
 
     print(f"Alembic revision gate passed with head {heads[0]}.")
     return 0

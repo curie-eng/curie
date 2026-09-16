@@ -11,6 +11,7 @@ from .approval_policy import (
     connector_tool_prefix,
     declared_mcp_server_names,
     effective_operator_gates,
+    effective_tool_prefix,
     grantable_routes,
 )
 from .archive import (
@@ -21,6 +22,11 @@ from .archive import (
     bundle_root,
     check_archive_bounds,
     safe_extract,
+)
+from .gate_summary import (
+    RESERVED_PERMISSION_PREFIX,
+    check_gate_summary_template,
+    render_gate_summary,
 )
 from .manifest import MANIFEST_LOCATIONS, resolve_manifest
 from .models import (
@@ -37,6 +43,11 @@ from .models import (
     TriggerDeclaration,
 )
 from .reserved_env import RESERVED_BOOT_ENV, is_reserved_boot_env_name
+from .skills import (
+    PROFILE_AGENT_SKILLS_STRICT,
+    PROFILE_CLAUDE_PLUGIN,
+    parse_allowed_tools,
+)
 from .tool_policy import (
     TOOL_POLICY_ENFORCEMENT,
     ToolPolicyDecision,
@@ -63,6 +74,9 @@ __all__ = [
     "PluginManifest",
     "Author",
     "SkillFrontmatter",
+    "parse_allowed_tools",
+    "PROFILE_CLAUDE_PLUGIN",
+    "PROFILE_AGENT_SKILLS_STRICT",
     "McpServer",
     "McpConfig",
     "HookDefinition",
@@ -72,9 +86,13 @@ __all__ = [
     "ApprovalGate",
     "ToolPolicy",
     "grantable_routes",
+    "RESERVED_PERMISSION_PREFIX",
+    "check_gate_summary_template",
+    "render_gate_summary",
     "declared_mcp_server_names",
     "connector_server_names",
     "connector_tool_prefix",
+    "effective_tool_prefix",
     "effective_operator_gates",
     "TOOL_POLICY_ENFORCEMENT",
     "ToolPolicyDecision",

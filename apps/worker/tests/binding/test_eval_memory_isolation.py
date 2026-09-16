@@ -55,6 +55,7 @@ def test_eval_isolate_thread_omits_memory_ref() -> None:
     assert "CURIE_HISTORY_REF" in env
     assert "CURIE_HISTORY_TOKEN" in env
     assert env["CURIE_BUNDLE_REF"] == "bundles/x.zip"
+    assert env["CURIE_BUNDLE_VERSION"] == "v1"
     assert str(_AGENT) in env["CURIE_SESSION_ID"]
 
 

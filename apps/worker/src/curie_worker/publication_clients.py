@@ -5,12 +5,14 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import UTC, datetime
+from typing import Literal, cast
 from urllib.parse import quote, urlsplit
 
 import httpx
 
 from .publication_loop import (
     PublicationCredential,
+    PublicationPullState,
     PublicationReconcileError,
     PublicationTranscriptPermanentError,
 )
@@ -35,11 +37,11 @@ class PublicationTranscriptClient:
     async def record_result(
         self,
         agent_id: uuid.UUID,
-        conversation_id: str,
+        workspace_conversation_id: str,
         publication_id: uuid.UUID,
         text: str,
     ) -> None:
-        key = quote(conversation_id, safe="")
+        key = quote(workspace_conversation_id, safe="")
         url = f"{self._base}/agents/{agent_id}/state/transcript/{key}"
         marker = str(publication_id)
         item = {
@@ -181,7 +183,7 @@ class PublicationCredentialClient:
 
 
 class GitHubPublicationLookup:
-    """Adopt an existing pull request by its deterministic head branch."""
+    """Read stored pull request identity and verify revision ancestry."""
 
     def __init__(
         self,
@@ -192,19 +194,149 @@ class GitHubPublicationLookup:
         self._client = client
         self._api_base = api_base_url.rstrip("/")
 
+    async def read_pr_by_number(
+        self,
+        repo_full_name: str,
+        pr_number: int,
+        authorization_header: str,
+    ) -> PublicationPullState:
+        if not authorization_header:
+            raise PublicationReconcileError(
+                "stored pull request lookup requires authorization"
+            )
+        if pr_number <= 0:
+            raise PublicationReconcileError("stored pull request lookup is invalid")
+        try:
+            response = await self._client.get(
+                f"{self._api_base}/repos/{repo_full_name}/pulls/{pr_number}",
+                headers=self._headers(authorization_header),
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise PublicationReconcileError("stored pull request lookup was unreachable") from exc
+        if response.status_code != 200:
+            raise PublicationReconcileError(
+                f"stored pull request lookup returned HTTP {response.status_code}"
+            )
+        try:
+            row = response.json()
+            number = int(row["number"])
+            url = str(row["html_url"])
+            head = row["head"]
+            head_ref = str(head["ref"])
+            head_sha = str(head["sha"])
+            raw_state = str(row["state"])
+            merged_at = row.get("merged_at")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PublicationReconcileError("GitHub returned an invalid pull request") from exc
+        if number != pr_number or re.fullmatch(
+            rf"https://github\.com/{re.escape(repo_full_name)}/pull/{pr_number}",
+            url,
+            re.IGNORECASE,
+        ) is None:
+            raise PublicationReconcileError("GitHub returned the wrong stored pull request")
+        if re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None or not head_ref:
+            raise PublicationReconcileError("GitHub pull request head is invalid")
+        state = "merged" if merged_at is not None else raw_state
+        if state not in {"open", "closed", "merged"}:
+            raise PublicationReconcileError("GitHub pull request state is invalid")
+        return PublicationPullState(
+            number=number,
+            url=url,
+            state=cast(Literal["open", "closed", "merged"], state),
+            head_sha=head_sha,
+            head_ref=head_ref,
+        )
+
+    async def verify_revision_commit(
+        self,
+        repo_full_name: str,
+        commit_sha: str,
+        *,
+        revision_id: uuid.UUID,
+        expected_parent: str,
+        authorization_header: str,
+    ) -> str:
+        if not authorization_header:
+            raise PublicationReconcileError("revision verification requires authorization")
+        try:
+            response = await self._client.get(
+                f"{self._api_base}/repos/{repo_full_name}/git/commits/{commit_sha}",
+                headers=self._headers(authorization_header),
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise PublicationReconcileError("revision commit lookup was unreachable") from exc
+        if response.status_code != 200:
+            raise PublicationReconcileError(
+                f"revision commit lookup returned HTTP {response.status_code}"
+            )
+        try:
+            row = response.json()
+            observed_sha = str(row["sha"])
+            message = str(row["message"])
+            parents = row["parents"]
+            parent = str(parents[0]["sha"])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise PublicationReconcileError("GitHub returned an invalid revision commit") from exc
+        marker = f"Curie-Revision: {revision_id}"
+        if observed_sha != commit_sha or marker not in message.splitlines():
+            raise PublicationReconcileError("remote commit has no matching revision marker")
+        if len(parents) != 1 or parent != expected_parent:
+            raise PublicationReconcileError("remote revision has the wrong expected parent")
+        return observed_sha
+
+    async def read_branch_head(
+        self,
+        repo_full_name: str,
+        branch: str,
+        authorization_header: str,
+    ) -> str | None:
+        """Return the deterministic branch head without creating any GitHub object."""
+
+        if not authorization_header:
+            raise PublicationReconcileError("GitHub branch lookup requires authorization")
+        try:
+            response = await self._client.get(
+                f"{self._api_base}/repos/{repo_full_name}/git/ref/heads/{quote(branch, safe='')}",
+                headers=self._headers(authorization_header),
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise PublicationReconcileError("GitHub branch lookup was unreachable") from exc
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            raise PublicationReconcileError(
+                f"GitHub branch lookup returned HTTP {response.status_code}"
+            )
+        try:
+            head_sha = str(response.json()["object"]["sha"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PublicationReconcileError("GitHub returned an invalid branch ref") from exc
+        if re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None:
+            raise PublicationReconcileError("GitHub returned an invalid branch head")
+        return head_sha
+
     async def recover_pr_by_head(
         self,
         repo_full_name: str,
         branch: str,
         title: str,
         body: str,
+        *,
+        expected_head_sha: str,
         authorization_header: str,
-    ) -> str | None:
+    ) -> PublicationPullState | None:
         """Adopt a PR, or create it only when its deterministic branch exists."""
 
         if not authorization_header:
             raise PublicationReconcileError(
                 "GitHub deterministic-head recovery requires authorization"
+            )
+        if re.fullmatch(r"[0-9a-f]{40,64}", expected_head_sha) is None:
+            raise PublicationReconcileError(
+                "GitHub deterministic-head recovery expected commit is invalid"
             )
         default_branch = await self._default_branch(
             repo_full_name,
@@ -216,6 +348,7 @@ class GitHubPublicationLookup:
             title=title,
             body=body,
             base=default_branch,
+            expected_head_sha=expected_head_sha,
             authorization_header=authorization_header,
         )
         if existing is not None:
@@ -241,6 +374,16 @@ class GitHubPublicationLookup:
                 "GitHub deterministic branch lookup returned HTTP "
                 f"{ref_response.status_code}"
             )
+        try:
+            ref_head_sha = str(ref_response.json()["object"]["sha"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PublicationReconcileError(
+                "GitHub returned an invalid deterministic branch ref"
+            ) from exc
+        if ref_head_sha != expected_head_sha:
+            raise PublicationReconcileError(
+                "GitHub deterministic branch no longer matches the expected commit"
+            )
 
         pulls_url = f"{repo_api}/pulls"
         try:
@@ -258,13 +401,14 @@ class GitHubPublicationLookup:
         except httpx.HTTPError:
             created = None
         if created is not None and created.status_code == 201:
-            return self._pull_url(
+            return self._pull_state(
                 created,
                 repo_full_name,
                 branch=branch,
                 title=title,
                 body=body,
                 base=default_branch,
+                expected_head_sha=expected_head_sha,
             )
 
         # A lost POST response or a concurrent reconciler is ambiguous. Query
@@ -275,6 +419,7 @@ class GitHubPublicationLookup:
             title=title,
             body=body,
             base=default_branch,
+            expected_head_sha=expected_head_sha,
             authorization_header=authorization_header,
         )
         if recovered is not None:
@@ -322,7 +467,7 @@ class GitHubPublicationLookup:
         return default_branch
 
     @staticmethod
-    def _pull_url(
+    def _pull_state(
         response: httpx.Response,
         repo_full_name: str,
         *,
@@ -330,7 +475,8 @@ class GitHubPublicationLookup:
         title: str,
         body: str,
         base: str,
-    ) -> str:
+        expected_head_sha: str,
+    ) -> PublicationPullState:
         try:
             payload = response.json()
         except ValueError as exc:
@@ -357,6 +503,7 @@ class GitHubPublicationLookup:
                 if isinstance(head, dict) and isinstance(head.get("repo"), dict)
                 else None
             ),
+            "head_sha": head.get("sha") if isinstance(head, dict) else None,
             "base_ref": (
                 base_payload.get("ref") if isinstance(base_payload, dict) else None
             ),
@@ -385,13 +532,45 @@ class GitHubPublicationLookup:
             raise PublicationReconcileError(
                 "GitHub pull request does not match the approved publication contract"
             )
+        head_sha = actual["head_sha"]
+        if (
+            not isinstance(head_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None
+            or head_sha != expected_head_sha
+        ):
+            raise PublicationReconcileError(
+                "GitHub pull request head does not match the expected commit"
+            )
         if not isinstance(url, str) or re.fullmatch(
             rf"https://github\.com/{re.escape(repo_full_name)}/pull/[1-9][0-9]*",
             url,
             re.IGNORECASE,
         ) is None:
             raise PublicationReconcileError("GitHub returned an invalid pull request URL")
-        return url
+        number = payload.get("number")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number <= 0
+            or not url.casefold().endswith(f"/pull/{number}".casefold())
+        ):
+            raise PublicationReconcileError("GitHub returned an invalid pull request URL")
+        raw_state = payload.get("state")
+        if payload.get("merged_at") is not None or payload.get("merged") is True:
+            state = "merged"
+        elif isinstance(raw_state, str):
+            state = raw_state
+        else:
+            state = ""
+        if state not in {"open", "closed", "merged"}:
+            raise PublicationReconcileError("GitHub pull request state is invalid")
+        return PublicationPullState(
+            number=number,
+            url=url,
+            state=cast(Literal["open", "closed", "merged"], state),
+            head_sha=head_sha,
+            head_ref=branch,
+        )
 
     async def _find(
         self,
@@ -401,13 +580,14 @@ class GitHubPublicationLookup:
         title: str,
         body: str,
         base: str,
+        expected_head_sha: str,
         authorization_header: str,
-    ) -> str | None:
+    ) -> PublicationPullState | None:
         owner = repo_full_name.split("/", 1)[0]
         try:
             response = await self._client.get(
                 f"{self._api_base}/repos/{repo_full_name}/pulls",
-                params={"state": "open", "head": f"{owner}:{branch}"},
+                params={"state": "all", "head": f"{owner}:{branch}"},
                 headers=self._headers(authorization_header),
                 follow_redirects=False,
             )
@@ -427,11 +607,16 @@ class GitHubPublicationLookup:
             ) from exc
         if not isinstance(rows, list) or not rows:
             return None
-        return self._pull_url(
+        if len(rows) != 1:
+            raise PublicationReconcileError(
+                "GitHub deterministic-head lookup returned multiple pull requests"
+            )
+        return self._pull_state(
             httpx.Response(200, json=rows[0]),
             repo_full_name,
             branch=branch,
             title=title,
             body=body,
             base=base,
+            expected_head_sha=expected_head_sha,
         )

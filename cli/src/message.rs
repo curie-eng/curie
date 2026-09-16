@@ -1449,11 +1449,7 @@ fn compose_config_files(label: &str) -> Result<Vec<String>> {
 /// recreates a service needs the same derivation -- this one just narrows it to
 /// the single image the one-shot producer runs.
 async fn one_shot_dispatcher_image() -> Option<String> {
-    let tag = crate::local::running_stack_tag().await?;
-    let candidate = crate::local::image_ref("curie-dispatcher", &tag);
-    crate::local::image_present(&candidate)
-        .await
-        .then_some(candidate)
+    crate::local::running_stack_image("curie-dispatcher").await
 }
 
 fn worker_compose_config_command(container: &str) -> OpsCommand {

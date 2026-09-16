@@ -67,6 +67,65 @@ def test_inbound_roundtrip() -> None:
         assert parse_inbound(to_inbound_json(message)) == message
 
 
+def test_legacy_inbound_event_without_session_context_defaults_to_none() -> None:
+    raw = json.dumps(
+        {
+            "kind": "event",
+            "type": "message",
+            "text": "hi",
+            "user": "U0EXAMPLE1",
+            "ts": "1.0",
+        }
+    )
+
+    message = parse_inbound(raw)
+
+    assert isinstance(message, Event)
+    assert message.session_id is None
+    assert message.history_ref is None
+
+
+def test_inbound_event_accepts_explicit_null_session_context() -> None:
+    raw = json.dumps(
+        {
+            "kind": "event",
+            "type": "message",
+            "text": "hi",
+            "user": "U0EXAMPLE1",
+            "ts": "1.0",
+            "session_id": None,
+            "history_ref": None,
+        }
+    )
+
+    message = parse_inbound(raw)
+
+    assert isinstance(message, Event)
+    assert message.session_id is None
+    assert message.history_ref is None
+
+
+def test_inbound_event_session_context_survives_json_roundtrip() -> None:
+    message = Event(
+        type="message",
+        text="hi",
+        user="U0EXAMPLE1",
+        ts="1.0",
+        session_id="session-example",
+        history_ref="history-example",
+    )
+
+    encoded = to_inbound_json(message)
+    wire = json.loads(encoded)
+    decoded = parse_inbound(encoded)
+
+    assert wire["session_id"] == "session-example"
+    assert wire["history_ref"] == "history-example"
+    assert isinstance(decoded, Event)
+    assert decoded.session_id == "session-example"
+    assert decoded.history_ref == "history-example"
+
+
 # --- Reader policy: tolerant consumers, strict producers ----------------------
 
 

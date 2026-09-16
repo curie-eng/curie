@@ -1,0 +1,4 @@
+jsonschema==4.26.0
+mcp==2.1.1
+pytest==9.1.1
+PyYAML==6.0.3

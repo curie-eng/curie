@@ -12,6 +12,7 @@ sync fixtures.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import socket
 import threading
@@ -438,7 +439,10 @@ class FakeRunner:
     ``final`` and ends the stream models a mid-run drop (no terminal). ``hold``
     (an asyncio.Event set by the test or by ``/v1/interrupt``) makes a turn hang
     active after its prefix so steer/interrupt can be exercised against a live
-    turn; ``tail`` frames flush on release.
+    turn; ``tail`` frames flush on release. ``accept`` is a separate Event that
+    gates after the POST is recorded in ``opened`` and before ``prepare``;
+    ``/v1/interrupt`` must not set it, or a kill before prepare would release
+    the gate and hide the race.
     """
 
     def __init__(self) -> None:
@@ -446,12 +450,15 @@ class FakeRunner:
         self.app.add_routes(
             [
                 web.get("/status", self._status),
+                web.get("/v1/status", self._status),
                 web.post("/v1/event", self._event),
                 web.post("/v1/steer", self._steer),
                 web.post("/v1/interrupt", self._interrupt),
             ]
         )
         self.turn_active = False
+        self.history_durable = True
+        self.session_status = "idle-awaiting-input"
         # When set, /status answers 500 so a test can drive the fail-closed
         # liveness read (an unreadable session must count as busy).
         self.status_fails = False
@@ -463,6 +470,7 @@ class FakeRunner:
         self.steers: list[str] = []
         self.interrupts: int = 0
         self.hold: object | None = None  # asyncio.Event when a turn should hang
+        self.accept: asyncio.Event | None = None  # gate after opened, before prepare
         self.tail: list[OutboundEvent] = []
         self.event_fail_times: int = 0  # return 500 on the next N /v1/event calls
         # Per-route captured request headers (the ACI auth Bearer check reads
@@ -481,7 +489,13 @@ class FakeRunner:
             # 200, but without the field the liveness read needs. A newer or
             # third-party runner could answer exactly this.
             return web.json_response({"status": "idle-awaiting-input"})
-        return web.json_response({"status": "idle-awaiting-input", "turn_active": self.turn_active})
+        return web.json_response(
+            {
+                "status": self.session_status,
+                "turn_active": self.turn_active,
+                "history_durable": self.history_durable,
+            }
+        )
 
     async def _event(self, request: web.Request) -> web.StreamResponse:
         self.event_headers.append(dict(request.headers))
@@ -492,6 +506,8 @@ class FakeRunner:
             return web.json_response({"error": "transient runner failure"}, status=500)
         script = self.turn_scripts.pop(0) if self.turn_scripts else list(self.default_script)
         resp = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
+        if self.accept is not None:
+            await self.accept.wait()
         await resp.prepare(request)
         self.turn_active = True
         # Cleared on EVERY exit path, not just the normal one. A client that
@@ -530,6 +546,8 @@ class FakeRunner:
         self.interrupts += 1
         if self.hold is not None:
             self.hold.set()  # type: ignore[attr-defined]
+        # ``accept`` is the gate before prepare. Releasing it here would hide a
+        # kill that lands after the POST is received and before the stream starts.
         return web.json_response({"ok": True})
 
 
@@ -699,7 +717,9 @@ async def kernel_harness(
     approval_reader: object | None = None,
     actions: object | None = None,
     publication_creator: object | None = None,
+    workspace_factory: Callable[[SandboxSubstrate], object] | None = None,
     sink: object | None = None,
+    runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
     per_sandbox_runners: int = 0,
     **config_overrides: object,
@@ -707,7 +727,10 @@ async def kernel_harness(
     """Assemble a live kernel wired to a fake runner and real Valkey."""
     config = make_config(names, **config_overrides)
     fake_runner = FakeRunner()
-    server = TestServer(fake_runner.app)
+    # Most kernel tests use the deliberately tiny ACI fake above.  The coder
+    # publication boundary test supplies the real runner app, still with its
+    # model seam faked, so the worker consumes production ACI frames.
+    server = TestServer(runner_app or fake_runner.app)
     await server.start_server()
     port = server.port
     assert port is not None
@@ -779,6 +802,9 @@ async def kernel_harness(
         approval_reader=approval_reader,  # type: ignore[arg-type]
         actions=actions,  # type: ignore[arg-type]
         publication_creator=publication_creator,  # type: ignore[arg-type]
+        workspace=(
+            workspace_factory(substrate) if workspace_factory else None
+        ),  # type: ignore[arg-type]
         card_store=card_store,
     )
     killswitch = None

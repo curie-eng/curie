@@ -1,0 +1,255 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Supported SRE bundle consistency input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "plugin",
+    "connectors",
+    "surface"
+  ],
+  "properties": {
+    "plugin": {
+      "type": "object",
+      "required": [
+        "name",
+        "toolPolicy",
+        "approvalPolicy"
+      ],
+      "properties": {
+        "name": {
+          "const": "sre-bot"
+        },
+        "toolPolicy": {
+          "type": "object",
+          "required": [
+            "enforcement",
+            "allow",
+            "approvalRequired",
+            "deny"
+          ],
+          "properties": {
+            "enforcement": {
+              "const": "curie/mcp-tool-policy@1"
+            },
+            "allow": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            },
+            "approvalRequired": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            },
+            "deny": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "approvalPolicy": {
+          "type": "object",
+          "required": [
+            "gates"
+          ],
+          "properties": {
+            "gates": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "gate",
+                  "route"
+                ],
+                "properties": {
+                  "gate": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "route": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "connectors": {
+      "type": "object",
+      "required": [
+        "connectors"
+      ],
+      "properties": {
+        "connectors": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "oneOf": [
+              {
+                "required": [
+                  "image"
+                ],
+                "not": {
+                  "required": [
+                    "build"
+                  ]
+                }
+              },
+              {
+                "required": [
+                  "build"
+                ],
+                "not": {
+                  "required": [
+                    "image"
+                  ]
+                }
+              }
+            ],
+            "properties": {
+              "image": {
+                "type": "string",
+                "pattern": "@sha256:[a-f0-9]{64}$"
+              },
+              "build": {
+                "type": "object",
+                "required": [
+                  "context"
+                ],
+                "properties": {
+                  "context": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "surface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "connectors",
+        "forbiddenTools",
+        "tiers"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "forbiddenTools": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "connectors": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "catalog",
+              "tools"
+            ],
+            "properties": {
+              "catalog": {
+                "enum": [
+                  "exact",
+                  "minimum"
+                ]
+              },
+              "tools": {
+                "type": "object",
+                "minProperties": 1,
+                "propertyNames": {
+                  "pattern": "^[a-zA-Z0-9_-]+$"
+                },
+                "additionalProperties": {
+                  "enum": [
+                    "allow",
+                    "approval-required",
+                    "deny"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "tiers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "skill",
+            "local",
+            "local-release",
+            "cluster",
+            "live provider",
+            "external integration"
+          ],
+          "properties": {
+            "skill": {
+              "$ref": "#/$defs/tier"
+            },
+            "local": {
+              "$ref": "#/$defs/tier"
+            },
+            "local-release": {
+              "$ref": "#/$defs/tier"
+            },
+            "cluster": {
+              "$ref": "#/$defs/tier"
+            },
+            "live provider": {
+              "$ref": "#/$defs/tier"
+            },
+            "external integration": {
+              "$ref": "#/$defs/tier"
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "tier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "setupAndProof"
+      ],
+      "properties": {
+        "required": {
+          "const": true
+        },
+        "setupAndProof": {
+          "type": "string",
+          "minLength": 20
+        }
+      }
+    }
+  }
+}

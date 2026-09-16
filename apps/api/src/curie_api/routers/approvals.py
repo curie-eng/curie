@@ -50,7 +50,18 @@ from ..wirebody import ApprovalRequestBody
 
 logger = logging.getLogger(__name__)
 
+# Frozen with the dispatcher in tests/vectors/approval-ownership.json. A 404
+# with this exact detail means this release's database does not have the row;
+# a dispatcher sharing a Slack app treats that as an ownership miss and leaves
+# the Socket Mode envelope unacked so Slack retries the owner. Do not widen it
+# to a generic "Not Found" -- that is how an ingress/proxy miss would read.
+APPROVAL_NOT_FOUND_DETAIL = "approval not found"
+
 router = APIRouter(prefix="/approvals", tags=["approvals"])
+
+
+def _approval_not_found() -> HTTPException:
+    return HTTPException(status.HTTP_404_NOT_FOUND, APPROVAL_NOT_FOUND_DETAIL)
 
 
 @router.post(
@@ -157,7 +168,7 @@ async def list_approvals(
 async def get_approval(approval_id: uuid.UUID, session: SessionDep) -> ApprovalOut:
     approval = await crud.get_approval(session, approval_id)
     if approval is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "approval not found")
+        raise _approval_not_found()
     return ApprovalOut.model_validate(approval)
 
 
@@ -172,7 +183,7 @@ async def get_approval_audit(approval_id: uuid.UUID, session: SessionDep) -> lis
 
     approval = await crud.get_approval(session, approval_id)
     if approval is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "approval not found")
+        raise _approval_not_found()
     entries = await crud.list_approval_audit(session, approval_id)
     return [ApprovalAuditOut.model_validate(e) for e in entries]
 
@@ -201,7 +212,7 @@ async def resolve_approval(
 
     approval = await crud.get_approval(session, approval_id)
     if approval is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "approval not found")
+        raise _approval_not_found()
     stored_parent = approval_trace_context(approval)
 
     # The route binding is read fresh at resolve time (#420), so revoking an
@@ -362,7 +373,7 @@ async def resolve_approval(
     if claimed is None:
         current = await crud.get_approval(session, approval_id)
         if current is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "approval not found")
+            raise _approval_not_found()
         if current.status == ApprovalStatus.expired:
             raise HTTPException(
                 status.HTTP_410_GONE,

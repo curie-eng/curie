@@ -91,6 +91,12 @@ jobs:
       # cluster-free static gate, so it runs alongside the docs gate.
       - name: Wire tolerance gate (_AciModel model_validate call sites)
         run: bash scripts/check-wire-tolerance.sh
+      # The platform-upgrade Job runs examples/sre-bot/platform-upgrade/upgrade.sh
+      # as its body. That script had no test and no CI; a helm upgrade the bot
+      # can start must be shellchecked on every PR, cheap and cluster-free, so
+      # this sits with the other static gates before the dev stack boots.
+      - name: Shellcheck sre-bot platform-upgrade script
+        run: shellcheck --severity=warning examples/sre-bot/platform-upgrade/upgrade.sh
       # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock above. Reuse
       # ignored_prefixes from .github/e2e-selection.yaml so a guides edit does
       # not boot postgres; packages/, apps/, runner/, examples/tests/, cli,
@@ -333,9 +339,12 @@ jobs:
           --event "$GITHUB_EVENT_PATH"
           --curie cli/target/release/curie
           --ref HEAD
+      # Every dev-stack service sits behind the compose `full` profile. Without
+      # --profile full, `docker compose logs` matches no service and prints
+      # nothing, so a real outage gets diagnosed with no container logs at all.
       - name: Dump dev stack logs on failure
         if: ${{ failure() && steps.fix-pin-curie.outputs.needed == 'true' }}
-        run: docker compose -f compose.dev.yaml logs --no-color --tail=200
+        run: docker compose --profile full -f compose.dev.yaml logs --no-color --tail=200
 
   rust:
     name: Rust (fmt + clippy + test)
@@ -732,13 +741,6 @@ jobs:
             context: examples/sre-bot/connectors/tempo
             dockerfile: examples/sre-bot/connectors/tempo/Dockerfile
             platforms: linux/amd64,linux/arm64
-          - name: sre-bot-k8s-write
-            context: examples/sre-bot/connectors/k8s-write
-            dockerfile: examples/sre-bot/connectors/k8s-write/Dockerfile
-            platforms: linux/amd64,linux/arm64
-          - name: sre-bot-k8s-scale
-            context: examples/sre-bot/connectors/k8s-scale
-            dockerfile: examples/sre-bot/connectors/k8s-scale/Dockerfile
           - name: sre-bot-self-upgrade
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
@@ -1209,6 +1211,82 @@ jobs:
           docker rm -f curie-api-smoke || true
           docker network rm curie-ui-smoke-net || true
 
+  # #2611: the Python job never builds curie-runner, so every container leg of
+  # runner/tests/test_repo_toolchain_proof.py skips on that job. This is the
+  # missing half: it builds the runner image and runs the harness with
+  # CURIE_REPO_TOOLCHAIN_PROOF=required so an absent image is a failure
+  # rather than a skip. No `needs:` on the Python job -- the image build must
+  # not serialise behind the ~22 min suite (#2230).
+  #
+  # Runtime (stated for #2611): the `images` matrix runner leg is ~2 min
+  # cache-warm (104s on run 34590132629). This job repeats that build with
+  # `load: true` (read-only `scope=runner` cache, same as the smoke jobs) and
+  # then runs the harness (~39s locally in required mode, 14 passed). Wall
+  # clock grows only if this job exceeds Python.
+  #
+  # GHA-layer-cached off the same `scope=runner` the `images` matrix writes,
+  # read-only so the two writers do not contend. `load: true` because the
+  # harness `docker run`s the tag. The builder is created with `use: false`
+  # so the default `docker` driver stays current, matching the smoke jobs.
+  repo-toolchain-proof:
+    name: Repository toolchain proof (runner image)
+    runs-on: ubuntu-latest
+    env:
+      CURIE_REPO_TOOLCHAIN_PROOF: required
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
+      - name: Required setting is present (negative control)
+        run: |
+          set -euo pipefail
+          if [ "${CURIE_REPO_TOOLCHAIN_PROOF}" != "required" ]; then
+            echo "CURIE_REPO_TOOLCHAIN_PROOF must be required so a missing image cannot skip; got ${CURIE_REPO_TOOLCHAIN_PROOF:-<empty>}" >&2
+            exit 1
+          fi
+      - name: Absent image fails in required mode (negative control)
+        env:
+          CURIE_RUNNER_IMAGE: curie-runner-absent-2611
+        run: |
+          set -euo pipefail
+          set +e
+          output=$(uv run pytest \
+            runner/tests/test_repo_toolchain_proof.py::test_dependency_install_succeeds_under_read_only_rootfs \
+            -q --tb=line 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "required mode passed or skipped without the runner image" >&2
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -F "may not skip"
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: buildcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the runner image locally (gha layer cache)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: runner/Dockerfile
+          builder: ${{ steps.buildcache.outputs.name }}
+          tags: curie-runner
+          push: false
+          load: true
+          cache-from: type=gha,scope=runner
+      - name: Repository toolchain proof
+        env:
+          CURIE_PROOF_EVIDENCE_DIR: ${{ runner.temp }}/repo-toolchain-proof
+        run: uv run pytest runner/tests/test_repo_toolchain_proof.py -q --durations=25
+
   # FALSIFIABILITY gate for the committed eval suites (issue #619). This is NOT
   # an E2E test: it never runs a real agent or makes a model call. It boots the
   # runner's scripted FAKE model (offline, no credential, no network) -- a
@@ -1604,6 +1682,8 @@ jobs:
         run: docker tag ghcr.io/curie-eng/curie-api:ci-local ghcr.io/curie-eng/curie-api:latest
       - name: Build the worker-local overlay for the generated release compose (ghcr.io/curie-eng/curie-worker-local:latest, no registry auth)
         run: docker build --build-arg BASE_TAG=ci-local -t ghcr.io/curie-eng/curie-worker-local:latest -f compose/worker-local.Dockerfile compose
+      - name: Build any remaining release-compose images the selected profile requires
+        run: python3 compose/ensure_release_images.py --profiles full --build-missing
       - name: Parity ladder (local-release rung against generated compose.release.yaml, fake model, credential-free)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -2017,13 +2097,15 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
 
   # RELEASED CHART UPGRADE REGRESSION (issues #2097 and #2194). This is separate
-  # from the fresh install cluster rung because it starts from the exact public
-  # v0.8.2 chart and its published images. The candidate chart is then applied
-  # over retained release values on the same disposable kind cluster. The
-  # selector keeps this expensive history bearing path limited to chart,
-  # migration, and worker state key changes.
+  # from the fresh install cluster rung because it starts from published charts
+  # and their published image tags. v0.8.2 covers placement-null and blank
+  # attester retention. v0.8.4 covers the 2026-09-04 extraEnv timeout collision
+  # with live-manifest and target-version convergence. The candidate chart is
+  # then applied over retained release values on the same disposable kind
+  # cluster. The selector keeps this expensive history bearing path limited to
+  # chart, migration, and worker state key changes.
   e2e-released-upgrade:
-    name: E2E released chart upgrade (v0.8.2 to candidate)
+    name: E2E released chart upgrade (released install to candidate)
     runs-on: ubuntu-latest
     needs: [rust-build, changes]
     if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
@@ -2169,6 +2251,16 @@ jobs:
             | sha256sum --check --strict
           test "$(helm show chart "$released_chart" | awk '$1 == "version:" {print $2}')" = "0.8.2"
           echo "RELEASED_CHART=$released_chart" >> "$GITHUB_ENV"
+      - name: Download and verify the exact public v0.8.4 chart
+        run: |
+          set -euo pipefail
+          released_chart_084="$RUNNER_TEMP/curie-0.8.4.tgz"
+          curl -fsSL -o "$released_chart_084" \
+            https://github.com/curie-eng/curie/releases/download/v0.8.4/curie-0.8.4.tgz
+          echo "fee20ab73c05d7a888165f980fb82d25150fcba509f19218bafc4c187a9044bb  $released_chart_084" \
+            | sha256sum --check --strict
+          test "$(helm show chart "$released_chart_084" | awk '$1 == "version:" {print $2}')" = "0.8.4"
+          echo "RELEASED_CHART_084=$released_chart_084" >> "$GITHUB_ENV"
       - name: Write the legacy retained values fixture
         run: |
           cat > "$RUNNER_TEMP/legacy-values.yaml" <<'EOF'
@@ -2183,6 +2275,18 @@ jobs:
           placement: null
           EOF
           echo "LEGACY_VALUES=$RUNNER_TEMP/legacy-values.yaml" >> "$GITHUB_ENV"
+      - name: Write the v0.8.4 retained timeout values fixture
+        run: |
+          cat > "$RUNNER_TEMP/v084-retained-timeout.yaml" <<'EOF'
+          security:
+            gvisor:
+              mode: "off"
+          worker:
+            extraEnv:
+              - name: CURIE_RUNNER_TOTAL_TIMEOUT_S
+                value: "1700"
+          EOF
+          echo "RELEASED_V084_VALUES=$RUNNER_TEMP/v084-retained-timeout.yaml" >> "$GITHUB_ENV"
       - name: Write the managed attester verifier
         run: |
           cat > "$RUNNER_TEMP/verify-managed-attester.sh" <<'EOF'
@@ -2270,6 +2374,7 @@ jobs:
           set -euo pipefail
           helm upgrade curie charts/curie -n curie \
             --reset-then-reuse-values --timeout 15m \
+            --set api.migrate.forwardOnly=true \
             --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
             --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
@@ -2315,6 +2420,7 @@ jobs:
           set -euo pipefail
           helm upgrade curie charts/curie -n curie \
             --reset-then-reuse-values --timeout 15m \
+            --set api.migrate.forwardOnly=true \
             --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
             --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
@@ -2337,6 +2443,95 @@ jobs:
             placement: .placement
           }' > "$RUNNER_TEMP/second-retained-values.json"
           cmp "$RUNNER_TEMP/retained-values.json" "$RUNNER_TEMP/second-retained-values.json"
+      - name: Replace the upgraded v0.8.2 release with the v0.8.4 baseline
+        run: |
+          set -euo pipefail
+          helm uninstall curie -n curie --wait --timeout 5m
+          kubectl delete namespace curie --wait=true --timeout=300s
+      # v0.8.4 deploys the dispatcher only when Slack tokens are set, and the
+      # retained extraEnv timeout crash-loops the worker on this baseline
+      # (1700 above delivery budget 600). Wait for the API only; worker
+      # health is asserted after the candidate upgrade drops the duplicate.
+      - name: Install the exact public v0.8.4 release
+        run: |
+          set -euo pipefail
+          helm install curie "$RELEASED_CHART_084" \
+            -n curie --create-namespace -f "$RELEASED_V084_VALUES" --timeout 15m \
+            --set api.image.tag=0.8.4 --set api.image.digest=sha256:8804a35d0c96e9bb2ed0d4f6a990015aab9e9343f6c1ae0b5dc7307e37b50aaf \
+            --set dispatcher.image.tag=0.8.4 --set dispatcher.image.digest=sha256:ab6766db1f7d211e86f6bd816bb5c73ebfe6ee6cbcdf3dc9de9f9a26848bef47 \
+            --set worker.image.tag=0.8.4 --set worker.image.digest=sha256:c3117c30ac0a4cdd626c1170a8c976911da601f55781c9ffea6f1d85d4f02656 \
+            --set ui.image.tag=0.8.4 --set ui.image.digest=sha256:7e22c984e53478df9d70e96ec1fd3c73601396a23b378f7b9483ef8bf498477b \
+            --set agentSandbox.runner.tag=0.8.4 --set agentSandbox.runner.digest=sha256:4e19b285d4161d4667145ce9ea6e3efd11c1a9e22b1f1f2f49167994515b0b88
+          kubectl rollout status deploy/curie-api -n curie --timeout=600s
+      - name: Upgrade the v0.8.4 release to the candidate chart
+        run: |
+          set -euo pipefail
+          # Live v0.8.4 worker env has duplicate CURIE_RUNNER_TOTAL_TIMEOUT_S
+          # (first-class plus retained extraEnv). Helm's 3-way strategic merge
+          # then drops the name from the live Deployment even when the candidate
+          # target is unique, which is the 2026-09-04 soak. Recreate that one
+          # workload so the candidate spec is applied in full. Explicitly
+          # migrate the retained document before the candidate chart evaluates
+          # its reserved environment guard. Preserve unrelated extraEnv entries
+          # while promoting the retained timeout to its first class value.
+          kubectl delete deploy/curie-worker -n curie --wait=true --timeout=120s
+          helm get values curie -n curie -o json > "$RUNNER_TEMP/v084-retained-values.json"
+          jq '
+            (.worker.extraEnv // []) as $extra |
+            (reduce $extra[] as $item (
+              {timeouts: [], kept: []};
+              if $item.name == "CURIE_RUNNER_TOTAL_TIMEOUT_S" then
+                .timeouts += [$item]
+              else
+                .kept += [$item]
+              end
+            )) as $partition |
+            if ($partition.timeouts | length) != 1 then
+              error("expected one retained CURIE_RUNNER_TOTAL_TIMEOUT_S value")
+            else
+              .
+            end |
+            ($partition.timeouts[0].value | tonumber) as $timeout |
+            .worker.runnerTotalTimeoutSeconds = $timeout |
+            .worker.extraEnv = $partition.kept |
+            .config.schemaVersion = "0.9.0" |
+            .config.migratedFrom = "0.8.4"
+          ' "$RUNNER_TEMP/v084-retained-values.json" > "$RUNNER_TEMP/v084-migrated-values.json"
+          helm upgrade curie charts/curie -n curie -f "$RUNNER_TEMP/v084-migrated-values.json" \
+            --timeout 15m \
+            --set api.migrate.forwardOnly=true \
+            --set worker.deliveryBudgetSeconds=1800 \
+            --set worker.terminationGracePeriodSeconds=1860 \
+            --set api.image.repository=curie-api --set api.image.tag=upgrade-candidate --set api.image.digest= --set api.image.pullPolicy=Never \
+            --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=upgrade-candidate --set ui.image.digest= --set ui.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=upgrade-candidate --set agentSandbox.runner.digest= --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+          helm get values curie -n curie -o json > "$RUNNER_TEMP/v084-effective-values.json"
+          jq -e '
+            .worker.runnerTotalTimeoutSeconds == 1700 and
+            .worker.deliveryBudgetSeconds == 1800 and
+            .worker.terminationGracePeriodSeconds == 1860 and
+            ([.worker.extraEnv[]? | select(.name == "CURIE_RUNNER_TOTAL_TIMEOUT_S")] | length) == 0 and
+            .config.schemaVersion == "0.9.0" and
+            .config.migratedFrom == "0.8.4"
+          ' "$RUNNER_TEMP/v084-effective-values.json"
+          kubectl rollout status deploy/curie-api -n curie --timeout=600s
+          kubectl rollout status deploy/curie-worker -n curie --timeout=600s
+      - name: Verify live-manifest parity and target-version convergence
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+          helm get manifest curie -n curie > "$RUNNER_TEMP/helm-manifest.yaml"
+          kubectl get deploy curie-worker -n curie -o yaml > "$RUNNER_TEMP/live-worker.yaml"
+          helm get metadata curie -n curie > "$RUNNER_TEMP/helm-metadata.txt"
+          python3 charts/curie/ci/live_manifest_parity.py \
+            --helm-manifest "$RUNNER_TEMP/helm-manifest.yaml" \
+            --live-deploy "$RUNNER_TEMP/live-worker.yaml" \
+            --helm-metadata "$RUNNER_TEMP/helm-metadata.txt" \
+            --chart-yaml charts/curie/Chart.yaml \
+            --expect-env CURIE_RUNNER_TOTAL_TIMEOUT_S
       - name: Existing cluster rung smoke on the upgraded candidate
         env:
           CURIE_BIN: cli/target/release/curie
@@ -2345,6 +2540,7 @@ jobs:
           set -euo pipefail
           helm upgrade curie charts/curie -n curie \
             --reset-then-reuse-values --timeout 15m \
+            --set api.migrate.forwardOnly=true \
             --set dispatcher.deploy=false \
             --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=upgrade-candidate --set dispatcher.image.digest= --set dispatcher.image.pullPolicy=Never \
             --set ui.service.type=NodePort --set ui.service.nodePort=30080 \

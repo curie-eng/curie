@@ -16,7 +16,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
@@ -28,6 +28,21 @@ MAX_PATCH_BYTES = 900_000
 _AUTHORIZATION_LOG = re.compile(
     r"Authorization:\s*(?:Basic|Bearer|token)\s+[^\s]+", re.IGNORECASE
 )
+_URL_USERINFO = re.compile(r"(https?://)[^/\s@]+@", re.IGNORECASE)
+_MARKER_LOG_LINE = re.compile(r"^CURIE_[A-Z_]+=")
+# Failed Job text leaves the cluster into thread history; keep it bounded.
+_MAX_JOB_ERROR = 1500
+
+
+def _redact(text: str) -> str:
+    text = _AUTHORIZATION_LOG.sub("Authorization: [REDACTED]", text)
+    return _URL_USERINFO.sub(r"\1[REDACTED]@", text)
+
+
+def _field(obj: Any, name: str, attr: str | None = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, attr or name, None)
 
 
 class PublicationResourceError(RuntimeError):
@@ -61,11 +76,17 @@ class PublicationJobSettings:
 @dataclass(frozen=True)
 class PublicationPayload:
     publication_id: uuid.UUID
+    revision_id: uuid.UUID
+    revision_number: int
     repo_full_name: str
     clean_clone_url: str
     base_sha: str
+    expected_prior_head: str
+    expected_remote_head: str | None
     patch: bytes
     branch: str
+    pr_number: int | None
+    pr_url: str | None
     title: str
     body: str
 
@@ -121,15 +142,22 @@ git_with_timeout() {
 }
 
 cleanup_auth() {
-  rm -f /tmp/curie-git-user /tmp/curie-git-pass /tmp/curie-askpass
+  rm -f /tmp/curie-git-user /tmp/curie-git-pass /tmp/curie-askpass \
+    /tmp/curie-github.py /tmp/curie-pr-facts.json
 }
 trap cleanup_auth EXIT
 
+credential_path="${CURIE_CREDENTIAL_PATH:-/credentials/credential}"
+patch_path="${CURIE_PATCH_PATH:-/publication/changes.patch}"
+work_dir="${CURIE_WORK_DIR:-/work}"
+export CURIE_CREDENTIAL_PATH="$credential_path"
+
 python - <<'PY'
 import base64
+import os
 from pathlib import Path
 
-value = Path("/credentials/credential").read_text().strip()
+value = Path(os.environ["CURIE_CREDENTIAL_PATH"]).read_text().strip()
 user, password = "x-access-token", value
 if value.lower().startswith("basic "):
     try:
@@ -154,8 +182,8 @@ chmod 0700 /tmp/curie-askpass
 export GIT_ASKPASS=/tmp/curie-askpass
 export GIT_TERMINAL_PROMPT=0
 
-mkdir -p /work
-cd /work
+mkdir -p "$work_dir"
+cd "$work_dir"
 git_with_timeout clone "$CLEAN_CLONE_URL" repo 2> >(redact >&2)
 cd repo
 git_with_timeout remote set-url origin "$CLEAN_CLONE_URL"
@@ -165,17 +193,24 @@ if ! git_with_timeout cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
 fi
 git_with_timeout checkout --detach "$BASE_SHA" 2> >(redact >&2)
 git_with_timeout switch -c "$BRANCH" 2> >(redact >&2)
-git_with_timeout apply --check --binary /publication/changes.patch
-git_with_timeout apply --binary /publication/changes.patch
+remote_head=$(git_with_timeout ls-remote origin "refs/heads/$BRANCH" \
+  2> >(redact >&2) | awk '{print $1}')
+if [[ "$remote_head" != "$EXPECTED_REMOTE_HEAD" ]]; then
+  echo "publication branch head conflict" >&2
+  exit 1
+fi
+git_with_timeout apply --check --binary "$patch_path"
+git_with_timeout apply --binary "$patch_path"
 git_with_timeout add --all
 if git_with_timeout diff --cached --quiet; then
   echo "publication patch produced no changes" >&2
   exit 1
 fi
-git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" commit -m "$PR_TITLE"
-git_with_timeout push origin "HEAD:refs/heads/$BRANCH" 2> >(redact >&2)
+git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" commit \
+  -m "$PR_TITLE" -m "Curie-Revision: $REVISION_ID"
+commit_sha=$(git_with_timeout rev-parse HEAD)
 
-python - <<'PY'
+cat >/tmp/curie-github.py <<'PY'
 import base64
 import json
 import os
@@ -190,7 +225,17 @@ owner = repo.split("/", 1)[0]
 github_api = os.environ["GITHUB_API_URL"].rstrip("/")
 repo_api = f"{github_api}/repos/{repo}"
 api = f"{repo_api}/pulls"
-raw = Path("/credentials/credential").read_text().strip()
+credential_path = Path(os.environ.get("CURIE_CREDENTIAL_PATH", "/credentials/credential"))
+facts_path = Path(os.environ.get("CURIE_PR_FACTS_PATH", "/tmp/curie-pr-facts.json"))
+phase = os.environ["CURIE_GITHUB_PHASE"]
+if phase not in {"pre-push", "post-push"}:
+    raise SystemExit("invalid publication GitHub validation phase")
+expected_head = os.environ.get("CURIE_EXPECTED_HEAD", "")
+if len(expected_head) not in range(40, 65) or any(
+    char not in "0123456789abcdef" for char in expected_head
+):
+    raise SystemExit("expected publication commit is invalid")
+raw = credential_path.read_text().strip()
 if raw.lower().startswith(("basic ", "bearer ", "token ")):
     authorization = raw
 else:
@@ -213,28 +258,33 @@ def request(method, url, payload=None):
     with opener.open(req, timeout=int(os.environ["GITHUB_TIMEOUT_SECONDS"])) as response:
         return json.load(response)
 
-def validate_pull(row, expected_base):
+def validate_pull(
+    row,
+    expected_base,
+    *,
+    require_metadata,
+    expected_number=None,
+    expected_url=None,
+    require_merged=False,
+):
     if not isinstance(row, dict):
         raise SystemExit("GitHub returned an invalid pull request")
     head = row.get("head")
     base = row.get("base")
     expected = {
-        "title": os.environ["PR_TITLE"],
-        "body": os.environ["PR_BODY"],
         "head_ref": branch,
         "head_repo": repo,
         "base_ref": expected_base,
         "base_repo": repo,
     }
     actual = {
-        "title": row.get("title"),
-        "body": row.get("body"),
         "head_ref": head.get("ref") if isinstance(head, dict) else None,
         "head_repo": (
             (head.get("repo") or {}).get("full_name")
             if isinstance(head, dict) and isinstance(head.get("repo"), dict)
             else None
         ),
+        "head_sha": head.get("sha") if isinstance(head, dict) else None,
         "base_ref": base.get("ref") if isinstance(base, dict) else None,
         "base_repo": (
             (base.get("repo") or {}).get("full_name")
@@ -243,6 +293,13 @@ def validate_pull(row, expected_base):
         ),
     }
     repo_fields = ("head_repo", "base_repo")
+    if require_metadata and (
+        row.get("title") != os.environ["PR_TITLE"]
+        or row.get("body") != os.environ["PR_BODY"]
+    ):
+        raise SystemExit(
+            "GitHub pull request does not match the approved publication contract"
+        )
     if any(
         not isinstance(actual[field], str)
         or actual[field].casefold() != expected[field].casefold()
@@ -255,42 +312,142 @@ def validate_pull(row, expected_base):
         raise SystemExit(
             "GitHub pull request does not match the approved publication contract"
         )
+    if actual["head_sha"] != expected_head:
+        raise SystemExit(
+            "GitHub pull request head does not match the expected publication commit"
+        )
     url = row.get("html_url")
     prefix = f"https://github.com/{repo}/pull/"
     if not isinstance(url, str) or not url.casefold().startswith(prefix.casefold()):
         raise SystemExit("GitHub did not return a usable pull request URL")
-    number = url[len(prefix):]
-    if not number.isdigit() or int(number) <= 0:
+    url_number = url[len(prefix):]
+    number = row.get("number")
+    if (
+        not url_number.isdigit()
+        or isinstance(number, bool)
+        or not isinstance(number, int)
+        or number <= 0
+        or number != int(url_number)
+        or (expected_number is not None and number != expected_number)
+        or (
+            expected_url is not None
+            and url.casefold() != expected_url.casefold()
+        )
+    ):
         raise SystemExit("GitHub did not return a usable pull request URL")
-    return url
+    state = row.get("state")
+    merged = row.get("merged")
+    merged_at = row.get("merged_at")
+    if require_merged and not isinstance(merged, bool):
+        raise SystemExit("GitHub returned an invalid pull request state")
+    if merged is True or merged_at is not None:
+        print(f"CURIE_PR_URL={url}")
+        print(f"CURIE_PR_NUMBER={number}")
+        print(f"CURIE_COMMIT_SHA={actual['head_sha']}")
+        print("CURIE_PR_STATE=merged", flush=True)
+        raise SystemExit("stored pull request is merged")
+    if state != "open":
+        if state == "closed":
+            print(f"CURIE_PR_URL={url}")
+            print(f"CURIE_PR_NUMBER={number}")
+            print(f"CURIE_COMMIT_SHA={actual['head_sha']}")
+            print("CURIE_PR_STATE=closed", flush=True)
+            raise SystemExit("stored pull request is closed")
+        raise SystemExit("GitHub returned an invalid pull request state")
+    return url, number
 
 def existing(expected_base):
     head=quote(f"{owner}:{branch}", safe="")
-    rows = request("GET", f"{api}?state=open&head={head}")
-    return validate_pull(rows[0], expected_base) if rows else None
+    rows = request("GET", f"{api}?state=all&head={head}")
+    if not isinstance(rows, list):
+        raise SystemExit("GitHub deterministic-head lookup returned an invalid response")
+    if len(rows) > 1:
+        raise SystemExit("GitHub deterministic-head lookup returned multiple pull requests")
+    return validate_pull(rows[0], expected_base, require_metadata=True) if rows else None
 
-# Query the deterministic head before POST, and again after an ambiguous REST
-# failure. This is the idempotency boundary for a lost response.
-repository = request("GET", repo_api)
-default_base = repository.get("default_branch")
-if not isinstance(default_base, str) or not default_base:
-    raise SystemExit("GitHub repository has no default branch")
-url = existing(default_base)
-if not url:
+pr_number = os.environ.get("PR_NUMBER")
+if pr_number:
     try:
-        created = request("POST", api, {
-            "title": os.environ["PR_TITLE"],
-            "head": branch,
-            "base": default_base,
-            "body": os.environ["PR_BODY"],
-        })
-        url = validate_pull(created, default_base)
-    except (HTTPError, URLError):
-        url = existing(default_base)
-        if not url:
-            raise
+        expected_number = int(pr_number)
+    except ValueError:
+        raise SystemExit("stored pull request number is invalid") from None
+    expected_url = os.environ.get("PR_URL")
+    if not expected_url:
+        raise SystemExit("stored pull request URL is missing")
+    if phase == "pre-push":
+        repository = request("GET", repo_api)
+        default_base = repository.get("default_branch")
+        if not isinstance(default_base, str) or not default_base:
+            raise SystemExit("GitHub repository has no default branch")
+        url, number = validate_pull(
+            request("GET", f"{api}/{pr_number}"),
+            default_base,
+            require_metadata=False,
+            expected_number=expected_number,
+            expected_url=expected_url,
+            require_merged=True,
+        )
+        facts_path.write_text(json.dumps({"base": default_base, "url": url, "number": number}))
+        raise SystemExit(0)
+    try:
+        facts = json.loads(facts_path.read_text())
+    except (OSError, ValueError):
+        raise SystemExit("stored pull request validation facts are missing") from None
+    if not isinstance(facts, dict):
+        raise SystemExit("stored pull request validation facts are invalid")
+    default_base = facts.get("base")
+    if (
+        not isinstance(default_base, str)
+        or facts.get("url") != expected_url
+        or facts.get("number") != expected_number
+    ):
+        raise SystemExit("stored pull request validation facts are invalid")
+    url, number = validate_pull(
+        request("GET", f"{api}/{pr_number}"),
+        default_base,
+        require_metadata=False,
+        expected_number=expected_number,
+        expected_url=expected_url,
+        require_merged=True,
+    )
+else:
+    if phase != "post-push":
+        raise SystemExit("new pull request cannot be validated before push")
+    # Query the deterministic head before POST, and again after an ambiguous
+    # REST failure. This is the idempotency boundary for a lost response.
+    repository = request("GET", repo_api)
+    default_base = repository.get("default_branch")
+    if not isinstance(default_base, str) or not default_base:
+        raise SystemExit("GitHub repository has no default branch")
+    pull = existing(default_base)
+    if not pull:
+        try:
+            created = request("POST", api, {
+                "title": os.environ["PR_TITLE"],
+                "head": branch,
+                "base": default_base,
+                "body": os.environ["PR_BODY"],
+            })
+            pull = validate_pull(created, default_base, require_metadata=True)
+        except (HTTPError, URLError):
+            pull = existing(default_base)
+            if not pull:
+                raise
+    url, number = pull
 print(f"CURIE_PR_URL={url}")
+print(f"CURIE_PR_NUMBER={number}")
 PY
+
+if [[ -n "$PR_NUMBER" ]]; then
+  CURIE_EXPECTED_HEAD="$EXPECTED_PRIOR_HEAD" \
+    CURIE_GITHUB_PHASE=pre-push python /tmp/curie-github.py
+fi
+git_with_timeout push \
+  --force-with-lease=refs/heads/$BRANCH:$EXPECTED_REMOTE_HEAD \
+  origin "HEAD:refs/heads/$BRANCH" 2> >(redact >&2)
+CURIE_EXPECTED_HEAD="$commit_sha" \
+  CURIE_GITHUB_PHASE=post-push python /tmp/curie-github.py
+echo "CURIE_COMMIT_SHA=$commit_sha"
 """
 
 
@@ -317,12 +474,31 @@ def build_publication_resources(
         raise PublicationResourceError(
             f"publication patch exceeds the {MAX_PATCH_BYTES} raw-byte limit"
         )
-    if payload.branch != deterministic_publication_branch(payload.publication_id):
-        raise PublicationResourceError("publication branch is not deterministic")
+    if not re.fullmatch(r"curie/[A-Za-z0-9._/-]+", payload.branch):
+        raise PublicationResourceError("publication branch is not a valid stored lineage branch")
     if re.fullmatch(r"[0-9a-f]{40,64}", payload.base_sha) is None:
         raise PublicationResourceError(
             "publication base SHA must be 40-64 lowercase hexadecimal characters"
         )
+    if re.fullmatch(r"[0-9a-f]{40,64}", payload.expected_prior_head) is None:
+        raise PublicationResourceError(
+            "publication expected prior head must be 40-64 lowercase hexadecimal characters"
+        )
+    if payload.base_sha != payload.expected_prior_head:
+        raise PublicationResourceError(
+            "publication base SHA does not match expected prior head"
+        )
+    if payload.expected_remote_head is not None and (
+        re.fullmatch(r"[0-9a-f]{40,64}", payload.expected_remote_head) is None
+        or payload.expected_remote_head != payload.expected_prior_head
+    ):
+        raise PublicationResourceError("publication expected remote head is invalid")
+    if payload.revision_number <= 0:
+        raise PublicationResourceError("publication revision number must be positive")
+    if (payload.pr_number is None) != (payload.pr_url is None):
+        raise PublicationResourceError("publication pull request identity is incomplete")
+    if payload.pr_number is not None and payload.pr_number <= 0:
+        raise PublicationResourceError("publication pull request number must be positive")
     if payload.clean_clone_url.casefold() != (
         f"https://github.com/{payload.repo_full_name}.git".casefold()
     ):
@@ -350,11 +526,17 @@ def build_publication_resources(
     }
     contract = {
         "publication_id": str(payload.publication_id),
+        "revision_id": str(payload.revision_id),
+        "revision_number": payload.revision_number,
         "repo_full_name": payload.repo_full_name,
         "clean_clone_url": payload.clean_clone_url,
         "base_sha": payload.base_sha,
+        "expected_prior_head": payload.expected_prior_head,
+        "expected_remote_head": payload.expected_remote_head,
         "patch_sha256": hashlib.sha256(payload.patch).hexdigest(),
         "branch": payload.branch,
+        "pr_number": payload.pr_number,
+        "pr_url": payload.pr_url,
         "title": payload.title,
         "body": payload.body,
         "runner_image": settings.runner_image,
@@ -398,6 +580,12 @@ def build_publication_resources(
         {"name": "CLEAN_CLONE_URL", "value": payload.clean_clone_url},
         {"name": "BASE_SHA", "value": payload.base_sha},
         {"name": "BRANCH", "value": payload.branch},
+        {"name": "REVISION_ID", "value": str(payload.revision_id)},
+        {"name": "REVISION_NUMBER", "value": str(payload.revision_number)},
+        {"name": "EXPECTED_PRIOR_HEAD", "value": payload.expected_prior_head},
+        {"name": "EXPECTED_REMOTE_HEAD", "value": payload.expected_remote_head or ""},
+        {"name": "PR_NUMBER", "value": str(payload.pr_number or "")},
+        {"name": "PR_URL", "value": payload.pr_url or ""},
         {"name": "PR_TITLE", "value": payload.title},
         {"name": "PR_BODY", "value": payload.body},
         {"name": "GIT_USER_NAME", "value": settings.git_user_name},
@@ -492,7 +680,19 @@ def _as_serialized_mapping(obj: Any) -> dict[str, Any]:
 
 
 def _expected_projection(observed: Any, expected: Any) -> Any:
-    """Project API-defaulted state onto the immutable submitted contract."""
+    """Project API-defaulted state onto the immutable submitted contract.
+
+    The apiserver omits empty strings, lists and maps (omitempty), so an
+    absent observed field matches an exactly-empty expected one. Absent and
+    empty are identical to the kubelet; ``0``/``False`` never qualify.
+    """
+
+    if observed is None and (
+        (type(expected) is str and expected == "")
+        or (type(expected) is list and len(expected) == 0)
+        or (type(expected) is dict and len(expected) == 0)
+    ):
+        return expected
 
     if isinstance(expected, dict):
         if not isinstance(observed, dict):
@@ -587,6 +787,21 @@ def validate_adopted_resource(
             f"refusing to adopt Job {expected_metadata['name']!r}: spec mismatch"
         )
     pod_spec = ((actual.get("spec") or {}).get("template") or {}).get("spec") or {}
+    for container in pod_spec.get("containers") or []:
+        # The expected-shape projection ignores keys the expected side never
+        # set, so an omitted literal env "value" tolerates any actual key on
+        # that item -- including a planted valueFrom that redirects the
+        # container to read an attacker-chosen Secret/ConfigMap value. Refuse
+        # any env entry outside name/value, and any envFrom, explicitly.
+        for env_item in container.get("env") or []:
+            if set(env_item) - {"name", "value"}:
+                raise PublicationResourceError(
+                    f"refusing to adopt Job {expected_metadata['name']!r}: spec mismatch"
+                )
+        if container.get("envFrom"):
+            raise PublicationResourceError(
+                f"refusing to adopt Job {expected_metadata['name']!r}: spec mismatch"
+            )
     forbidden = {
         "hostNetwork": pod_spec.get("hostNetwork"),
         "hostPID": pod_spec.get("hostPID"),
@@ -742,7 +957,13 @@ class KubernetesPublicationCluster:
         except k8s_client.ApiException as exc:
             if self._is_not_found(exc):
                 return PublicationJobObservation(
-                    phase="pending", pr_url=None, logs="", error=None, exists=False
+                    phase="pending",
+                    pr_url=None,
+                    pr_number=None,
+                    commit_sha=None,
+                    logs="",
+                    error=None,
+                    exists=False,
                 )
             raise
         metadata = job.get("metadata") if isinstance(job, dict) else getattr(job, "metadata", None)
@@ -769,28 +990,27 @@ class KubernetesPublicationCluster:
         elif status_value("failed", 0):
             phase = "failed"
             conditions = status_value("conditions", []) or []
-            error = (
-                "; ".join(
-                    str(
-                        (condition.get("message", "") or condition.get("reason", ""))
-                        if isinstance(condition, dict)
-                        else (
-                            getattr(condition, "message", "")
-                            or getattr(condition, "reason", "")
-                        )
+            seen_condition_texts: set[str] = set()
+            condition_text_parts = []
+            for condition in conditions:
+                if _field(condition, "status") != "True":
+                    continue
+                text = ": ".join(
+                    part
+                    for part in (
+                        str(_field(condition, "reason") or ""),
+                        str(_field(condition, "message") or ""),
                     )
-                    for condition in conditions
-                    if (
-                        condition.get("status")
-                        if isinstance(condition, dict)
-                        else getattr(condition, "status", None)
-                    )
-                    == "True"
+                    if part
                 )
-                or "publication Job failed"
-            )
+                if text and text not in seen_condition_texts:
+                    seen_condition_texts.add(text)
+                    condition_text_parts.append(text)
+            condition_text = "; ".join(condition_text_parts)
 
         logs = ""
+        selected: Any = None
+        logs_read = False
         try:
             pods = self._core.list_namespaced_pod(
                 self.namespace, label_selector=f"job-name={job_name}"
@@ -848,26 +1068,77 @@ class KubernetesPublicationCluster:
                     raise PublicationResourceError(
                         f"publication Job {job_name!r} owns a pod without a name"
                     )
-                logs = str(
-                    self._core.read_namespaced_pod_log(
-                        pod_name,
-                        self.namespace,
-                        tail_lines=200,
-                        limit_bytes=65_536,
-                    )
+                raw_log = self._core.read_namespaced_pod_log(
+                    pod_name,
+                    self.namespace,
+                    tail_lines=200,
+                    limit_bytes=65_536,
+                    _preload_content=False,
                 )
-                logs = _AUTHORIZATION_LOG.sub("Authorization: [REDACTED]", logs)
+                data = getattr(raw_log, "data", raw_log)
+                logs = (
+                    data.decode("utf-8", errors="replace")
+                    if isinstance(data, bytes)
+                    else str(data)
+                )
+                logs = _redact(logs)
+                logs_read = True
         except k8s_client.ApiException as exc:
             if exc.status not in (400, 404):
                 raise
+        if phase == "failed":
+            parts = [condition_text] if condition_text else []
+            statuses = _field(_field(selected, "status"), "containerStatuses", "container_statuses")
+            for container in statuses or []:
+                terminated = _field(_field(container, "state"), "terminated")
+                if terminated is None:
+                    continue
+                exit_code = _field(terminated, "exitCode", "exit_code")
+                reason = _field(terminated, "reason")
+                parts.append(
+                    "container exited"
+                    + (f" ({reason})" if reason else "")
+                    + (f" with exit code {exit_code}" if exit_code is not None else "")
+                )
+            if logs_read:
+                # Keep the tail: git and shell failures print their cause last.
+                meaningful = [
+                    line.strip()
+                    for line in logs.splitlines()
+                    if line.strip() and not _MARKER_LOG_LINE.match(line.strip())
+                ]
+                if meaningful:
+                    parts.append("; ".join(meaningful[-5:]))
+            else:
+                parts.append("pod logs were unavailable")
+            error = _redact("; ".join(parts) or "publication Job failed")
+            if len(error) > _MAX_JOB_ERROR:
+                # Truncate after redaction; keep the head (reason) and the log tail.
+                head = _MAX_JOB_ERROR // 3
+                tail = _MAX_JOB_ERROR - head - len(" ... ")
+                error = error[:head] + " ... " + error[-tail:]
         match = re.search(
             r"^CURIE_PR_URL=(https://github\.com/[^\s]+/pull/\d+)$",
             logs,
             re.MULTILINE,
         )
+        number_match = re.search(r"^CURIE_PR_NUMBER=([1-9][0-9]*)$", logs, re.MULTILINE)
+        commit_match = re.search(
+            r"^CURIE_COMMIT_SHA=([0-9a-f]{40,64})$", logs, re.MULTILINE
+        )
+        state_match = re.search(
+            r"^CURIE_PR_STATE=(closed|merged)$", logs, re.MULTILINE
+        )
         return PublicationJobObservation(
             phase=phase,
             pr_url=match.group(1) if match else None,
+            pr_number=int(number_match.group(1)) if number_match else None,
+            commit_sha=commit_match.group(1) if commit_match else None,
+            pr_state=(
+                cast(Literal["closed", "merged"], state_match.group(1))
+                if state_match
+                else None
+            ),
             logs=logs,
             error=error,
         )

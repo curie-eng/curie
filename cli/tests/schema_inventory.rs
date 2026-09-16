@@ -34,18 +34,31 @@ fn repo_path(rel: &str) -> std::path::PathBuf {
 /// matches the `raw_emit_sites` keys in `index.json`.
 fn cli_sources() -> Vec<(String, String)> {
     let dir = repo_path("cli/src");
+    let mut paths = Vec::new();
+    collect_rs_paths(&dir, &mut paths);
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("read cli/src") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let text = std::fs::read_to_string(&path).expect("read source");
-            out.push((format!("cli/src/{name}"), text));
-        }
+    for path in paths {
+        let rel = path.strip_prefix(&dir).expect("path under cli/src");
+        let label = format!("cli/src/{}", rel.to_string_lossy().replace('\\', "/"));
+        let text = std::fs::read_to_string(&path).expect("read source");
+        out.push((label, text));
     }
     out.sort();
     out
+}
+
+/// Recursively collect every `.rs` file under `dir`, subdirectories included
+/// (`cli/src/ops/*.rs` since the ops module split).
+fn collect_rs_paths(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read cli/src") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_paths(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
 }
 
 fn borrowed(srcs: &[(String, String)]) -> Vec<(&str, &str)> {

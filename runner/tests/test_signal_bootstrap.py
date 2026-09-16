@@ -19,6 +19,7 @@ from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner import __main__ as boot
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
+from curie_runner.history import ConversationReplay
 from curie_runner.session import SessionRunner
 from curie_telemetry import bootstrap_service_telemetry, configure_meter_provider
 from curie_telemetry.bootstrap import ServiceTelemetry
@@ -52,7 +53,7 @@ def _wire_process_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
             memory_store=object(),  # type: ignore[arg-type]
             memory_preamble=None,
             history_store=object(),  # type: ignore[arg-type]
-            conversation_preamble=None,
+            conversation_replay=ConversationReplay(),
             mcp_capability=None,
         )
 

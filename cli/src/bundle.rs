@@ -392,6 +392,11 @@ mod tests {
         crate::scaffold::scaffold(dir.path(), "deal-desk").unwrap();
         std::fs::create_dir_all(dir.path().join(".curie")).unwrap();
         std::fs::write(dir.path().join(".curie/runner.json"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join("curie.bundle.json"),
+            r#"{"webSearch":false}"#,
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".git/HEAD"), "ref").unwrap();
 
@@ -399,6 +404,7 @@ mod tests {
         assert!(names.contains(&".claude-plugin/plugin.json".to_string()));
         assert!(names.contains(&"skills/deal-desk/SKILL.md".to_string()));
         assert!(names.contains(&".mcp.json".to_string()));
+        assert!(names.contains(&"curie.bundle.json".to_string()));
         assert_eq!(
             digest_source(dir.path()).unwrap(),
             snapshot(dir.path()).unwrap().digest,

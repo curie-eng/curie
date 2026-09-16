@@ -1029,15 +1029,16 @@ true`, gated also on `agentSandbox.controller.deploy` (also default true).
 
 ## Single-node footprint (measured on a disposable single-node k3s cluster, 4 GB / 4 core)
 
-The dev profile fits the whole stack on one 4 GB node, but **tightly**: steady
-state is ~3.3 GB / ~82% node memory once Langfuse migrations settle. Langfuse
-web is the anchor (~950 MB resident with the heap cap raised to 1 GB; its Node
-default heap of ~512 MB OOM-crashes under a tight container limit, so the dev
-profile sets `NODE_OPTIONS=--max-old-space-size` and a 1536 MB web limit).
-ClickHouse settles around ~255 MB single-replica with cluster mode off. This
-matches the planned resize: everything runs in 4 GB for
-chart/security verification, and a resize to >=8 vCPU / 16-20 GB gives
-comfortable headroom for integration and soak testing.
+The ~3.3 GB / ~82% node memory figure was taken while rustfs was capped at
+512Mi and OOMKilling; HTTP /health still returned 200 between kubelet SIGKILLs,
+so the pod looked Ready. With the #2706 floor, rustfs resident size is ~1120Mi
+under ordinary Langfuse traffic and a 4 GB node is no longer an honest fit.
+Langfuse web is the other anchor (~950 MB resident with the heap cap raised to
+1 GB; its Node default heap of ~512 MB OOM-crashes under a tight container
+limit, so the dev profile sets `NODE_OPTIONS=--max-old-space-size` and a
+1536 MB web limit). ClickHouse settles around ~255 MB single-replica with
+cluster mode off. Resize to >=8 vCPU / 16-20 GB for integration and soak
+testing.
 
 ## High availability and PodDisruptionBudgets
 
@@ -1122,7 +1123,12 @@ sandbox and renders whenever an in-chart store is deployed.
 **Fail-closed egress.** `security.networkPolicy.allowedEgress` is EMPTY by
 default: a fresh install denies all egress except DNS until the operator declares
 where the model API and MCP endpoints live (`{cidr, ports}` entries). An unset
-allowlist never means allow-all. The BYO in-chart peers are not on that list
+allowlist never means allow-all. A live-registry `pip install` under that default
+is a truthful refusal (`Network is unreachable`, exit 1), not a hang: on
+`curie-runner:0.8.7` it took ~368s (pip's default retry budget across every
+resolved address). The runner image now ships `/etc/pip.conf` with `retries = 0`
+so the same command fails on the first unreachable attempt. See
+[Repository toolchain in the managed sandbox](../../docs/guides/repository-toolchain-in-the-managed-sandbox.md). The BYO in-chart peers are not on that list
 either, because each names one endpoint rather than a class of destinations: set
 `rustfs.egress` (and `rustfs.stsEgress` on the key-free path) so the sandbox
 bundle-fetch can reach S3 and STS, `otelCollector.egress` when the runner's
@@ -1524,13 +1530,28 @@ namespace named by `worker.publication.namespace` (release-scoped when empty).
 For a private runner image, create the referenced image pull Secret in that
 namespace separately; the chart deliberately does not copy the platform Secret.
 
-Deployment workspace capability is tri-state: `curie ... deploy --workspace`
-enables runtime selection, `--no-workspace` explicitly disables it, and
-omitting both carries the active deployment's value forward. The first root
-GitHub repository URL that establishes selection in a Slack thread is pinned to
-that agent and thread. A later message can establish selection when no earlier
-message did; later messages may omit the URL. Choosing another repository
-requires a new thread.
+`curie ... deploy --workspace` and `--no-workspace` are deprecated compatibility
+options and no longer enable or disable coding. Every session exposes the Claude
+Code file tools and `mcp__curie__publish_changes`. The publication tool is only
+an approval request: it cannot publish without a managed workspace and a human
+approval, publication still runs outside the sandbox, and no GitHub credential
+is mounted into the sandbox.
+
+One allowed root `https://github.com/owner/repository` URL in the initial
+message establishes the thread's selection and causes the worker to acquire its
+managed workspace at claim time. An initial message without a repository URL
+uses a generic sandbox and does not redeem a repository credential. If a root
+URL arrives after that generic route is already running, Curie may acquire the
+workspace only at an authenticated idle boundary where no turn can accept a
+steer, the latest structured history is durable, and no approval suspension or
+unresolved side-effect boundary is active. It prepares and verifies the
+workspace, cold-claims a replacement with the same logical session and history
+reference, and only then atomically fences the old route. If that safe
+boundary cannot be verified, Curie refuses the handoff and keeps the old route
+authoritative, as required by Accepted
+[ADR 0136](../../docs/adr/0136-a-late-workspace-handoff-replaces-the-sandbox-at-a-fenced-turn-boundary.md).
+The first established selection remains pinned to the agent and thread, and
+choosing another repository requires a new thread.
 
 Set `api.githubRepoAllowlist` to exact `owner/repository` entries or explicit
 owner-wide `owner/*` entries. Empty is deny-all. Curie checks this policy before
@@ -1660,7 +1681,7 @@ tracked by #1801. The three mail pairs were already retained with the mail
 surface and its paired worker credential source. A plain `curie cluster up`
 runs a full `helm upgrade --install` with no `--reuse-values`, so the CLI
 explicitly re-supplies each recorded source that the invocation does not
-replace or clear.
+replace or clear. That preservation lives in `cli/src/ops/up.rs`.
 
 ### Reserved environment variables
 

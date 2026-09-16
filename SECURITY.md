@@ -40,7 +40,10 @@ The rails are the actual control. Every agent runs inside them:
   explicitly-declared egress is permitted: DNS, the in-chart collector, RustFS
   (or `rustfs.egress` / `rustfs.stsEgress` when the object store is BYO),
   and inference when deployed, plus the operator's declared model API and MCP
-  hosts via `allowedEgress`.
+  hosts via `allowedEgress`. A live-registry pip install under that default is
+  a refusal, not a hang: ~368s on unconfigured pip (`curie-runner:0.8.7`,
+  2026-09-11); the runner image now ships `/etc/pip.conf` with `retries = 0`
+  so the same command fails on the first unreachable attempt.
 - **gVisor kernel isolation** via a RuntimeClass (`security.gvisor.mode`).
 - **Non-root runner containers** with a read-only root filesystem.
 - **Per-agent RBAC scoping** so one agent's secrets are isolated from another's. The chart ships a least-privilege baseline (a ServiceAccount with no bound Role and no mounted token); the control plane binds each agent's `resourceNames`-scoped Role when the agent is deployed.

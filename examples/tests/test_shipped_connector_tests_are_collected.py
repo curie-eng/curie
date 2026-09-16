@@ -2,8 +2,8 @@
 
 The failure this exists to stop, from the install it actually happened on:
 
-The four shipped SRE-bot connectors (``tempo``, ``k8s-write``, ``k8s-scale``,
-``self-upgrade``) each ship a ``test_server.py`` next to their Dockerfile. The
+The source-built SRE-bot connectors (``tempo`` and ``self-upgrade``) each ship a
+``test_server.py`` next to their Dockerfile. The
 tests exist, they are green when run by hand, and CI builds and
 ``release.yaml`` publishes the images regardless of whether anyone ever runs
 them. But ``pyproject.toml``'s ``[tool.pytest.ini_options] testpaths`` never

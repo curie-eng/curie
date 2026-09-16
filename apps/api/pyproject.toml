@@ -22,6 +22,7 @@ dependencies = [
     "redis>=5.0",
     "plugin-format",
     "aci-protocol",
+    "curie-channel-protocol",
     "curie-telemetry",
     "curie-telemetry-schema",
 ]
@@ -32,3 +33,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/curie_api"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/curie_api/schema_compat.json" = "curie_api/schema_compat.json"
+"src/curie_api/revision_kinds.json" = "curie_api/revision_kinds.json"

@@ -1,10 +1,10 @@
 {
   "name": "coder",
-  "description": "A minimal consumer of Curie's managed repository workspace and publication capability.",
+  "description": "A skill-less example that consumes Curie's built-in coding tools and approval-gated publication.",
   "version": "0.1.0",
   "starterPrompts": [
-    "What is checked out in this session?",
-    "Add a short usage section to the README and tell me exactly what changed.",
-    "Publish the focused changes in this workspace."
+    "Using https://github.com/acme-corp/acme-bot, summarize what is checked out in this session.",
+    "Using https://github.com/acme-corp/acme-bot, add a short usage section to the README and tell me exactly what changed.",
+    "Using https://github.com/acme-corp/acme-bot, make a focused change and request approval-gated publication."
   ]
 }

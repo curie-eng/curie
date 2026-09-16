@@ -72,11 +72,16 @@ fn manifest(name: &str) -> String {
 
 /// The genericized starter skill for `<name>`: a believable, editable
 /// placeholder scoped to the bundle name (no weather demo). Keeps the
-/// correct-by-example `allowed-tools` key and the when/how/rules section shape
-/// a real skill uses.
+/// correct-by-example `allowed-tools` key -- now the single space-separated
+/// scalar the Agent Skills specification calls canonical (ADR-0135), since this
+/// template is a teaching surface and whatever it shows is what authors copy --
+/// and the when/how/rules section shape a real skill uses. The two tool names
+/// are literals we control, so a bare scalar is safe here exactly as it already
+/// is for `name:`; `render_skill_md` quotes its joined value because those
+/// entries are arbitrary agent-authored text.
 fn skill_md(name: &str) -> String {
     format!(
-        "---\nname: {name}\ndescription: Starter skill for the {name} agent. Replace this description with when the agent should invoke this skill -- it is the routing signal.\nallowed-tools:\n  - WebSearch\n  - WebFetch\n---\n\n# {name}\n\nThis is the starter skill scaffolded by `curie init`. Replace each section\nbelow with your agent's real behavior; keep the section shape.\n\n## When to run\nDescribe the requests this skill should handle.\n\n## How to answer\n1. Numbered, concrete steps the agent follows.\n2. Prefer verifiable sources and tools over recall.\n\n## Hard rules\n- Never invent an answer. If you cannot find one, say so and name what you tried.\n- Keep replies short enough to read in Slack without expanding.\n"
+        "---\nname: {name}\ndescription: Starter skill for the {name} agent. Replace this description with when the agent should invoke this skill -- it is the routing signal.\nallowed-tools: WebSearch WebFetch\n---\n\n# {name}\n\nThis is the starter skill scaffolded by `curie init`. Replace each section\nbelow with your agent's real behavior; keep the section shape.\n\n## When to run\nDescribe the requests this skill should handle.\n\n## How to answer\n1. Numbered, concrete steps the agent follows.\n2. Prefer verifiable sources and tools over recall.\n\n## Hard rules\n- Never invent an answer. If you cannot find one, say so and name what you tried.\n- Keep replies short enough to read in Slack without expanding.\n"
     )
 }
 
@@ -298,13 +303,20 @@ fn write_bundle(dir: &Path, files: Vec<(PathBuf, String)>) -> Result<Vec<PathBuf
 ///
 /// The frontmatter is rendered without a YAML crate. `name` is kebab-case
 /// (validated in `spec.rs`), so a bare scalar is always safe. `description` and
-/// each `allowed-tools` value are ARBITRARY agent-authored text, so they are
+/// the `allowed-tools` value are ARBITRARY agent-authored text, so they are
 /// emitted as JSON-encoded strings: a serde_json string is a valid YAML
 /// double-quoted scalar (YAML double-quoted supports the same `\n \t \" \\
 /// \uXXXX` escapes serde_json emits), so the round-trip is exact. A bare scalar
 /// here would corrupt or invalidate the frontmatter `plugin_format.validate_bundle`
 /// parses with `yaml.safe_load` -- a colon-space breaks parsing, a leading ` #`
 /// silently truncates as a comment, leading `"[{&*@` etc. error the scanner.
+///
+/// `allowed-tools` is emitted as ONE canonical space-separated scalar (ADR-0135)
+/// rather than a block list, and the JSON encoding now wraps the WHOLE joined
+/// value: quoting each entry individually made a space or a `#` inside an entry
+/// safe by construction, and joining gives that up, so `spec::validate` refuses
+/// any entry that carries a depth-0 separator or unbalanced parens before a byte
+/// is written. That refusal is what keeps this join lossless.
 fn render_skill_md(skill: &SkillSpec) -> String {
     let mut s = String::new();
     s.push_str("---\n");
@@ -316,13 +328,10 @@ fn render_skill_md(skill: &SkillSpec) -> String {
     // Omit the key entirely when empty: the wrong shape (an empty list) reads as
     // "no tools" but is noise; a real Claude Code bundle just leaves it out.
     if !skill.allowed_tools.is_empty() {
-        s.push_str("allowed-tools:\n");
-        for tool in &skill.allowed_tools {
-            s.push_str(&format!(
-                "  - {}\n",
-                serde_json::to_string(tool).expect("string serializes")
-            ));
-        }
+        s.push_str(&format!(
+            "allowed-tools: {}\n",
+            serde_json::to_string(&skill.allowed_tools.join(" ")).expect("string serializes")
+        ));
     }
     s.push_str("---\n\n");
     // Normalize to a single trailing newline regardless of how the author ended
@@ -366,6 +375,9 @@ pub fn scaffold_from_spec(dir: &Path, spec: &AgentSpec) -> Result<Vec<PathBuf>> 
                 gate.insert("route".into(), serde_json::json!(g.route));
                 if g.grantable_via_policy {
                     gate.insert("grantableViaPolicy".into(), serde_json::json!(true));
+                }
+                if let Some(summary) = &g.summary {
+                    gate.insert("summary".into(), serde_json::json!(summary));
                 }
                 Value::Object(gate)
             })
@@ -580,7 +592,17 @@ mod tests {
             description_line.contains("deal-desk"),
             "description mentions the name: {description_line}"
         );
-        assert!(skill.contains("allowed-tools:"));
+        // The canonical single-line scalar (ADR-0135), asserted exactly: a bare
+        // `contains("allowed-tools:")` passes on the block form too, so the old
+        // shape has to be asserted ABSENT or a regression to it goes unnoticed.
+        assert!(
+            skill.contains("allowed-tools: WebSearch WebFetch\n"),
+            "starter skill must teach the canonical scalar: {skill}"
+        );
+        assert!(
+            !skill.contains("  - "),
+            "the block list form must be gone entirely: {skill}"
+        );
         assert!(
             !skill.contains("weather") && !skill.contains("Weather"),
             "starter skill must be genericized, not weather"

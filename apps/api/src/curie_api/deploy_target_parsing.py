@@ -15,6 +15,13 @@ from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targ
 from plugin_format.yaml_loader import DuplicateKeyError, safe_load_unique
 
 
+def _is_documentation_placeholder_channel(channel: str) -> bool:
+    """The public-repo Slack example shape is never a deployable binding."""
+
+    suffix = channel.removeprefix("C0EXAMPLE")
+    return suffix != channel and bool(suffix) and suffix.isascii() and suffix.isdigit()
+
+
 def parse_deploy_targets(content: str) -> DeployTargetsFile:
     """Parse and validate ``deploy.yaml``, or raise the operator-facing 400.
 
@@ -40,4 +47,15 @@ def parse_deploy_targets(content: str) -> DeployTargetsFile:
         detail = "; ".join(f"{code}: {message}" for code, message in errors)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
     assert parsed is not None
+
+    for name, target in parsed.targets.items():
+        channel = target.slack_channel
+        if channel is not None and _is_documentation_placeholder_channel(channel):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "deploy.placeholder_channel: "
+                f"targets.{name}.slack_channel is the documentation placeholder "
+                f"{channel!r}; replace it with a real Slack channel ID or remove "
+                "slack_channel before deploying",
+            )
     return parsed

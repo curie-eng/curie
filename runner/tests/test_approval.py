@@ -134,6 +134,110 @@ def test_genuine_permission_gate_summary_keeps_reserved_prefix() -> None:
     summary = summarize_tool_call("Bash", {"command": "rm -rf /tmp/x"})
     assert summary.startswith(APPROVAL_SUMMARY_PREFIX)
     assert guard_reserved_summary(summary) != summary
+    from plugin_format.gate_summary import RESERVED_PERMISSION_PREFIX
+
+    assert RESERVED_PERMISSION_PREFIX == APPROVAL_SUMMARY_PREFIX
+
+
+def test_summarize_tool_call_is_byte_stable_without_a_template() -> None:
+    # #2565: a gate that declares no template must keep today's machine string.
+    summary = summarize_tool_call(
+        "mcp__plugin_demo_files__approve_batch",
+        {"expected": {"a.xlsx": "aaa", "b.xlsx": "bbb"}, "going_out_blank": ["I35"]},
+    )
+    assert summary == (
+        APPROVAL_SUMMARY_PREFIX
+        + "mcp__plugin_demo_files__approve_batch "
+        + json.dumps(
+            {"expected": {"a.xlsx": "aaa", "b.xlsx": "bbb"}, "going_out_blank": ["I35"]},
+            sort_keys=True,
+        )
+    )
+
+
+def test_block_renders_a_declared_template_as_pending_display() -> None:
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}),
+        route_by_tool={"Bash": "managers"},
+        summary_by_tool={
+            "Bash": "Run {command}: {files|count} files. Approve?",
+        },
+    )
+    gate.block("Bash", {"command": "ls", "files": ["a", "b"]})
+    assert gate.pending_summary == summarize_tool_call(
+        "Bash", {"command": "ls", "files": ["a", "b"]}
+    )
+    assert gate.pending_summary.startswith(APPROVAL_SUMMARY_PREFIX)
+    assert gate.pending_display == "Run ls: 2 files. Approve?"
+
+
+def test_block_falls_back_to_machine_string_when_the_template_cannot_render() -> None:
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}),
+        route_by_tool={"Bash": "managers"},
+        summary_by_tool={"Bash": "Run {missing}. Approve?"},
+    )
+    tool_input = {"command": "ls"}
+    gate.block("Bash", tool_input)
+    assert gate.pending_display is None
+    assert gate.pending_summary == summarize_tool_call("Bash", tool_input)
+
+
+def test_block_without_a_template_leaves_pending_display_unset() -> None:
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}),
+        route_by_tool={"Bash": "managers"},
+    )
+    tool_input = {"command": "ls"}
+    gate.block("Bash", tool_input)
+    assert gate.pending_display is None
+    assert gate.pending_summary == summarize_tool_call("Bash", tool_input)
+
+
+def test_resolve_approval_policy_carries_summary_templates(tmp_path) -> None:
+    bundle = _write_manifest(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "demo",
+                "approvalPolicy": {
+                    "gates": [
+                        {
+                            "gate": "Bash",
+                            "route": "managers",
+                            "summary": "Run {command}. Approve?",
+                        }
+                    ]
+                },
+            }
+        ),
+    )
+    resolution = resolve_approval_policy(bundle)
+    assert resolution.summary_by_tool == {"Bash": "Run {command}. Approve?"}
+
+
+def test_resolve_approval_policy_last_gate_without_template_clears_it(tmp_path) -> None:
+    bundle = _write_manifest(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "demo",
+                "approvalPolicy": {
+                    "gates": [
+                        {
+                            "gate": "Bash",
+                            "route": "managers",
+                            "summary": "Run {command}. Approve?",
+                        },
+                        {"gate": "Bash", "route": "managers"},
+                    ]
+                },
+            }
+        ),
+    )
+    resolution = resolve_approval_policy(bundle)
+    assert resolution.route_by_tool == {"Bash": "managers"}
+    assert resolution.summary_by_tool == {}
 
 
 # --- session override ------------------------------------------------------------
@@ -236,7 +340,7 @@ def test_approval_server_config_shape() -> None:
     assert APPROVAL_TOOL_NAME == "mcp__curie__request_approval"
 
 
-def test_publish_tool_exists_only_for_a_managed_workspace() -> None:
+def test_publish_tool_is_always_listed_but_unmounted_invocation_refuses() -> None:
     async def names(server: object) -> set[str]:
         entry = server["instance"].get_request_handler("tools/list")  # type: ignore[index]
         if entry is None:
@@ -246,12 +350,67 @@ def test_publish_tool_exists_only_for_a_managed_workspace() -> None:
         return {str(item["name"]) for item in payload["tools"]}
 
     async def go() -> None:
-        assert "publish_changes" not in await names(build_approval_server())
-        assert "publish_changes" in await names(
-            build_approval_server(managed_workspace=True)
+        unmounted = build_approval_server()
+        mounted = build_approval_server(managed_workspace=True)
+        assert "publish_changes" in await names(unmounted)
+        assert "publish_changes" in await names(mounted)
+
+        # Discovery is unconditional so the model knows how publication works,
+        # but authority remains mount-keyed: an unmounted session has no gate.
+        assert (
+            build_approval_gate(
+                operator_tools=None, policy_routes={}, managed_workspace=False
+            )
+            is None
         )
+        mounted_gate = build_approval_gate(
+            operator_tools=None, policy_routes={}, managed_workspace=True
+        )
+        assert mounted_gate is not None
+        assert mounted_gate.required == frozenset({PUBLISH_TOOL_NAME})
+
+        # Defence in depth is also unconditional. Calling the discoverable
+        # tool without a mounted checkout must fail usefully, never fabricate a
+        # publication request or silently succeed.
+        entry = unmounted["instance"].get_request_handler("tools/call")
+        assert entry is not None
+        direct = await entry.handler(
+            None,
+            mcp_types.CallToolRequestParams(
+                name="publish_changes",
+                arguments={"title": "Ship changes"},
+            ),
+        )
+        payload = direct.model_dump()
+        assert payload.get("is_error") is True
+        message = " ".join(
+            str(item.get("text") or "") for item in payload.get("content") or []
+        ).lower()
+        assert "no managed repository workspace" in message
 
     anyio.run(go)
+
+
+def test_publish_tool_description_carries_coding_and_approval_safety_protocol() -> None:
+    async def listed_description() -> str:
+        server = build_approval_server()
+        entry = server["instance"].get_request_handler("tools/list")
+        assert entry is not None
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        tools = result.model_dump()["tools"]
+        publish = next(tool for tool in tools if tool["name"] == "publish_changes")
+        return str(publish["description"]).lower()
+
+    description = anyio.run(listed_description)
+
+    assert "when a managed repository is mounted" in description
+    assert "work only in /workspace" in description
+    assert "/workspace" in description
+    assert "do not push" in description
+    assert "preserve existing changes" in description
+    assert "human approval" in description
+    assert "end your turn" in description
+    assert "pending" in description
 
 
 def test_request_approval_can_be_omitted_without_dropping_managed_publication() -> None:
@@ -263,7 +422,9 @@ def test_request_approval_can_be_omitted_without_dropping_managed_publication() 
         return {tool.name for tool in result.tools}
 
     async def go() -> None:
-        assert await names(build_approval_server(include_request_approval=False)) == set()
+        assert await names(build_approval_server(include_request_approval=False)) == {
+            "publish_changes"
+        }
         assert await names(
             build_approval_server(
                 managed_workspace=True,
@@ -374,17 +535,26 @@ def test_blocked_turn_ends_awaiting_approval() -> None:
     anyio.run(go)
 
 
-def test_policy_gate_summary_outranks_gate_block() -> None:
-    """When the model explicitly called request_approval AND a permission gate
-    blocked a call in the same turn, the model-authored summary wins (it is
-    the intentional, richer statement of what needs approval)."""
+def test_permission_block_outranks_grantless_policy_request() -> None:
+    """#2657: one gated tool call is one permission card, even if the model
+    also called request_approval in the same turn.
+
+    A grantless policy summary must not drop the permission grant. Otherwise
+    resume has nothing to spend and PreToolUse raises a second card.
+    """
 
     async def go() -> None:
-        gate = ApprovalGate(required=frozenset({"Bash"}))
+        scale = "mcp__kubernetes__resources_scale"
+        # Match the shipped SRE bundle: scale is toolPolicy-only, so it has no
+        # approvalPolicy route. The card stays in the requesting thread (DEMO.md).
+        gate = ApprovalGate(required=frozenset({scale}))
 
         def factory() -> list:
-            gate.block("Bash", {"command": "x"})
-            return approval_turn("Explicit policy summary")
+            gate.block(scale, {"name": "acme-demo", "namespace": "sre-demo", "replicas": 2})
+            return approval_turn(
+                "Scale Deployment acme-demo in namespace sre-demo from 1 to 2 "
+                "replicas via Kubernetes resources_scale"
+            )
 
         session = FakeModelSession(factory)
         runner = SessionRunner(
@@ -398,8 +568,34 @@ def test_policy_gate_summary_outranks_gate_block() -> None:
         )
         await runner.start()
         frames = await _drain(runner, "gate this")
-        assert frames[-1]["status"] == "awaiting-approval"
-        assert frames[-1]["approval_summary"] == "Explicit policy summary"
+        final = frames[-1]
+        assert final["status"] == "awaiting-approval"
+        assert final["approval_gate_kind"] == "permission"
+        assert final["approval_granted_tool"] == scale
+        assert final["approval_route"] is None
+        assert str(final["approval_summary"]).startswith("Tool call awaiting approval: ")
+
+        # Resume is a cold rehydrate (ADR-0003): a new gate with the injected
+        # grant spends it once, then re-arms. The approved call must not raise
+        # a second card.
+        resume_gate = ApprovalGate(
+            required=frozenset({scale}),
+            grant_tool=str(final["approval_granted_tool"]),
+        )
+        callback = build_can_use_tool(resume_gate)
+        resume_gate.reset()
+        allowed = await callback(
+            scale,
+            {"name": "acme-demo", "namespace": "sre-demo", "replicas": 2},
+            ToolPermissionContext(),
+        )
+        assert isinstance(allowed, PermissionResultAllow)
+        denied = await callback(
+            scale,
+            {"name": "acme-demo", "namespace": "sre-demo", "replicas": 3},
+            ToolPermissionContext(),
+        )
+        assert isinstance(denied, PermissionResultDeny)
 
     anyio.run(go)
 
@@ -407,6 +603,7 @@ def test_policy_gate_summary_outranks_gate_block() -> None:
 def test_build_options_permission_posture() -> None:
     # Without a callback the historical bypass posture is preserved verbatim;
     # with one, the session runs in default mode and the callback decides.
+    hooks = {"PreToolUse": []}
     plain = build_options(
         plugins=[],
         model=None,
@@ -414,11 +611,21 @@ def test_build_options_permission_posture() -> None:
         max_turns=1,
         max_budget_usd=None,
         resume=None,
+        cwd="/workspace",
+        hooks=hooks,
     )
+    assert plain.tools == {"type": "preset", "preset": "claude_code"}
+    assert plain.allowed_tools == []
     assert plain.permission_mode == "bypassPermissions"
     assert plain.can_use_tool is None
+    assert plain.disallowed_tools == []
+    assert plain.cwd == "/workspace"
+    assert plain.hooks == hooks
 
-    gate = ApprovalGate(required=frozenset({"Bash"}))
+    approval_required = "mcp__plugin_acme-bot_operations__write_approval"
+    denied = "mcp__plugin_acme-bot_operations__write_denied"
+    unmatched = "mcp__plugin_acme-bot_operations__write_unmatched"
+    gate = ApprovalGate(required=frozenset({approval_required}))
     gated = build_options(
         plugins=[],
         model=None,
@@ -427,9 +634,43 @@ def test_build_options_permission_posture() -> None:
         max_budget_usd=None,
         resume=None,
         can_use_tool=build_can_use_tool(gate),
+        policy_disallowed_tools=[unmatched, denied, unmatched],
+        cwd="/workspace",
+        hooks=hooks,
     )
+    assert gated.tools == {"type": "preset", "preset": "claude_code"}
+    assert gated.allowed_tools == []
+    assert gated.disallowed_tools == [denied, unmatched]
     assert gated.permission_mode == "default"
     assert gated.can_use_tool is not None
+    assert gated.cwd == "/workspace"
+    assert gated.hooks == hooks
+
+    web_search_disabled = build_options(
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=1,
+        max_budget_usd=None,
+        resume=None,
+        web_search_enabled=False,
+    )
+    assert web_search_disabled.allowed_tools == []
+    assert web_search_disabled.disallowed_tools == ["WebSearch"]
+
+    combined = build_options(
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=1,
+        max_budget_usd=None,
+        resume=None,
+        can_use_tool=build_can_use_tool(gate),
+        policy_disallowed_tools=[unmatched, "WebSearch", denied, unmatched],
+        web_search_enabled=False,
+    )
+    assert combined.allowed_tools == []
+    assert combined.disallowed_tools == ["WebSearch", denied, unmatched]
 
 
 def test_runner_config_parses_approval_required_tools() -> None:
@@ -819,7 +1060,7 @@ def test_an_overlapping_bundle_route_is_logged_not_fatal(caplog) -> None:
 
 
 def test_no_declared_gate_without_workspace_preserves_historical_bypass() -> None:
-    """A non-workspace boot has neither a permission callback nor publish."""
+    """A non-workspace boot has no permission callback or publication authority."""
 
     gate = build_approval_gate(operator_tools=None, policy_routes={})
     assert gate is None
@@ -837,7 +1078,7 @@ def test_publish_gate_is_an_additive_exact_platform_member() -> None:
     assert gate.route_by_tool.get(PUBLISH_TOOL_NAME) is None
 
 
-def test_bundle_cannot_attach_a_route_to_platform_publish() -> None:
+def test_bundle_may_attach_a_route_to_platform_publish() -> None:
     gate = build_approval_gate(
         operator_tools=None,
         policy_routes={PUBLISH_TOOL_NAME: "bundle-selected-audience"},
@@ -846,7 +1087,27 @@ def test_bundle_cannot_attach_a_route_to_platform_publish() -> None:
 
     assert gate is not None
     assert gate.required == frozenset({PUBLISH_TOOL_NAME})
-    assert PUBLISH_TOOL_NAME not in gate.route_by_tool
+    assert PUBLISH_TOOL_NAME in gate.route_by_tool
+    assert gate.route_by_tool[PUBLISH_TOOL_NAME] == "bundle-selected-audience"
+
+
+def test_publish_permission_block_carries_policy_route() -> None:
+    async def go() -> None:
+        gate = build_approval_gate(
+            operator_tools=None,
+            policy_routes={PUBLISH_TOOL_NAME: "bundle-selected-audience"},
+            managed_workspace=True,
+        )
+        assert gate is not None
+        result = await build_can_use_tool(gate)(
+            PUBLISH_TOOL_NAME,
+            {"title": "  Update documentation  ", "body": "Exact body\n" * 100},
+            ToolPermissionContext(),
+        )
+        assert isinstance(result, PermissionResultDeny)
+        assert gate.pending_route == "bundle-selected-audience"
+
+    anyio.run(go)
 
 
 def test_publish_gate_denial_has_exact_trusted_provenance_and_no_route() -> None:

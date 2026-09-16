@@ -138,6 +138,8 @@ RULES = {
                  "app.kubernetes.io/instance=curie", "-o", NAMES)): "",
     # -- cluster status pod health ----------------------------------------
     ("kubectl", ("get", "pods", "-n", "curie", "-o", "json")): '{"items":[]}\n',
+    ("kubectl", ("get", "configmap", "curie-upgrade-checkpoint", "-n", "curie", "-o",
+                 "jsonpath={.data.record}")): "",
     # -- doctor release serving set (#2349) -------------------------------
     ("kubectl", ("get", "deployments,statefulsets", "-n", "curie", "-l",
                  "app.kubernetes.io/instance=curie", "-o", "json")):
@@ -330,7 +332,7 @@ fn probe_stages(log: &str) -> (usize, usize, Vec<String>, Vec<String>) {
 }
 
 /// `expected_calls` pins the documented probe set from the module doc (16 for
-/// `doctor`, 10 for `cluster status`) exactly, so a probe silently added or
+/// `doctor`, 11 for `cluster status`) exactly, so a probe silently added or
 /// dropped fails here rather than only showing up as a stage-count wobble.
 fn assert_fanout(
     label: &str,
@@ -469,7 +471,7 @@ fn cluster_status_fans_out_independent_probes() {
         stdout_of(&output),
         stderr_of(&output)
     );
-    assert_fanout("status", &fixture, 2, 10, wall_ms);
+    assert_fanout("status", &fixture, 2, 11, wall_ms);
 }
 
 /// Joining probes must not move a byte of what either surface prints, so both

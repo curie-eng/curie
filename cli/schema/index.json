@@ -43,7 +43,7 @@
       "result": "ChannelsOutput",
       "kind": "CliOutput",
       "schema": "surfaces.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "ChartCheckOutput",
@@ -73,13 +73,19 @@
       "result": "ClusterStatusOutput",
       "kind": "CliOutput",
       "schema": "cluster-status.schema.json",
-      "version": "1.3"
+      "version": "1.4"
     },
     {
       "result": "ClusterUpOutput",
       "kind": "CliOutput",
       "schema": "cluster-up.schema.json",
       "version": "1.0"
+    },
+    {
+      "result": "ClusterUpgradeOutput",
+      "kind": "CliOutput",
+      "schema": "cluster-upgrade.schema.json",
+      "version": "1.1"
     },
     {
       "result": "CommsOutput",

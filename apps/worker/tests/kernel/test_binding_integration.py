@@ -376,7 +376,10 @@ def test_kill_interrupts_a_live_turn(make_harness) -> None:
 
             ev = _qevent("hi", channel="C-bound", thread="tK")
             t1 = asyncio.create_task(h.kernel.process_event(ev))
-            await _wait_until(lambda: h.runner.turn_active)
+            await _wait_until(
+                lambda: h.runner.turn_active
+                and bool(h.kernel._active_by_agent.get(agent_id))
+            )
 
             # Killing the agent interrupts its registered live turn.
             signalled = await h.kernel.interrupt_agent(agent_id)
@@ -385,6 +388,48 @@ def test_kill_interrupts_a_live_turn(make_harness) -> None:
 
             await t1
             assert h.sink.last_text == "stopped"
+
+    asyncio.run(go())
+
+
+def test_kill_before_a_live_turn_signals_zero(make_harness) -> None:
+    async def go() -> None:
+        agent_id = uuid.uuid4()
+        binding = StubBinding({("slack", "C-bound"): _resolved(agent_id)})
+        async with make_harness(binding=binding, with_killswitch=True) as h:
+            signalled = await h.kernel.interrupt_agent(agent_id)
+            assert signalled == 0
+            assert h.runner.interrupts == 0
+
+            await h.kernel.process_event(_qevent("hi", channel="C-bound", thread="tBefore"))
+            assert h.runner.interrupts == 0
+
+    asyncio.run(go())
+
+
+def test_kill_interrupts_a_turn_accepted_before_prepare(make_harness) -> None:
+    async def go() -> None:
+        agent_id = uuid.uuid4()
+        binding = StubBinding({("slack", "C-bound"): _resolved(agent_id)})
+        async with make_harness(binding=binding, with_killswitch=True) as h:
+            hold = asyncio.Event()
+            accept = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.accept = accept
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="stopped", status=IDLE)]
+
+            ev = _qevent("hi", channel="C-bound", thread="tK")
+            t1 = asyncio.create_task(h.kernel.process_event(ev))
+            await _wait_until(lambda: bool(h.runner.opened))
+            assert not h.runner.turn_active
+
+            signalled = await h.kernel.interrupt_agent(agent_id)
+            assert signalled == 1
+            assert h.runner.interrupts == 1
+
+            h.runner.accept.set()
+            await t1
 
     asyncio.run(go())
 

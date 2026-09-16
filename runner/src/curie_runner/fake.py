@@ -26,6 +26,7 @@ from claude_agent_sdk.types import CanUseTool, PermissionResultDeny, ToolPermiss
 
 from .adapter import PartialMessageBoundary
 from .approval import APPROVAL_TOOL_NAME, ApprovalGate, process_approval_request
+from .history import ConversationMessage
 
 
 def _assistant(*blocks: Any, usage: dict[str, Any] | None = None) -> AssistantMessage:
@@ -190,6 +191,7 @@ class FakeModelSession:
         truncate_on_interrupt: bool = True,
         can_use_tool: CanUseTool | None = None,
         approval_gate: ApprovalGate | None = None,
+        replay_messages: tuple[ConversationMessage, ...] = (),
         emit_partial_boundaries: bool = False,
         disallowed_tools: list[str] | tuple[str, ...] | None = None,
     ) -> None:
@@ -203,6 +205,7 @@ class FakeModelSession:
         # the fake tier omits the sole-route auto-bind / unknown-route refusal and
         # silently widens the card -- the exact real-path regression #544 closed.
         self._approval_gate = approval_gate
+        self.replay_messages = replay_messages
         self.connected = False
         self.queries: list[str] = []
         self.interrupts = 0

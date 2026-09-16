@@ -45,6 +45,7 @@ CLAUDE_CONTRIBUTION = HarnessContribution(
     ),
     build_spawn_env=sdk_auth.resolve_sdk_env,
     compile_bundle=_compile_bundle,
+    supports_structured_replay=True,
 )
 
 

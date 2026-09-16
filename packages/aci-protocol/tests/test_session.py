@@ -122,6 +122,7 @@ def _worker_env(**overrides: object) -> dict[str, str]:
         "memory_ref": _MEMORY_REF,
         "history_ref": _HISTORY_REF,
         "bundle_ref": "bundles/demo/abc123.tar.gz",
+        "bundle_version": "abc123def456",
         "runner_token": "rt-plain-token",
         "model": "claude-opus-4-6",
         "history_token": "st-scoped-token",
@@ -164,6 +165,7 @@ def _full_boot_env() -> BootEnv:
             ),
         ),
         bundle_ref="bundles/demo/abc123.tar.gz",
+        bundle_version="abc123def456",
         runner_token="rt-full-token",
         model="claude-opus-4-6",
         fake_model=True,
@@ -342,6 +344,20 @@ def test_boot_env_declares_the_approval_resumed_kind_marker() -> None:
     assert BootEnv.from_env(env).approval_resumed_kind == "policy"
 
 
+def test_boot_env_declares_bundle_version() -> None:
+    """#2174: the agent-readable bundle version is a worker-produced boot key.
+
+    Distinct from CURIE_BUNDLE_REF (the RustFS object key). Unset is omitted.
+    """
+    assert "CURIE_BUNDLE_VERSION" in BootEnv.env_keys(producer="worker")
+    boot = BootEnv(session=_boot_session(), bundle_version="abc123def456")
+    env = boot.to_env()
+    assert env["CURIE_BUNDLE_VERSION"] == "abc123def456"
+    assert BootEnv.from_env(env | _SUBSTRATE_ENV).bundle_version == "abc123def456"
+    omitted = BootEnv(session=_boot_session()).to_env()
+    assert "CURIE_BUNDLE_VERSION" not in omitted
+
+
 def test_malformed_budget_json_raises_through_boot_env() -> None:
     env = BootEnv(session=_boot_session()).to_env()
     env["CURIE_BUDGET"] = "{not json"
@@ -370,6 +386,7 @@ def test_render_worker_matches_the_frozen_plain_bound_run_wire() -> None:
             "https://api.example.test/agents/11111111-2222-3333-4444-555555555555/state/memory"
         ),
         "CURIE_BUNDLE_REF": "bundles/demo/abc123.tar.gz",
+        "CURIE_BUNDLE_VERSION": "abc123def456",
         "CURIE_RUNNER_TOKEN": "rt-plain-token",
         "CURIE_MODEL": "claude-opus-4-6",
         "CURIE_HISTORY_REF": (
@@ -400,6 +417,7 @@ def test_render_worker_matches_the_frozen_resume_boot_wire() -> None:
             "https://api.example.test/agents/11111111-2222-3333-4444-555555555555/state/memory"
         ),
         "CURIE_BUNDLE_REF": "bundles/demo/abc123.tar.gz",
+        "CURIE_BUNDLE_VERSION": "abc123def456",
         "CURIE_RUNNER_TOKEN": "rt-resume-token",
         "CURIE_MODEL": "claude-opus-4-6",
         "CURIE_HISTORY_REF": (
@@ -435,6 +453,7 @@ def test_render_worker_matches_the_frozen_fake_local_boot_wire() -> None:
             "https://api.example.test/agents/11111111-2222-3333-4444-555555555555/state/memory"
         ),
         "CURIE_BUNDLE_REF": "bundles/demo/abc123.tar.gz",
+        "CURIE_BUNDLE_VERSION": "abc123def456",
         "CURIE_RUNNER_TOKEN": "rt-fake-token",
         # apply_model_env renders the flag as the literal "1", never "true".
         "CURIE_FAKE_MODEL": "1",
@@ -448,10 +467,16 @@ def test_render_worker_matches_the_frozen_fake_local_boot_wire() -> None:
 def test_render_worker_omits_unset_optionals_rather_than_emitting_empty_strings() -> None:
     """Unset optionals are absent, never present-and-empty (Edge case 7)."""
     env = _worker_env(
-        bundle_ref=None, model=None, history_token=None, memory_token=None, runner_token=None
+        bundle_ref=None,
+        bundle_version=None,
+        model=None,
+        history_token=None,
+        memory_token=None,
+        runner_token=None,
     )
     for key in (
         "CURIE_BUNDLE_REF",
+        "CURIE_BUNDLE_VERSION",
         "CURIE_RUNNER_TOKEN",
         "CURIE_MODEL",
         "CURIE_FAKE_MODEL",
@@ -521,6 +546,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         connector_release="curie",
         connector_agent="acme-dev",
         connector_namespace="curie",
+        bundle_version="abc123def456",
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -572,6 +598,7 @@ def test_from_env_parses_the_worker_subset_plus_the_substrate_fixture() -> None:
     assert boot.model == "claude-opus-4-6"
     assert boot.runner_token == "rt-plain-token"
     assert boot.bundle_ref == "bundles/demo/abc123.tar.gz"
+    assert boot.bundle_version == "abc123def456"
     assert boot.history_ref == _HISTORY_REF
     assert boot.history_token == "st-scoped-token"
     assert boot.memory_token == "st-scoped-token"
@@ -740,6 +767,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "OTEL_EXPORTER_OTLP_PROTOCOL",
         # platform-operational, declared on BootEnv itself
         "CURIE_BUNDLE_REF",
+        "CURIE_BUNDLE_VERSION",
         "CURIE_RUNNER_TOKEN",
         "CURIE_MODEL",
         "CURIE_FAKE_MODEL",

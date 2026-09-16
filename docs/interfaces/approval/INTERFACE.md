@@ -61,14 +61,24 @@ in code now:
   fields (ADR-0036) and are persisted as the `gate_kind`/`granted_tool` columns on the
   `Approval` record (migration `0015_approval_gate_provenance`). They replace the old
   summary-prefix sniff as the durable source of grant provenance — see the #430 bullet below.
+  A further optional `Final` field, `approval_display` (#2565, Draft ADR-0151), carries the
+  human sentence a bundle-authored `approvalPolicy.gates[].summary` template rendered. It is
+  additive (ACI patch 0.4.5). The worker uses `approval_display or approval_summary` for the
+  Slack card, the awaiting-approval notice (`Awaiting approval (<id>): ...`), and the
+  resolved card; `Approval.summary` stays the machine `summarize_tool_call` string so the
+  `gate_kind IS NULL` prefix fallback and the audit record are unchanged. A gate without a
+  template leaves `approval_display` unset, which is today's bytes.
 - **The lifecycle (landed, #244; pager advertisement narrowed, #1444).** A skill raises a
   policy gate through the runner's in-process `mcp__curie__request_approval` tool
   (`runner/src/curie_runner/approval.py`) when that tool is present. The runner advertises
-  this generic pager only when the observed MCP surface has an action that may write — a
-  tool not explicitly `readOnlyHint=true`, including an unknown or unreachable surface — or
-  when an explicit actionable approval gate exists. A surface with no MCP tools or only
-  explicitly read-only tools carries no generic pager, because approval cannot unlock an
-  action it cannot perform. `readOnlyHint` is not authorization and does not change gates
+  this generic pager when a route is `grantableViaPolicy`, or when the observed MCP
+  surface has an action that may write (a tool not explicitly `readOnlyHint=true`,
+  including an unknown or unreachable surface) and no permission gate already pages.
+  An explicit `approvalPolicy` or `toolPolicy.approvalRequired` gate is already a pager;
+  keeping `request_approval` beside it raises a second card for the same action (#2657).
+  A surface with no MCP tools or only explicitly read-only tools and no grantable
+  policy route carries no generic pager, because approval cannot unlock an action it
+  cannot perform. `readOnlyHint` is not authorization and does not change gates
   or tool execution. A live probe that explicitly reports `readOnlyHint=true` also feeds
   the MCP tool's SDK-visible name to the read-only classifier, suppressing the side-effect
   flag, no-retry-after-side-effects classification, and therefore its receipt line. A

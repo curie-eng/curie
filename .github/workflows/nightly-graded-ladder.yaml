@@ -23,8 +23,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Least privilege (#632): the nightly reads the checkout and consumes a secret;
-# it never writes back to the repo.
+# Least privilege (#632): the nightly reads the checkout and consumes a secret.
+# Workflow-level contents stay read. The file-failures job adds job-scoped
+# issues: write so a red run can open nightly-ladder issues (#2245); it still
+# cannot push to the repo.
 permissions:
   contents: read
 
@@ -289,6 +291,12 @@ jobs:
         run: docker tag ghcr.io/curie-eng/curie-api:ci-local ghcr.io/curie-eng/curie-api:latest
       - name: Build the worker-local overlay for the generated release compose (ghcr.io/curie-eng/curie-worker-local:latest, no registry auth)
         run: docker build --build-arg BASE_TAG=ci-local -t ghcr.io/curie-eng/curie-worker-local:latest -f compose/worker-local.Dockerfile compose
+      # Derive any remaining GHCR refs from the generated compose profile
+      # (plus dispatcher/runner extras the rung still needs) instead of
+      # adding images one at a time (#2005, #2245). Cached builds above
+      # satisfy the common images; this step builds whatever is still missing.
+      - name: Build any remaining release-compose images the selected profile requires
+        run: python3 compose/ensure_release_images.py --profiles full --build-missing
       # Live grading, same posture as the other rungs: CURIE_E2E_LIVE drops the
       # fake fixture and the ladder reads the OpenRouter credential from
       # CURIE_CREDENTIALS. The secret travels only as this env mapping, never on
@@ -529,3 +537,32 @@ jobs:
           kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
           kubectl describe pods -n curie -l app.kubernetes.io/component=runner-sandbox || true
           kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
+
+  # One issue per failure signature, labelled nightly-ladder, commented on
+  # when the same signature recurs (#2245). Job-scoped issues: write so the
+  # workflow-level contents: read posture is unchanged.
+  file-failures:
+    name: File nightly-ladder issues
+    needs: [ladder-skill-local, ladder-local-release, ladder-cluster]
+    if: |
+      always() && (
+        needs.ladder-skill-local.result == 'failure' ||
+        needs.ladder-local-release.result == 'failure' ||
+        needs.ladder-cluster.result == 'failure'
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: File or comment one issue per failure signature
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 release/nightly.py file-issues \
+            --repo "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

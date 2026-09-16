@@ -28,6 +28,7 @@ class PublicationResult:
     publication_id: uuid.UUID
     approval_id: uuid.UUID
     agent_id: uuid.UUID
+    workspace_conversation_id: str
     outcome: str
     pr_url: str | None
     error: str | None
@@ -85,6 +86,7 @@ class PostgresPublicationStore:
         self._engine = engine
         self._table = f'"{schema}".publications'
         self._approvals = f'"{schema}".approvals'
+        self._lineages = f'"{schema}".thread_publication_lineages'
         self._lease_owner = lease_owner
         self._lease_seconds = lease_seconds
         self._result_max_attempts = result_max_attempts
@@ -320,12 +322,16 @@ class PostgresPublicationStore:
         statement = text(
             f"""
             SELECT p.id, p.approval_id, p.repo_full_name, p.status, p.version,
+                   p.lineage_id, p.revision_number, p.expected_prior_head,
                    p.base_sha, p.patch_bytes, p.changed_paths, p.title, p.body,
                    p.reply_kind, p.reply_channel, p.reply_placeholder,
                    p.reply_endpoint, p.reply_adapter,
+                   l.version AS lineage_version, l.branch, l.pr_number,
+                   l.pr_url, l.head_sha,
                    a.conversation_id
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
+              JOIN {self._lineages} l ON l.id = p.lineage_id
              WHERE p.patch_bytes IS NOT NULL
                AND p.status IN ('approved', 'launching', 'running')
                AND p.approval_card_reported_at IS NOT NULL
@@ -385,7 +391,20 @@ class PostgresPublicationStore:
             publication_id=publication_id,
             approval_id=uuid.UUID(str(row["approval_id"])),
             decision="approved",
+            lineage_id=uuid.UUID(str(row["lineage_id"])),
+            lineage_version=int(row["lineage_version"]),
+            revision_id=publication_id,
+            revision_number=int(row["revision_number"]),
             repo_full_name=str(row["repo_full_name"]),
+            branch=str(row["branch"]),
+            pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
+            pr_url=str(row["pr_url"]) if row["pr_url"] is not None else None,
+            expected_prior_head=str(row["expected_prior_head"]),
+            expected_remote_head=(
+                str(row["head_sha"])
+                if row["pr_number"] is not None and row["head_sha"] is not None
+                else None
+            ),
             base_sha=str(row["base_sha"]),
             patch=patch,
             changed_paths=tuple(str(path) for path in paths),
@@ -425,6 +444,103 @@ class PostgresPublicationStore:
             status == "denied" and bool(row["patch_cleared"])
         )
 
+    async def mark_lineage_terminal(
+        self,
+        lineage_id: uuid.UUID,
+        *,
+        expected_version: int,
+        expected_stored_head: str | None,
+        state: str,
+        pr_number: int,
+        pr_url: str,
+        head_sha: str,
+    ) -> None:
+        """Persist exact terminal GitHub facts, accepting an identical replay."""
+
+        if state not in {"merged", "closed"}:
+            raise ValueError("publication lineage terminal state is invalid")
+        if expected_stored_head is not None and (
+            not isinstance(expected_stored_head, str)
+            or re.fullmatch(r"[0-9a-f]{40,64}", expected_stored_head) is None
+        ):
+            raise ValueError("publication lineage expected head is invalid")
+        if (
+            isinstance(pr_number, bool)
+            or not isinstance(pr_number, int)
+            or pr_number <= 0
+        ):
+            raise ValueError("publication lineage pull request number is invalid")
+        if (
+            not isinstance(pr_url, str)
+            or re.fullmatch(
+                r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9][0-9]*",
+                pr_url,
+                re.IGNORECASE,
+            )
+            is None
+            or not pr_url.casefold().endswith(f"/pull/{pr_number}".casefold())
+        ):
+            raise ValueError("publication lineage pull request URL is invalid")
+        if (
+            not isinstance(head_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None
+        ):
+            raise ValueError("publication lineage head is invalid")
+        async with self._engine.begin() as connection:
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._lineages}
+                           SET status = :state,
+                               pr_number = :pr_number,
+                               pr_url = :pr_url,
+                               head_sha = :head_sha,
+                               version = version + 1,
+                               updated_at = now()
+                         WHERE id = :lineage_id
+                           AND status = 'open'
+                           AND version = :expected_version
+                           AND head_sha IS NOT DISTINCT FROM :expected_stored_head
+                           AND (pr_number IS NULL OR pr_number = :pr_number)
+                           AND (pr_url IS NULL OR pr_url = :pr_url)
+                     RETURNING version
+                        """
+                    ),
+                    {
+                        "lineage_id": lineage_id,
+                        "expected_version": expected_version,
+                        "expected_stored_head": expected_stored_head,
+                        "state": state,
+                        "pr_number": pr_number,
+                        "pr_url": pr_url,
+                        "head_sha": head_sha,
+                    },
+                )
+            ).scalar_one_or_none()
+            if updated is not None:
+                return
+            current = (
+                await connection.execute(
+                    text(
+                        f"""
+                        SELECT status, pr_number, pr_url, head_sha
+                          FROM {self._lineages}
+                         WHERE id = :lineage_id
+                        """
+                    ),
+                    {"lineage_id": lineage_id},
+                )
+            ).mappings().one_or_none()
+            if current is not None and (
+                str(current["status"]) == state
+                and current["pr_number"] == pr_number
+                and current["pr_url"] == pr_url
+                and current["head_sha"] == head_sha
+            ):
+                return
+        raise PublicationStoreError("publication lineage terminal CAS was lost")
+
     async def complete(
         self, publication_id: uuid.UUID, *, outcome: str, pr_url: str | None
     ) -> None:
@@ -444,6 +560,7 @@ class PostgresPublicationStore:
         outcome: str,
         pr_url: str | None,
         error: str | None,
+        **lineage: object,
     ) -> None:
         """Persist the outcome and clear private work before any reply attempt."""
 
@@ -456,11 +573,35 @@ class PostgresPublicationStore:
         }.get(outcome)
         if status is None:
             raise ValueError(f"unsupported publication outcome {outcome!r}")
+        lineage_id_value = lineage.get("lineage_id")
+        lineage_version_value = lineage.get("lineage_version")
+        pr_number_value = lineage.get("pr_number")
         await self._terminal_cas(
             publication_id,
             status=status,
             result_url=pr_url,
             error=error[:2000] if error else None,
+            lineage_id=lineage_id_value if isinstance(lineage_id_value, uuid.UUID) else None,
+            lineage_version=(
+                lineage_version_value
+                if isinstance(lineage_version_value, int)
+                else None
+            ),
+            pr_number=(
+                pr_number_value
+                if isinstance(pr_number_value, int)
+                else None
+            ),
+            new_head=(
+                str(lineage["new_head"])
+                if lineage.get("new_head") is not None
+                else None
+            ),
+            expected_prior_head=(
+                str(lineage["expected_prior_head"])
+                if lineage.get("expected_prior_head") is not None
+                else None
+            ),
         )
 
     async def pending_result(
@@ -475,9 +616,12 @@ class PostgresPublicationStore:
             SELECT p.id, p.approval_id, p.status, p.result_url, p.error, p.version,
                    p.result_delivery_attempts, p.reply_kind, p.reply_channel,
                    p.reply_placeholder, p.reply_endpoint, p.reply_adapter,
+                   COALESCE(p.workspace_conversation_id, l.conversation_id)
+                       AS workspace_conversation_id,
                    a.agent_id, a.conversation_id, a.resolved_by, a.resolution_note
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
+              LEFT JOIN {self._lineages} l ON l.id = p.lineage_id
              WHERE p.status IN ('denied', 'expired', 'succeeded', 'failed')
                AND p.patch_bytes IS NULL
                AND (
@@ -561,6 +705,7 @@ class PostgresPublicationStore:
             publication_id=result_id,
             approval_id=uuid.UUID(str(row["approval_id"])),
             agent_id=uuid.UUID(str(row["agent_id"])),
+            workspace_conversation_id=str(row["workspace_conversation_id"]),
             outcome="published" if status == "succeeded" else status,
             pr_url=row["result_url"],
             error=row["error"],
@@ -589,6 +734,42 @@ class PostgresPublicationStore:
         """Acknowledge an outbox result only after the adapter accepted it."""
 
         await self._result_delivery_cas(publication_id, delivered=True, error=None)
+
+    async def mark_outcome_history_ready(self, publication_id: uuid.UUID) -> None:
+        """Release the thread fence only after transcript append succeeded."""
+
+        version = self._result_versions.get(publication_id)
+        if version is None:
+            raise PublicationStoreError("publication result has no owned lease version")
+        async with self._engine.begin() as connection:
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._table}
+                           SET outcome_history_ready_at =
+                                   COALESCE(outcome_history_ready_at, now()),
+                               version = version + 1,
+                               updated_at = now()
+                         WHERE id = :id
+                           AND status IN ('denied', 'expired', 'succeeded', 'failed')
+                           AND lease_owner = :owner
+                           AND version = :version
+                     RETURNING version
+                        """
+                    ),
+                    {
+                        "id": publication_id,
+                        "owner": self._lease_owner,
+                        "version": version,
+                    },
+                )
+            ).scalar_one_or_none()
+        if updated is None:
+            raise PublicationStoreError(
+                "publication outcome history acknowledgement CAS was lost"
+            )
+        self._result_versions[publication_id] = int(updated)
 
     async def retry_result_delivery(
         self, publication_id: uuid.UUID, *, error: str
@@ -638,6 +819,7 @@ class PostgresPublicationStore:
                                version = version + 1,
                                updated_at = now()
                          WHERE id = :id AND version = :version AND lease_owner = :owner
+                           AND (NOT :delivered OR outcome_history_ready_at IS NOT NULL)
                      RETURNING version
                         """
                     ),
@@ -818,11 +1000,61 @@ class PostgresPublicationStore:
         status: str,
         result_url: str | None,
         error: str | None,
+        lineage_id: uuid.UUID | None = None,
+        lineage_version: int | None = None,
+        pr_number: int | None = None,
+        new_head: str | None = None,
+        expected_prior_head: str | None = None,
     ) -> None:
         version = self._versions.get(publication_id)
         if version is None:
             raise PublicationStoreError("publication has no owned lease version")
         async with self._engine.begin() as connection:
+            if new_head is not None:
+                if (
+                    lineage_id is None
+                    or lineage_version is None
+                    or pr_number is None
+                    or result_url is None
+                    or expected_prior_head is None
+                ):
+                    raise PublicationStoreError(
+                        "publication success omitted lineage CAS identity"
+                    )
+                lineage_updated = (
+                    await connection.execute(
+                        text(
+                            f"""
+                            UPDATE {self._lineages}
+                               SET pr_number = COALESCE(pr_number, :pr_number),
+                                   pr_url = COALESCE(pr_url, :pr_url),
+                                   head_sha = :new_head,
+                                   version = version + 1,
+                                   updated_at = now()
+                             WHERE id = :lineage_id
+                               AND status = 'open'
+                               AND version = :lineage_version
+                               AND (pr_number IS NULL OR pr_number = :pr_number)
+                               AND (pr_url IS NULL OR pr_url = :pr_url)
+                               AND (
+                                    (head_sha IS NULL AND base_sha = :expected_prior)
+                                    OR head_sha = :expected_prior
+                               )
+                         RETURNING version
+                            """
+                        ),
+                        {
+                            "lineage_id": lineage_id,
+                            "lineage_version": lineage_version,
+                            "pr_number": pr_number,
+                            "pr_url": result_url,
+                            "new_head": new_head,
+                            "expected_prior": expected_prior_head,
+                        },
+                    )
+                ).scalar_one_or_none()
+                if lineage_updated is None:
+                    raise PublicationStoreError("publication lineage advance CAS was lost")
             updated = (
                 await connection.execute(
                     text(
@@ -853,6 +1085,12 @@ class PostgresPublicationStore:
                     },
                 )
             ).scalar_one_or_none()
+            # A successful lineage advance and a lost publication lease must
+            # roll back together. Otherwise a stale worker could move the
+            # shared PR head while leaving its revision nonterminal and make
+            # the retry appear to be a foreign concurrent commit.
+            if updated is None and new_head is not None:
+                raise PublicationStoreError("publication terminal CAS was lost")
         if updated is None:
             if await self.is_terminal(publication_id):
                 self._versions.pop(publication_id, None)

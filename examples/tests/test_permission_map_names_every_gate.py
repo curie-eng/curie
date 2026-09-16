@@ -1,4 +1,4 @@
-"""Every gated write in a bundle has an entry in that bundle's permission map.
+"""Every approval-controlled connector write has a permission-map entry.
 
 The failure this exists to stop has now happened twice, the same way both times.
 
@@ -56,6 +56,12 @@ def _gated_bundles() -> list[tuple[str, str, Path]]:
             # Connector tools only: see the module docstring.
             if name and str(name).startswith("mcp__"):
                 found.append((bundle, str(name), doc))
+        for canonical in ((parsed.get("toolPolicy") or {}).get("approvalRequired")) or []:
+            connector, separator, tool = str(canonical).partition("/")
+            # Exact connector/tool entries describe a concrete mutation. Wildcard
+            # policy fixtures do not identify one documentable live action.
+            if separator and connector and tool and "*" not in str(canonical):
+                found.append((bundle, f"mcp__{connector}__{tool}", doc))
     return found
 
 
@@ -78,9 +84,8 @@ def test_a_gated_write_is_named_in_the_permission_map(
         f"docs/PERMISSION-MAP.md. A bundle that can write needs the document "
         f"that says which writes, permitted by whom, bounded by what."
     )
-    # The tool name, not the gate string, because the document writes the tool
-    # with its signature -- `mcp__k8s-scale__scale_deployment(namespace, name,
-    # replicas)` -- and a substring check on the name matches that.
+    # The exact live tool name also appears inside any documented signature, so
+    # this catches both table rows and prose forms without parsing Markdown.
     assert gate in doc.read_text(encoding="utf-8"), (
         f"{bundle}'s permission map does not mention '{gate}'. That document "
         f"claims to list every write this bot can perform, so an unlisted gated "

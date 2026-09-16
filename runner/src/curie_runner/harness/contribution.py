@@ -59,5 +59,9 @@ class HarnessContribution:
     model_override_env_keys: tuple[str, ...]
     build_spawn_env: Callable[[MutableMapping[str, str]], dict[str, str] | None]
     compile_bundle: Callable[[str | None], BundleCompileResult]
+    # A harness must opt in only when it can consume Curie's ordered portable
+    # role/content prefix. False means recovered history is refused explicitly;
+    # rendering it into the system prompt is never a fallback (ADR-0119).
+    supports_structured_replay: bool = False
     aliases: frozenset[str] = field(default_factory=frozenset)
     labels: frozenset[str] = field(default_factory=frozenset)

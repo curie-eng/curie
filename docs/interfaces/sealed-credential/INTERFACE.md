@@ -89,7 +89,7 @@ below verbatim; there is nothing else to implement against.
   the blob **is** the credential, so the deploy path has no value to resolve.
 
 Key custody is asymmetric on purpose. The CLI mints the keypair on
-`curie cluster up` and preserves it across upgrades (`cli/src/ops.rs`); the chart
+`curie cluster up` and preserves it across upgrades (`cli/src/ops/up.rs`); the chart
 never generates one, because it has no lookup-persist and a chart-side random
 would mint a new key on every `helm upgrade`
 (`charts/curie/templates/secrets.yaml`, `charts/curie/values.yaml`). The previous

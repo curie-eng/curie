@@ -2,7 +2,13 @@
 
 Date: 2026-08-22
 
-Status: Draft
+Status: Accepted
+
+**Maintainer approval:** @TheConnMan explicitly approved coordinated acceptance
+and implementation on 2026-08-30 for [issue #1902](https://github.com/curie-eng/curie/issues/1902).
+The realizing code path is the conversation-history loader and SDK session
+integration in `runner/src/curie_runner/history.py` and
+`runner/src/curie_runner/session.py`.
 
 Depends on [ADR-0116](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md),
 whose decision 5 creates the problem this one answers. It changes **how**

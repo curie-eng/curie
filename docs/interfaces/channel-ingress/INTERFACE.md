@@ -1,7 +1,7 @@
 ---
 seam: Channel / ingress
-kind: SOFT
-impls: 3 production channels (Slack, Discord, email) plus CLI stub
+kind: CLEAN
+impls: 2 reply adapters behind the `ReplySink` port (Slack, HTTP) + a second wire ingress producer (Rust CLI)
 grade: B-
 vision_row: Communication
 epics:
@@ -16,7 +16,7 @@ order: 4
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 3 production channels (Slack, Discord, email) plus CLI stub &nbsp;·&nbsp; **Swap-readiness grade:** B-
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 2 reply adapters behind the `ReplySink` port (Slack, HTTP) + a second wire ingress producer (Rust CLI) &nbsp;·&nbsp; **Swap-readiness grade:** B-
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.

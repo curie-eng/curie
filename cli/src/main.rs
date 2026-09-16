@@ -20,7 +20,7 @@ use curie::docker;
 use curie::github_app as crate_github_app;
 use curie::local::{self, LocalDownOpts, LocalOpts};
 use curie::message::{self, MessageOpts};
-use curie::ops::{self, CommonOpts, DownOpts, RollbackOpts, UpOpts};
+use curie::ops::{self, CommonOpts, DownOpts, RollbackOpts, UpOpts, UpgradeChart, UpgradeOpts};
 use curie::secrets;
 use curie::state::{apply_continue, load_turn, CliTurnArgs, TurnVerb};
 use curie::ui::{self, ColorFlag, Ui};
@@ -937,16 +937,16 @@ enum SreBotAction {
         /// Bind the installed bot to this Slack channel.
         #[arg(long, value_name = "CHANNEL")]
         slack_channel: Option<String>,
-        /// Scope the approval-gated restart tool to these Deployments
-        /// (`namespace/name`, comma separated). One list renders BOTH ceilings:
-        /// the Role's resourceNames and the connector's K8S_WRITE_ALLOWLIST.
-        /// Omit and the connector is still installed, gated, with an empty
-        /// ceiling that refuses every call until targets are named.
-        #[arg(long, value_name = "NS/NAME[,NS/NAME]")]
-        write_allowlist: Option<String>,
-        /// Leave the gated write connector out of the install entirely.
+        /// Install the upgrade path: the self-upgrade connector, the platform
+        /// upgrade Job, and the two identities behind them.
+        ///
+        /// CREATES A NAMESPACE-ADMIN-EQUIVALENT IDENTITY for the Job that runs
+        /// `helm upgrade`. Read examples/sre-bot/manifests/platform-upgrade-role.yaml
+        /// before using this: it enumerates exactly what that grant covers and
+        /// what does and does not bound it. Omit the flag and nothing about the
+        /// install changes.
         #[arg(long)]
-        no_write: bool,
+        platform_upgrade: bool,
         /// Kubernetes namespace of the Curie release. Default: curie.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
@@ -956,6 +956,11 @@ enum SreBotAction {
         /// Kubernetes namespace of the retained observability stack. Default: observability.
         #[arg(long, default_value = "observability")]
         observability_namespace: String,
+        /// Allow this GitHub repository, or `owner/*`, for runtime workspace
+        /// selection. Repeatable. Sets `api.githubRepoAllowlist` on the Curie
+        /// install.
+        #[arg(long = "workspace-repo", value_name = "OWNER/REPO")]
+        workspace_repo: Vec<String>,
     },
 }
 
@@ -980,6 +985,13 @@ enum DevAction {
     /// Run the cold-start parity ladder across the skill, local, and cluster
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
+    /// Nightly SRE demo e2e: six assertions on kind with the pinned Kubernetes
+    /// MCP server, a CI-only Socket Mode Slack app, a live provider, and an
+    /// allowlisted throwaway repo (#2246, `bash cli/scripts/sre-demo-e2e.sh`).
+    /// Missing those CI secrets skip with the reason in the run summary.
+    SreDemoE2e,
+    /// Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`).
+    TwoReleaseApprovalE2e,
     /// Select the end to end tiers CI would run for paths or revisions.
     E2eCiSelection {
         /// Changed path. Repeat for every path in the candidate change.
@@ -1603,7 +1615,7 @@ enum LocalAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Connect or disconnect the local compose stack from a real Slack workspace.
+    /// Connect or disconnect the local compose stack from a real Slack workspace. Exactly one Curie release may connect to a given Slack app.
     Comms {
         /// Chat surface to configure. Required until the CLI grows more than
         /// one comms target.
@@ -1796,11 +1808,14 @@ enum LocalAction {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Let each new session select an allowed GitHub repository from the
-        /// opening message and materialize it as managed /workspace.
+        /// Deprecated compatibility no-op: coding tools are built in, and an
+        /// allowed root GitHub URL in the opening message drives managed
+        /// /workspace acquisition.
         #[arg(long, conflicts_with = "no_workspace")]
         workspace: bool,
-        /// Explicitly disable a previously configured managed workspace.
+        /// Deprecated compatibility no-op: coding tools are built in, and an
+        /// allowed root GitHub URL in the opening message drives managed
+        /// /workspace acquisition.
         #[arg(long, conflicts_with = "workspace")]
         no_workspace: bool,
         /// Target environment. Defaults to dev; a `--target` supplies it
@@ -2148,6 +2163,11 @@ enum ClusterAction {
         /// Print the helm command that would run and exit without executing.
         #[arg(long)]
         dry_run: bool,
+        /// Apply contract or irreversible schema migrations. Without this flag
+        /// the upgrade Job refuses those migrations before mutation so a patch
+        /// rollback window stays intact (#2300).
+        #[arg(long = "forward-only")]
+        forward_only: bool,
     },
     /// Uninstall the release and sweep its runtime namespaces, running helm
     /// uninstall followed by kubectl delete namespace. The namespace delete
@@ -2210,6 +2230,40 @@ enum ClusterAction {
         /// Print the commands that would run and exit without executing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Run the resumable cluster upgrade lifecycle to a target version.
+    ///
+    /// Plans, validates, drains accepted work, checkpoints, migrates, applies,
+    /// proves exact convergence, runs a target-version canary, and records the
+    /// new known-good revision. The operator does not pass Helm merge flags.
+    /// A failed attempt either leaves the previous known-good version serving
+    /// or returns one fail-forward command. See issue #2301.
+    Upgrade {
+        /// Target Curie version (chart/app version) to upgrade to.
+        #[arg(long = "to", value_name = "VERSION")]
+        to: String,
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Helm chart. An explicit path or ref overrides the default. Default:
+        /// the version-pinned release asset for `--to` on release builds; local
+        /// `charts/curie` on dev builds.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Print the redacted upgrade plan and exit without mutating.
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply contract or irreversible schema migrations. Without this flag
+        /// the upgrade Job refuses those migrations before mutation so a patch
+        /// rollback window stays intact (#2300).
+        #[arg(long = "forward-only")]
+        forward_only: bool,
     },
     /// Carry bundle objects across a chart upgrade that renames the object
     /// store (issue #1324).
@@ -2299,7 +2353,7 @@ enum ClusterAction {
         #[arg(long)]
         open: bool,
     },
-    /// Connect or disconnect the cluster release from a real Slack workspace.
+    /// Connect or disconnect the cluster release from a real Slack workspace. Exactly one Curie release may connect to a given Slack app.
     Comms {
         /// Chat surface to configure. Required until the CLI grows more than
         /// one comms target.
@@ -2596,11 +2650,14 @@ enum ClusterAction {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Let sessions on each deployment select an allowed GitHub repository
-        /// from the opening message and materialize it as managed /workspace.
+        /// Deprecated compatibility no-op: coding tools are built in, and an
+        /// allowed root GitHub URL in the opening message drives managed
+        /// /workspace acquisition.
         #[arg(long, conflicts_with = "no_workspace")]
         workspace: bool,
-        /// Explicitly disable a previously configured managed workspace.
+        /// Deprecated compatibility no-op: coding tools are built in, and an
+        /// allowed root GitHub URL in the opening message drives managed
+        /// /workspace acquisition.
         #[arg(long, conflicts_with = "workspace")]
         no_workspace: bool,
         /// Target environment. Defaults to dev; a `--target` supplies it
@@ -2971,6 +3028,34 @@ async fn materialize_artifact(
     }
 }
 
+/// Resolve the upgrade chart without erasing whether a release dry-run still
+/// needs the network-free target checks. Explicit operands retain the existing
+/// rule: an available path is local, while any other operand is Helm-resolved.
+async fn materialize_upgrade_chart(
+    resolved: artifacts::Resolved,
+    dry_run: bool,
+) -> Result<UpgradeChart> {
+    let pending_source = match &resolved {
+        artifacts::Resolved::Fetch { url, cache_path } if dry_run && !cache_path.exists() => {
+            Some(url.clone())
+        }
+        _ => None,
+    };
+    let helm_reference = matches!(&resolved, artifacts::Resolved::Local(path) if !path.exists());
+    let operand = materialize_artifact(resolved, dry_run, "chart").await?;
+
+    if let Some(source_url) = pending_source {
+        Ok(UpgradeChart::PendingRelease {
+            source_url,
+            cache_path: operand,
+        })
+    } else if helm_reference {
+        Ok(UpgradeChart::HelmReference(operand))
+    } else {
+        Ok(UpgradeChart::AvailableLocal(operand))
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -3067,22 +3152,22 @@ async fn run(command: Option<Command>) -> Result<()> {
                             observability,
                             dry_run,
                             slack_channel,
-                            write_allowlist,
-                            no_write,
+                            platform_upgrade,
                             namespace,
                             release,
                             observability_namespace,
+                            workspace_repo,
                         },
                 },
         }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
             observability,
             dry_run,
             slack_channel,
-            write_allowlist,
-            no_write,
+            platform_upgrade,
             namespace,
             release,
             observability_namespace,
+            workspace_repo,
         })
         .await?
         {
@@ -3149,6 +3234,10 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,
+            DevAction::SreDemoE2e => commands::dev_script("cli/scripts/sre-demo-e2e.sh", &[]).await,
+            DevAction::TwoReleaseApprovalE2e => {
+                commands::dev_script("cli/scripts/two-release-approval-e2e.sh", &[]).await
+            }
             DevAction::E2eCiSelection {
                 path,
                 base,
@@ -3944,7 +4033,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 set,
                 dev,
                 dry_run,
+                forward_only,
             } => {
+                let mut set = set;
+                if forward_only {
+                    set.push("api.migrate.forwardOnly=true".to_string());
+                }
                 let resolved = artifacts::resolve_chart(
                     chart.as_deref(),
                     artifacts::Channel::current(),
@@ -4041,6 +4135,38 @@ async fn run(command: Option<Command>) -> Result<()> {
                 })
                 .await?,
             ),
+            ClusterAction::Upgrade {
+                to,
+                namespace,
+                release,
+                chart,
+                yes,
+                dry_run,
+                forward_only,
+            } => {
+                let resolved = artifacts::resolve_chart(
+                    chart.as_deref(),
+                    artifacts::Channel::current(),
+                    &to,
+                    artifacts::cache_root,
+                    std::path::Path::new("charts/curie").is_dir(),
+                )?;
+                let chart = materialize_upgrade_chart(resolved, dry_run).await?;
+                emit(
+                    ops::upgrade(UpgradeOpts {
+                        common: CommonOpts {
+                            namespace,
+                            release,
+                            dry_run,
+                        },
+                        to,
+                        chart,
+                        yes,
+                        forward_only,
+                    })
+                    .await?,
+                )
+            }
             ClusterAction::Status {
                 namespace,
                 release,
@@ -4376,6 +4502,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                 secret,
                 api_local_port,
             } => {
+                if workspace {
+                    commands::warn_if_empty_github_repo_allowlist(&namespace, &release).await;
+                }
                 let api_key = commands::normalize_deploy_api_key(api_key);
                 // ADR-0057 (supersedes ADR-0024's deploy transport): with no
                 // explicit --api-key, discover the release's strong Secret key;
@@ -5470,6 +5599,31 @@ mod tests {
     }
 
     #[test]
+    fn cluster_upgrade_requires_to_and_reads_namespace_env() {
+        let parsed =
+            Cli::try_parse_from(["curie", "cluster", "upgrade", "--to", "0.9.0", "--dry-run"])
+                .expect("cluster upgrade --to should parse");
+        match parsed.command {
+            Some(Command::Cluster {
+                action:
+                    ClusterAction::Upgrade {
+                        to,
+                        namespace,
+                        dry_run,
+                        ..
+                    },
+            }) => {
+                assert_eq!(to, "0.9.0");
+                assert_eq!(namespace, "curie");
+                assert!(dry_run);
+            }
+            _ => panic!("expected cluster upgrade"),
+        }
+        let missing = Cli::try_parse_from(["curie", "cluster", "upgrade"]);
+        assert!(missing.is_err(), "--to is required");
+    }
+
+    #[test]
     fn clap_rejects_flag_and_clear_together() {
         // #1124 AC4, armed through the PARSER rather than the resolver: the
         // fourth, invalid state (set and clear at once) never reaches
@@ -5923,6 +6077,22 @@ mod tests {
             cli.command,
             Some(Command::Dev {
                 action: DevAction::E2eLadder
+            })
+        ));
+        let cli = Cli::try_parse_from(["curie", "dev", "sre-demo-e2e"])
+            .expect("dev sre-demo-e2e should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::SreDemoE2e
+            })
+        ));
+        let cli = Cli::try_parse_from(["curie", "dev", "two-release-approval-e2e"])
+            .expect("dev two-release-approval-e2e should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::TwoReleaseApprovalE2e
             })
         ));
         let cli = Cli::try_parse_from(["curie", "dev", "chart-runtime-e2e"])

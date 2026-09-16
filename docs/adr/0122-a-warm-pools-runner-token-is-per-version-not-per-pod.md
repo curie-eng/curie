@@ -2,15 +2,26 @@
 
 Date: 2026-08-25
 
-Status: Draft
+Status: Accepted
 
-**Supersedes in part, when accepted,
+**Supersedes in part
 [ADR-0116](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md)**,
-whose decision 2 says the pool "mints one per pod at creation". It cannot. While
-this record is Draft it replaces nothing; ADR-0116's clause stands until this one
-is Accepted. Everything else in ADR-0116 is unaffected either way, including the
+whose decision 2 says the pool "mints one per pod at creation". It cannot.
+Only the per-pod minting clause is replaced. Everything else in ADR-0116 is
+unaffected, including the
 half of decision 2 that moves session identity onto the ACI `Event` frame, and
 including the ordering that puts the token before decision 3's warm pool.
+
+## Acceptance and realization
+
+The maintainer explicitly approved acceptance on 2026-09-04. The realizing
+implementation and its live isolation proofs are tracked in
+[#1492](https://github.com/curie-eng/curie/issues/1492). Acceptance authorizes
+that work; it does not claim the mechanism is implemented or permit enabling
+warm replicas before adoption, bootstrap retirement, and conversation isolation
+are proven. The optional ACI session metadata prerequisite in
+[#2309](https://github.com/curie-eng/curie/pull/2309) does not implement those
+requirements.
 
 ## Context
 

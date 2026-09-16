@@ -1,0 +1,4 @@
+{
+  "comment": "Single source of truth for the approval-row miss detail duplicated across the API and the dispatcher. FastAPI's approvals router returns this exact string on GET, audit, and resolve when the row is absent from THIS release's database (apps/api/src/curie_api/routers/approvals.py). The dispatcher treats that detail, and only that detail, as a release-ownership miss rather than a deleted card or a proxy 404 (apps/dispatcher/src/curie_dispatcher/approval_actions.py). The two lanes cannot share code, so the literal is frozen here: changing one language without this file fails that language's test. Read by apps/api/tests/test_approvals.py::test_unknown_approval_uses_the_frozen_ownership_detail and by apps/dispatcher/tests/test_approval_actions.py::test_ownership_miss_detail_matches_the_frozen_vector. Both lanes reject unknown top-level keys so a key one lane cannot see cannot pass vacuously.",
+  "not_found_detail": "approval not found"
+}

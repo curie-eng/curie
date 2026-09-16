@@ -31,8 +31,9 @@ import contextlib
 import hmac
 import inspect
 import secrets
-from collections.abc import Awaitable, Callable
-from typing import cast
+from collections.abc import Awaitable, Callable, Mapping
+from types import MappingProxyType
+from typing import TypedDict, cast
 
 from aci_protocol import Event, Interrupt, parse_inbound
 from aiohttp import web
@@ -47,9 +48,9 @@ _TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
 _TURN_EPOCH_MIN_LENGTH = 32
 _TURN_EPOCH_MAX_LENGTH = 256
 
-# The six runner POST routes; gated when a token is configured.
-# /healthz and /status stay open so the chart readinessProbe (no auth header)
-# keeps working.
+# Authenticated control routes. /healthz and the probe-oriented /status stay
+# open so chart probes keep working; the worker reads replacement authority
+# from /v1/status with the per-claim bearer token.
 _GATED_PATHS = frozenset(
     {
         "/v1/event",
@@ -58,6 +59,7 @@ _GATED_PATHS = frozenset(
         "/v1/timeout",
         "/v1/reset",
         "/v1/snapshot",
+        "/v1/status",
     }
 )
 
@@ -65,10 +67,45 @@ _GATED_PATHS = frozenset(
 RUNNER: web.AppKey[SessionRunner] = web.AppKey("runner", SessionRunner)
 Snapshotter = Callable[[], WorkspaceSnapshot | Awaitable[WorkspaceSnapshot]]
 SNAPSHOTTER: web.AppKey[object] = web.AppKey("snapshotter", object)
+STATUS_ATTESTATION: web.AppKey[object] = web.AppKey("status_attestation", object)
+
+
+class _StatusAttestation(TypedDict):
+    session_id: str
+    sandbox_id: str
+    managed_workspace: bool
+    cwd: str | None
+
+
+_STATUS_ATTESTATION_ATTR = "_curie_control_status_attestation"
+
+
+def bind_status_attestation(
+    runner: SessionRunner,
+    *,
+    session_id: str,
+    sandbox_id: str,
+    cwd: str | None,
+) -> SessionRunner:
+    """Bind credential-free boot facts for the authenticated worker status."""
+
+    attestation: _StatusAttestation = {
+        "session_id": session_id,
+        "sandbox_id": sandbox_id,
+        "managed_workspace": cwd is not None,
+        "cwd": cwd,
+    }
+    setattr(runner, _STATUS_ATTESTATION_ATTR, MappingProxyType(attestation))
+    return runner
+
+
+def _bound_status_attestation(runner: SessionRunner) -> Mapping[str, object] | None:
+    value = getattr(runner, _STATUS_ATTESTATION_ATTR, None)
+    return cast("Mapping[str, object]", value) if isinstance(value, Mapping) else None
 
 
 def _auth_middleware(token: str) -> Middleware:
-    """Require ``Authorization: Bearer <token>`` on the gated ACI POST routes.
+    """Require ``Authorization: Bearer <token>`` on the gated control routes.
 
     Runs before body parsing so an authenticated call keeps the route's existing
     400/409 semantics unchanged. The presented token is compared with the
@@ -81,7 +118,7 @@ def _auth_middleware(token: str) -> Middleware:
 
     @web.middleware
     async def middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
-        if request.method == "POST" and request.path in _GATED_PATHS:
+        if request.path in _GATED_PATHS:
             header = request.headers.get("Authorization", "")
             scheme = "Bearer "
             if not header.startswith(scheme):
@@ -104,9 +141,9 @@ def create_app(
 ) -> web.Application:
     """Build the aiohttp application bound to a started SessionRunner.
 
-    When ``token`` is set, the six runner POST routes require a matching bearer
-    token; when it is ``None`` the app is a pass-through (CLI, fake-model CI, and
-    pre-token sandboxes stay unauthenticated).
+    When ``token`` is set, the runner control routes require a matching bearer
+    token; when it is ``None`` the app is a pass-through (CLI, fake-model CI,
+    and pre-token sandboxes stay unauthenticated).
     """
 
     # A falsy token (None or empty string) means no enforcement: an empty token
@@ -116,10 +153,14 @@ def create_app(
     app = web.Application(middlewares=middlewares)
     app[RUNNER] = runner
     app[SNAPSHOTTER] = snapshotter
+    # An identity-bearing response exists only when middleware above enforces a
+    # non-empty bearer. Legacy/tokenless apps keep both status routes probe-only.
+    app[STATUS_ATTESTATION] = _bound_status_attestation(runner) if token else None
     app.add_routes(
         [
             web.get("/healthz", _healthz),
             web.get("/status", _status),
+            web.get("/v1/status", _status),
             web.post("/v1/event", _event),
             web.post("/v1/steer", _steer),
             web.post("/v1/interrupt", _interrupt),
@@ -142,13 +183,17 @@ async def _healthz(_request: web.Request) -> web.Response:
 
 async def _status(request: web.Request) -> web.Response:
     runner: SessionRunner = request.app[RUNNER]
-    return web.json_response(
-        {
-            "status": runner.status.value,
-            "ready": runner.ready,
-            "turn_active": runner.turn_active,
-        }
-    )
+    body: dict[str, object] = {
+        "status": runner.status.value,
+        "ready": runner.ready,
+        "turn_active": runner.turn_active,
+        "history_durable": runner.history_durable,
+    }
+    if request.path == "/v1/status":
+        attestation = cast("Mapping[str, object] | None", request.app[STATUS_ATTESTATION])
+        if attestation is not None:
+            body.update(attestation)
+    return web.json_response(body)
 
 
 async def _snapshot(request: web.Request) -> web.Response:

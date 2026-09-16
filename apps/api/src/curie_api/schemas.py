@@ -34,6 +34,11 @@ from .config import get_settings
 from .hook_partition import HOOK_NAME, validate_pointer_syntax
 from .models import GIT_FLOW_CREATED_BY, Environment
 from .repo_full_name import RepoFullName
+from .source_binding import (
+    validate_revision,
+    validate_source_binding_keys,
+    validate_workload_key,
+)
 from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_name
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
@@ -624,6 +629,59 @@ def _validate_hook_partitions(
     return value
 
 
+class SourceBindingEntry(BaseModel):
+    """One workload's allowlisted repository and deployed revision (#2572)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repository: str
+    revision: str
+
+    @field_validator("repository")
+    @classmethod
+    def _check_repository(cls, value: str) -> str:
+        if not valid_repository_name(value):
+            raise ValueError("repository must be one canonical owner/repository name")
+        return value
+
+    @field_validator("revision")
+    @classmethod
+    def _check_revision(cls, value: str) -> str:
+        return validate_revision(value)
+
+
+class SourceBindingConfig(BaseModel):
+    """How one hook maps a workload identity onto a coding target (#2572)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    workload_pointer: str
+    map: dict[str, SourceBindingEntry]
+
+    @field_validator("workload_pointer")
+    @classmethod
+    def _check_pointer(cls, value: str) -> str:
+        return validate_pointer_syntax(value)
+
+    @field_validator("map")
+    @classmethod
+    def _check_map(cls, value: dict[str, SourceBindingEntry]) -> dict[str, SourceBindingEntry]:
+        if not value:
+            raise ValueError("source binding map must contain at least one workload")
+        for key in value:
+            validate_workload_key(key)
+        return value
+
+
+def _validate_source_bindings(
+    value: "dict[str, SourceBindingConfig] | None",
+) -> "dict[str, SourceBindingConfig] | None":
+    if value is None:
+        return value
+    validate_source_binding_keys(value)
+    return value
+
+
 def _validate_route_names(
     value: "dict[str, ApprovalRouteBinding] | None",
 ) -> "dict[str, ApprovalRouteBinding] | None":
@@ -1026,6 +1084,9 @@ class AgentCreate(BaseModel):
     # into the delivery body that names the thing each delivery is about. None
     # (the default) is the unpartitioned behavior: one thread per hook.
     hook_partitions: dict[str, HookPartitionConfig] | None = None
+    # Per-hook workload to repository mapping (#2572). None means no hook on
+    # this agent selects a coding target from a delivery.
+    source_bindings: dict[str, SourceBindingConfig] | None = None
     # Whether this agent's bindings share one workflow-state namespace (#1525
     # follow-up). False (the default) matches a single-binding agent's existing
     # behavior exactly, since there is nothing yet to share with.
@@ -1038,6 +1099,7 @@ class AgentCreate(BaseModel):
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
+    _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
 
 
@@ -1083,6 +1145,9 @@ class AgentUpdate(BaseModel):
     # there is no platform default for this field to be cleared back TO, so
     # reading None as "omitted" conflates nothing.
     hook_partitions: dict[str, HookPartitionConfig] | None = None
+    # New per-hook source mapping (#2572). Omitted leaves it unchanged; an
+    # explicit empty dict clears it.
+    source_bindings: dict[str, SourceBindingConfig] | None = None
     # Which repository's pushes deploy this agent (ADR-0091). PATCHable because
     # an agent created before its repo existed -- or, until migration 0018, the
     # SECOND agent of a repo, which the unique index forbade from carrying it --
@@ -1098,6 +1163,7 @@ class AgentUpdate(BaseModel):
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
+    _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
     _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
     # The update-only half: a withdrawn `channel` here is refused, while the
     # same key stays required on `AgentCreate`.
@@ -1125,6 +1191,7 @@ class AgentOut(BaseModel):
     # Which hooks fan out, and by what (ADR-0134). Null is the unpartitioned
     # posture and the value every pre-existing agent row carries.
     hook_partitions: dict[str, HookPartitionConfig] | None
+    source_bindings: dict[str, SourceBindingConfig] | None
     # Connector secret NAMES only (#429) -- values are never returned. The stored
     # column is a name->value map; expose just the sorted names so an operator can
     # see which secrets an agent has bound without the material leaving the API.
@@ -1337,9 +1404,9 @@ class DeploymentCreate(BaseModel):
     version_id: uuid.UUID
     environment: Environment
     commit_sha: str | None = None
-    # Three states are distinguished by ``model_fields_set`` in the router:
-    # omitted carries the last active deployment value, true enables runtime
-    # repository selection, and false disables it.
+    # Retained as a compatibility-only deployment field; it is not a runtime
+    # coding gate. The worker-wide workspace coordinator plus an allowed root
+    # GitHub URL determine whether claim-time repository acquisition occurs.
     workspace_enabled: bool | None = None
     status: str = "active"
 
@@ -1365,6 +1432,7 @@ class RepositoryCredentialOut(BaseModel):
     repo_full_name: str
     clone_url: str
     authorization_header: str
+    revision: str | None = None
 
 
 class WorkspaceSelectionRequest(BaseModel):
@@ -1383,7 +1451,8 @@ class WorkspaceSelectionRequest(BaseModel):
 
 
 class WorkspaceSelectionOut(BaseModel):
-    repo_full_name: str
+    repo_full_name: str | None
+    revision: str | None = None
 
 
 class WorkspaceCredentialRequest(BaseModel):
@@ -1395,6 +1464,7 @@ class PublicationCreate(BaseModel):
 
     deployment_id: uuid.UUID
     conversation_id: str = Field(min_length=1)
+    reply_conversation_id: str | None = Field(default=None, min_length=1)
     repo_full_name: str = Field(pattern=REPOSITORY_FULL_NAME_PATTERN)
     author: str = Field(min_length=1)
     summary: str = Field(min_length=1)
@@ -1404,6 +1474,8 @@ class PublicationCreate(BaseModel):
     reply_endpoint: str | None = None
     reply_adapter: str | None = None
     dedupe_key: str = Field(min_length=1)
+    review_origin_key: str | None = Field(default=None, min_length=1, max_length=180)
+    route: str | None = None
     base_sha: str
     patch_b64: str = Field(min_length=1)
     changed_paths: list[str] = Field(min_length=1, max_length=4096)
@@ -1467,6 +1539,92 @@ class PublicationCreate(BaseModel):
             raise ValueError("patch_b64 must be canonical base64") from exc
 
 
+class ReviewRevisionReserve(BaseModel):
+    repository_id: int = Field(gt=0, strict=True)
+    pr_number: int = Field(gt=0, strict=True)
+    expected_lineage_version: int = Field(ge=1, strict=True)
+    origin_key: str = Field(min_length=1, max_length=180)
+
+
+class ReviewRevisionOut(BaseModel):
+    revision_id: uuid.UUID
+    lineage_id: uuid.UUID
+    agent_id: uuid.UUID
+    conversation_id: str
+    reply_conversation_id: str
+    binding_id: uuid.UUID
+    binding_generation: int
+    repository_id: int
+    installation_id: int
+    pr_node_id: str
+    base_ref: str
+    repo_full_name: str
+    pr_number: int
+    branch: str
+    base_sha: str
+    expected_head_sha: str
+    lineage_version: int
+    revision_number: int
+    version: int
+    status: Literal["reserved", "consumed", "cancelled"]
+
+
+class ReviewRevisionCancel(BaseModel):
+    origin_key: str = Field(min_length=1, max_length=180)
+    expected_version: int = Field(ge=1, strict=True)
+
+
+class PublicationLineageAdvance(BaseModel):
+    """Exact compare-and-set facts for one publication revision outcome."""
+
+    expected_version: int = Field(ge=1)
+    expected_head_sha: str | None
+    state: Literal["open", "merged", "closed"] = "open"
+    pr_number: int = Field(gt=0)
+    pr_url: str = Field(min_length=1, max_length=2048)
+    head_sha: str
+
+    @field_validator("expected_head_sha", "head_sha")
+    @classmethod
+    def _full_commit_sha(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            raise ValueError("lineage head must be one full 40-character commit id")
+        return value.lower()
+
+
+class PublicationLineageOut(BaseModel):
+    """Credential-free pull-request lineage facts safe for the worker."""
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: uuid.UUID
+    deployment_id: uuid.UUID
+    conversation_id: str
+    repo_full_name: str
+    base_sha: str
+    branch: str
+    pr_number: int | None
+    pr_url: str | None
+    head_sha: str | None
+    state: Literal["open", "merged", "closed"] = Field(validation_alias="status")
+    version: int
+    latest_revision: int
+    # This is intentionally only a boolean. The worker needs to know whether a
+    # fenced replacement would race an unresolved revision, but must not learn
+    # that revision's identifier or private patch state.
+    has_pending_revision: bool = False
+    # True while a terminal publication outcome has not yet been acknowledged
+    # by the durable transcript outbox. No private patch or error text crosses
+    # this read seam.
+    has_pending_outcome: bool = False
+    # Monotonic within one lineage. The worker stores this on its route so a
+    # headless denial/failure causes exactly one cold history rehydrate even
+    # though the Git head itself did not move.
+    visible_outcome_revision: int = Field(default=0, ge=0)
+
+
 class PublicationOut(BaseModel):
     """Patch-free publication metadata safe for operator and worker reads."""
 
@@ -1475,6 +1633,16 @@ class PublicationOut(BaseModel):
     id: uuid.UUID
     approval_id: uuid.UUID
     deployment_id: uuid.UUID
+    lineage_id: uuid.UUID | None
+    revision_number: int | None
+    expected_prior_head: str | None
+    lineage_base_sha: str | None
+    lineage_head_sha: str | None
+    lineage_state: Literal["open", "merged", "closed"] | None
+    lineage_version: int | None
+    branch: str | None
+    pr_number: int | None
+    pr_url: str | None
     repo_full_name: str
     status: str
     version: int

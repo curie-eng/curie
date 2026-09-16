@@ -176,8 +176,8 @@ testpaths = [
     "compose/tests",
     "release/tests",
     "examples/tests",
-    # The four shipped SRE-bot connectors (tempo, k8s-write, k8s-scale,
-    # self-upgrade) are built by CI and published by release.yaml, but each
+    # The two source-built SRE-bot connectors (tempo and self-upgrade) are built
+    # by CI and published by release.yaml, but each
     # ships its own test_server.py outside every collection root above -- so
     # the only CI signal on the shipped images was "the Dockerfile builds"
     # (#2093).
@@ -189,16 +189,25 @@ testpaths = [
     "tools/e2e-ci-selection/tests",
     "tools/fix-pin-ci/tests",
     "tools/sdk-lock-gate/tests",
+    "tools/fix-pin-ci/tests",
+    "tools/close-on-next/tests",
     "tools/p0-closes-ci/tests",
     "tools/xdist-characterise/tests",
     "tools/ci-release-target-parity/tests",
     "tools/restore-drill/tests",
+    "tools/sre-contract/tests",
 ]
 
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-extend-exclude = ["prototypes"]
+# runner/tests/fixtures/repo_toolchain stands in for a FOREIGN repository that a
+# managed sandbox checks out. Its formatting, its pinned dependency and its
+# deliberately seeded defect belong to that repository's own fictional owner, so
+# holding it to this repository's lint rules would be wrong twice over: it would
+# make the stand-in unrepresentative, and ruff would "fix" the very defect the
+# red -> green -> red proof observes.
+extend-exclude = ["prototypes", "runner/tests/fixtures/repo_toolchain"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -210,6 +219,7 @@ select = ["E", "F", "I", "UP", "B"]
 # I001 included; only the frozen tests are exempt from import-block formatting.
 "tools/doclint/tests/**" = ["I001"]
 "tools/restore-drill/tests/**" = ["E402"]
+"tools/sre-contract/tests/**" = ["E402"]
 
 [tool.mypy]
 python_version = "3.13"

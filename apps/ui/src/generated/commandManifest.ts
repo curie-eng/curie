@@ -1046,7 +1046,7 @@ export const commandManifest = {
           "name": "status"
         },
         {
-          "about": "Connect or disconnect the local compose stack from a real Slack workspace",
+          "about": "Connect or disconnect the local compose stack from a real Slack workspace. Exactly one Curie release may connect to a given Slack app",
           "args": [
             {
               "global": false,
@@ -1499,7 +1499,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Let each new session select an allowed GitHub repository from the opening message and materialize it as managed /workspace",
+              "help": "Deprecated compatibility no-op: coding tools are built in, and an allowed root GitHub URL in the opening message drives managed /workspace acquisition",
               "id": "workspace",
               "long": "workspace",
               "positional": false,
@@ -1511,7 +1511,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Explicitly disable a previously configured managed workspace",
+              "help": "Deprecated compatibility no-op: coding tools are built in, and an allowed root GitHub URL in the opening message drives managed /workspace acquisition",
               "id": "no_workspace",
               "long": "no-workspace",
               "positional": false,
@@ -2647,6 +2647,18 @@ export const commandManifest = {
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Apply contract or irreversible schema migrations. Without this flag the upgrade Job refuses those migrations before mutation so a patch rollback window stays intact (#2300)",
+              "id": "forward_only",
+              "long": "forward-only",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
             }
           ],
           "hidden": false,
@@ -2788,6 +2800,89 @@ export const commandManifest = {
           "hidden": false,
           "long_about": "Roll the release back to the newest revision that is actually known good.\n\nA bare `helm rollback` targets the immediately preceding revision. On a cluster with no `runsc` RuntimeClass that is the wrong one: `cluster up` records a FAILED revision before its successful gVisor-off retry, so the history alternates failed/superseded and the preceding revision is a failed one -- a manifest helm never finished applying.\n\nThis verb skips every revision whose status is not `deployed` or `superseded` and rolls back to the newest one below the current revision that is, printing which revisions it passed over. See issue #1899.",
           "name": "rollback"
+        },
+        {
+          "about": "Run the resumable cluster upgrade lifecycle to a target version",
+          "args": [
+            {
+              "global": false,
+              "help": "Target Curie version (chart/app version) to upgrade to",
+              "id": "to",
+              "long": "to",
+              "positional": false,
+              "required": true
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm chart. An explicit path or ref overrides the default. Default: the version-pinned release asset for `--to` on release builds; local `charts/curie` on dev builds",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Skip the interactive confirmation prompt",
+              "id": "yes",
+              "long": "yes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the redacted upgrade plan and exit without mutating",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Apply contract or irreversible schema migrations. Without this flag the upgrade Job refuses those migrations before mutation so a patch rollback window stays intact (#2300)",
+              "id": "forward_only",
+              "long": "forward-only",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Run the resumable cluster upgrade lifecycle to a target version.\n\nPlans, validates, drains accepted work, checkpoints, migrates, applies, proves exact convergence, runs a target-version canary, and records the new known-good revision. The operator does not pass Helm merge flags. A failed attempt either leaves the previous known-good version serving or returns one fail-forward command. See issue #2301.",
+          "name": "upgrade"
         },
         {
           "about": "Carry bundle objects across a chart upgrade that renames the object store (issue #1324)",
@@ -3135,7 +3230,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "Connect or disconnect the cluster release from a real Slack workspace",
+          "about": "Connect or disconnect the cluster release from a real Slack workspace. Exactly one Curie release may connect to a given Slack app",
           "args": [
             {
               "global": false,
@@ -3845,7 +3940,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Let sessions on each deployment select an allowed GitHub repository from the opening message and materialize it as managed /workspace",
+              "help": "Deprecated compatibility no-op: coding tools are built in, and an allowed root GitHub URL in the opening message drives managed /workspace acquisition",
               "id": "workspace",
               "long": "workspace",
               "positional": false,
@@ -3857,7 +3952,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Explicitly disable a previously configured managed workspace",
+              "help": "Deprecated compatibility no-op: coding tools are built in, and an allowed root GitHub URL in the opening message drives managed /workspace acquisition",
               "id": "no_workspace",
               "long": "no-workspace",
               "positional": false,
@@ -4991,17 +5086,9 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
-                  "help": "Scope the approval-gated restart tool to these Deployments (`namespace/name`, comma separated). One list renders BOTH ceilings: the Role's resourceNames and the connector's K8S_WRITE_ALLOWLIST. Omit and the connector is still installed, gated, with an empty ceiling that refuses every call until targets are named",
-                  "id": "write_allowlist",
-                  "long": "write-allowlist",
-                  "positional": false,
-                  "required": false
-                },
-                {
-                  "global": false,
-                  "help": "Leave the gated write connector out of the install entirely",
-                  "id": "no_write",
-                  "long": "no-write",
+                  "help": "Install the upgrade path: the self-upgrade connector, the platform upgrade Job, and the two identities behind them",
+                  "id": "platform_upgrade",
+                  "long": "platform-upgrade",
                   "positional": false,
                   "possible_values": [
                     "true",
@@ -5040,6 +5127,14 @@ export const commandManifest = {
                   "help": "Kubernetes namespace of the retained observability stack. Default: observability",
                   "id": "observability_namespace",
                   "long": "observability-namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Allow this GitHub repository, or `owner/*`, for runtime workspace selection. Repeatable. Sets `api.githubRepoAllowlist` on the Curie install",
+                  "id": "workspace_repo",
+                  "long": "workspace-repo",
                   "positional": false,
                   "required": false
                 }
@@ -5381,6 +5476,16 @@ export const commandManifest = {
           "about": "Run the cold-start parity ladder across the skill, local, and cluster tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`)",
           "hidden": false,
           "name": "e2e-ladder"
+        },
+        {
+          "about": "Nightly SRE demo e2e: six assertions on kind with the pinned Kubernetes MCP server, a CI-only Socket Mode Slack app, a live provider, and an allowlisted throwaway repo (#2246, `bash cli/scripts/sre-demo-e2e.sh`). Missing those CI secrets skip with the reason in the run summary",
+          "hidden": false,
+          "name": "sre-demo-e2e"
+        },
+        {
+          "about": "Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`)",
+          "hidden": false,
+          "name": "two-release-approval-e2e"
         },
         {
           "about": "Select the end to end tiers CI would run for paths or revisions",

@@ -23,7 +23,7 @@ import stat
 import tarfile
 import threading
 import uuid
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,6 +58,7 @@ class _FakeCommands:
         self.events: list[str] = []
         self.available = True
         self.fail_stage: str | None = None
+        self.head_sha = "a" * 40
 
     def require(self, executable: str) -> None:
         self.calls.append({"require": executable})
@@ -97,6 +98,15 @@ class _FakeCommands:
             (checkout / "README.md").write_text("workspace ready\n")
             return _CommandResult()
 
+        if "fetch" in args:
+            self.events.append("fetch-exact")
+            return _CommandResult()
+
+        if "checkout" in args and "--detach" in args:
+            self.events.append("checkout-detached")
+            self.head_sha = args[-1]
+            return _CommandResult()
+
         if "remote" in args and "set-url" in args:
             self.events.append("set-url")
             assert cwd is not None
@@ -112,7 +122,7 @@ class _FakeCommands:
             return _CommandResult(stdout=f"{value}\n")
 
         if "rev-parse" in args:
-            return _CommandResult(stdout=f"{'a' * 40}\n")
+            return _CommandResult(stdout=f"{self.head_sha}\n")
 
         raise AssertionError(f"unexpected command: {args}")
 
@@ -267,7 +277,7 @@ def test_workspace_clone_strips_authenticated_remote_before_first_turn(
 
 
 def test_clone_credential_is_absent_from_argv_archive_config_and_claim_env(
-    workspace: Any, tmp_path: Path
+    workspace: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     preparer, commands, objects = _preparer(workspace, tmp_path)
     prepared = _prepare(preparer)
@@ -280,6 +290,8 @@ def test_clone_credential_is_absent_from_argv_archive_config_and_claim_env(
     assert b"redeemed-credential-value" not in payload
     assert b"redeemed-credential-value" not in config
     assert all("redeemed-credential-value" not in value for value in claim_env.values())
+    assert "redeemed-credential-value" not in "\n".join(commands.events)
+    assert "redeemed-credential-value" not in caplog.text
     assert set(claim_env) == {"CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256"}
 
 
@@ -303,6 +315,89 @@ def test_clone_is_private_full_blob_shallow_and_refuses_redirects(
     assert "http.followRedirects=false" in config_entries
     assert GIT_CREDENTIAL in config_entries
     assert stat.S_IMODE(prepared.checkout_mode) == 0o700
+
+
+def test_lineage_prepare_clones_the_stored_branch_at_the_exact_expected_head(
+    workspace: Any, tmp_path: Path
+) -> None:
+    """A revision starts from the PR head, not the repository default branch."""
+
+    expected_head = "a" * 40
+    branch = "curie/thread-lineage-example"
+    preparer, commands, objects = _preparer(workspace, tmp_path)
+
+    prepared = preparer.prepare_lineage(
+        deployment_id=DEPLOYMENT_ID,
+        thread_key="1700000000.000100",
+        generation="lineage-claim-2",
+        branch=branch,
+        expected_head=expected_head,
+    )
+
+    clone_call = next(call for call in commands.calls if "clone" in call.get("argv", []))
+    assert clone_call["argv"][:2] == ["git", "clone"]
+    assert "--depth=1" in clone_call["argv"]
+    assert "--single-branch" in clone_call["argv"]
+    assert clone_call["argv"][clone_call["argv"].index("--branch") + 1] == branch
+    assert prepared.materialized_head == expected_head
+    assert objects.objects[prepared.object_key]
+    assert GIT_CREDENTIAL.encode() not in objects.objects[prepared.object_key]
+
+
+def test_lineage_prepare_refuses_a_checkout_head_mismatch_before_upload(
+    workspace: Any, tmp_path: Path
+) -> None:
+    commands = _FakeCommands()
+    commands.head_sha = "b" * 40
+    preparer, _, objects = _preparer(workspace, tmp_path, commands=commands)
+
+    with pytest.raises(workspace.WorkspacePreparationError, match="expected lineage head"):
+        preparer.prepare_lineage(
+            deployment_id=DEPLOYMENT_ID,
+            thread_key="1700000000.000100",
+            generation="lineage-claim-stale",
+            branch="curie/thread-lineage-example",
+            expected_head="a" * 40,
+        )
+
+    assert objects.objects == {}
+
+
+def test_headless_lineage_prepare_fetches_exact_base_not_advanced_default(
+    workspace: Any, tmp_path: Path
+) -> None:
+    """A denied first revision rehydrates at its proposal base without a PR branch."""
+
+    expected_base = "a" * 40
+    commands = _FakeCommands()
+    commands.head_sha = "d" * 40
+    preparer, _, objects = _preparer(workspace, tmp_path, commands=commands)
+
+    prepared = preparer.prepare_lineage_base(
+        deployment_id=DEPLOYMENT_ID,
+        thread_key="1700000000.000100",
+        generation="headless-lineage-outcome-1",
+        expected_base=expected_base,
+    )
+
+    clone_call = next(call for call in commands.calls if "clone" in call.get("argv", []))
+    fetch_call = next(call for call in commands.calls if "fetch" in call.get("argv", []))
+    checkout_call = next(call for call in commands.calls if "checkout" in call.get("argv", []))
+    assert "--branch" not in clone_call["argv"]
+    assert fetch_call["argv"] == [
+        "git",
+        "fetch",
+        "--depth=1",
+        "--no-tags",
+        "origin",
+        expected_base,
+    ]
+    assert checkout_call["argv"] == ["git", "checkout", "--detach", expected_base]
+    assert GIT_CREDENTIAL in fetch_call["env"]["GIT_CONFIG_VALUE_1"]
+    assert GIT_CREDENTIAL not in " ".join(fetch_call["argv"])
+    assert prepared.base_sha == expected_base
+    assert prepared.materialized_head == expected_base
+    assert objects.objects[prepared.object_key]
 
 
 def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
@@ -357,11 +452,39 @@ def test_runtime_repo_parser_accepts_one_root_url_and_rejects_ambiguous(
         "Keep working in this thread; the repository is already selected."
     ) is None
 
-    with pytest.raises(workspace.WorkspaceSelectionRefused, match="only one"):
+    with pytest.raises(
+        workspace.WorkspaceSelectionRefused, match="only one"
+    ) as excinfo:
         workspace.parse_github_repo_fact(
             "Compare https://github.com/acme-corp/acme-bot with "
             "https://github.com/acme-corp/acme-api before changing anything."
         )
+    # #2659: the refusal states the reason instead of asking for a rephrase.
+    assert excinfo.value.public_detail == (
+        "This message names more than one GitHub repository, so no repository "
+        "was attached and no work started. A thread works in only one repository."
+    )
+
+
+def test_webhook_payload_urls_are_not_repository_facts(workspace: Any) -> None:
+    """#2572: a job payload cannot select a coding target by naming a GitHub URL."""
+
+    payload = (
+        "Inbound hook `alertmanager` fired.\n\n"
+        "Coding is stopped: no authorized mapping.\n\n"
+        "<untrusted-hook-payload>\n"
+        "https://github.com/evil-corp/evil\n"
+        "</untrusted-hook-payload>"
+    )
+    assert workspace.trusted_repository_fact(payload, ignore_message=True) is None
+    assert workspace.trusted_repository_fact(
+        "Please update https://github.com/acme-corp/acme-bot",
+        ignore_message=False,
+    ) == "acme-corp/acme-bot"
+    assert workspace.webhook_job_refuses_workspace(payload) is True
+    assert workspace.webhook_job_refuses_workspace(
+        "This delivery has an authorized source mapping: repository acme-corp/acme-bot"
+    ) is False
 
 
 def test_runtime_repo_parser_deduplicates_repeated_repository_facts(
@@ -397,6 +520,96 @@ def test_runtime_repo_parser_rejects_non_root_or_credentialed_urls(
     assert workspace.parse_github_repo_fact(message) is None
 
 
+def test_runtime_repo_parser_accepts_a_bare_owner_repo(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Please update acme-corp/acme-bot and add a test."
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_deduplicates_bare_and_url_for_the_same_repo(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Update acme-corp/acme-bot and keep https://github.com/acme-corp/acme-bot current."
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_rejects_two_different_bare_names(workspace: Any) -> None:
+    with pytest.raises(
+        workspace.WorkspaceSelectionRefused, match="only one"
+    ) as excinfo:
+        workspace.parse_github_repo_fact(
+            "Compare acme-corp/acme-bot with acme-corp/acme-api before changing anything."
+        )
+    assert excinfo.value.public_detail == (
+        "This message names more than one GitHub repository, so no repository "
+        "was attached and no work started. A thread works in only one repository."
+    )
+
+
+def test_runtime_repo_parser_still_rejects_a_pull_request_url(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "https://github.com/acme-corp/acme-bot/pull/1"
+    ) is None
+
+
+def test_runtime_repo_parser_ignores_nested_source_paths(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Look at apps/worker/src/curie_worker/workspace.py"
+    ) is None
+
+
+def test_runtime_repo_parser_ignores_english_slash_pairs(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Use retries and/or a fallback when the clone fails."
+    ) is None
+
+
+def test_runtime_repo_parser_accepts_wrapped_bare_owner_repo(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Please update <acme-corp/acme-bot> and add a test."
+    ) == "acme-corp/acme-bot"
+    assert workspace.parse_github_repo_fact(
+        "Please update `acme-corp/acme-bot` and add a test."
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_keeps_a_bare_repo_when_a_two_segment_file_path_is_also_present(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Update acme-corp/acme-bot in src/main.py"
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_accepts_a_dotted_repository_name(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Update acme-corp/acme.bot"
+    ) == "acme-corp/acme.bot"
+
+
+def test_runtime_repo_parser_keeps_a_bare_repo_when_an_extensionless_file_path_is_also_present(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Update acme-corp/acme-bot in docs/README"
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_ignores_a_two_segment_markdown_path(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact("Read docs/agents.md") is None
+
+
+def test_runtime_repo_parser_keeps_a_url_when_a_two_segment_file_path_is_also_present(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Please update https://github.com/acme-corp/acme-bot in src/main.py"
+    ) == "acme-corp/acme-bot"
+
+
 def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
     workspace: Any,
 ) -> None:
@@ -429,6 +642,84 @@ def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
         "author": "U0REQUEST1",
         "repo_full_name": "acme-corp/acme-bot",
     }
+
+
+def test_unallowlisted_selection_names_the_chart_allowlist(
+    workspace: Any,
+) -> None:
+    """A 403 must name api.githubRepoAllowlist, not the GitHub App install."""
+
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(status=403, headers={}, body=b"")
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    with pytest.raises(workspace.WorkspaceSelectionRefused) as excinfo:
+        client.select(
+            DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", "attacker/other-bot"
+        )
+
+    assert excinfo.value.public_detail == (
+        "That repository is not in api.githubRepoAllowlist for this installation; "
+        "allow `owner/repo` or `owner/*` in the chart values."
+    )
+    assert "not authorized for this installation" not in excinfo.value.public_detail
+
+
+def test_internal_workspace_selection_accepts_explicit_unselected_response(
+    workspace: Any,
+) -> None:
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=200,
+            headers={},
+            body=b'{"repo_full_name":null}',
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    assert client.select(DEPLOYMENT_ID, "thread-generic", "U0REQUEST1", None) is None
+
+
+def test_workspace_coordinator_propagates_absent_repository_selection(
+    workspace: Any,
+) -> None:
+    """The kernel-facing coordinator preserves the API's nullable result."""
+
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=200,
+            headers={},
+            body=b'{"repo_full_name":null}',
+        )
+
+    credentials = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=SimpleNamespace(credentials=credentials),
+        substrate=_RecordingSubstrate(),
+    )
+
+    assert (
+        coordinator.select_repository(
+            thread_key="1700000000.000100",
+            deployment_id=DEPLOYMENT_ID,
+            author="U0REQUEST1",
+            repo_full_name=None,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -699,6 +990,7 @@ def test_workspace_archive_member_and_compression_caps_are_enforced_before_init(
 class _RecordingSubstrate:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, str]]] = []
+        self.handoff_calls: list[dict[str, Any]] = []
 
     def claim(
         self, thread_key: str, *, env: dict[str, str] | None = None, **_: object
@@ -711,6 +1003,37 @@ class _RecordingSubstrate:
     ) -> object:
         self.calls.append(("resume", thread_key, dict(env or {})))
         return object()
+
+    def handoff(
+        self,
+        thread_key: str,
+        *,
+        expected: object,
+        env: dict[str, str] | None = None,
+        workspace_repo: str,
+        workspace_materialized_head: str | None = None,
+        publication_visible_outcome_revision: int = 0,
+        agent_name: str | None = None,
+        validate_candidate: Callable[[object], None] | None = None,
+    ) -> object:
+        payload = dict(env or {})
+        candidate = object()
+        self.calls.append(("handoff", thread_key, payload))
+        self.handoff_calls.append(
+            {
+                "thread_key": thread_key,
+                "expected": expected,
+                "env": payload,
+                "workspace_repo": workspace_repo,
+                "workspace_materialized_head": workspace_materialized_head,
+                "publication_visible_outcome_revision": publication_visible_outcome_revision,
+                "agent_name": agent_name,
+                "candidate": candidate,
+            }
+        )
+        if validate_candidate is not None:
+            validate_candidate(candidate)
+        return candidate
 
 
 def test_workspace_ownership_is_durable_before_the_sandbox_claim_is_exposed(
@@ -823,6 +1146,362 @@ def test_workspace_claim_or_resume_failure_restores_prior_durable_ownership(
     deleted_workspace_keys = [key for key in objects.deleted if not key.startswith("_ownership/")]
     assert len(deleted_workspace_keys) == 1
     assert previous.object_key not in objects.deleted
+
+
+def test_late_handoff_uses_substrate_handoff_and_keeps_credentials_out_of_claim_env(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, commands, _objects = _preparer(workspace, tmp_path)
+    ordering: list[str] = []
+    real_verify = preparer.verify
+
+    def verify(prepared: Any) -> None:
+        real_verify(prepared)
+        ordering.append("verified")
+
+    preparer.verify = verify
+
+    class OrderingSubstrate(_RecordingSubstrate):
+        def handoff(self, *args: Any, **kwargs: Any) -> object:
+            ordering.append("handoff")
+            return super().handoff(*args, **kwargs)
+
+    substrate = OrderingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    old_handle = object()
+
+    result = coordinator.claim_or_resume_with_handle(
+        thread_key="1700000000.000100",
+        deployment_id=DEPLOYMENT_ID,
+        env={
+            "CURIE_RUNNER_TOKEN": "workspace-test-token",
+            "CURIE_SESSION_ID": "logical-session",
+            "CURIE_HISTORY_REF": "https://api.example.com/state/transcript/thread-1",
+        },
+        agent_name="acme-bot",
+        repo_full_name="acme-corp/acme-bot",
+        replace_handle=old_handle,
+        publication_visible_outcome_revision=2,
+        revalidate_before_handoff=lambda: ordering.append("revalidated"),
+    )
+
+    assert ordering == ["verified", "revalidated", "handoff"]
+    assert substrate.calls[0][0] == "handoff"
+    assert [kind for kind, _thread, _env in substrate.calls] == ["handoff"]
+    handoff = substrate.handoff_calls[0]
+    assert handoff["expected"] is old_handle
+    assert handoff["workspace_repo"] == "acme-corp/acme-bot"
+    assert handoff["workspace_materialized_head"] == result.prepared.materialized_head
+    assert handoff["publication_visible_outcome_revision"] == 2
+    assert handoff["agent_name"] == "acme-bot"
+    workspace_env = result.prepared.claim_env()
+    assert handoff["env"]["CURIE_WORKSPACE_REF"] == workspace_env["CURIE_WORKSPACE_REF"]
+    assert handoff["env"]["CURIE_WORKSPACE_SHA256"] == workspace_env["CURIE_WORKSPACE_SHA256"]
+    assert handoff["env"]["CURIE_RUNNER_TOKEN"] == "workspace-test-token"
+    assert handoff["env"]["CURIE_SESSION_ID"] == "logical-session"
+    assert handoff["env"]["CURIE_HISTORY_REF"] == (
+        "https://api.example.com/state/transcript/thread-1"
+    )
+    assert {
+        "CURIE_INTERNAL_WORKER_TOKEN",
+        "CURIE_API_KEY",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "GITHUB_TOKEN",
+    }.isdisjoint(handoff["env"])
+    assert GIT_CREDENTIAL not in json.dumps(handoff["env"])
+    assert "redeemed-credential-value" not in json.dumps(handoff["env"])
+    assert not any(
+        marker in f"{name}={value}".upper()
+        for name, value in handoff["env"].items()
+        for marker in ("AUTHORIZATION", "PASSWORD", "SECRET")
+        if name != "CURIE_RUNNER_TOKEN"
+    )
+
+
+def test_headless_lineage_claim_owns_original_base_for_later_publication(
+    workspace: Any, tmp_path: Path
+) -> None:
+    expected_base = "a" * 40
+    commands = _FakeCommands()
+    commands.head_sha = "d" * 40
+    preparer, _, _objects = _preparer(workspace, tmp_path, commands=commands)
+    observed: list[dict[str, object]] = []
+
+    class Substrate(_RecordingSubstrate):
+        def claim(self, thread_key: str, **kwargs: object) -> object:
+            observed.append({"thread_key": thread_key, **kwargs})
+            return super().claim(thread_key, **kwargs)
+
+    substrate = Substrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+    )
+
+    result = coordinator.claim_or_resume_with_handle(
+        thread_key="1700000000.000100",
+        deployment_id=DEPLOYMENT_ID,
+        repo_full_name="acme-corp/acme-bot",
+        lineage_base_sha=expected_base,
+        publication_visible_outcome_revision=1,
+    )
+
+    assert result.prepared.base_sha == expected_base
+    assert result.prepared.materialized_head == expected_base
+    assert coordinator.current("1700000000.000100") == result.prepared
+    assert observed[0]["workspace_materialized_head"] == expected_base
+    assert observed[0]["publication_visible_outcome_revision"] == 1
+    assert "clone" in commands.events
+
+
+def test_late_handoff_revalidation_refusal_restores_ownership_and_old_route(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+    old_route = object()
+    ordering: list[str] = []
+
+    class RouteSubstrate(_RecordingSubstrate):
+        current_route = old_route
+
+        def handoff(self, *args: Any, **kwargs: Any) -> object:
+            ordering.append("handoff")
+            self.current_route = object()
+            return super().handoff(*args, **kwargs)
+
+    substrate = RouteSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    previous = coordinator.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+    substrate.calls.clear()
+    substrate.handoff_calls.clear()
+
+    real_verify = preparer.verify
+
+    def verify(prepared: Any) -> None:
+        real_verify(prepared)
+        ordering.append("verified")
+
+    preparer.verify = verify
+
+    def refuse_revalidation() -> None:
+        staged = coordinator.current(thread_key)
+        assert staged is not None and staged != previous
+        ordering.append("revalidated-refused")
+        raise RuntimeError("workspace handoff boundary changed")
+
+    with pytest.raises(RuntimeError, match="handoff boundary changed"):
+        coordinator.claim_or_resume_with_handle(
+            thread_key=thread_key,
+            deployment_id=DEPLOYMENT_ID,
+            repo_full_name="acme-corp/acme-bot",
+            replace_handle=old_route,
+            revalidate_before_handoff=refuse_revalidation,
+        )
+
+    assert ordering == ["verified", "revalidated-refused"]
+    assert substrate.handoff_calls == []
+    assert substrate.current_route is old_route
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1001.0,
+    )
+    assert restarted.current(thread_key) == previous
+    assert previous.object_key in objects.objects
+    archive_keys = [key for key in objects.objects if not key.startswith("_ownership/")]
+    assert archive_keys == [previous.object_key]
+    assert any(
+        key != previous.object_key and not key.startswith("_ownership/")
+        for key in objects.deleted
+    )
+
+
+def test_late_handoff_candidate_refusal_restores_prior_durable_ownership(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+    old_route = object()
+    ordering: list[str] = []
+    observed_candidates: list[object] = []
+
+    class CandidateSubstrate(_RecordingSubstrate):
+        current_route = old_route
+
+        def handoff(self, *args: Any, **kwargs: Any) -> object:
+            candidate = super().handoff(*args, **kwargs)
+            self.current_route = candidate
+            return candidate
+
+    substrate = CandidateSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    previous = coordinator.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+    substrate.calls.clear()
+    substrate.handoff_calls.clear()
+
+    real_verify = preparer.verify
+
+    def verify(prepared: Any) -> None:
+        real_verify(prepared)
+        ordering.append("verified")
+
+    preparer.verify = verify
+
+    def refuse_candidate(candidate: object) -> None:
+        staged = coordinator.current(thread_key)
+        assert staged is not None and staged != previous
+        observed_candidates.append(candidate)
+        ordering.append("candidate-refused")
+        raise RuntimeError("candidate runner attestation mismatch")
+
+    with pytest.raises(RuntimeError, match="candidate runner attestation mismatch"):
+        coordinator.claim_or_resume_with_handle(
+            thread_key=thread_key,
+            deployment_id=DEPLOYMENT_ID,
+            repo_full_name="acme-corp/acme-bot",
+            replace_handle=old_route,
+            revalidate_before_handoff=lambda: ordering.append("old-revalidated"),
+            validate_candidate=refuse_candidate,
+        )
+
+    assert ordering == ["verified", "old-revalidated", "candidate-refused"]
+    assert len(substrate.handoff_calls) == 1
+    assert observed_candidates == [substrate.handoff_calls[0]["candidate"]]
+    assert substrate.current_route is old_route
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1001.0,
+    )
+    assert restarted.current(thread_key) == previous
+    assert previous.object_key in objects.objects
+    archive_keys = [key for key in objects.objects if not key.startswith("_ownership/")]
+    assert archive_keys == [previous.object_key]
+    assert any(
+        key != previous.object_key and not key.startswith("_ownership/")
+        for key in objects.deleted
+    )
+
+
+def test_late_handoff_without_a_selected_repository_never_touches_the_substrate(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, _objects = _preparer(workspace, tmp_path)
+    substrate = _RecordingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+
+    with pytest.raises(
+        workspace.WorkspacePreparationError,
+        match="late workspace handoff requires a selected repository",
+    ):
+        coordinator.claim_or_resume_with_handle(
+            thread_key="1700000000.000100",
+            deployment_id=DEPLOYMENT_ID,
+            repo_full_name=None,
+            replace_handle=object(),
+        )
+
+    assert substrate.calls == []
+    assert substrate.handoff_calls == []
+
+
+def test_late_handoff_fence_loss_restores_prior_durable_ownership(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+
+    class LosingSubstrate(_RecordingSubstrate):
+        def handoff(
+            self,
+            thread_key: str,
+            *,
+            expected: object,
+            env: dict[str, str] | None = None,
+            workspace_repo: str,
+            workspace_materialized_head: str | None = None,
+            publication_visible_outcome_revision: int = 0,
+            agent_name: str | None = None,
+            validate_candidate: Callable[[object], None] | None = None,
+        ) -> object:
+            del (
+                expected,
+                env,
+                workspace_repo,
+                workspace_materialized_head,
+                publication_visible_outcome_revision,
+                agent_name,
+                validate_candidate,
+            )
+            self.calls.append(("handoff", thread_key, {}))
+            raise RuntimeError("late workspace handoff lost its route fence")
+
+    substrate = LosingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    previous = coordinator.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+
+    with pytest.raises(RuntimeError, match="lost its route fence"):
+        coordinator.claim_or_resume_with_handle(
+            thread_key=thread_key,
+            deployment_id=DEPLOYMENT_ID,
+            repo_full_name="acme-corp/acme-bot",
+            replace_handle=object(),
+        )
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1001.0,
+    )
+    assert restarted.current(thread_key) == previous
+    assert previous.object_key in objects.objects
+    deleted_workspace_keys = [
+        key for key in objects.deleted if not key.startswith("_ownership/")
+    ]
+    assert previous.object_key not in deleted_workspace_keys
 
 
 def test_fresh_claim_and_resume_each_prepare_a_new_workspace_and_reap_the_old_object(
@@ -1075,13 +1754,25 @@ def test_workspace_claim_env_never_carries_worker_auth_object_store_or_git_crede
     workspace: Any, tmp_path: Path
 ) -> None:
     preparer, _, _ = _preparer(workspace, tmp_path)
-    prepared = _prepare(preparer)
-    env = {
-        **prepared.claim_env(),
-        "CURIE_BUNDLE_REF": "bundles/first",
-    }
+    substrate = _RecordingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+    )
+    result = coordinator.claim_or_resume_with_handle(
+        thread_key="1700000000.000100",
+        deployment_id=DEPLOYMENT_ID,
+        env={
+            "CURIE_BUNDLE_REF": "bundles/first",
+            "CURIE_SESSION_ID": "logical-session",
+            "CURIE_HISTORY_REF": "https://api.example.com/state/transcript/thread-1",
+        },
+        repo_full_name="acme-corp/acme-bot",
+    )
+    env = substrate.calls[0][2]
     forbidden = {
         "CURIE_INTERNAL_WORKER_TOKEN",
+        "CURIE_API_KEY",
         "S3_ACCESS_KEY",
         "S3_SECRET_KEY",
         "AWS_ACCESS_KEY_ID",
@@ -1092,6 +1783,14 @@ def test_workspace_claim_env_never_carries_worker_auth_object_store_or_git_crede
     assert forbidden.isdisjoint(env)
     assert WORKER_AUTH not in env.values()
     assert GIT_CREDENTIAL not in env.values()
+    assert env["CURIE_SESSION_ID"] == "logical-session"
+    assert env["CURIE_HISTORY_REF"] == (
+        "https://api.example.com/state/transcript/thread-1"
+    )
+    assert env["CURIE_WORKSPACE_REF"] == result.prepared.claim_env()[
+        "CURIE_WORKSPACE_REF"
+    ]
+    assert env["CURIE_WORKSPACE_SHA256"] == result.prepared.sha256
 
 
 def test_two_clone_slots_bound_concurrency_and_a_third_waits(workspace: Any) -> None:

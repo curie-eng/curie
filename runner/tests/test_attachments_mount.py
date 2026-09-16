@@ -348,7 +348,7 @@ def _serve_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             memory_store=object(),  # type: ignore[arg-type]
             memory_preamble=None,
             history_store=object(),  # type: ignore[arg-type]
-            conversation_preamble=None,
+            conversation_replay=boot.ConversationReplay(),
             mcp_capability=None,
         )
 

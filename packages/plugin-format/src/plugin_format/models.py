@@ -120,6 +120,9 @@ class ApprovalGate(BaseModel):
     ``grantableViaPolicy`` is the operator opt-in (#558): when true, a policy-gate
     approval on this gate's route MAY mint a one-shot grant for the manifest tool
     ``gate`` names; default false preserves #544's policy-never-grants behavior.
+    ``summary`` is an optional bundle-authored sentence template (#2565) rendered
+    from the blocked call's arguments onto the approval card and notice. Absent,
+    the platform keeps the machine ``summarize_tool_call`` string.
     """
 
     model_config = _LENIENT
@@ -127,6 +130,7 @@ class ApprovalGate(BaseModel):
     gate: str
     route: str
     grantableViaPolicy: bool = False
+    summary: str | None = None
 
 
 class ApprovalPolicy(BaseModel):
@@ -184,13 +188,24 @@ class SkillFrontmatter(BaseModel):
     ``name`` and ``description`` are required. The tool restriction field is the
     verbatim Claude Code key ``allowed-tools`` (see the package README Decisions
     for why this differs from the task's shorthand "tools").
+
+    ``allowed-tools`` accepts BOTH authored shapes, because both occur in real
+    bundles: the space- or comma-separated string the Agent Skills specification
+    calls canonical, and the YAML list Claude Code equally accepts. The model
+    preserves whichever the author wrote and deliberately does NOT normalize --
+    there is exactly one normalization boundary, ``plugin_format
+    .parse_allowed_tools``, and every consumer must read the field through it
+    rather than raw. A second reader is how the #1852 gate-shadow fail-open
+    returns: ``runner/src/curie_runner/approval.py`` parses the frontmatter YAML
+    itself and never builds a ``SkillFrontmatter``, so a normalization living in
+    the model would be one the boot check never sees.
     """
 
     model_config = _LENIENT
 
     name: str
     description: str
-    allowed_tools: list[str] | None = Field(default=None, alias="allowed-tools")
+    allowed_tools: str | list[str] | None = Field(default=None, alias="allowed-tools")
 
 
 class HookDefinition(BaseModel):

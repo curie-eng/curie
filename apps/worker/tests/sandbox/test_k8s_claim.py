@@ -107,6 +107,33 @@ def test_bundle_ref_targets_init_containers_by_name() -> None:
         assert named[(container, "CURIE_BUNDLE_REF")] == "bundles/x.tar.gz"
 
 
+def test_bundle_version_reaches_the_runner_not_the_init_containers() -> None:
+    """#2174: the agent-readable version is runner env, not an object-store key.
+
+    Init containers still receive only CURIE_BUNDLE_REF (the fetch key). The
+    version_label is an unnamed main-container entry so the sandboxed agent
+    can read it, matching the docker substrate's forward of the same key.
+    """
+
+    api = _FakeApi()
+    _client(api).create_claim(
+        "claim-1",
+        pool="pool",
+        env={
+            "CURIE_BUNDLE_REF": "bundles/x.tar.gz",
+            "CURIE_BUNDLE_VERSION": "abc123def456",
+            "CURIE_BUDGET": "{}",
+        },
+    )
+    entries = _env_entries(api)
+
+    assert {"name": "CURIE_BUNDLE_VERSION", "value": "abc123def456"} in entries
+    named = {
+        (e["containerName"], e["name"]): e["value"] for e in entries if "containerName" in e
+    }
+    assert all(key[1] != "CURIE_BUNDLE_VERSION" for key in named)
+
+
 def test_no_named_env_without_bundle_ref() -> None:
     api = _FakeApi()
     _client(api).create_claim(

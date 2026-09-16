@@ -58,6 +58,12 @@ def derive(api_key: str, *, agent_id: str, generation: int) -> str:
     return _signature(api_key, f"{_LABEL}:{agent_id}:{generation}")
 
 
+def sign(secret: str, body: bytes) -> str:
+    """The ``sha256=`` header value for ``body`` under ``secret``."""
+
+    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
 def verify(secret: str, body: bytes, header: str | None) -> bool:
     """Constant-time check of the upstream's signature over the RAW body.
 
@@ -82,5 +88,4 @@ def verify(secret: str, body: bytes, header: str | None) -> bool:
 
     if not header or not header.startswith("sha256="):
         return False
-    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header)
+    return hmac.compare_digest(sign(secret, body), header)

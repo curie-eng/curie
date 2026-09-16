@@ -237,7 +237,7 @@ render() {
   shift
   local out="$TMP/render-$label"
   mkdir -p "$out"
-  helm template "$RELEASE" "$CHART" --output-dir "$out" "$@" >/dev/null \
+  helm template "$RELEASE" "$CHART" --namespace default --output-dir "$out" "$@" >/dev/null \
     || fail "$label: helm template exited non-zero (see the error above)"
   echo "$out"
 }

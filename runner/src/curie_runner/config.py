@@ -83,9 +83,9 @@ class RunnerConfig:
     false_completion_check: bool
     port: int
     runner_token: str | None
-    # Operator bounds on the rehydrated history preamble, reachable through the
-    # chart's runner.extraEnv. None hands the consumer its own default, so the
-    # defaults live at the call site rather than here.
+    # Operator bounds on the rehydrated structured history, reachable through
+    # the chart's runner.extraEnv. None hands the consumer its own default, so
+    # the defaults live at the call site rather than here.
     history_max_turns: int | None
     history_max_bytes: int | None
     # Runner-local deny list (#2429): comma-separated tool names handed to
@@ -111,7 +111,7 @@ class RunnerConfig:
         var raises there. ``history_ref`` is read only from an explicit
         ``CURIE_HISTORY_REF``, the URL of this thread's transcript namespace on
         the state API (ADR-0029, resolved by ``history.py`` into a
-        ``TranscriptStore`` and delivered as a boot preamble). It is deliberately
+        ``TranscriptStore`` and delivered as ordered harness messages). It is deliberately
         NOT derived from ``CURIE_MEMORY_REF``: memory is per-agent durable
         lessons, history is this thread's conversation (ADR-0025 keeps them
         distinct). Both live outside the sandbox and are rehydrated at boot

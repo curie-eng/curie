@@ -6,6 +6,7 @@
 //! (or the `--dry-run` printer) consumes it, so argv construction stays
 //! unit-testable with no Docker daemon.
 
+use std::future::Future;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -393,8 +394,8 @@ pub struct SourceImage {
 /// profiles alone left the main dev-loop verb still failing with
 /// `No module named curie_dispatcher.enqueue_once` -- observed, not theorised.
 ///
-/// `curie-api` covers `curie-migrate` too: same image, and it is what applies
-/// the migrations, which is how a stale one leaves the database behind the tree.
+/// `curie-api` covers `curie-migrate` too: same image, and that one-shot is the
+/// compose upgrade phase (`python -m curie_api.schema_compat upgrade`, #2300).
 pub fn source_images(o: &LocalOpts) -> Vec<SourceImage> {
     source_images_for(o.minimal)
 }
@@ -515,13 +516,36 @@ fn image_present_command(image: &str) -> OpsCommand {
     )
 }
 
+async fn image_present_with<F, Fut>(image: &str, capture: &mut F) -> bool
+where
+    F: FnMut(OpsCommand) -> Fut,
+    Fut: Future<Output = Result<(bool, String, String)>>,
+{
+    matches!(capture(image_present_command(image)).await, Ok((true, ..)))
+}
+
 /// Whether `image` exists in the local daemon. Best-effort: an unreadable
 /// daemon reads as absent, which leaves compose's own default in force.
 pub async fn image_present(image: &str) -> bool {
-    matches!(
-        run_capture(&image_present_command(image)).await,
-        Ok((true, ..))
-    )
+    let mut capture = |command: OpsCommand| async move { run_capture(&command).await };
+    image_present_with(image, &mut capture).await
+}
+
+async fn running_stack_tag_with<F, Fut>(capture: &mut F) -> Option<String>
+where
+    F: FnMut(OpsCommand) -> Fut,
+    Fut: Future<Output = Result<(bool, String, String)>>,
+{
+    let (ok, stdout, _) = capture(api_ps_command()).await.ok()?;
+    if !ok {
+        return None;
+    }
+    let container = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let (ok, image, _) = capture(container_image_command(container)).await.ok()?;
+    if !ok {
+        return None;
+    }
+    image_tag(image.trim()).map(str::to_string)
 }
 
 /// The image tag the RUNNING local stack was created with, or None when nothing
@@ -536,18 +560,27 @@ pub async fn image_present(image: &str) -> bool {
 /// Best-effort throughout: any unreadable step returns None and compose's
 /// defaults stand, which is the behaviour that existed before #1915.
 pub async fn running_stack_tag() -> Option<String> {
-    let (ok, stdout, _) = run_capture(&api_ps_command()).await.ok()?;
-    if !ok {
-        return None;
-    }
-    let container = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let (ok, image, _) = run_capture(&container_image_command(container))
+    let mut capture = |command: OpsCommand| async move { run_capture(&command).await };
+    running_stack_tag_with(&mut capture).await
+}
+
+async fn running_stack_image_with<F, Fut>(image: &str, capture: &mut F) -> Option<String>
+where
+    F: FnMut(OpsCommand) -> Fut,
+    Fut: Future<Output = Result<(bool, String, String)>>,
+{
+    let tag = running_stack_tag_with(capture).await?;
+    let candidate = image_ref(image, &tag);
+    image_present_with(&candidate, capture)
         .await
-        .ok()?;
-    if !ok {
-        return None;
-    }
-    image_tag(image.trim()).map(str::to_string)
+        .then_some(candidate)
+}
+
+/// Resolve `image` at the running local stack's tag when that candidate exists.
+/// Best-effort: any unreadable probe leaves compose's own default in force.
+pub(crate) async fn running_stack_image(image: &str) -> Option<String> {
+    let mut capture = |command: OpsCommand| async move { run_capture(&command).await };
+    running_stack_image_with(image, &mut capture).await
 }
 
 /// The compose env pinning every image to `tag`, given which of the per-image
@@ -2490,6 +2523,126 @@ mod tests {
         );
     }
 
+    /// The one-shot image resolver is one best-effort chain: identify the API
+    /// container, read its image tag, then check the requested sibling image at
+    /// that exact tag. Pin the API label and every argv in the chain so a caller
+    /// cannot silently derive the tag from the worker's untagged overlay.
+    #[tokio::test]
+    async fn running_stack_image_uses_the_api_tag_and_checks_the_candidate() {
+        let mut expected = std::collections::VecDeque::from([
+            (
+                "docker ps -a --filter label=com.docker.compose.service=curie-api --format '{{.Names}}'",
+                Ok::<_, anyhow::Error>((true, "curie-curie-api-1\n".into(), String::new())),
+            ),
+            (
+                "docker inspect --format '{{ .Config.Image }}' curie-curie-api-1",
+                Ok((
+                    true,
+                    "ghcr.io/curie-eng/curie-api:dev\n".into(),
+                    String::new(),
+                )),
+            ),
+            (
+                "docker image inspect --format '{{ .Id }}' ghcr.io/curie-eng/curie-dispatcher:dev",
+                Ok((true, "sha256:1\n".into(), String::new())),
+            ),
+        ]);
+        let mut issued = Vec::new();
+        let mut capture = |command: OpsCommand| {
+            let display = command.display();
+            issued.push(display.clone());
+            let (wanted, reply) = expected
+                .pop_front()
+                .expect("resolver issued more than the three expected docker probes");
+            std::future::ready(if display == wanted {
+                reply
+            } else {
+                Err(anyhow::anyhow!("expected `{wanted}`, received `{display}`"))
+            })
+        };
+
+        let image = running_stack_image_with("curie-dispatcher", &mut capture).await;
+
+        assert_eq!(
+            image.as_deref(),
+            Some("ghcr.io/curie-eng/curie-dispatcher:dev")
+        );
+        assert!(expected.is_empty(), "resolver skipped a docker probe");
+        assert_eq!(
+            issued,
+            [
+                "docker ps -a --filter label=com.docker.compose.service=curie-api --format '{{.Names}}'",
+                "docker inspect --format '{{ .Config.Image }}' curie-curie-api-1",
+                "docker image inspect --format '{{ .Id }}' ghcr.io/curie-eng/curie-dispatcher:dev",
+            ]
+        );
+
+        macro_rules! resolve_with {
+            ($replies:expr) => {{
+                let mut replies: std::collections::VecDeque<
+                    anyhow::Result<(bool, String, String)>,
+                > = $replies.into();
+                let mut capture = |_command: OpsCommand| {
+                    std::future::ready(
+                        replies
+                            .pop_front()
+                            .expect("resolver issued an unexpected docker probe"),
+                    )
+                };
+                let result = running_stack_image_with("curie-dispatcher", &mut capture).await;
+                assert!(
+                    replies.is_empty(),
+                    "resolver skipped an expected docker probe"
+                );
+                result
+            }};
+        }
+
+        assert_eq!(
+            resolve_with!([Ok((false, String::new(), "daemon unavailable".into()))]),
+            None,
+            "a nonzero docker probe must leave compose's default in force"
+        );
+        assert_eq!(
+            resolve_with!([Err(anyhow::anyhow!("docker is unreadable"))]),
+            None,
+            "an unreadable docker probe must leave compose's default in force"
+        );
+        assert_eq!(
+            resolve_with!([
+                Ok((true, "curie-curie-api-1\n".into(), String::new())),
+                Ok((true, "curie-api\n".into(), String::new())),
+            ]),
+            None,
+            "an untagged API image cannot identify a sibling image"
+        );
+        assert_eq!(
+            resolve_with!([
+                Ok((true, "curie-curie-api-1\n".into(), String::new())),
+                Ok((
+                    true,
+                    "ghcr.io/curie-eng/curie-api@sha256:abc\n".into(),
+                    String::new(),
+                )),
+            ]),
+            None,
+            "a digest-pinned API image has no reusable tag"
+        );
+        assert_eq!(
+            resolve_with!([
+                Ok((true, "curie-curie-api-1\n".into(), String::new())),
+                Ok((
+                    true,
+                    "ghcr.io/curie-eng/curie-api:dev\n".into(),
+                    String::new(),
+                )),
+                Ok((false, String::new(), "No such image".into())),
+            ]),
+            None,
+            "a missing dispatcher candidate must leave compose's default in force"
+        );
+    }
+
     /// A `--build` stack that was STOPPED rather than torn down still records
     /// its tag, and `up` is how an operator restarts it -- so that restart must
     /// not be the moment the stack quietly reverts to `:latest`. The stub answers
@@ -3102,23 +3255,29 @@ mod tests {
         )
         .expect("worker overlay");
 
-        let mut overridable = std::collections::BTreeSet::new();
-        for line in compose.lines().chain(overlay.lines()) {
-            let line = line.trim();
-            let interpolates = line.contains("${CURIE_BASE_TAG")
-                || line.contains("${BASE_TAG")
-                || line.contains("${CURIE_RUNNER_IMAGE")
-                || line.contains("${CURIE_UI_IMAGE")
-                || line.contains("${CURIE_DISPATCHER_IMAGE");
-            if !interpolates {
-                continue;
+        fn interpolated_curie_image(line: &str) -> Option<&str> {
+            if !line.contains("${") {
+                return None;
             }
-            if let Some(idx) = line.find("ghcr.io/curie-eng/") {
-                let rest = &line[idx + "ghcr.io/curie-eng/".len()..];
-                let name = rest.split(':').next().unwrap_or_default();
-                overridable.insert(name.to_string());
-            }
+            let (_, image) = line.split_once("ghcr.io/curie-eng/")?;
+            let name = image.split(':').next().unwrap_or_default();
+            (!name.is_empty()).then_some(name)
         }
+
+        assert_eq!(
+            interpolated_curie_image(
+                "image: ${CURIE_MAIL_IMAGE:-ghcr.io/curie-eng/curie-mail:latest}"
+            ),
+            Some("curie-mail"),
+            "a new interpolation variable must be discovered without an allowlist"
+        );
+
+        let overridable: std::collections::BTreeSet<String> = compose
+            .lines()
+            .chain(overlay.lines())
+            .filter_map(interpolated_curie_image)
+            .map(str::to_string)
+            .collect();
 
         let mut o = opts(DEFAULT_COMPOSE_FILE);
         o.build = Some(BuildReach::Substitutes);

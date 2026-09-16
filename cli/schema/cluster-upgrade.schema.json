@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/cluster-upgrade/v1.1.json",
+  "title": "curie cluster upgrade --json",
+  "description": "The agent-facing payload of `curie cluster upgrade`: the redacted dry-run plan, or the completed lifecycle (succeeded or failed). Success requires exact convergence and a passing target-version canary. A failure either leaves the previous known-good version serving or returns one fail-forward command.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    },
+    "convergence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "exact": {
+          "type": "boolean"
+        },
+        "images": {
+          "type": "boolean"
+        },
+        "generations": {
+          "type": "boolean"
+        },
+        "replicas": {
+          "type": "boolean"
+        },
+        "unavailable_zero": {
+          "type": "boolean"
+        },
+        "hooks_healthy": {
+          "type": "boolean"
+        },
+        "queues_drained": {
+          "type": "boolean"
+        },
+        "manifest_matches": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exact",
+        "images",
+        "generations",
+        "replicas",
+        "unavailable_zero",
+        "hooks_healthy",
+        "queues_drained",
+        "manifest_matches"
+      ]
+    },
+    "canary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "passed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "passed"
+      ]
+    },
+    "failForward": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "reason"
+      ]
+    },
+    "pendingStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "kind"
+      ]
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "type": "string"
+        },
+        "current_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target_min": {
+          "type": "string"
+        },
+        "target_head": {
+          "type": "string"
+        },
+        "source_head": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pending": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pendingStep"
+          }
+        },
+        "rollback_compatible": {
+          "type": "boolean"
+        },
+        "forward_only": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "decision",
+        "current_revision",
+        "target_min",
+        "target_head",
+        "source_head",
+        "pending",
+        "rollback_compatible",
+        "forward_only",
+        "reason",
+        "outcome"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "succeeded",
+            "failed"
+          ]
+        },
+        "phase": {
+          "type": "string"
+        },
+        "target_version": {
+          "type": "string"
+        },
+        "from_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "known_good_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resumed": {
+          "type": "boolean"
+        },
+        "previous_serving": {
+          "type": "boolean"
+        },
+        "unchanged": {
+          "type": "boolean"
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "convergence": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/convergence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "canary": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/canary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fail_forward": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/failForward"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "compatibility": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/compatibility"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "phase",
+        "target_version",
+        "from_version",
+        "known_good_version",
+        "resumed",
+        "previous_serving",
+        "unchanged",
+        "plan",
+        "convergence",
+        "canary",
+        "fail_forward"
+      ],
+      "if": {
+        "properties": {
+          "status": {
+            "const": "succeeded"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "convergence": {
+            "type": "object",
+            "properties": {
+              "exact": {
+                "const": true
+              }
+            },
+            "required": [
+              "exact"
+            ]
+          },
+          "canary": {
+            "type": "object",
+            "properties": {
+              "passed": {
+                "const": true
+              }
+            },
+            "required": [
+              "passed"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

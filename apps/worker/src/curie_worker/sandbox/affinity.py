@@ -27,6 +27,19 @@ end
 return 0
 """
 
+_REPLACE_IF_GENERATION = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local ok, current = pcall(cjson.decode, raw)
+if not ok then return 0 end
+local generation = current['generation'] or 0
+if current['claim_name'] ~= ARGV[1] or generation ~= tonumber(ARGV[2]) then
+    return 0
+end
+redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
+return 1
+"""
+
 
 class AffinityStore:
     """Thread-to-sandbox route records with atomic acquire and guarded delete."""
@@ -35,6 +48,7 @@ class AffinityStore:
         self._redis = client
         self._prefix = key_prefix
         self._delete_if_claim = client.register_script(_DELETE_IF_CLAIM)
+        self._replace_if_generation = client.register_script(_REPLACE_IF_GENERATION)
 
     def _key(self, thread_key: str) -> str:
         return f"{self._prefix}:route:{thread_key}"
@@ -60,6 +74,29 @@ class AffinityStore:
         """Overwrite the route unconditionally (suspend/resume transitions)."""
 
         self._redis.set(self._key(thread_key), record.to_json(), ex=ttl_seconds)
+
+    def replace_if_generation(
+        self,
+        thread_key: str,
+        *,
+        expected_claim: str,
+        expected_generation: int,
+        record: RouteRecord,
+        ttl_seconds: int,
+    ) -> bool:
+        """CAS a route only while both the old claim and generation still match."""
+
+        return bool(
+            self._replace_if_generation(
+                keys=[self._key(thread_key)],
+                args=[
+                    expected_claim,
+                    expected_generation,
+                    record.to_json(),
+                    ttl_seconds,
+                ],
+            )
+        )
 
     def touch(self, thread_key: str, ttl_seconds: int) -> bool:
         """Refresh the route TTL on activity. Returns False if no route."""

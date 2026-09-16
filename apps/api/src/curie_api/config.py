@@ -126,6 +126,11 @@ class Settings(BaseSettings):
     # Git flow (J1). The webhook secret authenticates inbound GitHub events; the
     # two bot identities are the routing targets recorded on each deployment.
     github_webhook_secret: str = "dev-webhook-secret"
+    # Review-feedback ingress is separately gated from push handling. Keep it
+    # off unless the GitHub App identity, webhook HMAC, and reconciler cadence
+    # form a complete bootable configuration.
+    github_review_ingress_enabled: bool = False
+    github_review_reconciler_interval_s: float = 5.0
     dev_branch: str = "dev"
     prod_branch: str = "main"
     # Outbound GitHub credential. Used for the eval PR check's commit-status
@@ -199,6 +204,10 @@ class Settings(BaseSettings):
     valkey_port: int = 26379
     valkey_tls: bool = False
     valkey_url: str | None = None
+    # Terminal review reconciliation reads the worker's completion/dead-letter
+    # keyspace. Match WorkerConfig's actual legacy environment contract:
+    # KEY_PREFIX overrides it; CURIE_KEY_PREFIX deliberately does not.
+    worker_key_prefix: str = Field(default="curie:worker", validation_alias="KEY_PREFIX")
 
     # The runs stream approval resolutions enqueue resume turns onto (#244).
     # Must match the worker's CURIE_STREAM (its consumer side) -- which is why
@@ -417,6 +426,31 @@ class Settings(BaseSettings):
         ]
         if invalid:
             raise ValueError("GITHUB_REPO_ALLOWLIST entries must be owner/repository or owner/*")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_github_review_ingress(self) -> "Settings":
+        if not self.github_review_ingress_enabled:
+            return self
+
+        offenders = []
+        if not self.github_app_id.strip():
+            offenders.append("GITHUB_APP_ID")
+        if not self.github_app_private_key.strip():
+            offenders.append("GITHUB_APP_PRIVATE_KEY")
+        if (
+            not self.github_webhook_secret.strip()
+            or self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET
+        ):
+            offenders.append("GITHUB_WEBHOOK_SECRET")
+        if self.github_review_reconciler_interval_s <= 0:
+            offenders.append("GITHUB_REVIEW_RECONCILER_INTERVAL_S")
+        if offenders:
+            raise ValueError(
+                "GitHub review ingress (GITHUB_REVIEW_INGRESS_ENABLED) requires "
+                "complete active configuration; "
+                f"set valid values for: {', '.join(offenders)}"
+            )
         return self
 
     @model_validator(mode="after")

@@ -30,18 +30,21 @@ body:
       required: true
 
   - type: dropdown
-    id: tier
+    id: found
     attributes:
-      label: Which tier were you running?
+      label: Discovery surface
       description: >-
-        `skill` is a local runner session for one bundle, `local` is the
-        Docker Compose stack, `cluster` is a deployed Kubernetes release.
+        Where the defect was observed. Apply the matching `found:*` label on
+        the issue; the fix-pin gate reads that label and rejects a pin below
+        this surface unless the pull request carries `Fix pin waiver:`.
+        `found:unit` is a unit test or skill runner, `found:local` is the
+        Docker Compose stack, `found:cluster` is a deployed Kubernetes
+        release, `found:live` is a live provider or Slack.
       options:
-        - skill
-        - local
-        - cluster
-        - Not sure
-        - Other (describe below)
+        - found:unit
+        - found:local
+        - found:cluster
+        - found:live
     validations:
       required: true
 

@@ -229,6 +229,10 @@ A fix PR changing `apps/*/tests/`, `packages/*/tests/`, `runner/tests/`, `cli/te
 A PR closing a `bug`-labeled issue includes exactly one `Fix pin: <SELECTOR>` line in its body,
 or an explicit `Fix pin: n/a - <reason>` line; CI enforces this. A PR closing no bug-labeled issue may omit
 the declaration, but a selector supplied voluntarily on any PR is still verified.
+The pin's tier is derived from the selector's location (unit tests, `charts/curie/ci/*`,
+`test_live.py`), not from prose. A pin below the closed issue's `found:unit` /
+`found:local` / `found:cluster` / `found:live` label fails unless the body also carries
+`Fix pin waiver: <reason>`.
 Assertions about an external API or SDK's shape or auth must be grounded in
 provider docs or observed behavior, cited in a test comment, never in the
 implementation's own assumption. Any read-modify-write on a versioned row needs a
@@ -431,41 +435,64 @@ rather than silently diverging.
 
 Sibling-path drift is the dominant historical bug class here: logic or hardening
 lands on one side of a structural seam while its twin keeps the old behavior.
-Known seam pairs:
+Known seam pairs, each tagged with what actually enforces it -- `vector:` (a
+frozen two-sided vector file), `gate:` (a test or CI job), `by construction:` (a
+shared module both sides route through), or `convention` (no gate covers the pair
+as a whole; remembered only):
 
 - worker vs CLI credential forwarding -- `_SDK_PASSTHROUGH_ENV`
   (`apps/worker/src/curie_worker/sandbox/docker.py`) and the CLI picker
   (`cli/src/commands.rs`) can't share code across Python/Rust, so they are frozen
   together in `tests/vectors/model-credential-forwarding.json`.
+  [vector: `tests/vectors/model-credential-forwarding.json`]
 - dispatcher vs CLI approval action ids -- the approval-card action-id constants
   (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`) and the CLI's
   `APPROVE_ACTION_ID_PREFIX` (`cli/src/chat.rs`) can't share code across
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
+  [vector: `tests/vectors/approval-action-ids.json`]
 - dispatcher vs API approval-principal tokens -- the dispatcher mint codec
   (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
   (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
   `tests/vectors/approval-principal.json`.
+  [vector: `tests/vectors/approval-principal.json`]
+- dispatcher vs API approval-row miss -- the API 404 detail
+  (`apps/api/src/curie_api/routers/approvals.py`) and the dispatcher's
+  ownership-miss match (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`)
+  cannot share code, so they are frozen together in
+  `tests/vectors/approval-ownership.json`.
+  [vector: `tests/vectors/approval-ownership.json`]
 - API vs worker vs CLI thread-reset SET -- `THREAD_RESET_SET` /
   `THREAD_RESET_INFLIGHT_SET` (`apps/api/src/curie_api/threadreset.py`,
   `apps/worker/src/curie_worker/consumer.py`) and the CLI's `THREAD_RESET_SET`
   (`cli/src/queue.rs`) can't share code across Python/Rust. Operator
   `reset-thread` and `local`/`cluster` eval (#1534) both SADD the same set.
   Frozen in `tests/vectors/thread-reset-set.json`.
+  [vector: `tests/vectors/thread-reset-set.json`]
 - worker vs CLI eval-isolate prefix -- `EVAL_ISOLATE_THREAD_PREFIX`
   (`apps/worker/src/curie_worker/binding.py`) and the CLI copy
   (`cli/src/queue.rs`, stamped in `cli/src/message.rs::run_eval_turns`)
   cannot share code across Python/Rust, so they are frozen together in
   `tests/vectors/eval-memory-isolation.json`.
-- real SDK vs fake model session in the runner (`FakeModelSession`, `runner/src/curie_runner/fake.py`).
-- runs lane vs eval lane stream consumers (`apps/worker/src/curie_worker/consumer.py` vs `eval/stream.py`, both on the shared `stream_consumer.py`).
-- CLI-side vs API-side input validation (validate at the API/persistence boundary, mirror in the CLI).
+  [vector: `tests/vectors/eval-memory-isolation.json`]
+- real SDK vs fake model session in the runner (`FakeModelSession`,
+  `runner/src/curie_runner/fake.py`).
+  [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]
+- runs lane vs eval lane stream consumers (`apps/worker/src/curie_worker/consumer.py`
+  vs `eval/stream.py`, both on the shared `stream_consumer.py`).
+  [by construction: `apps/worker/src/curie_worker/stream_consumer.py`]
+- CLI-side vs API-side input validation (validate at the API/persistence
+  boundary, mirror in the CLI). [convention]
 - `local up` vs `local down` compose profile sets.
+  [gate: `cli/src/local.rs::down_passes_every_up_profile`]
 - `compose.dev.yaml` vs the generated release compose.
+  [by construction: `compose/generate_release_compose.py`]
 - `core` vs `full` compose profiles.
-- `local` vs `cluster` verb pairs (reachability defaults, outcome enums).
-- CLI `--json` DTOs vs the API models they mirror.
-- deploy-time validators vs the runtime loaders that re-parse the same value (share normalization code).
+  [gate: `cli/src/local.rs::compose_file_declares_core_and_full_profiles`]
+- `local` vs `cluster` verb pairs (reachability defaults, outcome enums). [convention]
+- CLI `--json` DTOs vs the API models they mirror. [gate: `cli/tests/api_field_parity.rs`]
+- deploy-time validators vs the runtime loaders that re-parse the same value
+  (share normalization code). [convention]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR
@@ -493,6 +520,22 @@ drive the actual surface (the `curie` CLI, the deployed compose services, a
 real sandbox on-cluster) with realistic input and assert the real outcome, not
 just that unit tests pass.
 
+- **Pick the driver from the diff.** An end-to-end test is black-box testing of the
+  components that changed, so the box is the diff, not the whole system. A driving
+  surface is valid only if the path from it traverses every component you changed;
+  if it routes around one, it is not a valid driver for that change. Inside the box
+  nothing may be faked.
+- **Slack is a driver, not a requirement.** Approvals resolve equally through an
+  operator principal: `curie cluster approvals <agent> --mint-operator-principal
+  <USER>`, then export `CURIE_APPROVAL_PRINCIPAL_TOKEN` and `--resolve <id>` (or
+  `--reject`). Proven on a real cluster against an install with the dispatcher at
+  zero replicas and no bot token: the gated tool ran exactly once, the session
+  resumed, and the audit recorded `principal_kind: operator`. One setup constraint,
+  since `slack_approvers.py` sets `operator_eligible = False` on the channel-members
+  and user-group sets: bind `approvers.users` explicitly on any route you intend to
+  drive from the CLI, or resolution is refused 403. Reach for a real Slack pass only
+  when the change is in the Slack surface itself. Everything else drives from the
+  CLI, and an agent can run it unattended rather than handing a human a click list.
 - **In-repo tests are the durable net.** Prefer landing unit + integration tests
   (and a Playwright/e2e assertion where a UI or full-flow path changed) in the
   same PR. These are what keep the change working after you leave.
@@ -586,7 +629,7 @@ required and proved, not carried on the original classification.
 The path set is runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, and
 built-in coding-tool session capability. A behavior-bearing change that
-reaches any of those reaches both live-provider and Slack external-integration.
+reaches any of those reaches both live-provider and external-integration.
 Those two rows are required on that path. "No model routing change" is not a valid n/a reason.
 Fake-model kind, skill ladder, and helper-only tests remain useful and are
 not sufficient for those acceptance criteria. Leave the required-tier item
@@ -647,6 +690,15 @@ and the role is what selects your base.
 | --- | --- |
 | General bug fix, security fix, or change shared by both lines | `main` |
 | Feature for the next feature release, or a bug unique to that unreleased work | `next` |
+
+The GitHub milestone-to-train mapping that CI enforces lives in
+[`tools/fix-pin-ci/milestone-trains.json`](tools/fix-pin-ci/milestone-trains.json).
+Each milestone is explicitly classified there: `patch` entries map to `main`
+and `feature` entries map to `next`. The version number's shape does not select
+the branch independently of that mapping. A pull request that closes an issue
+whose milestone belongs to the other train fails, and a pull request that closes
+a `bug` issue with no milestone fails. The check reuses the existing fix-pin gate
+rather than adding a second workflow.
 
 Create a short lived `task/<short-description>` branch from the selected base:
 
@@ -713,8 +765,12 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   magic words fire once on the default branch.
 - PR bodies must contain real line breaks. The PR body guard rejects escaped
   newline sequences because GitHub treats them as text, making closing keywords
-  inert. Run `scripts/check-pr-body.sh <body-file>` before opening or editing a
-  PR.
+  inert. A patch release PR (title `Prepare the vX.Y.Z release` with Z not 0)
+  must also fill Trigger (issue numbers) and Live proof (a run URL or
+  `waiver: <reason>`); the same guard rejects either section left empty. Run
+  `scripts/check-pr-body.sh <body-file>` before opening or editing a PR
+  (`--title-file` for a release PR). See
+  [`docs/release-verification.md`](docs/release-verification.md#patch-releases-name-their-trigger-and-live-proof).
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages OR pull request bodies, and never add `Co-Authored-By` lines
   referencing AI.** This applies to the PR body as much as to the commits: many

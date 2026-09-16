@@ -20,19 +20,35 @@ locally in Docker.
 - Emits `side_effect_flag` when a non-idempotent tool executes (read-only
   allowlist, deny-by-default; see `side_effects.py`).
 - Loads and validates the mounted plugin bundle via `plugin_format.validate_bundle`.
+- Always exposes the Claude Code file tools and Curie's
+  `mcp__curie__publish_changes` tool, independent of bundle skills and bundle
+  MCP policy. Publication remains unusable without a managed `/workspace` and
+  only records an approval request; the trusted worker publishes after approval.
+- When a managed git checkout is mounted at `/workspace`, the runner prepends
+  that fact and the fail-closed network-git posture to the session system
+  prompt so the model edits in place instead of cloning over the network.
+- Offers Anthropic's provider-side `WebSearch` tool by default. A bundle can
+  suppress it with a root `curie.bundle.json` containing
+  `{"webSearch": false}`; the provider connection remains the only network
+  path, so this adds no sandbox web egress.
 - Exports gen_ai OTel spans: an `agent.run` root with duration-bearing
   `llm.generation` provider-wait and `execute_tool` tool-wait siblings, via
   OTLP-HTTP (the OpenTelemetry Protocol over HTTP) to the collector, which
   forwards to Langfuse.
 - Rehydrates from a history ref on start (`resume`), stateless-first
-  (ADR-0003, an Architecture Decision Record).
+  (ADR-0003, an Architecture Decision Record). Completed turns are stored as
+  structured replay; oversized text payloads are replaced with stable digest
+  markers before the state API's 64 KiB value boundary while tool-call
+  structure remains intact. An append failure makes the runner's
+  `history_durable` status fail closed for the rest of that process.
 
 ## HTTP surface (ACI channel)
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/healthz` | Liveness. |
-| GET | `/status` | Session status (done / idle-awaiting-input / classified-failure), readiness, turn state. |
+| GET | `/status` | Probe-safe session status, readiness, turn state, and transcript durability. |
+| GET | `/v1/status` | Bearer-authenticated handoff status, including session/sandbox identity and managed-workspace cwd attestation. |
 | POST | `/v1/event` | Open a turn: body is an ACI `event` frame; streams outbound NDJSON, ending in a `final`. |
 | POST | `/v1/steer` | Inject a follow-up into the live turn (`{"text": ...}`); 409 when no turn is active. |
 | POST | `/v1/interrupt` | Hard-stop the live turn: body is an ACI `interrupt` frame. |
@@ -42,14 +58,16 @@ side-channel injections whose output surfaces on the open `/v1/event` stream (th
 proven steering pattern). The finish race (a steer arriving as a turn ends,
 409) is owned by the worker.
 
-The three POST routes (`/v1/event`, `/v1/steer`, `/v1/interrupt`) require an
-`Authorization: Bearer <token>` header matching `CURIE_RUNNER_TOKEN` when that
-env var is set, returning 401 otherwise. This is per-sandbox transport auth
-(defense-in-depth on the ACI ingress alongside the NetworkPolicy), not part of
-the frozen ACI wire contract. Enforcement is only-when-configured: with the var
-unset the app is pass-through (CLI, fake-model CI, and pre-token sandboxes stay
-unauthenticated). `GET /healthz` and `GET /status` are never gated (the chart
-readinessProbe hits `/healthz`).
+The control routes (`/v1/event`, `/v1/steer`, `/v1/interrupt`, `/v1/reset`,
+`/v1/snapshot`, and `/v1/status`) require an `Authorization: Bearer <token>`
+header matching `CURIE_RUNNER_TOKEN` when that env var is set, returning 401
+otherwise. This is per-sandbox transport auth (defense-in-depth on the ACI
+ingress alongside the NetworkPolicy), not part of the frozen ACI wire contract.
+Enforcement is only-when-configured: with the var unset the app is pass-through
+(CLI, fake-model CI, and pre-token sandboxes stay unauthenticated). `GET
+/healthz` and probe-only `GET /status` are never gated (the chart readinessProbe
+hits `/healthz`); replacement authority comes only from authenticated
+`GET /v1/status`.
 
 ## Environment
 
@@ -57,10 +75,10 @@ readinessProbe hits `/healthz`).
   `CURIE_SESSION_ID`, `CURIE_SANDBOX_ID`, `CURIE_BUDGET`, optional
   `CURIE_MEMORY_REF` / `CURIE_CREDENTIALS`, `OTEL_EXPORTER_OTLP_*`.
 - **Runner-local**: `CURIE_MODEL`, `CURIE_MAX_TURNS`,
-  `CURIE_HISTORY_REF` (rehydrate; falls back to `CURIE_MEMORY_REF`),
+  `CURIE_HISTORY_REF` (rehydrate this thread from the durable state API),
   `CURIE_HISTORY_MAX_TURNS` / `CURIE_HISTORY_MAX_BYTES` (bound the rehydrated
-  history preamble to a tail window; defaults 40 turns / 16000 bytes, a
-  nonpositive value falls back to the default),
+  structured prefix with stable summary boundaries; defaults 40 turns / 16000
+  bytes, a nonpositive value falls back to the default),
   `CURIE_RUNNER_PORT`, `CURIE_RUNNER_TOKEN` (per-sandbox bearer token gating
   the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
   (offline smoke; no model call), `CURIE_DISALLOWED_TOOLS` (optional
@@ -150,5 +168,9 @@ uv run pytest runner/tests -q   # unit + integration + conformance
 uv run ruff check . && uv run mypy
 ```
 
-Live tests (`runner/tests/test_live.py`) run only when `CLAUDE_CODE_OAUTH_TOKEN`
-or `ANTHROPIC_API_KEY` is present; otherwise they are skipped.
+Most live tests (`runner/tests/test_live.py`) run only when
+`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` is present. Disposable tests
+explicitly selected with `CURIE_E2E_LIVE=1`, including the provider-side web
+search proof, may instead use an already-authenticated local Claude SDK. Without
+either authentication path they fail honestly rather than fabricating a live
+result.

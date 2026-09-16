@@ -3412,10 +3412,12 @@ fn empty_github_token_clear_is_shared_by_apply_and_diff() {
         &diff,
         &[
             "api.githubToken",
+            "config.schemaVersion",
             "langfuse.web.service.type",
             "ui.service.type",
         ],
     );
+    assert_added(&diff, "config.schemaVersion", "0.9.0");
 }
 
 #[test]

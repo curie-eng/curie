@@ -1,0 +1,107 @@
+name: Two-release approval e2e
+
+# Issue #2307: two Helm releases on one kind cluster, one Slack app, owner-only
+# approval without retry-until-acked. Path-trigger only the approval-action
+# fixture so unrelated dispatcher PRs do not pay this cost.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [next]
+    paths:
+      - "apps/dispatcher/src/curie_dispatcher/approval_actions.py"
+      - "apps/dispatcher/src/curie_dispatcher/handlers.py"
+      - "apps/dispatcher/tests/test_approval_actions.py"
+      - "cli/scripts/two-release-approval-e2e.sh"
+      - "cli/tests/two_release_approval_e2e.rs"
+      - ".github/workflows/two-release-approval-e2e.yaml"
+      - "charts/curie/values-e2e-two-release-consumer.yaml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  prereqs:
+    name: Helm fixture prereqs (Slack optional)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: check
+        name: Helm/API one-shot is always ready; Slack only gates live envelope
+        env:
+          CURIE_TWO_RELEASE_PHASE: prereqs
+          CURIE_TWO_RELEASE_REQUIRED: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          CI_SLACK_APP_TOKEN: ${{ secrets.CI_SLACK_APP_TOKEN }}
+          CI_SLACK_BOT_TOKEN: ${{ secrets.CI_SLACK_BOT_TOKEN }}
+        run: bash cli/scripts/two-release-approval-e2e.sh prereqs
+
+  two-release:
+    name: Two Helm releases, owner-only approval
+    needs: [prereqs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.16.4
+      - name: Install kind and kubectl
+        uses: helm/kind-action@v1.14.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: tworeleasecache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the api image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          builder: ${{ steps.tworeleasecache.outputs.name }}
+          tags: curie-api:local
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-api
+          cache-to: type=gha,mode=max,scope=ladder-api
+      - name: Build the dispatcher image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.tworeleasecache.outputs.name }}
+          tags: curie-dispatcher:local
+          push: false
+          load: true
+          cache-from: type=gha,scope=sre-demo-dispatcher
+          cache-to: type=gha,mode=max,scope=sre-demo-dispatcher
+      - name: Two-release owner-only fixture
+        env:
+          CURIE_TWO_RELEASE_PHASE: run
+          CURIE_TWO_RELEASE_ALLOW_LIVE: "1"
+          CURIE_API_IMAGE: curie-api:local
+          CURIE_DISPATCHER_IMAGE: curie-dispatcher:local
+          CI_SLACK_APP_TOKEN: ${{ secrets.CI_SLACK_APP_TOKEN }}
+          CI_SLACK_BOT_TOKEN: ${{ secrets.CI_SLACK_BOT_TOKEN }}
+        run: bash cli/scripts/two-release-approval-e2e.sh run
+      - name: Dump owned-namespace diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -n curie-2307-owner -o wide || true
+          kubectl get pods -n curie-2307-consumer -o wide || true
+          kubectl logs -n curie-2307-owner -l app.kubernetes.io/component=dispatcher --tail=100 || true
+          kubectl logs -n curie-2307-consumer -l app.kubernetes.io/component=dispatcher --tail=100 || true

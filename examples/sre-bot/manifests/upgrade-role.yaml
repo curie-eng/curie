@@ -2,11 +2,10 @@
 #
 #     kubectl apply -f examples/sre-bot/manifests/upgrade-role.yaml
 #
-# SEPARATE FROM the write and scale identities, and it must stay that way. This
-# one lives in the namespace the Curie RELEASE runs in -- the other two live
-# wherever the workloads this bot may touch are. Merging them would put `create`
-# on `jobs` next to the application namespace, or `patch` on `deployments` next
-# to the platform's own Secrets. Neither is a trade worth making for tidiness.
+# SEPARATE FROM the general Kubernetes connector identity, and it must stay that
+# way. This one lives in the namespace the Curie RELEASE runs in. Sharing it
+# would give the broad core-tool connector a namespace-wide Job-create grant
+# next to the platform's own Secrets.
 #
 # ---------------------------------------------------------------------------
 # Read this grant honestly: it is the widest one in the bundle
@@ -19,16 +18,24 @@
 # with any command in this namespace, which is the namespace holding the
 # platform's API key.
 #
-# That is the same shape as `write-role.yaml`'s `patch` on `deployments`, which
-# RBAC also cannot separate from `set image`, and it gets the same answer: the
-# real ceiling is the connector, which exposes ONE tool that takes NO arguments
+# There is a second, more serious consequence when this manifest is installed
+# alongside `platform-upgrade-role.yaml`: RBAC does not restrict the
+# `spec.serviceAccountName` a Job creator chooses. A leaked `sre-bot-upgrader`
+# token can therefore create a Job that runs as `curie-platform-upgrader`,
+# inheriting that account's namespace-wide platform-upgrade permissions. The
+# connector cannot construct that Job, but a party holding its leaked token can.
+# Mitigations include an admission policy that constrains service-account choice
+# for this requesting identity, separating the wider identity into another
+# namespace, or avoiding a long-lived connector token.
+#
+# The connector surface is one tool that takes no arguments
 # and posts the named CronJob's `jobTemplate.spec` verbatim. There is no field a
 # caller can reach. See connectors/self-upgrade/server.py.
 #
 # What that leaves is a credential whose blast radius is "this namespace, if the
 # token escapes the connector pod". It does not leave the pod: the kubeconfig is
 # mounted as a file, the sandbox never holds it, and the sandbox learns only a
-# URL (which is why the read-only connector drops `configuration_view` -- see
+# URL (which is why the general connector drops `configuration_view` -- see
 # connectors.yaml). If you are not willing to accept that, do not install this
 # connector; the CronJob on a schedule remains a complete alternative.
 #
@@ -73,6 +80,10 @@ rules:
       # purpose, so a ceiling stated once cannot move when someone edits the
       # other place.
       - sre-bot-self-upgrade
+      # The platform upgrade's template, if you installed it. Harmless to list
+      # when that CronJob does not exist: `resourceNames` grants nothing for a
+      # name with no object behind it.
+      - platform-upgrade
     verbs: ["get"]
   - apiGroups: ["batch"]
     resources: ["jobs"]

@@ -158,100 +158,52 @@ You should get a real answer instead of the canned loop.
 ## Deploy your own SRE bot
 
 The most complete example in this repo is a production triage bot:
-[`examples/sre-bot/`](examples/sre-bot/README.md). Ask it in plain English
-whether anything is broken and it reads your Kubernetes cluster and answers.
-Kubernetes read remains the default capability: its credential cannot read
-Secrets. The `k8s-write` connector and its exact approval gate ship declared
-together, but `K8S_WRITE_KUBECONFIG` does not. Connector bring up cannot
-complete, and no connector container starts, until that separate credential
-exists. This clean refusal is specific to connector bring up; other deployment
-steps can still fail independently or partially.
+[examples/sre-bot/](examples/sre-bot/README.md). It uses one pinned upstream
+Kubernetes MCP connector. Thirteen exact core read tools run immediately, six
+exact mutation tools require approval, and unmatched tools deny.
 
-This one runs on the **cluster** tier, so unlike the loop above it needs a
-Kubernetes cluster, `kubectl` pointed at it, a model credential, and this repo
-checked out (the bundle is a directory of files, so `curie` needs to see it).
+Kubernetes RBAC is the capability boundary. The connector can read enumerated
+non-secret operational resources cluster-wide and can mutate workload APIs only
+inside the disposable `sre-demo` namespace. It cannot read Secrets or mutate
+identity, RBAC, namespaces, nodes, admission configuration, CRDs, or any
+cluster-scoped resource.
+
+The supported installer applies that identity, constructs its file-mounted
+kubeconfig in memory, installs the observability stack, and deploys the bundle:
 
 ```bash
-# 1. Bring up the platform, which also creates the `curie` namespace the next
-#    step installs into. --allow-egress-host opens the model call; the cluster
-#    sandbox is fail-closed, so a credential alone is not enough.
 export CURIE_CREDENTIALS=sk-ant-...
 curie cluster up --allow-egress-host anthropic --set security.gvisor.mode=off
-
-# 2. Create the read-only identity the bot authenticates as.
-kubectl apply -f examples/sre-bot/manifests/read-access.yaml
-
-# 3. Assemble a kubeconfig from that identity's token and store it.
-CA=$(kubectl -n curie get secret sre-bot-reader-token -o jsonpath='{.data.ca\.crt}')
-TOKEN=$(kubectl -n curie get secret sre-bot-reader-token -o jsonpath='{.data.token}' | base64 -d)
-export K8S_READONLY_KUBECONFIG="$(cat <<YAML
-apiVersion: v1
-kind: Config
-clusters: [{name: prod, cluster: {server: https://kubernetes.default.svc, certificate-authority-data: $CA}}]
-users: [{name: sre-bot-reader, user: {token: $TOKEN}}]
-contexts: [{name: prod, context: {cluster: prod, user: sre-bot-reader}}]
-current-context: prod
-YAML
-)"
-CURIE_CLUSTER_ID="ca:$(kubectl config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
-curie secrets set K8S_READONLY_KUBECONFIG --from-env K8S_READONLY_KUBECONFIG \
-  --cluster-identity "$CURIE_CLUSTER_ID" --release curie --namespace curie
-
-# 4. Deploy the bundle. This is also what provisions the secret from step 3
-#    into the namespace; nothing else does.
-curie cluster deploy --plugin-dir examples/sre-bot
-
-# 5. Ask it something.
+curie example sre-bot install --observability
 curie cluster message "Is any pod crashlooping right now?"
 ```
 
-4. **Complete the gated write prerequisites.** Follow
-   [Level up: the gated write path](examples/sre-bot/README.md#level-up-the-gated-write-path)
-   to scope the writer identity and allowlist and store the separate
-   `K8S_WRITE_KUBECONFIG`. Then build and lock the declared connector with one
-   command:
+Run the installer with `--dry-run` first to inspect its ordered mutation plan.
+The optional `--platform-upgrade` flag adds a separate, much wider
+zero-argument Job-trigger path; read
+[the platform-upgrade Role](examples/sre-bot/manifests/platform-upgrade-role.yaml)
+before enabling it. The general Kubernetes connector never receives that Role
+or credential.
 
-   ```bash
-   curie build --plugin-dir examples/sre-bot --registry <registry-reference>
-   ```
+For manual deployment, apply
+[the Kubernetes access manifest](examples/sre-bot/manifests/kubernetes-access.yaml),
+construct a kubeconfig for `sre-bot-kubernetes`, store it under the owned
+connector key `K8S_KUBECONFIG`, deploy the unchanged bundle, bind the approval
+route it declares, and deploy again:
 
-   Bind `sre-approvals` before the next step. The bundle already declares that
-   route, and deploy is refused (`422` / `approval_routes.unbound`) until it is
-   bound:
+```bash
+curie cluster deploy --plugin-dir examples/sre-bot
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
+curie cluster approvals sre-bot --list-routes
+curie cluster deploy --plugin-dir examples/sre-bot
+```
 
-   ```bash
-   curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
-   curie cluster approvals sre-bot --list-routes
-   ```
-
-   Do not continue until those prerequisites, the build, and the route binding
-   succeed. Connector bring up cannot complete, and no connector container
-   starts, without them. The deploy itself is refused until the route is bound.
-
-5. **Deploy the bundle.** This provisions the secrets from the earlier steps
-   into the namespace; nothing else does.
-
-   ```bash
-   curie cluster deploy --plugin-dir examples/sre-bot
-   ```
-
-6. **Ask it something.**
-
-   ```bash
-   curie cluster message "Is any pod crashlooping right now?"
-   ```
-
-**Step 1 comes first for a reason.** `read-access.yaml` puts a ServiceAccount
-and a token Secret in the `curie` namespace, which does not exist until
-`cluster up` creates it. Apply it on a fresh cluster and you get a PARTIAL
-failure that reads like a success: the cluster-scoped ClusterRole and
-ClusterRoleBinding are created and print `created`, the two namespaced objects
-are not, and the command exits 1.
-
-Drop `--set security.gvisor.mode=off` on a cluster that has `runsc` installed.
-
-The write path, Slack, Grafana, traces, and how to make the skill your own all
-live in [`examples/sre-bot/README.md`](examples/sre-bot/README.md).
+On a fresh install the first deploy creates the agent and refuses locally
+(exit 2) with the binding command, before uploading anything; the platform API
+refuses the same gap with `422` / `approval_routes.unbound`.
+The
+[permission map](examples/sre-bot/docs/PERMISSION-MAP.md) lists every mutation,
+its approval classification, and the RBAC ceiling.
 
 ## Where to go next
 

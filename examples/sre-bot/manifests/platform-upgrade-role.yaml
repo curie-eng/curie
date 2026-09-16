@@ -1,0 +1,111 @@
+# The identity the platform-upgrade JOB runs as. Read this before applying it.
+#
+#     kubectl apply -f examples/sre-bot/manifests/platform-upgrade-role.yaml
+#
+# ---------------------------------------------------------------------------
+# THIS IS THE BROADEST GRANT IN THIS BUNDLE, BY A LARGE MARGIN
+# ---------------------------------------------------------------------------
+#
+# `helm upgrade` rewrites nearly every namespaced object the release owns:
+# Deployments, StatefulSets, Services, ServiceAccounts, Roles, RoleBindings,
+# Jobs, ConfigMaps, NetworkPolicies, and Helm's own release Secrets. There is no
+# RBAC expression for "may run that one upgrade". The rules below are the honest
+# enumeration of what it needs, and they add up to namespace-admin in all but
+# name: a holder of this credential can read every Secret in the namespace --
+# including the platform API key and the model credential -- and replace any
+# workload in it.
+#
+# Do not apply this because the bundle ships it. Apply it when you have decided
+# that a human-approved, no-argument platform upgrade is worth that credential
+# existing in this namespace.
+#
+# ---------------------------------------------------------------------------
+# WHAT KEEPS IT BOUNDED, AND WHAT DOES NOT
+# ---------------------------------------------------------------------------
+#
+# What does NOT bound it: the connector, the approval gate, or the bot's good
+# behaviour. Those bound who can START the Job. None of them bound what the Job's
+# credential could do if it were used for something else.
+#
+# What DOES bound it:
+#
+#   - **Lifetime.** This is a Job's identity, not a connector's. The token exists
+#     inside a pod that lives for the duration of one upgrade. No long-running
+#     process holds it, and in particular the sandbox -- which is
+#     prompt-injectable -- never sees it.
+#   - **The script, which is yours.** The Job runs
+#     `platform-upgrade/upgrade.sh` from a ConfigMap you create. The bot supplies
+#     no argument: not the version, not the chart, not the values. Every choice
+#     is made in files you wrote.
+#   - **The namespace.** Nothing here is cluster-scoped. It cannot touch another
+#     tenant, another release, or any cluster-wide object.
+#
+# If you are not willing to accept a namespace-admin-equivalent credential
+# existing, do not install this. The bot remains able to REPORT that an upgrade
+# is available (`latest_release`) without it, which is most of the operational
+# value at none of the risk.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: curie-platform-upgrader
+  # CHANGE ME: the namespace the Curie release runs in.
+  namespace: curie
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: curie-platform-upgrader
+  namespace: curie
+rules:
+  # Helm's release state. `secrets` is also what makes this grant equivalent to
+  # namespace-admin, and it cannot be narrowed: Helm stores releases as Secrets
+  # whose names it computes, so `resourceNames` cannot enumerate them ahead of
+  # time, and reading one requires `get` on the kind.
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps", "services", "serviceaccounts", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies", "ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The chart renders the identities its own components run as, so an upgrade
+  # that changes one has to be able to write it. Kubernetes requires the writer
+  # to already hold every permission it grants (privilege escalation prevention),
+  # so this line is only usable for rules this Role itself covers.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only. `helm --wait` polls pod readiness, and the script re-reads the
+  # release afterwards rather than trusting the command's exit code.
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: curie-platform-upgrader
+  namespace: curie
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: curie-platform-upgrader
+subjects:
+  - kind: ServiceAccount
+    name: curie-platform-upgrader
+    # Easy to miss: indented under `subjects`, not `metadata.namespace`. Getting
+    # it wrong does not fail `kubectl apply` -- every object still reports
+    # `created` and the identity simply grants nothing.
+    namespace: curie
+---
+# The upgrade Job's identity is projected by Kubernetes into its own pod, so
+# unlike the connector identities in this directory it needs NO static token
+# Secret. That is a real difference and worth keeping: a static token is a
+# credential that outlives the thing that needed it, and this one is exactly the
+# credential you least want lying around.

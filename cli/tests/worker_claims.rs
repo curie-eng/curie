@@ -575,6 +575,7 @@ fn assert_existing_cluster_status_shape(value: &serde_json::Value) {
             "release_found",
             "release_state",
             "revision",
+            "upgrade",
             "urls",
             "warnings",
         ]),

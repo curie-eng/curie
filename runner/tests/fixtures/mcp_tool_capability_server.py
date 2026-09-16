@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import anyio
 from mcp import Tool, types
@@ -19,6 +20,38 @@ async def list_tools(
     """Serve one or two tools so the client exercises MCP pagination."""
 
     mode = os.environ.get("CURIE_TEST_TOOL_MODE", "unknown")
+    if mode == "policy-catalog":
+        return ListToolsResult(
+            tools=[
+                Tool(
+                    name="read_allowed",
+                    description="Read a test value without changing external state.",
+                    inputSchema={"type": "object"},
+                    annotations=ToolAnnotations(readOnlyHint=True),
+                ),
+                Tool(
+                    name="write_approval",
+                    description="Write one test marker after approval.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                    annotations=ToolAnnotations(readOnlyHint=False),
+                ),
+                Tool(
+                    name="write_denied",
+                    description="A test write forbidden by policy.",
+                    inputSchema={"type": "object"},
+                    annotations=ToolAnnotations(readOnlyHint=False),
+                ),
+                Tool(
+                    name="write_unmatched",
+                    description="A test write omitted from policy.",
+                    inputSchema={"type": "object"},
+                ),
+            ]
+        )
     annotations = None
     if mode in {"read-only", "paginated"}:
         annotations = ToolAnnotations(readOnlyHint=True)
@@ -49,9 +82,13 @@ async def list_tools(
 
 
 async def call_tool(
-    _context: ServerRequestContext[object], _params: types.CallToolRequestParams
+    _context: ServerRequestContext[object], params: types.CallToolRequestParams
 ) -> CallToolResult:
-    return CallToolResult(content=[TextContent(type="text", text="ok")])
+    marker = os.environ.get("CURIE_TEST_CALL_MARKER")
+    if marker:
+        with Path(marker).open("a", encoding="utf-8") as output:
+            output.write(f"{params.name}\n")
+    return CallToolResult(content=[TextContent(type="text", text=f"executed {params.name}")])
 
 
 async def main() -> None:

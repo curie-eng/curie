@@ -310,6 +310,7 @@ mod tests {
             approval_route: None,
             approval_gate_kind: None,
             approval_granted_tool: None,
+            approval_display: None,
             input_tokens: None,
             output_tokens: None,
         };
@@ -328,6 +329,7 @@ mod tests {
             approval_route: Some("managers".to_string()),
             approval_gate_kind: Some("policy".to_string()),
             approval_granted_tool: None,
+            approval_display: None,
             input_tokens: None,
             output_tokens: None,
         };
@@ -343,6 +345,8 @@ mod tests {
             text: "hello".to_string(),
             user: "U1".to_string(),
             ts: "1.0".to_string(),
+            session_id: None,
+            history_ref: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();

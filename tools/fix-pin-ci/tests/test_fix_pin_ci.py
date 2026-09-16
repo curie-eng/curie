@@ -25,9 +25,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 CHECKER = REPO_ROOT / "tools" / "fix-pin-ci" / "check.py"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 PR_TEMPLATE = REPO_ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md"
+BUG_REPORT = REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
 VERIFY_FIX_PIN = REPO_ROOT / "cli" / "scripts" / "verify-fix-pin.sh"
 
 VALID_SELECTOR = "apps/api/tests/test_fix_pin_ci_gate.py::test_exact_declaration"
+LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
+CHART_SELECTOR = "charts/curie/ci/render-assertions.sh"
 PR_CONDITION = re.compile(r"github\.event_name\s*==\s*['\"]pull_request['\"]")
 
 
@@ -37,8 +41,9 @@ def _write_event(
     *,
     action: str = "opened",
     include_body: bool = True,
+    base_ref: str = "next",
 ) -> Path:
-    pull_request: dict[str, object] = {}
+    pull_request: dict[str, object] = {"base": {"ref": base_ref}}
     if include_body:
         pull_request["body"] = body
     event_path = tmp_path / "event.json"
@@ -102,6 +107,18 @@ def _write_fake_curie(tmp_path: Path) -> tuple[Path, Path]:
     )
 
 
+def _gh_issue_payload(
+    gh_labels: str, gh_body: str = "", gh_milestone: str | None = "v0.9.0"
+) -> str:
+    """The gate reads `{labels, body, milestone}` so found:* and train mapping work."""
+    parsed = json.loads(gh_labels)
+    if isinstance(parsed, list):
+        return json.dumps(
+            {"labels": parsed, "body": gh_body, "milestone": gh_milestone}
+        )
+    return gh_labels
+
+
 def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
     """Install a fake ``gh`` in its own directory so PATH shadows nothing else."""
     return _write_fake_binary(
@@ -126,10 +143,15 @@ def _run_checker(
     verifier_stdout: str = "PINNED\n",
     timeout: float | None = None,
     gh_labels: str = "[]",
+    gh_body: str = "",
+    gh_milestone: str | None = "v0.9.0",
     gh_exit: int = 0,
     gh_on_path: bool = True,
+    base_ref: str = "next",
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
-    event_path = _write_event(tmp_path, body, action=action, include_body=include_body)
+    event_path = _write_event(
+        tmp_path, body, action=action, include_body=include_body, base_ref=base_ref
+    )
     curie, call_log = _write_fake_curie(tmp_path)
     binaries, gh_call_log = _write_fake_gh(tmp_path)
     environment = {
@@ -138,7 +160,7 @@ def _run_checker(
         "FIX_PIN_EXIT": str(verifier_exit),
         "FIX_PIN_OUTPUT": verifier_stdout,
         "FIX_PIN_GH_CALL_LOG": str(gh_call_log),
-        "FIX_PIN_GH_LABELS": gh_labels,
+        "FIX_PIN_GH_LABELS": _gh_issue_payload(gh_labels, gh_body, gh_milestone),
         "FIX_PIN_GH_EXIT": str(gh_exit),
         "GITHUB_REPOSITORY": "curie-eng/curie",
         # An empty PATH is how "gh is not installed" is expressed; the checker
@@ -797,7 +819,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
 
     diagnostic_index = _single_step_index(
         steps,
-        lambda step: "docker compose -f compose.dev.yaml logs" in _string(step, "run"),
+        lambda step: "compose.dev.yaml logs" in _string(step, "run"),
         "failure stack diagnostic",
     )
     diagnostic_if = _string(steps[diagnostic_index], "if")
@@ -954,6 +976,10 @@ def test_pull_request_template_documents_the_required_declaration() -> None:
 
 
 BUG_LABELS = '["bug"]'
+FOUND_LIVE_LABELS = '["bug", "found:live"]'
+FOUND_UNIT_LABELS = '["bug", "found:unit"]'
+FOUND_LOCAL_LABELS = '["bug", "found:local"]'
+FOUND_CLUSTER_LABELS = '["bug", "found:cluster"]'
 
 # Split across the slash so this repo's gitleaks `cross-repo-issue-ref` rule does not read the
 # fixture as a real cross-repo citation. The checker must still see the joined form, because
@@ -978,7 +1004,7 @@ def test_closing_a_bug_issue_without_a_declaration_fails_and_names_the_issue(
         "api",
         "repos/curie-eng/curie/issues/12",
         "--jq",
-        "[.labels[].name]",
+        "{labels:[.labels[].name],body:.body,milestone:.milestone.title}",
     ]
 
 
@@ -1123,3 +1149,369 @@ def test_missing_gh_fails_closed_without_calling_curie(tmp_path: Path) -> None:
     assert completed.returncode != 0
     assert "#12" in completed.stderr
     assert not call_log.exists(), "an unavailable label API must not open the gate"
+
+
+def test_unit_pin_for_a_found_live_issue_fails_without_a_waiver(tmp_path: Path) -> None:
+    """A unit selector cannot pin a defect found on a live surface (#2243)."""
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
+        gh_labels=FOUND_LIVE_LABELS,
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "found:live" in completed.stderr, shown
+    assert "unit" in completed.stderr, shown
+    assert "Fix pin waiver:" in completed.stderr, shown
+    assert not call_log.exists(), "a pin below the discovery surface must not reach curie"
+
+
+def test_unit_pin_for_a_found_live_issue_passes_with_a_waiver(tmp_path: Path) -> None:
+    """The explicit waiver is the only way a below-surface pin may proceed."""
+    completed, call_log = _run_checker(
+        tmp_path,
+        (
+            f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n"
+            "Fix pin waiver: live retest is manual; the unit pin covers the regression\n"
+        ),
+        gh_labels=FOUND_LIVE_LABELS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(call_log.read_text(encoding="utf-8")) == [
+        "dev",
+        "verify-fix-pin",
+        "HEAD",
+        VALID_SELECTOR,
+    ]
+
+
+def test_live_pin_for_a_found_live_issue_passes_without_a_waiver(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LIVE_SELECTOR}\n",
+        gh_labels=FOUND_LIVE_LABELS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(call_log.read_text(encoding="utf-8")) == [
+        "dev",
+        "verify-fix-pin",
+        "HEAD",
+        LIVE_SELECTOR,
+    ]
+
+
+def test_helm_render_pin_for_a_found_live_issue_fails_without_a_waiver(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {CHART_SELECTOR}\n",
+        gh_labels=FOUND_LIVE_LABELS,
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "found:live" in completed.stderr, shown
+    assert "cluster" in completed.stderr, shown
+    assert not call_log.exists(), "a helm-render pin must not pass for a live-found issue"
+
+
+def test_unit_pin_for_a_found_unit_issue_passes_without_a_waiver(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
+        gh_labels=FOUND_UNIT_LABELS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert call_log.exists(), "an at-surface pin must still be verified"
+
+
+def test_unit_pin_for_a_found_local_issue_fails_without_a_waiver(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
+        gh_labels=FOUND_LOCAL_LABELS,
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "found:local" in completed.stderr, shown
+    assert not call_log.exists(), "a unit pin must not pass for a local-found issue"
+
+
+def test_helm_render_pin_for_a_found_cluster_issue_passes_without_a_waiver(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {CHART_SELECTOR}\n",
+        gh_labels=FOUND_CLUSTER_LABELS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(call_log.read_text(encoding="utf-8")) == [
+        "dev",
+        "verify-fix-pin",
+        "HEAD",
+        CHART_SELECTOR,
+    ]
+
+
+def test_unlabeled_bug_with_a_unit_pin_keeps_no_tier_floor(tmp_path: Path) -> None:
+    """Existing bugs without a found:* label keep the pre-#2243 behaviour."""
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert call_log.exists(), "an unlabeled bug must still verify a declared selector"
+
+
+def test_waiver_without_a_reason_fails_closed_without_calling_curie(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\nFix pin waiver:\n",
+        gh_labels=FOUND_LIVE_LABELS,
+    )
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "Fix pin waiver" in completed.stderr
+    assert not call_log.exists(), "an unexplained waiver must not reach curie"
+
+
+def test_duplicate_waiver_lines_fail_closed_without_calling_curie(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        (
+            f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n"
+            "Fix pin waiver: first\n"
+            "Fix pin waiver: second\n"
+        ),
+        gh_labels=FOUND_LIVE_LABELS,
+    )
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "Fix pin waiver" in completed.stderr
+    assert not call_log.exists(), "duplicate waivers must not reach curie"
+
+
+def test_pin_tier_comes_from_selector_location_not_from_prose(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        (
+            f"Closes #12\n\nThis pin is a live Slack test.\n"
+            f"Fix pin: {VALID_SELECTOR}\n"
+        ),
+        gh_labels=FOUND_LIVE_LABELS,
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "unit" in completed.stderr, shown
+    assert not call_log.exists(), "prose claiming a higher tier must not raise the pin"
+
+
+def test_found_live_in_the_issue_body_without_the_label_still_raises_the_floor(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_body="### Discovery surface\n\nfound:live\n",
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "found:live" in completed.stderr, shown
+    assert not call_log.exists()
+
+
+def test_found_live_mentioned_in_issue_prose_does_not_raise_the_floor(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_body=(
+            "### Discovery surface\n\nfound:unit\n\n"
+            "### What happened\n\nThis was not found:live; it failed in pytest.\n"
+        ),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert call_log.exists(), "narrative found:* mentions must not raise the floor"
+
+
+def test_strictest_found_label_across_closed_bugs_is_the_floor(tmp_path: Path) -> None:
+    """A fake gh returns one label list; the gate must still fail on found:live."""
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12, #13\n\nFix pin: {VALID_SELECTOR}\n",
+        gh_labels='["bug", "found:unit", "found:live"]',
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "found:live" in completed.stderr, shown
+    assert not call_log.exists()
+
+
+def test_python_suite_collects_the_fix_pin_gate_tests() -> None:
+    text = PYPROJECT.read_text(encoding="utf-8")
+    assert '"tools/fix-pin-ci/tests"' in text
+
+
+def test_bug_report_template_records_the_discovery_surface() -> None:
+    template = BUG_REPORT.read_text(encoding="utf-8")
+    for label in ("found:unit", "found:local", "found:cluster", "found:live"):
+        assert label in template, f"bug template must name {label}"
+
+
+def test_pull_request_template_documents_the_tier_waiver() -> None:
+    template = PR_TEMPLATE.read_text(encoding="utf-8")
+    assert "Fix pin waiver: <reason>" in template
+    assert "found:live" in template
+
+
+FEATURE_MILESTONE = "v0.8.6"
+PATCH_MILESTONE = "v0.8.5"
+MAPPING_PATH = REPO_ROOT / "tools" / "fix-pin-ci" / "milestone-trains.json"
+NA_BODY = "Closes #12\n\nFix pin: n/a - the fix is a chart template with no test surface\n"
+
+
+def test_matching_milestone_train_passes(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone=FEATURE_MILESTONE,
+        base_ref="next",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("SKIPPED: Fix pin declared not applicable")
+    assert _gh_call_log(tmp_path).exists(), "a closed issue must be looked up even when excused"
+    assert not call_log.exists(), "an excused declaration must not run curie"
+
+
+def test_matching_patch_milestone_on_main_passes(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref="main",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("SKIPPED: Fix pin declared not applicable")
+    assert _gh_call_log(tmp_path).exists(), "a closed issue must be looked up even when excused"
+    assert not call_log.exists(), "an excused declaration must not run curie"
+
+
+def test_mismatched_milestone_train_fails(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref="next",
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "#12" in completed.stderr, shown
+    assert PATCH_MILESTONE in completed.stderr, shown
+    assert "main" in completed.stderr, shown
+    assert "next" in completed.stderr, shown
+    assert not call_log.exists(), "a train mismatch must not reach curie"
+
+
+def test_missing_milestone_on_a_bug_fails(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone=None,
+        base_ref="next",
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "#12" in completed.stderr, shown
+    assert "milestone" in completed.stderr.lower(), shown
+    assert not call_log.exists(), "a bug without a milestone must not reach curie"
+
+
+def test_missing_milestone_on_a_non_bug_is_allowed(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        "Closes #12\n",
+        gh_labels='["enhancement"]',
+        gh_milestone=None,
+        base_ref="next",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "SKIPPED: no Fix pin declaration"
+    assert not call_log.exists(), "a non bug without a milestone must not run curie"
+
+
+def test_mismatched_train_fails_even_when_a_selector_is_declared(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {VALID_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref="next",
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert PATCH_MILESTONE in completed.stderr, shown
+    assert not call_log.exists(), "a train mismatch must not reach the verifier"
+
+
+def test_unknown_milestone_fails_closed(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        NA_BODY,
+        gh_labels=BUG_LABELS,
+        gh_milestone="v9.9.9",
+        base_ref="next",
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "v9.9.9" in completed.stderr, shown
+    assert not call_log.exists(), "an unmapped milestone must not open the gate"
+
+
+def test_milestone_mapping_sends_patch_to_main_and_feature_to_next() -> None:
+    mapping = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
+    trains = mapping["trains"]
+    milestones = mapping["milestones"]
+
+    assert trains == {"patch": "main", "feature": "next"}
+    assert milestones[FEATURE_MILESTONE] == "feature"
+    assert milestones[PATCH_MILESTONE] == "patch"
+    assert set(trains.values()) == {"main", "next"}
+    assert set(milestones.values()) <= {"patch", "feature"}
+
+
+def test_agents_md_cites_the_mapping_next_to_the_release_train_table() -> None:
+    agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    heading = "## Release train, branch, and commit conventions"
+    start = agents.index(heading)
+    window = agents[start : start + 2500]
+
+    assert "milestone-trains.json" in window
+    assert "`main`" in window and "`next`" in window

@@ -347,10 +347,11 @@ services:
   # The API host port 28000 comes from the dev stack's 2xxxx host-port block
   # (host port = "2" + the service's container port).
 
-  # One-shot: bring the Postgres schema to head before api/worker boot. The API
-  # image ships the Alembic tree but its CMD only runs uvicorn, so migrations
-  # run here (mirrors the chart's api migrate init container). Migration 0001
-  # creates the `curie` schema, so this also gates on Postgres being reachable.
+  # One-shot upgrade phase: plan then apply migrations before api/worker boot
+  # (#2300). The API image ships the Alembic tree but its CMD only runs
+  # uvicorn; this service is the compose sibling of the chart schema-migrate
+  # Job. Migration 0001 creates the `curie` schema, so this also gates on
+  # Postgres being reachable.
   #
   # CURIE_BASE_TAG overrides the tag pulled for the api image (and, below,
   # the worker-local overlay's FROM base) in one shot. Defaults to `latest`
@@ -366,7 +367,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
+    command: ["python", "-m", "curie_api.schema_compat", "upgrade"]
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/postgres
       DB_SCHEMA: curie
@@ -422,6 +423,14 @@ services:
       LANGFUSE_HOST: http://langfuse-web:3000
       LANGFUSE_PUBLIC_KEY: pk-lf-curie-dev
       LANGFUSE_SECRET_KEY: sk-lf-curie-dev
+      # GitHub review-feedback ingress stays inert unless explicitly enabled.
+      # These credentials reach only the API control plane; runner sandboxes do
+      # not receive the App private key or webhook HMAC secret.
+      GITHUB_REVIEW_INGRESS_ENABLED: ${GITHUB_REVIEW_INGRESS_ENABLED:-false}
+      GITHUB_REVIEW_RECONCILER_INTERVAL_S: ${GITHUB_REVIEW_RECONCILER_INTERVAL_S:-5}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-dev-webhook-secret}
       # Approval user-group authorizers (#420) look up Slack usergroup
       # membership from the API itself, so the API reads the same bot token the
       # worker and dispatcher use. Empty by default: the Slack-free local loop

@@ -16,27 +16,252 @@ this boundary and nothing above it is. ``aci-protocol`` is never mocked.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
+import os
 import time
-from collections.abc import AsyncIterator
+import uuid
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
     HookMatcher,
     SdkPluginConfig,
+    ServerToolResultBlock,
+    ServerToolUseBlock,
     StreamEvent,
     TaskBudget,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
 )
-from claude_agent_sdk.types import CanUseTool, McpSdkServerConfig, PermissionMode
+from claude_agent_sdk._cli_version import __cli_version__
+from claude_agent_sdk._internal.session_store import project_key_for_directory
+from claude_agent_sdk.types import (
+    CanUseTool,
+    McpSdkServerConfig,
+    PermissionMode,
+    SessionKey,
+    SessionStore,
+    SessionStoreEntry,
+)
 
+from .history import ConversationMessage, HarnessReplayState
 from .mcp_argv import install as install_mcp_argv_offload
 
 install_mcp_argv_offload()
 
 logger = logging.getLogger(__name__)
+
+_SDK_SESSION_NAMESPACE = uuid.UUID("83efb74f-f09e-4db6-b898-9ed8d7084ba8")
+
+
+class _SeededSessionStore:
+    """SDK mirror seeded from portable messages or an optional native checkpoint."""
+
+    def __init__(
+        self,
+        key: SessionKey,
+        entries: list[SessionStoreEntry],
+        *,
+        checkpoint_required: bool,
+    ) -> None:
+        self._key = key
+        self._entries = json.loads(json.dumps(entries))
+        self._exported_from = len(entries)
+        self._checkpoint_required = checkpoint_required
+
+    async def append(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
+        if key == self._key:
+            self._entries.extend(json.loads(json.dumps(entries)))
+
+    async def load(self, key: SessionKey) -> list[SessionStoreEntry] | None:
+        return (
+            cast("list[SessionStoreEntry]", json.loads(json.dumps(self._entries)))
+            if key == self._key and self._entries
+            else None
+        )
+
+    async def export_replay_state(self) -> HarnessReplayState | None:
+        """Return a full checkpoint once, then only newly mirrored SDK entries."""
+
+        if self._checkpoint_required:
+            kind = "checkpoint"
+            selected = self._entries
+        else:
+            kind = "delta"
+            selected = self._entries[self._exported_from :]
+        self._checkpoint_required = False
+        self._exported_from = len(self._entries)
+        if not selected:
+            return None
+        return HarnessReplayState(
+            harness="claude",
+            kind=kind,
+            entries=tuple(json.loads(json.dumps(selected))),
+        )
+
+
+@dataclass(frozen=True)
+class StructuredResume:
+    """Claude SDK options needed to reconstruct one portable prefix."""
+
+    session_id: str
+    resume: str | None
+    session_store: SessionStore | None
+    session_key: SessionKey
+
+
+def build_structured_resume(
+    messages: tuple[ConversationMessage, ...],
+    *,
+    curie_session_id: str,
+    cwd: str | None,
+    harness_replay: HarnessReplayState | None = None,
+) -> StructuredResume:
+    """Materialize portable messages into the SDK's ephemeral resume envelope.
+
+    Portable role/content is always sufficient. When the matching harness left
+    an opaque native checkpoint, it is preferred to retain the SDK's exact
+    cache-breakpoint shape; otherwise UUIDs and the local JSONL envelope are
+    deterministic adapter details reconstructed on this runner. Native entries
+    are an optional optimization, never Curie's portable persistence contract.
+    """
+
+    session_id = str(uuid.uuid5(_SDK_SESSION_NAMESPACE, curie_session_id))
+    key: SessionKey = {
+        "project_key": project_key_for_directory(cwd),
+        "session_id": session_id,
+    }
+    if (
+        harness_replay is not None
+        and harness_replay.harness == "claude"
+        and harness_replay.kind == "checkpoint"
+        and harness_replay.entries
+    ):
+        native_entries = cast(
+            "list[SessionStoreEntry]",
+            json.loads(json.dumps(harness_replay.entries)),
+        )
+        store = _SeededSessionStore(
+            key,
+            native_entries,
+            checkpoint_required=False,
+        )
+        return StructuredResume(
+            session_id=session_id,
+            resume=session_id,
+            session_store=cast("SessionStore", store),
+            session_key=key,
+        )
+
+    if not messages:
+        store = _SeededSessionStore(key, [], checkpoint_required=True)
+        return StructuredResume(
+            session_id=session_id,
+            resume=None,
+            session_store=cast("SessionStore", store),
+            session_key=key,
+        )
+
+    effective_cwd = str(Path(cwd).resolve()) if cwd is not None else os.getcwd()
+    entries: list[SessionStoreEntry] = []
+    parent_uuid: str | None = None
+    for index, message in enumerate(messages):
+        canonical = json.dumps(message.to_dict(), separators=(",", ":"), sort_keys=True)
+        entry_uuid = str(uuid.uuid5(uuid.UUID(session_id), f"{index}:{canonical}"))
+        entry = cast(
+            "SessionStoreEntry",
+            {
+                "parentUuid": parent_uuid,
+                "isSidechain": False,
+                "userType": "external",
+                "cwd": effective_cwd,
+                "sessionId": session_id,
+                "version": __cli_version__,
+                "gitBranch": "",
+                "type": message.role,
+                "message": message.to_dict(),
+                "uuid": entry_uuid,
+                # This is adapter envelope metadata, not conversation time. Keep it
+                # stable so separate runners materialize identical local transcripts.
+                "timestamp": "1970-01-01T00:00:00.000Z",
+            },
+        )
+        entries.append(entry)
+        parent_uuid = entry_uuid
+    store = _SeededSessionStore(key, entries, checkpoint_required=True)
+    return StructuredResume(
+        session_id=session_id,
+        resume=session_id,
+        session_store=cast("SessionStore", store),
+        session_key=key,
+    )
+
+
+def _content_block_to_dict(block: object) -> dict[str, Any] | None:
+    if isinstance(block, TextBlock):
+        return {"type": "text", "text": block.text}
+    if isinstance(block, ThinkingBlock):
+        return {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
+    if isinstance(block, ToolUseBlock):
+        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+    if isinstance(block, ToolResultBlock):
+        result: dict[str, Any] = {
+            "type": "tool_result",
+            "tool_use_id": block.tool_use_id,
+            "content": block.content,
+        }
+        if block.is_error is not None:
+            result["is_error"] = block.is_error
+        return result
+    if isinstance(block, ServerToolUseBlock):
+        return {
+            "type": "server_tool_use",
+            "id": block.id,
+            "name": block.name,
+            "input": block.input,
+        }
+    if isinstance(block, ServerToolResultBlock):
+        return {
+            "type": "server_tool_result",
+            "tool_use_id": block.tool_use_id,
+            "content": block.content,
+        }
+    return None
+
+
+def model_message_to_conversation(message: object) -> ConversationMessage | None:
+    """Project one SDK message into Curie's portable role/content shape."""
+
+    if isinstance(message, UserMessage):
+        if isinstance(message.content, str):
+            content: str | list[dict[str, Any]] = message.content
+        else:
+            content = [
+                projected
+                for block in message.content
+                if (projected := _content_block_to_dict(block)) is not None
+            ]
+        return ConversationMessage(role="user", content=content)
+    if isinstance(message, AssistantMessage):
+        return ConversationMessage(
+            role="assistant",
+            content=[
+                projected
+                for block in message.content
+                if (projected := _content_block_to_dict(block)) is not None
+            ],
+        )
+    return None
+
 
 _ALLOWED_PARTIAL_BOUNDARY_TYPES = frozenset(("message_start", "content_block_start"))
 
@@ -105,6 +330,8 @@ def build_options(
     max_turns: int,
     max_budget_usd: float | None,
     resume: str | None,
+    session_id: str | None = None,
+    session_store: SessionStore | None = None,
     thinking: dict[str, Any] | None = None,
     task_budget_hint: int | None = None,
     env: dict[str, str] | None = None,
@@ -112,14 +339,16 @@ def build_options(
     mcp_servers: dict[str, McpSdkServerConfig] | None = None,
     can_use_tool: CanUseTool | None = None,
     cwd: str | None = None,
+    web_search_enabled: bool = True,
+    policy_disallowed_tools: Iterable[str] = (),
     disallowed_tools: list[str] | tuple[str, ...] | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
-    ``resume`` is the rehydrate path (ADR-0003, stateless-first): when a history
-    ref is supplied it is passed as the SDK ``resume`` session id so a resumed
-    thread reconstructs its history from the store rather than assuming a
-    surviving in-RAM process.
+    ``resume`` is the provider-native rehydrate path (ADR-0003,
+    stateless-first). For Curie's portable history it names an ephemeral SDK
+    session envelope rebuilt by :func:`build_structured_resume`; it never points
+    the provider at Curie's durable state URL or assumes surviving local state.
 
     The three ACI budget fields map to distinct SDK controls: ``max_budget_usd``
     is the daily USD cap enforced natively; ``task_budget_hint`` becomes the SDK
@@ -142,15 +371,46 @@ def build_options(
     # install has always said and must keep saying.
     thinking_option: dict[str, Any] = {"thinking": cast("Any", thinking)} if thinking else {}
     cwd_option: dict[str, Any] = {"cwd": cwd} if cwd is not None else {}
+    # The explicit operator denylist is an ordered configuration surface. Keep
+    # its order stable, then append the policy projection deterministically.
+    # A set-only merge reordered CURIE_DISALLOWED_TOOLS and broke parity with
+    # the fake session; filtering the policy tail also deduplicates names that
+    # both sources deny without changing the operator's declared order.
+    explicit_disallowed = list(dict.fromkeys(disallowed_tools or ()))
+    explicit_names = set(explicit_disallowed)
+    disallowed_tools = [
+        *explicit_disallowed,
+        *sorted(set(policy_disallowed_tools) - explicit_names),
+    ]
+    if not web_search_enabled:
+        disallowed_tools = [
+            "WebSearch",
+            *(tool_name for tool_name in disallowed_tools if tool_name != "WebSearch"),
+        ]
     return ClaudeAgentOptions(
         plugins=plugins,
         model=model,
+        # Pin the SDK's complete Claude Code tool surface explicitly.  Coding
+        # tools are a platform session capability, not something a bundle skill
+        # opts into; ``allowed_tools`` stays empty so this does not pre-authorize
+        # any call or bypass Curie's permission/approval callbacks.
+        tools=cast("Any", {"type": "preset", "preset": "claude_code"}),
+        allowed_tools=[],
+        # Anthropic documents WebSearch as a provider-executed server tool.
+        # ``disallowed_tools`` removes a tool from the model catalogue; unlike
+        # ``allowed_tools`` it is not a permission preauthorization. See:
+        # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
+        # https://github.com/anthropics/claude-agent-sdk-python#using-tools
+        disallowed_tools=disallowed_tools,
         **thinking_option,
         **cwd_option,
         system_prompt=system_prompt,
         max_turns=max_turns,
         max_budget_usd=max_budget_usd,
         resume=resume,
+        session_id=session_id if resume is None else None,
+        session_store=session_store,
+        session_store_flush="eager" if session_store is not None else "batched",
         task_budget=task_budget,
         permission_mode=permission_mode,
         can_use_tool=can_use_tool,
@@ -162,12 +422,6 @@ def build_options(
         # In-process platform tools (the approval-request gate, ADR-0010).
         mcp_servers=cast("Any", mcp_servers or {}),
         include_partial_messages=True,
-        # Optional operator deny list (#2429). Empty/None keeps the SDK default
-        # (no tools removed). Names are removed from the model context and cannot
-        # be used even under bypassPermissions. This removes a tool, not the
-        # capability behind it: it does not revoke CURIE_STATE_TOKEN, which a
-        # still-permitted tool can still use to reach the same API directly.
-        disallowed_tools=list(disallowed_tools or ()),
     )
 
 
@@ -226,6 +480,14 @@ class ClaudeAgentSession:
 
     async def close(self) -> None:
         await self._client.disconnect()
+
+    async def export_replay_state(self) -> HarnessReplayState | None:
+        """Export the provider transcript checkpoint/delta mirrored this turn."""
+
+        store = self._options.session_store
+        if isinstance(store, _SeededSessionStore):
+            return await store.export_replay_state()
+        return None
 
     async def ensure_mcp_server(self, name: str) -> bool:
         """Confirm the SDK session's own MCP connection to ``name`` (#2634).

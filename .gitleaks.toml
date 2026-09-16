@@ -151,7 +151,9 @@ paths = [
 # obviously invented fixture id: it spells a word (C0MANAGERS), repeats a
 # character (C0FFFFFF6), or is mostly zeroes (C000000A01). That is the bar for
 # a new one: a reader must be able to tell at a glance that it is not somebody's
-# channel. Adding to this list should be rare; prefer reusing C0EXAMPLE1.
+# channel. `C0EXAMPLE` reserves the documentation-placeholder family (including
+# numbered variants) that deploy target validation must name and reject.
+# Adding to this list should be rare; prefer reusing C0EXAMPLE1.
 stopwords = [
   "C000000A01",
   "C000000A02",
@@ -172,6 +174,7 @@ stopwords = [
   "C000000M01",
   "C000000NEW",
   "C000000OLD",
+  "C000000P01",
   "C000000R01",
   "C000000R02",
   "C000000R03",
@@ -206,7 +209,7 @@ stopwords = [
   "C0DDDDDD4",
   "C0EEEEEE5",
   "C0ELSE001",
-  "C0EXAMPLE1",
+  "C0EXAMPLE",
   "C0EXEC0000",
   "C0FFFFFF6",
   "C0FFFFFF7",

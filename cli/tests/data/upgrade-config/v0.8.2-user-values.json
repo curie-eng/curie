@@ -1,0 +1,18 @@
+{
+  "_fixture": {
+    "releasedChart": "v0.8.2",
+    "source": "user-supplied helm values overlay from a released v0.8.2 chart, not current-chart defaults"
+  },
+  "ui": { "deploy": false },
+  "worker": {
+    "extraEnv": [
+      { "name": "CURIE_RUNNER_TOTAL_TIMEOUT_S", "value": "92" },
+      { "name": "CURIE_SHIMMER", "value": "false" }
+    ]
+  },
+  "api": {
+    "githubAppExistingSecret": "acme-github-app",
+    "githubAppExistingSecretKey": "privateKey",
+    "githubAppPrivateKey": "-----BEGIN PRIVATE KEY-----\nMII-test\n-----END PRIVATE KEY-----"
+  }
+}

@@ -16,14 +16,16 @@
 //! reachable when the operator asks for it; `--set-file` above is still what a
 //! chart-held connect does.
 
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use anyhow::Result;
-use serde::Serialize;
+use tokio::io::AsyncWriteExt;
 
 use crate::ops::{
-    fetch_release_values, plain, require_on_path, resolve_existing_secret_ref, run_capture,
-    run_step, CommonOpts, OpsCommand,
+    helm_history_cmd, parse_helm_history, plain, require_on_path, resolve_existing_secret_ref,
+    run_capture, CommonOpts, OpsCommand,
 };
 
 #[derive(Debug, Clone)]
@@ -316,10 +318,9 @@ pub(crate) fn configured_existing_secret(
 /// chart-held connect (`--private-key`, no `--existing-secret`) that we have
 /// not yet checked against the release.
 ///
-/// Cheap predicate so a `--disconnect` or an explicit BYO connect never pays
-/// for a `helm get values` round trip -- neither needs anything from the
-/// release, and on a real run the read would add a hard failure when the
-/// cluster is unreachable to two paths that never had one.
+/// This predicate scopes only the credential-conflict decision. Every real
+/// invocation now reads one exact revision's values to derive the sandbox
+/// inventory, including disconnect and explicit BYO paths.
 pub(crate) fn needs_byo_conflict_check(opts: &GithubAppOpts) -> bool {
     !opts.disconnect
         && opts.existing_secret.trim().is_empty()
@@ -328,15 +329,11 @@ pub(crate) fn needs_byo_conflict_check(opts: &GithubAppOpts) -> bool {
 
 /// True when THIS invocation must read the release's values before it acts.
 ///
-/// A `--dry-run` answers false unconditionally. `cli/CLAUDE.md` makes it a
-/// load-bearing invariant that pure argv builders never fetch and that
-/// `--dry-run` never touches the network, and that invariant outranks the
-/// convenience of refusing a plan: a best-effort read that silently degrades to
-/// "no conflict" the moment `helm get values` fails is worse than no read at
-/// all, because automation cannot tell a conflict-checked plan from a plan
-/// whose check was skipped. Nothing is lost -- [`guard_byo_key_conflict`] runs
-/// on the real invocation BEFORE any mutation, so a misconfigured release is
-/// never written to either way.
+/// The chart-held credential-conflict check needs a values read on a real run.
+/// The caller also reads values for every real invocation's sandbox inventory;
+/// this predicate remains scoped to the older conflict guard so its sibling
+/// policy can be tested independently. A `--dry-run` is always offline.
+#[cfg(test)]
 pub(crate) fn needs_release_read(opts: &GithubAppOpts) -> bool {
     !opts.common.dry_run && needs_byo_conflict_check(opts)
 }
@@ -363,7 +360,7 @@ pub(crate) fn needs_release_read(opts: &GithubAppOpts) -> bool {
 /// but not a string is refused without a name rather than read as "nothing
 /// configured", which is the same false success one layer down.
 ///
-/// Called with `existing = None` under `--dry-run` (see [`needs_release_read`]),
+/// Called with `existing = None` under `--dry-run`,
 /// where it is a no-op: the plan is offline, and the refusal comes on the real
 /// invocation before helm is ever run.
 pub(crate) fn guard_byo_key_conflict(
@@ -429,6 +426,1026 @@ fn opaque_byo_field_error(
          back to the chart-held key",
     )
     .into()
+}
+
+const SANDBOX_API_VERSION: &str = "extensions.agents.x-k8s.io/v1beta1";
+const SANDBOX_TEMPLATE_KIND: &str = "SandboxTemplate";
+const SANDBOX_POOL_KIND: &str = "SandboxWarmPool";
+const SANDBOX_RECOVERY_ATTEMPTS: usize = 3;
+const KUBECTL_REQUEST_TIMEOUT: &str = "5s";
+const KUBECTL_WALL_TIMEOUT: Duration = Duration::from_secs(7);
+const SANDBOX_RECONCILE_WALL_TIMEOUT: Duration = Duration::from_secs(30);
+const HELM_READ_WALL_TIMEOUT: Duration = Duration::from_secs(15);
+const HELM_MUTATION_WALL_TIMEOUT: Duration = Duration::from_secs(200);
+const KUBECTL_ROLLOUT_WALL_TIMEOUT: Duration = Duration::from_secs(200);
+const HELM_MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
+const HELM_RELEASE_NAME_ANNOTATION: &str = "meta.helm.sh/release-name";
+const HELM_RELEASE_NAMESPACE_ANNOTATION: &str = "meta.helm.sh/release-namespace";
+const RECOVERY_OPERATION_ANNOTATION: &str = "curietech.ai/github-app-recovery";
+
+#[derive(Clone, Copy)]
+struct HelmOwnership<'a> {
+    release: &'a str,
+    namespace: &'a str,
+}
+
+#[derive(Debug)]
+struct RecoverySandboxMarker {
+    kind: String,
+    name: String,
+    operation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HelmHistorySnapshot {
+    active_revision: u32,
+    head_revision: u32,
+    head_status: String,
+}
+
+impl HelmHistorySnapshot {
+    fn is_normal_failed_successor_of(&self, prior: &Self) -> bool {
+        self.active_revision == prior.active_revision
+            && prior
+                .head_revision
+                .checked_add(1)
+                .is_some_and(|successor| self.head_revision == successor)
+            && self.head_status == "failed"
+    }
+}
+
+#[derive(Debug)]
+enum SandboxReconcileFailure {
+    RevisionDrift {
+        expected: Box<HelmHistorySnapshot>,
+        observed: Box<HelmHistorySnapshot>,
+        phase: String,
+        recovery_object: Option<RecoverySandboxMarker>,
+    },
+    RevisionIndeterminate {
+        expected: Box<HelmHistorySnapshot>,
+        phase: String,
+        recovery_object: Option<RecoverySandboxMarker>,
+    },
+    StableRevisionFailure {
+        proven_snapshot: Box<HelmHistorySnapshot>,
+        error: anyhow::Error,
+    },
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SandboxReconcileFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+fn helm_mutation_wall_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("CURIE_TEST_GITHUB_APP_HELM_TIMEOUT_MS") {
+        if let Ok(milliseconds) = raw.parse::<u64>() {
+            if (1..=HELM_MUTATION_WALL_TIMEOUT.as_millis() as u64).contains(&milliseconds) {
+                return Duration::from_millis(milliseconds);
+            }
+        }
+    }
+    HELM_MUTATION_WALL_TIMEOUT
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedSandboxInventory {
+    deploy: bool,
+    agents: Vec<String>,
+}
+
+impl ExpectedSandboxInventory {
+    fn from_values(values: Option<&serde_json::Value>) -> Result<Self> {
+        let sandbox = values.and_then(|value| value.get("agentSandbox"));
+        let deploy = match sandbox.and_then(|value| value.get("deploy")) {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Bool(value)) => *value,
+            Some(_) => anyhow::bail!("agentSandbox.deploy in Helm values is not a boolean"),
+        };
+        let mut agents = match sandbox.and_then(|value| value.get("connectorSecrets")) {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Object(values)) => values.keys().cloned().collect(),
+            Some(_) => anyhow::bail!("agentSandbox.connectorSecrets in Helm values is not a map"),
+        };
+        agents.sort();
+        Ok(Self { deploy, agents })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DesiredSandboxObject {
+    kind: String,
+    name: String,
+    template_ref: Option<String>,
+    manifest: serde_json::Value,
+}
+
+impl DesiredSandboxObject {
+    fn key(&self) -> (String, String) {
+        (self.kind.clone(), self.name.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DesiredSandboxSet {
+    objects: Vec<DesiredSandboxObject>,
+}
+
+impl DesiredSandboxSet {
+    fn parse(manifest: &str) -> Result<Self> {
+        let mut objects = Vec::new();
+        for document in serde_norway::Deserializer::from_str(manifest) {
+            let value = serde_json::Value::deserialize(document)
+                .map_err(|_| anyhow::anyhow!("could not parse the deployed Helm manifest"))?;
+            let Some(kind) = value.get("kind").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if kind != SANDBOX_TEMPLATE_KIND && kind != SANDBOX_POOL_KIND {
+                continue;
+            }
+            if value.get("apiVersion").and_then(serde_json::Value::as_str)
+                != Some(SANDBOX_API_VERSION)
+            {
+                continue;
+            }
+            let name = value
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .context("a sandbox object in the deployed Helm manifest has no metadata.name")?
+                .to_string();
+            let template_ref = if kind == SANDBOX_POOL_KIND {
+                Some(
+                    value
+                        .pointer("/spec/sandboxTemplateRef/name")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .context(
+                            "a SandboxWarmPool in the deployed Helm manifest has no sandboxTemplateRef.name",
+                        )?
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            objects.push(DesiredSandboxObject {
+                kind: kind.to_string(),
+                name,
+                template_ref,
+                manifest: value,
+            });
+        }
+        objects.sort_by_key(|object| {
+            (
+                if object.kind == SANDBOX_TEMPLATE_KIND {
+                    0
+                } else {
+                    1
+                },
+                object.name.clone(),
+            )
+        });
+        let set = Self { objects };
+        set.validate_pairs()?;
+        Ok(set)
+    }
+
+    fn validate_pairs(&self) -> Result<()> {
+        let mut keys = BTreeSet::new();
+        let templates: BTreeSet<&str> = self
+            .objects
+            .iter()
+            .filter(|object| object.kind == SANDBOX_TEMPLATE_KIND)
+            .map(|object| object.name.as_str())
+            .collect();
+        let mut referenced = BTreeSet::new();
+        for object in &self.objects {
+            if !keys.insert(object.key()) {
+                anyhow::bail!(
+                    "the deployed Helm manifest contains duplicate {} {}",
+                    object.kind,
+                    object.name
+                );
+            }
+            if let Some(template_ref) = object.template_ref.as_deref() {
+                if !templates.contains(template_ref) {
+                    anyhow::bail!(
+                        "SandboxWarmPool {} references missing SandboxTemplate {}",
+                        object.name,
+                        template_ref
+                    );
+                }
+                referenced.insert(template_ref);
+            }
+        }
+        if let Some(unpaired) = templates.difference(&referenced).next() {
+            anyhow::bail!("SandboxTemplate {unpaired} has no SandboxWarmPool pair");
+        }
+        Ok(())
+    }
+
+    fn validate_inventory(&self, expected: &ExpectedSandboxInventory) -> Result<()> {
+        if !expected.deploy {
+            if self.objects.is_empty() {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "agentSandbox.deploy=false but the deployed manifest still owns sandbox objects"
+            );
+        }
+        if self.objects.is_empty() {
+            anyhow::bail!(
+                "the deployed Helm manifest contains no SandboxTemplate/SandboxWarmPool pairs"
+            );
+        }
+
+        let templates: BTreeSet<&str> = self
+            .objects
+            .iter()
+            .filter(|object| object.kind == SANDBOX_TEMPLATE_KIND)
+            .map(|object| object.name.as_str())
+            .collect();
+        let pools: BTreeMap<&str, &DesiredSandboxObject> = self
+            .objects
+            .iter()
+            .filter(|object| object.kind == SANDBOX_POOL_KIND)
+            .map(|object| (object.name.as_str(), object))
+            .collect();
+        let generic = templates
+            .iter()
+            .filter(|name| {
+                name.strip_suffix("-runner").is_some_and(|prefix| {
+                    pools
+                        .get(format!("{prefix}-runner-pool").as_str())
+                        .is_some_and(|pool| pool.template_ref.as_deref() == Some(**name))
+                })
+            })
+            .min_by_key(|name| name.len())
+            .copied()
+            .context("the deployed manifest has no generic SandboxTemplate/SandboxWarmPool pair")?;
+        let prefix = generic
+            .strip_suffix("-runner")
+            .expect("generic candidate has runner suffix");
+        for agent in &expected.agents {
+            let template = format!("{prefix}-agent-{agent}-runner");
+            let pool = format!("{template}-pool");
+            if !templates.contains(template.as_str())
+                || pools
+                    .get(pool.as_str())
+                    .is_none_or(|object| object.template_ref.as_deref() != Some(template.as_str()))
+            {
+                anyhow::bail!(
+                    "agent {agent} is missing expected SandboxTemplate/SandboxWarmPool pair {template} / {pool}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn by_key(&self) -> BTreeMap<(String, String), &serde_json::Value> {
+        self.objects
+            .iter()
+            .map(|object| (object.key(), &object.manifest))
+            .collect()
+    }
+
+    fn preserves(&self, prior: &Self) -> bool {
+        let current = self.by_key();
+        prior
+            .objects
+            .iter()
+            .all(|object| current.get(&object.key()) == Some(&&object.manifest))
+    }
+}
+
+fn helm_manifest_command(opts: &GithubAppOpts, revision: Option<u32>) -> OpsCommand {
+    let mut args = vec![
+        plain("get"),
+        plain("manifest"),
+        plain(&opts.common.release),
+        plain("-n"),
+        plain(&opts.common.namespace),
+    ];
+    if let Some(revision) = revision {
+        args.push(plain("--revision"));
+        args.push(plain(revision.to_string()));
+    }
+    OpsCommand::new("helm", args)
+}
+
+fn helm_values_command(opts: &GithubAppOpts, revision: u32) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("get"),
+            plain("values"),
+            plain(&opts.common.release),
+            plain("-n"),
+            plain(&opts.common.namespace),
+            plain("--revision"),
+            plain(revision.to_string()),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn sandbox_list_command(namespace: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain(
+                "sandboxtemplates.extensions.agents.x-k8s.io,sandboxwarmpools.extensions.agents.x-k8s.io",
+            ),
+            plain("-n"),
+            plain(namespace),
+            plain("-o"),
+            plain("json"),
+            plain(format!("--request-timeout={KUBECTL_REQUEST_TIMEOUT}")),
+        ],
+    )
+}
+
+fn rollback_command(opts: &GithubAppOpts, revision: u32) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("rollback"),
+            plain(&opts.common.release),
+            plain(revision.to_string()),
+            plain("-n"),
+            plain(&opts.common.namespace),
+            plain("--wait"),
+            plain("--timeout"),
+            plain("180s"),
+        ],
+    )
+}
+
+fn rollback_recovery_command(opts: &GithubAppOpts, revision: u32) -> String {
+    rollback_command(opts, revision).display()
+}
+
+async fn run_helm_bounded(
+    command: &OpsCommand,
+    timeout: Duration,
+    operation: &str,
+) -> Result<(bool, String, String)> {
+    tokio::time::timeout(timeout, run_capture(command))
+        .await
+        .map_err(|_| anyhow::anyhow!("{operation} timed out at its wall-clock deadline"))?
+}
+
+async fn current_history_snapshot(opts: &GithubAppOpts) -> Result<HelmHistorySnapshot> {
+    let command = helm_history_cmd(&opts.common);
+    let recovery = command.display();
+    let (ok, out, _) = run_helm_bounded(
+        &command,
+        HELM_READ_WALL_TIMEOUT,
+        "reading Helm release history",
+    )
+    .await?;
+    if !ok {
+        return Err(crate::exit::CliError::failure(format!(
+            "could not capture the deployed Helm revision for release {}",
+            opts.common.release
+        ))
+        .with_fix(format!("inspect it with `{recovery}`"))
+        .into());
+    }
+    let history = parse_helm_history(&out)?;
+    let active_revision = history
+        .iter()
+        .filter(|row| row.status.trim().eq_ignore_ascii_case("deployed"))
+        .map(|row| row.revision)
+        .max()
+        .ok_or_else(|| {
+            crate::exit::CliError::failure(format!(
+                "release {} has no revision Helm marks deployed",
+                opts.common.release
+            ))
+            .with_fix(format!("inspect it with `{recovery}`"))
+        })?;
+    let head = history
+        .iter()
+        .max_by_key(|row| row.revision)
+        .ok_or_else(|| {
+            crate::exit::CliError::failure(format!(
+                "release {} has no revisions in Helm history",
+                opts.common.release
+            ))
+            .with_fix(format!("inspect it with `{recovery}`"))
+        })?;
+    Ok(HelmHistorySnapshot {
+        active_revision,
+        head_revision: head.revision,
+        head_status: head.status.trim().to_ascii_lowercase(),
+    })
+}
+
+async fn read_desired_sandboxes(
+    opts: &GithubAppOpts,
+    revision: Option<u32>,
+) -> Result<DesiredSandboxSet> {
+    let command = helm_manifest_command(opts, revision);
+    let (ok, out, _) = run_helm_bounded(
+        &command,
+        HELM_READ_WALL_TIMEOUT,
+        "reading the Helm release manifest",
+    )
+    .await?;
+    if !ok {
+        anyhow::bail!("helm could not read the deployed manifest")
+    }
+    DesiredSandboxSet::parse(&out)
+}
+
+async fn read_release_values_at_revision(
+    opts: &GithubAppOpts,
+    revision: u32,
+) -> Result<Option<serde_json::Value>> {
+    let command = helm_values_command(opts, revision);
+    let (ok, out, _) = run_helm_bounded(
+        &command,
+        HELM_READ_WALL_TIMEOUT,
+        "reading the Helm release values",
+    )
+    .await?;
+    if !ok {
+        anyhow::bail!("helm could not read the captured revision's values")
+    }
+    let value: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|_| anyhow::anyhow!("helm returned malformed values JSON"))?;
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(_) => Ok(Some(value)),
+        _ => anyhow::bail!("helm returned values JSON that is neither an object nor null"),
+    }
+}
+
+async fn live_sandboxes(namespace: &str) -> Result<BTreeMap<String, serde_json::Value>> {
+    let command = sandbox_list_command(namespace);
+    let (ok, out, err) = tokio::time::timeout(KUBECTL_WALL_TIMEOUT, run_capture(&command))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("kubectl sandbox read timed out at its wall-clock deadline")
+        })??;
+    if !ok {
+        if err.to_ascii_lowercase().contains("deadline")
+            || err.to_ascii_lowercase().contains("timed out")
+        {
+            anyhow::bail!("kubectl sandbox read timed out at its request deadline")
+        }
+        anyhow::bail!("kubectl could not list SandboxTemplate and SandboxWarmPool objects")
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&out).context("kubectl returned malformed sandbox JSON")?;
+    let items = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("kubectl sandbox JSON has no items array")?;
+    let mut live = BTreeMap::new();
+    for item in items {
+        let Some(kind) = item.get("kind").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if kind != SANDBOX_TEMPLATE_KIND && kind != SANDBOX_POOL_KIND {
+            continue;
+        }
+        let name = item
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("a live sandbox object has no metadata.name")?;
+        if live.insert(name.to_string(), item.clone()).is_some() {
+            anyhow::bail!("multiple live sandbox objects share the name {name}");
+        }
+    }
+    Ok(live)
+}
+
+fn value_is_required_subset(desired: &serde_json::Value, live: &serde_json::Value) -> bool {
+    match (desired, live) {
+        (serde_json::Value::Object(desired), serde_json::Value::Object(live)) => {
+            desired.iter().all(|(key, value)| {
+                live.get(key)
+                    .is_some_and(|item| value_is_required_subset(value, item))
+            })
+        }
+        (serde_json::Value::Array(desired), serde_json::Value::Array(live)) => {
+            desired.len() == live.len()
+                && desired
+                    .iter()
+                    .zip(live)
+                    .all(|(desired, live)| value_is_required_subset(desired, live))
+        }
+        _ => desired == live,
+    }
+}
+
+fn validate_live_object(
+    desired: &DesiredSandboxObject,
+    live: &serde_json::Value,
+    ownership: HelmOwnership<'_>,
+) -> Result<()> {
+    if live.get("apiVersion") != desired.manifest.get("apiVersion")
+        || live.get("kind") != desired.manifest.get("kind")
+        || live.pointer("/metadata/name") != desired.manifest.pointer("/metadata/name")
+    {
+        anyhow::bail!("apiVersion, kind, or metadata.name diverges");
+    }
+    if live
+        .pointer("/metadata/labels/app.kubernetes.io~1managed-by")
+        .and_then(serde_json::Value::as_str)
+        != Some("Helm")
+        || live
+            .pointer("/metadata/annotations/meta.helm.sh~1release-name")
+            .and_then(serde_json::Value::as_str)
+            != Some(ownership.release)
+        || live
+            .pointer("/metadata/annotations/meta.helm.sh~1release-namespace")
+            .and_then(serde_json::Value::as_str)
+            != Some(ownership.namespace)
+    {
+        anyhow::bail!("Helm ownership metadata is missing or does not match this release");
+    }
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    let desired_labels = desired
+        .manifest
+        .pointer("/metadata/labels")
+        .unwrap_or(&empty);
+    let live_labels = live.pointer("/metadata/labels").unwrap_or(&empty);
+    let desired_spec = desired
+        .manifest
+        .get("spec")
+        .unwrap_or(&serde_json::Value::Null);
+    let live_spec = live.get("spec").unwrap_or(&serde_json::Value::Null);
+    if !value_is_required_subset(desired_labels, live_labels) {
+        anyhow::bail!("Helm-desired labels diverge");
+    }
+    if !value_is_required_subset(desired_spec, live_spec) {
+        anyhow::bail!("Helm-desired spec diverges");
+    }
+    Ok(())
+}
+
+fn missing_from_live<'a>(
+    desired: &'a DesiredSandboxSet,
+    live: &BTreeMap<String, serde_json::Value>,
+    ownership: HelmOwnership<'_>,
+) -> Result<Vec<&'a DesiredSandboxObject>> {
+    let mut missing = Vec::new();
+    for object in &desired.objects {
+        match live.get(&object.name) {
+            Some(value) => {
+                if let Err(error) = validate_live_object(object, value, ownership) {
+                    anyhow::bail!(
+                        "live sandbox object {} diverges from its Helm-desired state: {error}",
+                        object.name
+                    );
+                }
+            }
+            None => missing.push(object),
+        }
+    }
+    Ok(missing)
+}
+
+async fn create_sandbox(
+    ownership: HelmOwnership<'_>,
+    object: &DesiredSandboxObject,
+    recovery_operation: &str,
+) -> Result<()> {
+    tokio::time::timeout(
+        KUBECTL_WALL_TIMEOUT,
+        create_sandbox_inner(ownership, object, recovery_operation),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("kubectl sandbox create timed out at its wall-clock deadline"))?
+}
+
+async fn create_sandbox_inner(
+    ownership: HelmOwnership<'_>,
+    object: &DesiredSandboxObject,
+    recovery_operation: &str,
+) -> Result<()> {
+    let mut recovery_manifest = object.manifest.clone();
+    let metadata = recovery_manifest
+        .get_mut("metadata")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("a sandbox recovery object has no metadata map")?;
+    let labels = metadata
+        .entry("labels")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("a sandbox recovery object's metadata.labels is not a map")?;
+    labels.insert(
+        HELM_MANAGED_BY_LABEL.to_string(),
+        serde_json::Value::String("Helm".to_string()),
+    );
+    let annotations = metadata
+        .entry("annotations")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("a sandbox recovery object's metadata.annotations is not a map")?;
+    annotations.insert(
+        HELM_RELEASE_NAME_ANNOTATION.to_string(),
+        serde_json::Value::String(ownership.release.to_string()),
+    );
+    annotations.insert(
+        HELM_RELEASE_NAMESPACE_ANNOTATION.to_string(),
+        serde_json::Value::String(ownership.namespace.to_string()),
+    );
+    annotations.insert(
+        RECOVERY_OPERATION_ANNOTATION.to_string(),
+        serde_json::Value::String(recovery_operation.to_string()),
+    );
+    let body = serde_norway::to_string(&recovery_manifest)
+        .context("could not serialize a sandbox recovery object")?;
+    let mut child = tokio::process::Command::new("kubectl")
+        .args([
+            "create",
+            "-n",
+            ownership.namespace,
+            "-f",
+            "-",
+            &format!("--request-timeout={KUBECTL_REQUEST_TIMEOUT}"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to invoke `kubectl`; is it on PATH?")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("could not open kubectl stdin for sandbox recovery")?;
+    stdin
+        .write_all(body.as_bytes())
+        .await
+        .context("could not send a sandbox recovery object to kubectl")?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .await
+        .context("could not wait for kubectl sandbox recovery")?;
+    if !output.status.success() {
+        anyhow::bail!("kubectl could not recreate {} {}", object.kind, object.name);
+    }
+    Ok(())
+}
+
+async fn ensure_reconcile_revision(
+    opts: &GithubAppOpts,
+    expected: &HelmHistorySnapshot,
+    phase: &'static str,
+) -> std::result::Result<(), SandboxReconcileFailure> {
+    let observed = match current_history_snapshot(opts).await {
+        Ok(observed) => observed,
+        Err(_) => {
+            return Err(SandboxReconcileFailure::RevisionIndeterminate {
+                expected: Box::new(expected.clone()),
+                phase: phase.to_string(),
+                recovery_object: None,
+            });
+        }
+    };
+    if &observed == expected {
+        Ok(())
+    } else {
+        Err(SandboxReconcileFailure::RevisionDrift {
+            expected: Box::new(expected.clone()),
+            observed: Box::new(observed),
+            phase: phase.to_string(),
+            recovery_object: None,
+        })
+    }
+}
+
+async fn reconcile_live_sandboxes(
+    opts: &GithubAppOpts,
+    ownership: HelmOwnership<'_>,
+    expected_snapshot: &HelmHistorySnapshot,
+    desired: &DesiredSandboxSet,
+) -> std::result::Result<(), SandboxReconcileFailure> {
+    tokio::time::timeout(
+        SANDBOX_RECONCILE_WALL_TIMEOUT,
+        reconcile_live_sandboxes_inner(opts, ownership, expected_snapshot, desired),
+    )
+    .await
+    .map_err(|_| {
+        SandboxReconcileFailure::Other(anyhow::anyhow!(
+            "sandbox reconciliation timed out at its overall deadline"
+        ))
+    })?
+}
+
+async fn reconcile_live_sandboxes_inner(
+    opts: &GithubAppOpts,
+    ownership: HelmOwnership<'_>,
+    expected_snapshot: &HelmHistorySnapshot,
+    desired: &DesiredSandboxSet,
+) -> std::result::Result<(), SandboxReconcileFailure> {
+    for _ in 0..SANDBOX_RECOVERY_ATTEMPTS {
+        let live = live_sandboxes(ownership.namespace).await?;
+        let missing = missing_from_live(desired, &live, ownership)?;
+        if missing.is_empty() {
+            return ensure_reconcile_revision(
+                opts,
+                expected_snapshot,
+                "after the sandbox reconciliation barrier",
+            )
+            .await;
+        }
+        ensure_reconcile_revision(opts, expected_snapshot, "before a sandbox recovery attempt")
+            .await?;
+        for object in missing {
+            ensure_reconcile_revision(opts, expected_snapshot, "before a sandbox recovery write")
+                .await?;
+            let recovery_operation = uuid::Uuid::new_v4().to_string();
+            let create = create_sandbox(ownership, object, &recovery_operation).await;
+            let recovery_object = || RecoverySandboxMarker {
+                kind: object.kind.clone(),
+                name: object.name.clone(),
+                operation: recovery_operation.clone(),
+            };
+            let observed = match current_history_snapshot(opts).await {
+                Ok(observed) => observed,
+                Err(_) => {
+                    return Err(SandboxReconcileFailure::RevisionIndeterminate {
+                        expected: Box::new(expected_snapshot.clone()),
+                        phase: "after a sandbox recovery write".to_string(),
+                        recovery_object: Some(recovery_object()),
+                    });
+                }
+            };
+            if &observed != expected_snapshot {
+                return Err(SandboxReconcileFailure::RevisionDrift {
+                    expected: Box::new(expected_snapshot.clone()),
+                    observed: Box::new(observed),
+                    phase: "during a sandbox recovery write".to_string(),
+                    recovery_object: Some(recovery_object()),
+                });
+            }
+            if create.is_err() {
+                // A concurrent controller or operator may have won the create
+                // race. Relist immediately and accept that outcome only when
+                // the object now contains every Helm-desired field.
+                let live = live_sandboxes(ownership.namespace).await?;
+                let still_missing = missing_from_live(desired, &live, ownership)?;
+                if !still_missing
+                    .iter()
+                    .any(|candidate| candidate.name == object.name)
+                {
+                    continue;
+                }
+            }
+        }
+    }
+    let live = live_sandboxes(ownership.namespace).await?;
+    let missing = missing_from_live(desired, &live, ownership)?
+        .into_iter()
+        .map(|object| object.name.as_str())
+        .collect::<Vec<_>>();
+    ensure_reconcile_revision(
+        opts,
+        expected_snapshot,
+        "after the sandbox reconciliation barrier",
+    )
+    .await?;
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(SandboxReconcileFailure::StableRevisionFailure {
+            proven_snapshot: Box::new(expected_snapshot.clone()),
+            error: anyhow::anyhow!("unreconciled sandbox object(s): {}", missing.join(", ")),
+        })
+    }
+}
+
+fn recovery_failure(
+    opts: &GithubAppOpts,
+    revision: u32,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    crate::exit::CliError::failure(message.into())
+        .with_fix(format!(
+            "run `{}` and inspect every SandboxTemplate/SandboxWarmPool pair before retrying",
+            rollback_recovery_command(opts, revision)
+        ))
+        .into()
+}
+
+fn manifest_preflight_failure(
+    opts: &GithubAppOpts,
+    revision: u32,
+    error: &anyhow::Error,
+) -> anyhow::Error {
+    let command = helm_manifest_command(opts, Some(revision)).display();
+    crate::exit::CliError::failure(format!(
+        "release {} revision {} has no complete, usable SandboxTemplate/SandboxWarmPool set: {error}",
+        opts.common.release, revision
+    ))
+    .with_fix(format!(
+        "inspect it with `{command}` and restore every complete template/pool pair before retrying"
+    ))
+    .into()
+}
+
+fn revision_stability_failure(
+    opts: &GithubAppOpts,
+    captured: &HelmHistorySnapshot,
+    observed: &HelmHistorySnapshot,
+    phase: &str,
+) -> anyhow::Error {
+    revision_stability_failure_with_recovery(opts, captured, observed, phase, None)
+}
+
+fn snapshot_description(snapshot: &HelmHistorySnapshot) -> String {
+    format!(
+        "active revision {}, history head revision {} ({})",
+        snapshot.active_revision, snapshot.head_revision, snapshot.head_status
+    )
+}
+
+fn pending_head_failure(opts: &GithubAppOpts, snapshot: &HelmHistorySnapshot) -> anyhow::Error {
+    let command = helm_history_cmd(&opts.common).display();
+    crate::exit::CliError::failure(format!(
+        "release {} has Helm history head revision {} in {}; refusing all mutation while that operation is pending",
+        opts.common.release, snapshot.head_revision, snapshot.head_status
+    ))
+    .with_fix(format!(
+        "inspect current release history with `{command}` and resolve the pending Helm operation before retrying; no automatic rollback was attempted"
+    ))
+    .into()
+}
+
+fn sandbox_inspection_command(
+    opts: &GithubAppOpts,
+    recovery_object: &RecoverySandboxMarker,
+) -> OpsCommand {
+    let resource = if recovery_object.kind == SANDBOX_TEMPLATE_KIND {
+        "sandboxtemplates.extensions.agents.x-k8s.io"
+    } else {
+        "sandboxwarmpools.extensions.agents.x-k8s.io"
+    };
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain(format!("{resource}/{}", recovery_object.name)),
+            plain("-n"),
+            plain(&opts.common.namespace),
+            plain("-o"),
+            plain("yaml"),
+            plain(format!("--request-timeout={KUBECTL_REQUEST_TIMEOUT}")),
+        ],
+    )
+}
+
+fn revision_stability_failure_with_recovery(
+    opts: &GithubAppOpts,
+    captured: &HelmHistorySnapshot,
+    observed: &HelmHistorySnapshot,
+    phase: &str,
+    recovery_object: Option<&RecoverySandboxMarker>,
+) -> anyhow::Error {
+    let history_command = helm_history_cmd(&opts.common).display();
+    let recovery_detail = recovery_object.map_or_else(String::new, |object| {
+        format!(
+            "; the create attempt for {} {} used recovery marker {}={} and was left untouched for operator inspection",
+            object.kind, object.name, RECOVERY_OPERATION_ANNOTATION, object.operation
+        )
+    });
+    let fix = recovery_object.map_or_else(
+        || {
+            format!(
+                "inspect concurrent release history with `{history_command}` and reconcile the active revision; no automatic rollback was attempted"
+            )
+        },
+        |object| {
+            let inspect_command = sandbox_inspection_command(opts, object).display();
+            format!(
+                "inspect the operation-marked object with `{inspect_command}` and verify {}={}; inspect concurrent release history with `{history_command}`, then reconcile only against the active revision; no automatic deletion or rollback was attempted",
+                RECOVERY_OPERATION_ANNOTATION, object.operation
+            )
+        },
+    );
+    crate::exit::CliError::failure(
+        format!(
+            "release {} moved from captured Helm history snapshot ({}) to ({}) {phase}; refusing stale state",
+            opts.common.release,
+            snapshot_description(captured),
+            snapshot_description(observed)
+        ) + &recovery_detail,
+    )
+    .with_fix(fix)
+    .into()
+}
+
+fn revision_indeterminate_failure_with_recovery(
+    opts: &GithubAppOpts,
+    expected: &HelmHistorySnapshot,
+    phase: &str,
+    recovery_object: Option<&RecoverySandboxMarker>,
+) -> anyhow::Error {
+    let history_command = helm_history_cmd(&opts.common).display();
+    let recovery_detail = recovery_object.map_or_else(String::new, |object| {
+        format!(
+            "; the create attempt for {} {} used recovery marker {}={} and was left untouched for operator inspection",
+            object.kind, object.name, RECOVERY_OPERATION_ANNOTATION, object.operation
+        )
+    });
+    let fix = recovery_object.map_or_else(
+        || {
+            format!(
+                "inspect current release history with `{history_command}` before reconciling the expected snapshot ({}); no automatic rollback was attempted",
+                snapshot_description(expected)
+            )
+        },
+        |object| {
+            let inspect_command = sandbox_inspection_command(opts, object).display();
+            format!(
+                "inspect the operation-marked object with `{inspect_command}` and verify {}={}; inspect current release history with `{history_command}`, then reconcile only against the active revision; no automatic deletion or rollback was attempted",
+                RECOVERY_OPERATION_ANNOTATION, object.operation
+            )
+        },
+    );
+    crate::exit::CliError::failure(
+        format!(
+            "could not establish whether release {} still has expected Helm history snapshot ({}) {phase}; refusing stale state",
+            opts.common.release,
+            snapshot_description(expected)
+        ) + &recovery_detail,
+    )
+    .with_fix(fix)
+    .into()
+}
+
+fn map_reconcile_failure(
+    opts: &GithubAppOpts,
+    recovery_revision: u32,
+    expected_snapshot: &HelmHistorySnapshot,
+    context: impl FnOnce(anyhow::Error) -> String,
+    failure: SandboxReconcileFailure,
+) -> anyhow::Error {
+    match failure {
+        SandboxReconcileFailure::RevisionDrift {
+            expected,
+            observed,
+            phase,
+            recovery_object,
+        } => revision_stability_failure_with_recovery(
+            opts,
+            &expected,
+            &observed,
+            &phase,
+            recovery_object.as_ref(),
+        ),
+        SandboxReconcileFailure::RevisionIndeterminate {
+            expected,
+            phase,
+            recovery_object,
+        } => revision_indeterminate_failure_with_recovery(
+            opts,
+            &expected,
+            &phase,
+            recovery_object.as_ref(),
+        ),
+        SandboxReconcileFailure::StableRevisionFailure {
+            proven_snapshot,
+            error,
+        } => recovery_failure(
+            opts,
+            recovery_revision,
+            format!(
+                "{}; Helm history snapshot ({}) was rechecked immediately before this failure",
+                context(error),
+                snapshot_description(&proven_snapshot)
+            ),
+        ),
+        SandboxReconcileFailure::Other(error) => revision_indeterminate_failure_with_recovery(
+            opts,
+            expected_snapshot,
+            &format!("while reconciling sandbox state: {}", context(error)),
+            None,
+        ),
+    }
+}
+
+async fn restore_captured_sandboxes(
+    opts: &GithubAppOpts,
+    ownership: HelmOwnership<'_>,
+    expected_snapshot: &HelmHistorySnapshot,
+    prior: &DesiredSandboxSet,
+) -> std::result::Result<(), SandboxReconcileFailure> {
+    reconcile_live_sandboxes(opts, ownership, expected_snapshot, prior).await
 }
 
 pub enum GithubAppOutput {
@@ -735,20 +1752,10 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     if !opts.common.dry_run {
         require_on_path("helm")?;
     }
-    let existing = if needs_release_read(&opts) {
-        // The typed error propagates: the `helm upgrade` two steps later would
-        // fail identically, and failing before any mutation is strictly better
-        // than failing part-way through one.
-        fetch_release_values(&opts.common).await?
-    } else {
-        None
-    };
-    // Under `--dry-run` this is a no-op by construction: `needs_release_read`
-    // answered false, so `existing` is None and the guard has nothing to judge.
-    // The plan therefore stays offline, and the guard still runs on the REAL
-    // invocation above -- before any mutation -- so nothing is ever written to
-    // a release whose key the API would ignore.
-    guard_byo_key_conflict(&opts, existing.as_ref())?;
+    // The dry-run guard has no release state to judge and remains a no-op. A
+    // real run evaluates the guard below against the exact captured revision,
+    // so inventory and credential decisions cannot come from different reads.
+    guard_byo_key_conflict(&opts, None)?;
 
     let cmds = if opts.disconnect {
         disconnect_commands(&opts)
@@ -773,12 +1780,46 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     }
 
     require_on_path("kubectl")?;
-    // Probe GitHub BEFORE helm upgrade so a 401 cannot replace the last
-    // known-good credential mode (#2269). `--disconnect` has nothing to
-    // authenticate; `--dry-run` returned above and stays offline.
+    let ownership = HelmOwnership {
+        release: &opts.common.release,
+        namespace: &opts.common.namespace,
+    };
+    let prior_snapshot = current_history_snapshot(&opts).await?;
+    if prior_snapshot.head_status.starts_with("pending-") {
+        return Err(pending_head_failure(&opts, &prior_snapshot));
+    }
+    let prior_revision = prior_snapshot.active_revision;
+    let revision_values = read_release_values_at_revision(&opts, prior_revision)
+        .await
+        .map_err(|error| manifest_preflight_failure(&opts, prior_revision, &error))?;
+    guard_byo_key_conflict(&opts, revision_values.as_ref())?;
+    // Probe the configured App before either sandbox reconciliation or Helm
+    // mutation. Disconnect has no credential to authenticate; dry-run is offline.
     if !opts.disconnect {
         guard_app_identity(&opts, clone_base).await?;
     }
+    let expected_inventory = ExpectedSandboxInventory::from_values(revision_values.as_ref())?;
+    let prior_sandboxes = read_desired_sandboxes(&opts, Some(prior_revision))
+        .await
+        .map_err(|error| manifest_preflight_failure(&opts, prior_revision, &error))?;
+    prior_sandboxes
+        .validate_inventory(&expected_inventory)
+        .map_err(|error| manifest_preflight_failure(&opts, prior_revision, &error))?;
+    reconcile_live_sandboxes(&opts, ownership, &prior_snapshot, &prior_sandboxes)
+        .await
+        .map_err(|failure| {
+            map_reconcile_failure(
+                &opts,
+                prior_revision,
+                &prior_snapshot,
+                |error| format!(
+                    "release {} is unsafe to mutate because its pre-existing sandbox set could not be reconciled: {error}",
+                    opts.common.release
+                ),
+                failure,
+            )
+        })?;
+
     let cl = ui.checklist();
     let label = if opts.disconnect {
         format!(
@@ -796,8 +1837,132 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     } else {
         "configured"
     };
+    let mut helm_failure = None;
     for cmd in &cmds {
-        run_step(&cl, &label, ok_detail, cmd).await?;
+        ui.plumbing(&format!("+ {}", cmd.display()));
+        let step = cl.step(&label);
+        match run_helm_bounded(
+            cmd,
+            helm_mutation_wall_timeout(),
+            "the GitHub App Helm mutation",
+        )
+        .await
+        {
+            Ok((true, _, _)) => step.done(ok_detail),
+            Ok((false, _, _)) | Err(_) => {
+                step.fail("failed; recovering sandbox resources");
+                helm_failure = Some(());
+                break;
+            }
+        }
+    }
+
+    let post_snapshot = current_history_snapshot(&opts).await.map_err(|_| {
+        revision_indeterminate_failure_with_recovery(
+            &opts,
+            &prior_snapshot,
+            "immediately after the Helm mutation",
+            None,
+        )
+    })?;
+    if helm_failure.is_some() {
+        if post_snapshot != prior_snapshot
+            && !post_snapshot.is_normal_failed_successor_of(&prior_snapshot)
+        {
+            return Err(revision_stability_failure(
+                &opts,
+                &prior_snapshot,
+                &post_snapshot,
+                "after the Helm mutation failed or became indeterminate",
+            ));
+        }
+    } else {
+        let expected_revision = prior_snapshot.head_revision.checked_add(1).ok_or_else(|| {
+            crate::exit::CliError::failure(
+                "the captured Helm history head cannot have a representable successor",
+            )
+            .with_fix(format!(
+                "inspect release history with `{}`",
+                helm_history_cmd(&opts.common).display()
+            ))
+        })?;
+        let expected_post_snapshot = HelmHistorySnapshot {
+            active_revision: expected_revision,
+            head_revision: expected_revision,
+            head_status: "deployed".to_string(),
+        };
+        if post_snapshot != expected_post_snapshot {
+            return Err(revision_stability_failure(
+                &opts,
+                &expected_post_snapshot,
+                &post_snapshot,
+                &format!(
+                    "after the credential mutation from active prior revision {prior_revision}"
+                ),
+            ));
+        }
+    }
+    let post_revision = post_snapshot.active_revision;
+    let post_sandboxes = read_desired_sandboxes(&opts, Some(post_revision)).await;
+    let manifest_is_safe = post_sandboxes.as_ref().is_ok_and(|current| {
+        if helm_failure.is_some() {
+            current == &prior_sandboxes
+        } else {
+            current.preserves(&prior_sandboxes)
+        }
+    });
+    if !manifest_is_safe {
+        let reason = match &post_sandboxes {
+            Ok(_) => "the credential Helm attempt removed or changed a previously deployed sandbox object".to_string(),
+            Err(error) => format!("the post-attempt Helm manifest could not prove sandbox ownership: {error}"),
+        };
+        let restoration =
+            restore_captured_sandboxes(&opts, ownership, &post_snapshot, &prior_sandboxes).await;
+        let message = match restoration {
+            Ok(()) => format!(
+                "{reason}; the captured pre-mutation sandbox objects were restored and verified, but Helm ownership is still unsafe"
+            ),
+            Err(failure) => {
+                return Err(map_reconcile_failure(
+                    &opts,
+                    prior_revision,
+                    &post_snapshot,
+                    |error| {
+                        format!(
+                            "{reason}; captured sandbox restoration failed within the bounded recovery barrier: {error}"
+                        )
+                    },
+                    failure,
+                ));
+            }
+        };
+        return Err(recovery_failure(&opts, prior_revision, message));
+    }
+
+    let post_sandboxes = post_sandboxes.expect("manifest_is_safe requires a parsed manifest");
+    reconcile_live_sandboxes(&opts, ownership, &post_snapshot, &post_sandboxes)
+        .await
+        .map_err(|failure| {
+            map_reconcile_failure(
+                &opts,
+                prior_revision,
+                &post_snapshot,
+                |error| {
+                    format!(
+                        "release {} still has {error} after {} bounded recovery attempts",
+                        opts.common.release, SANDBOX_RECOVERY_ATTEMPTS
+                    )
+                },
+                failure,
+            )
+        })?;
+
+    if helm_failure.is_some() {
+        return Err(recovery_failure(
+            &opts,
+            prior_revision,
+            "Helm mutation failed after the sandbox recovery barrier restored and verified the captured release-owned set; no API rollout was started",
+        ));
     }
     // A secretKeyRef env var is resolved once at pod start, so the Secret
     // change alone leaves the running API on the old credential.
@@ -809,8 +1974,89 @@ pub async fn github_app(opts: GithubAppOpts, clone_base: &str) -> Result<GithubA
     let fullname = crate::ops::release_fullname(&opts.common.namespace, &opts.common.release).await;
     let rollout = rollout_commands(&opts.common.namespace, &fullname);
     let roll_label = format!("rolling {} to pick up the credential", opts.common.release);
+    let mut rollout_failure = None;
     for cmd in &rollout {
-        run_step(&cl, &roll_label, "rolled", cmd).await?;
+        ui.plumbing(&format!("+ {}", cmd.display()));
+        let step = cl.step(&roll_label);
+        match tokio::time::timeout(KUBECTL_ROLLOUT_WALL_TIMEOUT, run_capture(cmd)).await {
+            Ok(Ok((true, _, _))) => step.done("rolled"),
+            Ok(Ok((false, _, _))) | Ok(Err(_)) | Err(_) => {
+                step.fail("failed; verifying sandbox recovery");
+                rollout_failure = Some(());
+                break;
+            }
+        }
+    }
+
+    let final_snapshot = current_history_snapshot(&opts).await.map_err(|_| {
+        revision_indeterminate_failure_with_recovery(
+            &opts,
+            &post_snapshot,
+            "after API rollout",
+            None,
+        )
+    })?;
+    if final_snapshot != post_snapshot {
+        return Err(revision_stability_failure(
+            &opts,
+            &post_snapshot,
+            &final_snapshot,
+            "during API rollout",
+        ));
+    }
+    let final_revision = final_snapshot.active_revision;
+    let final_sandboxes = read_desired_sandboxes(&opts, Some(final_revision)).await;
+    let final_sandboxes = match final_sandboxes {
+        Ok(current) if current == post_sandboxes => current,
+        Ok(_) | Err(_) => {
+            let restoration =
+                restore_captured_sandboxes(&opts, ownership, &final_snapshot, &prior_sandboxes)
+                    .await;
+            let detail = match restoration {
+                Ok(()) => String::new(),
+                Err(failure) => {
+                    return Err(map_reconcile_failure(
+                        &opts,
+                        prior_revision,
+                        &final_snapshot,
+                        |error| format!("captured sandbox restoration failed: {error}"),
+                        failure,
+                    ));
+                }
+            };
+            let command = helm_manifest_command(&opts, Some(final_revision)).display();
+            return Err(crate::exit::CliError::failure(format!(
+                "release {} revision {} manifest was not stable through API rollout{detail}",
+                opts.common.release, final_revision
+            ))
+            .with_fix(format!(
+                "inspect the immutable revision with `{command}` and reconcile its SandboxTemplate/SandboxWarmPool ownership; no automatic rollback was attempted"
+            ))
+            .into());
+        }
+    };
+    reconcile_live_sandboxes(&opts, ownership, &final_snapshot, &final_sandboxes)
+        .await
+        .map_err(|failure| {
+            map_reconcile_failure(
+                &opts,
+                prior_revision,
+                &final_snapshot,
+                |error| {
+                    format!(
+                        "release {} lost sandbox state during API rollout: {error}",
+                        opts.common.release
+                    )
+                },
+                failure,
+            )
+        })?;
+    if rollout_failure.is_some() {
+        return Err(recovery_failure(
+            &opts,
+            prior_revision,
+            "API rollout failed; the bounded sandbox recovery barrier restored and verified the release-owned sandbox set before returning",
+        ));
     }
     if opts.disconnect {
         ui.note("GitHub App cleared; the platform falls back to api.githubToken");

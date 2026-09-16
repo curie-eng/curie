@@ -155,10 +155,10 @@ def worker_client(_disposable_db: Any, monkeypatch: pytest.MonkeyPatch) -> Itera
     get_settings.cache_clear()
 
 
-def test_deployment_workspace_capability_is_sticky_and_explicit_false_disables_it(
+def test_legacy_deployment_workspace_field_preserves_explicit_values(
     client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """Omitted, enabled, and disabled are three distinct deployment writes."""
+    """The deprecated field remains round-trip compatible for existing clients."""
 
     agent_id, version_id = _create_agent_version(client, auth_headers)
 
@@ -211,7 +211,7 @@ def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
     )
 
     assert selected.status_code == reused.status_code == 200
-    assert selected.json() == reused.json() == {"repo_full_name": REPO}
+    assert selected.json() == reused.json() == {"repo_full_name": REPO, "revision": None}
     assert conflict.status_code == 409
     assert conflict.json()["detail"]["code"] == "workspace.selection_conflict"
     assert _selection_rows() == [
@@ -222,6 +222,62 @@ def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
             "selected_by": "U0REQUEST1",
         }
     ]
+
+
+def test_workspace_capability_without_repo_remains_an_unselected_generic_thread(
+    worker_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """Capability alone must not force repository selection or persist a row."""
+
+    agent_id, version_id = _create_agent_version(worker_client, auth_headers)
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
+
+    response = worker_client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": "thread-generic-first",
+            "author": "U0REQUEST1",
+            "repo_full_name": None,
+        },
+        headers=WORKER_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"repo_full_name": None, "revision": None}
+    assert _selection_rows() == []
+
+
+def test_no_url_and_no_durable_selection_returns_null_without_redemption(
+    worker_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """An ordinary non-coding turn creates neither selection nor credential audit state."""
+    agent_id, version_id = _create_agent_version(worker_client, auth_headers)
+    deployment = _deploy(
+        worker_client,
+        auth_headers,
+        agent_id,
+        version_id,
+        workspace=False,
+    )
+
+    response = worker_client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": "thread-no-repository",
+            "author": "U0REQUEST1",
+            "repo_full_name": None,
+        },
+        headers=WORKER_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"repo_full_name": None, "revision": None}
+    assert _selection_rows() == []
+    assert _audit_rows() == []
 
 
 def test_selection_survives_redeployment_for_the_same_agent_thread(
@@ -254,7 +310,7 @@ def test_selection_survives_redeployment_for_the_same_agent_thread(
     )
 
     assert reused.status_code == 200, reused.text
-    assert reused.json() == {"repo_full_name": REPO}
+    assert reused.json() == {"repo_full_name": REPO, "revision": None}
     assert len(_selection_rows()) == 1
 
 
@@ -370,6 +426,7 @@ def test_workspace_credential_is_worker_only_server_derived_and_no_store(
         "clone_url": "https://github.com/acme-corp/acme-bot.git",
         "authorization_header": "Basic "
         + base64.b64encode(b"x-access-token:ghp_operator_workspace").decode(),
+        "revision": None,
     }
     assert OTHER_REPO not in issued.text
     assert "evil.example" not in issued.text
@@ -549,7 +606,7 @@ def test_workspace_credential_prefers_app_installation_token_over_pat(
     assert mint == {"repositories": ["acme-bot"]}
 
 
-def test_workspace_credential_requires_a_workspace_enabled_deployment(
+def test_legacy_deployment_workspace_field_does_not_gate_selection_or_credential(
     worker_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
@@ -557,15 +614,27 @@ def test_workspace_credential_requires_a_workspace_enabled_deployment(
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
     deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=False)
 
+    selected = worker_client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": "thread-disabled",
+            "author": "U0REQUEST1",
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
     response = worker_client.post(
         f"/v1/internal/workspaces/{deployment['id']}/credential",
         json={"conversation_id": "thread-disabled"},
         headers=WORKER_HEADERS,
     )
-    assert response.status_code == 409
+
+    assert selected.status_code == 200, selected.text
+    assert selected.json() == {"repo_full_name": REPO, "revision": None}
+    assert response.status_code == 200, response.text
     assert response.headers["cache-control"] == "no-store"
-    assert "workspace" in response.json()["detail"].lower()
+    assert response.json()["repo_full_name"] == REPO
     audit = _audit_rows()
     assert len(audit) == 1
-    assert audit[0]["outcome"] == "refused"
+    assert audit[0]["outcome"] == "issued"
     assert str(audit[0]["deployment_id"]) == deployment["id"]

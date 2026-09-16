@@ -85,7 +85,10 @@ carries over unchanged.
 <!-- doclint:ignore-line -->
 `skills/deal-desk/SKILL.md`. The frontmatter needs `name` and `description`;
 `allowed-tools` is optional but is how you scope what the model may call. Use the
-**real** field name `allowed-tools` (not `tools`).
+**real** field name `allowed-tools` (not `tools`), and write its value as the canonical
+space-separated string — several tools go on the one line (`allowed-tools: pricing Read`), and a
+specifier keeps its own spaces because the value splits at parenthesis depth 0
+([ADR-0135](../../adr/0135-a-skill-bundle-has-two-conformance-profiles.md), Draft).
 
 The body is the procedure. Put the deterministic steps behind a tool call — the
 model's job is to *gather inputs, call the tool, and phrase the result*, never to do
@@ -95,8 +98,7 @@ the arithmetic itself.
 ---
 name: deal-desk
 description: Price a deal from a free-text ask. Invoke whenever a user asks for a quote, pricing, a discount check, or "how much for N seats".
-allowed-tools:
-  - pricing            # the MCP tool server wired in .mcp.json (Step 3)
+allowed-tools: pricing            # the MCP tool server wired in .mcp.json (Step 3)
 ---
 
 # Deal desk

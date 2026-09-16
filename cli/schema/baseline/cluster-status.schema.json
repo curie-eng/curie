@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/cluster-status/v1.3.json",
+  "$id": "https://schemas.curietech.ai/cli/cluster-status/v1.4.json",
   "title": "curie cluster status --json",
-  "description": "The agent-facing payload of `curie cluster status`: the dry-run plan, or the release's revision, pod readiness roll-up (with per-pod rows and the unhealthy names), discovered service URLs (a degraded surface carries a `note` and a null `url`), any `warnings` (diagnoses that could not be made, which never affect `healthy`), and an overall `healthy` verdict.",
+  "description": "The agent-facing payload of `curie cluster status`: the dry-run plan, or the release's revision, pod readiness roll-up (with per-pod rows and the unhealthy names), discovered service URLs (a degraded surface carries a `note` and a null `url`), any `warnings` (diagnoses that could not be made, which never affect `healthy`), completion-delivery health, an overall `healthy` verdict, and the current upgrade phase plus last known-good version.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -189,6 +189,42 @@
             ]
           }
         },
+        "healthy": {
+          "type": "boolean"
+        },
+        "upgrade": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "phase": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": "string"
+            },
+            "known_good_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "phase",
+            "status",
+            "known_good_version",
+            "target_version"
+          ]
+        },
         "warnings": {
           "description": "Diagnoses the command could not make, as opposed to defects it found. A mail adapter whose /statusz could not be read appears here. Never affects `healthy` or the exit code.",
           "type": "array",
@@ -201,16 +237,35 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "count": { "type": "integer" },
-            "oldest_age_s": { "type": "number" },
-            "inflight": { "type": "integer" },
-            "retry": { "type": "integer" },
-            "terminal": { "type": "integer" },
-            "state": {
-              "enum": ["empty", "inflight", "retry", "unknown"]
+            "count": {
+              "type": "integer"
             },
-            "degraded": { "type": "boolean" },
-            "detail": { "type": "string" }
+            "oldest_age_s": {
+              "type": "number"
+            },
+            "inflight": {
+              "type": "integer"
+            },
+            "retry": {
+              "type": "integer"
+            },
+            "terminal": {
+              "type": "integer"
+            },
+            "state": {
+              "enum": [
+                "empty",
+                "inflight",
+                "retry",
+                "unknown"
+              ]
+            },
+            "degraded": {
+              "type": "boolean"
+            },
+            "detail": {
+              "type": "string"
+            }
           },
           "required": [
             "count",
@@ -222,9 +277,6 @@
             "degraded",
             "detail"
           ]
-        },
-        "healthy": {
-          "type": "boolean"
         }
       },
       "required": [

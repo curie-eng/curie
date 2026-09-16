@@ -654,7 +654,9 @@ def test_observed_active_turn_that_ends_before_steer_reports_one_finish_race(
             steer_attempts = len(h.runner.steer_headers)
             status_reads = 0
 
-            async def active_before_steer(_base_url: str) -> dict[str, object]:
+            async def active_before_steer(
+                _base_url: str, **_kwargs: object
+            ) -> dict[str, object]:
                 nonlocal status_reads
                 status_reads += 1
                 return {"turn_active": True}

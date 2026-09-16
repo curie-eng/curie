@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 import anyio
+import httpx
 import pytest
 import yaml
 from mcp import types as mcp_types
@@ -58,12 +59,21 @@ JOB_TEMPLATE = {
 }
 
 
-def _load(tmp_path, kubeconfig=GOOD_KUBECONFIG, cronjob="sre-bot-self-upgrade"):
+def _load(
+    tmp_path,
+    kubeconfig=GOOD_KUBECONFIG,
+    cronjob="sre-bot-self-upgrade",
+    platform_cronjob="platform-upgrade",
+    release_repo="curie-eng/curie",
+):
     cfg = tmp_path / "kubeconfig"
     cfg.write_text(yaml.safe_dump(kubeconfig), encoding="utf-8")
     os.environ["KUBECONFIG_PATH"] = str(cfg)
     os.environ["SELF_UPGRADE_CRONJOB"] = cronjob
     os.environ["SELF_UPGRADE_NAMESPACE"] = "curie"
+    os.environ["PLATFORM_UPGRADE_CRONJOB"] = platform_cronjob
+    os.environ["SELF_UPGRADE_RELEASE_REPO"] = release_repo
+    os.environ["SELF_UPGRADE_RELEASE_API"] = "https://api.github.test"
     sys.modules.pop(_MODULE_NAME, None)
     spec = importlib.util.spec_from_file_location(_MODULE_NAME, _SERVER_PY)
     module = importlib.util.module_from_spec(spec)
@@ -112,7 +122,22 @@ class _FakeClient:
             return _Response(*self._cronjob)
         self.seen["jobs_path"] = path
         self.seen["jobs_params"] = params
-        return _Response(*self._jobs)
+        status, body = self._jobs
+        # FILTER, like the API server does. Echoing every item back regardless of
+        # `labelSelector` makes the fake looser than the thing it stands in for:
+        # a tool that sent the WRONG selector would still see the job and still
+        # refuse, so the concurrency scoping could regress with every test green.
+        selector = (params or {}).get("labelSelector")
+        if selector and isinstance(body, dict) and "items" in body:
+            key, _, value = selector.partition("=")
+            body = {
+                "items": [
+                    item
+                    for item in body["items"]
+                    if ((item.get("metadata") or {}).get("labels") or {}).get(key) == value
+                ]
+            }
+        return _Response(status, body)
 
     def post(self, path, *, json=None, content=None, headers=None):
         self.seen["post_path"] = path
@@ -152,7 +177,19 @@ def test_it_refuses_while_an_upgrade_is_still_running(tmp_path, monkeypatch):
     """Two overlapping runs race on creating the version; the loser leaves a row."""
     srv = _load(tmp_path)
     seen = {}
-    running = {"items": [{"metadata": {"name": "in-flight"}, "status": {"active": 1}}]}
+    running = {
+        "items": [
+            {
+                # Labelled as the connector labels its own Jobs, because the fake
+                # now filters by selector exactly as the API server does.
+                "metadata": {
+                    "name": "in-flight",
+                    "labels": {"curie.dev/self-upgrade-of": "sre-bot-self-upgrade"},
+                },
+                "status": {"active": 1},
+            }
+        ]
+    }
     monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, jobs=(200, running)))
     with pytest.raises(ToolError) as excinfo:
         srv.upgrade_self()
@@ -297,7 +334,19 @@ def test_an_active_job_refusal_and_a_started_upgrade_have_different_error_flags(
 ):
     srv = _load(tmp_path)
     refused_seen = {}
-    running = {"items": [{"metadata": {"name": "in-flight"}, "status": {"active": 1}}]}
+    running = {
+        "items": [
+            {
+                # Labelled as the connector labels its own Jobs, because the fake
+                # now filters by selector exactly as the API server does.
+                "metadata": {
+                    "name": "in-flight",
+                    "labels": {"curie.dev/self-upgrade-of": "sre-bot-self-upgrade"},
+                },
+                "status": {"active": 1},
+            }
+        ]
+    }
     monkeypatch.setattr(
         srv,
         "_client",
@@ -338,14 +387,7 @@ def test_an_active_job_refusal_and_a_started_upgrade_have_different_error_flags(
 
 
 def test_the_fake_client_cannot_accept_a_call_the_real_one_rejects():
-    """Pinned for the reason the sibling connector had to learn (#1947).
-
-    `k8s-scale` passed its patch body positionally and every one of its tests
-    passed, because its fake accepted it positionally too while the real
-    `httpx.Client` takes everything after the URL keyword-only. The verb could
-    never run. This connector's calls are already keyword, and this keeps the
-    fake from quietly drifting looser than the client it stands in for.
-    """
+    """Keep the fake from accepting a call the real httpx client rejects."""
 
     import httpx
 
@@ -357,3 +399,179 @@ def test_the_fake_client_cannot_accept_a_call_the_real_one_rejects():
             assert name in real, f"_FakeClient.{method} accepts {name!r}, httpx does not"
             assert param.kind is inspect.Parameter.KEYWORD_ONLY
             assert real[name].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+# --- latest_release -------------------------------------------------------
+#
+# These keep the REAL httpx.Client and swap only its transport, for the reason
+# the sibling scale connector had to learn the hard way (#1947): a hand-written
+# double accepted a call the real client rejects, and every test passed while the
+# tool could never run.
+
+RELEASE_BODY = {
+    "tag_name": "v0.8.1",
+    "name": "v0.8.1",
+    "html_url": "https://github.test/curie-eng/curie/releases/tag/v0.8.1",
+    "published_at": "2026-08-30T20:40:35Z",
+}
+
+
+def _with_release_response(srv, monkeypatch, status=200, body=RELEASE_BODY, seen=None):
+    """Point the module's httpx at a mock transport, keeping the real client."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen["request"] = request
+        return httpx.Response(status, json=body)
+
+    real_client = httpx.Client
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(srv.httpx, "Client", factory)
+
+
+def test_it_reports_the_newest_published_tag(tmp_path, monkeypatch):
+    srv = _load(tmp_path)
+    _with_release_response(srv, monkeypatch)
+    result = json.loads(srv.latest_release())
+    assert result["tag"] == "v0.8.1"
+    assert result["published_at"] == "2026-08-30T20:40:35Z"
+
+
+def test_the_summary_says_this_is_not_what_is_installed(tmp_path, monkeypatch):
+    """The exact confusion this tool exists next to, so it is pinned.
+
+    A bot that reports the newest tag as its own version is worse than one that
+    cannot answer: the installed version is a property of the cluster and this
+    number is a property of a repository, and they are routinely different.
+    """
+    srv = _load(tmp_path)
+    _with_release_response(srv, monkeypatch)
+    assert "NOT what this install is running" in json.loads(srv.latest_release())["summary"]
+
+
+def test_it_sends_no_credential(tmp_path, monkeypatch):
+    """A connector whose whole job is one public read must not hold a token."""
+    srv = _load(tmp_path)
+    seen = {}
+    _with_release_response(srv, monkeypatch, seen=seen)
+    srv.latest_release()
+    assert "authorization" not in {k.lower() for k in seen["request"].headers}
+
+
+def test_it_asks_the_configured_repository(tmp_path, monkeypatch):
+    srv = _load(tmp_path, release_repo="acme/widget")
+    seen = {}
+    _with_release_response(srv, monkeypatch, seen=seen)
+    srv.latest_release()
+    assert seen["request"].url.path == "/repos/acme/widget/releases/latest"
+
+
+def test_the_read_tool_exposes_no_parameters(tmp_path):
+    srv = _load(tmp_path)
+    assert inspect.signature(srv.latest_release).parameters == {}
+
+
+def test_it_is_annotated_as_a_read(tmp_path):
+    srv = _load(tmp_path)
+    assert srv.READ.read_only_hint is True
+    assert srv.READ.destructive_hint is False
+
+
+def test_an_unset_repository_refuses_without_a_network_call(tmp_path, monkeypatch):
+    srv = _load(tmp_path, release_repo="")
+    seen = {}
+    _with_release_response(srv, monkeypatch, seen=seen)
+    with pytest.raises(ToolError) as excinfo:
+        srv.latest_release()
+    assert "SELF_UPGRADE_RELEASE_REPO" in str(excinfo.value)
+    assert seen == {}
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [(404, "no published releases"), (403, "rate limits"), (500, "HTTP 500")],
+)
+def test_release_failures_explain_themselves(tmp_path, monkeypatch, status, expected):
+    srv = _load(tmp_path)
+    _with_release_response(srv, monkeypatch, status=status, body={})
+    with pytest.raises(ToolError) as excinfo:
+        srv.latest_release()
+    assert expected in str(excinfo.value)
+
+
+def test_a_body_with_no_tag_is_reported_not_guessed(tmp_path, monkeypatch):
+    srv = _load(tmp_path)
+    _with_release_response(srv, monkeypatch, body={"name": "no tag here"})
+    with pytest.raises(ToolError) as excinfo:
+        srv.latest_release()
+    assert "no tag_name" in str(excinfo.value)
+
+
+# --- upgrade_platform -----------------------------------------------------
+
+
+def test_it_starts_the_platform_template_not_the_bundle_one(tmp_path, monkeypatch):
+    """The two verbs must not be able to run each other's template."""
+    srv = _load(tmp_path)
+    seen = {}
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen))
+    result = json.loads(srv.upgrade_platform())
+    assert result["ok"] is True
+    assert seen["cronjob_path"].endswith("/cronjobs/platform-upgrade")
+    assert seen["post_body"]["metadata"]["generateName"].startswith("platform-upgrade")
+
+
+def test_an_unset_platform_cronjob_refuses(tmp_path, monkeypatch):
+    """An install that has not opted in does not get a platform upgrade."""
+    srv = _load(tmp_path, platform_cronjob="")
+    seen = {}
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen))
+    with pytest.raises(ToolError) as excinfo:
+        srv.upgrade_platform()
+    assert "PLATFORM_UPGRADE_CRONJOB" in str(excinfo.value)
+    assert seen == {}
+
+
+def test_the_two_verbs_do_not_block_each_other(tmp_path, monkeypatch):
+    """A running bundle redeploy must not refuse a platform upgrade.
+
+    They run different templates against different credentials and are
+    independent. The concurrency guard is scoped to the CronJob being started,
+    so a Job labelled for one does not look active to the other -- if that
+    scoping regresses, one in-flight upgrade silently blocks the unrelated verb.
+    """
+    srv = _load(tmp_path)
+    running_self = {
+        "items": [
+            {
+                "metadata": {
+                    "name": "in-flight",
+                    "labels": {"curie.dev/self-upgrade-of": "sre-bot-self-upgrade"},
+                },
+                "status": {"active": 1},
+            }
+        ]
+    }
+    seen = {}
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient(seen, jobs=(200, running_self)))
+    srv.upgrade_platform()
+    assert seen["jobs_params"]["labelSelector"] == (
+        "curie.dev/self-upgrade-of=platform-upgrade"
+    )
+
+
+def test_the_platform_tool_exposes_no_parameters(tmp_path):
+    srv = _load(tmp_path)
+    assert inspect.signature(srv.upgrade_platform).parameters == {}
+
+
+def test_its_reply_refuses_to_imply_a_rollback(tmp_path, monkeypatch):
+    srv = _load(tmp_path)
+    monkeypatch.setattr(srv, "_client", lambda: _FakeClient({}))
+    result = json.loads(srv.upgrade_platform())
+    assert result["prior"] is None
+    assert "no undo" in result["summary"]

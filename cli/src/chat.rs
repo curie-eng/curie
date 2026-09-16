@@ -920,12 +920,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_approval_id_reads_a_human_sentence_tail() {
+        // #2565: a bundle-authored sentence replaces the machine JSON in the
+        // notice tail. The parser still only needs the UUID head.
+        let id = "44c2cc21-7b0a-4f3e-9c1d-aaaaaaaaaaaa";
+        let text = format!(
+            "Awaiting approval ({id}): File FY26Q1: 11 workbooks into Approved, \
+             25 cells going out blank. Approve?\n\
+             The session is paused and will resume once an authorized member \
+             resolves this request."
+        );
+        assert_eq!(parse_approval_id(&text).as_deref(), Some(id));
+    }
+
+    #[test]
     fn parse_approval_id_survives_the_base_prefix() {
         // The real shape when a prior answer exists: `f"{base}\n\n{notice}"`
         // (kernel.py:929). The id must still be recovered after the prefix.
         let id = "00000000-0000-4000-8000-000000000000";
         let text = format!(
             "Here is the partial answer so far.\n\n\
+             Awaiting approval ({id}): run the deploy\n\
+             The session is paused and will resume once an authorized member \
+             resolves this request."
+        );
+        assert_eq!(parse_approval_id(&text).as_deref(), Some(id));
+    }
+
+    #[test]
+    fn parse_approval_id_reads_the_notice_after_a_workspace_announcement() {
+        // #2659: the worker places the inferred repository announcement as its
+        // own block between the answer and the notice. The notice stays the
+        // trailing block, so the id must still be recovered.
+        let id = "00000000-0000-4000-8000-000000000000";
+        let text = format!(
+            "Answer.\n\n\
+             Working in acme-corp/acme-bot, from the repository named in your message.\n\n\
              Awaiting approval ({id}): run the deploy\n\
              The session is paused and will resume once an authorized member \
              resolves this request."

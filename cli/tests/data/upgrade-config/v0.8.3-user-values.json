@@ -1,0 +1,16 @@
+{
+  "_fixture": {
+    "releasedChart": "v0.8.3",
+    "source": "user-supplied helm values overlay from a released v0.8.3 chart, not current-chart defaults"
+  },
+  "ui": { "deploy": false },
+  "worker": {
+    "extraEnv": [
+      { "name": "CURIE_RUNNER_TOTAL_TIMEOUT_S", "value": "93" },
+      { "name": "CURIE_DELIVERY_BUDGET_S", "value": "900" }
+    ],
+    "adapterCredentialsExistingSecret": "acme-adapters",
+    "adapterCredentialsExistingSecretKey": "adapterCredentials",
+    "adapterCredentials": { "slack": "adapter-secret-must-not-leak" }
+  }
+}

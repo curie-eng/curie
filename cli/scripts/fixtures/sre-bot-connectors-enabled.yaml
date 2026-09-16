@@ -53,20 +53,20 @@ connectors:
   # The two `build:` connectors: no image reference anywhere, so every rung can
   # only run what `curie build --plugin-dir` resolved and recorded in
   # `connectors.lock.yaml`.
-  k8s-write:
+  self-upgrade:
     build:
-      context: connectors/k8s-write
+      context: connectors/self-upgrade
       platforms: [linux/amd64, linux/arm64]
     env:
-      # The connector refuses to start on an empty allowlist, so this is
-      # load-bearing for the rung and not decoration. A placeholder pair: the
-      # ladder never calls the write verb, which needs a second human actor.
-      K8S_WRITE_ALLOWLIST: acme-prod/acme-api
+      # Hosting and tools/list only: upgrade calls remain disabled in this
+      # fixture, and the shipped manifest retains their approval gates.
+      SELF_UPGRADE_CRONJOB: ""
+      PLATFORM_UPGRADE_CRONJOB: ""
     secret_files:
       # A SEPARATE credential from the read-only one above, as the example
       # requires. The ladder generates two distinct scratch kubeconfigs and
       # never reuses one for both.
-      K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
+      SELF_UPGRADE_KUBECONFIG: /secrets/kubeconfig
 
   tempo:
     build:

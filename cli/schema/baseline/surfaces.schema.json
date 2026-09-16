@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/surfaces/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/surfaces/v1.1.json",
   "title": "curie <tier> surfaces --json",
-  "description": "The agent-facing payload of `curie <tier> surfaces <agent>`: the dry-run plan, or the agent's surface bindings as the API stored them (ADR-0118). An agent holds one or more bindings, and each is the PAIR `kind` + `address`, never a bare address: a consumer must be able to read the ingress kind without guessing it. `changed` is false for a list (no `--add`/`--remove` passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
+  "description": "The agent-facing payload of `curie <tier> surfaces <agent>`: the dry-run plan, or the agent's surface bindings as the API stored them (ADR-0118). The `kind` and `address` values are preserved verbatim, including the raw stored address. An agent holds one or more bindings, and each is the PAIR `kind` + `address`, never a bare address: a consumer must be able to read the ingress kind without guessing it. `changed` is false for a list (no `--add`/`--remove` passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -32,6 +32,10 @@
         },
         "address": {
           "type": "string"
+        },
+        "warning": {
+          "type": "string",
+          "description": "Present only when the CLI proves that the stored binding never resolves."
         }
       },
       "required": [

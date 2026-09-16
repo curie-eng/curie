@@ -464,12 +464,15 @@ fi
 if [[ -n "${CURIE_E2E_OTEL:-}" ]]; then
     START_ARGS+=(--otel-endpoint "$CURIE_E2E_OTEL")
 fi
-if UP_OUTPUT="$("$BIN" skill up "${START_ARGS[@]}" 2>&1)"; then
-    printf '%s\n' "$UP_OUTPUT"
-else
-    UP_STATUS=$?
-    printf '%s\n' "$UP_OUTPUT" >&2
-    exit "$UP_STATUS"
+UP_RC=0
+UP_OUTPUT="$("$BIN" skill up "${START_ARGS[@]}" 2>&1)" || UP_RC=$?
+printf '%s\n' "$UP_OUTPUT"
+if (( UP_RC != 0 )); then
+    echo "error: \`skill up\` exited $UP_RC." >&2
+    if [[ -z "$UP_OUTPUT" ]]; then
+        echo "error: \`skill up\` produced no diagnostic output." >&2
+    fi
+    exit "$UP_RC"
 fi
 
 # The boot panel must NAME the model path it resolved. `skill up` picks the

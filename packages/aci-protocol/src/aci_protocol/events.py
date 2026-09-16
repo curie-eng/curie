@@ -88,13 +88,20 @@ class SessionStatus(StrEnum):
 
 
 class Event(_AciModel):
-    """An inbound event delivered into a live session (initial or follow-up)."""
+    """An inbound event delivered into a live session (initial or follow-up).
+
+    ``session_id`` and ``history_ref`` carry conversation-scoped identity to a
+    runner after its sandbox is bound. Both remain optional so older producers
+    can omit them and tolerant consumers can adopt the additive wire shape.
+    """
 
     kind: Literal["event"] = "event"
     type: Literal["message", "job", "eval_case"]
     text: str
     user: str
     ts: str
+    session_id: str | None = None
+    history_ref: str | None = None
 
 
 class Interrupt(_AciModel):
@@ -157,6 +164,13 @@ class Final(_OutboundBase):
     Both ``None`` on every other status, and ``None`` from an older runner that
     predates these fields (the worker falls back to the prefix parse then).
 
+    ``approval_display`` is the optional human sentence a bundle-authored
+    permission-gate template rendered (#2565). ``None`` means the card and
+    notice use ``approval_summary`` (today's machine string). It is never the
+    grant-provenance signal; that stays ``approval_gate_kind`` /
+    ``approval_granted_tool``. Additive optional scalar: a tolerant consumer
+    decoding an older producer's ``final`` simply sees it absent.
+
     ``input_tokens``/``output_tokens`` carry the turn's model token usage when
     the harness reported it (#390): the runner stamps them from the SDK result's
     ``usage`` so a consumer can attribute a dollar cost to the turn (model
@@ -175,6 +189,7 @@ class Final(_OutboundBase):
     approval_route: str | None = None
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    approval_display: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
 

@@ -3,11 +3,16 @@
 #   helm install curie-dev charts/curie -n curie-dev --create-namespace \
 #     -f charts/curie/values-dev.yaml
 #
-# Sized to fit a ~4 GB / 4-core scratch cluster, tightly. Sum of memory
-# requests here is 2496 Mi (~2.44 GiB). That plus a distribution's kubelet
-# and system pods leaves little request headroom on a 4 GB node; ClickHouse
-# and Langfuse bursting toward their limits is the remaining squeeze, which
-# is why the README's measured steady state is ~3.3 GB / ~82% node memory.
+# Sized to pack onto a ~4 GB / 4-core scratch cluster by REQUEST, not by
+# resident size. Sum of memory requests here is 2496 Mi (~2.44 GiB). That
+# plus a distribution's kubelet and system pods leaves little request
+# headroom on a 4 GB node. The request sum is unchanged; actual resident
+# size is not: this profile overcommits rustfs on purpose (128Mi request
+# against a measured ~1120Mi working set, issue #2706) so the scheduler
+# still packs, while the 2Gi limit stops the 512Mi OOMKill loop. A 4 GB
+# node is therefore no longer an honest fit under ordinary Langfuse
+# traffic. ClickHouse and Langfuse bursting toward their limits remains
+# the remaining squeeze.
 # Everything is single-replica and ClickHouse cluster mode is off. This
 # mirrors compose.dev.yaml (same Langfuse, Postgres and Valkey pins; chart
 # ClickHouse default is 25.12.11.4 / AVX-required, compose stays 24.8.14.39 for
@@ -55,9 +60,13 @@ clickhouse:
 rustfs:
   persistence:
     size: 3Gi
+  # Scratch profile overcommits rustfs on purpose: keep the 128Mi request so
+  # the 2496 Mi request sum still schedules on a 4 GB node, but raise the
+  # limit to the #2706 floor so this overlay cannot restore the 512Mi
+  # OOMKill loop. Resident size under ordinary Langfuse traffic is ~1120Mi.
   resources:
     requests: { cpu: 50m, memory: 128Mi }
-    limits: { cpu: 500m, memory: 512Mi }
+    limits: { cpu: "1", memory: 2Gi }
 
 otelCollector:
   debugExporter:

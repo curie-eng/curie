@@ -33,6 +33,7 @@ from .db import create_engine, create_sessionmaker
 from .evalqueue import EvalQueue
 from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
+from .github_review_store import GitHubReviewReconciler
 from .graveyardwatcher import GraveyardWatcher
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
@@ -54,6 +55,7 @@ from .routers import (
     evals,
     gitflow_routing,
     github,
+    github_reviews,
     hooks,
     memory,
     observability,
@@ -62,6 +64,7 @@ from .routers import (
     state,
     workspaces,
 )
+from .schema_compat import assert_servable
 from .slack_approvers import SlackApproverSetSelector
 from .slack_usergroups import SlackUserGroupClient
 from .storage import BundleStore
@@ -74,6 +77,9 @@ _LOG = logging.getLogger("curie_api")
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
+    # Fail closed when this image cannot serve the live schema. Migrations are
+    # applied by the upgrade Job / curie-migrate, never here (#2300).
+    await assert_servable()
     engine = create_engine()
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
@@ -102,6 +108,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         valkey,
         stream=settings.runs_stream,
         dead_letter_stream=settings.resume_dead_letter_stream or settings.dead_letter_stream_name(),
+    )
+    app.state.github_review_reconciler = GitHubReviewReconciler(
+        app.state.sessionmaker,
+        valkey,
+        settings,
+    )
+    app.state.github_review_reconciler_task = (
+        asyncio.create_task(app.state.github_review_reconciler.run_forever())
+        if settings.github_review_ingress_enabled
+        and settings.github_review_reconciler_interval_s > 0
+        else None
     )
     # The composition root for approvals (#420, ADR-0034): the only place that
     # names Slack to build the approver-set selector, so the authorizer and the
@@ -206,6 +223,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        review_task = getattr(app.state, "github_review_reconciler_task", None)
+        if review_task is not None:
+            review_task.cancel()
+            try:
+                await review_task
+            except asyncio.CancelledError:
+                pass
         # Both background loops enqueue via resume_queue (which uses the valkey
         # client) and read via the sessionmaker, so both are stopped BEFORE
         # valkey.aclose()/engine.dispose() below.
@@ -348,6 +372,7 @@ def create_app() -> FastAPI:
     app.include_router(bundles.router)
     app.include_router(deploy_targets.router)
     app.include_router(github.router)
+    app.include_router(github_reviews.router)
     app.include_router(gitflow_routing.router)
     app.include_router(observability.router)
     app.include_router(control.router)

@@ -18,6 +18,8 @@ because the worker already depends on this package for the queue seam; the
 card renderer imports them so the two sides cannot drift.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 from dataclasses import dataclass
@@ -124,6 +126,76 @@ def is_approval_action(action_id: str) -> bool:
     """True when a Block Kit action id belongs to the approval card."""
 
     return action_id in _APPROVAL_ACTION_IDS
+
+
+def is_release_ownership_miss(outcome: ResolveOutcome) -> bool:
+    """True when this release's API does not have the approval row (#2248)."""
+
+    return (
+        outcome.status_code == 404
+        and outcome.detail.strip().casefold() == _APPROVAL_NOT_FOUND_DETAIL
+    )
+
+
+def decline_unowned_envelope(
+    ack: Any,
+    *,
+    approval_id: str,
+    log: logging.Logger,
+    web_client: WebClient | None = None,
+    channel: str | None = None,
+    user: str | None = None,
+) -> None:
+    """Leave the Socket Mode envelope unacked so Slack retries another connection.
+
+    Bolt's SocketModeHandler only emits the envelope ack when the BoltResponse
+    status is 200 (slack_bolt.adapter.socket_mode.internals.send_response).
+    Assigning a non-200 to ack.response unblocks the listener runner, which
+    waits on ``ack.response is None``, without acknowledging. Slack then
+    retries the same envelope on another connection of the same app.
+
+    When ``web_client``, ``channel``, and ``user`` are all present, also post
+    an ephemeral telling the clicker to disconnect the extra Socket Mode
+    client. That notice must not ack the envelope or mutate the card.
+    """
+
+    from slack_bolt.response import BoltResponse
+
+    log.warning(
+        "approval %s was not found in this release and may be owned by another Curie release",
+        approval_id,
+    )
+    ack.response = BoltResponse(status=404, body="")
+    if web_client is not None and channel and user:
+        _ephemeral(
+            web_client,
+            channel=channel,
+            user=user,
+            text=_refusal_text(ResolveOutcome(status_code=404, detail=_APPROVAL_NOT_FOUND_DETAIL)),
+            log=log,
+        )
+
+
+def this_release_owns_action(body: dict[str, Any], resolver: ApprovalResolveClient) -> bool | None:
+    """Ownership probe for a note-dialog click, before views.open."""
+
+    actions = body.get("actions") or []
+    approval_id = str(actions[0].get("value") or "") if actions else ""
+    if not approval_id:
+        return True
+    return resolver.exists(approval_id)
+
+
+def _http_json(response: httpx.Response) -> tuple[str, dict[str, Any] | None]:
+    """Parse a JSON body for detail; never surface a non-JSON intermediary page."""
+
+    try:
+        parsed = response.json()
+    except ValueError:
+        return "", None
+    if not isinstance(parsed, dict):
+        return "", None
+    return str(parsed.get("detail", "")), parsed
 
 
 @dataclass(frozen=True)
@@ -244,27 +316,40 @@ class ApprovalResolveClient:
         except httpx.HTTPError as exc:
             logger.warning("approval resolve call failed for %s: %s", approval_id, exc)
             return ResolveOutcome(status_code=0, detail=str(exc))
-        detail = ""
-        resolved = None
-        decided = None
-        try:
-            body = response.json()
-            if isinstance(body, dict):
-                detail = str(body.get("detail", ""))
-                resolved = body.get("resolved_by")
-                decided = body.get("status")
-        except ValueError:
-            # A non-JSON body (e.g. from an ingress/proxy/WAF intermediary)
-            # may carry an internal hostname or request id. Do not surface
-            # that raw text to the Slack clicker; fall back to empty so the
-            # caller's class-neutral fallback applies instead (#453 LOW-1).
-            detail = ""
+        detail, parsed = _http_json(response)
+        resolved = parsed.get("resolved_by") if parsed else None
+        decided = parsed.get("status") if parsed else None
         return ResolveOutcome(
             status_code=response.status_code,
             detail=detail,
             resolved_by=str(resolved) if resolved else None,
             decision=str(decided) if decided else None,
         )
+
+    def exists(self, approval_id: str) -> bool | None:
+        """Whether THIS release's API has the approval row.
+
+        True when GET /approvals/{id} is 200. False when the response is the
+        exact row-miss 404 the API and dispatcher freeze in
+        tests/vectors/approval-ownership.json -- that is the ownership signal
+        for two dispatchers sharing one Slack app. None when the probe failed
+        or returned some other error; callers treat None as "do not decline".
+        """
+
+        try:
+            response = self._client.get(
+                f"{self._base}/approvals/{approval_id}",
+                headers=self._headers,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("approval existence probe failed for %s: %s", approval_id, exc)
+            return None
+        if response.status_code == 200:
+            return True
+        detail, _parsed = _http_json(response)
+        if response.status_code == 404 and detail.strip().casefold() == _APPROVAL_NOT_FOUND_DETAIL:
+            return False
+        return None
 
 
 def settled_approval_card(
@@ -771,7 +856,8 @@ def _refusal_text(outcome: ResolveOutcome) -> str:
         if outcome.detail.strip().casefold() == _APPROVAL_NOT_FOUND_DETAIL:
             return (
                 "This Curie release does not have this approval, so nothing was "
-                "changed. Try again so the owning release can handle it."
+                "changed. Another Socket Mode client is likely serving this Slack app. "
+                "Disconnect the extra client; do not retry from this side."
             )
         return "Resolving failed; try again shortly."
     return "Resolving failed; try again shortly."
@@ -897,8 +983,7 @@ def _render_outcome(
         and outcome.detail.strip().casefold() == _APPROVAL_NOT_FOUND_DETAIL
     ):
         log.warning(
-            "approval %s was not found in this release and may be owned by "
-            "another Curie release",
+            "approval %s was not found in this release and may be owned by another Curie release",
             approval_id,
         )
     log.info(
@@ -910,25 +995,32 @@ def _render_outcome(
     )
 
 
-def process_approval_action(
+@dataclass(frozen=True)
+class ImmediateClick:
+    """A no-dialog click that has already been resolved, carried across the ack.
+
+    Same split as ``NoteSubmission`` (#1077, #2248): resolve (API only) before
+    ack, render Slack after. Ownership miss never reaches render; the handler
+    declines the envelope instead.
+    """
+
+    approval_id: str
+    decision: str
+    user: str
+    channel: str
+    card_ts: str
+    message: dict[str, Any]
+    outcome: ResolveOutcome
+
+
+def resolve_approval_action(
     *,
     body: dict[str, Any],
     decision: str,
-    web_client: WebClient,
     resolver: ApprovalResolveClient,
     logger: logging.Logger | None = None,
-) -> ResolveOutcome | None:
-    """Resolve one card click immediately and render the verdict back into Slack.
-
-    The no-dialog path, for a card rendered without ``allow_free_text``. It shares
-    ``_render_outcome`` with the dialog path so the two cannot disagree about what
-    a settled card looks like; only the surface a refusal is rendered on
-    differs, and that difference is real: here nothing is open, so an ephemeral is
-    the right place for it.
-
-    Returns the API outcome (for tests/logging), or None when the interaction
-    payload is not a resolvable card click (missing value/channel/message).
-    """
+) -> ImmediateClick | None:
+    """Parse one immediate card click and POST resolve. No Slack I/O."""
 
     log = logger or logging.getLogger(__name__)
 
@@ -942,27 +1034,58 @@ def process_approval_action(
         log.info("approval action without id/channel/user/message, skipping")
         return None
 
-    outcome = _resolve_and_render(
+    outcome = resolver.resolve(
+        approval_id,
+        decision=decision,
+        attested_user=user,
+        attested_channel=channel,
+        note=None,
+    )
+    return ImmediateClick(
         approval_id=approval_id,
         decision=decision,
         user=user,
         channel=channel,
         card_ts=card_ts,
         message=message,
-        note=None,
-        web_client=web_client,
-        resolver=resolver,
-        log=log,
+        outcome=outcome,
     )
-    if outcome.status_code != 200:
-        _ephemeral(
-            web_client,
-            channel=channel,
-            user=user,
-            text=_refusal_text(outcome),
+
+
+def render_approval_action(
+    click: ImmediateClick,
+    *,
+    web_client: WebClient,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Stamp or refuse an already-resolved immediate click. Post-ack; never raises."""
+
+    log = logger or logging.getLogger(__name__)
+    if is_release_ownership_miss(click.outcome):
+        return
+    try:
+        _render_outcome(
+            approval_id=click.approval_id,
+            decision=click.decision,
+            user=click.user,
+            channel=click.channel,
+            card_ts=click.card_ts,
+            message=click.message,
+            note=None,
+            outcome=click.outcome,
+            web_client=web_client,
             log=log,
         )
-    return outcome
+        if click.outcome.status_code != 200:
+            _ephemeral(
+                web_client,
+                channel=click.channel,
+                user=click.user,
+                text=_refusal_text(click.outcome),
+                log=log,
+            )
+    except Exception as exc:  # noqa: BLE001 - a raise past the ack eats the ack
+        log.warning("post-ack render failed for approval %s: %s", click.approval_id, exc)
 
 
 def _refresh_settled_card(

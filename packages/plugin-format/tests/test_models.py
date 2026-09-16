@@ -113,6 +113,27 @@ def test_approval_gate_grantable_via_policy_field() -> None:
     assert ApprovalGate.model_validate(dumped).grantableViaPolicy is True
 
 
+def test_approval_gate_summary_template_field() -> None:
+    """A bundle-authored human template round-trips on ApprovalGate (#2565).
+
+    Absent -> None so an old manifest keeps today's machine-string card.
+    """
+
+    gate = ApprovalGate.model_validate(
+        {
+            "gate": "Bash",
+            "route": "managers",
+            "summary": "Run {command}: {files|count} files. Approve?",
+        }
+    )
+    assert gate.summary == "Run {command}: {files|count} files. Approve?"
+    gate2 = ApprovalGate.model_validate({"gate": "Bash", "route": "managers"})
+    assert gate2.summary is None
+    dumped = gate.model_dump()
+    assert dumped["summary"] == "Run {command}: {files|count} files. Approve?"
+    assert ApprovalGate.model_validate(dumped).summary == gate.summary
+
+
 def test_tool_policy_parses_a_full_declaration_and_defaults_its_collections() -> None:
     """The ``toolPolicy`` model round-trips, and its three collections default to empty.
 
@@ -207,3 +228,82 @@ def test_manifest_tool_policy_field() -> None:
     assert manifest.model_dump(exclude_none=True)["toolPolicy"] == declared
 
     assert PluginManifest.model_validate({"name": "demo"}).toolPolicy is None
+
+
+def test_skill_frontmatter_accepts_the_canonical_string_form_verbatim() -> None:
+    """``allowed-tools`` accepts the space-separated string the spec calls canonical.
+
+    The model widening is the headline fix: a SKILL.md written for the Agent
+    Skills specification is rejected today with "Input should be a valid list".
+    Restoring it is a return to this model's ORIGINAL intent -- mirroring the
+    Claude Code shape verbatim -- not a departure from it.
+    """
+    fm = SkillFrontmatter.model_validate(
+        {"name": "greeter", "description": "greets", "allowed-tools": "Read Bash"}
+    )
+    assert fm.allowed_tools == "Read Bash"
+
+    # The comma-separated string Claude Code equally documents.
+    comma = SkillFrontmatter.model_validate(
+        {"name": "greeter", "description": "greets", "allowed-tools": "Read,Bash"}
+    )
+    assert comma.allowed_tools == "Read,Bash"
+
+    # Absent stays None, so every bundle shipped before this widening is untouched.
+    assert (
+        SkillFrontmatter.model_validate({"name": "greeter", "description": "d"}).allowed_tools
+        is None
+    )
+
+
+def test_the_model_preserves_the_authored_shape_and_does_not_normalize() -> None:
+    """One normalization boundary, and the model is not it (D1).
+
+    If the model normalized, there would be two places that know how to read the
+    field, and ``runner/src/curie_runner/approval.py`` -- which parses the raw
+    YAML itself and never builds a ``SkillFrontmatter`` -- would be the one left
+    behind. That divergence is the #1852 fail-open: a gate reported as armed
+    while the tool executes unapproved.
+    """
+    from plugin_format import parse_allowed_tools
+
+    fm = SkillFrontmatter.model_validate(
+        {"name": "greeter", "description": "greets", "allowed-tools": "Read Bash"}
+    )
+    # The model hands back exactly what the author wrote...
+    assert isinstance(fm.allowed_tools, str)
+    assert fm.allowed_tools == "Read Bash"
+    # ...and the helper is the only thing that turns it into entries.
+    assert parse_allowed_tools(fm.allowed_tools) == ["Read", "Bash"]
+
+    # The list form is likewise preserved, not rewritten into a string.
+    listed = SkillFrontmatter.model_validate(
+        {"name": "greeter", "description": "greets", "allowed-tools": ["Read", "Bash"]}
+    )
+    assert listed.allowed_tools == ["Read", "Bash"]
+    assert parse_allowed_tools(listed.allowed_tools) == ["Read", "Bash"]
+
+    # Round-tripping through the alias keeps the authored shape.
+    assert fm.model_dump(by_alias=True)["allowed-tools"] == "Read Bash"
+
+
+def test_the_committed_schema_declares_the_string_form() -> None:
+    """Intent-bearing cover for the regenerated schema, not just a byte diff.
+
+    ``test_schema_compat.py`` proves the committed file matches what pydantic
+    renders TODAY. It cannot tell you that a future regeneration silently
+    narrowed ``allowed-tools`` back to a list -- both sides would move together
+    and the gate would stay green. This asserts the meaning.
+    """
+    import json
+    from pathlib import Path
+
+    schema_path = Path(__file__).parents[1] / "schema" / "plugin-format.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    any_of = schema["$defs"]["SkillFrontmatter"]["properties"]["allowed-tools"]["anyOf"]
+
+    assert {"type": "string"} in any_of, any_of
+    # The widening is purely additive: the list and null members must survive, or
+    # every bundle carrying a block list stops validating against the schema.
+    assert {"type": "array", "items": {"type": "string"}} in any_of, any_of
+    assert {"type": "null"} in any_of, any_of

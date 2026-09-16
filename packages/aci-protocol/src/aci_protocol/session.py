@@ -287,6 +287,12 @@ class BootEnv(_AciModel):
     bundle_ref: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_BUNDLE_REF", "worker")
     )
+    # The platform-tracked agent version_label, so a sandboxed agent can name
+    # the bundle it is running (#2174). Distinct from bundle_ref, which is the
+    # object-store fetch key and is not the agent-facing identity.
+    bundle_version: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_BUNDLE_VERSION", "worker")
+    )
     # Per-claim bearer token the runner enforces on its ACI POST routes (#63).
     # Enforced only when configured, so local/fake sandboxes are unaffected.
     runner_token: str | None = Field(
@@ -510,6 +516,7 @@ class BootEnv(_AciModel):
         memory_ref: str,
         history_ref: str,
         bundle_ref: str | None = None,
+        bundle_version: str | None = None,
         runner_token: str | None = None,
         model: str | None = None,
         fake_model: bool | None = None,
@@ -558,6 +565,8 @@ class BootEnv(_AciModel):
         }
         if bundle_ref:
             env[cls.env_key("bundle_ref")] = bundle_ref
+        if bundle_version:
+            env[cls.env_key("bundle_version")] = bundle_version
         if runner_token:
             env[cls.env_key("runner_token")] = runner_token
         if approval_required_tools:
@@ -608,6 +617,8 @@ class BootEnv(_AciModel):
         env = self.session.to_env()
         if self.bundle_ref is not None:
             env[self.env_key("bundle_ref")] = self.bundle_ref
+        if self.bundle_version is not None:
+            env[self.env_key("bundle_version")] = self.bundle_version
         if self.runner_token is not None:
             env[self.env_key("runner_token")] = self.runner_token
         if self.model is not None:
@@ -676,6 +687,7 @@ class BootEnv(_AciModel):
         return cls(
             session=SessionConfig.from_env(env),
             bundle_ref=_str_or_none(env.get("CURIE_BUNDLE_REF")),
+            bundle_version=_str_or_none(env.get("CURIE_BUNDLE_VERSION")),
             runner_token=_str_or_none(env.get("CURIE_RUNNER_TOKEN")),
             model=_str_or_none(env.get("CURIE_MODEL")),
             fake_model=_fake_model_or_none(env.get("CURIE_FAKE_MODEL")),

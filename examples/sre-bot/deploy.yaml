@@ -38,8 +38,9 @@
 #         Reads this file. `--target` picks one entry; `--all-targets` walks
 #         every entry, which is how both agents get created in one command.
 #
-# So the golden path in the README does not touch these values, and the
-# documentation IDs below are inert until you name a target.
+# So the golden path in the README does not touch these values. The installer
+# (`curie example sre-bot install`) also ignores this file for routing: pass
+# `--slack-channel` there instead.
 #
 # ---------------------------------------------------------------------------
 # WHEN YOU DO USE TARGETS
@@ -54,15 +55,22 @@
 # **Use the ID, never the `#name`.** Binding by name is the single most common
 # "I deployed it and nothing happens" failure, and it fails the same silent way.
 #
-# Not using Slack? Drop the `slack_channel` lines. The targets still bind an
-# agent name and an environment, and `curie cluster message` talks to the agent
-# without a channel at all.
+# Documentation placeholders (`C0EXAMPLE1`, `C0EXAMPLE2`) match that id shape,
+# so they are not a safe stand-in. This file used to ship them as live values;
+# `curie cluster deploy --target` then rebound the bot to a nonexistent
+# channel and reported success. The target resolver and CLI now refuse this
+# documentation-placeholder shape before any deployment write. They stay in
+# the comment below as the shape to copy, not as values that can be deployed.
+#
+# Not using Slack? Leave the `slack_channel` lines commented. The targets
+# still bind an agent name and an environment, and `curie cluster message`
+# talks to the agent without a channel at all.
 targets:
   dev:
     agent: sre-bot-dev
     env: dev
-    slack_channel: C0EXAMPLE1
+    # slack_channel: C0EXAMPLE1
   prod:
     agent: sre-bot
     env: prod
-    slack_channel: C0EXAMPLE2
+    # slack_channel: C0EXAMPLE2

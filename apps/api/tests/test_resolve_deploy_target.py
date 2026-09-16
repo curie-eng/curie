@@ -39,11 +39,11 @@ REAL = (
     "  dev:\n"
     "    agent: acme-dev\n"
     "    env: dev\n"
-    "    slack_channel: C0EXAMPLE2\n"
+    "    slack_channel: C000000A01\n"
     "  prod:\n"
     "    agent: acme-bot\n"
     "    env: prod\n"
-    "    slack_channel: C0EXAMPLE1\n"
+    "    slack_channel: C000000A02\n"
 )
 
 
@@ -56,7 +56,7 @@ def _resolve(client: TestClient, headers: dict, content: str, target: str):
 def test_resolves_the_named_target(client: TestClient, auth_headers: dict) -> None:
     r = _resolve(client, auth_headers, REAL, "prod")
     assert r.status_code == 200, r.text
-    assert r.json() == {"agent": "acme-bot", "env": "prod", "slack_channel": "C0EXAMPLE1"}
+    assert r.json() == {"agent": "acme-bot", "env": "prod", "slack_channel": "C000000A02"}
 
 
 def test_each_target_resolves_differently(client: TestClient, auth_headers: dict) -> None:
@@ -84,6 +84,27 @@ def test_a_validation_error_is_returned_not_swallowed(
     r = _resolve(client, auth_headers, "targets:\n  p:\n    env: staging\n", "p")
     assert r.status_code == 400
     assert "deploy.bad_env" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("endpoint", ["resolve", "list"])
+def test_documentation_placeholder_channel_is_rejected(
+    client: TestClient, auth_headers: dict, endpoint: str
+) -> None:
+    content = (
+        "targets:\n"
+        "  dev:\n"
+        "    agent: acme-dev\n"
+        "    env: dev\n"
+        "    slack_channel: C0EXAMPLE1\n"
+    )
+    r = client.post(
+        f"/deploy-targets/{endpoint}",
+        json={"content": content, "target": "dev"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 400, r.text
+    assert "deploy.placeholder_channel" in r.json()["detail"]
+    assert "C0EXAMPLE1" in r.json()["detail"]
 
 
 @pytest.mark.parametrize(

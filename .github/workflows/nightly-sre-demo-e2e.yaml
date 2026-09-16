@@ -1,0 +1,237 @@
+name: Nightly SRE demo e2e
+
+# Issue #2246: the six SRE demo assertions (namespaces_list read, approved
+# resources_scale, one-shot re-arm, configuration_view denial, RBAC ceiling,
+# throwaway-repo coding PR) on kind with the pinned kubernetes-mcp-server
+# (sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423),
+# a CI-only Socket Mode Slack app, a live provider, and api.githubRepoAllowlist.
+#
+# GitHub fires schedule and workflow_dispatch from the default branch, so a
+# scheduled run checks out next to grade the v0.9.0 train. Missing the CI Slack
+# app, throwaway repo, or live provider blocks required scheduled/dispatch/RC
+# acceptance. Pull requests only inventory readiness without running live work.
+on:
+  schedule:
+    - cron: "0 5 * * *"   # 05:00 UTC, before the 08:00 graded ladder
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "OpenRouter model route for the live demo"
+        required: false
+        default: "z-ai/glm-5.2"
+  push:
+    tags:
+      - "v*-rc*"
+  pull_request:
+    branches: [next]
+    paths:
+      - ".github/workflows/nightly-sre-demo-e2e.yaml"
+      - "cli/scripts/sre-demo-e2e.sh"
+      - "cli/scripts/sre-demo-mcp-probe.py"
+      - "cli/tests/nightly_sre_demo_e2e.rs"
+      - "cli/tests/sre_demo_e2e_test.py"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  prereqs:
+    name: Check CI Slack app, throwaway repo, and live provider
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # On schedule, ref: next. GitHub cron fires from the default branch.
+          ref: ${{ github.event_name == 'schedule' && 'next' || github.ref }}
+          persist-credentials: false
+      - id: check
+        name: Report missing setup and fail required live acceptance
+        env:
+          CURIE_SRE_DEMO_PHASE: prereqs
+          CURIE_SRE_DEMO_REQUIRED: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+          CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
+          CI_SLACK_APP_TOKEN: ${{ secrets.CI_SLACK_APP_TOKEN }}
+          CI_SLACK_BOT_TOKEN: ${{ secrets.CI_SLACK_BOT_TOKEN }}
+          CI_SLACK_USER_TOKEN: ${{ secrets.CI_SLACK_USER_TOKEN }}
+          CI_SLACK_CHANNEL_ID: ${{ secrets.CI_SLACK_CHANNEL_ID }}
+          CI_THROWAY_REPO: ${{ secrets.CI_THROWAY_REPO }}
+        run: bash cli/scripts/sre-demo-e2e.sh prereqs
+
+  sre-demo:
+    name: Six SRE demo assertions on kind
+    needs: [prereqs]
+    if: needs.prereqs.outputs.ready == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # On schedule, ref: next. GitHub cron fires from the default branch.
+          ref: ${{ github.event_name == 'schedule' && 'next' || github.ref }}
+          persist-credentials: false
+      - name: Toolchain
+        working-directory: cli
+        run: rustc --version
+      - name: Install uv for the runner's MCP SDK probe
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+      - name: Release build
+        working-directory: cli
+        run: cargo build --release --locked
+      - name: Make the binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.16.4
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: democache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the api image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          builder: ${{ steps.democache.outputs.name }}
+          tags: curie-api:local
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-api
+          cache-to: type=gha,mode=max,scope=ladder-api
+      - name: Build the worker image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/worker/Dockerfile
+          builder: ${{ steps.democache.outputs.name }}
+          tags: curie-worker:local
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-worker
+          cache-to: type=gha,mode=max,scope=ladder-worker
+      - name: Build the ui image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/ui/Dockerfile
+          builder: ${{ steps.democache.outputs.name }}
+          tags: curie-ui:local
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-ui
+          cache-to: type=gha,mode=max,scope=ladder-ui
+      - name: Build the dispatcher image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.democache.outputs.name }}
+          tags: curie-dispatcher:local
+          push: false
+          load: true
+          cache-from: type=gha,scope=sre-demo-dispatcher
+          cache-to: type=gha,mode=max,scope=sre-demo-dispatcher
+      - name: Build the runner image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: runner/Dockerfile
+          builder: ${{ steps.democache.outputs.name }}
+          tags: curie-runner:latest
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-runner
+          cache-to: type=gha,mode=max,scope=ladder-runner
+      - name: Pull the pinned kubernetes-mcp-server image
+        run: docker pull ghcr.io/containers/kubernetes-mcp-server@sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423
+      - name: Write the kind cluster config
+        run: |
+          cat > kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - containerPort: 30080
+                  hostPort: 30080
+                  listenAddress: "127.0.0.1"
+                  protocol: TCP
+          EOF
+      - name: Create the kind cluster
+        uses: helm/kind-action@v1.14.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          cluster_name: curie-sre-demo
+          config: kind-config.yaml
+      - name: Load images into the kind cluster
+        run: |
+          set -euo pipefail
+          for img in curie-api:local curie-worker:local curie-ui:local curie-dispatcher:local curie-runner:latest; do
+            kind load docker-image "$img" --name curie-sre-demo
+          done
+          kind load docker-image ghcr.io/containers/kubernetes-mcp-server@sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423 --name curie-sre-demo
+      - name: Install the platform (curie cluster up, live, dispatcher on)
+        env:
+          CURIE_BIN: cli/target/release/curie
+          CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
+          CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
+          CI_THROWAY_REPO: ${{ secrets.CI_THROWAY_REPO }}
+        run: |
+          set -euo pipefail
+          "$CURIE_BIN" cluster up \
+            --chart charts/curie \
+            --dev \
+            --allow-egress-host openrouter \
+            --set security.gvisor.mode=off \
+            --set "api.githubRepoAllowlist[0]=${CI_THROWAY_REPO}" \
+            --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
+            --set dispatcher.image.repository=curie-dispatcher --set dispatcher.image.tag=local --set dispatcher.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=latest --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+      - name: Wait for the platform to become ready
+        run: |
+          set -euo pipefail
+          kubectl rollout status deploy/curie-api -n curie --timeout=300s
+          kubectl rollout status deploy/curie-worker -n curie --timeout=300s
+          kubectl rollout status deploy/curie-ui -n curie --timeout=300s
+          kubectl rollout status deploy/curie-dispatcher -n curie --timeout=300s
+          kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
+      - name: Six SRE demo assertions
+        env:
+          CURIE_SRE_DEMO_RESULTS_FILE: ${{ runner.temp }}/sre-demo-outcomes.jsonl
+          # Dedicated verifier capability, when configured; not the product App.
+          GH_TOKEN: ${{ secrets.CI_THROWAY_REPO_READ_TOKEN }}
+          CURIE_BIN: cli/target/release/curie
+          CURIE_SRE_DEMO_PHASE: run
+          CURIE_SRE_DEMO_ALLOW_LIVE: "1"
+          CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
+          CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
+          CI_SLACK_APP_TOKEN: ${{ secrets.CI_SLACK_APP_TOKEN }}
+          CI_SLACK_BOT_TOKEN: ${{ secrets.CI_SLACK_BOT_TOKEN }}
+          CI_SLACK_USER_TOKEN: ${{ secrets.CI_SLACK_USER_TOKEN }}
+          CI_SLACK_CHANNEL_ID: ${{ secrets.CI_SLACK_CHANNEL_ID }}
+          CI_THROWAY_REPO: ${{ secrets.CI_THROWAY_REPO }}
+        run: bash cli/scripts/sre-demo-e2e.sh run
+      - name: Retain sanitized assertion outcomes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sre-demo-outcomes
+          path: ${{ runner.temp }}/sre-demo-outcomes.jsonl
+          if-no-files-found: ignore
+          retention-days: 7

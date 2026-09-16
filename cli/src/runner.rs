@@ -110,6 +110,8 @@ impl RunnerClient {
             text: text.to_string(),
             user: user.to_string(),
             ts: slack_ts(),
+            session_id: None,
+            history_ref: None,
         };
         let resp = self
             .http

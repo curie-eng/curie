@@ -28,7 +28,10 @@ Pydantic models mirroring the Claude Code shapes:
   `homepage`, `repository`, `license`, `keywords`, `commands`, `agents`,
   `hooks`, `mcpServers`. Unknown keys are accepted and preserved.
 - `SkillFrontmatter` (`skills/**/SKILL.md` YAML frontmatter): `name` and
-  `description` required; `allowed-tools` optional.
+  `description` required; `allowed-tools` optional, accepted as either the
+  space- or comma-separated string the Agent Skills specification calls
+  canonical or as a YAML list. The authored shape is preserved verbatim;
+  `parse_allowed_tools` is the only thing that turns it into entries.
 - `McpServer` / `McpConfig` (`.mcp.json`): `mcpServers` maps a name to a server
   that is either stdio (`command`, `args?`, `env?`) or remote (`type`, `url`,
   `headers?`).
@@ -54,8 +57,10 @@ Pydantic models mirroring the Claude Code shapes:
   is a separate not-yet-built seam (see `docs/interfaces/triggers/INTERFACE.md`),
   so this is validation only today.
 - `ApprovalPolicy` / `ApprovalGate` (the manifest `approvalPolicy` field, #273):
-  `{gates: [{gate, route}]}` — each gate names a pause point and the approval
-  route that decides it; both are required. **Deploy-time validation** rejects a
+  `{gates: [{gate, route, grantableViaPolicy, summary}]}` — each gate names a pause
+  point and the approval route that decides it; both `gate` and `route` are
+  required. Optional `summary` (#2565) is a bundle-authored sentence template
+  rendered onto the approval card. **Deploy-time validation** rejects a
   malformed policy or a gate missing `gate`/`route`. It also rejects a gate whose
   (whitespace-stripped) name starts with `mcp__` but is not a live,
   fully-namespaced tool name for a server the bundle declares
@@ -170,6 +175,28 @@ committed schema with `scripts/check-contracts.sh` (which runs
   field is `allowed-tools`; using the real field name is the compatibility
   choice (the wedge), so the model exposes `allowed_tools` aliased to
   `allowed-tools`. A bundle written for Claude Code validates unchanged.
+- **Two conformance profiles, one rule set (ADR-0135).** A bundle is judged
+  against Claude Code's ingestion shape and against the Agent Skills
+  specification, and the two genuinely diverge in both directions. So
+  `validate_bundle` takes a `profile`: `claude-plugin` (the **default**, and the
+  ingestion contract) reports every specification divergence as a
+  `skill.spec_nonconformant.*` **warning**, so widening what we accept can never
+  break a deploy; `agent-skills-strict` reports the same findings as **errors**
+  and is a publishability gate, never an ingestion default. Runner boot and
+  deploy ingestion pass no profile and stay lenient permanently. The one finding
+  that stays a warning in both profiles is the `allowed-tools` block list, which
+  the reference validator accepts even though the spec prose does not. A typo'd
+  profile id raises `ValueError` rather than falling back — a silent fallback to
+  the lenient profile would report a bundle as publishable that was never
+  strictly checked.
+- **The canonical `allowed-tools` is one space-separated string.** Both shapes
+  are accepted forever, but the string is what `curie init` emits and what the
+  strict profile asks for. It carries one consequence worth stating: entries are
+  separated by whitespace or a comma **at paren depth 0**, so `Bash(git
+  commit:*)` round-trips intact while `Bash(git` (unbalanced) and `Read,Write`
+  cannot and are reported as `allowed_tools_unserializable`. Every consumer must
+  read the field through `parse_allowed_tools`; a second reader is how a skill's
+  declared tools become invisible to the runner's gate-shadow check (#1852).
 - **Lenient models (`extra="allow"`).** Real bundles and future Claude Code
   versions carry manifest and frontmatter keys this MVP does not model. Rejecting
   them would reject valid bundles, so the models accept and preserve unknown

@@ -77,10 +77,9 @@ of not discarding what is already computed.
   pointed at a different row.
 
 - **The read-before-write habit is already in the example's RBAC.**
-  [`examples/sre-bot/manifests/write-role.yaml`](../../examples/sre-bot/manifests/write-role.yaml)
-  grants `get` because it "is needed to read the Deployment before patching it
-  and to confirm the patch was accepted afterwards." The snapshot this design
-  needs is a read the write path was already making.
+  [`examples/sre-bot/manifests/kubernetes-access.yaml`](../../examples/sre-bot/manifests/kubernetes-access.yaml)
+  grants reads alongside the disposable-namespace workload writes. The snapshot
+  this design needs is a read the write path is already authorized to make.
 
 ## Decisions taken
 
@@ -167,11 +166,10 @@ is plain HTTP to the platform API. Taking a snapshot there would mean building a
 second MCP client inside the runner, which is a large new mechanism for the one
 job.
 
-The spike also found the snapshot is already being taken. The example's write
-tool reads the resource before patching it and then discards what it read:
+The spike also found the snapshot can already travel in a connector result. A
+connector-owned write can read the resource before mutation and return it:
 
 ```python
-# examples/sre-bot/connectors/k8s-write/server.py::restart_deployment
 existing = client.get(path)
 if existing.status_code == 404: ...
 ```
@@ -223,11 +221,11 @@ because the bundle is the versioned unit an operator reviews.
 ```yaml
 reversibility:
   tools:
-    - tool: mcp__k8s-write__scale_deployment
-      snapshot: { via: mcp__kubernetes__get_deployment, keys: [namespace, name] }
-      restore:  { via: mcp__k8s-write__scale_deployment, from: spec.replicas }
-    - tool: mcp__k8s-write__restart_deployment
-      irreversible: "restarting pods cannot be undone"
+    - tool: mcp__kubernetes__resources_scale
+      snapshot: { via: mcp__kubernetes__resources_get, keys: [namespace, name] }
+      restore:  { via: mcp__kubernetes__resources_scale, from: spec.replicas }
+    - tool: mcp__kubernetes__pods_delete
+      irreversible: "deleting a pod cannot be undone"
 ```
 
 Two things carry weight here. `irreversible` is a **declared string the user

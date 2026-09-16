@@ -1,0 +1,11 @@
+--- a/billing/throttle.py
++++ b/billing/throttle.py
+@@ -18,7 +18,7 @@
+     ``used_in_window + 1``. A budget of ``n`` admits requests 1..n.
+     """
+     limit, _window_seconds = parse_rate(spec)
+-    return used_in_window <= limit
++    return used_in_window < limit
+ 
+ 
+ def remaining(spec: str, used_in_window: int) -> int:

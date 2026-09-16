@@ -83,7 +83,7 @@ render() {
   shift
   RENDER_DIR="$TMP/$name"
   rm -rf "$RENDER_DIR"
-  helm template rel "$CHART" --output-dir "$RENDER_DIR" "$@" >/dev/null \
+  helm template rel "$CHART" --namespace default --output-dir "$RENDER_DIR" "$@" >/dev/null \
     || fail "helm template failed for render '$name'"
 }
 
@@ -193,8 +193,8 @@ def consumers(templates_dir, host):
         ("api", containers_named(f"{templates_dir}/api.yaml", "api"), app),
         ("worker", containers_named(f"{templates_dir}/worker.yaml", "worker"), app),
         (
-            "migrate",
-            containers_named(f"{templates_dir}/api.yaml", "migrate", init=True),
+            "schema-migrate",
+            containers_named(f"{templates_dir}/schema-migrate.yaml", "schema-migrate"),
             app,
         ),
         (
@@ -223,7 +223,7 @@ for label, containers, expected in consumers(BYO_PLAIN_DIR, BYO_HOST):
 
 # ---- 3: byo-require, per-driver suffix, BYO host. -------------------------
 for label, containers, expected in consumers(BYO_REQUIRE_DIR, BYO_HOST):
-    if label in {"api", "worker", "migrate"}:
+    if label in {"api", "worker", "schema-migrate"}:
         expected = expected + "?ssl=require"
     else:
         expected = expected + "?sslmode=require&sslaccept=accept_invalid_certs"
@@ -358,7 +358,7 @@ def die(message):
 
 docs = [
     doc
-    for doc in yaml.safe_load_all(pathlib.Path(templates_dir, "api.yaml").read_text())
+    for doc in yaml.safe_load_all(pathlib.Path(templates_dir, "schema-migrate.yaml").read_text())
     if doc
 ]
 migrate = []
@@ -368,11 +368,11 @@ for doc in docs:
         .get("template", {})
         .get("spec", {})
     )
-    for container in spec.get("initContainers") or []:
-        if container.get("name") == "migrate":
+    for container in spec.get("containers") or []:
+        if container.get("name") == "schema-migrate":
             migrate.append(container)
 if len(migrate) != 1:
-    die(f"expected exactly one migrate init container, found {len(migrate)}")
+    die(f"expected exactly one schema-migrate container, found {len(migrate)}")
 
 process = list(migrate[0].get("command") or []) + list(migrate[0].get("args") or [])
 if len(process) < 3 or process[1] != "-c":
@@ -387,8 +387,8 @@ end = script.find("'", start)
 if end < 0:
     die("migrate init python -c probe is not single-quote terminated")
 probe_src = textwrap.dedent(script[start:end])
-if "urlparse" not in probe_src or "ssl" not in probe_src:
-    die("extracted probe does not lift ssl out of the DSN (no urlparse/ssl split)")
+if "DATABASE_URL" not in probe_src or "asyncpg.connect" not in probe_src:
+    die("extracted probe does not connect through DATABASE_URL with asyncpg")
 
 closed = socket.socket()
 closed.bind(("127.0.0.1", 0))
@@ -399,9 +399,8 @@ fake = tmp / "fake-asyncpg"
 fake.mkdir()
 (fake / "asyncpg.py").write_text(
     """\
-import os
 import socket
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 
 class Connection:
@@ -410,17 +409,7 @@ class Connection:
 
 
 async def connect(database_url, timeout=None, **kwargs):
-    parsed = urlparse(database_url)
-    query = parse_qs(parsed.query)
-    if "ssl" in query:
-        raise RuntimeError("ssl_query_not_lifted")
-    if os.environ.get("EXPECT_SSL_KWARG") == "1":
-        # asyncpg maps ssl=True to verify-full; the chart must pass the
-        # mode string so require encrypts without a CA, matching SQLAlchemy.
-        if kwargs.get("ssl") is True:
-            raise RuntimeError("ssl_kwarg_is_true_not_require")
-        if kwargs.get("ssl") != "require":
-            raise RuntimeError("ssl_kwarg_missing")
+    parsed = urlparse(database_url.replace("postgresql+asyncpg://", "postgresql://", 1))
     socket.create_connection(
         (parsed.hostname, parsed.port or 5432),
         timeout=timeout if timeout is not None else 2,
@@ -437,7 +426,6 @@ result = subprocess.run(
     env={
         **os.environ,
         "DATABASE_URL": database_url,
-        "EXPECT_SSL_KWARG": "1",
         "PYTHONPATH": str(fake),
     },
     capture_output=True,
@@ -448,19 +436,13 @@ result = subprocess.run(
 output = (result.stdout or "") + (result.stderr or "")
 if result.returncode == 0:
     die(f"probe succeeded against a closed port: {output!r}")
-if "ssl_query_not_lifted" in output:
-    die("probe forwarded ssl= to the server instead of lifting it to the connect kwarg")
-if "ssl_kwarg_is_true_not_require" in output:
-    die("probe passed ssl=True (asyncpg verify-full) instead of ssl='require'")
-if "ssl_kwarg_missing" in output:
-    die("probe stripped ssl= from the DSN but did not pass ssl='require' to asyncpg.connect")
 if "ConnectionRefusedError" not in output and "OSError" not in output:
     die(
         "probe against a closed port must fail with a connection error class, "
         f"got {output!r}"
     )
 print(
-    "  [6] extracted migrate probe lifts ssl= to the connect kwarg and fails "
+    "  [6] extracted schema-migrate probe uses DATABASE_URL and fails "
     "against a closed port with a connection error class: OK"
 )
 PY
@@ -499,17 +481,17 @@ def die(message):
 
 docs = [
     doc
-    for doc in yaml.safe_load_all(pathlib.Path(templates_dir, "api.yaml").read_text())
+    for doc in yaml.safe_load_all(pathlib.Path(templates_dir, "schema-migrate.yaml").read_text())
     if doc
 ]
 migrate = []
 for doc in docs:
     spec = (doc.get("spec") or {}).get("template", {}).get("spec", {})
-    for container in spec.get("initContainers") or []:
-        if container.get("name") == "migrate":
+    for container in spec.get("containers") or []:
+        if container.get("name") == "schema-migrate":
             migrate.append(container)
 if len(migrate) != 1:
-    die(f"expected exactly one migrate init container, found {len(migrate)}")
+    die(f"expected exactly one schema-migrate container, found {len(migrate)}")
 
 process = list(migrate[0].get("command") or []) + list(migrate[0].get("args") or [])
 script = process[2]
@@ -552,7 +534,7 @@ if "ConnectionRefusedError" not in output and "OSError" not in output:
         f"got {output!r}"
     )
 print(
-    "  [7] extracted migrate probe with real asyncpg fails against a closed "
+    "  [7] extracted schema-migrate probe with real asyncpg fails against a closed "
     "port with a connection error class: OK"
 )
 PY
@@ -561,6 +543,6 @@ echo
 echo "PASS: postgres.sslMode renders a TLS parameter on every Postgres DSN"
 echo "      (asyncpg ?ssl=require, Prisma ?sslmode=require&sslaccept=accept_invalid_certs), the default and"
 echo "      BYO-plain renders stay suffix-free, invalid values and require+"
-echo "      in-chart deploy are refused by name, and the migrate probe lifts"
-echo "      ssl='require' out of the DSN before asyncpg.connect, including"
-echo "      against a closed port with the real driver."
+echo "      in-chart deploy are refused by name, and the schema-migrate probe"
+echo "      connects through DATABASE_URL with asyncpg, including against a"
+echo "      closed port with the real driver."

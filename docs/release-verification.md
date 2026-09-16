@@ -12,6 +12,34 @@ These artifacts are produced by the release workflow, so they exist on every
 release published *after* v0.4.0. Nothing below works against v0.4.0 or earlier,
 which shipped bare binaries.
 
+## Patch releases name their trigger and live proof
+
+A patch release (`vX.Y.Z` where Z is not 0) names the defects that triggered it
+and the live surface each defect was re-verified on. The four v0.8.x patch PRs
+(#2117, #2157, #2181, #2218) are the negative examples: they described release
+mechanics, marked every product end-to-end tier n/a, and moved unfinished
+issues out of the milestone so it read as empty. Only v0.8.4 had a real
+trigger, and even that cut did not record live proof on the PR.
+
+The release pull request therefore carries two required sections, which the
+default [PR template](../.github/PULL_REQUEST_TEMPLATE.md) includes:
+
+- **Trigger** lists the issue numbers of the defects that caused the cut.
+- **Live proof** names a CI or ladder run URL that re-verified each trigger on
+  a live surface, or an explicit `waiver:` line with the reason no live run
+  was possible.
+
+`scripts/check-pr-body.sh` (the PR-body gate in
+[`.github/workflows/pr-body.yaml`](../.github/workflows/pr-body.yaml)) rejects a
+patch release PR whose title matches `Prepare the vX.Y.Z release` when either
+section is missing, comment-only, or empty of those contents. Feature releases
+(`vX.Y.0`) are not this gate.
+
+When an open issue is moved out of the milestone within 24 hours of the cut,
+comment on that issue naming the release it moved from. That is a process
+rule: the PR-body gate does not observe milestone moves. A milestone that
+reads "zero open issues" is not itself a reason to cut.
+
 ## What each release publishes
 
 | Asset | What it is |

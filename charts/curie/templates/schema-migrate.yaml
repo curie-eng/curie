@@ -1,0 +1,134 @@
+{{- if and .Values.api.deploy .Values.api.migrate.enabled }}
+{{/*
+One controlled schema upgrade phase (#2300).
+
+API pods used to run `alembic upgrade head` in an init container. That made
+every replica a migrator and made patch rollback undependable: an older image
+refused a newer additive revision it did not have in its script directory.
+
+This Job is the only in-chart migrator:
+
+  post-install  -> Postgres exists (created with the rest of the release).
+                   A pre-install hook would race a database that is not there.
+  pre-upgrade   -> runs after the worker drain gate (weight -10) and before
+                   Deployments roll, so the previous application keeps serving
+                   through a compatible expand.
+
+backoffLimit is 3 because apply is idempotent at the alembic_version boundary.
+A refused irreversible decision is deterministic, so retrying it fails the
+same way without a second mutation.
+*/}}
+{{- $image := include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "curie.fullname" . }}-schema-migrate
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: schema-migrate
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- with (include "curie.placement.labels" (dict "root" $ "class" "hooks")) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- include "curie.selectorLabels" (dict "root" . "component" "schema-migrate") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "hooks")) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with (include "curie.placement.spec" (dict "root" $ "class" "hooks")) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      restartPolicy: Never
+      {{- with .Values.priorityClasses.platform.name }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.api.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: schema-migrate
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+          {{- with .Values.api.containerSecurityContext }}
+          {{- include "curie.containerSecurityContext" . | nindent 10 }}
+          {{- end }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              attempt=1
+              max_attempts=60
+              probe_error_class=""
+              while [ "$attempt" -le "$max_attempts" ]; do
+                # Lift ssl= out of the DSN into the connect kwarg (#2431).
+                # asyncpg's DSN parser knows sslmode, not ssl, so an ssl=
+                # query arg is forwarded as a server setting. Pass the mode
+                # string through: ssl=True is verify-full; ssl="require"
+                # encrypts without a CA, matching SQLAlchemy's ?ssl=require.
+                if probe_error_class=$(python -c '
+              import asyncio
+              import os
+              from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+              try:
+                  import asyncpg
+
+                  async def probe():
+                      database_url = os.environ["DATABASE_URL"].replace(
+                          "postgresql+asyncpg://", "postgresql://", 1
+                      )
+                      parsed = urlparse(database_url)
+                      query = []
+                      ssl = None
+                      for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+                          if key == "ssl":
+                              ssl = value
+                          else:
+                              query.append((key, value))
+                      database_url = urlunparse(parsed._replace(query=urlencode(query)))
+                      connect_kwargs = {"timeout": 2}
+                      if ssl is not None:
+                          connect_kwargs["ssl"] = ssl
+                      connection = await asyncpg.connect(database_url, **connect_kwargs)
+                      await connection.close()
+
+                  asyncio.run(probe())
+              except Exception as error:
+                  print(type(error).__name__)
+                  raise SystemExit(1)
+              ' 2>/dev/null); then
+                  if python -c 'import curie_api.schema_compat' >/dev/null 2>&1; then
+                    exec python -m curie_api.schema_compat upgrade
+                  fi
+                  # Retained pre-#2300 API image (helm --reset-then-reuse-values
+                  # keeps the old digest). That image still ships Alembic and
+                  # is already at its own head; upgrade head is a no-op.
+                  exec alembic -c alembic.ini upgrade head
+                fi
+                if [ "$attempt" -eq 1 ]; then
+                  echo "Waiting for Postgres readiness"
+                fi
+                if [ "$attempt" -lt "$max_attempts" ]; then
+                  sleep 2
+                fi
+                attempt=$((attempt + 1))
+              done
+              echo "Postgres unavailable after $max_attempts readiness attempts; final probe error class: $probe_error_class" >&2
+              exit 1
+          env:
+            {{- include "curie.env.postgres" . | nindent 12 }}
+            - name: CURIE_SCHEMA_FORWARD_ONLY
+              value: {{ .Values.api.migrate.forwardOnly | default false | quote }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+{{- end }}

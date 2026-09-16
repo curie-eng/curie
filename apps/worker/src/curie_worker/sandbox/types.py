@@ -128,6 +128,16 @@ class SandboxHandle:
     # (written before the token existed) with token == "" -- no header is sent
     # for those and the pre-token runner enforces nothing, so they keep working.
     token: str = ""
+    # Worker-internal late-acquisition fence. These facts never cross ACI.
+    workspace_repo: str | None = None
+    # Exact commit extracted into /workspace for this runner. A verified PR
+    # lineage can reuse the route only while this still matches its remote head.
+    workspace_materialized_head: str | None = None
+    # Highest publication result already present in durable transcript history
+    # when this runner booted. Advancing it requires one cold rehydrate even
+    # when a denied/failed revision leaves the git head unchanged.
+    publication_visible_outcome_revision: int = 0
+    generation: int = 0
 
     @property
     def sandbox_id(self) -> str:

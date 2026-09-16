@@ -182,11 +182,11 @@ fn the_wired_byo_connect_still_rolls_the_api() {
 /// execution through the real consumer path, and the real consumer path is the
 /// binary.
 ///
-/// Real invocation, and still no cluster. `github_app()` orders itself
-/// `require_connect_inputs` -> `require_on_path("helm")` -> `fetch_release_values`
-/// -> `guard_byo_key_conflict` -> `helm upgrade`, and the CLI reads the release
-/// with `helm get values -o json`. A `helm` shim earlier on the CHILD's PATH
-/// answers that read; the refusal then happens before anything is executed.
+/// Real invocation, and still no cluster. `github_app()` validates the inputs
+/// and tools, captures the deployed Helm revision, then reads that revision's
+/// values before applying `guard_byo_key_conflict` and entering any sandbox or
+/// Helm mutation path. A `helm` shim earlier on the CHILD's PATH answers those
+/// exact-revision reads; the refusal then happens before anything is mutated.
 /// `--dry-run` is deliberately NOT used here: it must never touch the network
 /// (`cli/CLAUDE.md`), so it makes no values read and reaches no guard at all --
 /// a dry run could not exercise this call site.
@@ -201,9 +201,10 @@ mod byo_conflict_guard_through_the_binary {
     use std::path::PathBuf;
     use std::process::{Command, Output};
 
-    /// Logs every invocation, answers only the values read this verb makes, and
-    /// refuses everything else -- so no test can pass because the CLI ran some
-    /// other command that happened to succeed, and no test can mutate anything.
+    /// Logs every invocation, answers the read-only release and sandbox reads
+    /// required before a credential mutation, and refuses everything else --
+    /// so no test can pass because the CLI ran some other command that happened
+    /// to succeed, and no test can mutate anything.
     /// Installed under both names: the real path calls `require_on_path`
     /// ("kubectl") before running the upgrade, so a missing kubectl would abort
     /// the sibling paths one step early and for the wrong reason.
@@ -212,6 +213,44 @@ tool=$(basename "$0")
 echo "$tool $*" >> "$SHIM_LOG"
 if [ "$tool" = "helm" ] && [ "$1" = "get" ] && [ "$2" = "values" ]; then
   echo "$FAKE_VALUES"
+  exit 0
+fi
+if [ "$tool" = "helm" ] && [ "$1" = "history" ]; then
+  echo '[{"revision":12,"status":"deployed","chart":"curie-0.8.6"}]'
+  exit 0
+fi
+if [ "$tool" = "helm" ] && [ "$1" = "get" ] && [ "$2" = "manifest" ]; then
+  cat <<'MANIFEST'
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: curie-runner
+  labels:
+    app.kubernetes.io/component: agent-sandbox
+    app.kubernetes.io/instance: curie
+    app.kubernetes.io/managed-by: Helm
+spec:
+  service: true
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: curie-runner-pool
+  labels:
+    app.kubernetes.io/component: agent-sandbox
+    app.kubernetes.io/instance: curie
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: curie-runner
+MANIFEST
+  exit 0
+fi
+if [ "$tool" = "kubectl" ] && [ "$1" = "get" ] \
+  && [[ "$2" == sandboxtemplates.extensions.agents.x-k8s.io,* ]]; then
+  echo '{"items":[{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"SandboxTemplate","metadata":{"name":"curie-runner","labels":{"app.kubernetes.io/component":"agent-sandbox","app.kubernetes.io/instance":"curie","app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"curie","meta.helm.sh/release-namespace":"curie"}},"spec":{"service":true}},{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"SandboxWarmPool","metadata":{"name":"curie-runner-pool","labels":{"app.kubernetes.io/component":"agent-sandbox","app.kubernetes.io/instance":"curie","app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"curie","meta.helm.sh/release-namespace":"curie"}},"spec":{"replicas":0,"sandboxTemplateRef":{"name":"curie-runner"}}}]}'
   exit 0
 fi
 if [ "$tool" = "kubectl" ] && echo "$*" | grep -q " get secret "; then
@@ -441,16 +480,20 @@ exit 1
             "the refused run reported the App as configured: {value}"
         );
 
-        // And the refusal must land before any mutation: the values read is the
-        // only thing the CLI was allowed to run.
+        // And the refusal must land before any mutation. The exact-revision
+        // guard first identifies Helm revision 12, then reads values from that
+        // revision so the credential decision and sandbox inventory cannot
+        // observe different release states. Those are the only two commands
+        // allowed before this refusal; in particular no helm upgrade and no
+        // kubectl mutation may run.
         let log = release.invocations();
-        assert!(
-            log.iter().all(|line| line.starts_with("helm get values")),
-            "the guard let something run before refusing: {log:?}"
-        );
-        assert!(
-            log.iter().any(|line| line.starts_with("helm get values")),
-            "the release was never read, so the refusal proves nothing: {log:?}"
+        assert_eq!(
+            log,
+            vec![
+                "helm history curie -n curie -o json --max 256",
+                "helm get values curie -n curie --revision 12 -o json",
+            ],
+            "the guard must perform only the exact-revision read before refusing"
         );
     }
 

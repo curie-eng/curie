@@ -17,18 +17,65 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
-from aci_protocol import ApprovalRequest
+from aci_protocol import ApprovalRequest, QueuedTurn
 from curie_telemetry import inject_trace_context
+
+from .workspace import WorkspaceSelectionRefused
 
 # Re-exported so this module stays the kernel-facing seam for the approval
 # payload: ``ApprovalRequest`` is now the shared wire model (#492), not a
 # lane-local mirror of the API's schema.
 logger = logging.getLogger(__name__)
+
+_PUBLICATION_REFUSAL_CODES = {
+    "publication.github_unavailable",
+    "publication.lineage_stale",
+    "publication.lineage_terminal",
+}
+_TERMINAL_WORKSPACE_CONFLICT_DETAILS = {
+    "conversation has no selected repository workspace",
+    "publication repository differs from the thread workspace",
+    "thread workspace repository is no longer allowed",
+}
+_REVIEW_EVENT_ID_RE = re.compile(
+    r"github-feedback-"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+# The API owns a two-second overall reserve deadline. Leave it a small response
+# margin while still bounding this worker-side HTTP hop independently of the
+# much longer model/session client timeout.
+_REVIEW_RESERVE_HTTP_TIMEOUT_S = 3.0
+
+
+def _publication_refusal(response: httpx.Response) -> str | None:
+    """Return a safe API-classified refusal instead of making it retryable."""
+
+    if response.status_code not in (409, 502, 503):
+        return None
+    try:
+        detail = response.json()["detail"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if isinstance(detail, dict):
+        code = detail.get("code")
+        message = detail.get("message")
+        if (
+            isinstance(code, str)
+            and code in _PUBLICATION_REFUSAL_CODES
+            and isinstance(message, str)
+            and message.strip()
+        ):
+            return message
+        return None
+    if isinstance(detail, str) and detail in _TERMINAL_WORKSPACE_CONFLICT_DETAILS:
+        return detail
+    return None
 
 __all__ = [
     "ApprovalBackendError",
@@ -41,6 +88,9 @@ __all__ = [
     "CreatedPublication",
     "PublicationCreateRequest",
     "PublicationCreator",
+    "PublicationLineage",
+    "ReviewAuthorityUnavailable",
+    "VerifiedReviewFeedback",
 ]
 
 
@@ -73,14 +123,17 @@ class PublicationCreateRequest:
     expires_in_seconds: int
     title: str
     body: str
+    reply_conversation_id: str | None = None
     max_patch_bytes: int = 900_000
+    review_origin_key: str | None = None
+    route: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         if len(self.patch) > self.max_patch_bytes:
             raise ApprovalBackendError(
                 f"publication patch exceeds {self.max_patch_bytes} raw bytes"
             )
-        return {
+        payload: dict[str, Any] = {
             "deployment_id": str(self.deployment_id),
             "conversation_id": self.conversation_id,
             "repo_full_name": self.repo_full_name,
@@ -99,6 +152,13 @@ class PublicationCreateRequest:
             "title": self.title,
             "body": self.body,
         }
+        if self.reply_conversation_id is not None:
+            payload["reply_conversation_id"] = self.reply_conversation_id
+        if self.review_origin_key is not None:
+            payload["review_origin_key"] = self.review_origin_key
+        if self.route is not None:
+            payload["route"] = self.route
+        return payload
 
 
 @dataclass(frozen=True)
@@ -108,9 +168,37 @@ class CreatedPublication:
     status: str
 
 
+@dataclass(frozen=True)
+class PublicationLineage:
+    id: uuid.UUID
+    deployment_id: uuid.UUID
+    conversation_id: str
+    repo_full_name: str
+    base_sha: str
+    branch: str
+    pr_number: int | None
+    pr_url: str | None
+    head_sha: str | None
+    state: str
+    version: int
+    latest_revision: int
+    has_pending_revision: bool
+    has_pending_outcome: bool
+    visible_outcome_revision: int
+
+
 class ApprovalBackendError(Exception):
     """The approval record could not be created; the kernel escalates rather
     than suspending a session no resolution could ever wake."""
+
+
+class ReviewAuthorityUnavailable(Exception):
+    """Fresh review authority was unavailable before a model turn started.
+
+    The consumer leaves this delivery pending for its existing bounded
+    reclaim/dead-letter path instead of spending the model retry budget on a
+    turn the runner never accepted.
+    """
 
 
 @dataclass(frozen=True)
@@ -136,10 +224,43 @@ class ApprovalCreator(Protocol):
     async def create(self, request: ApprovalRequest) -> CreatedApproval: ...
 
 
+@dataclass(frozen=True)
+class VerifiedReviewFeedback:
+    """Credential-free authority for one exact persisted review queue row."""
+
+    head_sha: str
+    agent_id: uuid.UUID
+    sender: str
+    receipt: str
+    origin_key: str
+    lineage_version: int
+    reservation_id: uuid.UUID | None
+
+
 class PublicationCreator(Protocol):
     """Atomic trusted write seam used only for exact publish provenance."""
 
     async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication: ...
+
+    async def get_publication_lineage(
+        self,
+        deployment_id: uuid.UUID,
+        conversation_id: str,
+        repo_full_name: str,
+    ) -> PublicationLineage | None: ...
+
+    async def verify_review_feedback(
+        self,
+        turn: QueuedTurn,
+        deployment_id: uuid.UUID,
+    ) -> VerifiedReviewFeedback: ...
+
+    async def reserve_review_feedback(
+        self,
+        turn: QueuedTurn,
+        deployment_id: uuid.UUID,
+        verified: VerifiedReviewFeedback,
+    ) -> uuid.UUID: ...
 
 
 class ApprovalReader(Protocol):
@@ -161,13 +282,155 @@ class ApprovalClient:
         client: httpx.AsyncClient,
         read_timeout_s: float,
         worker_token: str = "",
+        review_timeout_s: float = 30.0,
     ) -> None:
         self._url = f"{api_base_url.rstrip('/')}/approvals"
         self._publication_url = f"{api_base_url.rstrip('/')}/v1/internal/publications"
+        self._review_url = f"{api_base_url.rstrip('/')}/v1/internal/github/reviews"
         self._headers = {"X-API-Key": api_key} if api_key else {}
         self._worker_headers = {"X-Curie-Worker-Token": worker_token} if worker_token else {}
         self._client = client
         self._read_timeout_s = read_timeout_s
+        self._review_timeout_s = review_timeout_s
+
+    async def verify_review_feedback(
+        self,
+        turn: QueuedTurn,
+        deployment_id: uuid.UUID,
+    ) -> VerifiedReviewFeedback:
+        """Ask the trusted API to match this complete turn to fresh authority."""
+
+        refusal = (
+            "GitHub feedback could not be verified for this conversation; "
+            "no model turn started."
+        )
+        if (
+            not self._worker_headers
+            or _REVIEW_EVENT_ID_RE.fullmatch(turn.event_id) is None
+        ):
+            raise WorkspaceSelectionRefused(refusal)
+        headers = {**self._worker_headers, "Content-Type": "application/json"}
+        inject_trace_context(headers)
+        try:
+            response = await self._client.post(
+                f"{self._review_url}/{turn.event_id}/verify",
+                json={
+                    "turn": turn.model_dump(mode="json"),
+                    "deployment_id": str(deployment_id),
+                },
+                headers=headers,
+                follow_redirects=False,
+                timeout=self._review_timeout_s,
+            )
+        except httpx.HTTPError:
+            raise ApprovalBackendError(
+                "GitHub feedback verification transport unavailable"
+            ) from None
+        if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
+            raise ApprovalBackendError(
+                "GitHub feedback verification temporarily unavailable"
+            )
+        if response.status_code != 200:
+            # Never reflect an API/provider body into the conversation. A 409 is
+            # a definitive authority refusal; rollout/auth/availability statuses
+            # above stay retryable.
+            raise WorkspaceSelectionRefused(refusal)
+        try:
+            body = response.json()
+            head_sha = body["head_sha"]
+            sender = body["sender"]
+            receipt = body["receipt"]
+            origin_key = body["origin_key"]
+            lineage_version = body["lineage_version"]
+            reservation_value = body["reservation_id"]
+            if (
+                not isinstance(head_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+                or sender != turn.author
+                or not isinstance(receipt, str)
+                or not receipt.strip()
+                or len(receipt) > 1024
+                or origin_key != turn.event_id
+                or type(lineage_version) is not int
+                or lineage_version < 1
+            ):
+                raise ValueError("invalid verified feedback")
+            return VerifiedReviewFeedback(
+                head_sha=head_sha,
+                agent_id=uuid.UUID(str(body["agent_id"])),
+                sender=sender,
+                receipt=receipt,
+                origin_key=origin_key,
+                lineage_version=lineage_version,
+                reservation_id=(
+                    uuid.UUID(str(reservation_value))
+                    if reservation_value is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            raise WorkspaceSelectionRefused(refusal) from None
+
+    async def reserve_review_feedback(
+        self,
+        turn: QueuedTurn,
+        deployment_id: uuid.UUID,
+        verified: VerifiedReviewFeedback,
+    ) -> uuid.UUID:
+        """Freshly verify and reserve this origin after the kernel observes idle."""
+
+        refusal = "GitHub feedback revision identity was refused."
+        if (
+            not self._worker_headers
+            or _REVIEW_EVENT_ID_RE.fullmatch(turn.event_id) is None
+            or verified.origin_key != turn.event_id
+            or verified.sender != turn.author
+            or not isinstance(verified.head_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", verified.head_sha) is None
+            or type(verified.lineage_version) is not int
+            or verified.lineage_version < 1
+        ):
+            raise WorkspaceSelectionRefused(refusal)
+        headers = {**self._worker_headers, "Content-Type": "application/json"}
+        inject_trace_context(headers)
+        try:
+            response = await self._client.post(
+                f"{self._review_url}/{turn.event_id}/reserve",
+                json={
+                    "turn": turn.model_dump(mode="json"),
+                    "deployment_id": str(deployment_id),
+                    "expected_lineage_version": verified.lineage_version,
+                    "expected_head_sha": verified.head_sha,
+                },
+                headers=headers,
+                follow_redirects=False,
+                timeout=_REVIEW_RESERVE_HTTP_TIMEOUT_S,
+            )
+        except httpx.HTTPError:
+            raise ApprovalBackendError(
+                "GitHub review reservation transport unavailable"
+            ) from None
+        if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
+            raise ApprovalBackendError(
+                "GitHub review reservation temporarily unavailable"
+            )
+        if response.status_code != 200:
+            raise WorkspaceSelectionRefused(
+                "GitHub feedback revision is no longer executable."
+            )
+        try:
+            body = response.json()
+            if body["origin_key"] != turn.event_id:
+                raise ValueError("wrong review origin")
+            reservation_id = uuid.UUID(str(body["reservation_id"]))
+            if (
+                verified.reservation_id is not None
+                and reservation_id != verified.reservation_id
+            ):
+                raise ValueError("wrong review reservation")
+            return reservation_id
+        except (KeyError, TypeError, ValueError):
+            raise WorkspaceSelectionRefused(refusal) from None
 
     async def create(self, request: ApprovalRequest) -> CreatedApproval:
         headers = {**self._headers, "Content-Type": "application/json"}
@@ -246,6 +509,9 @@ class ApprovalClient:
             )
         except httpx.HTTPError as exc:
             raise ApprovalBackendError(f"publication create failed: {exc}") from exc
+        refusal = _publication_refusal(response)
+        if refusal is not None:
+            raise WorkspaceSelectionRefused(refusal)
         if response.status_code not in (200, 201):
             raise ApprovalBackendError(
                 f"publication create failed: HTTP {response.status_code}: {response.text}"
@@ -259,3 +525,59 @@ class ApprovalClient:
             )
         except (ValueError, KeyError) as exc:
             raise ApprovalBackendError("publication create returned an unusable body") from exc
+
+    async def get_publication_lineage(
+        self,
+        deployment_id: uuid.UUID,
+        conversation_id: str,
+        repo_full_name: str,
+    ) -> PublicationLineage | None:
+        """Read credential-free lineage before choosing a runner route."""
+
+        if not self._worker_headers:
+            return None
+        try:
+            response = await self._client.get(
+                f"{self._publication_url}/lineage",
+                params={
+                    "deployment_id": str(deployment_id),
+                    "conversation_id": conversation_id,
+                    "repo_full_name": repo_full_name,
+                },
+                headers=self._worker_headers,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise ApprovalBackendError(f"publication lineage read failed: {exc}") from exc
+        if response.status_code == 404:
+            return None
+        refusal = _publication_refusal(response)
+        if refusal is not None:
+            raise WorkspaceSelectionRefused(refusal)
+        if response.status_code != 200:
+            raise ApprovalBackendError(
+                f"publication lineage read failed: HTTP {response.status_code}: {response.text}"
+            )
+        try:
+            body = response.json()
+            return PublicationLineage(
+                id=uuid.UUID(str(body["id"])),
+                deployment_id=uuid.UUID(str(body["deployment_id"])),
+                conversation_id=str(body["conversation_id"]),
+                repo_full_name=str(body["repo_full_name"]),
+                base_sha=str(body["base_sha"]),
+                branch=str(body["branch"]),
+                pr_number=int(body["pr_number"]) if body.get("pr_number") is not None else None,
+                pr_url=str(body["pr_url"]) if body.get("pr_url") is not None else None,
+                head_sha=str(body["head_sha"]) if body.get("head_sha") is not None else None,
+                state=str(body["state"]),
+                version=int(body["version"]),
+                latest_revision=int(body["latest_revision"]),
+                has_pending_revision=bool(body["has_pending_revision"]),
+                has_pending_outcome=bool(body["has_pending_outcome"]),
+                visible_outcome_revision=int(body["visible_outcome_revision"]),
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ApprovalBackendError(
+                "publication lineage read returned an unusable body"
+            ) from exc

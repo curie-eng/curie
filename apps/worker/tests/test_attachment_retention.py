@@ -113,6 +113,7 @@ def _workspace_lane(
         clean_clone_url="https://github.com/acme-corp/acme-bot.git",
         repo_full_name="acme-corp/acme-bot",
         base_sha="b" * 40,
+        materialized_head="b" * 40,
         checkout_mode=0o40700,
         reference=reference,
     )

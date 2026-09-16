@@ -1224,6 +1224,29 @@ def test_eval_lane_boot_env_omits_memory_ref() -> None:
     assert "CURIE_HISTORY_REF" not in env
 
 
+def test_eval_boot_env_forwards_sha_as_bundle_version() -> None:
+    """#2174 sibling: the eval lane boots the same agent-readable version key.
+
+    EvalJob carries ``sha`` rather than version_label; that is the version the
+    suite is scoring, so it is what the provisioned sandbox must be able to
+    name. CURIE_BUNDLE_REF stays the object key used to fetch the bundle.
+    """
+
+    consumer = EvalStreamConsumer(
+        redis=None,  # type: ignore[arg-type]
+        config=WorkerConfig(),
+        bundle_store=None,  # type: ignore[arg-type]
+        substrate=None,  # type: ignore[arg-type]
+        reporter=None,  # type: ignore[arg-type]
+        recorder=None,  # type: ignore[arg-type]
+        repo_lookup=None,
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
+    env = consumer._boot_env(item)
+    assert env["CURIE_BUNDLE_VERSION"] == "deadbeef"
+    assert env[BUNDLE_REF_ENV] == "bundles/x.zip"
+
+
 def test_eval_requested_model_boots_and_tags_that_model() -> None:
     """#526: a work item's ``model`` is booted into the provisioned sandbox
     (CURIE_MODEL wins over the worker default) AND becomes the run's model

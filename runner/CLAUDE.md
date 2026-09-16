@@ -31,12 +31,14 @@ Docker via `curie skill up`. Full behavior spec in `runner/README.md`.
   conservative.
 - **Rehydration on start is stateless-first** (ADR-0003): the runner
   rehydrates external state on boot rather than assuming any surviving
-  in-process state. Two distinct external refs, each resolved to a store over
-  the durable state API and delivered as a system-prompt preamble, never a
-  surviving process: `CURIE_HISTORY_REF` is this thread's conversation
-  transcript (`history.py`, ADR-0029), `CURIE_MEMORY_REF` is the agent's
-  durable memory (`memory.py`, ADR-0025). `CURIE_HISTORY_REF` is a state-API
-  URL, no longer an SDK `resume` id, and is not fed to the SDK `resume=` path.
+  in-process state. Two distinct external refs resolve over the durable state
+  API: `CURIE_HISTORY_REF` is this thread's structured conversation transcript
+  (`history.py`, ADR-0119/0029), while `CURIE_MEMORY_REF` is the agent's durable
+  memory and still enters the system prompt (`memory.py`, ADR-0025).
+  `CURIE_HISTORY_REF` is never itself an SDK resume id; the harness adapter may
+  consume optional opaque checkpoint/delta data for cache fidelity or reconstruct
+  an ephemeral provider resume envelope from its portable messages. The portable
+  messages remain authoritative across harnesses.
   Never write a code path that depends on the runner having been "the same
   process" as an earlier turn.
 - **One turn consumes the SDK generator at a time.** Steer and interrupt are
@@ -61,10 +63,12 @@ uv run pytest runner/tests -q                            # unit + integration + 
 uv run ruff check runner/ && uv run mypy
 ```
 
-`runner/tests/test_live.py` runs only when `CLAUDE_CODE_OAUTH_TOKEN` or
-`ANTHROPIC_API_KEY` is present; it is skipped otherwise, so a green local run
-without a credential does not exercise the real model path -- do not treat
-it as equivalent to a `@live` pass. The conformance suite
+The ordinary provider smokes in `runner/tests/test_live.py` run only when
+`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` is present. The disposable
+structured-replay/cross-runner cases require an explicit `CURIE_E2E_LIVE=1` and
+may use an already authenticated local Claude SDK. Without those gates they are
+skipped, so a green default run does not exercise the real model path -- do not
+treat it as equivalent to a live pass. The conformance suite
 (`run_conformance` from `packages/aci-protocol`) must return `passed=True`
 against this runner's producer; a change that breaks conformance is a
 contract violation even if the runner's own tests pass.

@@ -23,6 +23,15 @@ def test_version_field_is_required_in_the_exported_schema() -> None:
     assert "const" not in final["properties"]["version"]
 
 
+def test_event_session_context_fields_are_optional_nullable_strings() -> None:
+    event = build_schema()["$defs"]["Event"]
+    for field in ("session_id", "history_ref"):
+        assert field not in event["required"]
+        prop = event["properties"][field]
+        assert "anyOf" in prop
+        assert {variant["type"] for variant in prop["anyOf"]} == {"string", "null"}
+
+
 def test_generated_rust_guards_the_version() -> None:
     rust = render_rust()
     lines = rust.splitlines()

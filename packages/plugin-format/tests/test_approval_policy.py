@@ -15,7 +15,12 @@ import shutil
 from pathlib import Path
 
 import yaml
-from plugin_format import ApprovalGate, grantable_routes, validate_bundle
+from plugin_format import (
+    TOOL_POLICY_ENFORCEMENT,
+    ApprovalGate,
+    grantable_routes,
+    validate_bundle,
+)
 
 
 def _gate(gate: str, route: str, grantable: bool = False) -> ApprovalGate:
@@ -108,7 +113,9 @@ def test_route_matching_is_case_sensitive() -> None:
 # A gate may only name a connector the bundle declares -- #1495, and #1691's
 # constraint that it must keep holding once a third connector form exists
 # --------------------------------------------------------------------------- #
-def test_sre_bot_declares_gated_write_connector_and_validates(tmp_path: Path) -> None:
+def test_sre_bot_declares_policy_scoped_kubernetes_connector_and_validates(
+    tmp_path: Path,
+) -> None:
     source = Path(__file__).resolve().parents[3] / "examples" / "sre-bot"
     plugin = json.loads(
         (source / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
@@ -117,46 +124,30 @@ def test_sre_bot_declares_gated_write_connector_and_validates(tmp_path: Path) ->
         (source / "connectors.yaml").read_text(encoding="utf-8")
     )
 
-    # Every gated write verb, pinned as a list rather than checked for
-    # membership: `curie example sre-bot install` strips approvalPolicy entirely
-    # for its read only install, and stripping a gate is only safe when the
-    # connector it guards is stripped too (cli/src/examples.rs). A gate added
-    # here without its counterpart there ships a write verb into a read only
-    # install, so this assertion is what makes the pair fail loudly instead.
+    # Platform upgrades keep their separate zero-argument connector gates. The
+    # general Kubernetes surface is classified by toolPolicy instead.
     assert plugin["approvalPolicy"]["gates"] == [
-        {
-            "gate": "mcp__k8s-write__restart_deployment",
-            "route": "sre-approvals",
-        },
-        {
-            "gate": "mcp__k8s-scale__scale_deployment",
-            "route": "sre-approvals",
-        },
         {
             "gate": "mcp__self-upgrade__upgrade_self",
             "route": "sre-approvals",
         },
+        {
+            "gate": "mcp__self-upgrade__upgrade_platform",
+            "route": "sre-approvals",
+        },
     ]
-    assert connectors["connectors"]["k8s-write"]["build"] == {
-        "context": "connectors/k8s-write",
-        "platforms": ["linux/amd64", "linux/arm64"],
+    assert set(plugin["toolPolicy"]) == {
+        "enforcement",
+        "allow",
+        "approvalRequired",
+        "deny",
     }
-    assert "unhosted_url" not in connectors["connectors"]["k8s-write"]
-    assert connectors["connectors"]["k8s-write"]["secret_files"] == {
-        "K8S_WRITE_KUBECONFIG": "/secrets/kubeconfig"
+    assert "k8s-write" not in connectors["connectors"]
+    assert "k8s-scale" not in connectors["connectors"]
+    assert connectors["connectors"]["kubernetes"]["secret_files"] == {
+        "K8S_KUBECONFIG": "/secrets/kubeconfig"
     }
-    # A THIRD kubeconfig, not the write connector's. Reusing that one would hand
-    # this connector `patch` on `deployments`, throwing away the
-    # `deployments/scale` subresource ceiling that is its whole security
-    # argument (manifests/scale-role.yaml).
-    assert connectors["connectors"]["k8s-scale"]["secret_files"] == {
-        "K8S_SCALE_KUBECONFIG": "/secrets/kubeconfig"
-    }
-    assert connectors["connectors"]["k8s-scale"]["build"] == {
-        "context": "connectors/k8s-scale",
-        "platforms": ["linux/amd64", "linux/arm64"],
-    }
-    # A FOURTH kubeconfig, and the one bound to the widest grant in the bundle:
+    # A separate kubeconfig, and the one bound to the widest grant in the bundle:
     # `create` on `jobs` cannot be narrowed with `resourceNames`, so the ceiling
     # is the connector taking no arguments rather than RBAC
     # (manifests/upgrade-role.yaml). Reusing any of the other three would either
@@ -194,7 +185,9 @@ def test_sre_bot_declares_gated_write_connector_and_validates(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    result = validate_bundle(str(bundle))
+    result = validate_bundle(
+        str(bundle), enforces_tool_policy=TOOL_POLICY_ENFORCEMENT
+    )
     assert result.valid, [(error.code, error.message) for error in result.errors]
 
 

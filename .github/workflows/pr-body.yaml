@@ -26,27 +26,35 @@ jobs:
           persist-credentials: false
       # Keep untrusted PR text out of shell source. github-script reads the
       # payload directly and writes its bytes to a runner-owned temporary file.
-      - name: Write the pull request body to a temporary file
+      - name: Write the pull request body and title to temporary files
         uses: actions/github-script@v9
         env:
           PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
+          PR_TITLE_FILE: ${{ runner.temp }}/curie-pr-title.txt
         with:
           script: |
             const fs = require("node:fs");
             const body = context.payload.pull_request?.body ?? "";
+            const title = context.payload.pull_request?.title ?? "";
             if (typeof body !== "string") {
               core.setFailed("pull request body must be a string or null");
               return;
             }
+            if (typeof title !== "string") {
+              core.setFailed("pull request title must be a string or null");
+              return;
+            }
             fs.writeFileSync(process.env.PR_BODY_FILE, body, { encoding: "utf8", mode: 0o600 });
+            fs.writeFileSync(process.env.PR_TITLE_FILE, title, { encoding: "utf8", mode: 0o600 });
       # Prove both branches of the matcher can still be reached before trusting
       # its verdict against the event payload.
       - name: PR body guard self-test
         run: bash scripts/check-pr-body.sh --self-test
-      - name: Reject literal newline escapes and AI attribution in the pull request body
+      - name: Reject literal newline escapes, AI attribution, and empty patch-release sections
         env:
           PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
+          PR_TITLE_FILE: ${{ runner.temp }}/curie-pr-title.txt
         run: |
           set -euo pipefail
-          trap 'rm -f -- "$PR_BODY_FILE"' EXIT
-          bash scripts/check-pr-body.sh "$PR_BODY_FILE"
+          trap 'rm -f -- "$PR_BODY_FILE" "$PR_TITLE_FILE"' EXIT
+          bash scripts/check-pr-body.sh "$PR_BODY_FILE" --title-file "$PR_TITLE_FILE"

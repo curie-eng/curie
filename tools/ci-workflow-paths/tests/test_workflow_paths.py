@@ -623,12 +623,20 @@ def test_pr_body_guard_workflow_handles_body_only_pull_request_edits() -> None:
     assert script_step.get("env", {}).get("PR_BODY_FILE") == (
         "${{ runner.temp }}/curie-pr-body.md"
     ), "github-script must write only to a runner-owned temporary file"
+    assert script_step.get("env", {}).get("PR_TITLE_FILE") == (
+        "${{ runner.temp }}/curie-pr-title.txt"
+    ), "github-script must write the untrusted title to a runner-owned temporary file"
     script = script_step.get("with", {}).get("script")
     assert isinstance(script, str), "github-script must contain the payload serialization script"
     assert "context.payload.pull_request?.body ?? \"\"" in script
+    assert "context.payload.pull_request?.title ?? \"\"" in script
     assert "fs.writeFileSync(process.env.PR_BODY_FILE, body" in script
+    assert "fs.writeFileSync(process.env.PR_TITLE_FILE, title" in script
     assert "github.event.pull_request.body" not in script, (
         "untrusted PR text must be read from context.payload, not interpolated into script source"
+    )
+    assert "github.event.pull_request.title" not in script, (
+        "untrusted PR title must be read from context.payload, not interpolated into script source"
     )
 
     run_bodies = [step.get("run") for step in steps if isinstance(step.get("run"), str)]
@@ -641,8 +649,14 @@ def test_pr_body_guard_workflow_handles_body_only_pull_request_edits() -> None:
         if isinstance(body, str) and 'bash scripts/check-pr-body.sh "$PR_BODY_FILE"' in body
     ]
     assert len(guard_runs) == 1, "the event check must pass the runner temp file to the guard"
+    assert "--title-file \"$PR_TITLE_FILE\"" in guard_runs[0], (
+        "the event check must pass the title file so patch-release Trigger/Live proof can be gated"
+    )
     assert "${{ github.event.pull_request.body }}" not in guard_runs[0], (
         "the guard must receive the temporary file, never an interpolated PR body"
+    )
+    assert "${{ github.event.pull_request.title }}" not in guard_runs[0], (
+        "the guard must receive the title file, never an interpolated PR title"
     )
 
 

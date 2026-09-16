@@ -1,0 +1,131 @@
+# One credential for the pinned upstream Kubernetes MCP connector.
+#
+# Reads are cluster-wide but enumerate only non-secret operational resources.
+# Writes are namespaced to `sre-demo` and limited to workload APIs. Curie's
+# approval gate is deliberately absent from this file: approval decides whether
+# a call may be attempted; Kubernetes RBAC decides whether it can succeed.
+#
+# Verify the ceiling after applying:
+#
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     list pods --all-namespaces                                      # yes
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     patch deployments -n sre-demo                                  # yes
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     patch deployments -n curie                                     # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     get secrets --all-namespaces                                    # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-kubernetes \
+#     create rolebindings -n sre-demo                                 # no
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sre-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-bot-kubernetes
+  namespace: curie
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-bot-kubernetes-reader
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - events
+      - nodes
+      - namespaces
+      - services
+      - endpoints
+      - persistentvolumeclaims
+      - persistentvolumes
+      - configmaps
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods, nodes]
+    verbs: [get, list]
+  - apiGroups: [argoproj.io]
+    resources: [applications, applicationsets, appprojects]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-bot-kubernetes-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sre-bot-kubernetes-reader
+subjects:
+  - kind: ServiceAccount
+    name: sre-bot-kubernetes
+    namespace: curie
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-bot-kubernetes-workloads
+  namespace: sre-demo
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create]
+  - apiGroups: [apps]
+    resources:
+      - deployments
+      - deployments/scale
+      - statefulsets
+      - statefulsets/scale
+      - daemonsets
+      - replicasets
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-bot-kubernetes-workloads
+  namespace: sre-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sre-bot-kubernetes-workloads
+subjects:
+  - kind: ServiceAccount
+    name: sre-bot-kubernetes
+    namespace: curie
+---
+# The connector reads a static file-mounted kubeconfig and cannot refresh a
+# projected token, so the example explicitly mints the non-expiring token it
+# packages into that kubeconfig. Keep this credential out of bundle content.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sre-bot-kubernetes-token
+  namespace: curie
+  annotations:
+    kubernetes.io/service-account.name: sre-bot-kubernetes
+type: kubernetes.io/service-account-token

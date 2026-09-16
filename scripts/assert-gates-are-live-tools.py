@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import fnmatch
 import json
 import pathlib
 import sys
@@ -231,17 +232,22 @@ def main() -> int:
 
     manifest_path = args.bundle / ".claude-plugin" / "plugin.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    gates = [
+    legacy_gates = [
         g["gate"].strip()
         for g in (manifest.get("approvalPolicy") or {}).get("gates", [])
         if g.get("gate")
     ]
-    if not gates:
+    approval_patterns = [
+        str(pattern).strip()
+        for pattern in (manifest.get("toolPolicy") or {}).get("approvalRequired", [])
+        if str(pattern).strip()
+    ]
+    if not legacy_gates and not approval_patterns:
         # NOT a free pass, which is what it used to be. A bundle with no gates
         # and no write tools is fine; a bundle with no gates and a write tool is
         # exactly the hole this script exists for, so the ungated-write check
         # below still has to run.
-        print("no approvalPolicy gates declared")
+        print("no approvalPolicy or toolPolicy approval gates declared")
 
     hosts: dict[str, str] = {}
     for spec in args.host:
@@ -252,6 +258,7 @@ def main() -> int:
         hosts[name] = value
 
     live: list[str] = []
+    live_canonical: list[str] = []
     write_tools: list[str] = []
     for spec in args.connector:
         if "=" not in spec:
@@ -282,12 +289,24 @@ def main() -> int:
         for tool, read_only in tools:
             qualified = f"mcp__{name}__{tool}"
             live.append(qualified)
+            live_canonical.append(f"{name}/{tool}")
             if not read_only:
                 write_tools.append(qualified)
         writes = sum(1 for _, ro in tools if not ro)
         print(f"  {name:<18} {len(tools)} tools ({writes} write)")
 
-    bad = [g for g in gates if g not in live]
+    policy_gates = {
+        f"mcp__{canonical.split('/', 1)[0]}__{canonical.split('/', 1)[1]}"
+        for canonical in live_canonical
+        if any(fnmatch.fnmatchcase(canonical, pattern) for pattern in approval_patterns)
+    }
+    unmatched_patterns = [
+        pattern
+        for pattern in approval_patterns
+        if not any(fnmatch.fnmatchcase(canonical, pattern) for canonical in live_canonical)
+    ]
+    gates = sorted(set(legacy_gates) | policy_gates)
+    bad = [g for g in legacy_gates if g not in live]
     for g in bad:
         near = difflib.get_close_matches(g, live, n=1, cutoff=0.5)
         hint = f" -- closest live tool: {near[0]}" if near else ""
@@ -298,6 +317,14 @@ def main() -> int:
             "written they would validate, deploy, and silently never fire.",
             file=sys.stderr,
         )
+        return 1
+    for pattern in unmatched_patterns:
+        print(
+            f"GATE ARMS NOTHING: toolPolicy approvalRequired pattern {pattern!r} "
+            "matches no live tool",
+            file=sys.stderr,
+        )
+    if unmatched_patterns:
         return 1
 
     # THE OTHER DIRECTION, and the one that matters more. The check above stops a
@@ -314,7 +341,8 @@ def main() -> int:
     for t in ungated:
         print(
             f"UNGATED WRITE TOOL: {t} is not readOnlyHint and no approvalPolicy "
-            "gate names it -- it would execute without asking anyone",
+            "gate or toolPolicy approvalRequired pattern names it -- it would "
+            "execute without asking anyone",
             file=sys.stderr,
         )
     if ungated:

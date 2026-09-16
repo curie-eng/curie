@@ -10,20 +10,15 @@
 # WHAT SHIPS ON, AND WHAT SHIPS OFF
 # ---------------------------------------------------------------------------
 #
-#   kubernetes    ON.       Read-only cluster access. The only connector you
-#                           need to make this bot useful, and the only one with
-#                           no external dependency beyond the cluster itself.
-#   k8s-write     DECLARED. One gated write verb. Its source build and exact
-#                           approval gate ship together, but its separate
-#                           K8S_WRITE_KUBECONFIG does not. Without that secret,
-#                           bring-up refuses cleanly before any connector starts,
-#                           so read-only operation remains the default. See
-#                           README.md, "Level up: the gated write path".
-#   k8s-scale     DECLARED. One gated, reversible scale verb, on its own
-#                           subresource-scoped identity. Same shape as
-#                           k8s-write: no K8S_SCALE_KUBECONFIG, no scale path.
+#   kubernetes    ON.       The pinned upstream core toolset. Exact toolPolicy
+#                           entries make reads immediate, six mutations require
+#                           approval, and unmatched additions fail closed. One
+#                           file-mounted credential is bounded independently by
+#                           Kubernetes RBAC.
 #   self-upgrade  DECLARED. One gated verb that starts this bot's own upgrade,
-#                           so it happens when asked rather than on a schedule.
+#                           so it happens when asked rather than on a schedule,
+#                           plus an ungated read saying which version is
+#                           available to upgrade to.
 #                           Needs SELF_UPGRADE_KUBECONFIG and the CronJob it
 #                           starts. Read manifests/upgrade-role.yaml first: its
 #                           grant is the widest in this bundle.
@@ -34,15 +29,13 @@
 # Removing a declared connector removes its tools. Remove any matching approval
 # gate in the same change so the bundle remains valid.
 connectors:
-  # Read-only Kubernetes: the questions metrics cannot answer. What the
+# Kubernetes: the questions metrics cannot answer, plus demo-namespace workload
+# operations after a fresh human approval. What the
   # scheduler actually said, what a crashed container logged, what a manifest
   # currently declares.
   #
-  # Tool surface verified against this image with these exact flags: 13 tools,
-  # and `tools/list` reports readOnlyHint=true on every one. It was 14 until
-  # `--toolsets core` dropped `configuration_view`; see below. `--read-only`
-  # FILTERS the surface rather than merely advising, and `--disable-destructive`
-  # sits under it.
+  # Tool surface verified against this image with these exact flags: 19 tools,
+  # exactly the 13 allow and 6 approvalRequired entries in plugin.json.
   #
   #   events_list      the scheduler's reason string -- FailedScheduling,
   #                    FailedMount, BackOff, Evicted. A metric says a pod is
@@ -68,8 +61,8 @@ connectors:
     # and exited into CrashLoopBackOff. A mutable tag turns "verified the flags"
     # into a statement about a moment rather than about the image.
     #
-    # v0.0.66 verified directly: carries --port/--bind-address/--read-only/
-    # --disable-destructive/--disable-multi-cluster/--stateless/--kubeconfig,
+    # v0.0.66 verified directly: carries --port/--bind-address/--toolsets/
+    # --disable-multi-cluster/--stateless/--kubeconfig,
     # and publishes both amd64 and arm64.
     image: ghcr.io/containers/kubernetes-mcp-server@sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423
     args:
@@ -77,13 +70,7 @@ connectors:
       - "8000"
       - --bind-address
       - 0.0.0.0
-      # Load-bearing. The RBAC on the mounted kubeconfig is the real boundary --
-      # a write is refused server-side -- but the agent is prompt-injectable and
-      # cannot be talked into calling a tool it cannot see. Tool filtering is
-      # defense in depth, not the fence.
-      - --read-only
-      # `--read-only` is NOT sufficient on its own, and the reason is worth
-      # keeping: `configuration_view` returns the kubeconfig as YAML --
+      # The config toolset is disabled because `configuration_view` returns the kubeconfig as YAML --
       # including the bearer token in cleartext -- and it is annotated
       # readOnlyHint=true, because reading a credential IS a read. So the
       # read-only filter keeps it, and "all 14 tools are readOnlyHint" was
@@ -103,7 +90,6 @@ connectors:
       # Verified by diffing tools/list with and without the flag.
       - --toolsets
       - core
-      - --disable-destructive
       # One cluster, one context -- otherwise the multi-cluster tools appear and
       # invite reasoning about clusters this bot has no business in.
       - --disable-multi-cluster
@@ -122,138 +108,15 @@ connectors:
     # first attempt at this connector declared `secrets:` and sat in
     # CreateContainerConfigError, because a secretKeyRef cannot become a file.
     #
-    # A STATIC kubeconfig holding a ServiceAccount token, not a cloud-provider
+    # A STATIC kubeconfig holding the one connector ServiceAccount token, not a cloud-provider
     # `get-token` exec credential: an exec credential mints short-lived tokens
     # and would need cloud credentials sitting next to the connector purely to
     # refresh them. A ServiceAccount token keeps the whole blast radius inside
-    # Kubernetes RBAC, where manifests/read-access.yaml bounds it -- verified it
-    # cannot read Secrets or delete anything.
+    # Kubernetes RBAC, where manifests/kubernetes-access.yaml bounds it. Reads
+    # span non-secret operational resources; writes stop at disposable
+    # demo-namespace workloads even after approval.
     secret_files:
-      K8S_READONLY_KUBECONFIG: /secrets/kubeconfig
-
-# ---------------------------------------------------------------------------
-# THE GATED WRITE CONNECTOR -- DECLARED, WITH ITS CREDENTIAL ABSENT BY DEFAULT.
-#
-# What it is: a purpose-built server exposing exactly ONE tool,
-# `restart_deployment`, behind a Curie approval gate. Calling it pauses the
-# turn, posts an approval card, and a human decides. The agent never does.
-#
-# PURPOSE-BUILT, not kubernetes-mcp-server without `--read-only`. Dropping that
-# flag would expose create/update/delete across every kind, so the bot would
-# hold general write gated only by what `approvalPolicy` remembers to name --
-# and a tool nobody thought to gate has nothing in front of it. This server
-# exposes one tool, so there is no second thing for a gate to miss. Source and
-# full reasoning: connectors/k8s-write/server.py.
-#
-# The connector declaration and its gate in `.claude-plugin/plugin.json` ship
-# together. That closes the unsafe intermediate state where the tool exists but
-# its gate does not. It does NOT grant a write path by itself. Before bring-up:
-#
-#   1. Apply `manifests/write-role.yaml` (after editing its namespace and
-#      `resourceNames`) and store the resulting kubeconfig as
-#      K8S_WRITE_KUBECONFIG.
-#   2. Replace the K8S_WRITE_ALLOWLIST placeholder below with the one
-#      `namespace/deployment` this bot may roll.
-#   3. Build and deploy the declared source:
-#
-#          curie build --plugin-dir examples/sre-bot --registry <your-registry>
-#
-#      That builds every connector with a `build:` declaration for every named
-#      platform and records the resolved digests in `connectors.lock.yaml`.
-#      There is no `image:` line to edit: the digest lives in the lock.
-#
-# The missing separate kubeconfig is load-bearing -- but only once a lock file
-# exists. On a genuinely untouched bring-up, the unbuilt connectors.lock.yaml
-# refuses deploy before the secret check is ever reached; once built, the
-# still-missing kubeconfig refuses just as cleanly before either connector
-# starts, instead of silently running a writer with the read credential or an
-# unreviewed target.
-#
-# Full walkthrough: README.md, "Level up: the gated write path".
-#
-# THE TOOL NAME BELOW IS NOT WHAT CURIE'S ERROR MESSAGE TELLS YOU. Tools here
-# are `mcp__k8s-write__<tool>`, NOT `mcp__plugin_sre-bot_k8s-write__<tool>`.
-# Curie connectors are platform-supplied servers on
-# ClaudeAgentOptions.mcp_servers, so they are named like
-# `mcp__curie__request_approval`, with no plugin infix. The deploy error advises
-# the prefixed form; following it yields a gate that validates, deploys, and
-# never fires.
-#
-  k8s-write:
-    # Where the image comes FROM, instead of what it is. `curie build` builds
-    # this context and records the digest it resolved in
-    # `connectors.lock.yaml`; the deploy renders that digest and nothing else,
-    # so the pinning note on `kubernetes` above, which is not theoretical, is
-    # satisfied by construction here rather than by remembering to type an
-    # immutable tag.
-    #
-    # `platforms` is required rather than defaulted, because a silently
-    # single-arch image builds clean, passes CI, and then fails to pull on a
-    # node of the other architecture as "no matching manifest".
-    build:
-      context: connectors/k8s-write
-      platforms: [linux/amd64, linux/arm64]
-    # Deliberately no `unhosted_url`: skill and local runs host this connector,
-    # so they exercise the separate secret requirement instead of silently
-    # dialing an operator-supplied copy. Re-run `curie build --plugin-dir`
-    # after source or declaration changes so the lock matches what is hosted.
-    env:
-      # Defence in depth alongside the Role's `resourceNames`. A ceiling
-      # stated in one place only is a ceiling that moves when someone edits
-      # the other place. Format is `namespace/deployment`, comma-separated.
-      # EMPTY MEANS THE CONNECTOR REFUSES TO START, not that everything is
-      # permitted -- a missing config fails closed.
-      K8S_WRITE_ALLOWLIST: <namespace>/<deployment>
-    # A SEPARATE kubeconfig from the read-only one, bound to the
-    # ServiceAccount in manifests/write-role.yaml: one namespace, get+patch on
-    # exactly the named Deployments. Never the read-only connector's
-    # credential -- that one is deliberately unable to write, and reusing it
-    # here would mean widening it.
-    secret_files:
-      K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
-
-# ---------------------------------------------------------------------------
-# THE GATED SCALE CONNECTOR -- DECLARED, CREDENTIAL ABSENT BY DEFAULT, AND
-# REVERSIBLE.
-#
-# A second one-tool server rather than a second tool on `k8s-write`, for the
-# reason that file's own docstring gives: it exposes ONE tool and takes no
-# parameter through which a caller could reach a replica count. Adding one there
-# would put caller input into a process whose whole argument is that no caller
-# input reaches the patch body.
-#
-# It is also the NARROWER grant, and that is the interesting part. A rollout
-# restart is a PATCH of the pod template, so RBAC cannot separate it from `set
-# image`; scaling has `deployments/scale` as its own subresource, so
-# `manifests/scale-role.yaml` grants a ceiling Kubernetes itself enforces.
-#
-# REVERSIBLE, which is why it exists at all (ADR-0117). It reads the replica
-# count immediately before it patches and returns it, so the platform records
-# what to restore without asking a model what happened -- and REFUSES TO WRITE if
-# it cannot read one, because an action that happened without a recorded prior
-# state leaves the platform holding a record it cannot act on. A restart cannot
-# do this and says so in prose, which is how a receipt ends up honestly saying
-# "restarting pods cannot be undone" next to "scaled 3 to 10, undo".
-#
-# Before bring-up: apply `manifests/scale-role.yaml`, store the resulting
-# kubeconfig as K8S_SCALE_KUBECONFIG, and replace the allowlist placeholder.
-  k8s-scale:
-    build:
-      context: connectors/k8s-scale
-      platforms: [linux/amd64, linux/arm64]
-    env:
-      # Same ceiling discipline as the write connector, stated in two places on
-      # purpose. EMPTY MEANS EVERY CALL IS REFUSED.
-      K8S_SCALE_ALLOWLIST: <namespace>/<deployment>
-      # A scale is reversible; an outage caused by a typo'd zero is still an
-      # outage. This bounds the upper end; the allowlist bounds the target.
-      K8S_SCALE_MAX_REPLICAS: "50"
-    # A THIRD kubeconfig, bound to the ServiceAccount in
-    # manifests/scale-role.yaml. Never the write connector's -- that one holds
-    # `patch` on `deployments`, and reusing it here would throw away the
-    # subresource ceiling that is this connector's whole security argument.
-    secret_files:
-      K8S_SCALE_KUBECONFIG: /secrets/kubeconfig
+      K8S_KUBECONFIG: /secrets/kubeconfig
 
 # ---------------------------------------------------------------------------
 # THE GATED SELF-UPGRADE CONNECTOR -- SO THE UPGRADE IS ASKED FOR, NOT SCHEDULED.
@@ -296,6 +159,21 @@ connectors:
       # its own ServiceAccount namespace, which is the same place -- stated here
       # so a cross-namespace install does not silently look in the wrong one.
       SELF_UPGRADE_NAMESPACE: ""
+      # Which project's published releases answer "what version is available".
+      # A public, read-only lookup with NO credential -- the connector holds none
+      # for it on purpose. Empty disables that tool's answer rather than guessing.
+      #
+      # This is what closes the question the sandbox cannot answer for itself:
+      # the runner has no general internet egress (deliberately -- it is
+      # prompt-injectable), so a direct fetch of a releases page is refused at
+      # the network. Connector pods do have egress, so the read happens here and
+      # the sandbox still learns only a URL.
+      SELF_UPGRADE_RELEASE_REPO: curie-eng/curie
+      # The CronJob that upgrades the PLATFORM, as distinct from this bot's own
+      # bundle. EMPTY BY DEFAULT AND MEANT TO STAY THAT WAY unless you have read
+      # manifests/platform-upgrade-role.yaml and accepted the credential it
+      # describes. Empty means `upgrade_platform` refuses every call.
+      PLATFORM_UPGRADE_CRONJOB: ""
     # A FOURTH kubeconfig, bound to the ServiceAccount in
     # manifests/upgrade-role.yaml. Never one of the other three: those are
     # scoped to the workloads this bot may touch, and this one is scoped to the

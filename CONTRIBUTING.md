@@ -232,8 +232,11 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   title.
 - **Use real line breaks in the PR body**. The PR body guard rejects escaped
   newline sequences because GitHub treats them as text, which makes closing
-  keywords inert. Before opening or editing a PR, run
-  `scripts/check-pr-body.sh <body-file>`.
+  keywords inert. A patch release PR (title `Prepare the vX.Y.Z release` with
+  Z not 0) must also fill **Trigger** (issue numbers) and **Live proof** (a
+  run URL or `waiver: <reason>`). Before opening or editing a PR, run
+  `scripts/check-pr-body.sh <body-file>` (pass `--title-file` for a release
+  PR).
 - **No dashes or emdashes in prose; no emojis** in code or docs.
 - **Never mention any AI assistant** (or AI in general) in commit messages, and
   never add `Co-Authored-By` lines referencing an AI.

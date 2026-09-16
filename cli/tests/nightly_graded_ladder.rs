@@ -12,7 +12,7 @@
 //!   auto-selects `OPENROUTER_BASE_URL`; no `ANTHROPIC_BASE_URL` is set for this
 //!   provider, and the real key travels as `ANTHROPIC_API_KEY` inside the
 //!   runner -- the CLI-facing input for that credential is `CURIE_CREDENTIALS`.
-//! - `cli/src/ops.rs:529-532`: `--allow-egress-host` takes the provider
+//! - `cli/src/ops/providers.rs` (`parse_egress_provider` / `provider_egress_hosts`): `--allow-egress-host` takes the provider
 //!   KEYWORD `openrouter` (resolved to `openrouter.ai` at install time), never
 //!   a bare hostname like `openrouter.ai` itself.
 //!
@@ -146,7 +146,7 @@ fn validate_bundle_json(dir: &Path) -> serde_json::Value {
             "-c",
             "import sys\n\
              from plugin_format import validate_bundle\n\
-             print(validate_bundle(sys.argv[1]).model_dump_json())\n",
+             print(validate_bundle(sys.argv[1], enforces_tool_policy='curie/mcp-tool-policy@1').model_dump_json())\n",
         ])
         .arg(dir)
         .output()
@@ -748,6 +748,64 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).expect("mark harness executable");
 }
 
+/// The cluster ladder may run an otherwise standard `curie` release in an
+/// owned namespace. Its direct worker probe must follow the same
+/// `CURIE_NAMESPACE` setting as the CLI calls around it, or it reads an
+/// unrelated shared install before the first cluster message is sent.
+#[test]
+fn cluster_worker_probe_uses_the_configured_namespace() {
+    const NAMESPACE: &str = "test-2593-chart-ladder";
+
+    let harness = tempfile::tempdir().expect("create cluster probe harness");
+    let invocation_log = harness.path().join("kubectl-invocation.log");
+    write_executable(
+        &harness.path().join("kubectl"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" > "$STUB_KUBECTL_INVOCATION_LOG"
+printf '1'
+"#,
+    );
+
+    let helper = ladder_function("cluster_worker_deploy");
+    let function = ladder_function("probe_cluster_fake_model");
+    let script = format!("set -euo pipefail\n{helper}\n{function}\nprobe_cluster_fake_model\n");
+    let path = format!(
+        "{}:{}",
+        harness.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("PATH", path)
+        .env("CURIE_NAMESPACE", NAMESPACE)
+        .env("STUB_KUBECTL_INVOCATION_LOG", &invocation_log)
+        .output()
+        .expect("run the real cluster worker probe");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the cluster worker probe must complete through the stub: stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(stdout, "1", "the probe must return kubectl's model mode");
+
+    let invocation = fs::read_to_string(&invocation_log)
+        .expect("read kubectl invocation")
+        .trim()
+        .to_owned();
+    assert_eq!(
+        invocation,
+        format!(
+            "-n {NAMESPACE} get deployment/curie-worker -o \
+             jsonpath={{.spec.template.spec.containers[*].env[?(@.name==\"CURIE_FAKE_MODEL\")].value}}"
+        ),
+        "the direct worker read must use the configured namespace while preserving the standard release's deployment and model-mode assertion"
+    );
+}
+
 // --- Assertion group 1: arms the GRADED path -------------------------------
 
 /// The nightly workflow must arm live grading with the exact double-quoted
@@ -833,7 +891,8 @@ fn nightly_covers_both_the_skill_local_and_cluster_tier_sets() {
 // --- Assertion group 2: cluster graded install -----------------------------
 
 /// The cluster install must open egress to the `openrouter` provider keyword
-/// (resolved to `openrouter.ai` at install time by `cli/src/ops.rs:529-532`),
+/// (resolved to `openrouter.ai` at install time by `cli/src/ops/providers.rs`'s
+/// `parse_egress_provider` / `provider_egress_hosts`),
 /// and the workflow must never contain the sealed-install flag anywhere --
 /// proving the cluster rung is graded, not fake.
 #[test]
@@ -1379,6 +1438,91 @@ fn cluster_product_observability_is_private_preflight_and_query_only() {
     );
 }
 
+fn selected_release_worker_target(text: &str) -> bool {
+    text.contains("cluster_worker_deploy")
+        || text.contains("${CURIE_RELEASE}-curie-worker")
+        || text.contains("$CURIE_RELEASE-curie-worker")
+        || text.contains("${CURIE_RELEASE}-worker")
+        || text.contains("$CURIE_RELEASE-worker")
+        || text.contains(r#""$CURIE_RELEASE-worker""#)
+}
+
+/// The cluster fake-model probe must read CURIE_FAKE_MODEL off the selected
+/// release's worker. Hardcoding `curie`/`curie-worker` lets a nondefault
+/// control stay green against the wrong Deployment.
+#[test]
+fn probe_cluster_fake_model_targets_selected_namespace_and_release() {
+    let probe = ladder_function("probe_cluster_fake_model");
+    assert!(
+        !probe.contains("kubectl -n curie"),
+        "probe_cluster_fake_model must not hardcode kubectl -n curie; a selected namespace would be ignored: {probe}"
+    );
+    assert!(
+        !probe.contains("deployment/curie-worker"),
+        "probe_cluster_fake_model must not hardcode deployment/curie-worker; a selected release would be ignored: {probe}"
+    );
+    assert!(
+        probe.contains("$CURIE_NAMESPACE"),
+        "probe_cluster_fake_model must read the selected CURIE_NAMESPACE: {probe}"
+    );
+    assert!(
+        selected_release_worker_target(&probe),
+        "probe_cluster_fake_model must target deployment/${{CURIE_RELEASE}}-worker or equivalent: {probe}"
+    );
+}
+
+/// Regular cluster verbs must pass the selected namespace and release
+/// explicitly. Relying on CLI defaults hides a script that forgot to thread
+/// CURIE_NAMESPACE/CURIE_RELEASE, and a hardcoded worker probe cannot see a
+/// nondefault target.
+#[test]
+fn rung_cluster_threads_selected_namespace_and_release() {
+    let cluster = ladder_function("rung_cluster");
+    assert!(
+        !cluster.contains("kubectl -n curie"),
+        "rung_cluster must not hardcode kubectl -n curie: {cluster}"
+    );
+    assert!(
+        !cluster.contains("deployment/curie-worker"),
+        "rung_cluster must not hardcode deployment/curie-worker: {cluster}"
+    );
+    assert!(
+        cluster.contains("$CURIE_NAMESPACE") && selected_release_worker_target(&cluster),
+        "rung_cluster connector probes must use the selected namespace and release worker: {cluster}"
+    );
+    assert!(
+        cluster.contains("${ns_rel[@]}") || cluster.contains("cluster_ns_rel_args"),
+        "rung_cluster must pass namespace and release through ns_rel or cluster_ns_rel_args: {cluster}"
+    );
+    assert!(
+        !cluster.contains(r#"--json cluster status 2>/dev/null"#),
+        "cluster status must pass namespace and release rather than using CLI defaults: {cluster}"
+    );
+    assert!(
+        cluster.contains(r#"cluster status "${ns_rel[@]}""#)
+            || cluster.contains("cluster_ns_rel_args"),
+        "cluster status must receive the selected namespace and release: {cluster}"
+    );
+    assert!(
+        !cluster.contains(r#"--json cluster deploy --plugin-dir"#),
+        "cluster deploy must pass namespace and release before --plugin-dir: {cluster}"
+    );
+    assert!(
+        cluster.contains(r#"cluster deploy "${ns_rel[@]}""#)
+            || cluster.contains("cluster_ns_rel_args"),
+        "cluster deploy must receive the selected namespace and release: {cluster}"
+    );
+    assert!(
+        !cluster.contains(r#"local msg_args=(--json cluster message "$PROMPT")"#),
+        "cluster message must prepend namespace and release rather than a flag-less argv: {cluster}"
+    );
+    assert!(
+        cluster.contains(r#"eval_args+=("${ns_rel[@]}")"#)
+            || cluster.contains("cluster_ns_rel_args"),
+        "cluster eval must prepend the selected namespace and release: {cluster}"
+    );
+}
+
 #[test]
 fn product_sanitizer_and_message_failures_never_dump_private_json() {
     let sanitizer = ladder_function("sanitize_exact_trace_read");
@@ -1486,6 +1630,7 @@ fn live_cluster_rung_runs_weather_cases_with_the_message_listen_host() {
     // carries the #1602/#1603 rationale comments and a reworded comment must not
     // red this contract.
     let contract = r#"local eval_args=(cluster eval)
+    eval_args+=("${ns_rel[@]}")
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
         eval_args+=(--cases "$WORKDIR/bundle/evals/cases.json")
     fi
@@ -1663,16 +1808,35 @@ for arg in "$@"; do bundle_dir="$arg"; done
 
 # The `--name <name>` value, read off argv: the #747 leftover-runner case asserts
 # that `skill up`'s refusal names the exact container an operator must clear.
+# `--namespace` / `--release` are parsed the same way so cluster arms can refuse
+# a selected target that does not match the control.
 name=""
+namespace=""
+release=""
 observability_start=""
 observability_end=""
 prev=""
 for arg in "$@"; do
     if [ "$prev" = "--name" ]; then name="$arg"; fi
+    if [ "$prev" = "--namespace" ]; then namespace="$arg"; fi
+    if [ "$prev" = "--release" ]; then release="$arg"; fi
     if [ "$prev" = "--start" ]; then observability_start="$arg"; fi
     if [ "$prev" = "--end" ]; then observability_end="$arg"; fi
     prev="$arg"
 done
+
+# Cluster arms require the flags the ladder now always passes. A mismatch against
+# STUB_EXPECT_* (default curie/curie) is unexpected, so a hardcoded curie
+# invocation cannot satisfy a nondefault control.
+require_expected_ns_rel() {
+    expect_ns="${STUB_EXPECT_NAMESPACE:-curie}"
+    expect_rel="${STUB_EXPECT_RELEASE:-curie}"
+    if [ -z "$namespace" ] || [ -z "$release" ] \
+        || [ "$namespace" != "$expect_ns" ] || [ "$release" != "$expect_rel" ]; then
+        echo "unexpected curie invocation: $*" >&2
+        exit 97
+    fi
+}
 
 # The production ladder derives one UTC window around the just-completed turn.
 # Validate the values, not merely the presence of two argv tokens: exact
@@ -1772,7 +1936,7 @@ case "$*" in
         printf '%s\n' '{"name":"curie-demo"}' > curie-demo/.claude-plugin/plugin.json
         echo "stub try all done"
         ;;
-    "--json cluster status")
+    "--json cluster status --namespace "*" --release "*)
         # The case-ids-only control's single injection point: after the local
         # rung deployed and before the cluster rung does, rewrite ONLY the case
         # ids in the bundle both rungs deploy. Suite name and case count are
@@ -1786,7 +1950,12 @@ for i, c in enumerate(d["cases"]):
     c["id"] = "drifted-case-%d" % i
 json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.json"
         fi
-        printf '%s\n' '{"release_found":true}'
+        require_expected_ns_rel "$@"
+        if [ "${STUB_CLUSTER_RELEASE_FOUND:-1}" = "0" ]; then
+            printf '%s\n' '{"release_found":false}'
+        else
+            printf '%s\n' '{"release_found":true}'
+        fi
         ;;
     "skill up --plugin-dir . --image curie-runner --port 7245 --name curie-e2e-runner --fake-model")
         if [ -n "${STUB_PRIMARY_SKILL_UP_ERROR:-}" ]; then
@@ -1889,7 +2058,8 @@ print(json.dumps({
         printf '%s' "$bundle_dir" > "$STUB_STATE/last_plugin_dir"
         emit_deploy "${STUB_LOCAL_SHA256:-$(sha_of_bundle "$bundle_dir")}"
         ;;
-    "--json cluster deploy --plugin-dir "*)
+    "--json cluster deploy --namespace "*" --release "*" --plugin-dir "*)
+        require_expected_ns_rel "$@"
         printf '%s' "$bundle_dir" > "$STUB_STATE/last_plugin_dir"
         emit_deploy "${STUB_CLUSTER_SHA256:-$(sha_of_bundle "$bundle_dir")}"
         ;;
@@ -1897,6 +2067,7 @@ print(json.dumps({
         printf '%s\n' '{"finalized":true,"reply":"stub local weather reply"}'
         ;;
     "--json cluster message "*)
+        require_expected_ns_rel "$@"
         printf '%s\n' '{"finalized":true,"reply":"stub cluster weather reply"}'
         ;;
     "--json local observability runs --limit 100")
@@ -1953,21 +2124,35 @@ print(json.dumps({
     "--json local eval --dry-run")
         emit_plan local 1 weather
         ;;
-    "--json cluster eval --cases "*--dry-run*)
+    "--json cluster eval --namespace "*" --release "*" --cases "*--dry-run*)
+        require_expected_ns_rel "$@"
         # Only the cluster count is an override: it is the knob the suite
         # divergence control moves. Everything else is the constant the weather
         # bundle declares.
         emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
         ;;
-    "--json cluster eval --dry-run")
+    "--json cluster eval --namespace "*" --release "*" --listen-host "*--dry-run*)
+        require_expected_ns_rel "$@"
+        emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
+        ;;
+    "--json cluster eval --namespace "*" --release "*" --dry-run")
+        require_expected_ns_rel "$@"
         emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
         ;;
     # The two LIVE grades, and they are deliberately asymmetric: the local rung
     # runs the plain human table, the cluster rung runs `--json` so a passing
     # case's reply is auditable in the job log (#1602). The dry-run arms above
     # must stay above this one, since `--json cluster eval --cases *` matches a
-    # dry-run argv too and the first matching arm wins.
-    "local eval --cases "*|"--json cluster eval --cases "*|"local eval"|"--json cluster eval")
+    # dry-run argv too and the first matching arm wins. Flag-less cluster eval
+    # is unexpected: the ladder always passes namespace and release.
+    "local eval --cases "*|"local eval")
+        if [ -n "${STUB_EVAL_MARKER:-}" ]; then
+            printf '%s\n' called > "$STUB_EVAL_MARKER"
+        fi
+        exit "${STUB_EVAL_EXIT:-0}"
+        ;;
+    "--json cluster eval --namespace "*" --release "*" --cases "*|"--json cluster eval --namespace "*" --release "*)
+        require_expected_ns_rel "$@"
         if [ -n "${STUB_EVAL_MARKER:-}" ]; then
             printf '%s\n' called > "$STUB_EVAL_MARKER"
         fi
@@ -2061,9 +2246,42 @@ esac
         &dir.join("kubectl"),
         r#"#!/bin/sh
 set -u
+if [ -n "${STUB_KUBECTL_INVOCATION_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$STUB_KUBECTL_INVOCATION_LOG"
+fi
+expect_ns="${STUB_EXPECT_NAMESPACE:-curie}"
+expect_rel="${STUB_EXPECT_RELEASE:-curie}"
+case "$expect_rel" in
+    *curie*) worker="${expect_rel}-worker" ;;
+    *) worker="${expect_rel}-curie-worker" ;;
+esac
+matched_target=0
+case " $* " in
+    *" -n $expect_ns "*)
+        case "$*" in
+            *"deployment/${worker}"*)
+                matched_target=1
+                ;;
+        esac
+        ;;
+esac
+# Answer env probes only for the selected worker. A hardcoded curie probe must
+# not satisfy a nondefault control.
 case "$*" in
     *"CURIE_FAKE_MODEL"*)
-        printf '%s' "${STUB_FAKE_MODEL:-}"
+        if [ "$matched_target" = 1 ]; then
+            printf '%s' "${STUB_FAKE_MODEL:-}"
+        fi
+        ;;
+    *"CURIE_RELEASE"*)
+        if [ "$matched_target" = 1 ]; then
+            printf '%s' "$expect_rel"
+        fi
+        ;;
+    *"CURIE_NAMESPACE"*)
+        if [ "$matched_target" = 1 ]; then
+            printf '%s' "$expect_ns"
+        fi
         ;;
     *)
         ;;
@@ -2204,6 +2422,12 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
         .env_remove("CURIE_FAKE_MODEL")
         .env_remove("CURIE_API_KEY")
         .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_NAMESPACE")
+        .env_remove("CURIE_RELEASE")
+        .env_remove("STUB_EXPECT_NAMESPACE")
+        .env_remove("STUB_EXPECT_RELEASE")
+        .env_remove("STUB_CLUSTER_RELEASE_FOUND")
+        .env_remove("STUB_KUBECTL_INVOCATION_LOG")
         .env_remove("STUB_PRIMARY_SKILL_UP_ERROR")
         .env_remove("STUB_DOCKER_INVOCATION_LOG")
         .env_remove("STUB_EXISTING_LOCAL_STACK")
@@ -2889,10 +3113,11 @@ fn mcp_receipt_setup_leaves_a_valid_owned_weather_bundle_and_refuses_a_rerun() {
     );
 }
 
-/// #2423: the connector-fixture setup overwrites connectors.yaml on the
-/// sre-bot scratch copy. It must also own the matching approval gates so the
-/// scratch bundle stays valid; dangling k8s-scale / self-upgrade gates are
-/// the live connector-lane boot failure.
+/// #2423/#2295: the connector-fixture setup overwrites connectors.yaml on the
+/// sre-bot scratch copy. It must also own the matching approval gates and
+/// toolPolicy entries so the scratch bundle stays valid. The self-upgrade
+/// fixture must retain both of its gates while gates and grants for every
+/// unhosted connector are removed.
 #[test]
 fn connector_fixture_setup_owns_consistent_approval_gates() {
     if Command::new("uv").arg("--version").output().is_err() {
@@ -2928,15 +3153,23 @@ fn connector_fixture_setup_owns_consistent_approval_gates() {
         .iter()
         .map(|gate| gate["gate"].as_str().expect("gate name").to_string())
         .collect();
-    assert!(
-        gates.iter().any(|gate| gate.contains("k8s-write")),
-        "the fixture still hosts k8s-write, so its gate must remain: {gates:?}"
+    assert_eq!(
+        gates,
+        vec![
+            "mcp__self-upgrade__upgrade_self".to_string(),
+            "mcp__self-upgrade__upgrade_platform".to_string(),
+        ],
+        "the owned scratch copy must retain exactly the gates for the hosted self-upgrade connector"
     );
+    let allow: Vec<&str> = plugin["toolPolicy"]["allow"]
+        .as_array()
+        .expect("toolPolicy.allow")
+        .iter()
+        .map(|entry| entry.as_str().expect("allow entry"))
+        .collect();
     assert!(
-        gates
-            .iter()
-            .all(|gate| !gate.contains("k8s-scale") && !gate.contains("self-upgrade")),
-        "gates for connectors the fixture does not host must be dropped from the owned scratch copy: {gates:?}"
+        allow.iter().all(|entry| !entry.starts_with("grafana/")),
+        "the fixture does not host grafana, so grafana grants must be stripped: {allow:?}"
     );
 
     let result = validate_bundle_json(&bundle);
@@ -3315,4 +3548,164 @@ fn live_cluster_rung_reports_but_does_not_propagate_evaluator_failure() {
          the ticket, so a silent tolerance is never mistaken for a pass; \
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );
+}
+
+/// Cluster-only fake-model harness for namespace/release selection. Credential
+/// free: the cluster rung skips the runtime-binding read without CURIE_API_KEY.
+fn run_cluster_target_control(extra_envs: &[(&str, &str)]) -> (Output, String, String) {
+    let harness = tempfile::tempdir().expect("create cluster target harness directory");
+    write_ladder_stubs(harness.path());
+    let invocation_log = harness.path().join("cluster-invocations.log");
+    let kubectl_log = harness.path().join("kubectl-invocations.log");
+    let invocation_log_value = invocation_log.display().to_string();
+    let kubectl_log_value = kubectl_log.display().to_string();
+    let mut envs = vec![
+        ("CURIE_E2E_TIERS", "cluster"),
+        ("STUB_FAKE_MODEL", "1"),
+        ("STUB_INVOCATION_LOG", invocation_log_value.as_str()),
+        ("STUB_KUBECTL_INVOCATION_LOG", kubectl_log_value.as_str()),
+    ];
+    envs.extend_from_slice(extra_envs);
+    let output = run_ladder(harness.path(), &envs);
+    let invocations = fs::read_to_string(&invocation_log).unwrap_or_default();
+    let kubectl = fs::read_to_string(&kubectl_log).unwrap_or_default();
+    (output, invocations, kubectl)
+}
+
+fn cluster_verbs_carry_ns_rel(invocations: &str, namespace: &str, release: &str) -> bool {
+    let ns_flag = format!("--namespace {namespace}");
+    let rel_flag = format!("--release {release}");
+    ["status", "deploy", "message", "eval"].iter().all(|verb| {
+        invocations.lines().any(|line| {
+            line.contains(&format!("cluster {verb}"))
+                && line.contains(&ns_flag)
+                && line.contains(&rel_flag)
+        })
+    })
+}
+
+/// POSITIVE CONTROL. Unset CURIE_NAMESPACE/CURIE_RELEASE must still select
+/// curie/curie and pass those flags. Without this, CI's default install would
+/// keep passing while a forgotten hardcoded target silently misses a selected
+/// namespace.
+#[test]
+fn cluster_ladder_defaults_to_curie_namespace_and_release() {
+    let (output, invocations, kubectl) = run_cluster_target_control(&[]);
+    let transcript = transcript(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "unset namespace and release must still pass the cluster ladder against curie/curie; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("LADDER PASS"),
+        "the default cluster ladder must announce a pass; transcript:\n{transcript}"
+    );
+    assert!(
+        cluster_verbs_carry_ns_rel(&invocations, "curie", "curie"),
+        "cluster status, deploy, message, and eval must pass --namespace curie --release curie; invocations:\n{invocations}"
+    );
+    assert!(
+        kubectl.contains("-n curie") && kubectl.contains("deployment/curie-worker"),
+        "the fake-model probe must read the default worker; kubectl:\n{kubectl}"
+    );
+}
+
+/// POSITIVE CONTROL. A task-named namespace and nondefault release must be
+/// threaded through every cluster verb and kubectl probe. The silent failure
+/// this prevents: CLI ClusterConn still defaulting to curie while the selected
+/// target is never contacted.
+#[test]
+fn cluster_ladder_threads_nondefault_namespace_and_release() {
+    let (output, invocations, kubectl) = run_cluster_target_control(&[
+        ("CURIE_NAMESPACE", "task-ladder-ns"),
+        ("CURIE_RELEASE", "task-ladder-rel"),
+        ("STUB_EXPECT_NAMESPACE", "task-ladder-ns"),
+        ("STUB_EXPECT_RELEASE", "task-ladder-rel"),
+    ]);
+    let transcript = transcript(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a selected nondefault namespace and release must pass the cluster ladder; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("LADDER PASS"),
+        "the nondefault cluster ladder must announce a pass; transcript:\n{transcript}"
+    );
+    assert!(
+        cluster_verbs_carry_ns_rel(&invocations, "task-ladder-ns", "task-ladder-rel"),
+        "cluster status, deploy, message, and eval must pass the selected namespace and release; invocations:\n{invocations}"
+    );
+    assert!(
+        kubectl.contains("-n task-ladder-ns")
+            && kubectl.contains("deployment/task-ladder-rel-curie-worker"),
+        "kubectl probes must hit the selected worker; kubectl:\n{kubectl}"
+    );
+    assert!(
+        !kubectl.contains("-n curie") && !kubectl.contains("deployment/curie-worker"),
+        "a nondefault control must not contact the default curie worker; kubectl:\n{kubectl}"
+    );
+}
+
+/// NEGATIVE CONTROL, one knob off the default-green path: cluster status reports
+/// no release for the selected target. The failure must name namespace curie and
+/// release curie so an operator is not sent to the wrong install.
+#[test]
+fn cluster_ladder_refuses_absent_selected_release() {
+    let (output, _, _) = run_cluster_target_control(&[("STUB_CLUSTER_RELEASE_FOUND", "0")]);
+    let transcript = transcript(&output);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "an absent selected release must fail the cluster ladder; transcript:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("LADDER PASS"),
+        "the ladder must not announce a pass when the selected release is absent; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("namespace")
+            && (transcript.contains("--namespace curie")
+                || transcript.contains("namespace curie")
+                || has_line_with(&transcript, &["namespace", "curie"])),
+        "the error or fix must name the selected namespace curie; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("--release curie") || transcript.contains("release curie"),
+        "the error or fix must name the selected release curie; transcript:\n{transcript}"
+    );
+}
+
+/// NEGATIVE CONTROL. Invalid or empty names must fail before cluster status.
+/// A DNS-invalid value that still reached kubectl would look like a missing
+/// release instead of a caller error.
+#[test]
+fn cluster_ladder_refuses_invalid_namespace_and_release() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("CURIE_NAMESPACE", "Not_Valid", "Not_Valid"),
+        ("CURIE_NAMESPACE", "", "CURIE_NAMESPACE"),
+        ("CURIE_RELEASE", "Bad_Name", "Bad_Name"),
+    ];
+    for (variable, value, named) in cases {
+        let (output, invocations, _) = run_cluster_target_control(&[(variable, value)]);
+        let transcript = transcript(&output);
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "{variable}={value:?} must fail the cluster ladder before any cluster verb; transcript:\n{transcript}"
+        );
+        assert!(
+            !transcript.contains("LADDER PASS"),
+            "{variable}={value:?} must not announce a pass; transcript:\n{transcript}"
+        );
+        assert!(
+            transcript.contains(named),
+            "{variable}={value:?} must name the invalid value {named:?} in the error or fix; transcript:\n{transcript}"
+        );
+        assert!(
+            !invocations.contains("cluster status"),
+            "{variable}={value:?} must refuse before cluster status; invocations:\n{invocations}"
+        );
+    }
 }

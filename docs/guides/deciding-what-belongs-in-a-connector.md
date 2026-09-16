@@ -40,11 +40,12 @@ correct; unit tests do that, and they run identically either way.
 One case, and it is the case the SRE bot example is built around: when the
 calculation is the only thing bounding the capability.
 
-`examples/sre-bot/connectors/k8s-write/server.py` builds its patch body itself,
-a constant with a timestamp filled in, and exposes no parameter through which a
-caller reaches an image, a command or a replica count. If that body-building
-moved into the sandbox, a caller could supply the body, and a restart tool would
-become an arbitrary-write tool. The computation *is* the ceiling.
+`examples/sre-bot/connectors/self-upgrade/server.py` reads the named CronJob's
+Job template and exposes no parameter through which a caller reaches an image,
+an environment variable, or a command. If that template selection and
+body-building moved into the sandbox, a caller could supply the Job body, and a
+self-upgrade tool would become an arbitrary-Job tool. The computation *is* the
+ceiling.
 
 **The test:** if this code moved into the sandbox, could a caller reach the
 capability without it?
@@ -81,13 +82,12 @@ Sometimes the boundary you want cannot be written as a permission. Then layer 3
 is simply not on offer, and the code has to carry it. That is not a workaround.
 It is layer 1, which is stronger anyway.
 
-**The worked example in this repository is Kubernetes RBAC.** `kubectl rollout
-restart` is not a distinct permission; it is a PATCH of the pod template. So
-`patch` on deployments is the *same grant* as `set image`, `set env`, and
-replacing the container command. RBAC grants verbs on resources and cannot say
-"patch only this one field". `examples/sre-bot/manifests/write-role.yaml` says so
-in its own comments, and it is why that connector constructs its patch rather
-than forwarding one.
+**The worked example in this repository is Kubernetes RBAC.** `create` on Jobs
+is namespace-wide: `resourceNames` cannot restrict a create because the object
+does not exist yet. RBAC therefore cannot say "create only this Job".
+`examples/sre-bot/manifests/upgrade-role.yaml` says so in its own comments, and
+it is why the connector reads the configured CronJob template and posts only
+that template rather than forwarding a caller-supplied Job body.
 
 **The shape generalises.** Object stores and document platforms commonly grant
 per-bucket or per-site, not per-prefix or per-folder. If two locations that must

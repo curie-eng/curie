@@ -1,0 +1,61 @@
+name: Issues fixed on next
+
+# Choice: label path (`fixed-on-next`), not close-on-merge-to-next.
+#
+# GitHub closing keywords fire only on the default branch (`main`). Closing an
+# issue when its fix lands on `next` would under-count remaining work on the
+# patch train: the issue would be closed while the fix is not yet on `main`.
+# Labeling with `fixed-on-next` keeps the issue open, lets milestone queries
+# exclude already-fixed-on-next work, and closes those issues when `next`
+# merges to `main`.
+#
+# No closer convention exists in this repository today (no `fixed-on-next`
+# label and no existing closer workflow), so this workflow takes the label
+# path.
+
+on:
+  push:
+    branches: [next, main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print planned actions without mutating issues
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  reconcile:
+    name: Label or close issues fixed on next
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch next for merge detection
+        if: github.ref == 'refs/heads/main'
+        run: git fetch --no-tags origin next:refs/remotes/origin/next
+      - name: Close-on-next self-test
+        run: python3 tools/close-on-next/close.py --self-test
+      - name: Reconcile issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            extra+=(--dry-run)
+          fi
+          python3 tools/close-on-next/close.py \
+            --event "$GITHUB_EVENT_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            "${extra[@]}"

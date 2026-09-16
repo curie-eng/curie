@@ -1,10 +1,10 @@
-"""RouteRecord wire-format contract for the per-sandbox runner token (issue #63).
+"""Upgrade-safe RouteRecord contract for worker-internal route metadata.
 
 The token is carried on the SandboxHandle from claim-time to call-time, and the
 affinity store serializes the handle to Valkey, so the token must survive the
-JSON round-trip. Upgrade safety: a route written by a pre-token worker has no
-``token`` key, and must rehydrate to ``token == ""`` (that sandbox's runner has
-no token configured, so the client sends no header and it keeps working).
+JSON round-trip. Workspace head and visible publication outcome revision are
+the corresponding cold-reconciliation fences. Upgrade safety: a legacy route
+has none of these keys and must still rehydrate with conservative defaults.
 """
 
 from __future__ import annotations
@@ -29,10 +29,18 @@ def _handle(**overrides: object) -> SandboxHandle:
 
 
 def test_route_record_round_trips_token() -> None:
-    record = RouteRecord(handle=_handle(token="tok-20"))
+    record = RouteRecord(
+        handle=_handle(
+            token="tok-20",
+            workspace_materialized_head="a" * 40,
+            publication_visible_outcome_revision=2,
+        )
+    )
     restored = RouteRecord.from_json(record.to_json())
 
     assert restored.handle.token == "tok-20"
+    assert restored.handle.workspace_materialized_head == "a" * 40
+    assert restored.handle.publication_visible_outcome_revision == 2
     assert restored.handle == record.handle
 
 
@@ -52,3 +60,5 @@ def test_route_record_legacy_payload_without_token_defaults_empty() -> None:
     }
     record = RouteRecord.from_json(json.dumps(legacy))
     assert record.handle.token == ""
+    assert record.handle.workspace_materialized_head is None
+    assert record.handle.publication_visible_outcome_revision == 0

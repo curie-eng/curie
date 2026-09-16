@@ -410,11 +410,27 @@ class StreamConsumer:
         refresh_s = ttl_s / 3
         expiry_guard_s = max(0.001, ttl_s - refresh_s)
         retry_s = max(0.001, min(refresh_s / 4, 0.25))
+        failed_once = False
 
         await self._sleep_generation(refresh_s)
         while not self._generation_stop.is_set():
+            last = self._last_liveness_renewal
+            now = time.monotonic()
+            elapsed = 0.0 if last is None else now - last
+            remaining_guard = expiry_guard_s - elapsed
+            remaining_lease = ttl_s - elapsed
+            # Guard minus 1ms on the first pass so a hang-forever attempt can
+            # still retry. Once that window is thinner than retry_s, remaining
+            # key TTL keeps a recovered SET alive instead of a 1ms floor.
+            # Cap by leftover TTL minus retry_s so a late refresh sleep still
+            # leaves room for one retry before the key expires.
+            if remaining_guard - 0.001 >= retry_s:
+                computed = remaining_guard - 0.001
+            else:
+                computed = max(0.001, remaining_lease)
+            attempt_timeout = min(computed, max(0.001, ttl_s - elapsed - retry_s))
             try:
-                async with asyncio.timeout(self._liveness_timeout_s()):
+                async with asyncio.timeout(attempt_timeout):
                     await self._liveness_store.renew(
                         stream=self._spec.stream,
                         group=self._spec.group,
@@ -426,18 +442,27 @@ class StreamConsumer:
                 # ``CancelledError`` remains a BaseException and propagates.
                 last = self._last_liveness_renewal
                 elapsed = float("inf") if last is None else time.monotonic() - last
-                if elapsed >= expiry_guard_s:
+                # A first timeout that crossed the pre-expiry guard still retries
+                # if the key TTL has not elapsed. Raise after a second failure
+                # in that window, or once the key itself is past TTL.
+                if elapsed >= ttl_s or (elapsed >= expiry_guard_s and failed_once):
                     raise ConsumerLivenessExpired(
                         "consumer liveness renewal could not be confirmed before "
                         f"lease expiry for {self._spec.consumer}"
                     ) from exc
+                failed_once = True
                 self._spec.logger.warning(
                     "consumer liveness renewal failed transiently for %s; retrying",
                     self._spec.consumer,
                     exc_info=True,
                 )
-                await self._sleep_generation(retry_s)
+                leftover = expiry_guard_s - elapsed
+                # Do not sleep past the guard; retry immediately when leftover
+                # is too small for retry_s.
+                if leftover > retry_s:
+                    await self._sleep_generation(retry_s)
                 continue
+            failed_once = False
             self._last_liveness_renewal = time.monotonic()
             await self._sleep_generation(refresh_s)
 

@@ -19,6 +19,15 @@
 nameOverride: ""
 fullnameOverride: ""
 
+# Installed configuration schema version (issue #2299). `curie cluster up` and
+# `curie apply` stamp this on every install and upgrade so later upgrades know
+# which migrations to run. Operators should not set this by hand.
+config:
+  schemaVersion: ""
+  # Chart / schema version the previous document was migrated from. Empty on a
+  # fresh install that already uses the current schema.
+  migratedFrom: ""
+
 global:
   imagePullPolicy: IfNotPresent
   # "" uses the cluster default StorageClass. Set to pin a class (e.g. local-path
@@ -122,8 +131,10 @@ langfuse:
   image:
     web: langfuse/langfuse
     worker: langfuse/langfuse-worker
-    # Keep web and worker on one reviewed migration set. A floating :3 moved to
-    # 3.225.6 during CI and left ClickHouse migration 39 dirty (#2190).
+    # Keep web and worker on one reviewed version. On 2026-09-01 upstream
+    # rebuilt both the `3` and `3.225` tags in place to ship v3.225.6 without
+    # ever publishing a 3.225.6 tag, breaking CI bring-up. Neither major nor
+    # minor tags are safe -- only the exact patch tag is stable (#2190).
     # Coupled to clickhouse.image.tag 25.12.11.4: Langfuse 3.225.x migrations
     # from 39 onward need that ClickHouse 25.12 line. Do not advance this pin
     # without it, and do not move ClickHouse off 25.12.11.4 while this pin
@@ -702,9 +713,26 @@ rustfs:
   persistence:
     enabled: true
     size: 3Gi
+  # Measured rustfs/rustfs:1.0.0-beta.12 under ordinary Langfuse traffic
+  # (issue #2706): 1120Mi working set, 425m CPU. The shipped 512Mi / 500m
+  # ceiling OOMKilled every in-chart install in a silent loop: kubelet
+  # cgroup SIGKILL of a healthy process. HTTP /health returns 200 between
+  # kills, so the pod reports Ready; tightening probe thresholds cannot
+  # observe SIGKILL. The observable is lastState.terminated.reason=OOMKilled
+  # / restart count. Probes in templates/rustfs.yaml are out of scope.
+  #
+  # Memory request 1280Mi covers the measured 1120Mi working set so the
+  # scheduler packs against real resident size (same lesson as inference
+  # #2329). Memory limit 2Gi is ceil(1120Mi * 1.5 = 1680Mi) to the next Gi.
+  # That is the headroom, not the 2Gi that happened to work on one rig.
+  # CPU request 250m is below the 425m draw (burstable). CPU limit is "1",
+  # not 425m, not 500m, and not 2. Do not pin at the observed draw. Do not
+  # use 2: a CPU limit of 2 on a 2-vCPU node is the whole machine and
+  # starved sandbox 90s claim binds (clickhouse walked 2 to 1; inference
+  # copied that).
   resources:
-    requests: { cpu: 50m, memory: 128Mi }
-    limits: { cpu: 500m, memory: 512Mi }
+    requests: { cpu: 250m, memory: 1280Mi }
+    limits: { cpu: "1", memory: 2Gi }
   # RustFS supports a fixed nonroot identity when fsGroup owns the data volume.
   containerSecurityContext:
     runAsUser: 10001
@@ -1087,6 +1115,11 @@ api:
   orgName: Curie
   # HMAC secret the GitHub git-flow webhook authenticates inbound events with.
   githubWebhookSecret: dev-webhook-secret
+  # GitHub review-feedback ingress is opt-in. When enabled, the API boot gate
+  # requires a GitHub App id/private key, a non-default webhook secret, and a
+  # positive reconciliation interval.
+  githubReviewIngressEnabled: false
+  githubReviewReconcilerIntervalSeconds: 5
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
@@ -1225,11 +1258,15 @@ api:
       # A Secret you supply, or one cert-manager creates from the annotation
       # above. Empty means "use the controller's default certificate".
       secretName: ""
-  # Run `alembic upgrade head` in an init container before the server starts, so
-  # a fresh Postgres gets the `curie` schema + tables. Disable only when an
-  # external migration step owns the DB.
+  # Schema migrations run in one upgrade Job (templates/schema-migrate.yaml),
+  # not in every API pod. The API init container waits until the live revision
+  # is inside this image's declared window. Disable only when an external
+  # migration step owns the DB.
   migrate:
     enabled: true
+    # Apply contract/irreversible migrations. Default false refuses them
+    # before mutation so a patch rollback window stays intact (#2300).
+    forwardOnly: false
   # Resume reconciler (#411): the background loop that re-enqueues resume turns
   # for approvals whose inline enqueue failed, so a suspended session is never
   # permanently stranded. `enabled` is the off-switch -- with it false the loop
@@ -1910,7 +1947,10 @@ worker:
   adapterCredentialsExistingSecretKey: adapterCredentials
   # Extra env for the worker container, list of {name, value}. For SLACK_API_BASE_URL
   # prefer the first-class slackApiBaseUrl above; use extraEnv for any other
-  # worker override the fixed env block does not cover. Per-workload
+  # worker override the fixed env block does not cover. Names that collide with
+  # first-class timeout/budget env (CURIE_RUNNER_TOTAL_TIMEOUT_S and the rest of
+  # that family) are dropped at render so a retained pre-first-class override
+  # cannot duplicate the key on upgrade (#2097). Per-workload
   # OTEL_EXPORTER_OTLP_* overrides still win over the chart-owned collector
   # endpoint.
   extraEnv: []

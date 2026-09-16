@@ -42,6 +42,7 @@ see `release/integrity.py` for the same manifest/verify split rationale.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -49,6 +50,19 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+
+
+def _load_nightly():
+    path = Path(__file__).resolve().parent / "nightly.py"
+    spec = importlib.util.spec_from_file_location("release_nightly", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["release_nightly"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_nightly = _load_nightly()
 
 PASSING_CONCLUSIONS = {"success", "neutral"}
 
@@ -59,9 +73,10 @@ PASSING_CONCLUSIONS = {"success", "neutral"}
 # three language/test jobs, the generated-artifact drift checks, the
 # release-compose validation, every first-party image actually building
 # (including the worker-local overlay and the dispatcher's own import
-# smoke-test), and the two behavioral gates (eval falsifiability, the E2E
-# parity ladder) that ci.yaml's own comments describe as catching bug
-# classes no unit test does. Checks from other workflows (CodeQL, the
+# smoke-test), and the behavioral gates (eval falsifiability, the E2E
+# parity ladder, the repository-toolchain proof) that ci.yaml's own
+# comments describe as catching bug classes no unit test does. Checks
+# from other workflows (CodeQL, the
 # dependency/secret scanners, release.yaml's own jobs) are deliberately
 # excluded -- they matter, but are not what this gate is asserting about
 # *this* commit's CI.
@@ -72,6 +87,27 @@ PASSING_CONCLUSIONS = {"success", "neutral"}
 # runtime. It is the simpler of the two options ADR-0058 left open (issue
 # #733). Tests pin its required names to jobs in both workflows, so a job
 # rename or removal requires a matching edit here.
+#
+# EVERY first-party connector image build is required here, not just the
+# bundle's read-only `tempo` server (issue #1951). The `examples/` rows of
+# ci.yaml's `images` job are release-load-bearing in a way the one-sided
+# version of this list could not see. `release.yaml`'s `build` matrix rebuilds
+# those same Dockerfiles for real, and its `merge` job -- the job that
+# assembles the multi-arch manifest every published tag actually resolves to --
+# is gated `if: always() && needs.build.result == 'success'`. So one connector
+# image going red on `next` and not named here authorizes the tag, fails a
+# single `build` leg, and takes the manifest merge for EVERY image down with
+# it, while the CLI binaries and the GitHub Release -- which hang off
+# `authorize-release` alone -- publish regardless. The release ships binaries
+# whose images have per-arch blobs pushed by digest and no pullable manifest
+# tag anywhere.
+#
+# The subset test below cannot see that direction: it asserts every required
+# name is a real job, so ADDING a connector build to ci.yaml and forgetting it
+# here leaves the subset perfectly intact. That direction is now pinned by
+# `test_every_connector_image_build_is_a_required_check`, which derives the
+# connector rows from ci.yaml itself -- a new connector image is guarded by a
+# failing test, not by whoever remembers to read this comment.
 REQUIRED_CHECK_NAMES = frozenset(
     {
         "Python (ruff + mypy + pytest)",
@@ -85,8 +121,10 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build worker image (no push)",
         "Build ui image (no push)",
         "Build sre-bot-tempo image (no push)",
+        "Build sre-bot-self-upgrade image (no push)",
         "Build worker-local overlay image (no push)",
         "Dispatcher image imports resolve",
+        "Repository toolchain proof (runner image)",
         "Eval falsifiability gate (fake model, offline)",
         "E2E parity ladder (skill + local, fake model)",
         "E2E parity ladder (local-release, fake model)",
@@ -244,6 +282,9 @@ def authorize(
     cwd: Path | None = None,
     exclude_run_id: str | None = None,
     required_names: frozenset[str] | None = None,
+    nightly_conclusion: str | None = None,
+    allow_red_nightly: bool = False,
+    require_nightly: bool = False,
     tag: str | None = None,
 ) -> None:
     """Raise AuthorizationError unless `sha` may publish a release.
@@ -290,6 +331,12 @@ def authorize(
             f"{', '.join(sorted(missing))}. Refusing to authorize this tag "
             "until its required checks are current and green."
         )
+    if require_nightly or nightly_conclusion is not None or allow_red_nightly:
+        reason = _nightly.nightly_refusal_reason(
+            nightly_conclusion, allow_red=allow_red_nightly
+        )
+        if reason:
+            raise AuthorizationError(reason)
 
 
 def fetch_check_runs(
@@ -363,7 +410,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--tag",
-        required=True,
+        default=None,
         help="the pushed tag name, e.g. v0.7.0 or v0.7.0-rc.1",
     )
     parser.add_argument(
@@ -372,15 +419,53 @@ def main(argv: list[str] | None = None) -> int:
         help="this workflow run's id; its own check-runs are excluded from the gate",
     )
     args = parser.parse_args(argv)
+    branch = "main"
+    nightly_conclusion: str | None = None
 
     try:
         check_runs = fetch_check_runs(args.sha, args.repo)
+        # Establish reachability, tag class, and required CI before the nightly
+        # network lookup. This keeps a deterministic authorization refusal from
+        # being masked by an unrelated lookup failure.
         authorize(
             args.sha,
             check_runs,
             args.reviewed_ref,
             exclude_run_id=args.run_id,
             tag=args.tag,
+        )
+        matching = [
+            ref
+            for ref in args.reviewed_ref
+            if commit_is_on_reviewed_branch(args.sha, ref)
+        ]
+        branch = _nightly.nightly_branch_from_refs(matching)
+        try:
+            nightly_conclusion = _nightly.fetch_latest_nightly_conclusion(
+                args.repo, branch
+            )
+            bodies = _nightly.fetch_associated_pr_bodies(args.sha, args.repo)
+        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as exc:
+            detail = getattr(exc, "stderr", None)
+            suffix = f": {str(detail).strip()}" if detail else ""
+            print(
+                f"ERROR: could not retrieve the nightly conclusion or associated "
+                f"pull request bodies for {args.sha} on {branch} from {args.repo} "
+                f"-- the lookup failed with {type(exc).__name__}{suffix}. "
+                "Refusing to authorize this tag because its nightly status is "
+                "unknown.",
+                file=sys.stderr,
+            )
+            return 1
+        authorize(
+            args.sha,
+            check_runs,
+            args.reviewed_ref,
+            exclude_run_id=args.run_id,
+            tag=args.tag,
+            nightly_conclusion=nightly_conclusion,
+            allow_red_nightly=_nightly.allow_red_nightly_from_bodies(bodies),
+            require_nightly=True,
         )
     except AuthorizationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -400,9 +485,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     checked_refs = ", ".join(args.reviewed_ref)
+    if nightly_conclusion == "success":
+        nightly_note = f"the latest nightly on {branch} concluded success"
+    else:
+        nightly_note = (
+            f"the latest nightly on {branch} concluded {nightly_conclusion!r} "
+            "with --allow-red-nightly recorded in an associated pull request body"
+        )
     print(
         f"OK: {args.sha} is reachable from a reviewed ref "
-        f"({checked_refs}) and checked; authorized"
+        f"({checked_refs}), checked, and {nightly_note}; authorized"
     )
     return 0
 
