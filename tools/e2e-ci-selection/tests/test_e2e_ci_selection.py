@@ -458,7 +458,6 @@ AGGREGATE_EXPRESSIONS = {
     "cluster_result": "${{ needs.e2e-ladder-cluster.result }}",
     "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
     "upgrade_matrix_result": "${{ needs.e2e-cluster-upgrade-matrix.result }}",
-    "is_next_train": "${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}",
 }
 
 
@@ -498,21 +497,17 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert jobs["e2e-released-upgrade"]["if"] == (
         "${{ needs.changes.outputs.released_upgrade == 'true' }}"
     )
-    assert jobs["e2e-cluster-upgrade-matrix"]["if"] == (
-        "${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}"
-    )
+    assert jobs["e2e-cluster-upgrade-matrix"]["if"] == "${{ false }}"
 
 
-def test_upgrade_matrix_workflow_is_always_on_next_and_runs_the_script() -> None:
+def test_upgrade_matrix_workflow_is_disabled_and_retains_the_script() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     job = workflow["jobs"]["e2e-cluster-upgrade-matrix"]
     needs = job["needs"]
     if isinstance(needs, str):
         needs = [needs]
     assert set(needs) == {"rust-build"}
-    assert job["if"] == (
-        "${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}"
-    )
+    assert job["if"] == "${{ false }}"
     assert job["timeout-minutes"] == 180
     named_steps = {
         step["name"]: step for step in job["steps"] if isinstance(step.get("name"), str)
@@ -923,7 +918,6 @@ def _run_aggregate(
         "cluster_result": "skipped",
         "released_upgrade_result": "skipped",
         "upgrade_matrix_result": "skipped",
-        "is_next_train": "false",
     }
     state.update(overrides)
     environment = os.environ.copy()
@@ -984,12 +978,12 @@ def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> Non
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_aggregate_requires_upgrade_matrix_success_on_next_train() -> None:
-    ok = _run_aggregate(is_next_train="true", upgrade_matrix_result="success")
+def test_aggregate_requires_upgrade_matrix_to_stay_skipped() -> None:
+    ok = _run_aggregate(upgrade_matrix_result="skipped")
     assert ok.returncode == 0, ok.stdout + ok.stderr
-    skipped = _run_aggregate(is_next_train="true", upgrade_matrix_result="skipped")
-    assert skipped.returncode != 0
-    failed = _run_aggregate(is_next_train="true", upgrade_matrix_result="failure")
+    unexpected = _run_aggregate(upgrade_matrix_result="success")
+    assert unexpected.returncode != 0
+    failed = _run_aggregate(upgrade_matrix_result="failure")
     assert failed.returncode != 0
 
 
@@ -1006,7 +1000,7 @@ def test_aggregate_requires_upgrade_matrix_success_on_next_train() -> None:
         {"local_release_result": "success"},
         {"cluster_result": "success"},
         {"upgrade_matrix_result": "success"},
-        {"is_next_train": "true", "upgrade_matrix_result": "skipped"},
+        {"upgrade_matrix_result": "failure"},
     ],
 )
 def test_aggregate_rejects_inconsistent_outcomes(state: dict[str, str]) -> None:
