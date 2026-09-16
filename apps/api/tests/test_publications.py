@@ -979,7 +979,10 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
 
     def blocking_resolver(_: str, __: Any) -> tuple[str, str]:
         resolver_started.set()
-        if not loop_progressed.wait(timeout=0.5):
+        # A blocked loop never sets the event, however long this waits, so the
+        # budget only has to outlast thread wakeups on a contended runner: 0.5s
+        # failed 1 in 20 under `pytest -n 4` on 4 vCPU (run 34542518036).
+        if not loop_progressed.wait(timeout=10):
             raise AssertionError("credential resolver blocked the event loop")
         return "https://github.com/acme-corp/acme-bot.git", "Basic test"
 
@@ -1002,7 +1005,7 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
                     loop_progressed.set()
 
                 progress = asyncio.create_task(prove_progress())
-                result = await asyncio.wait_for(call, timeout=2)
+                result = await asyncio.wait_for(call, timeout=15)
                 await progress
                 return result.authorization_header
         finally:

@@ -137,6 +137,11 @@ def _log_through_stdout(*args: object) -> str:
     handler = logging.StreamHandler(stream)
     root = logging.getLogger()
     root.addHandler(handler)
+    # install_stdout_redaction() filters EVERY root handler, including pytest's
+    # own capture handlers. Restore their filters, or any later test in this
+    # process that asserts on a raw log message sees it redacted (surfaced
+    # under xdist, where file order differs from the serial run).
+    saved_filters = {item: list(item.filters) for item in root.handlers}
     try:
         install_stdout_redaction()
         logger = logging.getLogger("curie_runner.test_redact")
@@ -144,6 +149,8 @@ def _log_through_stdout(*args: object) -> str:
         logger.info(*args)
     finally:
         root.removeHandler(handler)
+        for item, filters in saved_filters.items():
+            item.filters[:] = filters
     return stream.getvalue()
 
 
