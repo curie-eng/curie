@@ -310,6 +310,7 @@ class _TlsEdge:
         ca_path, cert_path, key_path = _write_tls_material(tmp_path, cert_hostname)
         self.sni: list[str | None] = []
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(cert_path, key_path)
 
         def record_sni(_sock: Any, server_name: str | None, _context: Any) -> None:
