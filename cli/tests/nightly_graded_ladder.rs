@@ -1169,12 +1169,13 @@ fn exact_seed_matcher_recovers_embedded_marker_once_and_rejects_background() {
 }
 
 #[test]
-fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt() {
+fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() {
     let text = ladder();
     for required in [
         "seed_ordinary_turn() {",
         "seed_mcp_read_turn() {",
         "seed_approval_resume_turn() {",
+        "seed_coding_tool_turn() {",
         "seed-invalid",
         "mcp_receipt_call_count() {",
         "discover_trace_id_for_seed",
@@ -1183,7 +1184,7 @@ fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt()
     ] {
         assert!(
             text.contains(required),
-            "the product observability oracle must pin independent ordinary, MCP, and approval seed evidence; missing {required}"
+            "the product observability oracle must pin independent ordinary, MCP, approval, and built-in coding-tool seed evidence; missing {required}"
         );
     }
 
@@ -1212,6 +1213,67 @@ fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt()
     assert!(
         !approval.contains("curie.approval.wait"),
         "the oracle must not invent a wait span that no current emitter produces"
+    );
+}
+
+#[test]
+fn coding_tool_seed_drives_a_builtin_tool_and_asserts_execute_tool_in_its_exact_trace() {
+    let coding = ladder_function("seed_coding_tool_turn");
+    assert!(
+        coding.contains("Bash"),
+        "the coding seed must drive a built-in coding tool by name, since the MCP seed only covers a hosted connector tool"
+    );
+    assert!(
+        coding.contains("--json local message"),
+        "the coding seed must issue a real product turn rather than inspect telemetry alone"
+    );
+    assert!(
+        coding.contains("assert_finalized_reply"),
+        "the coding seed must require a finalized reply before trusting its telemetry"
+    );
+    assert!(
+        coding.contains("expected_receipt"),
+        "the coding seed must carry an independent deterministic receipt the model cannot produce without executing the tool"
+    );
+    assert!(
+        coding.contains("$expected_receipt") && coding.contains("seed-invalid"),
+        "the coding seed must check the reply against the expected literal receipt and fail closed when it is absent"
+    );
+    assert!(
+        coding.contains("discover_trace_id_for_seed"),
+        "the coding seed must derive the exact trace id of its own turn, never a newest-N or window query"
+    );
+    assert!(
+        coding.contains("query_exact_seed_trace") && coding.contains("execute_tool"),
+        "the coding seed must assert execute_tool membership in that exact trace"
+    );
+    assert!(
+        !coding.contains("newest") && !coding.contains("--limit"),
+        "a newest-N or windowed lookup would let an unrelated trace satisfy the coding seed"
+    );
+}
+
+#[test]
+fn coding_tool_seed_membership_gates_product_observability() {
+    let rung = ladder_function("rung_local");
+    assert!(
+        rung.contains("seed_coding_tool_turn"),
+        "the LIVE orchestration block must run the built-in coding-tool seed alongside the hosted MCP seed"
+    );
+    assert!(
+        rung.contains("LAST_CODING_MEMBERSHIP"),
+        "the coding seed must publish its membership result the way the MCP seed publishes LAST_MCP_MEMBERSHIP"
+    );
+    let gating = rung.lines().any(|line| {
+        line.contains("LAST_CODING_MEMBERSHIP") && line.contains("product_membership=\"false\"")
+    });
+    assert!(
+        gating,
+        "a coding seed that runs without gating product_membership is inert; its membership must force product_membership=false"
+    );
+    assert!(
+        ladder().contains("LAST_CODING_TRACE_ID=\"\""),
+        "the coding seed's exact trace id must be declared beside the other LAST_*_TRACE_ID seed results"
     );
 }
 
