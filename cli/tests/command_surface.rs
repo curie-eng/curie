@@ -814,8 +814,8 @@ fn agent_target_verbs_expose_the_same_flags_on_both_tiers() {
     // --dry-run) but DIVERGE intentionally on the cluster side (#524): cluster
     // adds --namespace/--release to discover the release's connection. So the
     // cluster flag set must be a strict superset of the local one, differing only
-    // by those two discovery flags -- a flag added to local can still never be
-    // silently dropped from cluster.
+    // by those two discovery flags plus the cluster-wide --context (#2723) -- a
+    // flag added to local can still never be silently dropped from cluster.
     for verb in ["versions", "memory", "approvals"] {
         let local = help_flags(&["local", verb]);
         let cluster = help_flags(&["cluster", verb]);
@@ -826,10 +826,12 @@ fn agent_target_verbs_expose_the_same_flags_on_both_tiers() {
             );
         }
         let extra: Vec<_> = cluster.iter().filter(|f| !local.contains(*f)).collect();
+        let mut extra: Vec<&str> = extra.iter().map(|f| f.as_str()).collect();
+        extra.sort_unstable();
         assert_eq!(
-            extra.len(),
-            2,
-            "cluster {verb} should add exactly --namespace/--release; got extras {extra:?}"
+            extra,
+            ["--context", "--namespace", "--release"],
+            "cluster {verb} should add exactly --context/--namespace/--release"
         );
     }
 }

@@ -2486,6 +2486,16 @@ export const commandManifest = {
     },
     {
       "about": "Work with the deployed cluster release and platform API",
+      "args": [
+        {
+          "global": true,
+          "help": "Kubernetes context for every helm and kubectl call. Defaults to the kubeconfig current-context, which is resolved once and pinned",
+          "id": "context",
+          "long": "context",
+          "positional": false,
+          "required": false
+        }
+      ],
       "hidden": false,
       "name": "cluster",
       "subcommands": [

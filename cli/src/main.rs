@@ -644,6 +644,10 @@ enum Command {
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
+        /// Kubernetes context for every helm and kubectl call. Defaults to the
+        /// kubeconfig current-context, which is resolved once and pinned.
+        #[arg(long, global = true, value_name = "NAME")]
+        context: Option<String>,
     },
     /// Install a complete first party example workflow.
     Example {
@@ -4057,7 +4061,16 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await?,
             ),
         },
-        Some(Command::Cluster { action }) => match action {
+        Some(Command::Cluster { action, context }) => {
+            if let Some(target) =
+                curie::kube_context::pin_for_cluster_command(context.as_deref()).await?
+            {
+                ui::ui().note(&format!(
+                    "Kubernetes context: {} (cluster {})",
+                    target.context, target.cluster
+                ));
+            }
+            match action {
             ClusterAction::Up {
                 namespace,
                 release,
@@ -5236,7 +5249,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
-        },
+        }
+        }
         Some(Command::ListAgents) => commands::list_agents().await,
         Some(Command::DeployLocal {
             folder,
@@ -5622,6 +5636,7 @@ mod tests {
         match from_env.command {
             Some(Command::Cluster {
                 action: ClusterAction::Up { github_token, .. },
+                ..
             }) => assert_eq!(
                 github_token.as_deref(),
                 Some("ghp-SENTINEL-1124-leak-canary")
@@ -5631,6 +5646,7 @@ mod tests {
         match without.command {
             Some(Command::Cluster {
                 action: ClusterAction::Up { github_token, .. },
+                ..
             }) => assert_eq!(
                 github_token, None,
                 "an unset variable must be absence, not an empty credential"
@@ -5653,6 +5669,7 @@ mod tests {
                         dry_run,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(to, "0.9.0");
                 assert_eq!(namespace, "curie");
@@ -5875,6 +5892,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Eval { model, .. },
+                ..
             }) => assert_eq!(model, vec!["opus"]),
             _ => panic!("expected cluster eval sweep"),
         }
@@ -5951,6 +5969,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Eval { case_id, .. },
+                ..
             }) => assert_eq!(case_id, vec!["greets-the-user", "escalates"]),
             _ => panic!("expected cluster eval with a selector"),
         }
@@ -5960,6 +5979,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Eval { case_id, .. },
+                ..
             }) => assert!(case_id.is_empty()),
             _ => panic!("expected cluster eval"),
         }
@@ -6407,6 +6427,7 @@ mod tests {
                         valkey_password,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(api_key, None, "an omitted --api-key must not default");
                 assert_eq!(
@@ -6439,6 +6460,7 @@ mod tests {
                         valkey_password,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(api_key, Some("K".to_string()));
                 assert_eq!(valkey_password, Some("P".to_string()));
@@ -6462,6 +6484,7 @@ mod tests {
                         valkey_password,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(api_key, None, "an omitted --api-key must not default");
                 assert_eq!(
@@ -6493,6 +6516,7 @@ mod tests {
                         valkey_password,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(api_key, Some("K".to_string()));
                 assert_eq!(valkey_password, Some("P".to_string()));
@@ -6518,6 +6542,7 @@ mod tests {
                         api_local_port,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(listen_port, 0, "an omitted --listen-port must request 0");
                 assert_eq!(
@@ -6545,6 +6570,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { api_local_port, .. },
+                ..
             }) => assert_eq!(
                 api_local_port, 0,
                 "an omitted --api-local-port must request a kernel-assigned port"
@@ -6563,6 +6589,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { api_local_port, .. },
+                ..
             }) => assert_eq!(api_local_port, 18123),
             _ => panic!("expected cluster deploy command"),
         }
@@ -6591,6 +6618,7 @@ mod tests {
                         api_local_port,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(listen_port, 18155);
                 assert_eq!(valkey_local_port, 18156);
@@ -6613,6 +6641,7 @@ mod tests {
                         release,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(api_url, None);
                 assert_eq!(namespace, "curie");
@@ -6635,6 +6664,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { api_url, .. },
+                ..
             }) => assert_eq!(api_url.as_deref(), Some("http://h:30080/api")),
             _ => panic!("expected cluster deploy command"),
         }
@@ -6658,6 +6688,7 @@ mod tests {
                     ClusterAction::Deploy {
                         namespace, release, ..
                     },
+                ..
             }) => {
                 assert_eq!(namespace, "ns1");
                 assert_eq!(release, "rel1");
@@ -6792,6 +6823,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Versions { target },
+                ..
             }) => {
                 assert_eq!(target.agent, "demo");
                 assert_eq!(target.conn.namespace, "prod");
@@ -6812,6 +6844,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Kill { agent, yes, .. },
+                ..
             }) => {
                 assert_eq!(agent, "deal-desk");
                 assert!(yes);
@@ -6833,6 +6866,7 @@ mod tests {
                         dry_run,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(agent, "a");
                 assert!(!yes);
@@ -6849,6 +6883,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Resume { agent, dry_run, .. },
+                ..
             }) => {
                 assert_eq!(agent, "a");
                 assert!(dry_run);
@@ -6864,6 +6899,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Budget { agent, limit, .. },
+                ..
             }) => {
                 assert_eq!(agent, "a");
                 assert_eq!(limit, 12.5);
@@ -6893,6 +6929,7 @@ mod tests {
                         yes,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(agent, "deal-desk");
                 assert_eq!(thread_key, "1234.5678");
@@ -6923,6 +6960,7 @@ mod tests {
                         dry_run,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(agent, "a");
                 assert_eq!(thread_key, "t1");
@@ -7007,6 +7045,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Memory { target, add },
+                ..
             }) => {
                 assert_eq!(target.agent, "translation-bot");
                 assert_eq!(add.as_deref(), Some("ask before translating to French"));
@@ -7128,6 +7167,7 @@ mod tests {
                         open,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(namespace, "curie");
                 assert_eq!(release, "curie");
@@ -7148,7 +7188,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Cluster {
-                action: ClusterAction::Observability { .. }
+                action: ClusterAction::Observability { .. },
+                ..
             })
         ));
     }
@@ -7161,6 +7202,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Observability { dry_run, open, .. },
+                ..
             }) => {
                 assert!(dry_run, "--dry-run must parse to true");
                 assert!(open, "--open must parse to true");
@@ -7216,6 +7258,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Delete { agent, yes, .. },
+                ..
             }) => {
                 assert_eq!(agent, "a");
                 assert!(yes);
@@ -7310,6 +7353,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { secret, .. },
+                ..
             }) => assert_eq!(secret, vec!["GITHUB_PERSONAL_ACCESS_TOKEN"]),
             _ => panic!("expected cluster deploy"),
         }
@@ -7320,6 +7364,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { secret, .. },
+                ..
             }) => assert!(secret.is_empty()),
             _ => panic!("expected cluster deploy"),
         }
@@ -7358,6 +7403,7 @@ mod tests {
                         app_token,
                         ..
                     },
+                ..
             }) => {
                 assert!(slack);
                 assert!(disconnect);

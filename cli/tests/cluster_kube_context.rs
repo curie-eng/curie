@@ -138,8 +138,14 @@ fn assert_all_pinned(run: &Run, ctx: &str) {
         run.stderr()
     );
     for (prog, cur, helm_ctx, args) in &run.log {
-        assert_eq!(cur, ctx, "{prog} {args}: first KUBECONFIG entry must pin {ctx}");
-        assert_eq!(helm_ctx, ctx, "{prog} {args}: HELM_KUBECONTEXT must be {ctx}");
+        assert_eq!(
+            cur, ctx,
+            "{prog} {args}: first KUBECONFIG entry must pin {ctx}"
+        );
+        assert_eq!(
+            helm_ctx, ctx,
+            "{prog} {args}: HELM_KUBECONTEXT must be {ctx}"
+        );
     }
 }
 
@@ -158,8 +164,14 @@ fn explicit_context_pins_every_helm_and_kubectl_call() {
         );
         assert_all_pinned(&run, "test-ctx");
         let err = run.stderr();
-        assert!(err.contains("test-ctx"), "stderr must name the context: {err}");
-        assert!(err.contains("test-cluster"), "stderr must name the cluster: {err}");
+        assert!(
+            err.contains("test-ctx"),
+            "stderr must name the context: {err}"
+        );
+        assert!(
+            err.contains("test-cluster"),
+            "stderr must name the cluster: {err}"
+        );
     }
 }
 
@@ -195,5 +207,9 @@ fn no_context_pins_current_context() {
     let run = run_curie(&["cluster", "down", "--yes"], None);
     assert!(run.out.status.success(), "stderr={}", run.stderr());
     assert_all_pinned(&run, "prod-ctx");
-    assert!(run.stderr().contains("prod-ctx"), "stderr: {}", run.stderr());
+    assert!(
+        run.stderr().contains("prod-ctx"),
+        "stderr: {}",
+        run.stderr()
+    );
 }
