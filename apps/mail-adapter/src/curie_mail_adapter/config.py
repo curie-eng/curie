@@ -29,6 +29,8 @@ Env mapping:
     CURIE_MAIL_MAX_REPLY_BYTES              -> max_reply_bytes
     CURIE_MAIL_MAX_STATE_BYTES              -> max_state_bytes
     CURIE_MAIL_ALLOWED_SENDERS              -> allowed_senders
+    CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS       -> agentmail_egress_cidrs
+    CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS -> discovery_unready_after_seconds
 
 The adapter holds no platform API key, queue credential, or platform database
 access: ``CURIE_CHANNEL_TOKEN`` and ``CURIE_EGRESS_SECRET`` are its only Curie
@@ -38,6 +40,7 @@ file is a single-replica delivery journal, not a platform capability.
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Annotated, Any
 
 from aci_protocol.service_config import (
@@ -136,3 +139,26 @@ class MailAdapterConfig(BaseSettings):
         if not isinstance(entries, (list, tuple)):
             return value
         return tuple(stripped for entry in entries if (stripped := str(entry).strip()))
+
+    # Comma-separated CIDRs the pod's egress policy admits for AgentMail. When
+    # set, the AgentMail client dials only addresses inside them (#2731); empty
+    # means dial whatever DNS returns.
+    agentmail_egress_cidrs: Annotated[
+        tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...], NoDecode
+    ] = Field(default=(), validation_alias="CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS")
+
+    # How long a continuous discovery failure run lasts before /readyz reports 503.
+    discovery_unready_after_seconds: float = Field(
+        default=120.0, validation_alias="CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS"
+    )
+
+    @field_validator("agentmail_egress_cidrs", mode="before")
+    @classmethod
+    def _split_egress_cidrs(cls, value: Any) -> Any:
+        """Parse the comma-separated form, dropping empty segments."""
+        entries = value.split(",") if isinstance(value, str) else value
+        if not isinstance(entries, (list, tuple)):
+            return value
+        return tuple(
+            ipaddress.ip_network(stripped) for entry in entries if (stripped := str(entry).strip())
+        )

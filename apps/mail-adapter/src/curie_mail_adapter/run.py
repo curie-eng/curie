@@ -51,6 +51,11 @@ def boot_problems(config: MailAdapterConfig) -> list[str]:
     ):
         if bound_value <= 0:
             problems.append(f"{env_name} must be greater than zero, not {bound_value}")
+    if config.discovery_unready_after_seconds <= 0:
+        problems.append(
+            "CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS must be greater than zero, "
+            f"not {config.discovery_unready_after_seconds}"
+        )
     if config.ingress_enabled and not config.allowed_senders:
         problems.append(
             "CURIE_MAIL_ALLOWED_SENDERS is required while ADAPTER_INGRESS_ENABLED is true: "

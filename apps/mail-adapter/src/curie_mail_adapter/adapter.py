@@ -72,6 +72,14 @@ class MailAdapter:
         # Opaque pagination is a discovery hint only. Durable pending ids, never
         # this cursor, are the source of truth across a restart.
         self.page_cursor: str | None = None
+        # Discovery health (#2731): the monotonic start of the current failure
+        # run and its length. A run older than the configured threshold makes
+        # /readyz report 503 while /healthz stays 200. State is judged as of the
+        # latest recorded pass, so it only moves when the poll loop observes.
+        self.discovery_failing_since: float | None = None
+        self.discovery_failures = 0
+        self.discovery_last_failure_at = 0.0
+        self.discovery_unreachable_logged = False
 
     def status(self) -> dict[str, Any]:
         """Report diagnostic claims only; the adapter cannot verify the signature."""
@@ -80,6 +88,7 @@ class MailAdapter:
         with self.lock:
             rejected = self.channel_token_rejected
             last_status = self.last_ingress_status
+            discovery = self._discovery_snapshot()
         now = time.time()
         state = "ok"
         if not self.config.ingress_enabled:
@@ -98,7 +107,48 @@ class MailAdapter:
             "status": "ready" if self.ready.is_set() else "starting",
             "channel_token": {"present": bool(token), "exp": exp, "state": state},
             "last_ingress_status": last_status,
+            "discovery": discovery,
         }
+
+    def _discovery_snapshot(self) -> dict[str, Any]:
+        since = self.discovery_failing_since
+        if since is None:
+            return {"state": "ok", "consecutive_failures": 0, "failing_for_seconds": 0.0}
+        failing_for = max(0.0, self.discovery_last_failure_at - since)
+        unreachable = failing_for >= self.config.discovery_unready_after_seconds
+        return {
+            "state": "unreachable" if unreachable else "failing",
+            "consecutive_failures": self.discovery_failures,
+            "failing_for_seconds": failing_for,
+        }
+
+    def record_discovery(self, status: int, now: float | None = None) -> None:
+        """Fold one discovery pass status into readiness; only 200 clears a failure run."""
+        at = time.monotonic() if now is None else now
+        with self.lock:
+            if status == 200:
+                recovered = self.discovery_unreachable_logged
+                failures = self.discovery_failures
+                self.discovery_failing_since = None
+                self.discovery_failures = 0
+                self.discovery_unreachable_logged = False
+                if recovered:
+                    logger.info("discovery recovered after %s consecutive failures", failures)
+                return
+            if self.discovery_failing_since is None:
+                self.discovery_failing_since = at
+            self.discovery_failures += 1
+            self.discovery_last_failure_at = at
+            snapshot = self._discovery_snapshot()
+            if snapshot["state"] == "unreachable" and not self.discovery_unreachable_logged:
+                self.discovery_unreachable_logged = True
+                logger.error(
+                    "discovery unreachable: %s consecutive failures over %.1fs, last status=%s; "
+                    "readiness now reports 503",
+                    snapshot["consecutive_failures"],
+                    snapshot["failing_for_seconds"],
+                    status,
+                )
 
     # -- startup and ingress ------------------------------------------------
 
@@ -169,6 +219,7 @@ class MailAdapter:
         backoff = 0.0
         while not self.shutdown.is_set():
             status = self.poll_once()
+            self.record_discovery(status)
             if status == 200:
                 return
             backoff = min(backoff * 2 + BACKOFF_STEP_SECONDS, BACKOFF_MAX_SECONDS)
@@ -183,6 +234,7 @@ class MailAdapter:
             if self.shutdown.is_set():
                 return
             status = self.poll_once()
+            self.record_discovery(status)
             if _poll_should_back_off(status):
                 backoff = min(backoff * 2 + BACKOFF_STEP_SECONDS, BACKOFF_MAX_SECONDS)
                 logger.warning(

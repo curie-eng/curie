@@ -1487,6 +1487,13 @@ mailAdapter:
   # while sending nothing inbound, which is the staged-cutover position while the
   # platform side of a new binding is being wired.
   ingressEnabled: true
+  # Continuous discovery-failure seconds after which readiness goes 503;
+  # liveness is unaffected. The Service still publishes the pod's address
+  # while it is unready (publishNotReadyAddresses: true), so reply/completion
+  # deliveries from the worker keep reaching it through a discovery outage;
+  # readiness going 503 is the operator signal via Deployment.Available, not
+  # a routing cutoff.
+  discoveryUnreadyAfterSeconds: 120
   # Who may start a turn by emailing the inbox. Empty denies everything, and with
   # ingressEnabled true the adapter refuses to boot rather than run an inbox that
   # answers nobody. "*" is the explicit allow-all.
@@ -1517,7 +1524,11 @@ mailAdapter:
     baseUrl: "https://api.agentmail.to/v0"
     # NetworkPolicy cannot authorize a DNS name. Supply the current provider
     # (or a controlled egress proxy) HTTPS CIDRs explicitly. Enabling the
-    # adapter with an empty list fails the chart render closed.
+    # adapter with an empty list fails the chart render closed. The adapter
+    # dials only addresses these CIDRs admit, pinning to /32 entries when DNS
+    # rotates to an edge outside the list (TLS is still verified against the
+    # hostname) -- this is what kept a CDN-fronted provider from being refused
+    # when its DNS rotated (#2731).
     httpsCidrs: []
   # The `chn` channel token minted by the API's POST /channels/token, scoped to
   # this adapter's channel binding. The adapter presents it on every inbound post.
