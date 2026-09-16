@@ -43,6 +43,7 @@ from .types import (
     CapacityExhaustedError,
     ClaimTimeoutError,
     NoRouteError,
+    RouteChangedError,
     RouteRecord,
     RouteState,
     SandboxClient,
@@ -163,6 +164,7 @@ class SandboxSubstrate:
         workspace_repo: str | None = None,
         workspace_materialized_head: str | None = None,
         publication_visible_outcome_revision: int = 0,
+        fresh_only: bool = False,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -170,6 +172,12 @@ class SandboxSubstrate:
         history ref); the fast path passes none so the claim binds a pre-warmed
         generic sandbox. ``agent_name`` selects the per-agent warm pool when
         connector secrets are marked on ``env`` (#1488).
+
+        ``fresh_only`` is for callers whose ``env`` must reach the runner that
+        serves the turn (attachment staging, #2739): a live running route, or
+        a concurrent winner of the route race, raises ``RouteChangedError``
+        instead of being reused. Suspended routes still raise
+        ``SuspendedThreadError``.
         """
 
         started = time.monotonic()
@@ -188,6 +196,8 @@ class SandboxSubstrate:
                         raise SuspendedThreadError(thread_key)
                     sandbox = self._k8s.get_sandbox(record.handle.sandbox_name)
                     if sandbox is not None and sandbox.operating_mode == "Running":
+                        if fresh_only:
+                            raise RouteChangedError(thread_key)
                         self._affinity.touch(thread_key, self._config.route_ttl_seconds)
                         handle = record.handle
                         outcome = "reused"
@@ -205,6 +215,7 @@ class SandboxSubstrate:
                         publication_visible_outcome_revision=(
                             publication_visible_outcome_revision
                         ),
+                        fresh_only=fresh_only,
                     )
                     outcome = "claimed"
             except Exception as exc:
@@ -697,6 +708,7 @@ class SandboxSubstrate:
         publication_visible_outcome_revision: int = 0,
         generation: int = 0,
         publish: bool = True,
+        fresh_only: bool = False,
     ) -> SandboxHandle:
         config = self._config
         nonce = uuid.uuid4().hex[:6]
@@ -759,6 +771,9 @@ class SandboxSubstrate:
             sandbox = self._k8s.get_sandbox(winner.handle.sandbox_name)
             if sandbox is not None and sandbox.operating_mode == "Running":
                 self._k8s.delete_claim(name)
+                if fresh_only:
+                    # The winner never saw this claim's env (#2739).
+                    raise RouteChangedError(thread_key)
                 return winner.handle
             self._evict_stale(thread_key, winner)
         self._k8s.delete_claim(name)
