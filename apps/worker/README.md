@@ -503,8 +503,9 @@ Contract notes the kernel must know:
   `agentSandbox.deploy=true` installs `<release>-runner` (SandboxTemplate) and
   `<release>-runner-pool` (SandboxWarmPool). Claims without per-claim env bind
   a pre-warmed sandbox (0.04-0.07 s measured on a scratch k3s cluster); claims **with**
-  env (the resume path) get a fresh sandbox instead (cold create, seconds not
-  sub-second) because env cannot be injected into an already-running pod.
+  env through resume or retained attachment replacement get a fresh sandbox
+  instead. This cold create takes seconds rather than less than one second
+  because env cannot be injected into a running pod.
 - **Suspend/resume is a cold rehydrate.** `suspend()` flips the Sandbox
   to `Suspended` (the pod is deleted) and records the caller-supplied history
   ref. `resume()` retires the old claim and creates a new one whose per-claim
@@ -541,3 +542,30 @@ Contract notes the kernel must know:
   plane); Valkey is never mocked. The env-gated e2e
   (`tests/sandbox/test_e2e_k8scratch.py`, `CURIE_SANDBOX_E2E=1`) drives the
   real cluster.
+
+### Retained thread attachments
+
+An attachment on an idle retained thread needs new claim environment, so the
+worker cold creates a candidate runner. Replacement requires an authenticated
+old runner that is inactive, has a safe completed or idle status, and reports
+durable history. The old route remains authoritative while the candidate binds.
+The worker then swaps the candidate over the exact old claim and generation in
+one affinity operation. This temporarily requires capacity for both the old and
+candidate runners. A capacity refusal, bind failure, or lost fence deletes only
+the candidate and preserves the old route.
+
+The replacement keeps the logical session identity and durable transcript
+reference, but it loses prompt cache warmth, process memory, and other container
+local state. Text without an attachment keeps the existing steering behavior.
+An active runner asks the sender to wait. An unauthenticated, unreadable,
+nondurable, malformed, or otherwise unsafe runner asks the sender to start a
+new thread. Neither refusal processes the message text.
+
+In v0.9.1 a retained thread with an open repository workspace says that its
+workspace is already open and asks the sender to start a new thread. A generic
+retained thread whose new file message selects a repository, or whose server
+state already holds a repository selection, gives a separate repository
+selection refusal and the same recovery. When repository workspaces are
+disabled, the existing workspaces disabled refusal takes precedence before the
+file is resolved. Fresh workspace claims and suspended workspace resumes still
+receive attachments. Retained workspace replacement is tracked in #2728.

@@ -11,13 +11,15 @@ import logging
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from aci_protocol import (
+    Attachment,
     ErrorEvent,
     Final,
     QueuedTurn,
@@ -68,6 +70,7 @@ def _qevent(
     endpoint: str | None = None,
     adapter: str | None = None,
     source: TurnSource = TurnSource.SLACK,
+    attachments: Sequence[Attachment] = (),
 ) -> QueuedTurn:
     return QueuedTurn(
         event_id=event_id or uuid.uuid4().hex,
@@ -83,6 +86,7 @@ def _qevent(
         ),
         received_at="2026-07-05T00:00:00+00:00",
         source=source,
+        attachments=list(attachments),
     )
 
 
@@ -2403,6 +2407,120 @@ def test_followup_steers_the_live_turn(make_harness) -> None:
 
             hold.set()
             await t1
+
+    asyncio.run(go())
+
+
+def test_active_file_turn_with_a_real_delivery_lease_settles_once(
+    make_harness,
+) -> None:
+    """A refused active file turn is delivered, acknowledged, and never reclaimed."""
+
+    async def go() -> None:
+        from curie_dispatcher.queue import to_stream_fields
+        from curie_worker.consumer import Consumer
+        from curie_worker.delivery_lease import DeliveryLeaseStore
+
+        class AttachmentLane:
+            def __init__(self) -> None:
+                self.resolve_calls = 0
+
+            def resolve(self, **_kwargs: object) -> object:
+                self.resolve_calls += 1
+                raise AssertionError("an active file turn downloaded its attachment")
+
+        async with make_harness() as h:
+            lane = AttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=store,
+            )
+            await consumer.ensure_group()
+
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=DONE)]
+            first = asyncio.create_task(
+                h.kernel.process_event(_qevent("first", thread="tActiveFile"))
+            )
+            try:
+                await _wait_until(lambda: h.runner.turn_active)
+                thread_key = "slack:C1:tActiveFile"
+                route = h.substrate._affinity.get(thread_key)  # noqa: SLF001
+                assert route is not None
+                h.substrate._affinity.replace(  # noqa: SLF001
+                    thread_key,
+                    replace(
+                        route,
+                        handle=replace(route.handle, token="active-test-token"),
+                    ),
+                    ttl_seconds=60,
+                )
+                file_event = _qevent(
+                    "read this too",
+                    thread="tActiveFile",
+                    event_id="active-file-with-lease",
+                    placeholder="p-file",
+                    attachments=[Attachment(id="F1", name="followup.txt")],
+                )
+                await h.async_redis.xadd(
+                    h.config.stream,
+                    to_stream_fields(file_event),
+                )
+                rows = await h.async_redis.xreadgroup(
+                    h.config.consumer_group,
+                    h.config.consumer_name,
+                    {h.config.stream: ">"},
+                    count=1,
+                )
+                entry_id, fields = rows[0][1][0]
+                await consumer._dispatch(entry_id, dict(fields))
+                await asyncio.gather(
+                    *list(consumer._inflight),
+                    return_exceptions=True,
+                )
+
+                expected = (
+                    "I cannot add a file while the current reply is still running. "
+                    "Please send the whole message again after that reply finishes. "
+                    "The text of this message was not processed."
+                )
+                file_updates = [
+                    text for _channel, ref, text in h.sink.updates if ref == "p-file"
+                ]
+                assert file_updates[-1] == expected
+                assert lane.resolve_calls == 0
+                assert h.runner.steers == []
+                assert h.runner.interrupts == 0
+                assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
+                completions = [
+                    item for item in h.sink.completions if item.event_id == file_event.event_id
+                ]
+                assert len(completions) == 1
+                assert completions[0].outcome == "delivered"
+                pending = await h.async_redis.xpending(
+                    h.config.stream,
+                    h.config.consumer_group,
+                )
+                assert pending["pending"] == 0
+                assert not await store.is_live(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                )
+                assert not await store.has_state(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                )
+            finally:
+                hold.set()
+                await first
 
     asyncio.run(go())
 
