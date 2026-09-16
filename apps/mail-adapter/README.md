@@ -135,6 +135,26 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_MAIL_MAX_REPLY_BYTES` | `1048576` | maximum accumulated outbound reply, in bytes |
 | `CURIE_MAIL_MAX_STATE_BYTES` | `268435456` | maximum SQLite page budget; size the volume above this for the WAL and filesystem overhead. Terminal `completion_events` rows (`delivered=1` or `deleted=1`, not both-required) are compacted oldest-first under the same derived ceiling as terminal receipts (at most 4096, and at most one quarter of the page budget). Unresolved and leased completion rows are never evicted to admit newer mail. A late duplicate whose row was evicted and whose provider marker is gone resends; keep the cap above the worker's 7-day completion retention if that duplicate must not fire |
 | `CURIE_MAIL_ALLOWED_SENDERS` | "" | the allow-list above. Required while ingress is enabled |
+| `CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS` | "" | comma-separated CIDRs the egress policy admits for AgentMail. When set, the AgentMail client dials only addresses inside them (see below). Empty dials whatever DNS returns |
+| `CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS` | `120` | how long a continuous discovery failure run lasts before `/readyz` reports 503. Must be greater than zero |
+
+### Egress pinning and discovery readiness
+
+AgentMail sits behind CloudFront, which rotates edge IPs, while the chart's
+NetworkPolicy admits a fixed CIDR snapshot. A dial to a rotated edge is rejected
+by the cluster and surfaces as `Connection refused`. With
+`CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS` set, the AgentMail client prefers resolved
+addresses inside those CIDRs, falls back to the configured `/32` and `/128`
+addresses, and fails the call (status 0) when nothing admitted is available. Only
+the dialed IP changes: TLS still verifies the certificate against the URL
+hostname. Platform API calls are never pinned.
+
+Every discovery pass that does not return 200 extends the current failure run;
+a 200 clears it. `/statusz` reports `discovery` as `ok`, `failing`, or
+`unreachable` with the failure count and duration. Once the run exceeds
+`CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS`, the state is `unreachable`,
+`/readyz` returns 503, and one ERROR is logged; one INFO is logged on recovery.
+`/healthz` does not follow discovery, so an outage does not restart the pod.
 
 ### Boot gates
 

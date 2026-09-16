@@ -74,6 +74,8 @@ _DEFAULTS: dict[str, object] = {
     "max_reply_bytes": 1048576,
     "max_state_bytes": 268435456,
     "allowed_senders": (),
+    "agentmail_egress_cidrs": (),
+    "discovery_unready_after_seconds": 120.0,
 }
 
 

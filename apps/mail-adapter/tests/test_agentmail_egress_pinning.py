@@ -105,7 +105,9 @@ def _config(tmp_path: Path, port: int, cidrs: list[str], host: str = HOST) -> Ma
 
 
 def test_egress_cidrs_parse_from_env_comma_separated(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS", " 18.160.41.105/32 ,10.0.0.0/8,, 2001:db8::/32 ")
+    monkeypatch.setenv(
+        "CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS", " 18.160.41.105/32 ,10.0.0.0/8,, 2001:db8::/32 "
+    )
     config = MailAdapterConfig()
     assert list(config.agentmail_egress_cidrs) == [
         ipaddress.ip_network("18.160.41.105/32"),
@@ -166,7 +168,9 @@ def test_admitted_address_is_preferred_over_non_admitted(
     assert ROTATED_EDGE not in dns.dialed, f"a non-admitted edge was dialed: {dns.dialed}"
 
 
-def test_without_cidrs_resolution_is_used_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_without_cidrs_resolution_is_used_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No pinning configured: the client dials whatever DNS says, as before.
 
     DNS answers 127.0.0.1 on a closed port, so the unpinned dial fails fast with

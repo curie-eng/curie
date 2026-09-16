@@ -321,6 +321,17 @@ spec:
             # process fall back to its own default and start.
             - name: CURIE_MAIL_ALLOWED_SENDERS
               value: {{ join "," .Values.mailAdapter.allowedSenders | quote }}
+            # #2731: the exact set of addresses the egress NetworkPolicy admits
+            # on TCP 443, comma-joined in the same order as its ipBlock rules, so
+            # the adapter can pin to /32 entries when DNS rotates the provider's
+            # hostname to an edge outside the policy (TLS is still verified
+            # against the hostname).
+            - name: CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS
+              value: {{ join "," $agentmailCidrs | quote }}
+            # Readiness goes 503 after discovery fails continuously this long;
+            # liveness is unaffected.
+            - name: CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS
+              value: {{ .Values.mailAdapter.discoveryUnreadyAfterSeconds | quote }}
             # The shared OTLP env, so this adapter's records join the same
             # redacted telemetry path as every other instrumented workload.
             # extraEnv is deliberately an empty list, not a new

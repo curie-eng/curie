@@ -20,7 +20,6 @@ from _support import IngressState, MailState, get, wait_until
 from curie_mail_adapter.adapter import MailAdapter
 from curie_mail_adapter.config import MailAdapterConfig
 
-
 # -- config ------------------------------------------------------------------
 
 
@@ -51,9 +50,7 @@ def test_non_positive_threshold_is_a_boot_problem(
 # -- adapter state and HTTP surface -------------------------------------------
 
 
-def _ready_adapter(
-    make_adapter: Callable[..., MailAdapter], **overrides: Any
-) -> MailAdapter:
+def _ready_adapter(make_adapter: Callable[..., MailAdapter], **overrides: Any) -> MailAdapter:
     instance = make_adapter(**overrides)
     instance.startup()
     assert instance.ready.is_set()
@@ -197,9 +194,9 @@ def test_poll_loop_drives_discovery_readiness_and_logs_edges_once(
             assert len(errors()) == 1, errors()
 
             client.down = False
-            assert wait_until(
-                lambda: adapter.status()["discovery"]["state"] == "ok", timeout=10
-            ), adapter.status()
+            assert wait_until(lambda: adapter.status()["discovery"]["state"] == "ok", timeout=10), (
+                adapter.status()
+            )
             assert get(url + "/readyz")[0] == 200
             assert adapter.status()["discovery"]["consecutive_failures"] == 0
             assert wait_until(lambda: len(recoveries()) == 1, timeout=5), recoveries()
