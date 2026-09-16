@@ -165,6 +165,61 @@ def test_one_attachment_is_stored_under_the_attachment_prefix_with_a_digest_of_i
     assert ref.size_bytes == len(payload)
 
 
+def test_discarding_a_prepared_set_removes_its_objects_and_matching_ledger(
+    attachments: Any,
+) -> None:
+    """A preclaim abandonment leaves neither bytes nor a retention owner behind.
+
+    The kernel resolves an idle file turn before it reacquires the route lock.
+    When that phase two decision refuses or times out, the prepared set is no
+    longer claimable, so its private objects and the ledger that retains them
+    must disappear together. This is deliberately a public coordinator action:
+    the kernel knows the exact ``PreparedAttachments`` it abandoned, while
+    retention ownership remains private to this seam.
+    """
+
+    files = FakeSlackFiles({"F1": [b"abandoned_bytes"]})
+    coordinator, objects = _coordinator(attachments, files)
+    prepared = _resolve(coordinator, [_ref("F1")], generation="abandoned")
+
+    assert coordinator.current(THREAD_KEY) is not None
+    assert list(objects.list_keys(attachments.ATTACHMENT_LEDGER_PREFIX))
+
+    coordinator.discard_prepared(thread_key=THREAD_KEY, prepared=prepared)
+
+    assert all(key not in objects.objects for key in prepared.object_keys)
+    assert list(objects.list_keys(attachments.ATTACHMENT_LEDGER_PREFIX)) == []
+    assert coordinator.current(THREAD_KEY) is None
+
+
+def test_discarding_an_older_prepared_set_preserves_a_newer_set_and_its_ledger(
+    attachments: Any,
+) -> None:
+    """Exact comparison keeps another worker's newer resolve live.
+
+    The first worker can finish its Slack download after a second worker has
+    already resolved the next turn for the same thread. Its cleanup must delete
+    only the objects it wrote and must not erase the newer ledger record, or a
+    later retention sweep loses ownership of still live private bytes.
+    """
+
+    files = FakeSlackFiles({"F1": [b"older_bytes"], "F2": [b"newer_bytes"]})
+    coordinator, objects = _coordinator(attachments, files)
+    older = _resolve(coordinator, [_ref("F1", "older.csv")], generation="older")
+    newer = _resolve(coordinator, [_ref("F2", "newer.csv")], generation="newer")
+    (ledger_key,) = tuple(objects.list_keys(attachments.ATTACHMENT_LEDGER_PREFIX))
+    newer_ledger = objects.objects[ledger_key]
+
+    coordinator.discard_prepared(thread_key=THREAD_KEY, prepared=older)
+
+    assert all(key not in objects.objects for key in older.object_keys)
+    assert all(objects.objects[key] == b"newer_bytes" for key in newer.object_keys)
+    assert objects.objects[ledger_key] == newer_ledger
+    current = coordinator.current(THREAD_KEY)
+    assert current is not None
+    assert current.object_keys == newer.object_keys
+
+
 def test_the_minted_reference_is_a_short_lived_signed_one_object_capability(
     attachments: Any,
 ) -> None:

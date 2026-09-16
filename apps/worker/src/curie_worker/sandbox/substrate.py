@@ -285,13 +285,13 @@ class SandboxSubstrate:
         *,
         expected: SandboxHandle,
         env: dict[str, str],
-        workspace_repo: str,
+        workspace_repo: str | None,
         workspace_materialized_head: str | None = None,
         publication_visible_outcome_revision: int = 0,
         agent_name: str | None = None,
         validate_candidate: Callable[[SandboxHandle], None] | None = None,
     ) -> SandboxHandle:
-        """Cold-create a workspace runner, then CAS it over one generic route.
+        """Cold create a runner, then CAS it over one retained route.
 
         The old route remains authoritative while the candidate binds. Losing
         the claim+generation fence deletes only the unexposed candidate. After
@@ -334,11 +334,11 @@ class SandboxSubstrate:
             ttl_seconds=self._config.route_ttl_seconds,
         ):
             self._k8s.delete_claim(candidate.claim_name)
-            raise NoRouteError(f"late workspace handoff lost its route fence for {thread_key}")
+            raise NoRouteError(f"late handoff lost its route fence for {thread_key}")
         try:
             self._k8s.delete_claim(expected.claim_name)
         except Exception:  # noqa: BLE001 - route already swapped; reaper owns cleanup
-            logger.exception("late workspace handoff left old claim for orphan reaping")
+            logger.exception("late handoff left old claim for orphan reaping")
         return candidate
 
     # -- suspend / resume -------------------------------------------------------

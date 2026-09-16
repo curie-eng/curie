@@ -542,6 +542,82 @@ def test_suspend_resume_rehydrates_from_history(
     assert substrate.lookup("T1") == resumed
 
 
+def test_handoff_without_workspace_preserves_identity_generation_and_env(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
+) -> None:
+    first = substrate.claim("T1", env={RUNNER_TOKEN_ENV: "token-first"})
+    history_ref = "redis://state/transcript/T1"
+    affinity.replace(
+        "T1",
+        RouteRecord(handle=replace(first, history_ref=history_ref)),
+        ttl_seconds=60,
+    )
+    caller_env = {
+        "CURIE_BUNDLE_REF": "bundles/acme-agent-v7.tgz",
+        "CURIE_ATTACHMENTS_REF": "state/attachments/T1/set-2",
+        RUNNER_TOKEN_ENV: "token-second",
+    }
+
+    expected = replace(first, history_ref=history_ref)
+    replacement = substrate.handoff(
+        "T1",
+        expected=expected,
+        env=caller_env,
+        workspace_repo=None,
+    )
+
+    assert replacement.claim_name != first.claim_name
+    assert replacement.sandbox_name != first.sandbox_name
+    assert first.claim_name in fake_k8s.deleted
+    assert first.claim_name not in fake_k8s.claims
+    assert replacement.claim_name in fake_k8s.claims
+
+    replacement_env = fake_k8s.claims[replacement.claim_name].env
+    assert replacement_env["CURIE_BUNDLE_REF"] == caller_env["CURIE_BUNDLE_REF"]
+    assert replacement_env["CURIE_ATTACHMENTS_REF"] == caller_env["CURIE_ATTACHMENTS_REF"]
+    assert replacement_env[SESSION_ENV] == first.session_id
+    assert replacement_env[HISTORY_ENV] == history_ref
+    assert replacement_env[RUNNER_TOKEN_ENV] == "token-second"
+    assert replacement_env[RUNNER_TOKEN_ENV] != first.token
+    assert replacement.token == replacement_env[RUNNER_TOKEN_ENV]
+    assert caller_env[RUNNER_TOKEN_ENV] == "token-second"
+
+    assert replacement.session_id == first.session_id
+    assert replacement.history_ref == history_ref
+    assert replacement.workspace_repo is None
+    assert replacement.generation == expected.generation + 1
+    route = affinity.get("T1")
+    assert route is not None
+    assert route.state is RouteState.LIVE
+    assert route.handle == replacement
+    assert affinity.route_inventory()[RouteState.LIVE] == {replacement.claim_name}
+    assert substrate.lookup("T1") == replacement
+
+
+def test_handoff_bind_failure_preserves_old_route(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    first = substrate.claim("T1", env={RUNNER_TOKEN_ENV: "token-first"})
+    fake_k8s.bind_ready = False
+
+    with pytest.raises(ClaimTimeoutError):
+        substrate.handoff(
+            "T1",
+            expected=first,
+            env={
+                "CURIE_ATTACHMENTS_REF": "set-2",
+                RUNNER_TOKEN_ENV: "token-second",
+            },
+            workspace_repo=None,
+        )
+
+    assert affinity.get("T1") == RouteRecord(handle=first)
+    assert first.claim_name in fake_k8s.claims
+    assert first.claim_name not in fake_k8s.deleted
+    assert substrate.lookup("T1") == first
+
+
 def test_suspend_and_resume_require_route(substrate: SandboxSubstrate) -> None:
     with pytest.raises(NoRouteError):
         substrate.suspend("nope", history_ref=None)

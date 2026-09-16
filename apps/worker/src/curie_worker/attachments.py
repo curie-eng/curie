@@ -708,6 +708,28 @@ class AttachmentCoordinator:
             except Exception:  # noqa: BLE001 -- the refusal above is the real news
                 continue
 
+    def discard_prepared(self, *, thread_key: str, prepared: PreparedAttachments) -> None:
+        """Discard an abandoned preclaim set without disturbing a newer resolve.
+
+        The caller knows the exact bytes it prepared but not whether another
+        worker resolved a later turn for the same thread while the route was
+        being decided.  Its own objects are always safe to remove; the sibling
+        ledger is removed only when it is still the exact record for this set.
+        """
+
+        with self._lock:
+            self._discard(prepared.object_keys)
+            current = self._load(thread_key)
+            expected = _AttachmentSet(
+                thread_key=thread_key,
+                refs=prepared.refs,
+                object_keys=prepared.object_keys,
+                expires_at_epoch=prepared.retention_expires_at_epoch,
+            )
+            if current != expected:
+                return
+            self.objects.delete(self._ledger_key(thread_key))
+
     @staticmethod
     def _object_key(*, agent_id: str, generation: str, index: int) -> str:
         """Agent-scoped, worker-minted structure -- never the channel's filename.
