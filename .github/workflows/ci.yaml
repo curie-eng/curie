@@ -2716,6 +2716,8 @@ jobs:
           ls -la .projects/2590-evidence 2>/dev/null || true
           tail -c 4000 .projects/2590-evidence/last-upgrade.json 2>/dev/null || true
           tail -c 2000 .projects/2590-evidence/last-upgrade.err 2>/dev/null || true
+          tail -c 2000 .projects/2590-evidence/compatible-rollback.json 2>/dev/null || true
+          tail -c 1000 .projects/2590-evidence/compatible-rollback.err 2>/dev/null || true
       - name: Tear down the owned upgrade matrix cluster
         if: always()
         run: |

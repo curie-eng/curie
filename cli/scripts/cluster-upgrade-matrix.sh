@@ -243,6 +243,12 @@ run_self_test() {
         log "self-test: exclusive_kind_tag must untag siblings before and after kind load"
         failed=1
     fi
+    if awk '/^run_compatible_rollback\(\)/,/^}/' "$script_path" | grep -q 'exclusive_kind_tag "0.9.0"'; then
+        log "compatible rollback reloads exclusive 0.9.0 images"
+    else
+        log "self-test: compatible rollback must exclusive_kind_tag 0.9.0 before helm rollback"
+        failed=1
+    fi
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
@@ -979,13 +985,16 @@ run_n_to_n1() {
 
 run_compatible_rollback() {
     local status=0
+    # n-to-n1 left exclusive 0.9.1 on the node. Rollback to 0.9.0 cannot
+    # pull that tag with pullPolicy Never.
+    exclusive_kind_tag "0.9.0"
     set +e
     "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
         >"$EVIDENCE_DIR/compatible-rollback.json" 2>"$EVIDENCE_DIR/compatible-rollback.err"
     status=$?
     set -e
     (( status == 0 )) || die "compatible rollback exited $status"
-    wait_rollout
+    wait_rollout || die "compatible rollback rollout timed out (helm $(helm_version))"
     [[ "$(helm_version)" == "0.9.0" ]] || die "compatible rollback helm version is $(helm_version) not 0.9.0"
     kubectl_ns get deploy "$(fullname)-api" -o jsonpath='{.status.readyReplicas}{"\n"}' | grep -vq '^0$' \
         || die "api not Ready after compatible rollback"

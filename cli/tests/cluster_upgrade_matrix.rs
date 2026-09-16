@@ -107,6 +107,10 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin exclusive_kind_tag untag-before-load\n{text}"
     );
     assert!(
+        text.contains("compatible rollback reloads exclusive 0.9.0 images"),
+        "self-test must pin compatible rollback reloading 0.9.0 images\n{text}"
+    );
+    assert!(
         text.contains("schema heads published=0039"),
         "self-test must pin the published 0.8.8 alembic head\n{text}"
     );
