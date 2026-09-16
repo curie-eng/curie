@@ -861,14 +861,21 @@ def _wait_for_exact_trace_counts(
 def test_streamed_tool_starts_reach_langfuse_through_collector() -> None:
     """Scripted SDK events cross real OTLP/HTTP without a model credential."""
 
-    collector_endpoint = "http://localhost:24318/v1/traces"
-    langfuse_host = "http://localhost:23000"
+    collector_endpoint = os.environ.get(
+        "TEST_OTEL_COLLECTOR_ENDPOINT", "http://localhost:24318/v1/traces"
+    )
+    collector_probe = collector_endpoint.removesuffix("/v1/traces")
+    langfuse_host = (
+        os.environ.get("TEST_LANGFUSE_HOST")
+        or os.environ.get("LANGFUSE_HOST")
+        or "http://localhost:23000"
+    )
     auth = ("pk-lf-curie-dev", "sk-lf-curie-dev")
 
     with httpx.Client(timeout=2.0) as preflight_client:
         try:
             health = preflight_client.get(f"{langfuse_host}/api/public/health")
-            preflight_client.get(collector_endpoint)
+            preflight_client.get(collector_probe)
         except (httpx.HTTPError, ValueError):
             pytest.skip("local Collector and Langfuse are not reachable")
         if health.status_code != 200:
