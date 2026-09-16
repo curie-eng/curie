@@ -975,6 +975,7 @@ safe_operations = {
     }
 operations = []
 types = set()
+tool_names = set()
 observation_count = [0]
 
 def walk(node):
@@ -986,10 +987,23 @@ def walk(node):
     observation_count[0] += 1
     name = public_node.get("name")
     kind = public_node.get("type")
+    normalized_kind = kind.upper() if isinstance(kind, str) else ""
+    # Langfuse 3.225.5 maps any span carrying gen_ai.tool.name to type TOOL and
+    # RENAMES the observation to the tool, so a real tool call never arrives
+    # under the name execute_tool. Name-keyed membership alone is therefore
+    # blind to every tool call; the type and the hoisted toolName are the only
+    # surviving evidence that the execute_tool operation happened.
+    tool_name = public_node.get("toolName")
+    if not isinstance(tool_name, str) or not tool_name:
+        tool_name = name if normalized_kind == "TOOL" and isinstance(name, str) else None
     if name in safe_operations:
         operations.append(name)
-    if isinstance(kind, str) and kind.upper() in {"SPAN", "GENERATION", "EVENT"}:
-        types.add(kind.upper())
+    elif normalized_kind == "TOOL" or tool_name:
+        operations.append("execute_tool")
+    if tool_name:
+        tool_names.add(tool_name)
+    if normalized_kind in {"SPAN", "GENERATION", "EVENT", "TOOL"}:
+        types.add(normalized_kind)
     children = public_node.get("children")
     if not isinstance(children, list):
         raise SystemExit("exact trace node omitted its child array")
@@ -1015,11 +1029,14 @@ sanitized = {
     "operation": sorted(set(operations)),
     "observation_count": observation_count[0],
     "observation_type": sorted(types),
+    # WHICH tool ran, not merely that some tool observation existed: a required
+    # Bash call must not be satisfied by an unrelated surviving tool span.
+    "tool_name": sorted(tool_names),
     "approval_decision": decision,
     }
 allowed_evidence_fields = {
     "trace_id", "service", "operation", "observation_count",
-    "observation_type", "approval_decision",
+    "observation_type", "tool_name", "approval_decision",
     }
 if set(sanitized) != allowed_evidence_fields:
     raise SystemExit("sanitized evidence field set drifted")
@@ -1030,7 +1047,7 @@ PY
 # Query one exact ID only. Raw CLI output remains in a mode-0600 file and only
 # sanitize_exact_trace_read reaches stdout.
 query_exact_seed_trace() {
-    local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}"
+    local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}" expected_tool="${6:-}"
     local attempt code=0 private_read safe_read membership observation_count saw_valid=0
     local last_query_state="query-error"
     LAST_QUERY_MEMBERSHIP=""
@@ -1131,7 +1148,7 @@ PY
             else
                 saw_valid=1
                 last_query_state="incomplete-membership"
-                read -r membership observation_count < <(python3 - "$safe_read" "$expected_csv" "$expected_decision" <<'PY'
+                read -r membership observation_count < <(python3 - "$safe_read" "$expected_csv" "$expected_decision" "$expected_tool" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
 expected = [item for item in sys.argv[2].split(",") if item]
@@ -1141,7 +1158,10 @@ missing = [
     if not any(candidate in operations for candidate in item.split("|"))
 ]
 decision_matches = not sys.argv[3] or value["approval_decision"] == sys.argv[3]
-membership = value["observation_count"] > 0 and not missing and decision_matches
+# Fail closed on identity: checked against the sanitized tool_name projection,
+# never a raw private read, so a surviving unrelated tool cannot stand in.
+tool_matches = not sys.argv[4] or sys.argv[4] in value["tool_name"]
+membership = value["observation_count"] > 0 and not missing and decision_matches and tool_matches
 print("true" if membership else "false", value["observation_count"])
 PY
                 )
@@ -1175,7 +1195,7 @@ PY
 import json, sys
 print(json.dumps({
     "trace_id": sys.argv[1], "service": [], "operation": [],
-    "observation_count": 0, "observation_type": [],
+    "observation_count": 0, "observation_type": [], "tool_name": [],
     "approval_decision": None,
 }, sort_keys=True, separators=(",", ":")))
 PY
@@ -1267,9 +1287,12 @@ seed_mcp_read_turn() {
 seed_coding_tool_turn() {
     local tier="$1" agent_id="${2:-}" query_state="${3:-present}" marker="curie-seed-coding-$$-$RANDOM"
     local stream_start stream_end out reply trace_id
-    # 10007 * 10009. Fixed primes, so the product is a literal the ladder knows
-    # up front and the model cannot plausibly emit without running the tool.
-    local expected_receipt="100160063"
+    local expected_receipt
+    # A fixed arithmetic product is model-computable, and a DENIED tool call
+    # still emits its span, so that receipt witnessed neither execution nor
+    # success. The sha256 of this run's own random marker is not derivable
+    # without actually running the tool.
+    expected_receipt="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$marker")" || return 1
     if [[ "$LIVE" != "1" || -z "$agent_id" || -z "$marker" ]]; then
         echo "seed-invalid: built-in coding seed needs live mode, a deployed agent, and a marker before telemetry" >&2
         return 1
@@ -1280,11 +1303,11 @@ seed_coding_tool_turn() {
     fi
     stream_start="$(capture_stream_cursor "$tier")" || return 1
     out="$("$BIN" --json local message --channel C0LOCALDEV \
-        "Use the built-in Bash tool exactly once to run: python3 -c 'print(10007 * 10009)'. Then reply with the exact number it printed. $marker" || true)"
+        "Use the built-in Bash tool exactly once to run: python3 -c \"import hashlib;print(hashlib.sha256(b'$marker').hexdigest())\". Then reply with the exact digest it printed. $marker" || true)"
     assert_finalized_reply "$tier built-in coding correlation" "$out"
     # Independent of telemetry: a built-in tool has no hosted container to log a
-    # receipt, so the computed product in the finalized reply is the proof that
-    # the tool really ran.
+    # receipt, so the sha256 digest in the finalized reply is the proof that the
+    # tool really ran and succeeded.
     reply="$(printf '%s' "$out" | python3 -c '
 import json, sys
 try:
@@ -1300,7 +1323,7 @@ print(d.get("reply", "") if isinstance(d, dict) else "")
     echo "built-in coding receipt present in reply"
     stream_end="$(capture_stream_cursor "$tier")" || return 1
     trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
-    query_exact_seed_trace "$tier" "$trace_id" "execute_tool" "" "$query_state"
+    query_exact_seed_trace "$tier" "$trace_id" "execute_tool" "" "$query_state" "Bash"
     LAST_CODING_TRACE_ID="$trace_id"
     LAST_CODING_MEMBERSHIP="$LAST_QUERY_MEMBERSHIP"
     printf '%s' "$trace_id"
