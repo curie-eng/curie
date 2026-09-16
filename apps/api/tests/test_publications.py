@@ -1172,10 +1172,14 @@ def test_publication_card_outbox_dead_letters_to_terminal_result(
         try:
             first = await store.claim_pending_card()
             assert first is not None
-            await store.retry_card_delivery(first.publication_id, error="Slack unavailable")
+            await store.retry_card_delivery(
+                first.publication_id, error="Slack unavailable", permanent=False
+            )
             second = await store.claim_pending_card()
             assert second is not None
-            await store.retry_card_delivery(second.publication_id, error="Slack unavailable")
+            await store.retry_card_delivery(
+                second.publication_id, error="Slack unavailable", permanent=False
+            )
             cleanup = await store.claim_pending_cleanup()
             assert cleanup is not None
             await store.mark_cleanup_completed(cleanup.publication_id)
@@ -1201,6 +1205,208 @@ def test_publication_card_outbox_dead_letters_to_terminal_result(
         "dead_lettered": True,
         "approval_status": "expired",
     }
+
+
+def test_cluster_message_publication_card_claim_carries_the_session_reply_ref(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#2720: the card outbox must address the cluster-message reply bucket.
+
+    The relay refuses any ``reply.post`` without the session's UUIDv4 ref, so a
+    claim that drops the stored placeholder can never be delivered. A Slack card
+    is the secondary path: it still posts a fresh thread message with no ref.
+    """
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    reply_ref = str(uuid.uuid4())
+    relay_payload = _publication_payload(
+        deployment["id"], dedupe_key="event-card-cluster-message"
+    )
+    relay_payload.update(
+        reply_placeholder=reply_ref,
+        reply_endpoint=None,
+        reply_adapter=CLUSTER_MESSAGE_ADAPTER,
+    )
+    relay_status, relay = _create_publication(client, relay_payload)
+    assert relay_status == 201
+    slack_status, slack = _create_publication(
+        client,
+        _publication_payload(deployment["id"], dedupe_key="event-card-slack"),
+    )
+    assert slack_status == 201
+
+    async def claim_both() -> dict[str, Any]:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="card-reply-ref-test"
+        )
+        try:
+            claimed = {}
+            for _ in range(2):
+                work = await store.claim_pending_card()
+                assert work is not None
+                claimed[str(work.publication_id)] = work
+            return claimed
+        finally:
+            await engine.dispose()
+
+    claimed = asyncio.run(claim_both())
+    relay_card = claimed[relay["id"]]
+    assert relay_card.route.adapter == CLUSTER_MESSAGE_ADAPTER
+    assert relay_card.target.reply_ref == reply_ref
+    assert claimed[slack["id"]].target.reply_ref is None
+
+
+@pytest.mark.parametrize(
+    ("case", "relay_status", "expected"),
+    [
+        (
+            "delivered",
+            200,
+            {
+                "raised": [None],
+                "relay_posts": 1,
+                "status": "pending",
+                "approval_card_delivery_attempts": 0,
+                "reported": True,
+                "dead_lettered": False,
+                "approval_status": "pending",
+            },
+        ),
+        (
+            "unaddressable",
+            200,
+            {
+                "raised": ["InvalidReplyTargetError"],
+                "relay_posts": 0,
+                "status": "failed",
+                "approval_card_delivery_attempts": 1,
+                "reported": False,
+                "dead_lettered": True,
+                "approval_status": "expired",
+            },
+        ),
+        (
+            "relay_outage",
+            503,
+            {
+                "raised": ["RejectedAdapterResponseError", "RejectedAdapterResponseError"],
+                "relay_posts": 2,
+                "status": "failed",
+                "approval_card_delivery_attempts": 2,
+                "reported": False,
+                "dead_lettered": True,
+                "approval_status": "expired",
+            },
+        ),
+    ],
+)
+def test_cluster_message_publication_card_consumer_is_delivered_or_bounded(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    case: str,
+    relay_status: int,
+    expected: dict[str, Any],
+) -> None:
+    """#2720: the worker card consumer on the cluster-message relay route.
+
+    A persisted publication is claimed by the real store and delivered by the
+    real reconciler through the worker's real reply sink. Success lands the card
+    in the session's relay bucket; an unaddressable target dead-letters on its
+    first attempt; a relay outage retries only up to the cap. Every failure ends
+    in a durable failed publication and an expired approval, never a hot loop.
+    """
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from curie_worker.approval_cards import ApprovalCardStore
+    from curie_worker.config import WorkerConfig
+    from curie_worker.publication_loop import PublicationReconciler
+    from curie_worker.publication_store import PostgresPublicationStore
+    from curie_worker.reply_sink import build_reply_sink
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    reply_ref = str(uuid.uuid4())
+    payload = _publication_payload(deployment["id"], dedupe_key=f"event-card-{case}")
+    payload.update(
+        # A relay route with no session ref is accepted by the API, so the
+        # worker must terminalize it rather than retry an impossible post.
+        reply_placeholder=None if case == "unaddressable" else reply_ref,
+        reply_endpoint=None,
+        reply_adapter=CLUSTER_MESSAGE_ADAPTER,
+    )
+    status_code, publication = _create_publication(client, payload)
+    assert status_code == 201
+
+    relay_posts: list[str] = []
+
+    async def relay(request: web.Request) -> web.Response:
+        relay_posts.append(request.match_info["reply_ref"])
+        if relay_status != 200:
+            return web.Response(status=relay_status)
+        return web.json_response({"ref": request.match_info["reply_ref"]})
+
+    async def consume() -> list[str | None]:
+        app = web.Application()
+        app.add_routes(
+            [web.post("/v1/internal/cluster-message-replies/{reply_ref}", relay)]
+        )
+        server = TestServer(app)
+        await server.start_server()
+        config = WorkerConfig(
+            api_base_url=f"http://127.0.0.1:{server.port}",
+            internal_worker_token=WORKER_TOKEN,
+        )
+        engine = create_async_engine(get_settings().database_url)
+        valkey = aioredis.from_url(get_settings().valkey_dsn())
+        sink = build_reply_sink(config)
+        reconciler = PublicationReconciler(
+            store=PostgresPublicationStore(
+                engine,
+                schema="curie",
+                lease_owner=f"card-consumer-{case}",
+                result_max_attempts=2,
+            ),
+            credentials=None,
+            cluster=None,
+            github=None,
+            replies=sink,
+            job_settings=None,  # type: ignore[arg-type]
+            card_store=ApprovalCardStore(valkey, config),
+        )
+        raised: list[str | None] = []
+        try:
+            for _ in range(3):
+                try:
+                    if not await reconciler.deliver_pending_card():
+                        break
+                    raised.append(None)
+                except Exception as exc:
+                    raised.append(type(exc).__name__)
+        finally:
+            await sink.aclose()
+            await valkey.aclose()
+            await engine.dispose()
+            await server.close()
+        return raised
+
+    raised = asyncio.run(consume())
+    stored = _rows(
+        "SELECT p.status, p.approval_card_delivery_attempts, "
+        "p.approval_card_reported_at IS NOT NULL AS reported, "
+        "p.approval_card_delivery_dead_lettered_at IS NOT NULL AS dead_lettered, "
+        "a.status AS approval_status "
+        "FROM curie.publications p JOIN curie.approvals a ON a.id = p.approval_id "
+        "WHERE p.id = :id",
+        {"id": publication["id"]},
+    )[0]
+    assert {"raised": raised, "relay_posts": len(relay_posts), **stored} == expected
+    assert set(relay_posts) <= {reply_ref}
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -1491,7 +1697,9 @@ def test_claimed_card_then_denied_waits_for_adoption_without_status_overwrite(
                 )
             adopted = await store.claim_pending_card()
             assert adopted is not None
-            await store.retry_card_delivery(adopted.publication_id, error="post uncertain")
+            await store.retry_card_delivery(
+                adopted.publication_id, error="post uncertain", permanent=False
+            )
             result = await store.pending_result(adopted.publication_id)
             assert result is not None
             return result.outcome
@@ -1555,7 +1763,9 @@ def test_claimed_card_then_expired_waits_for_adoption_without_status_overwrite(
                 )
             adopted = await store.claim_pending_card()
             assert adopted is not None
-            await store.retry_card_delivery(adopted.publication_id, error="post uncertain")
+            await store.retry_card_delivery(
+                adopted.publication_id, error="post uncertain", permanent=False
+            )
             result = await store.pending_result(adopted.publication_id)
             assert result is not None
             return result.outcome

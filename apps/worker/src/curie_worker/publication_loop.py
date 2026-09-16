@@ -30,7 +30,7 @@ from .publication_k8s import (
     deterministic_publication_branch,
     publication_resource_names,
 )
-from .reply_sink import ReplySink, TargetRoute
+from .reply_sink import InvalidReplyTargetError, ReplySink, TargetRoute
 
 _PR_MARKER = re.compile(r"^CURIE_PR_URL=(https://github\.com/[^\s]+/pull/\d+)$", re.MULTILINE)
 _PR_NUMBER_MARKER = re.compile(r"^CURIE_PR_NUMBER=([1-9][0-9]*)$", re.MULTILINE)
@@ -107,7 +107,7 @@ class PublicationStore(Protocol):
     ) -> None | Awaitable[None]: ...
 
     def retry_card_delivery(
-        self, publication_id: uuid.UUID, *, error: str
+        self, publication_id: uuid.UUID, *, error: str, permanent: bool
     ) -> None | Awaitable[None]: ...
 
     def claim_pending_cleanup(self) -> Any: ...
@@ -325,7 +325,9 @@ class PublicationReconciler:
         if self._card_store is None:
             error = "durable approval-card reference storage is unavailable"
             await _resolve(
-                self._store.retry_card_delivery(work.publication_id, error=error)
+                self._store.retry_card_delivery(
+                    work.publication_id, error=error, permanent=False
+                )
             )
             raise PublicationReconcileError(error)
         try:
@@ -374,7 +376,13 @@ class PublicationReconciler:
         except Exception as exc:
             error = str(exc)[:2000] or type(exc).__name__
             await _resolve(
-                self._store.retry_card_delivery(work.publication_id, error=error)
+                self._store.retry_card_delivery(
+                    work.publication_id,
+                    error=error,
+                    # An unaddressable reply target is refused before any
+                    # transport attempt and fails identically on every retry.
+                    permanent=isinstance(exc, InvalidReplyTargetError),
+                )
             )
             raise
         await _resolve(self._store.mark_card_delivered(work.publication_id))
