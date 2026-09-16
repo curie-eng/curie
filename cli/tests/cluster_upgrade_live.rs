@@ -623,11 +623,20 @@ fn assert_only_consumed_chart(fixture: &Fixture, expected: &str, context: &str) 
 /// target archive is deliberately preseeded because this recording fixture is
 /// offline; the build-stamped release-binary run remains separate acceptance
 /// evidence. Running outside the checkout ensures the old literal fallback
-/// cannot accidentally resolve to a real local chart.
+/// cannot accidentally resolve to a real local chart. The target must differ
+/// from the running CLI version so this test can distinguish target keyed cache
+/// resolution from CLI version keyed resolution.
 #[test]
 fn release_channel_default_uses_target_chart_cache_outside_checkout() {
+    const TO: &str = "0.8.9";
+
+    assert_ne!(
+        TO,
+        env!("CARGO_PKG_VERSION"),
+        "the target must differ from the running CLI version"
+    );
     let fixture = Fixture::new(None);
-    let target = fixture.target_chart_cache("0.9.0");
+    let target = fixture.target_chart_cache(TO);
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(
         &target,
@@ -636,7 +645,7 @@ fn release_channel_default_uses_target_chart_cache_outside_checkout() {
     .unwrap();
 
     let output =
-        fixture.run_without_chart_with("schema-compatible", "0.9.0", fixture.0.path(), true, &[]);
+        fixture.run_without_chart_with("release-cache-prior", TO, fixture.0.path(), true, &[]);
     assert!(
         output.status.success(),
         "preseeded target archive must complete the recording fixture: {} / {}",
