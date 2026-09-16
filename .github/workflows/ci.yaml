@@ -2568,10 +2568,184 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade 2>/dev/null || true
 
+  # Always-on next-train `cluster upgrade` matrix (#2590). Not path-filtered.
+  # Skipped on other trains so e2e-required can require skipped there.
+  e2e-cluster-upgrade-matrix:
+    name: E2E cluster upgrade matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    needs: [rust-build]
+    if: ${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Download the candidate curie binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the candidate binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: matrixcache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the candidate api image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          builder: ${{ steps.matrixcache.outputs.name }}
+          tags: curie-api:matrix-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-api
+          cache-to: type=gha,mode=max,scope=ladder-api
+      - name: Build the candidate dispatcher image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/dispatcher/Dockerfile
+          builder: ${{ steps.matrixcache.outputs.name }}
+          tags: curie-dispatcher:matrix-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-dispatcher
+          cache-to: type=gha,mode=max,scope=ladder-dispatcher
+      - name: Build the candidate worker image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/worker/Dockerfile
+          builder: ${{ steps.matrixcache.outputs.name }}
+          tags: curie-worker:matrix-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-worker
+          cache-to: type=gha,mode=max,scope=ladder-worker
+      - name: Build the candidate ui image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/ui/Dockerfile
+          builder: ${{ steps.matrixcache.outputs.name }}
+          tags: curie-ui:matrix-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-ui
+          cache-to: type=gha,mode=max,scope=ladder-ui
+      - name: Build the candidate runner image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: runner/Dockerfile
+          builder: ${{ steps.matrixcache.outputs.name }}
+          tags: curie-runner:matrix-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-runner
+          cache-to: type=gha,mode=max,scope=ladder-runner
+      - name: Write the kind cluster config
+        run: |
+          cat > kind-upgrade-matrix-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          networking:
+            disableDefaultCNI: true
+            podSubnet: "192.168.0.0/16"
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - containerPort: 30080
+                  hostPort: 30082
+                  listenAddress: "127.0.0.1"
+                  protocol: TCP
+          EOF
+      - name: Create the disposable kind cluster
+        id: create_kind_cluster
+        continue-on-error: true
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          cluster_name: curie-upgrade-matrix
+          config: kind-upgrade-matrix-config.yaml
+      - name: Back off before retrying Create the disposable kind cluster
+        if: steps.create_kind_cluster.outcome == 'failure'
+        run: |
+          echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
+          sleep 15
+      - name: Create the disposable kind cluster (retry)
+        if: steps.create_kind_cluster.outcome == 'failure'
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          cluster_name: curie-upgrade-matrix
+          config: kind-upgrade-matrix-config.yaml
+      - name: Install Calico so NetworkPolicy is enforced
+        run: |
+          set -euo pipefail
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
+          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
+          kubectl wait --for=condition=Ready node --all --timeout=300s
+      - name: Load candidate images into the kind cluster
+        run: |
+          set -euo pipefail
+          for image in \
+            curie-api:matrix-candidate \
+            curie-dispatcher:matrix-candidate \
+            curie-worker:matrix-candidate \
+            curie-ui:matrix-candidate \
+            curie-runner:matrix-candidate; do
+            kind load docker-image "$image" --name curie-upgrade-matrix
+          done
+      - name: Run the cluster upgrade matrix
+        env:
+          CURIE_BIN: cli/target/release/curie
+          CURIE_E2E_CANDIDATE_TAG: matrix-candidate
+          CURIE_E2E_KIND_CLUSTER: curie-upgrade-matrix
+        run: |
+          set -euo pipefail
+          if [[ -n "${KUBECONFIG:-}" ]]; then
+            export CURIE_E2E_KUBECONFIG="$KUBECONFIG"
+          fi
+          bash cli/scripts/cluster-upgrade-matrix.sh --scenario all --json
+      - name: Dump cluster upgrade matrix diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get events -n acme-2590 --sort-by=.lastTimestamp | tail -50 || true
+          kubectl logs -n acme-2590 deploy/t2590-curie-api --tail=100 || true
+          ls -la .projects/2590-evidence 2>/dev/null || true
+          tail -c 4000 .projects/2590-evidence/last-upgrade.json 2>/dev/null || true
+          tail -c 2000 .projects/2590-evidence/last-upgrade.err 2>/dev/null || true
+          tail -c 2000 .projects/2590-evidence/compatible-rollback.json 2>/dev/null || true
+          tail -c 1000 .projects/2590-evidence/compatible-rollback.err 2>/dev/null || true
+          tail -c 2000 .projects/2590-evidence/rollback-088.json 2>/dev/null || true
+          tail -c 1000 .projects/2590-evidence/rollback-088.err 2>/dev/null || true
+      - name: Tear down the owned upgrade matrix cluster
+        if: always()
+        run: |
+          kubectl delete namespace acme-2590 --ignore-not-found --wait=false 2>/dev/null || true
+          kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
+
   e2e-required:
     name: E2E required
     runs-on: ubuntu-latest
-    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-released-upgrade]
+    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-released-upgrade, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -2589,6 +2763,8 @@ jobs:
           LOCAL_RELEASE_RESULT: ${{ needs.e2e-ladder-release.result }}
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
           RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
+          UPGRADE_MATRIX_RESULT: ${{ needs.e2e-cluster-upgrade-matrix.result }}
+          IS_NEXT_TRAIN: ${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}
         run: |
           set -euo pipefail
 
@@ -2596,7 +2772,8 @@ jobs:
             if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
                   "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
                   "$CLUSTER_RESULT" != "$cluster_expected" ||
-                  "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ]]; then
+                  "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
+                  "$UPGRADE_MATRIX_RESULT" != "$upgrade_matrix_expected" ]]; then
               return 1
             fi
             return 0
@@ -2628,6 +2805,10 @@ jobs:
           if [[ "$RELEASED_UPGRADE_SELECTED" == "true" ]]; then
             released_upgrade_expected="success"
           fi
+          upgrade_matrix_expected="skipped"
+          if [[ "$IS_NEXT_TRAIN" == "true" ]]; then
+            upgrade_matrix_expected="success"
+          fi
 
           if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
@@ -2638,6 +2819,7 @@ jobs:
           negative_local_release_result="$local_release_expected"
           negative_cluster_result="$cluster_expected"
           negative_released_upgrade_result="$released_upgrade_expected"
+          negative_upgrade_matrix_result="$upgrade_matrix_expected"
           if [[ "$skill_local_expected" == "success" ]]; then
             negative_skill_local_result="skipped"
           elif [[ "$local_release_expected" == "success" ]]; then
@@ -2646,6 +2828,8 @@ jobs:
             negative_cluster_result="skipped"
           elif [[ "$released_upgrade_expected" == "success" ]]; then
             negative_released_upgrade_result="skipped"
+          elif [[ "$upgrade_matrix_expected" == "success" ]]; then
+            negative_upgrade_matrix_result="skipped"
           else
             negative_skill_local_result="success"
           fi
@@ -2654,6 +2838,7 @@ jobs:
             LOCAL_RELEASE_RESULT="$negative_local_release_result" \
             CLUSTER_RESULT="$negative_cluster_result" \
             RELEASED_UPGRADE_RESULT="$negative_released_upgrade_result" \
+            UPGRADE_MATRIX_RESULT="$negative_upgrade_matrix_result" \
             validate_selected_outcomes; then
             echo "Selected and skipped negative control failed" >&2
             exit 1

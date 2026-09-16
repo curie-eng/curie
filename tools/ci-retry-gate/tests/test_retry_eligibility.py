@@ -46,6 +46,7 @@ RETRY_ALLOWLIST = frozenset(
         ("ci.yaml", "python", "Install uv"),
         ("ci.yaml", "fix-pin", "Install uv"),
         ("ci.yaml", "e2e-ladder-cluster", "Create the kind cluster"),
+        ("ci.yaml", "e2e-cluster-upgrade-matrix", "Create the disposable kind cluster"),
         ("xdist-characterise.yaml", "attempt", "Install uv"),
         ("xdist-characterise.yaml", "aggregate", "Install uv"),
         ("dependency-audit.yaml", "python-audit", "Install uv"),
