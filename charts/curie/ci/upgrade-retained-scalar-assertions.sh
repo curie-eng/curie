@@ -27,11 +27,12 @@
 #     `merge_forward_only`). A unit round trip through the Rust types cannot
 #     see this bug, because the bug is in what the bytes mean to the NEXT
 #     reader.
-#   * the captured bytes are read back by the two YAML 1.1 parsers that
-#     actually matter: real `helm`, rendering the chart and asked whether
-#     gVisor is still off, and PyYAML's `safe_load`, asked whether the scalar
-#     is still the string "off". Reading it back with a YAML 1.2 parser would
-#     agree with the writer and prove nothing.
+#   * the captured bytes are read back by real `helm` -- the YAML 1.1 parser
+#     whose opinion actually ships -- asked both whether gVisor is still off
+#     and what the two fixture env scalars rendered as. Reading it back with a
+#     YAML 1.2 parser would agree with the writer and prove nothing, and
+#     PyYAML is only a SECONDARY reader here: its implicit resolver does not
+#     treat a bare `y`/`n` as a boolean, so it cannot see the whole class.
 #
 # `helm`/`kubectl` are the recording stubs `cli/tests/data/upgrade-driver.py`
 # already provides for `cluster_upgrade_live.rs`, so the run is offline and
@@ -145,7 +146,73 @@ assert_captures() {
       fi
     done
 
-    # --- PyYAML, a second independent YAML 1.1 reader ------------------------
+    # --- real Helm again, this time on the two fixture env scalars -----------
+    # The gVisor signals above only cover security.gvisor.mode. The other two
+    # boolean words have to be read back through Helm as well, because PyYAML
+    # is NOT a faithful stand-in for Helm's YAML 1.1: PyYAML's implicit
+    # resolver accepts yes/no/on/off/true/false but NOT a bare `y` or `n`,
+    # while Helm's Go parser resolves both. A capture carrying `value: n`
+    # therefore passes every PyYAML check below while Helm renders
+    # CURIE_FIXTURE_SHORT as the boolean false. Do not simplify this away.
+    #
+    # The observable is the rendered manifest: `curie.extraEnv` toYaml's the
+    # list, so a value Helm read as a boolean comes out as an unquoted
+    # `value: false` while a string comes out quoted. Helm quotes every
+    # boolean-shaped string it emits, so reading its OWN output back with
+    # PyYAML is unambiguous -- the ambiguity only exists on the input side.
+    python3 - "$label" "$capture" "$rendered" <<'PY'
+import sys
+
+import yaml
+
+label, capture, rendered = sys.argv[1], sys.argv[2], sys.argv[3]
+expected = {"CURIE_FIXTURE_FLAG": "yes", "CURIE_FIXTURE_SHORT": "n"}
+
+seen = {}
+for doc in yaml.safe_load_all(open(rendered)):
+    if not isinstance(doc, dict):
+        continue
+    stack = [doc]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            name = node.get("name")
+            if name in expected and "value" in node:
+                seen[name] = node["value"]
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+
+failures = []
+for name, want in expected.items():
+    if name not in seen:
+        failures.append(
+            f"{name} never reached the rendered manifest, so Helm was never "
+            f"asked what its value means"
+        )
+        continue
+    value = seen[name]
+    if not isinstance(value, str) or value != want:
+        failures.append(
+            f"{name} rendered as {value!r} ({type(value).__name__}), expected "
+            f"the string {want!r}: Helm's YAML 1.1 parser resolved the "
+            f"unquoted scalar in the retained overlay to a boolean"
+        )
+
+if failures:
+    print(f"FAIL: {label}: helm rendered {capture} with corrupted env scalars", file=sys.stderr)
+    for failure in failures:
+        print("  " + failure, file=sys.stderr)
+    print("  the captured document was:", file=sys.stderr)
+    for line in open(capture).read().splitlines():
+        print("    " + line, file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+    # --- PyYAML, a secondary reading of the captured bytes -------------------
+    # Kept for the structural checks (key presence, the --forward-only marker)
+    # and as a second opinion on the scalars it CAN resolve. It is not the
+    # authority: see the `y`/`n` divergence above.
     python3 - "$label" "$capture" "$@" <<'PY'
 import sys
 

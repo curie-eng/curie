@@ -39,6 +39,15 @@ on:
       # (#2190) both read compose.dev.yaml to check third-party image tags,
       # so a compose-only edit that unpins one must run this workflow too.
       - "compose.dev.yaml"
+      # Third obligation, and the one this gate exists for (#2741): the
+      # retained-values scalar gate below BUILDS AND EXECUTES the real CLI
+      # against the recorded upgrade boundary, so its subject is Rust and its
+      # driver is a Python stub -- neither of them under charts/. Without these
+      # entries, a PR that reverts the JSON re-serializer and puts the YAML 1.2
+      # emitter back matches nothing in this filter, the helm job is skipped,
+      # and the gate that exists to catch exactly that revert never runs.
+      - "cli/src/ops/upgrade.rs"
+      - "cli/tests/data/upgrade-driver.py"
 
 permissions:
   contents: read
