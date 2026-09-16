@@ -314,3 +314,193 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         "supported 0.9.1 to 0.9.0 rollback must retain the sentinel and catalogued Alembic head"
     );
 }
+
+fn run_script(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new("bash");
+    cmd.arg(script()).args(args).current_dir(repo_root());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run cluster-upgrade-matrix")
+}
+
+fn bash_array_from_script(name: &str) -> Vec<String> {
+    let source = fs::read_to_string(script()).expect("read cluster upgrade matrix");
+    let body = source
+        .split_once(&format!("\n{name}=("))
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("script must define array {name}"));
+    body.split_whitespace().map(str::to_owned).collect()
+}
+
+const PHASED: [&str; 2] = ["fail-every-phase", "interrupt-resume"];
+
+#[test]
+fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
+    let output = run_script(&["--list-shards", "--json"], &[]);
+    assert!(
+        output.status.success(),
+        "--list-shards --json failed\n{}",
+        output_text(&output)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--list-shards --json must emit JSON");
+    let shards = manifest["shards"].as_array().expect("shards array");
+    let ids: Vec<&str> = shards
+        .iter()
+        .map(|s| s["id"].as_str().expect("shard id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11"],
+        "canonical shard ids\n{manifest}"
+    );
+
+    let mut unsplit: Vec<String> = Vec::new();
+    let mut phases: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for shard in shards {
+        let id = shard["id"].as_str().unwrap();
+        let setup = shard["setup"].as_bool().expect("shard setup flag");
+        assert_eq!(setup, !matches!(id, "s01" | "s10"), "setup flag wrong for {id}");
+        for item in shard["scenarios"].as_array().expect("scenarios array") {
+            let name = item["name"].as_str().expect("scenario name").to_owned();
+            if PHASED.contains(&name.as_str()) {
+                let list = item["phases"].as_array().unwrap_or_else(|| {
+                    panic!("phased scenario {name} in {id} must be split by phase")
+                });
+                assert!(!list.is_empty(), "{name} in {id} has no phases");
+                phases
+                    .entry(name)
+                    .or_default()
+                    .extend(list.iter().map(|p| p.as_str().expect("phase").to_owned()));
+            } else {
+                assert!(item["phases"].is_null(), "{name} in {id} must have phases null");
+                unsplit.push(name);
+            }
+        }
+    }
+
+    let mut matrix_phases = bash_array_from_script("MATRIX_PHASES");
+    assert_eq!(
+        matrix_phases,
+        ["plan", "validate", "drain", "checkpoint", "migrate", "apply", "converge", "canary", "commit"]
+    );
+    matrix_phases.sort();
+    for name in PHASED {
+        let mut got = phases.get(name).cloned().unwrap_or_default();
+        got.sort();
+        assert_eq!(got, matrix_phases, "{name} phases must cover MATRIX_PHASES once each");
+    }
+
+    let mut expected: Vec<String> = bash_array_from_script("SCENARIOS_ALL")
+        .into_iter()
+        .filter(|s| !PHASED.contains(&s.as_str()))
+        .collect();
+    expected.sort();
+    unsplit.sort();
+    assert_eq!(unsplit, expected, "non-phased scenarios must each appear once");
+}
+
+#[test]
+fn self_test_checks_shard_coverage_and_timing() {
+    let output = run_script(&["--self-test"], &[]);
+    let text = output_text(&output);
+    assert!(output.status.success(), "self-test failed\n{text}");
+    for needle in [
+        "shard manifest covers every scenario exactly once",
+        "shard coverage refused a dropped scenario",
+        "shard coverage refused a duplicated scenario",
+        "shard coverage refused a dropped phase",
+        "shard coverage refused a duplicated phase",
+        "per-scenario timing recorded",
+    ] {
+        assert!(text.contains(needle), "self-test must print `{needle}`\n{text}");
+    }
+    let source = fs::read_to_string(script()).expect("read script");
+    assert!(
+        source.contains("phases=") && source.contains("elapsed_seconds="),
+        "timing log line must carry phases and elapsed_seconds"
+    );
+}
+
+const GOOD_SHARDS: &str = "s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version
+s02 setup fail-every-phase:plan+validate+drain+checkpoint+migrate+apply+converge
+s03 setup fail-every-phase:canary+commit
+s04 setup interrupt-resume:plan+validate
+s05 setup interrupt-resume:drain+checkpoint
+s06 setup interrupt-resume:migrate+apply
+s07 setup interrupt-resume:converge+canary
+s08 setup interrupt-resume:commit
+s09 setup n-to-n1 compatible-rollback rollback-published-088
+s10 nosetup rollback-published-089 migration-crash
+s11 setup converge-negative previous-serves";
+
+fn assert_override_refused(manifest: &str, what: &str) {
+    assert_ne!(manifest, GOOD_SHARDS, "fixture for {what} must differ from the good manifest");
+    let output = run_script(&["--self-test"], &[("CURIE_E2E_SHARDS_OVERRIDE", manifest)]);
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{what} must fail self-test\n{text}");
+    assert!(text.contains("shard coverage failed"), "{what}\n{text}");
+}
+
+#[test]
+fn good_override_passes_self_test() {
+    let output = run_script(&["--self-test"], &[("CURIE_E2E_SHARDS_OVERRIDE", GOOD_SHARDS)]);
+    let text = output_text(&output);
+    assert!(output.status.success(), "canonical override must pass\n{text}");
+    assert!(text.contains("shard manifest covers every scenario exactly once"), "{text}");
+}
+
+#[test]
+fn self_test_fails_when_override_drops_a_scenario() {
+    assert_override_refused(&GOOD_SHARDS.replace(" migration-crash", ""), "dropped scenario");
+}
+
+#[test]
+fn self_test_fails_when_override_duplicates_a_scenario() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("s10 nosetup rollback-published-089", "s10 nosetup rollback-published-089 fresh-n"),
+        "duplicated scenario",
+    );
+}
+
+#[test]
+fn self_test_fails_when_override_drops_a_phase() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("interrupt-resume:converge+canary", "interrupt-resume:converge"),
+        "dropped phase",
+    );
+}
+
+#[test]
+fn self_test_fails_when_override_duplicates_a_phase() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("fail-every-phase:canary+commit", "fail-every-phase:canary+commit+plan"),
+        "duplicated phase",
+    );
+}
+
+#[test]
+fn self_test_fails_when_override_runs_phased_scenario_unsplit() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("s08 setup interrupt-resume:commit", "s08 setup interrupt-resume:commit\ns12 setup interrupt-resume"),
+        "unsplit phased scenario",
+    );
+}
+
+#[test]
+fn unknown_shard_is_refused() {
+    let output = run_script(&["--shard", "nope"], &[]);
+    let text = output_text(&output);
+    assert!(!output.status.success(), "unknown shard must fail\n{text}");
+    assert!(text.contains("unknown shard"), "{text}");
+}
+
+#[test]
+fn shard_and_scenario_together_are_refused() {
+    let output = run_script(&["--shard", "s01", "--scenario", "fresh-n"], &[]);
+    let text = output_text(&output);
+    assert!(!output.status.success(), "--shard with --scenario must fail\n{text}");
+    assert!(text.contains("--shard and --scenario"), "{text}");
+}
