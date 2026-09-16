@@ -128,7 +128,9 @@ pub fn pin_file_path(temp_dir: &Path, uid: u32, context: &str) -> PathBuf {
 
 fn current_uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
+    // `/proc/self` is Linux only; on macOS the owner of `$HOME` names the same user.
     std::fs::metadata("/proc/self")
+        .or_else(|_| std::fs::metadata(std::env::var_os("HOME").unwrap_or_default()))
         .map(|m| m.uid())
         .unwrap_or(0)
 }
@@ -209,7 +211,9 @@ pub async fn pin_for_cluster_command(explicit: Option<&str>) -> Result<Option<Ku
         home.as_deref(),
     )?;
     for (key, value) in env {
-        // SAFETY-equivalent: called once at dispatch, before any child is spawned.
+        // Called once at dispatch, before the verb spawns any helm or kubectl child and
+        // before any other task reads the environment; the only earlier child is the
+        // `kubectl config view` above, which has already exited.
         std::env::set_var(key, value);
     }
     Ok(Some(target))

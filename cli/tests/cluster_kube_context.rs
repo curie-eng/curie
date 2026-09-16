@@ -36,6 +36,12 @@ cur=""
 if [ -n "$first" ] && [ -f "$first" ]; then
   cur=$(grep -E '^current-context:' "$first" | head -n1 | sed -e 's/^current-context:[[:space:]]*//' -e 's/["'"'"']//g')
 fi
+# The pin only selects a context; the operator's kubeconfig (clusters, users,
+# exec credentials) must stay in the list behind it or real kubectl has no cluster.
+case ":${KUBECONFIG#*:}:" in
+  *":$CURIE_TEST_ORIGINAL_KUBECONFIG:"*) ;;
+  *) cur="original-kubeconfig-dropped" ;;
+esac
 "#;
 
 fn install_fakes(bin_dir: &Path, log: &Path) {
@@ -106,6 +112,7 @@ fn run_curie(args: &[&str], ambient_helm_ctx: Option<&str>) -> Run {
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("HOME", &home)
         .env("KUBECONFIG", &kubeconfig)
+        .env("CURIE_TEST_ORIGINAL_KUBECONFIG", &kubeconfig)
         .env("TMPDIR", tmp.path())
         .env_remove("HELM_KUBECONTEXT");
     if let Some(ctx) = ambient_helm_ctx {

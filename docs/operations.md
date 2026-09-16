@@ -31,12 +31,11 @@ pod; if `cluster message` can't auto-detect a pod-reachable host, pass
 `--listen-host` explicitly (see `cli/README.md`).
 
 **For production**, you'll likely point at a managed or self-hosted cluster
-instead. Curie has no cluster-selection flag of its own -- every `cluster`
-command just uses whatever `kubectl` and `helm` are already pointed at, so
-switch clusters the normal `kubectl` way:
+instead. Name it on every `cluster` command with `--context` (see below), so a
+stale kubeconfig current-context cannot send a command at the wrong cluster:
 
 ```bash
-kubectl config use-context <your-production-context>
+curie cluster status --context <your-production-context>
 ```
 
 ## Installing and inspecting the Curie platform on the cluster
