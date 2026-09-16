@@ -163,6 +163,8 @@ BASE = {
 
 SCENARIOS = {
     "healthy": {},
+    # Keep the release cache target distinct from the running CLI version so
+    # the resolver test can prove that --to owns the cache key.
     "release-cache-prior": {
         "after": "0.8.9",
         "served_after": "0.8.9",
