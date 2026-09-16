@@ -50,6 +50,17 @@ const UPGRADE_TOOL: &str = "self-upgrade/upgrade_self";
 const PLATFORM_UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_platform";
 const PLATFORM_UPGRADE_TOOL: &str = "self-upgrade/upgrade_platform";
 const LATEST_RELEASE_TOOL: &str = "self-upgrade/latest_release";
+// The six Kubernetes mutation verbs. These are always present in the shipped
+// bundle (unlike self-upgrade), so their gates are never stripped by this
+// transform -- only the self-upgrade gates come and go with upgrade_enabled.
+const KUBERNETES_MUTATION_TOOLS: &[&str] = &[
+    "pods_delete",
+    "pods_exec",
+    "pods_run",
+    "resources_create_or_update",
+    "resources_delete",
+    "resources_scale",
+];
 // The platform-upgrade objects this installer renders. Names are fixed rather
 // than configurable: the connector is told the CronJob's name through its own
 // env, and two places free to disagree is how a tool ends up refusing every call
@@ -1993,14 +2004,19 @@ fn is_self_upgrade_policy_entry(entry: &serde_json::Value) -> bool {
 fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u8>> {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(source).context("parsing embedded SRE bot plugin.json")?;
-    // Pinned, not merely present. The Kubernetes tool policy remains intact;
-    // approvalPolicy only governs the optional self-upgrade connector.
-    let expected_policy = serde_json::json!({
-        "gates": [
-            {"gate": UPGRADE_GATE, "route": "sre-approvals"},
-            {"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}
-        ]
-    });
+    // Pinned, not merely present. approvalPolicy governs both the optional
+    // self-upgrade connector and the always-present Kubernetes mutations.
+    let mut expected_gates = vec![
+        serde_json::json!({"gate": UPGRADE_GATE, "route": "sre-approvals"}),
+        serde_json::json!({"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}),
+    ];
+    for tool in KUBERNETES_MUTATION_TOOLS {
+        expected_gates.push(serde_json::json!({
+            "gate": format!("mcp__kubernetes__{tool}"),
+            "route": "sre-approvals"
+        }));
+    }
+    let expected_policy = serde_json::json!({ "gates": expected_gates });
     if manifest.get("approvalPolicy") != Some(&expected_policy) {
         bail!("embedded SRE bot must declare the exact gated write verbs");
     }
@@ -2028,25 +2044,27 @@ fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u
     }
     // Keep exactly the gates and tool-policy entries whose connectors survived.
     // Either kind of reference to a stripped connector fails bundle validation;
-    // a kept connector without both layers would bypass the intended gate.
+    // a kept connector without both layers would bypass the intended gate. The
+    // Kubernetes connector is never stripped, so its six mutation gates are
+    // always kept regardless of upgrade_enabled -- otherwise those mutations
+    // would carry route=None and no operator principal could resolve them.
     let mut kept: Vec<serde_json::Value> = Vec::new();
     if upgrade_enabled {
         kept.push(serde_json::json!({"gate": UPGRADE_GATE, "route": "sre-approvals"}));
         kept.push(serde_json::json!({"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}));
     }
-    if !kept.is_empty() {
-        // Keep exactly the gate for the connector that stayed. A gate naming a
-        // connector this install removed fails bundle validation for everyone,
-        // and a connector kept without its gate is the ungated write this whole
-        // path exists to avoid -- so the two are decided together, here, from one
-        // condition.
-        manifest.insert(
-            "approvalPolicy".to_string(),
-            serde_json::json!({"gates": kept}),
-        );
-    } else {
-        manifest.remove("approvalPolicy");
+    for tool in KUBERNETES_MUTATION_TOOLS {
+        kept.push(serde_json::json!({
+            "gate": format!("mcp__kubernetes__{tool}"),
+            "route": "sre-approvals"
+        }));
     }
+    // approvalPolicy is never removed: the Kubernetes gates above are always
+    // present, so the policy always has at least six gates.
+    manifest.insert(
+        "approvalPolicy".to_string(),
+        serde_json::json!({"gates": kept}),
+    );
     serde_json::to_vec_pretty(&manifest).context("serializing the SRE bot plugin manifest")
 }
 

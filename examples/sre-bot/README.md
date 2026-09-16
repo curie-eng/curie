@@ -73,6 +73,14 @@ curie cluster deploy --plugin-dir examples/sre-bot
 On an existing agent that already binds the route, the first deploy succeeds
 and the bind step is unnecessary.
 
+To resolve these approvals from the CLI with an operator principal, the route
+must bind an explicit user list; the channel-members default refuses operator
+principals. Bind users on the route before resolving from the CLI:
+
+```bash
+curie cluster approvals sre-bot --route-approvers sre-approvals=users:U0EXAMPLE1
+```
+
 With `--observability`, the example also installs the metrics pipeline and
 reliability alerts. Follow [METRICS-ROLLOUT.md](docs/METRICS-ROLLOUT.md) for the
 staged rollout and runtime proof; rendered configuration is evidence of wiring,
