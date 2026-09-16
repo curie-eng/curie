@@ -192,13 +192,14 @@ jobs:
       # 1315s on run 35131366084 and the long pole of every required run; a
       # 20-attempt characterisation at -n 4 (run 34542518036) finished in
       # ~400s. Isolation is per worker: apps/api provisions its database per
-      # session and the worker suite namespaces Valkey keys per test. loadfile
-      # keeps each file's tests in one process, so module fixtures and
-      # in-file ordering behave exactly as they do serially.
+      # session and the worker suite namespaces Valkey keys per test. The root
+      # conftest.py groups every test by its file, so loadgroup schedules like
+      # loadfile, and pins the files sharing unnamespaced Valkey keys or the
+      # Langfuse project to one group so they never overlap.
       - name: Pytest
         id: pytest
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: uv run pytest -q -n 4 --dist loadfile --durations=25
+        run: uv run pytest -q -n 4 --dist loadgroup --durations=25
       # Keep the required Python check honest when compose+pytest are skipped:
       # a selected skip (or an unselected success) fails this job, so the
       # ruleset still gates the suite whenever the selector asked for it.

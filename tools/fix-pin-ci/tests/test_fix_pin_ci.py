@@ -668,7 +668,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     # xdist distribution flags change where tests run, not which tests run, so
     # they are allowed alongside reporting flags. Anything else could filter.
     extra = pytest_command[4:]
-    distribution = ["-n", "4", "--dist", "loadfile"]
+    distribution = ["-n", "4", "--dist", "loadgroup"]
     if extra[: len(distribution)] == distribution:
         extra = extra[len(distribution) :]
     assert all(argument.startswith("--durations") for argument in extra), (
