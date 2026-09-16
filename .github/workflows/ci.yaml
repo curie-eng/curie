@@ -2568,14 +2568,15 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade 2>/dev/null || true
 
-  # Always-on next-train `cluster upgrade` matrix (#2590). Not path-filtered.
-  # Skipped on other trains so e2e-required can require skipped there.
+  # Temporarily disabled on every train. The serial eleven scenario matrix took
+  # more than two hours on ordinary next PRs, including documentation only
+  # release metadata. Issue #2733 owns a scalable replacement.
   e2e-cluster-upgrade-matrix:
     name: E2E cluster upgrade matrix
     runs-on: ubuntu-latest
     timeout-minutes: 180
     needs: [rust-build]
-    if: ${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}
+    if: ${{ false }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -2764,7 +2765,6 @@ jobs:
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
           RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
           UPGRADE_MATRIX_RESULT: ${{ needs.e2e-cluster-upgrade-matrix.result }}
-          IS_NEXT_TRAIN: ${{ github.base_ref == 'next' || github.ref == 'refs/heads/next' }}
         run: |
           set -euo pipefail
 
@@ -2806,9 +2806,6 @@ jobs:
             released_upgrade_expected="success"
           fi
           upgrade_matrix_expected="skipped"
-          if [[ "$IS_NEXT_TRAIN" == "true" ]]; then
-            upgrade_matrix_expected="success"
-          fi
 
           if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
