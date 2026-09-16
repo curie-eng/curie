@@ -1070,10 +1070,9 @@ class Kernel:
         # absent the kernel runs a generic sandbox (the F1 behavior); when present
         # it resolves channel -> agent -> bundle/budget and gates killed agents.
         self._binding = binding
-        # The trusted repository preparation lane.  It is optional for generic
-        # and legacy deployments, but a deployment that declares a workspace
-        # fails loudly if this lane was not wired instead of booting an empty
-        # directory and giving the appearance of success.
+        # The trusted repository preparation lane. It is optional for generic
+        # and legacy deployments. A turn that requires a repository refuses when
+        # this lane is unavailable instead of booting an empty directory.
         self._workspace = workspace
         # The inbound-attachment lane (#2567), optional on exactly the same
         # terms as the workspace lane above: a deployment that has not wired it
@@ -3467,34 +3466,18 @@ class Kernel:
         workspace_inference: _WorkspaceInferenceCarry,
         attachment_fresh_only: bool = False,
     ) -> _RouteResult:
-        # A workspace-enabled thread must establish (or confirm) its repository
+        # A repository-required thread must establish (or confirm) its repository
         # before any platform response path. This deliberately precedes the
         # greeting/help shortcut: a canned reply must not create a thread whose
         # repository remains ambiguous, and a conflicting repository must be
-        # refused before an existing sandbox can be adopted or steered.
+        # refused before an existing sandbox can be adopted or steered. Generic
+        # turns keep the normal claim path when the coordinator is disabled.
         # Hoisted so the new-turn return can tell whether THIS message named the
         # repository it attached (#2659); None when no selection ran.
         repo_fact: str | None = None
         workspace_repo: str | None = None
         lineage: PublicationLineage | None = None
         if workspace_deployment_id is not None:
-            if self._workspace is None:
-                # A named repository that cannot be attached is a decision the
-                # user must read (#2659, ADR 0126 terminal refusal), not a
-                # retryable fault. A message naming two repositories raises the
-                # parser's own terminal ambiguity refusal from here unchanged. A
-                # turn naming no repository keeps today's retryable wiring fault
-                # (#2683), because changing it changes turns that never asked.
-                ignore_message = (
-                    verified_review is not None or source is TurnSource.WEBHOOK
-                )
-                if trusted_repository_fact(
-                    event.text, ignore_message=ignore_message
-                ) is not None:
-                    raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
-                raise WorkspacePreparationError(
-                    "wiring", "workspace-enabled deployment has no trusted coordinator"
-                )
             # The API already bound a verified review to its persisted thread
             # workspace. Links in the untrusted review body are context, not a
             # request to select another repository. Webhook jobs (#2572) likewise
@@ -3506,7 +3489,20 @@ class Kernel:
                     verified_review is not None or source is TurnSource.WEBHOOK
                 ),
             )
-            if source is TurnSource.WEBHOOK and webhook_job_refuses_workspace(
+            if self._workspace is None:
+                # The coordinator is a worker-wide capability, not a condition
+                # on generic agent turns. Refuse only an event that requires a
+                # workspace: its own repository fact, a carried inference from
+                # this delivery, or verified feedback whose authority is bound to
+                # a repository. Ambiguity still raises from
+                # trusted_repository_fact above before any route is adopted.
+                if (
+                    repo_fact is not None
+                    or workspace_inference.repo is not None
+                    or verified_review is not None
+                ):
+                    raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
+            elif source is TurnSource.WEBHOOK and webhook_job_refuses_workspace(
                 event.text
             ):
                 workspace_repo = None
@@ -3576,6 +3572,14 @@ class Kernel:
                 "The pull request changed after GitHub feedback verification; "
                 "no model turn started."
             )
+        existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
+        if (
+            workspace_deployment_id is not None
+            and self._workspace is None
+            and existing_handle is not None
+            and existing_handle.workspace_repo is not None
+        ):
+            raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
         # the thread has no existing route, it is provably a NEW turn (it cannot be
@@ -3589,7 +3593,6 @@ class Kernel:
         # claiming is compared with this full snapshot rather than treating the
         # mere presence of an affinity record as proof that a live route was
         # retained.
-        existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
         materialized_lineage_head = lineage_head or lineage_base_sha
         if (
             materialized_lineage_head is not None
