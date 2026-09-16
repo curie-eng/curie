@@ -457,6 +457,13 @@ class _Cards:
         self.restored: list[tuple[str, ApprovalCardRef]] = []
         self.remember_fail_once = False
         self.restore_failures_remaining = 0
+        self.notice_refs: dict[str, str] = {}
+        self.notice_read_fails = False
+
+    async def read_notice_ref(self, approval_id: str) -> str | None:
+        if self.notice_read_fails:
+            raise RuntimeError("notice ref store unavailable")
+        return self.notice_refs.get(approval_id)
 
     async def pop(self, approval_id: str) -> ApprovalCardRef | None:
         self.popped.append(approval_id)
@@ -1632,6 +1639,41 @@ async def test_non_slack_publication_result_uses_the_stored_adapter_route_withou
     assert PR_URL in event.text
     assert store.completed[PUBLICATION_ID] == ("published", PR_URL)
     assert not hasattr(loop, "runner") and not hasattr(loop, "model")
+
+
+@pytest.mark.parametrize(
+    ("remembered", "read_fails", "expected_ref"),
+    [
+        ("1700000000.000077", False, "1700000000.000077"),
+        (None, False, None),
+        ("1700000000.000077", True, None),
+    ],
+)
+async def test_publication_result_edits_the_remembered_pending_notice(
+    publication: Any,
+    remembered: str | None,
+    read_fails: bool,
+    expected_ref: str | None,
+) -> None:
+    # #2721: a ref-less row's pending notice ref lives only in the card store.
+    cards = _Cards()
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    if remembered is not None:
+        cards.notice_refs[str(APPROVAL_ID)] = remembered
+    cards.notice_read_fails = read_fails
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+        "resolved_by": RESOLVER,
+        "resolution_note": None,
+    }
+
+    await loop.deliver_pending_result(PUBLICATION_ID)
+
+    event, _ = replies.events[0]
+    assert PR_URL in event.text
+    assert event.target.reply_ref == expected_ref
 
 
 @pytest.mark.parametrize(
