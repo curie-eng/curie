@@ -41,6 +41,14 @@ kubectl config use-context <your-production-context>
 
 ## Installing and inspecting the Curie platform on the cluster
 
+Every `curie cluster` verb takes `--context <NAME>`. The CLI resolves the
+context once, prints `Kubernetes context: <NAME> (cluster <CLUSTER>)` on stderr,
+and pins it for every `helm` and `kubectl` call it makes, including any ambient
+`HELM_KUBECONTEXT`. Without the flag it pins the kubeconfig current-context. A
+name that is not in the kubeconfig is refused before anything runs. Pass the
+flag explicitly on a workstation whose kubeconfig also holds production
+clusters.
+
 ### Running a build from a commit, without waiting for a release
 
 Every CI run publishes an installable Linux binary for both architectures,
