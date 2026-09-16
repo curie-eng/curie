@@ -227,6 +227,22 @@ run_self_test() {
         log "self-test: n-to-n1 must call restore_n so leftover in_progress 0.9.0 cannot refuse 0.9.1"
         failed=1
     fi
+    if awk '/^restore_n\(\)/,/^}/' "$script_path" | grep -q 'helm_ns rollback'; then
+        log "restore_n rolls back to 0.9.0 when a revision exists"
+    else
+        log "self-test: restore_n must helm rollback to 0.9.0 instead of a full upgrade wait"
+        failed=1
+    fi
+    if awk '/^exclusive_kind_tag\(\)/,/^}/' "$script_path" | awk '
+        /untag_kind_siblings/ { untag++ }
+        /kind load docker-image/ { load=1 }
+        END { exit (untag >= 2 && load) ? 0 : 1 }
+    '; then
+        log "exclusive_kind_tag untags siblings before and after load"
+    else
+        log "self-test: exclusive_kind_tag must untag siblings before and after kind load"
+        failed=1
+    fi
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
@@ -419,22 +435,45 @@ kind_node() {
     kind get nodes --name "$KIND_CLUSTER" 2>/dev/null | head -1
 }
 
-exclusive_kind_tag() {
+untag_kind_siblings() {
     local keep="$1" node img tag ref
     node="$(kind_node)"
     [[ -n "$node" ]] || return 0
-    load_tag_images "$keep"
     for img in "${IMAGES[@]}"; do
         for tag in 0.9.0 0.9.1 matrix-candidate upgrade-candidate; do
             [[ "$tag" == "$keep" ]] && continue
             for ref in \
                 "ghcr.io/curie-eng/${img}:${tag}" \
                 "docker.io/library/${img}:${tag}" \
+                "docker.io/curie-eng/${img}:${tag}" \
                 "${img}:${tag}"; do
                 docker exec "$node" crictl rmi "$ref" >/dev/null 2>&1 || true
+                docker exec "$node" ctr -n k8s.io images untag "$ref" >/dev/null 2>&1 || true
             done
         done
     done
+}
+
+exclusive_kind_tag() {
+    local keep="$1" node img ref
+    node="$(kind_node)"
+    [[ -n "$node" ]] || return 0
+    # Untag siblings before load. 0.9.0 and 0.9.1 are the same digest in CI;
+    # loading 0.9.1 while 0.9.0 remains makes converge refuse the alias.
+    untag_kind_siblings "$keep"
+    for img in "${IMAGES[@]}"; do
+        ref="$(image_for "$img" "$keep")"
+        if docker image inspect "$ref" >/dev/null 2>&1; then
+            :
+        elif docker image inspect "${img}:${keep}" >/dev/null 2>&1; then
+            ref="${img}:${keep}"
+        else
+            continue
+        fi
+        log "kind load $ref"
+        kind load docker-image "$ref" --name "$KIND_CLUSTER"
+    done
+    untag_kind_siblings "$keep"
     log "kind node $node holds exclusive app tag $keep"
 }
 
@@ -821,11 +860,29 @@ recover_helm_lock() {
     esac
 }
 
+helm_revision_for_version() {
+    local want="$1"
+    helm_ns history "$RELEASE" -o json 2>/dev/null | python3 -c '
+import json,sys
+want=sys.argv[1]
+try:
+    hist=json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+for row in reversed(list(hist)):
+    chart=str(row.get("chart") or "")
+    app=str(row.get("app_version") or "")
+    if want in chart or app == want:
+        print(row.get("revision") or "")
+        break
+' "$want" || true
+}
+
 restore_n() {
     # A leftover in_progress 0.9.1 is a foreign record: resume would keep
     # going to 0.9.1. Delete only that. A leftover in_progress 0.9.0 is
     # resumed below so converge/canary/commit can finish.
-    local target status
+    local target status rev
     target="$(checkpoint_field target_version)"
     status="$(checkpoint_field status)"
     recover_helm_lock
@@ -836,9 +893,24 @@ restore_n() {
     fi
     if [[ "$(helm_version)" != "0.9.0" || ( "$status" == "in_progress" && "$target" == "0.9.0" ) ]]; then
         log "restoring helm 0.9.0 (currently $(helm_version), checkpoint_target=${target:-none} checkpoint_status=${status:-none})"
-        cluster_upgrade "0.9.0" "$CHART_090" || true
+        if [[ "$status" == "in_progress" && "$target" == "0.9.0" ]]; then
+            cluster_upgrade "0.9.0" "$CHART_090" || true
+        else
+            # A full cluster upgrade --wait can sit on a hook Job for the
+            # whole Helm timeout. Rollback to the last 0.9.0 revision is the
+            # harness restore; it is not the product mutator under test.
+            rev="$(helm_revision_for_version 0.9.0)"
+            if [[ -n "$rev" ]]; then
+                log "rolling back to helm revision $rev (0.9.0)"
+                helm_ns rollback "$RELEASE" "$rev" --wait --timeout 180s || \
+                    cluster_upgrade "0.9.0" "$CHART_090" || true
+            else
+                cluster_upgrade "0.9.0" "$CHART_090" || true
+            fi
+        fi
         wait_rollout || true
     fi
+    exclusive_kind_tag "0.9.0"
     # The restore upgrade itself writes a record. Wipe it so the next
     # FAIL_AT 0.9.1 cannot be refused as "upgrade to 0.9.0 already in progress".
     clear_upgrade_checkpoint

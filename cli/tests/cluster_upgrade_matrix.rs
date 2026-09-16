@@ -99,6 +99,14 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin n-to-n1 using restore_n\n{text}"
     );
     assert!(
+        text.contains("restore_n rolls back to 0.9.0 when a revision exists"),
+        "self-test must pin restore_n rolling back to 0.9.0\n{text}"
+    );
+    assert!(
+        text.contains("exclusive_kind_tag untags siblings before and after load"),
+        "self-test must pin exclusive_kind_tag untag-before-load\n{text}"
+    );
+    assert!(
         text.contains("schema heads published=0039"),
         "self-test must pin the published 0.8.8 alembic head\n{text}"
     );
