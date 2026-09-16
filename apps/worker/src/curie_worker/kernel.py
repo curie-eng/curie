@@ -119,6 +119,7 @@ from .runner_client import (
 from .sandbox import SandboxSubstrate
 from .sandbox.types import (
     CapacityExhaustedError,
+    RouteChangedError,
     SandboxError,
     SandboxHandle,
     SuspendedThreadError,
@@ -3220,6 +3221,21 @@ class Kernel:
                                 verified_review=verified_review,
                                 review_turn=review_turn,
                                 workspace_inference=workspace_inference,
+                                attachment_fresh_only=True,
+                            )
+                        except RouteChangedError:
+                            # Another worker bound a runner after the lookup
+                            # above; the prepared files never reached it, so
+                            # leave them uninstalled for the finally (#2739).
+                            logger.info(
+                                "attachment claim refused for agent=%s thread=%s: "
+                                "route changed during claim",
+                                agent_name,
+                                thread_key,
+                            )
+                            return _RouteResult(
+                                steered=False,
+                                canned_reply=_CHANGED_ATTACHMENT_REPLY,
                             )
                         except BaseException:
                             try:
@@ -3319,6 +3335,7 @@ class Kernel:
         verified_review: VerifiedReviewFeedback | None = None,
         review_turn: QueuedTurn | None = None,
         workspace_inference: _WorkspaceInferenceCarry,
+        attachment_fresh_only: bool = False,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
         # before any platform response path. This deliberately precedes the
@@ -3536,6 +3553,7 @@ class Kernel:
             pending_publication_approval=pending_publication_approval,
             agent_name=agent_name,
             remaining_s=remaining_s,
+            attachment_fresh_only=attachment_fresh_only,
         )
         retained_live_route = existing_handle is not None and handle == existing_handle
         # #2659: announce a repository only when this message named it, the
@@ -3863,6 +3881,7 @@ class Kernel:
         pending_publication_approval: bool = False,
         agent_name: str | None = None,
         remaining_s: float | None = None,
+        attachment_fresh_only: bool = False,
     ) -> SandboxHandle:
         # A live route is an adopt/steer, not a session start. Preparing before
         # this check would clone on every threaded steer and could even replace
@@ -3889,6 +3908,10 @@ class Kernel:
             existing = None
             if not force_lineage_replacement:
                 existing = await asyncio.to_thread(self._substrate.adopt, thread_key)
+            if attachment_fresh_only and existing is not None:
+                # A runner appeared after the attachment lookup; it never saw
+                # the staged files, so refuse rather than adopt it (#2739).
+                raise RouteChangedError(thread_key)
             if existing is not None and existing.workspace_repo == workspace_repo:
                 await asyncio.to_thread(
                     self._workspace.touch,
@@ -3998,6 +4021,7 @@ class Kernel:
                 publication_visible_outcome_revision=(
                     publication_visible_outcome_revision
                 ),
+                fresh_only=attachment_fresh_only,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(
@@ -4006,7 +4030,11 @@ class Kernel:
             return workspace_claim.handle
         try:
             return await asyncio.to_thread(
-                self._substrate.claim, thread_key, env=boot_env, agent_name=agent_name
+                self._substrate.claim,
+                thread_key,
+                env=boot_env,
+                agent_name=agent_name,
+                fresh_only=attachment_fresh_only,
             )
         except SuspendedThreadError:
             # Resume with the same bound boot env a fresh claim gets (bundle

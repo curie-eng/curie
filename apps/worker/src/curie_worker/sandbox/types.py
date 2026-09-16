@@ -349,6 +349,15 @@ class NoRouteError(SandboxError):
     """An operation needed an existing thread route and none was found."""
 
 
+class RouteChangedError(SandboxError):
+    """A fresh-only claim found (or raced) a live route it did not create.
+
+    Attachment turns stage files into the runner created for them (#2739);
+    adopting a runner another worker bound in the meantime would deliver the
+    turn without its files, so the caller refuses instead.
+    """
+
+
 class SuspendedThreadError(SandboxError):
     """claim() was called on a suspended thread; the kernel must resume()
     explicitly so the stored history is carried into the replacement runner
