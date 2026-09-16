@@ -101,16 +101,30 @@ def test_every_pinned_core_tool_is_classified_exactly_once() -> None:
 
 def test_platform_upgrade_stays_a_separate_legacy_gate() -> None:
     gates = _manifest()["approvalPolicy"]["gates"]
-    assert gates == [
-        {
-            "gate": "mcp__self-upgrade__upgrade_self",
-            "route": "sre-approvals",
-        },
-        {
-            "gate": "mcp__self-upgrade__upgrade_platform",
-            "route": "sre-approvals",
-        },
-    ]
+    for gate in (
+        "mcp__self-upgrade__upgrade_self",
+        "mcp__self-upgrade__upgrade_platform",
+    ):
+        assert {"gate": gate, "route": "sre-approvals"} in gates
+
+
+def test_every_approval_required_tool_has_a_routed_gate() -> None:
+    # #2722: the runner derives an approval's route only from approvalPolicy.gates.
+    # A toolPolicy.approvalRequired entry with no routed gate raises a route-less
+    # approval that an operator principal can never resolve (403).
+    manifest = _manifest()
+    routes = {
+        gate["gate"]: gate.get("route")
+        for gate in manifest["approvalPolicy"]["gates"]
+    }
+    required = manifest["toolPolicy"]["approvalRequired"]
+    assert required, "no approvalRequired entries found"
+    for entry in required:
+        server, _, tool = entry.partition("/")
+        live = f"mcp__{server}__{tool}"
+        assert live in routes, f"{entry} has no approvalPolicy gate {live}"
+        assert routes[live], f"{live} gate has no route"
+    assert set(routes.values()) == {"sre-approvals"}
 
 
 def test_kubernetes_rbac_has_one_identity_and_a_demo_namespace_write_ceiling() -> None:
