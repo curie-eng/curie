@@ -2142,6 +2142,13 @@ def test_null_placeholder_turn_persists_its_approval_before_any_delivery(
     asyncio.run(go())
 
 
+def _gate_only_script(summary: str) -> list:
+    # No TextDelta before the Final: pre-gate streamed prose is the turn's own
+    # delivery during the model turn, before the kernel can know a gate fired,
+    # and is out of scope for #2721.
+    return [Final(text="Requesting sign-off", status=AWAITING, approval_summary=summary)]
+
+
 def _record_create_calls_at_emit(h, approvals: RecordingApprovals) -> list[int]:  # noqa: ANN001
     seen: list[int] = []
     original_emit = h.sink.emit
@@ -2175,7 +2182,7 @@ def test_placeholderless_approval_row_precedes_every_delivery_attempt(
     async def go() -> None:
         approvals = RecordingApprovals()
         async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            h.runner.default_script = _gate_only_script("Give ACME a 20% discount")
             seen = _record_create_calls_at_emit(h, approvals)
 
             await h.kernel.process_event(
@@ -2217,7 +2224,7 @@ def test_approval_without_a_slack_surface_still_suspends_and_completes(
     async def go() -> None:
         approvals = RecordingApprovals()
         async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            h.runner.default_script = _gate_only_script("Give ACME a 20% discount")
             _install_dead_transport(h)
             event = _qevent("please discount", thread="th_no_slack", placeholder=None)
 
@@ -2240,7 +2247,7 @@ def test_approval_without_a_slack_surface_is_exactly_once_and_resumes_once(
     async def go() -> None:
         approvals = RecordingApprovals()
         async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            h.runner.default_script = _gate_only_script("Give ACME a 20% discount")
             working_emit = h.sink.emit
             _install_dead_transport(h)
             thread = "th_no_slack_once"
