@@ -2690,7 +2690,13 @@ async fn rendered_gvisor_preflight_job(
     args.push(plain("templates/preflight-gvisor.yaml"));
     let (ok, out, err) = run_capture(&OpsCommand::new("helm", args)).await?;
     if !ok {
-        if err.trim() == "Error: could not find template templates/preflight-gvisor.yaml in chart" {
+        // Helm 3.16+ --show-only omits templates whose top-level `if` is
+        // false (gVisor off / fake-model auto) and may quote the path or
+        // prefix warnings. Treat any missing-template report as skip.
+        let combined = format!("{err}\n{out}");
+        if combined.contains("could not find template")
+            && combined.contains("preflight-gvisor.yaml")
+        {
             return Ok(None);
         }
         bail!(

@@ -1339,6 +1339,19 @@ fn product_collector_restore_covers_every_emitter_and_invalid_auth_is_observable
 }
 
 #[test]
+fn local_source_build_uses_the_daemon_backed_builder() {
+    let (output, _, _, _) = run_local_observability_control(&[
+        ("BUILDX_BUILDER", "curie-e2e-builder"),
+        ("STUB_REQUIRE_DEFAULT_BUILDER", "1"),
+    ]);
+    let transcript = transcript(&output);
+    assert!(
+        output.status.success(),
+        "the local source build must replace an isolated ambient builder with the Docker daemon builder: {transcript}"
+    );
+}
+
+#[test]
 fn cluster_product_observability_is_private_preflight_and_query_only() {
     let preflight = ladder_function("preflight_cluster_product_observability");
     for required in [
@@ -2052,6 +2065,11 @@ print(json.dumps({
         echo "stub: compose stack up"
         ;;
     "local up -f "*/compose.dev.yaml" --build")
+        if [ "${STUB_REQUIRE_DEFAULT_BUILDER:-0}" = "1" ] \
+            && [ "${BUILDX_BUILDER:-}" != "default" ]; then
+            echo "local source build did not select the Docker daemon builder" >&2
+            exit 97
+        fi
         echo "stub: full compose stack up"
         ;;
     "--json local deploy --plugin-dir "*)
