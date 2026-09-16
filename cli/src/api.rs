@@ -489,7 +489,10 @@ pub struct ObservationNode {
     pub model: Option<String>,
     /// Langfuse renames a tool observation to the tool itself, so the API hoists
     /// `gen_ai.tool.name` here; dropping it would strip the only tool identity.
-    #[serde(rename = "toolName", default)]
+    // Skipped when absent so the CLI reproduces the API payload exactly rather
+    // than inventing a null key: a released CLI talks to whatever API version is
+    // deployed, and an older one omits this field entirely.
+    #[serde(rename = "toolName", default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     #[serde(rename = "usageDetails", default)]
     pub usage_details: Option<serde_json::Map<String, serde_json::Value>>,
