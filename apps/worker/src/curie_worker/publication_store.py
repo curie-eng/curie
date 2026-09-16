@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from .publication_loop import PublicationWork
-from .reply_sink import TargetRoute
+from .reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute
 
 _SAFE_SCHEMA = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -103,7 +103,7 @@ class PostgresPublicationStore:
         statement = text(
             f"""
             SELECT p.id, p.approval_id, p.reply_kind, p.reply_channel,
-                   p.reply_endpoint, p.reply_adapter,
+                   p.reply_placeholder, p.reply_endpoint, p.reply_adapter,
                    p.approval_card_delivery_attempts,
                    p.approval_card_version,
                    p.approval_card_delivery_started_at,
@@ -177,7 +177,13 @@ class PostgresPublicationStore:
                 kind=str(row["reply_kind"]),
                 address=str(row["reply_channel"]),
                 conversation_id=str(row["conversation_id"]),
-                reply_ref=None,
+                # The cluster-message relay addresses its session bucket by the
+                # stored ref; every other route posts a fresh card message.
+                reply_ref=(
+                    row["reply_placeholder"]
+                    if row["reply_adapter"] == CLUSTER_MESSAGE_ADAPTER
+                    else None
+                ),
             ),
             route=TargetRoute(
                 endpoint=row["reply_endpoint"], adapter=row["reply_adapter"]
@@ -223,9 +229,13 @@ class PostgresPublicationStore:
         self._card_versions.pop(publication_id, None)
 
     async def retry_card_delivery(
-        self, publication_id: uuid.UUID, *, error: str
+        self, publication_id: uuid.UUID, *, error: str, permanent: bool
     ) -> None:
-        """Release a card lease or terminalize safely at the bounded cap."""
+        """Release a card lease or terminalize safely at the bounded cap.
+
+        A ``permanent`` failure cannot succeed on retry, so it terminalizes on
+        this attempt instead of spending the remaining cap in a hot loop.
+        """
 
         version = self._card_versions.get(publication_id)
         if version is None:
@@ -292,7 +302,7 @@ class PostgresPublicationStore:
                         "id": publication_id,
                         "owner": self._lease_owner,
                         "version": version,
-                        "max_attempts": self._result_max_attempts,
+                        "max_attempts": 1 if permanent else self._result_max_attempts,
                         "error": error[:2000],
                         "terminal_error": (
                             "publication approval card could not be delivered: "
