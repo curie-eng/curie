@@ -249,6 +249,12 @@ run_self_test() {
         log "self-test: compatible rollback must exclusive_kind_tag 0.9.0 before helm rollback"
         failed=1
     fi
+    if awk '/^run_rollback_published_088\(\)/,/^}/' "$script_path" | grep -q 'load_tag_images "0.8.8"'; then
+        log "published 0.8.8 rollback reloads 0.8.8 images"
+    else
+        log "self-test: rollback-published-088 must load 0.8.8 images before helm rollback"
+        failed=1
+    fi
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
@@ -633,6 +639,7 @@ uninstall_owned() {
 
 helm_install_088() {
     refuse_soak "$NAMESPACE" "$RELEASE"
+    load_tag_images "0.8.8"
     kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
     local sets=()
     local line
@@ -1038,6 +1045,9 @@ run_rollback_published_088() {
     [[ -n "$found" ]] || found="$(helm_history_088)"
     [[ -n "$found" ]] || die "could not find a 0.8.8 helm revision"
     REV_088="$found"
+    # exclusive 0.9.x tags never remove 0.8.8, but the node may have dropped
+    # the published images after hours of retag. Reload before rollback.
+    load_tag_images "0.8.8"
     local status=0
     set +e
     "$BIN" --json cluster rollback --yes --revision "$REV_088" \
@@ -1046,7 +1056,7 @@ run_rollback_published_088() {
     status=$?
     set -e
     if (( status == 0 )); then
-        wait_rollout
+        wait_rollout || die "rollback-088 rollout timed out (helm $(helm_version))"
         [[ "$(helm_version)" == "0.8.8" ]] || die "rollback-088 helm version is $(helm_version)"
         assert_sentinel
         log "rollback-published-088 succeeded; 0.8.8 serves and sentinel is readable"

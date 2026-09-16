@@ -111,6 +111,10 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin compatible rollback reloading 0.9.0 images\n{text}"
     );
     assert!(
+        text.contains("published 0.8.8 rollback reloads 0.8.8 images"),
+        "self-test must pin rollback-088 reloading 0.8.8 images\n{text}"
+    );
+    assert!(
         text.contains("schema heads published=0039"),
         "self-test must pin the published 0.8.8 alembic head\n{text}"
     );
