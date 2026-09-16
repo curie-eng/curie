@@ -635,13 +635,8 @@ fn release_channel_default_uses_target_chart_cache_outside_checkout() {
     )
     .unwrap();
 
-    let output = fixture.run_without_chart_with(
-        "release-cache-prior",
-        "0.8.9",
-        fixture.0.path(),
-        true,
-        &[],
-    );
+    let output =
+        fixture.run_without_chart_with("release-cache-prior", "0.8.9", fixture.0.path(), true, &[]);
     assert!(
         output.status.success(),
         "preseeded target archive must complete the recording fixture: {} / {}",
