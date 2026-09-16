@@ -659,6 +659,10 @@ def test_product_oracle_discovers_only_the_seed_trace_from_bounded_transport(
         "operation",
         "observation_count",
         "observation_type",
+        # Langfuse renames a tool observation to the tool, so the tool identity is
+        # the only evidence that a specific tool ran. A built-in or connector tool
+        # name is not caller data.
+        "tool_name",
         "approval_decision",
     ):
         assert allowed in sanitizer, f"sanitized evidence omits safe field {allowed!r}"
@@ -719,6 +723,7 @@ def test_product_evidence_sanitizer_and_failure_paths_never_dump_private_json(
         "operation",
         "observation_count",
         "observation_type",
+        "tool_name",
         "approval_decision",
     }
     combined_output = result.stdout + result.stderr
