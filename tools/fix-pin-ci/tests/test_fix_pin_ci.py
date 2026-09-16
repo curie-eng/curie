@@ -665,11 +665,15 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     )
     pytest_command = shlex.split(_string(steps[pytest_index], "run").strip())
     assert pytest_command[:4] == ["uv", "run", "pytest", "-q"]
-    assert all(
-        argument.startswith("--durations") for argument in pytest_command[4:]
-    ), (
-        "the Python suite must run unfiltered: only reporting flags may be added "
-        f"to `uv run pytest -q`, got {pytest_command!r}"
+    # xdist distribution flags change where tests run, not which tests run, so
+    # they are allowed alongside reporting flags. Anything else could filter.
+    extra = pytest_command[4:]
+    distribution = ["-n", "4", "--dist", "loadfile"]
+    if extra[: len(distribution)] == distribution:
+        extra = extra[len(distribution) :]
+    assert all(argument.startswith("--durations") for argument in extra), (
+        "the Python suite must run unfiltered: only reporting and xdist "
+        f"distribution flags may be added to `uv run pytest -q`, got {pytest_command!r}"
     )
     assert stack_index < migration_index < pytest_index
 

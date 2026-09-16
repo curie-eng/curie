@@ -186,10 +186,19 @@ jobs:
       # bound unlistening port is dropped on macOS and refused on Linux (#2233).
       # Sharding on numbers like those would have split the suite along the wrong
       # seam. This prints the real ones on every run, for the price of 25 lines.
+      #
+      # `-n 4 --dist loadfile` runs the same unfiltered suite on the runner's
+      # four cores (public-repo ubuntu-latest is 4 vCPU). The serial step was
+      # 1315s on run 35131366084 and the long pole of every required run; a
+      # 20-attempt characterisation at -n 4 (run 34542518036) finished in
+      # ~400s. Isolation is per worker: apps/api provisions its database per
+      # session and the worker suite namespaces Valkey keys per test. loadfile
+      # keeps each file's tests in one process, so module fixtures and
+      # in-file ordering behave exactly as they do serially.
       - name: Pytest
         id: pytest
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: uv run pytest -q --durations=25
+        run: uv run pytest -q -n 4 --dist loadfile --durations=25
       # Keep the required Python check honest when compose+pytest are skipped:
       # a selected skip (or an unselected success) fails this job, so the
       # ruleset still gates the suite whenever the selector asked for it.
