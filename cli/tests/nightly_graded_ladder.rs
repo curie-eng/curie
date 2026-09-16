@@ -4018,10 +4018,8 @@ fn coding_tool_seed_requires_the_bash_tool_by_name_in_its_exact_trace() {
 
 #[test]
 fn cli_observation_node_carries_the_langfuse_tool_name() {
-    let api = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api.rs"),
-    )
-    .expect("read the CLI API module");
+    let api = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api.rs"))
+        .expect("read the CLI API module");
     let (_, node) = api
         .split_once("pub struct ObservationNode {")
         .expect("the CLI must model the observation tree node");
