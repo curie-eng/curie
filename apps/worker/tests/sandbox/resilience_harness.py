@@ -297,29 +297,39 @@ class PodReadError(RuntimeError):
 
 
 def read_pod(cfg: ResilienceConfig, name: str) -> dict[str, object] | None:
-    """The pod object for ``name``, or ``None`` when the API says NotFound.
+    """The pod object for ``name``, or ``None`` when the API says it does not exist.
 
-    Only a genuine NotFound yields ``None``. Any other ``kubectl`` failure
-    (RBAC, an unreachable API server, a timeout) and any unparseable or
-    non-object body raise :class:`PodReadError`, so a broken read can never be
-    mistaken for a deleted pod.
+    ``--ignore-not-found`` makes the API itself answer the question: a missing
+    pod is an empty body with exit 0, and every other failure (RBAC, an
+    unreachable API server, a credential-helper that will not run, a timeout)
+    is a non-zero exit that raises :class:`PodReadError`. Matching ``kubectl``
+    stderr text would be wrong here -- an auth message such as ``exec:
+    executable kubelogin not found`` contains "not found" and would certify a
+    deletion nobody observed.
+
+    A body that parses but carries no usable ``metadata.uid`` is also a failed
+    read, not a pod: identity is the whole question this answers.
     """
 
     try:
-        raw = kubectl(cfg, "get", "pod", name, "-o", "json")
+        raw = kubectl(cfg, "get", "pod", name, "--ignore-not-found", "-o", "json")
     except subprocess.CalledProcessError as exc:
-        stderr = exc.stderr or ""
-        if "NotFound" in stderr or "not found" in stderr:
-            return None
-        raise PodReadError(f"pod read for {name} failed: {stderr.strip()}") from exc
+        stderr = (exc.stderr or "").strip()
+        raise PodReadError(f"pod read for {name} failed: {stderr}") from exc
     except subprocess.SubprocessError as exc:
         raise PodReadError(f"pod read for {name} failed: {exc}") from exc
+    if not raw.strip():
+        return None
     try:
         parsed = json.loads(raw)
     except ValueError as exc:
         raise PodReadError(f"pod read for {name} returned malformed JSON") from exc
-    if not isinstance(parsed, dict) or "metadata" not in parsed:
+    if not isinstance(parsed, dict):
         raise PodReadError(f"pod read for {name} returned an unexpected body")
+    metadata = parsed.get("metadata")
+    uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    if not isinstance(uid, str) or not uid:
+        raise PodReadError(f"pod read for {name} returned no metadata.uid")
     return dict(parsed)
 
 

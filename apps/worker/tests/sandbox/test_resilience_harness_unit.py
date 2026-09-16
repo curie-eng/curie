@@ -155,14 +155,20 @@ def test_pod_identity_not_gone_while_original_uid_present() -> None:
     assert pod_identity_gone(_pod(OLD_UID), OLD_UID) is False
 
 
-def test_read_pod_returns_none_only_on_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_read_pod_returns_none_only_on_an_api_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--ignore-not-found`` prints nothing and exits 0 when the pod is gone."""
+
+    seen: list[tuple[str, ...]] = []
+
     def fake_kubectl(cfg: object, *args: str) -> str:
-        raise subprocess.CalledProcessError(
-            1, args, stderr='Error from server (NotFound): pods "sbx-1" not found'
-        )
+        seen.append(args)
+        return ""
 
     monkeypatch.setattr(resilience_harness, "kubectl", fake_kubectl)
     assert read_pod(_cfg(), "sbx-1") is None
+    assert "--ignore-not-found" in seen[0]
 
 
 @pytest.mark.parametrize(
@@ -171,6 +177,9 @@ def test_read_pod_returns_none_only_on_not_found(monkeypatch: pytest.MonkeyPatch
         'Error from server (Forbidden): pods "sbx-1" is forbidden',
         "Unable to connect to the server: dial tcp 10.0.0.1:6443: i/o timeout",
         "error: You must be logged in to the server (Unauthorized)",
+        # #2743 review: an auth failure whose text contains "not found" must not
+        # be read as a deletion.
+        "getting credentials: exec: executable kubelogin not found",
     ],
 )
 def test_read_pod_raises_on_authorization_and_transport_errors(
@@ -195,7 +204,19 @@ def test_read_pod_raises_on_subprocess_timeout(monkeypatch: pytest.MonkeyPatch) 
         read_pod(_cfg(), "sbx-1")
 
 
-@pytest.mark.parametrize("body", ["not json at all", "[]", '{"items": []}'])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "not json at all",
+        "[]",
+        '{"items": []}',
+        '{"metadata": {"name": "sbx-1"}}',
+        # #2743 review: an empty uid is not an identity, and comparing it would
+        # read as a replacement.
+        '{"metadata": {"name": "sbx-1", "uid": ""}}',
+        '{"metadata": {"name": "sbx-1", "uid": null}}',
+    ],
+)
 def test_read_pod_raises_on_malformed_response(
     monkeypatch: pytest.MonkeyPatch, body: str
 ) -> None:
@@ -209,6 +230,35 @@ def test_read_pod_parses_a_pod_body(monkeypatch: pytest.MonkeyPatch) -> None:
         resilience_harness, "kubectl", lambda cfg, *args: json.dumps(_pod(OLD_UID))
     )
     assert read_pod(_cfg(), "sbx-1") == _pod(OLD_UID)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "getting credentials: exec: executable kubelogin not found",
+        '{"metadata": {"name": "sbx-1", "uid": ""}}',
+    ],
+)
+def test_wait_refuses_to_certify_deletion_from_a_broken_read(
+    monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    """End to end through the waiter: neither shape may be read as disappearance."""
+
+    def fake_kubectl(cfg: object, *args: str) -> str:
+        if body.startswith("{"):
+            return body
+        raise subprocess.CalledProcessError(1, args, stderr=body)
+
+    monkeypatch.setattr(resilience_harness, "kubectl", fake_kubectl)
+    with pytest.raises(PodReadError):
+        wait_pod_identity_gone(
+            _cfg(),
+            "sbx-1",
+            OLD_UID,
+            timeout=30.0,
+            sleep=lambda _s: None,
+            clock=lambda: 0.0,
+        )
 
 
 def test_wait_returns_replacement_on_same_name_recreation(
