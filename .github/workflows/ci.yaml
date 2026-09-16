@@ -985,7 +985,7 @@ jobs:
 
           # Resolve the hashed asset path from the running container rather
           # than hardcoding a hash that changes on every build.
-          JS_ASSET_NAME="$(docker exec curie-ui-smoke sh -c 'cd /usr/share/nginx/html/assets && ls *.js' | head -1)"
+          JS_ASSET_NAME="$(docker exec curie-ui-smoke sh -c 'cd /usr/share/nginx/html/assets && ls *.js' | sed -n '1p')"
           if [ -z "$JS_ASSET_NAME" ]; then
             echo "No hashed JS asset found in the built image" >&2
             exit 1
@@ -1175,9 +1175,9 @@ jobs:
           # floor nginx correctly declines to compress it, so the check falls
           # back to asserting the config declares text/css as compressible.
           # Skip gracefully if the build emits no CSS asset at all.
-          GZIP_MIN="$(docker exec curie-ui-smoke sh -c "awk '/gzip_min_length/ {gsub(/[^0-9]/, \"\", \$2); print \$2}' /etc/nginx/conf.d/default.conf" | head -1)"
+          GZIP_MIN="$(docker exec curie-ui-smoke sh -c "awk '/gzip_min_length/ {gsub(/[^0-9]/, \"\", \$2); print \$2}' /etc/nginx/conf.d/default.conf" | sed -n '1p')"
           GZIP_MIN="${GZIP_MIN:-1024}"
-          CSS_ASSET_NAME="$(docker exec curie-ui-smoke sh -c 'cd /usr/share/nginx/html/assets && ls *.css 2>/dev/null || true' | head -1)"
+          CSS_ASSET_NAME="$(docker exec curie-ui-smoke sh -c 'cd /usr/share/nginx/html/assets && ls *.css 2>/dev/null || true' | sed -n '1p')"
           if [ -n "$CSS_ASSET_NAME" ]; then
             CSS_ASSET_SIZE="$(docker exec curie-ui-smoke sh -c "wc -c < /usr/share/nginx/html/assets/${CSS_ASSET_NAME}" | tr -d '[:space:]')"
             css_headers="$(curl -sS -D - -o /dev/null -H 'Accept-Encoding: gzip' "${BASE_URL}/assets/${CSS_ASSET_NAME}" | tr 'A-Z' 'a-z')"
