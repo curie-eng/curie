@@ -1486,6 +1486,22 @@ pub fn helm_history_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
+/// Read the manifest Helm retained for one selected revision.
+fn helm_retained_manifest_cmd(o: &CommonOpts, revision: u32) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("get"),
+            plain("manifest"),
+            plain(&o.release),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("--revision"),
+            plain(revision.to_string()),
+        ],
+    )
+}
+
 /// Read the live Alembic revision from the running API pod before Helm mutates.
 pub fn live_schema_revision_cmd(o: &CommonOpts) -> OpsCommand {
     let deploy = chart_fullname(&o.release).resource("api");
@@ -1648,6 +1664,33 @@ fn skipped_note(skipped: &[u32], from: u32) -> Option<String> {
 const LIVE_SCHEMA_PROBE_OVERRIDE_FIX: &str =
     "pass --live-schema-revision <rev> with the live Alembic revision so the schema-window check can run without the API pod";
 
+fn retained_manifest_guidance(
+    common: &CommonOpts,
+    revision: u32,
+    published_head: &str,
+    remediation: Option<&str>,
+) -> String {
+    let inspect = helm_retained_manifest_cmd(common, revision);
+    let raw_rollback = helm_rollback_cmd(common, revision);
+    let remediation = remediation
+        .map(|text| format!(" {text}."))
+        .unwrap_or_default();
+    format!(
+        "inspect `{}`; an absent ConfigMap labeled app.kubernetes.io/component=schema-compat identifies the published artifact with schema head {published_head}.{remediation} Only after accepting the schema risk, the operator owns using `{}` directly outside Curie's guarded rollback",
+        inspect.display(),
+        raw_rollback.display()
+    )
+}
+
+fn retained_manifest_fix(common: &CommonOpts, revision: u32, published_head: &str) -> String {
+    retained_manifest_guidance(
+        common,
+        revision,
+        published_head,
+        Some("repair Helm access or the retained metadata and retry"),
+    )
+}
+
 async fn probe_live_schema_revision(common: &CommonOpts, ui: &crate::ui::Ui) -> Result<String> {
     require_on_path("kubectl")?;
     let probe = live_schema_revision_cmd(common);
@@ -1749,11 +1792,88 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
             .with_fix("inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued")
             .into());
         };
-        if let Err(refusal) =
-            crate::schema_window::check_target_schema(&target_app, &live, &history_apps)
-        {
+        let Some(catalog_window) = crate::schema_window::window_for(&target_app) else {
+            let refusal = crate::schema_window::missing_target_window_refusal(
+                &target_app,
+                &live,
+                &history_apps,
+            );
             return Err(crate::exit::CliError::failure(refusal.message)
                 .with_fix(refusal.fix)
+                .into());
+        };
+        let (resolved_window, published_identity_fix) = if catalog_window
+            .artifact_identity_ambiguous
+        {
+            let manifest_cmd = helm_retained_manifest_cmd(&opts.common, choice.to_revision);
+            ui.plumbing(&format!("+ {}", manifest_cmd.display()));
+            let (ok, manifest_out, manifest_err) = run_capture(&manifest_cmd).await?;
+            let fix = retained_manifest_fix(
+                &opts.common,
+                choice.to_revision,
+                &catalog_window.schema_head,
+            );
+            if !ok {
+                let detail = crate::schema_window::redact_probe_text(
+                    manifest_err
+                        .trim()
+                        .lines()
+                        .next()
+                        .unwrap_or("helm get manifest exited nonzero with no message"),
+                );
+                return Err(crate::exit::CliError::failure(format!(
+                    "refusing rollback to application {target_app}: could not establish the selected artifact identity from its retained manifest: {detail}"
+                ))
+                .with_fix(fix)
+                .into());
+            }
+            match crate::schema_compat::classify_retained_manifest(&manifest_out, &target_app) {
+                Ok(crate::schema_compat::RetainedManifestIdentity::Published) => {
+                    let guidance = retained_manifest_guidance(
+                        &opts.common,
+                        choice.to_revision,
+                        &catalog_window.schema_head,
+                        None,
+                    );
+                    (catalog_window, Some(guidance))
+                }
+                Ok(crate::schema_compat::RetainedManifestIdentity::Candidate(metadata)) => {
+                    let candidate = crate::schema_window::candidate_window(
+                        &metadata.schema_min,
+                        &metadata.schema_head,
+                    )
+                    .map_err(|error| {
+                        crate::exit::CliError::failure(format!(
+                            "refusing rollback to application {target_app}: {}",
+                            crate::schema_window::redact_probe_text(&error)
+                        ))
+                        .with_fix(fix.clone())
+                    })?;
+                    (candidate, None)
+                }
+                Err(error) => {
+                    return Err(crate::exit::CliError::failure(format!(
+                        "refusing rollback to application {target_app}: could not establish the selected artifact identity: {}",
+                        crate::schema_window::redact_probe_text(&error)
+                    ))
+                    .with_fix(fix)
+                    .into());
+                }
+            }
+        } else {
+            (catalog_window, None)
+        };
+        if let Err(refusal) = crate::schema_window::check_target_schema(
+            &target_app,
+            &resolved_window,
+            &live,
+            &history_apps,
+        ) {
+            let fix = published_identity_fix
+                .map(|identity| format!("{}. {identity}", refusal.fix))
+                .unwrap_or(refusal.fix);
+            return Err(crate::exit::CliError::failure(refusal.message)
+                .with_fix(fix)
                 .into());
         }
         if opts.live_schema_revision.is_some() {
