@@ -35,6 +35,7 @@ STARTED_AT=""
 CHART_090=""
 CHART_091=""
 REV_088=""
+REV_089=""
 SENTINEL_ID="acme-2590"
 FAIL_AT_HOOK=""
 INTERRUPT_AFTER_HOOK=""
@@ -42,11 +43,16 @@ INTERRUPT_AFTER_HOOK=""
 CHART_088_SHA="88664c2f991bed7a3e4bc0513ae73bfcbac08077d99a69e7087138aa6f8f3af2"
 CLI_088_SHA="dc0e1ab1b928522f1ca1c03e05d823e08218800c2d2a33d0d88af623972f6685"
 REL_088="https://github.com/curie-eng/curie/releases/download/v0.8.8"
+CHART_089_SHA="ee57017fe3009c35a4390b0c0555c44249ba98bba1d4f53f12aa3944b2bd5e5e"
+CLI_089_SHA="b8f3a00bcbf0920ae61e55039aa6a9d48e4d302db88a8c97e8148905569c0e9a"
+REL_089="https://github.com/curie-eng/curie/releases/download/v0.8.9"
 # Published v0.8.8 ships alembic 0039. The candidate head is the checkout's
 # schema_compat.json, so a rebase onto a newer next does not hard-code 0043.
 PUBLISHED_HEAD="0039"
 TARGET_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["schema_head"])' \
     "$REPO_ROOT/apps/api/src/curie_api/schema_compat.json")"
+SUPPORTED_ROLLBACK_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["windows"]["0.9.0"]["schema_head"])' \
+    "$REPO_ROOT/cli/src/application_schema_windows.json")"
 
 SCENARIOS_ALL=(
     soak-refusal
@@ -58,6 +64,7 @@ SCENARIOS_ALL=(
     n-to-n1
     compatible-rollback
     rollback-published-088
+    rollback-published-089
     migration-crash
     converge-negative
     previous-serves
@@ -72,7 +79,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|compatible-rollback|rollback-published-088|migration-crash|converge-negative|previous-serves] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|compatible-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -161,10 +168,17 @@ run_self_test() {
         log "self-test: published checksum pins are malformed"
         failed=1
     fi
-    if [[ "$PUBLISHED_HEAD" =~ ^[0-9]{4}$ && "$TARGET_HEAD" =~ ^[0-9]{4}$ ]]; then
-        log "schema heads published=$PUBLISHED_HEAD candidate=$TARGET_HEAD"
+    if is_sha256 "$CHART_089_SHA" && is_sha256 "$CLI_089_SHA"; then
+        log "published v0.8.9 chart checksum pinned"
+        log "published v0.8.9 cli checksum pinned"
     else
-        log "self-test: schema heads are malformed published='$PUBLISHED_HEAD' target='$TARGET_HEAD'"
+        log "self-test: published v0.8.9 checksum pins are malformed"
+        failed=1
+    fi
+    if [[ "$PUBLISHED_HEAD" =~ ^[0-9]{4}$ && "$TARGET_HEAD" =~ ^[0-9]{4}$ && "$SUPPORTED_ROLLBACK_HEAD" =~ ^[0-9]{4}$ ]]; then
+        log "schema heads published=$PUBLISHED_HEAD candidate=$TARGET_HEAD supported-rollback=$SUPPORTED_ROLLBACK_HEAD"
+    else
+        log "self-test: schema heads are malformed published='$PUBLISHED_HEAD' target='$TARGET_HEAD' supported-rollback='$SUPPORTED_ROLLBACK_HEAD'"
         failed=1
     fi
     tmp="$(mktemp)"
@@ -255,6 +269,12 @@ run_self_test() {
         log "self-test: rollback-published-088 must load 0.8.8 images before helm rollback"
         failed=1
     fi
+    if awk '/^run_rollback_published_089\(\)/,/^}/' "$script_path" | grep -q 'run_compatible_rollback'; then
+        log "published 0.8.9 refusal keeps the compatible rollback proof in one scenario"
+    else
+        log "self-test: rollback-published-089 must run the compatible rollback proof"
+        failed=1
+    fi
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
@@ -337,9 +357,20 @@ fetch_published() {
     download_pin "$REL_088/curie-x86_64-unknown-linux-gnu" "$ASSET_DIR/curie-0.8.8" "$CLI_088_SHA"
     chmod +x "$ASSET_DIR/curie-0.8.8"
     PUBLISHED_BIN="$ASSET_DIR/curie-0.8.8"
+    download_pin "$REL_089/curie-0.8.9.tgz" "$ASSET_DIR/curie-0.8.9.tgz" "$CHART_089_SHA"
+    download_pin "$REL_089/curie-x86_64-unknown-linux-gnu" "$ASSET_DIR/curie-0.8.9" "$CLI_089_SHA"
+    chmod +x "$ASSET_DIR/curie-0.8.9"
     [[ "$(helm show chart "$ASSET_DIR/curie-0.8.8.tgz" | awk '$1 == "version:" {print $2}')" == 0.8.8 ]] \
         || die "published chart tgz is not version 0.8.8"
-    log "published v0.8.8 chart and CLI verified"
+    [[ "$(helm show chart "$ASSET_DIR/curie-0.8.9.tgz" | awk '$1 == "version:" {print $2}')" == 0.8.9 ]] \
+        || die "published chart tgz is not version 0.8.9"
+    if tar -tzf "$ASSET_DIR/curie-0.8.8.tgz" | grep -Eq 'templates/schema-compat.yaml|files/schema-compat.json'; then
+        die "published v0.8.8 chart unexpectedly carries schema compatibility metadata"
+    fi
+    if tar -tzf "$ASSET_DIR/curie-0.8.9.tgz" | grep -Eq 'templates/schema-compat.yaml|files/schema-compat.json'; then
+        die "published v0.8.9 chart unexpectedly carries schema compatibility metadata"
+    fi
+    log "published v0.8.8 and v0.8.9 charts and CLIs verified without schema compatibility metadata"
 }
 
 package_n_charts() {
@@ -393,7 +424,7 @@ image_for() {
 IMAGES=(curie-api curie-worker curie-dispatcher curie-ui curie-runner)
 
 retag_candidate_versions() {
-    local src_tag="$1" version="$2" img src dest short
+    local src_tag="$1" version="$2" required="${3:-optional}" img src dest short
     for img in "${IMAGES[@]}"; do
         src="$(image_for "$img" "$src_tag")"
         if docker image inspect "$src" >/dev/null 2>&1; then
@@ -401,6 +432,9 @@ retag_candidate_versions() {
         elif docker image inspect "${img}:${src_tag}" >/dev/null 2>&1; then
             src="${img}:${src_tag}"
         else
+            if [[ "$required" == required ]]; then
+                die "required source image $img:$src_tag is not local"
+            fi
             log "candidate image $img:$src_tag is not local; skipping retag"
             continue
         fi
@@ -435,9 +469,9 @@ load_tag_images() {
 prepare_candidate_images() {
     local src="${CANDIDATE_TAG:-upgrade-candidate}"
     retag_candidate_versions "$src" "0.9.0"
-    retag_candidate_versions "$src" "0.9.1"
     load_tag_images "0.8.8"
     load_tag_images "0.9.0"
+    retag_candidate_versions "0.9.0" "0.9.1" required
     # Do not load 0.9.0 and 0.9.1 together: they are the same digest in CI,
     # and converge refuses a tagged alias with more than one name.
     exclusive_kind_tag "0.9.0"
@@ -655,6 +689,32 @@ helm_install_088() {
     wait_rollout
     REV_088="$(helm_revision)"
     log "published 0.8.8 helm revision $REV_088"
+}
+
+helm_install_089() {
+    refuse_soak "$NAMESPACE" "$RELEASE"
+    local img ref
+    for img in "${IMAGES[@]}"; do
+        ref="$(image_for "$img" "0.8.9")"
+        log "refreshing published image $ref"
+        docker pull "$ref"
+    done
+    load_tag_images "0.8.9"
+    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
+    local sets=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && sets+=(--set "$line")
+    done < <(image_sets "IfNotPresent")
+    log "helm install published 0.8.9 ns=$NAMESPACE release=$RELEASE"
+    helm_ns install "$RELEASE" "$ASSET_DIR/curie-0.8.9.tgz" \
+        --create-namespace \
+        --wait --timeout 15m \
+        "${sets[@]}"
+    OWNED_HELM=1
+    wait_rollout
+    REV_089="$(helm_revision)"
+    log "published 0.8.9 helm revision $REV_089"
 }
 
 cluster_up_n() {
@@ -1006,6 +1066,8 @@ run_compatible_rollback() {
     kubectl_ns get deploy "$(fullname)-api" -o jsonpath='{.status.readyReplicas}{"\n"}' | grep -vq '^0$' \
         || die "api not Ready after compatible rollback"
     api_health >/dev/null || die "api health failed after compatible rollback"
+    assert_sentinel
+    assert_alembic "$SUPPORTED_ROLLBACK_HEAD"
     log "compatible rollback previous version 0.9.0 serves"
 }
 
@@ -1070,6 +1132,71 @@ run_rollback_published_088() {
             || die "0.9.x stopped serving after refused 0.8.8 rollback"
         log "rollback-published-088 refused with schema window; sentinel retained; N still serving"
     fi
+}
+
+run_rollback_published_089() {
+    uninstall_owned
+    helm_install_089
+    insert_sentinel
+    assert_sentinel
+    assert_alembic "$PUBLISHED_HEAD"
+
+    local boot=0
+    cluster_upgrade "0.9.0" "$CHART_090" --forward-only || boot=$?
+    record_upgrade_json "rollback-089-bootstrap"
+    [[ "$boot" -eq 0 ]] || die "rollback-089 bootstrap 0.8.9 to 0.9.0 exited $boot"
+    wait_rollout
+    [[ "$(helm_version)" == "0.9.0" ]] || die "rollback-089 bootstrap did not reach 0.9.0"
+    assert_sentinel
+    assert_alembic "$TARGET_HEAD"
+
+    helm_ns get manifest "$RELEASE" --revision "$REV_089" \
+        >"$EVIDENCE_DIR/rollback-089-retained-manifest.yaml"
+    if grep -Eq 'app.kubernetes.io/component:[[:space:]]*schema-compat' \
+        "$EVIDENCE_DIR/rollback-089-retained-manifest.yaml"; then
+        die "published 0.8.9 retained manifest unexpectedly has app.kubernetes.io/component=schema-compat"
+    fi
+    log "published 0.8.9 retained manifest has no app.kubernetes.io/component=schema-compat object"
+
+    load_tag_images "0.8.9"
+    local status=0
+    set +e
+    "$BIN" --json cluster rollback --yes --revision "$REV_089" \
+        --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-089.json" 2>"$EVIDENCE_DIR/rollback-089.err"
+    status=$?
+    set -e
+    (( status != 0 )) || die "published 0.8.9 rollback unexpectedly succeeded"
+
+    local err
+    err="$(cat "$EVIDENCE_DIR/rollback-089.json" "$EVIDENCE_DIR/rollback-089.err" 2>/dev/null || true)"
+    echo "$err" | grep -F "0.8.9" >/dev/null \
+        || die "rollback-089 refusal did not name 0.8.9: $err"
+    echo "$err" | grep -F "$PUBLISHED_HEAD" >/dev/null \
+        || die "rollback-089 refusal did not name published head $PUBLISHED_HEAD: $err"
+    echo "$err" | grep -F "$SUPPORTED_ROLLBACK_HEAD" >/dev/null \
+        || die "rollback-089 refusal did not name supported head $SUPPORTED_ROLLBACK_HEAD: $err"
+    echo "$err" | grep -F "outside its declared schema range" >/dev/null \
+        || die "rollback-089 refusal did not name the declared schema range: $err"
+    if echo "$err" | grep -F "could not establish" >/dev/null; then
+        die "rollback-089 failed identity classification instead of applying the published range: $err"
+    fi
+    [[ "$(helm_version)" == "0.9.0" ]] \
+        || die "refused rollback changed helm from 0.9.0 to $(helm_version)"
+    assert_sentinel
+    assert_alembic "$TARGET_HEAD"
+    kubectl_ns get deploy "$(fullname)-api" -o jsonpath='{.status.readyReplicas}{"\n"}' | grep -vq '^0$' \
+        || die "api has no readyReplicas after refused published 0.8.9 rollback"
+    api_health >/dev/null || die "api health failed after refused published 0.8.9 rollback"
+    log "published 0.8.9 refused at schema head $PUBLISHED_HEAD; 0.9.0 and sentinel remain healthy"
+
+    local advance=0
+    cluster_upgrade "0.9.1" "$CHART_091" || advance=$?
+    record_upgrade_json "rollback-089-compatible-setup"
+    [[ "$advance" -eq 0 ]] || die "rollback-089 compatible setup exited $advance"
+    wait_rollout
+    [[ "$(helm_version)" == "0.9.1" ]] || die "rollback-089 compatible setup did not reach 0.9.1"
+    run_compatible_rollback
 }
 
 schema_migrate_busy() {
@@ -1263,6 +1390,7 @@ write_evidence() {
   "issue": 2590,
   "commit": "$CANDIDATE",
   "published": "0.8.8",
+  "strict_published_rollback": "0.8.9",
   "published_head": "$PUBLISHED_HEAD",
   "target_head": "$TARGET_HEAD",
   "n": "0.9.0",
@@ -1320,6 +1448,9 @@ run_matrix() {
     fi
     if scenario_wanted "rollback-published-088"; then
         run_rollback_published_088
+    fi
+    if scenario_wanted "rollback-published-089"; then
+        run_rollback_published_089
     fi
     if scenario_wanted "migration-crash"; then
         run_migration_crash
