@@ -19,6 +19,7 @@ const AGENT_ID: &str = "44444444-4444-4444-4444-444444444444";
 const AGENT_NAME: &str = "acme-bot";
 const INBOX: &str = "ops@example.com";
 const EXP: i64 = 1_800_000_000;
+const DISCOVERED_FULLNAME: &str = "acme-mail-runtime";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -197,6 +198,11 @@ impl ClusterStub {
             .to_string(),
         )
         .unwrap();
+        fs::write(
+            root.join("discovered-api.txt"),
+            format!("{DISCOVERED_FULLNAME}-api\n"),
+        )
+        .unwrap();
         // `fail.<step>` sentinel files let a test make one stubbed step exit
         // nonzero. The stderr text matters: `helm` must not say "release: not
         // found" (which the CLI reads as an absent release, not a failure) and
@@ -236,6 +242,24 @@ case "${0##*/}:$*" in
       exit 1
     fi
     exit 0 ;;
+  kubectl:*get\ svc*)
+    if fail fullname; then
+      echo 'Error from server (Forbidden): services is forbidden' >&2
+      exit 1
+    fi
+    cat "${0%/*}/discovered-api.txt"; exit 0 ;;
+  kubectl:*get\ secret*)
+    secret=
+    prev=
+    for arg in "$@"; do
+      if [ "$prev" = "secret" ]; then secret=$arg; fi
+      prev=$arg
+    done
+    if fail secret-read; then
+      echo "Error from server (Forbidden): secrets \"$secret\" is forbidden" >&2
+      exit 1
+    fi
+    printf '%s\n' '{}'; exit 0 ;;
   kubectl:*--raw*)
     cat "${0%/*}/status.json"; exit 0 ;;
   kubectl:"get pods"*)
@@ -255,9 +279,19 @@ exit 0
         self.0.path()
     }
 
-    /// Make the named stubbed step (`helm`, `patch`, `rollout`) exit nonzero.
+    /// Make the named stubbed step (`helm`, `helm-absent`, `fullname`,
+    /// `secret-read`, `patch`, `rollout`) exit nonzero.
     fn failing(self, step: &str) -> Self {
         fs::write(self.0.path().join(format!("fail.{step}")), "").unwrap();
+        self
+    }
+
+    fn with_discovered_fullname(self, fullname: &str) -> Self {
+        fs::write(
+            self.0.path().join("discovered-api.txt"),
+            format!("{fullname}-api\n"),
+        )
+        .unwrap();
         self
     }
 
@@ -322,12 +356,11 @@ fn api_logging_to(token: &str, log_dir: Option<&std::path::Path>) -> MockServer 
 }
 
 #[test]
-fn mint_writes_the_secret_via_patch_file_and_never_prints_the_token() {
+fn mint_discovers_an_override_fullname_before_minting_and_patches_its_secret() {
     let token = sample_token(EXP);
-    let server = api_for_mint(&token);
-    let stub = ClusterStub::new(serde_json::json!({
-        "mailAdapter": {"deploy": true}
-    }));
+    let stub = ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}}))
+        .with_discovered_fullname(DISCOVERED_FULLNAME);
+    let server = api_logging_to(&token, Some(stub.dir()));
     let run = stub.run(&[
         "--json",
         "cluster",
@@ -350,6 +383,11 @@ fn mint_writes_the_secret_via_patch_file_and_never_prints_the_token() {
     let value: serde_json::Value = serde_json::from_str(run.stdout.trim()).unwrap();
     assert_eq!(value["exp"], EXP, "{value}");
     assert_eq!(value["kind"], "email");
+    assert_eq!(
+        value["secret"]["name"],
+        format!("{DISCOVERED_FULLNAME}-secrets"),
+        "{value}"
+    );
     assert_eq!(value["secret"]["key"], "mailChannelToken");
     assert!(value.get("token").is_none(), "{value}");
     assert!(!run.stdout.contains(&token), "{}", run.stdout);
@@ -357,35 +395,73 @@ fn mint_writes_the_secret_via_patch_file_and_never_prints_the_token() {
     let patched = stub.patched();
     assert!(patched.contains(&token), "{patched}");
     let calls = stub.calls();
-    assert!(calls.contains("patch secret"), "{calls}");
+    assert!(
+        calls.contains(&format!("patch secret {DISCOVERED_FULLNAME}-secrets")),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("patch secret acme-curie-secrets"),
+        "the chart computed Secret must not be patched when discovery found an override: {calls}"
+    );
     assert!(calls.contains("--patch-file"), "{calls}");
     assert!(calls.contains("rollout restart"), "{calls}");
+    let secret_preflight =
+        format!("kubectl -n mail-test get secret {DISCOVERED_FULLNAME}-secrets -o name");
+    assert!(calls.contains(&secret_preflight), "{calls}");
     assert!(
         !calls.contains(&token),
         "token must not appear in kubectl/helm argv: {calls}"
     );
-    let traffic = server
+    let at = |needle: &str| {
+        calls
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing from: {calls}"))
+    };
+    assert!(
+        at("kubectl -n mail-test get svc") < at(&secret_preflight),
+        "fullname discovery must precede the resolved Secret read: {calls}"
+    );
+    assert!(
+        at(&secret_preflight) < at("api POST /channels/token"),
+        "the resolved Secret read must precede minting: {calls}"
+    );
+    assert!(
+        at("api POST /channels/token") < at("patch secret"),
+        "minting must precede the Secret patch: {calls}"
+    );
+    assert!(
+        at("patch secret") < at("rollout restart"),
+        "the Secret patch must precede the rollout: {calls}"
+    );
+    let mint_requests = server
         .recorded()
-        .iter()
-        .map(|r| format!("{} {}", r.method, r.path))
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.path == "/channels/token")
         .collect::<Vec<_>>();
     assert!(
-        traffic.iter().any(|t| t == "POST /channels/token"),
-        "{traffic:?}"
+        mint_requests.len() == 1,
+        "expected exactly one token mint request, got {mint_requests:?}"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&mint_requests[0].body).expect("mint request body must be JSON");
+    assert_eq!(
+        body,
+        serde_json::json!({"kind": "email", "address": INBOX, "ttl_s": 604_800})
     );
 }
 
 #[test]
 fn mint_targets_the_existing_secret_when_configured() {
     let token = sample_token(EXP);
-    let server = api_for_mint(&token);
     let stub = ClusterStub::new(serde_json::json!({
         "mailAdapter": {
             "deploy": true,
             "channelTokenExistingSecret": "curie-mail-credentials",
             "channelTokenExistingSecretKey": "channel-token"
         }
-    }));
+    }))
+    .failing("fullname");
+    let server = api_logging_to(&token, Some(stub.dir()));
     let run = stub.run(&[
         "--json",
         "cluster",
@@ -409,11 +485,152 @@ fn mint_targets_the_existing_secret_when_configured() {
     assert_eq!(value["secret"]["name"], "curie-mail-credentials");
     assert_eq!(value["secret"]["key"], "channel-token");
     assert!(!run.stdout.contains(&token));
+    assert!(!run.stderr.contains(&token));
     let calls = stub.calls();
     assert!(
         calls.contains("patch secret curie-mail-credentials"),
         "{calls}"
     );
+    assert!(
+        !calls.contains("get svc"),
+        "an explicitly configured Secret must bypass fullname discovery: {calls}"
+    );
+    assert!(
+        calls.contains("kubectl -n mail-test get secret curie-mail-credentials -o name"),
+        "the explicitly configured Secret must be preflighted exactly: {calls}"
+    );
+    assert!(
+        !calls.contains(&token),
+        "the token must not enter a shell argument: {calls}"
+    );
+    let at = |needle: &str| {
+        calls
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing from: {calls}"))
+    };
+    assert!(
+        at("kubectl -n mail-test get secret curie-mail-credentials -o name")
+            < at("api POST /channels/token"),
+        "the configured Secret read must precede minting: {calls}"
+    );
+}
+
+#[test]
+fn an_unconfirmed_chart_secret_refuses_before_mint_patch_or_rollout() {
+    let token = sample_token(EXP);
+    let stub =
+        ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}})).failing("fullname");
+    let server = api_logging_to(&token, Some(stub.dir()));
+    let run = stub.run(&mint_argv(&server.base_url));
+
+    assert_ne!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    let value: serde_json::Value = serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|error| panic!("stdout must be JSON: {error}; {}", run.stdout));
+    let error = value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("failure JSON must contain an error string: {value}"));
+    assert!(error.contains("unconfirmed Secret"), "{value}");
+    assert!(error.contains("namespace mail-test"), "{value}");
+    assert!(error.contains("release acme"), "{value}");
+    assert!(error.contains("services is forbidden"), "{value}");
+    let fix = value["fix"].as_str().unwrap_or_default();
+    assert!(
+        fix.contains("restore kubectl access and RBAC to get/list services and deployments"),
+        "{value}"
+    );
+    assert!(!run.stdout.contains(&token), "{}", run.stdout);
+    assert!(!run.stderr.contains(&token), "{}", run.stderr);
+    assert!(
+        !run.stderr.contains("COMPUTED GUESS"),
+        "a refusal must not continue with a computed Secret target: {}",
+        run.stderr
+    );
+
+    let calls = stub.calls();
+    let at = |needle: &str| {
+        calls
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing from: {calls}"))
+    };
+    assert!(
+        at("helm get values") < at("kubectl -n mail-test get svc"),
+        "fullname discovery must run after Helm values are confirmed: {calls}"
+    );
+    assert!(
+        !calls.contains("patch secret") && !calls.contains("rollout"),
+        "the unconfirmed target must stop before cluster writes: {calls}"
+    );
+    assert!(
+        !calls.contains(&token),
+        "the token must not enter a shell argument: {calls}"
+    );
+    assert!(stub.patched().is_empty(), "no patch file may be produced");
+    let minted = server
+        .recorded()
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.path == "/channels/token")
+        .count();
+    assert_eq!(minted, 0, "an unconfirmed Secret must not mint a token");
+}
+
+#[test]
+fn an_unreadable_resolved_chart_secret_refuses_before_mint_patch_or_rollout() {
+    let token = sample_token(EXP);
+    let secret = format!("{DISCOVERED_FULLNAME}-secrets");
+    let stub = ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}}))
+        .with_discovered_fullname(DISCOVERED_FULLNAME)
+        .failing("secret-read");
+    let server = api_logging_to(&token, Some(stub.dir()));
+    let run = stub.run(&mint_argv(&server.base_url));
+
+    assert_ne!(run.code, 0, "{} {}", run.stdout, run.stderr);
+    let value: serde_json::Value = serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|error| panic!("stdout must be JSON: {error}; {}", run.stdout));
+    let error = value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("failure JSON must contain an error string: {value}"));
+    assert!(error.contains(&secret), "{value}");
+    assert!(error.contains("namespace mail-test"), "{value}");
+    assert!(error.contains("release acme"), "{value}");
+    assert!(
+        error.contains(&format!("secrets \"{secret}\" is forbidden")),
+        "{value}"
+    );
+    assert!(error.contains("no token was minted"), "{value}");
+    assert!(!run.stdout.contains(&token), "{}", run.stdout);
+    assert!(!run.stderr.contains(&token), "{}", run.stderr);
+
+    let calls = stub.calls();
+    let preflight = format!("kubectl -n mail-test get secret {secret} -o name");
+    let at = |needle: &str| {
+        calls
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing from: {calls}"))
+    };
+    assert!(
+        at("helm get values") < at("kubectl -n mail-test get svc")
+            && at("kubectl -n mail-test get svc") < at(&preflight),
+        "Helm values and fullname discovery must precede the Secret preflight: {calls}"
+    );
+    assert!(
+        !calls.contains("api POST /channels/token")
+            && !calls.contains("patch secret")
+            && !calls.contains("rollout"),
+        "an unreadable Secret must stop before every mutation: {calls}"
+    );
+    assert!(
+        !calls.contains(&token),
+        "the token must not enter a shell argument: {calls}"
+    );
+    assert!(stub.patched().is_empty(), "no patch file may be produced");
+    let minted = server
+        .recorded()
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.path == "/channels/token")
+        .count();
+    assert_eq!(minted, 0, "an unreadable Secret must not mint a token");
 }
 
 #[test]
