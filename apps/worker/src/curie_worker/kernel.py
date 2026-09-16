@@ -1393,6 +1393,7 @@ class Kernel:
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
             # and gated on the resume event id so an ordinary turn pays nothing.
             if self._is_approval_resume(qevent.event_id):
+                await self._adopt_remembered_notice_ref(qevent)
                 with operation_span(
                     "curie.approval.resume",
                     kind=SpanKind.INTERNAL,
@@ -4169,6 +4170,31 @@ class Kernel:
             note=record.resolution_note,
         )
 
+    async def _adopt_remembered_notice_ref(self, qevent: QueuedTurn) -> None:
+        """Adopt the pending notice's ref on a ref-less approval resume (#2721).
+
+        The approval row is persisted before any delivery, so a placeholderless
+        turn's record replays no ref. The notice's minted ref was remembered
+        under the approval id instead; adopting it before the turn streams keeps
+        the resumed answer on that same message (#1640). Best-effort: a miss
+        only means the answer lands on a new message.
+        """
+
+        if self._card_store is None or self._target_for(qevent).reply_ref is not None:
+            return
+        approval_id = _approval_id_from_resume_event(qevent.event_id)
+        if approval_id is None:
+            return
+        try:
+            ref = await self._card_store.read_notice_ref(approval_id)
+        except Exception as exc:  # noqa: BLE001 - never fail the resume
+            logger.warning(
+                "reading notice ref failed for approval %s: %s", approval_id, exc
+            )
+            return
+        if ref:
+            self._adopt_ref(qevent, ReplyAck(ref=ref))
+
     async def _pause_for_approval(
         self,
         qevent: QueuedTurn,
@@ -4186,6 +4212,13 @@ class Kernel:
         can wake it. The converse crash (record created, suspend or notice
         lost) self-heals -- creation is idempotent on the event id, and the
         resume path cold-claims a fresh sandbox regardless (ADR-0003).
+
+        The record also precedes EVERY delivery (#2721). A placeholderless turn
+        persists whatever ref it already holds, possibly None, and the pending
+        notice is best-effort: a dead transport must not strand a turn whose row
+        and suspension already happened. A ref the notice mints for a ref-less
+        row is remembered in the card store so the resume edits that message
+        (#1640).
 
         ``approval_routes`` is the agent's per-deployment route-binding map
         (#247/#1460): ``resolution`` owns the sole interactive card and verified
@@ -4268,17 +4301,6 @@ class Kernel:
         # so the durable record, the card and the publication request stay free
         # of it.
         inference = _workspace_inference_notice(outcome.workspace_inferred_repo)
-        if self._target_for(qevent).reply_ref is None:
-            # A placeholderless approval must be addressable before persistence.
-            # If this delivery fails, let the exception escape so the event stays
-            # retryable instead of creating and suspending an approval whose
-            # requester cannot see it.
-            ack = await self._reply_for(
-                qevent, route, _join_reply_blocks(base or summary, inference)
-            )
-            if ack.ref is None:
-                raise RuntimeError("approval reply ref was not minted")
-
         try:
             if is_publication:
                 publication_creator = self._publication_creator
@@ -4482,7 +4504,35 @@ class Kernel:
                 "The session is paused and will resume once an authorized member "
                 "resolves this request."
             )
-        await self._reply_for(qevent, route, _join_reply_blocks(base, inference, notice))
+        # Best-effort (#2721): the row exists and the session is suspended, so a
+        # transport failure here must not reclaim the turn into a second model
+        # run. Cancellation still propagates.
+        persisted_ref = self._target_for(qevent).reply_ref
+        try:
+            await self._reply_for(
+                qevent, route, _join_reply_blocks(base, inference, notice)
+            )
+        except Exception as exc:  # noqa: BLE001 - the approval is already durable
+            logger.warning(
+                "pending notice delivery failed for approval %s: %s", created.id, exc
+            )
+        else:
+            minted_ref = self._target_for(qevent).reply_ref
+            if (
+                persisted_ref is None
+                and minted_ref is not None
+                and self._card_store is not None
+            ):
+                # The row carries no ref, so remember the one the notice minted
+                # for the resume turn to adopt (#1640 under #2721 ordering).
+                try:
+                    await self._card_store.remember_notice_ref(created.id, minted_ref)
+                except Exception as exc:  # noqa: BLE001 - resume falls back to a new message
+                    logger.warning(
+                        "remembering notice ref failed for approval %s: %s",
+                        created.id,
+                        exc,
+                    )
 
         if is_publication:
             # The atomic Approval+Publication insert is also the durable initial

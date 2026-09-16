@@ -246,6 +246,28 @@ class ApprovalCardStore:
         except (ValueError, KeyError, TypeError):
             return None
 
+    async def remember_notice_ref(self, approval_id: str, ref: str) -> None:
+        """Remember the ref a pending notice minted for a ref-less row (#2721).
+
+        The row is persisted before any delivery, so a placeholderless turn's
+        record carries no ref; this is the only memory of the message the resume
+        should edit. Same TTL as the card, for the same SLA reason.
+        """
+
+        if not approval_id:
+            raise ValueError("approval_id is required to remember a notice ref")
+        await self._redis.set(
+            self._config.approval_notice_ref_key(approval_id), ref, ex=self._ttl_s
+        )
+
+    async def read_notice_ref(self, approval_id: str) -> str | None:
+        """The remembered notice ref for an approval, if any (#2721)."""
+
+        raw = await self._redis.get(self._config.approval_notice_ref_key(approval_id))
+        if not raw:
+            return None
+        return raw.decode() if isinstance(raw, bytes) else str(raw)
+
     async def read(
         self, approval_id: str
     ) -> tuple[ApprovalCardRef, str | bytes] | None:
