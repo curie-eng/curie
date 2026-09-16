@@ -294,12 +294,15 @@ class _WorkspaceProbe:
         }
         thread_key = str(kwargs["thread_key"])
         agent_name = kwargs.get("agent_name")
+        # #2739: the coordinator forwards the kernel's fresh-only fence.
+        fence = {"fresh_only": kwargs["fresh_only"]} if "fresh_only" in kwargs else {}
         try:
             handle = self.substrate.claim(
                 thread_key,
                 env=env,
                 agent_name=agent_name,
                 workspace_repo=kwargs.get("repo_full_name"),
+                **fence,
             )
         except SuspendedThreadError:
             handle = self.substrate.resume(
@@ -1786,5 +1789,307 @@ def test_the_attachment_ledger_is_swept_from_the_same_reap_tick_under_the_route_
             assert len(finished) == 1, "the sweep never reached its fenced ledger delete"
             token = await contender
             await h.kernel._lock.release(h.config.lock_key(thread), token)
+
+    asyncio.run(go())
+
+
+# --- #2739: a retained runner that restarts across the attachment lookups ----
+
+
+def _hide_sandboxes(h: Any, monkeypatch: Any) -> set[str]:
+    """Docker-shaped non-liveness: ``get_sandbox`` reports these names gone.
+
+    ``DockerSandboxClient.get_sandbox`` returns None for a ``restarting``
+    container, so both attachment lookups read no route. Clearing the returned
+    set models the container coming back ``running``.
+    """
+
+    hidden: set[str] = set()
+    real_get_sandbox = h.fake_k8s.get_sandbox
+
+    def get_sandbox(name: str) -> Any:
+        if name in hidden:
+            return None
+        return real_get_sandbox(name)
+
+    monkeypatch.setattr(h.fake_k8s, "get_sandbox", get_sandbox)
+    return hidden
+
+
+def _before_substrate_call(
+    h: Any, monkeypatch: Any, method: str, action: Callable[[], None]
+) -> list[int]:
+    """Run ``action`` once, right before the kernel's next ``substrate.<method>``."""
+
+    calls: list[int] = []
+    real = getattr(h.substrate, method)
+
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if not calls:
+            action()
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(h.substrate, method, wrapped)
+    return calls
+
+
+async def _refused_restart_race(
+    h: Any,
+    monkeypatch: Any,
+    *,
+    thread: str,
+    shape: str,
+) -> tuple[Any, Any, _FakeAttachmentLane, QueuedTurn]:
+    """Drive one file turn through the non-live -> live race and return
+    (old handle, old runner, lane, file event)."""
+
+    for runner in h.runners.values():
+        runner.default_script = [Final(text="ok", status=DONE)]
+    await h.kernel.process_event(_qevent("first", thread=thread))
+    _authenticate_route(h, thread)
+    thread_key = _thread_key(thread)
+    old = h.substrate.lookup(thread_key)
+    assert old is not None
+    old_runner = h.runners[h.fake_k8s.assigned_ports[old.sandbox_name]]
+    assert old_runner.opened == ["first"]
+
+    lane = _FakeAttachmentLane()
+    h.kernel._attachments = lane  # type: ignore[attr-defined]
+
+    if shape == "docker":
+        hidden = _hide_sandboxes(h, monkeypatch)
+        hidden.add(old.sandbox_name)
+        revive = hidden.clear
+    else:
+        h.fake_k8s.set_sandbox_mode(old.sandbox_name, "Suspended")
+
+        def revive() -> None:
+            h.fake_k8s.set_sandbox_mode(old.sandbox_name, "Running")
+
+    assert h.substrate.lookup(thread_key) is None
+    claim_calls = _before_substrate_call(h, monkeypatch, "claim", revive)
+
+    file_event = _qevent(
+        "read this",
+        thread=thread,
+        event_id=f"restart-race-{shape}",
+        placeholder="p-file",
+        attachments=[Attachment(id="F2739", name="restart.txt")],
+    )
+    await h.kernel.process_event(file_event)
+    assert claim_calls, "the race never reached substrate.claim"
+    return old, old_runner, lane, file_event
+
+
+async def _assert_refused_race(
+    h: Any,
+    *,
+    thread: str,
+    old: Any,
+    old_runner: Any,
+    lane: _FakeAttachmentLane,
+    file_event: QueuedTurn,
+) -> None:
+    thread_key = _thread_key(thread)
+    assert old_runner.opened == ["first"], "the file turn started on the pre-existing runner"
+    assert all("read this" not in runner.opened for runner in h.runners.values())
+    assert lane.discard_calls == [{"thread_key": thread_key, "prepared": lane.prepared}]
+    file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
+    assert file_updates and file_updates[-1] == CHANGED_FILE_REPLY
+    assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
+    assert all(
+        ATTACHMENTS_REF_ENV not in (env or {}) for env in h.fake_k8s.claim_envs
+    ), "a claim env carried the refused attachment"
+    assert len(h.fake_k8s.claim_envs) == 1
+    assert h.substrate.lookup(thread_key) == old
+
+
+def test_docker_restart_between_attachment_lookups_and_claim_refuses_the_file_turn(
+    make_harness,
+    monkeypatch,
+) -> None:
+    """#2739: a ``restarting`` container reads as no route, then is adopted.
+
+    Both lookups saw no live handle, so no fenced handoff ran, and the ordinary
+    claim reused the old runner (no attachment capability) and ignored the
+    attachment env. The turn must instead be refused as a changed thread.
+    """
+
+    async def go() -> None:
+        async with make_harness(per_sandbox_runners=2) as h:
+            old, old_runner, lane, file_event = await _refused_restart_race(
+                h, monkeypatch, thread="tDockerRestart", shape="docker"
+            )
+            await _assert_refused_race(
+                h,
+                thread="tDockerRestart",
+                old=old,
+                old_runner=old_runner,
+                lane=lane,
+                file_event=file_event,
+            )
+
+    asyncio.run(go())
+
+
+def test_k8s_nonrunning_mode_between_attachment_lookups_and_claim_refuses_the_file_turn(
+    make_harness,
+    monkeypatch,
+) -> None:
+    """#2739: the K8s shape, an operatingMode that is not Running during both
+    lookups and Running again at claim."""
+
+    async def go() -> None:
+        async with make_harness(per_sandbox_runners=2) as h:
+            old, old_runner, lane, file_event = await _refused_restart_race(
+                h, monkeypatch, thread="tK8sRestart", shape="k8s"
+            )
+            await _assert_refused_race(
+                h,
+                thread="tK8sRestart",
+                old=old,
+                old_runner=old_runner,
+                lane=lane,
+                file_event=file_event,
+            )
+
+    asyncio.run(go())
+
+
+def test_redelivered_file_after_a_refused_restart_race_reaches_one_runner_once(
+    make_harness,
+    monkeypatch,
+) -> None:
+    """#2739 negative duplicate-consumption control.
+
+    After the refusal, the whole message sent again finds the now-live idle
+    route and goes through the fenced handoff: the attachment reaches exactly
+    one new runner exactly once, and the old runner never sees the file text.
+    """
+
+    async def go() -> None:
+        async with make_harness(per_sandbox_runners=2) as h:
+            thread = "tRestartRetry"
+            old, old_runner, lane, file_event = await _refused_restart_race(
+                h, monkeypatch, thread=thread, shape="docker"
+            )
+            await _assert_refused_race(
+                h,
+                thread=thread,
+                old=old,
+                old_runner=old_runner,
+                lane=lane,
+                file_event=file_event,
+            )
+            monkeypatch.undo()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+
+            retry = _qevent(
+                "read this again",
+                thread=thread,
+                event_id="restart-race-retry",
+                placeholder="p-retry",
+                attachments=[Attachment(id="F2739", name="restart.txt")],
+            )
+            await h.kernel.process_event(retry)
+
+            attachment_envs = [
+                env
+                for env in h.fake_k8s.claim_envs
+                if env is not None and ATTACHMENTS_REF_ENV in env
+            ]
+            assert len(attachment_envs) == 1
+            assert attachment_envs[0][ATTACHMENTS_REF_ENV] == REF_VALUE
+            new = h.substrate.lookup(_thread_key(thread))
+            assert new is not None and new.claim_name != old.claim_name
+            new_runner = h.runners[h.fake_k8s.assigned_ports[new.sandbox_name]]
+            assert new_runner is not old_runner
+            assert new_runner.opened == ["read this again"]
+            assert old_runner.opened == ["first"]
+            assert len(lane.resolve_calls) == 2
+            assert len(lane.discard_calls) == 1
+
+    asyncio.run(go())
+
+
+def test_file_turn_on_a_new_thread_still_claims_fresh_with_the_attachment(
+    make_harness,
+) -> None:
+    """#2739 AC3: with no route at all the fence is not a refusal."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            lane = _FakeAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="read", status=DONE)]
+
+            await h.kernel.process_event(
+                _qevent(
+                    "read this",
+                    thread="tRestartFresh",
+                    placeholder="p-fresh",
+                    attachments=[Attachment(id="F2739N", name="new.txt")],
+                )
+            )
+
+            assert len(h.fake_k8s.claim_envs) == 1
+            assert _claim_env(h)[ATTACHMENTS_REF_ENV] == REF_VALUE
+            assert h.runner.opened == ["read this"]
+            assert lane.discard_calls == []
+            assert h.substrate.lookup(_thread_key("tRestartFresh")) is not None
+
+    asyncio.run(go())
+
+
+def test_workspace_route_live_again_at_adopt_refuses_the_file_turn(
+    make_harness,
+    monkeypatch,
+) -> None:
+    """#2739 workspace sibling: ``_claim_or_resume`` must not adopt a route that
+    both attachment lookups saw as non-live."""
+
+    async def go() -> None:
+        binding = _WorkspaceBinding(uuid.uuid4())
+        async with make_harness(binding=binding) as h:
+            workspace = _WorkspaceProbe(h.substrate)
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            h.runner.default_script = [Final(text="one", status=DONE)]
+            await h.kernel.process_event(_qevent("first", thread="tWorkspaceRestart"))
+            thread_key = _thread_key("tWorkspaceRestart")
+            old = h.substrate.lookup(thread_key)
+            assert old is not None and old.workspace_repo == "acme/example"
+            assert len(workspace.claim_calls) == 1
+
+            lane = _FakeAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            hidden = _hide_sandboxes(h, monkeypatch)
+            hidden.add(old.sandbox_name)
+            assert h.substrate.lookup(thread_key) is None
+            adopt_calls = _before_substrate_call(h, monkeypatch, "adopt", hidden.clear)
+
+            file_event = _qevent(
+                "read this",
+                thread="tWorkspaceRestart",
+                event_id="workspace-restart-race",
+                placeholder="p-file",
+                attachments=[Attachment(id="F2739W", name="workspace.txt")],
+            )
+            await h.kernel.process_event(file_event)
+
+            assert adopt_calls, "the race never reached substrate.adopt"
+            assert h.runner.opened == ["first"]
+            assert lane.discard_calls == [
+                {"thread_key": thread_key, "prepared": lane.prepared}
+            ]
+            file_updates = [
+                text for _channel, ref, text in h.sink.updates if ref == "p-file"
+            ]
+            assert file_updates and file_updates[-1] == CHANGED_FILE_REPLY
+            assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
+            assert all(
+                ATTACHMENTS_REF_ENV not in (env or {}) for env in h.fake_k8s.claim_envs
+            )
+            assert h.substrate.lookup(thread_key) == old
 
     asyncio.run(go())

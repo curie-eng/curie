@@ -1510,3 +1510,195 @@ def test_service_fqdn_polling_restarts_fast_after_a_cold_bind(
 
     assert fake_k8s.sandbox_polls == pytest.approx([10.0, 10.05])
     assert handle.service_fqdn.endswith(".svc.cluster.local")
+
+
+# --- #2739: fresh-only claims across runner restart transitions -------------
+
+
+def _route_changed_error() -> type[Exception]:
+    """Imported lazily so the rest of this module still collects before #2739."""
+
+    from curie_worker.sandbox import RouteChangedError, SandboxError
+
+    assert issubclass(RouteChangedError, SandboxError)
+    return RouteChangedError
+
+
+def test_default_claim_reuses_a_route_that_went_nonlive_then_live_again(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient
+) -> None:
+    """Control for #2739: the ordinary claim reuses and ignores ``env``.
+
+    This is the bug shape a file turn must not inherit: a lookup that saw no
+    live route followed by a claim that silently adopts the old runner.
+    """
+
+    old = substrate.claim("T2739")
+    fake_k8s.sandboxes[old.sandbox_name].operating_mode = "Restarting"
+    assert substrate.lookup("T2739") is None
+    fake_k8s.sandboxes[old.sandbox_name].operating_mode = "Running"
+
+    again = substrate.claim("T2739", env={"CURIE_ATTACHMENTS_REF": "ref"})
+
+    assert again == old
+    assert len(fake_k8s.created) == 1
+
+
+def test_fresh_only_claim_refuses_a_route_that_became_live_after_lookup(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
+) -> None:
+    """#2739: a Running record under fresh_only is a changed route, not reuse."""
+
+    route_changed = _route_changed_error()
+    old = substrate.claim("T2739")
+    fake_k8s.sandboxes[old.sandbox_name].operating_mode = "Restarting"
+    assert substrate.lookup("T2739") is None
+    fake_k8s.sandboxes[old.sandbox_name].operating_mode = "Running"
+
+    with pytest.raises(route_changed):
+        substrate.claim(
+            "T2739",
+            env={"CURIE_ATTACHMENTS_REF": "ref"},
+            fresh_only=True,  # type: ignore[call-arg]
+        )
+
+    assert len(fake_k8s.created) == 1
+    assert affinity.get("T2739") == RouteRecord(handle=old)
+    assert old.claim_name not in fake_k8s.deleted
+
+
+def test_fresh_only_claim_with_no_route_claims_fresh_with_env(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient
+) -> None:
+    """#2739 AC3: a brand new thread still gets the attachment env on its claim."""
+
+    handle = substrate.claim(
+        "T2739-new",
+        env={"CURIE_ATTACHMENTS_REF": "ref"},
+        fresh_only=True,  # type: ignore[call-arg]
+    )
+
+    assert fake_k8s.created == [handle.claim_name]
+    assert fake_k8s.claims[handle.claim_name].env["CURIE_ATTACHMENTS_REF"] == "ref"
+    assert substrate.lookup("T2739-new") == handle
+
+
+def test_fresh_only_claim_evicts_a_gone_sandbox_and_claims_fresh_with_env(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient
+) -> None:
+    """#2739: a dead retained runner is not a changed route; it is replaced."""
+
+    old = substrate.claim("T2739-gone")
+    fake_k8s.sandboxes.pop(old.sandbox_name)
+
+    handle = substrate.claim(
+        "T2739-gone",
+        env={"CURIE_ATTACHMENTS_REF": "ref"},
+        fresh_only=True,  # type: ignore[call-arg]
+    )
+
+    assert handle.claim_name != old.claim_name
+    assert old.claim_name in fake_k8s.deleted
+    assert fake_k8s.claims[handle.claim_name].env["CURIE_ATTACHMENTS_REF"] == "ref"
+    assert substrate.lookup("T2739-gone") == handle
+
+
+def test_fresh_only_claim_that_loses_the_route_race_deletes_its_own_claim(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2739: losing put_if_absent to a live winner never adopts the winner."""
+
+    route_changed = _route_changed_error()
+    real_put = affinity.put_if_absent
+    planted: list[bool] = []
+
+    def plant_winner_first(thread_key: str, record: RouteRecord, ttl_seconds: int) -> bool:
+        if not planted:
+            planted.append(True)
+            # The nested default claim records the live winner through the
+            # real put (the flag above lets it through), then ours loses.
+            substrate.claim(thread_key)
+        return real_put(thread_key, record, ttl_seconds)
+
+    monkeypatch.setattr(affinity, "put_if_absent", plant_winner_first)
+
+    with pytest.raises(route_changed):
+        substrate.claim(
+            "T2739-race",
+            env={"CURIE_ATTACHMENTS_REF": "ref"},
+            fresh_only=True,  # type: ignore[call-arg]
+        )
+
+    winner = affinity.get("T2739-race")
+    assert winner is not None
+    assert len(fake_k8s.created) == 2
+    (loser_claim,) = [name for name in fake_k8s.created if name != winner.handle.claim_name]
+    assert loser_claim in fake_k8s.deleted
+    assert loser_claim not in fake_k8s.claims
+    assert winner.handle.claim_name in fake_k8s.claims
+    assert winner.handle.claim_name not in fake_k8s.deleted
+    assert substrate.lookup("T2739-race") == winner.handle
+
+
+def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    """#2739 AC4 on the Docker client: ``restarting`` reads as gone to lookup,
+    and the same container back to ``running`` must not be adopted by a
+    fresh-only claim."""
+
+    from curie_worker.sandbox.docker import DockerSandboxClient
+
+    from .conftest import _FakeBundleStore
+
+    route_changed = _route_changed_error()
+
+    class _RestartingDocker(DockerSandboxClient):
+        def __init__(self) -> None:
+            super().__init__(image="curie-runner", bundle_store=_FakeBundleStore())
+            self.status = "running"
+            self.created: list[str] = []
+
+        def _docker(self, args: list[str], *, check: bool = True) -> str:
+            raise AssertionError(f"unexpected docker call {args}")
+
+        def _inspect(self, name: str) -> tuple[str, dict[str, str], datetime | None]:
+            return self.status, {}, None
+
+        def _dial_endpoint(self, name: str) -> tuple[str, int] | None:
+            return ("127.0.0.1", 18080)
+
+        def create_claim(self, name: str, **_kwargs: object) -> None:
+            self.created.append(name)
+            raise AssertionError("a fresh-only claim created a container on a live route")
+
+    docker = _RestartingDocker()
+    substrate = SandboxSubstrate(docker, affinity, config)
+    old = SandboxHandle(
+        thread_key="T2739-docker",
+        claim_name="curie-thread-docker-abc123",
+        sandbox_name="curie-thread-docker-abc123",
+        namespace=config.namespace,
+        service_fqdn="127.0.0.1",
+        port=18080,
+        session_id="thread-docker",
+    )
+    assert affinity.put_if_absent("T2739-docker", RouteRecord(handle=old), 60)
+
+    docker.status = "restarting"
+    assert substrate.lookup("T2739-docker") is None
+    docker.status = "running"
+    assert substrate.lookup("T2739-docker") == old
+
+    with pytest.raises(route_changed):
+        substrate.claim(
+            "T2739-docker",
+            env={"CURIE_ATTACHMENTS_REF": "ref"},
+            fresh_only=True,  # type: ignore[call-arg]
+        )
+
+    assert docker.created == []
+    assert affinity.get("T2739-docker") == RouteRecord(handle=old)
