@@ -627,7 +627,7 @@ fn assert_only_consumed_chart(fixture: &Fixture, expected: &str, context: &str) 
 #[test]
 fn release_channel_default_uses_target_chart_cache_outside_checkout() {
     let fixture = Fixture::new(None);
-    let target = fixture.target_chart_cache("0.9.0");
+    let target = fixture.target_chart_cache("0.8.9");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
     fs::write(
         &target,
@@ -635,8 +635,13 @@ fn release_channel_default_uses_target_chart_cache_outside_checkout() {
     )
     .unwrap();
 
-    let output =
-        fixture.run_without_chart_with("schema-compatible", "0.9.0", fixture.0.path(), true, &[]);
+    let output = fixture.run_without_chart_with(
+        "release-cache-prior",
+        "0.8.9",
+        fixture.0.path(),
+        true,
+        &[],
+    );
     assert!(
         output.status.success(),
         "preseeded target archive must complete the recording fixture: {} / {}",

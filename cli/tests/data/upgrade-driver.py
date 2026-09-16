@@ -163,6 +163,12 @@ BASE = {
 
 SCENARIOS = {
     "healthy": {},
+    "release-cache-prior": {
+        "after": "0.8.9",
+        "served_after": "0.8.9",
+        "target": "0.8.9",
+        "show_chart": "0.8.9",
+    },
     # Helm exits 0 and the workloads converge, but the release never leaves the
     # old chart version. `helm show chart` still reports 0.9.0, so Validate
     # passes and Apply is genuinely reached; the post-condition read is the
