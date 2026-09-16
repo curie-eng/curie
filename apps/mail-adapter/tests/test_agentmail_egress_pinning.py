@@ -13,6 +13,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import socket
+import ssl
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -87,11 +88,13 @@ class _Dns:
         monkeypatch.setattr(socket.socket, "connect", recording_connect)
 
 
-def _config(tmp_path: Path, port: int, cidrs: list[str], host: str = HOST) -> MailAdapterConfig:
+def _config(
+    tmp_path: Path, port: int, cidrs: list[str], host: str = HOST, scheme: str = "http"
+) -> MailAdapterConfig:
     return MailAdapterConfig(
         agentmail_api_key="am-key",
         agentmail_inbox="inbox@agentmail.to",
-        agentmail_base_url=f"http://{host}:{port}/v0",
+        agentmail_base_url=f"{scheme}://{host}:{port}/v0",
         api_base_url="http://127.0.0.1:1",
         channel_token="chn",
         egress_secret="egr",
@@ -216,4 +219,163 @@ def test_module_request_is_not_pinned(edge: int, monkeypatch: pytest.MonkeyPatch
     result = agentmail.request("POST", f"http://{HOST}:{edge}/v1/ingress", {"x": 1})
 
     assert result.status == 200, result.body
+    assert dns.dialed == ["127.0.0.1"]
+
+
+# -- pinned dialing over real TLS ----------------------------------------------
+
+
+def _write_tls_material(tmp_path: Path, cert_hostname: str) -> tuple[Path, Path, Path]:
+    """A throwaway CA and a server certificate for ``cert_hostname``, both PEM."""
+    import datetime
+
+    x509 = pytest.importorskip("cryptography.x509", reason="real-TLS pins need cryptography")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.datetime.now(datetime.UTC)
+
+    def name(common: str) -> Any:
+        return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common)])
+
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(name("curie test CA"))
+        .issuer_name(name("curie test CA"))
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(hours=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    server_key = ec.generate_private_key(ec.SECP256R1())
+    server_cert = (
+        x509.CertificateBuilder()
+        .subject_name(name(cert_hostname))
+        .issuer_name(ca_cert.subject)
+        .public_key(server_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(hours=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(cert_hostname)]), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    ca_path = tmp_path / "ca.pem"
+    cert_path = tmp_path / "server.pem"
+    key_path = tmp_path / "server.key"
+    ca_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    cert_path.write_bytes(server_cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        server_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return ca_path, cert_path, key_path
+
+
+class _TlsEdge:
+    """A real HTTPS server on 127.0.0.1 that records the SNI name each client sends."""
+
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cert_hostname: str) -> None:
+        ca_path, cert_path, key_path = _write_tls_material(tmp_path, cert_hostname)
+        self.sni: list[str | None] = []
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert_path, key_path)
+
+        def record_sni(_sock: Any, server_name: str | None, _context: Any) -> None:
+            self.sni.append(server_name)
+
+        context.sni_callback = record_sni
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _ListHandler)
+        self.server.daemon_threads = True
+        self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        # The client trusts the throwaway CA through the stdlib default context, which
+        # keeps CERT_REQUIRED and check_hostname on: nothing in agentmail is replaced.
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca_path))
+        monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def tls_edge_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    edges: list[_TlsEdge] = []
+
+    def make(cert_hostname: str) -> _TlsEdge:
+        edge = _TlsEdge(tmp_path, monkeypatch, cert_hostname)
+        edges.append(edge)
+        return edge
+
+    yield make
+    for edge in edges:
+        edge.close()
+
+
+def test_https_dial_is_pinned_and_keeps_sni_and_verification(
+    tls_edge_factory: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production path: HTTPS with DNS answers wholly outside the policy."""
+    from curie_mail_adapter.agentmail import AgentMailClient
+
+    assert ssl.create_default_context().verify_mode == ssl.CERT_REQUIRED
+    tls = tls_edge_factory(HOST)
+    dns = _Dns(monkeypatch, [ROTATED_EDGE])
+    client = AgentMailClient(_config(tmp_path, tls.port, ["127.0.0.1/32"], scheme="https"))
+
+    status, body = client.list_messages(20)
+
+    assert status == 200, f"the pinned HTTPS dial did not reach the admitted edge: {body!r}"
+    assert body == LIST_BODY
+    assert tls.sni == [HOST], f"SNI did not carry the URL hostname: {tls.sni}"
+    assert ROTATED_EDGE not in dns.dialed, f"a non-admitted edge was dialed: {dns.dialed}"
+    assert "127.0.0.1" in dns.dialed
+
+
+def test_https_pinned_dial_still_rejects_a_certificate_for_another_host(
+    tls_edge_factory: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_mail_adapter.agentmail import AgentMailClient
+
+    tls = tls_edge_factory("other.invalid")
+    dns = _Dns(monkeypatch, [ROTATED_EDGE])
+    client = AgentMailClient(_config(tmp_path, tls.port, ["127.0.0.1/32"], scheme="https"))
+
+    status, body = client.list_messages(20)
+
+    assert status == 0, f"hostname verification was not enforced: {body!r}"
+    assert ROTATED_EDGE not in dns.dialed
     assert dns.dialed == ["127.0.0.1"]

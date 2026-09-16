@@ -155,6 +155,11 @@ a 200 clears it. `/statusz` reports `discovery` as `ok`, `failing`, or
 `CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS`, the state is `unreachable`,
 `/readyz` returns 503, and one ERROR is logged; one INFO is logged on recovery.
 `/healthz` does not follow discovery, so an outage does not restart the pod.
+The Service renders with `publishNotReadyAddresses: true`, so this 503 flips
+the Deployment's `Available` condition (the operator signal for a discovery
+outage) without removing the pod from Service endpoints: reply/completion
+deliveries from the worker do not depend on discovery and keep reaching the
+pod's POST handler through the outage.
 
 ### Boot gates
 
@@ -188,8 +193,10 @@ egress secret like every other POST.
 reports unhealthy for an unusable token. `curie doctor --json` reports a mail
 channel check with expiry, last ingress status, and a recovery command. Both
 read the adapter through Kubernetes pod proxy access, so diagnostics remain
-reachable after readiness removes the pod from Service endpoints. Unavailable
-diagnostics report unknown instead of healthy.
+reachable regardless of readiness state; the Service also keeps routing the
+pod's address while unready (`publishNotReadyAddresses: true`), so reply and
+completion deliveries reach it the same way. Unavailable diagnostics report
+unknown instead of healthy.
 
 For recovery, run `curie cluster channel-token <agent> --kind email --address <inbox>`.
 That mints a replacement via `POST /channels/token`, writes it into the Secret

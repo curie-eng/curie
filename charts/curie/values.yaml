@@ -1488,7 +1488,11 @@ mailAdapter:
   # platform side of a new binding is being wired.
   ingressEnabled: true
   # Continuous discovery-failure seconds after which readiness goes 503;
-  # liveness is unaffected.
+  # liveness is unaffected. The Service still publishes the pod's address
+  # while it is unready (publishNotReadyAddresses: true), so reply/completion
+  # deliveries from the worker keep reaching it through a discovery outage;
+  # readiness going 503 is the operator signal via Deployment.Available, not
+  # a routing cutoff.
   discoveryUnreadyAfterSeconds: 120
   # Who may start a turn by emailing the inbox. Empty denies everything, and with
   # ingressEnabled true the adapter refuses to boot rather than run an inbox that

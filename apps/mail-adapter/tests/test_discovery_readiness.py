@@ -12,11 +12,12 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
+from http.server import ThreadingHTTPServer
 from typing import Any
 
 import curie_mail_adapter.adapter as adapter_module
 import pytest
-from _support import IngressState, MailState, get, wait_until
+from _support import IngressState, MailHandler, MailState, get, wait_until
 from curie_mail_adapter.adapter import MailAdapter
 from curie_mail_adapter.config import MailAdapterConfig
 
@@ -128,21 +129,18 @@ def test_server_errors_count_as_discovery_failures(
 # -- poll loop wiring ---------------------------------------------------------
 
 
-class _SwitchableClient:
-    """Answers every call over no network; `down` makes the listing refuse."""
+def _serve_mail_on(port: int, mail: MailState) -> ThreadingHTTPServer:
+    """The fake AgentMail server bound to a FIXED port, so it can go away and return."""
+    server = ThreadingHTTPServer(("127.0.0.1", port), MailHandler)
+    server.state = mail  # type: ignore[attr-defined]
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
-    def __init__(self) -> None:
-        self.down = False
-        self.lists = 0
 
-    def list_messages(self, limit: int, page_token: str | None = None) -> tuple[int, Any]:
-        self.lists += 1
-        if self.down:
-            return 0, {"error": "[Errno 111] Connection refused"}
-        return 200, {"messages": []}
-
-    def __getattr__(self, name: str) -> Any:
-        raise AssertionError(f"unexpected provider call {name}")
+def _stop(server: ThreadingHTTPServer) -> None:
+    server.shutdown()
+    server.server_close()
 
 
 def test_poll_loop_drives_discovery_readiness_and_logs_edges_once(
@@ -153,11 +151,20 @@ def test_poll_loop_drives_discovery_readiness_and_logs_edges_once(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """The real AgentMailClient loses the provider at the transport, then regains it.
+
+    The provider is a fake AgentMail server on a fixed local port. It serves the
+    prime, is then shut down so every real list call is refused (status 0, the
+    soak outage's shape), and is finally started again on the same port.
+    """
     monkeypatch.setattr(adapter_module, "BACKOFF_STEP_SECONDS", 0.01)
     monkeypatch.setattr(adapter_module, "BACKOFF_MAX_SECONDS", 0.02)
-    client = _SwitchableClient()
+    provider = _serve_mail_on(0, mail)
+    port = provider.server_address[1]
     adapter = make_adapter(
-        client=client, poll_interval_seconds=0.01, discovery_unready_after_seconds=0.01
+        agentmail_base_url=f"http://127.0.0.1:{port}/v0",
+        poll_interval_seconds=0.01,
+        discovery_unready_after_seconds=0.05,
     )
     url = serve_egress(adapter)
     thread = threading.Thread(target=adapter.poll_loop, daemon=True)
@@ -180,29 +187,40 @@ def test_poll_loop_drives_discovery_readiness_and_logs_edges_once(
         try:
             thread.start()
             assert adapter.ready.wait(10), "startup never completed"
+            assert wait_until(lambda: mail.list_calls >= 2, timeout=10)
             assert get(url + "/readyz")[0] == 200
 
-            client.down = True
+            _stop(provider)
             assert wait_until(
                 lambda: adapter.status()["discovery"]["state"] == "unreachable", timeout=10
             ), adapter.status()
-            failures_at_unready = client.lists
-            assert wait_until(lambda: client.lists >= failures_at_unready + 3, timeout=10)
+            failures_at_unready = adapter.status()["discovery"]["consecutive_failures"]
+            assert wait_until(
+                lambda: (
+                    adapter.status()["discovery"]["consecutive_failures"] >= failures_at_unready + 3
+                ),
+                timeout=10,
+            ), adapter.status()
             assert get(url + "/readyz")[0] == 503
-            assert get(url + "/healthz")[0] == 200
-            assert adapter.status()["discovery"]["consecutive_failures"] >= 2
+            assert get(url + "/healthz")[0] == 200, "liveness must not follow discovery"
             assert len(errors()) == 1, errors()
+            assert any("poll: status=0," in r.getMessage() for r in caplog.records), (
+                "the outage was not a transport-level failure"
+            )
 
-            client.down = False
+            lists_while_down = mail.list_calls
+            provider = _serve_mail_on(port, mail)
             assert wait_until(lambda: adapter.status()["discovery"]["state"] == "ok", timeout=10), (
                 adapter.status()
             )
+            assert mail.list_calls > lists_while_down, "recovery was not a real provider listing"
             assert get(url + "/readyz")[0] == 200
             assert adapter.status()["discovery"]["consecutive_failures"] == 0
             assert wait_until(lambda: len(recoveries()) == 1, timeout=5), recoveries()
         finally:
             adapter.shutdown.set()
             thread.join(timeout=10)
+            _stop(provider)
     assert not thread.is_alive()
     assert len(errors()) == 1, errors()
     assert len(recoveries()) == 1, recoveries()

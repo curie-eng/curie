@@ -210,6 +210,13 @@ metadata:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: mail-adapter
 spec:
+  # publishNotReadyAddresses: readiness now reports sustained AgentMail
+  # discovery failure (#2731), so the Deployment's Available condition is
+  # the operator signal for that outage. The worker's reply/completion
+  # POST handler does not depend on discovery, so its deliveries must keep
+  # reaching this pod while it is unready, or a discovery outage also cuts
+  # reply routing on top of the discovery failure itself.
+  publishNotReadyAddresses: true
   selector:
     {{- include "curie.selectorLabels" (dict "root" . "component" "mail-adapter") | nindent 4 }}
   ports:

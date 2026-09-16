@@ -7,8 +7,11 @@
 # and rolls its pods when any of its three credentials rotate.
 #
 #   1  Default install renders no mail-adapter Deployment and no Service.
-#   2  mailAdapter.deploy=true renders both, and the Service port tracks
-#      mailAdapter.service.port.
+#   2  mailAdapter.deploy=true renders both, the Service port tracks
+#      mailAdapter.service.port, and the Service publishes addresses for a
+#      pod that is Ready=false (readiness reports sustained AgentMail
+#      discovery failure, #2731; the worker's reply/completion POST handler
+#      does not depend on discovery and must keep reaching the pod).
 #   3  Byte-limit defaults and overrides render as exact base-10 integer strings.
 #   4  CURIE_API_URL derives the in-chart API Service, tracks api.service.port,
 #      and mailAdapter.apiBaseUrl overrides it verbatim.
@@ -300,6 +303,14 @@ port_dir="$(render port "${ON[@]}" "${CREDS[@]}" --set mailAdapter.service.port=
 actual="$(field "$port_dir" Service "$SERVICE_NAME" spec.ports.0.port)"
 [ "$actual" = "9091" ] \
   || fail "with mailAdapter.service.port=9091 the Service port is '$actual'; the port is hardcoded in the template instead of read from the value"
+
+# The Service must publish addresses for a pod that is Ready=false, because
+# readiness now reports sustained AgentMail discovery failure (#2731) and the
+# worker's reply/completion POST handler does not depend on discovery. A
+# regression here silently cuts reply routing on top of any discovery outage.
+actual="$(field "$on_dir" Service "$SERVICE_NAME" spec.publishNotReadyAddresses)"
+[ "$actual" = "True" ] \
+  || fail "Service publishNotReadyAddresses is '$actual', expected true; an unready pod (discovery outage) must still receive worker reply/completion deliveries"
 
 # ---------------------------------------------------------------------------
 # 3: integer-valued env must be rendered as exact base-10 strings. YAML scientific
