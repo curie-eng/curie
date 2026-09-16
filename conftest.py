@@ -40,6 +40,14 @@ SHARED_LIVE_STATE_FILES = frozenset(
         "apps/api/tests/test_thread_reset_vector.py",
         "apps/api/tests/test_control_integration.py",
         "apps/api/tests/test_github_review_events.py",
+        # GitHub review fixtures share fixed delivery identities, whose Valkey
+        # idempotency keys collide across these files
+        "apps/api/tests/test_github_review_binding_scope.py",
+        "apps/api/tests/test_github_review_pending_outbox.py",
+        "apps/api/tests/test_github_review_sender_authority.py",
+        "apps/api/tests/test_github_review_terminal.py",
+        # Diffs a global relay key glob before and after each call
+        "apps/api/tests/test_cluster_message_results.py",
         # The default eval stream (curie:evals): exact length reads and producers
         "apps/api/tests/test_evalqueue_integration.py",
         "apps/api/tests/test_evals_trigger_integration.py",
