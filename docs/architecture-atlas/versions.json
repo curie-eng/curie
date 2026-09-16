@@ -31,7 +31,7 @@
       "label": "v0.8.0",
       "file": "snapshots/v0.8.0.json",
       "date": "2026-08-29",
-      "branch": "next",
+      "branch": "main",
       "commit": "c365bea117ad6c24a6feba5baa4b5e6ed4551f76"
     },
     {
@@ -112,7 +112,7 @@
       "file": "snapshots/v0.9.0.json",
       "date": "2026-09-15",
       "branch": "next",
-      "commit": "8b75ed9500276d63981234a3586551ca96689ef4"
+      "commit": "2d7b07aa81ae57f5ffb9f27bac066e65d153533b"
     }
   ]
 }
