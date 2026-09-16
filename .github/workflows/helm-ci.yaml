@@ -468,6 +468,20 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/upgrade-drain-assertions.sh
 
+      # Retained values must reach Helm with their scalar TYPES intact (#2741).
+      # The CLI re-serialized the values it reads back from a release, and its
+      # YAML 1.2 emitter left `off`, `on`, `yes` and `no` unquoted -- words that
+      # Helm's YAML 1.1 parser resolves as booleans. A release holding
+      # `security.gvisor.mode: "off"` upgraded into `false` and then demanded a
+      # RuntimeClass the cluster did not have. This step drives the real CLI,
+      # captures the document it hands Helm, and reads it back with real Helm,
+      # so the round trip is asserted through the consumer that actually broke.
+      # It builds the CLI, which is why it is the one step here that needs cargo.
+      - name: helm render assertions (retained values scalar preservation)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/upgrade-retained-scalar-assertions.sh
+
       # Schema migrations run in one hook Job (#2300). Prove the Job is the
       # migrator, the API init only waits, and forward-only is opt-in.
       - name: helm render assertions (schema migrate phase)
