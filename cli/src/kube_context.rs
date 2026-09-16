@@ -20,7 +20,7 @@ pub struct KubeTarget {
     pub cluster: String,
 }
 
-/// Choose the target from `kubectl config view -o json` output.
+/// Choose the target from a merged kubeconfig in `kubectl config view -o json` shape.
 ///
 /// An explicit name must exist in `.contexts[].name`; otherwise the error names it and
 /// lists the available contexts. Without one, the current-context is used, and `None`
@@ -166,19 +166,68 @@ fn write_pin_file(path: &Path, context: &str) -> Result<()> {
     Ok(())
 }
 
-async fn kubectl_config_view() -> Result<serde_json::Value> {
-    let out = tokio::process::Command::new("kubectl")
-        .args(["config", "view", "-o", "json"])
-        .output()
-        .await
-        .context("running `kubectl config view -o json`")?;
-    if !out.status.success() {
-        bail!(
-            "`kubectl config view -o json` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+/// The kubeconfig files kubectl would load: the `KUBECONFIG` list, or
+/// `$HOME/.kube/config` when it is unset or empty.
+pub fn kubeconfig_paths(existing: Option<OsString>, home: Option<&Path>) -> Vec<PathBuf> {
+    match existing.filter(|v| !v.is_empty()) {
+        Some(list) => std::env::split_paths(&list)
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect(),
+        None => home
+            .map(|h| vec![h.join(".kube").join("config")])
+            .unwrap_or_default(),
     }
-    serde_json::from_slice(&out.stdout).context("parsing `kubectl config view -o json` output")
+}
+
+/// Merge kubeconfig documents the way client-go does for the fields this module reads:
+/// the first file that sets `current-context` wins, and the first file that defines a
+/// context name wins. The result has the `kubectl config view -o json` shape.
+pub fn merge_kubeconfigs(documents: &[serde_json::Value]) -> serde_json::Value {
+    let mut current = String::new();
+    let mut contexts: Vec<serde_json::Value> = Vec::new();
+    for doc in documents {
+        if current.is_empty() {
+            if let Some(c) = doc.get("current-context").and_then(|v| v.as_str()) {
+                current = c.to_string();
+            }
+        }
+        for ctx in doc
+            .get("contexts")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let name = ctx.get("name").and_then(|n| n.as_str());
+            let seen = contexts
+                .iter()
+                .any(|c| c.get("name").and_then(|n| n.as_str()) == name);
+            if name.is_some() && !seen {
+                contexts.push(ctx.clone());
+            }
+        }
+    }
+    serde_json::json!({ "current-context": current, "contexts": contexts })
+}
+
+/// Read the kubeconfig without spawning anything, so offline and fully explicit
+/// commands still never invoke kubectl. Missing files are skipped, as kubectl does.
+fn read_kubeconfig() -> Result<serde_json::Value> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut documents = Vec::new();
+    for path in kubeconfig_paths(std::env::var_os("KUBECONFIG"), home.as_deref()) {
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let doc: serde_json::Value = if raw.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_norway::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+        };
+        documents.push(doc);
+    }
+    Ok(merge_kubeconfigs(&documents))
 }
 
 /// Resolve and pin the Kubernetes context for this `curie cluster` process.
@@ -186,8 +235,8 @@ async fn kubectl_config_view() -> Result<serde_json::Value> {
 /// With an explicit name, any failure to read the kubeconfig or an unknown name is an
 /// error. Without one, a failure or an absent current-context returns `Ok(None)` and
 /// leaves the env untouched.
-pub async fn pin_for_cluster_command(explicit: Option<&str>) -> Result<Option<KubeTarget>> {
-    let view = match kubectl_config_view().await {
+pub fn pin_for_cluster_command(explicit: Option<&str>) -> Result<Option<KubeTarget>> {
+    let view = match read_kubeconfig() {
         Ok(v) => v,
         Err(e) => match explicit {
             Some(name) => {
@@ -211,9 +260,8 @@ pub async fn pin_for_cluster_command(explicit: Option<&str>) -> Result<Option<Ku
         home.as_deref(),
     )?;
     for (key, value) in env {
-        // Called once at dispatch, before the verb spawns any helm or kubectl child and
-        // before any other task reads the environment; the only earlier child is the
-        // `kubectl config view` above, which has already exited.
+        // Called once at dispatch, before the verb spawns any child or starts any task
+        // that reads the environment.
         std::env::set_var(key, value);
     }
     Ok(Some(target))
@@ -232,6 +280,41 @@ mod tests {
                 {"name": "test-ctx", "context": {"cluster": "test-cluster"}}
             ]
         })
+    }
+
+    #[test]
+    fn merge_takes_the_first_current_context_and_first_context_definition() {
+        let pin = json!({"current-context": "test-ctx"});
+        let a = json!({"current-context": "prod-ctx", "contexts": [
+            {"name": "test-ctx", "context": {"cluster": "first"}}]});
+        let b = json!({"contexts": [
+            {"name": "test-ctx", "context": {"cluster": "second"}},
+            {"name": "prod-ctx", "context": {"cluster": "prod-cluster"}}]});
+        let merged = merge_kubeconfigs(&[pin, a, b]);
+        let t = select_target(&merged, None).unwrap().unwrap();
+        assert_eq!(
+            (t.context.as_str(), t.cluster.as_str()),
+            ("test-ctx", "first")
+        );
+        assert!(select_target(&merged, Some("prod-ctx")).unwrap().is_some());
+    }
+
+    #[test]
+    fn kubeconfig_paths_fall_back_to_home_only_when_unset_or_empty() {
+        let home = Path::new("/h");
+        assert_eq!(
+            kubeconfig_paths(None, Some(home)),
+            vec![PathBuf::from("/h/.kube/config")]
+        );
+        assert_eq!(
+            kubeconfig_paths(Some(OsString::new()), Some(home)),
+            vec![PathBuf::from("/h/.kube/config")]
+        );
+        let list = std::env::join_paths(["/a", "/b"]).unwrap();
+        assert_eq!(
+            kubeconfig_paths(Some(list), Some(home)),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 
     #[test]

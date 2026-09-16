@@ -4062,8 +4062,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             ),
         },
         Some(Command::Cluster { action, context }) => {
-            if let Some(target) =
-                curie::kube_context::pin_for_cluster_command(context.as_deref()).await?
+            if let Some(target) = curie::kube_context::pin_for_cluster_command(context.as_deref())?
             {
                 ui::ui().note(&format!(
                     "Kubernetes context: {} (cluster {})",

@@ -8,8 +8,9 @@
 //!
 //! Contract driven here, black box through the real `curie` binary with fake
 //! `kubectl`/`helm` on PATH:
-//! - `--context <NAME>` is resolved against `kubectl config view -o json` BEFORE any
-//!   mutation; an unknown name refuses with zero helm and zero non-config kubectl calls.
+//! - `--context <NAME>` is resolved by reading the kubeconfig files, with no process
+//!   spawned, BEFORE any mutation; an unknown name refuses with zero helm and zero
+//!   kubectl calls (the fake logs every call, `config view` included).
 //! - every helm/kubectl child sees a KUBECONFIG whose FIRST entry sets
 //!   `current-context: <NAME>` and `HELM_KUBECONTEXT=<NAME>` (overriding ambient).
 //! - stderr names the context and its cluster.
@@ -47,13 +48,7 @@ esac
 fn install_fakes(bin_dir: &Path, log: &Path) {
     let log = log.display();
     let kubectl = format!(
-        r#"{LOG_PREFIX}if [ "$1" = config ] && [ "$2" = view ]; then
-  cat <<'JSON'
-{{"apiVersion":"v1","kind":"Config","current-context":"prod-ctx","contexts":[{{"name":"prod-ctx","context":{{"cluster":"prod-cluster","user":"prod-user"}}}},{{"name":"test-ctx","context":{{"cluster":"test-cluster","user":"test-user"}}}}],"clusters":[{{"name":"prod-cluster","cluster":{{"server":"https://prod:6443"}}}},{{"name":"test-cluster","cluster":{{"server":"https://test:6443"}}}}],"users":[]}}
-JSON
-  exit 0
-fi
-printf 'kubectl\t%s\t%s\t%s\n' "$cur" "$HELM_KUBECONTEXT" "$*" >> '{log}'
+        r#"{LOG_PREFIX}printf 'kubectl\t%s\t%s\t%s\n' "$cur" "$HELM_KUBECONTEXT" "$*" >> '{log}'
 if [ "$1" = get ] && [ "$2" = namespace ]; then
   echo '{{"apiVersion":"v1","kind":"Namespace","metadata":{{"name":"curie","labels":{{}},"uid":"uid-curie","resourceVersion":"17"}}}}'
   exit 0
@@ -96,7 +91,7 @@ fn run_curie(args: &[&str], ambient_helm_ctx: Option<&str>) -> Run {
     let kubeconfig = home.join(".kube").join("config");
     fs::write(
         &kubeconfig,
-        "apiVersion: v1\nkind: Config\ncurrent-context: prod-ctx\ncontexts: []\nclusters: []\nusers: []\n",
+        "apiVersion: v1\nkind: Config\ncurrent-context: prod-ctx\ncontexts:\n- name: prod-ctx\n  context:\n    cluster: prod-cluster\n    user: prod-user\n- name: test-ctx\n  context:\n    cluster: test-cluster\n    user: test-user\nclusters: []\nusers: []\n",
     )
     .unwrap();
     let log = tmp.path().join("calls.log");
