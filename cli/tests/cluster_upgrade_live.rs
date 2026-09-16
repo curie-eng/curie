@@ -3109,3 +3109,177 @@ fn fail_at_plan_on_owned_namespace_fails_before_helm() {
         fixture.argv()
     );
 }
+
+// T#2741 -- boolean-shaped string scalars must survive the retained-values
+// round trip.
+//
+// Mechanism: Helm parses values with Go's go-yaml, which is YAML **1.1**, where
+// the bare tokens `off`/`on`/`yes`/`no`/`y`/`n`/`true`/`false` are booleans.
+// `serde_norway` emits YAML **1.2**, where only `true`/`false` are, so it writes
+// the JSON string "off" as the bare scalar `off`. Helm then reads a BOOLEAN
+// false. An install carrying `security.gvisor.mode: "off"` silently flips on
+// upgrade and the absent `gvisor` RuntimeClass becomes required.
+//
+// The assertion therefore has to be made on the emitted BYTES with YAML 1.1
+// eyes: re-parsing with `serde_norway` (YAML 1.2) would hand the string back and
+// prove nothing.
+
+/// The YAML 1.1 boolean tokens that YAML 1.2 does NOT share. `true`/`false` are
+/// deliberately absent: both versions read them as booleans, so a bare `true` is
+/// a correct emission for a genuine boolean, not a leak. Helm's go-yaml also
+/// accepts the capitalised and all-caps spellings, which `to_lowercase` folds in.
+const YAML11_ONLY_BOOLEAN_WORDS: [&str; 6] = ["y", "yes", "n", "no", "on", "off"];
+
+/// The retained overlay used by every #2741 test: one boolean-shaped string at
+/// each of three nesting depths, so a fix that only special-cases the known
+/// gvisor key does not pass.
+fn boolean_shaped_retained() -> String {
+    serde_json::json!({
+        "config": {"schemaVersion": "0.8.4"},
+        "security": {"gvisor": {"mode": "off"}},
+        "api": {"logStructured": "yes"},
+        "uiFlag": "n",
+    })
+    .to_string()
+}
+
+/// Lines of a block-style YAML document whose scalar value is an UNQUOTED YAML
+/// 1.1 boolean token. Non-empty means Helm would read a boolean where the
+/// operator wrote a string.
+///
+/// Block style only, which is what `serde_norway::to_string` emits; a flow-style
+/// emitter would need this widened rather than weakened.
+fn unquoted_yaml11_booleans(raw: &str) -> Vec<String> {
+    raw.lines()
+        .filter(|line| {
+            let Some((key, value)) = line.split_once(": ") else {
+                return false;
+            };
+            if key.trim_start().starts_with('#') {
+                return false;
+            }
+            let value = value.trim();
+            YAML11_ONLY_BOOLEAN_WORDS.contains(&value.to_lowercase().as_str())
+        })
+        .map(|line| line.trim().to_string())
+        .collect()
+}
+
+/// #2741 -- the ordinary retained-values path. `retained_overlay()` re-serializes
+/// with `serde_norway::to_string` (YAML 1.2), so the strings "off", "yes" and "n"
+/// reach Helm's YAML 1.1 parser as bare booleans.
+#[test]
+fn boolean_shaped_retained_strings_stay_strings_in_the_apply_overlay() {
+    let fixture = Fixture::new(Some(&boolean_shaped_retained()));
+    let output = fixture.local("healthy");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "nothing was applied: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let raw = fixture.values(1);
+    assert!(
+        unquoted_yaml11_booleans(&raw).is_empty(),
+        "Helm parses YAML 1.1, so these bare scalars become booleans: {:?}\n{raw}",
+        unquoted_yaml11_booleans(&raw)
+    );
+    let values = values_doc(&raw);
+    for (pointer, expected) in [
+        ("/security/gvisor/mode", "off"),
+        ("/api/logStructured", "yes"),
+        ("/uiFlag", "n"),
+    ] {
+        assert_eq!(
+            values.pointer(pointer),
+            Some(&Value::String(expected.into())),
+            "{pointer} must still be the string {expected:?}: {raw}"
+        );
+    }
+}
+
+/// #2741 -- the `--forward-only` path re-serializes through a SECOND
+/// `serde_norway::to_string` site (`merge_forward_only()`), so it needs its own
+/// coverage. The paired assertion is the control: a genuine boolean
+/// (`api.migrate.forwardOnly`) must stay a boolean, so the fix cannot be
+/// "quote everything".
+#[test]
+fn forward_only_overlay_preserves_boolean_shaped_strings_and_real_booleans() {
+    let fixture = Fixture::new(Some(&boolean_shaped_retained()));
+    let output = fixture.run_with(
+        "schema-contract",
+        "0.9.0",
+        "charts/curie",
+        &["--forward-only"],
+    );
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "--forward-only must reach helm upgrade: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let raw = fixture.values(1);
+    assert!(
+        unquoted_yaml11_booleans(&raw).is_empty(),
+        "forward-only overlay leaks YAML 1.1 booleans: {:?}\n{raw}",
+        unquoted_yaml11_booleans(&raw)
+    );
+    let values = values_doc(&raw);
+    assert_eq!(
+        values.pointer("/security/gvisor/mode"),
+        Some(&Value::String("off".into())),
+        "the forward-only path must keep the string \"off\": {raw}"
+    );
+    assert_eq!(
+        values.pointer("/api/migrate/forwardOnly"),
+        Some(&Value::Bool(true)),
+        "a real boolean must stay a boolean, not be stringified: {raw}"
+    );
+}
+
+/// #2741 -- the negative control. Quoting is not allowed to be blanket: genuine
+/// booleans, integers and nulls in the retained values must reach Helm with
+/// their own YAML 1.2/1.1-agreeing types.
+#[test]
+fn genuine_scalar_types_are_not_coerced_to_strings() {
+    let retained = serde_json::json!({
+        "config": {"schemaVersion": "0.8.4"},
+        "ui": {"deploy": false},
+        "worker": {"runnerTotalTimeoutSeconds": 120, "replicas": 3},
+        "api": {"nodeSelector": null},
+    })
+    .to_string();
+    let fixture = Fixture::new(Some(&retained));
+    let output = fixture.local("healthy");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "nothing was applied: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let raw = fixture.values(1);
+    let values = values_doc(&raw);
+    assert_eq!(
+        values.pointer("/ui/deploy"),
+        Some(&Value::Bool(false)),
+        "a genuine boolean must not become a string: {raw}"
+    );
+    assert_eq!(
+        values.pointer("/worker/runnerTotalTimeoutSeconds"),
+        Some(&serde_json::json!(120)),
+        "a genuine integer must not become a string: {raw}"
+    );
+    assert_eq!(
+        values.pointer("/worker/replicas"),
+        Some(&serde_json::json!(3)),
+        "a genuine integer must not become a string: {raw}"
+    );
+    assert_eq!(
+        values.pointer("/api/nodeSelector"),
+        Some(&Value::Null),
+        "a genuine null must not become a string: {raw}"
+    );
+}
