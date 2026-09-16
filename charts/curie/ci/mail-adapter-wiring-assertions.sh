@@ -7,8 +7,11 @@
 # and rolls its pods when any of its three credentials rotate.
 #
 #   1  Default install renders no mail-adapter Deployment and no Service.
-#   2  mailAdapter.deploy=true renders both, and the Service port tracks
-#      mailAdapter.service.port.
+#   2  mailAdapter.deploy=true renders both, the Service port tracks
+#      mailAdapter.service.port, and the Service publishes addresses for a
+#      pod that is Ready=false (readiness reports sustained AgentMail
+#      discovery failure, #2731; the worker's reply/completion POST handler
+#      does not depend on discovery and must keep reaching the pod).
 #   3  Byte-limit defaults and overrides render as exact base-10 integer strings.
 #   4  CURIE_API_URL derives the in-chart API Service, tracks api.service.port,
 #      and mailAdapter.apiBaseUrl overrides it verbatim.
@@ -301,6 +304,14 @@ actual="$(field "$port_dir" Service "$SERVICE_NAME" spec.ports.0.port)"
 [ "$actual" = "9091" ] \
   || fail "with mailAdapter.service.port=9091 the Service port is '$actual'; the port is hardcoded in the template instead of read from the value"
 
+# The Service must publish addresses for a pod that is Ready=false, because
+# readiness now reports sustained AgentMail discovery failure (#2731) and the
+# worker's reply/completion POST handler does not depend on discovery. A
+# regression here silently cuts reply routing on top of any discovery outage.
+actual="$(field "$on_dir" Service "$SERVICE_NAME" spec.publishNotReadyAddresses)"
+[ "$actual" = "True" ] \
+  || fail "Service publishNotReadyAddresses is '$actual', expected true; an unready pod (discovery outage) must still receive worker reply/completion deliveries"
+
 # ---------------------------------------------------------------------------
 # 3: integer-valued env must be rendered as exact base-10 strings. YAML scientific
 # notation (for example 1.048576e+06) reaches the container as text and is then
@@ -497,7 +508,8 @@ knobs_dir="$(render knobs "${ON[@]}" "${CREDS[@]}" \
   --set mailAdapter.maxBodyBytes=4096 \
   --set mailAdapter.maxReplyBytes=8192 \
   --set mailAdapter.maxStateBytes=1048576 \
-  --set mailAdapter.ingressEnabled=false)"
+  --set mailAdapter.ingressEnabled=false \
+  --set mailAdapter.discoveryUnreadyAfterSeconds=45)"
 assert_env_value "$knobs_dir" AGENTMAIL_INBOX "assert-inbox@example.com" \
   "mailAdapter.inbox must reach the process; a name typo renders green and is ignored at runtime."
 assert_env_value "$knobs_dir" CURIE_MAIL_POLL_INTERVAL_SECONDS "37" \
@@ -512,6 +524,57 @@ assert_env_value "$knobs_dir" CURIE_MAIL_MAX_REPLY_BYTES "8192" \
   "mailAdapter.maxReplyBytes must bound egress text before allocation/storage."
 assert_env_value "$knobs_dir" CURIE_MAIL_MAX_STATE_BYTES "1048576" \
   "mailAdapter.maxStateBytes must cap SQLite pages/queued bytes."
+assert_env_value "$knobs_dir" CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS "45" \
+  "mailAdapter.discoveryUnreadyAfterSeconds must reach the process; a name typo renders green and the readiness gate never flips on a stuck discovery outage."
+
+# ---------------------------------------------------------------------------
+# 10c (#2731): the adapter dials only addresses the egress NetworkPolicy
+# admits. CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS must equal the configured
+# mailAdapter.agentmail.httpsCidrs entries, comma-joined in the same order as
+# the policy's ipBlock rules -- a mismatch here reintroduces the #2731 Errno
+# 111 outage, where the client dialed a DNS-returned address outside the
+# policy and every poll failed closed with ECONNREFUSED.
+# ---------------------------------------------------------------------------
+egress_cidrs_dir="$(render egress-cidrs \
+  --set mailAdapter.deploy=true "${CREDS[@]}" \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[0]=198.51.100.7/32' \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[1]=203.0.113.0/28')"
+assert_env_value "$egress_cidrs_dir" CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS "198.51.100.7/32,203.0.113.0/28" \
+  "The adapter dials only policy-admitted addresses; a mismatch between this env and the NetworkPolicy's ipBlocks reintroduces the #2731 Errno 111 outage."
+python3 - "$egress_cidrs_dir" <<'PY' \
+  || fail "CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS order does not match the NetworkPolicy ipBlocks order"
+import pathlib
+import sys
+
+import yaml
+
+rendered = sys.argv[1]
+docs = [
+    doc
+    for path in pathlib.Path(rendered).rglob("*.yaml")
+    for doc in yaml.safe_load_all(path.read_text())
+    if isinstance(doc, dict)
+]
+policies = [
+    doc
+    for doc in docs
+    if doc.get("kind") == "NetworkPolicy"
+    and doc.get("metadata", {}).get("name") == "curie-mail-adapter-egress"
+]
+if len(policies) != 1:
+    raise SystemExit(f"expected one mail egress policy, found {len(policies)}")
+port_443_cidrs = []
+for rule in policies[0].get("spec", {}).get("egress", []):
+    if any(p.get("port") == 443 for p in rule.get("ports", [])):
+        port_443_cidrs.extend(
+            peer["ipBlock"]["cidr"] for peer in rule.get("to", []) if peer.get("ipBlock")
+        )
+expected = ["198.51.100.7/32", "203.0.113.0/28"]
+if port_443_cidrs != expected:
+    raise SystemExit(
+        f"NetworkPolicy port-443 ipBlocks are {port_443_cidrs!r}, expected {expected!r} in order"
+    )
+PY
 
 # ---------------------------------------------------------------------------
 # 11: one replica, no knob that changes it, and Recreate. Every routing map in
