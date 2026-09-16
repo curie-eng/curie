@@ -4142,7 +4142,7 @@ rung_local() {
         # it. Claiming a stack that then fails to boot is harmless, because
         # `local down` is safe against a partial or already-stopped stack.
         LOCAL_STACK_OWNED=1
-        "$BIN" "${up_args[@]}"
+        BUILDX_BUILDER=default "$BIN" "${up_args[@]}"
         pin_local_source_images
     fi
 
