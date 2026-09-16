@@ -858,7 +858,7 @@ PY
 # Slack queue entry; no caller-supplied id and no harness XADD are accepted.
 cluster_external_ingress_seed() {
     local kind="$1" expected_operations="$2" expected_decision="${3:-}"
-    local receipt="$CLUSTER_EXTERNAL_INGRESS_RECEIPT" fields marker stream_start stream_end trace_id
+    local receipt="$CLUSTER_EXTERNAL_INGRESS_RECEIPT" fields marker stream_start stream_end trace_id expected_tool=""
     [[ -n "$PRODUCT_OBSERVABILITY_RUN_ID" ]] || {
         echo "cluster product evidence blocked: CURIE_E2E_PRODUCT_RUN_ID is required to join one supported run" >&2
         return 1
@@ -872,7 +872,7 @@ cluster_external_ingress_seed() {
         return 1
     }
     fields="$(python3 - "$receipt" "$PRODUCT_OBSERVABILITY_RUN_ID" "$kind" <<'PY'
-import json, pathlib, re, sys
+import hashlib, json, pathlib, re, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
 run_id, kind = sys.argv[2:4]
 if not isinstance(value, dict) or value.get("run_id") != run_id:
@@ -897,6 +897,12 @@ if kind == "mcp" and seed.get("mcp_call_count_delta") != 1:
     raise SystemExit("external MCP seed omitted its independent one-call receipt")
 if kind == "approval" and seed.get("approval_transition_observed") is not True:
     raise SystemExit("external approval seed omitted its independent transition receipt")
+if kind == "coding":
+    # The external Slack driver observes this digest in the finalized reply
+    # after asking Bash to run hashlib.sha256(marker.encode()).hexdigest().
+    expected_receipt = hashlib.sha256(marker.encode()).hexdigest()
+    if seed.get("coding_execution_receipt") != expected_receipt:
+        raise SystemExit("external coding seed omitted its independent execution receipt")
 accepted = seed.get("otelcol_receiver_accepted_spans_delta")
 sent = seed.get("otelcol_exporter_sent_spans_delta")
 if not all(isinstance(item, (int, float)) and not isinstance(item, bool) and item > 0 for item in (accepted, sent)):
@@ -906,7 +912,10 @@ PY
 )" || return 1
     read -r marker stream_start stream_end LAST_EXTERNAL_ACCEPTED_DELTA LAST_EXTERNAL_SENT_DELTA <<< "$fields"
     trace_id="$(discover_cluster_external_trace_id "$marker" "$stream_start" "$stream_end")" || return 1
-    query_exact_seed_trace cluster "$trace_id" "$expected_operations" "$expected_decision" observe
+    if [[ "$kind" == "coding" ]]; then
+        expected_tool="Bash"
+    fi
+    query_exact_seed_trace cluster "$trace_id" "$expected_operations" "$expected_decision" observe "$expected_tool"
 }
 
 discover_cluster_external_trace_id() {
@@ -4767,6 +4776,7 @@ PY
 
 run_cluster_product_observability() {
     local agent_id="$1" agent_name="$2" membership accepted_delta sent_delta
+    local second_accepted_delta second_sent_delta third_accepted_delta=0 third_sent_delta=0
     preflight_cluster_product_observability
     seed_cluster_missing_carrier_control
     cluster_external_ingress_seed ordinary \
@@ -4779,17 +4789,26 @@ run_cluster_product_observability() {
             "curie.turn.ingress,curie.queue.enqueue,curie.approval.suspend,curie.approval.resolve,curie.approval.resume,curie.reply.post|curie.reply.update" \
             approved
         [[ "$LAST_QUERY_MEMBERSHIP" == "true" ]] || membership="false"
+        second_accepted_delta="$LAST_EXTERNAL_ACCEPTED_DELTA"
+        second_sent_delta="$LAST_EXTERNAL_SENT_DELTA"
     else
         cluster_external_ingress_seed mcp \
             "curie.turn.ingress,curie.queue.enqueue,execute_tool,curie.reply.post|curie.reply.update"
         [[ "$LAST_QUERY_MEMBERSHIP" == "true" ]] || membership="false"
+        second_accepted_delta="$LAST_EXTERNAL_ACCEPTED_DELTA"
+        second_sent_delta="$LAST_EXTERNAL_SENT_DELTA"
+        cluster_external_ingress_seed coding \
+            "curie.turn.ingress,curie.queue.enqueue,execute_tool,curie.reply.post|curie.reply.update"
+        [[ "$LAST_QUERY_MEMBERSHIP" == "true" ]] || membership="false"
+        third_accepted_delta="$LAST_EXTERNAL_ACCEPTED_DELTA"
+        third_sent_delta="$LAST_EXTERNAL_SENT_DELTA"
     fi
     read -r accepted_delta sent_delta < <(python3 - \
-        "$accepted_delta" "$LAST_EXTERNAL_ACCEPTED_DELTA" \
-        "$sent_delta" "$LAST_EXTERNAL_SENT_DELTA" <<'PY'
+        "$accepted_delta" "$second_accepted_delta" "$third_accepted_delta" \
+        "$sent_delta" "$second_sent_delta" "$third_sent_delta" <<'PY'
 import sys
-accepted_first, accepted_second, sent_first, sent_second = map(float, sys.argv[1:5])
-print(accepted_first + accepted_second, sent_first + sent_second)
+accepted_first, accepted_second, accepted_third, sent_first, sent_second, sent_third = map(float, sys.argv[1:7])
+print(accepted_first + accepted_second + accepted_third, sent_first + sent_second + sent_third)
 PY
     )
     # Each external seed performs the exact candidate read equivalent to
