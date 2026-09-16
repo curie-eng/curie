@@ -26,17 +26,22 @@ surface the gate and its read-back runner are built to:
   names Pydantic, and must reject every way the legacy-state sentinel can stop
   being one shared runner-visible identity.
 
-Everything here is a pure unit test with stubs. No test creates a git worktree,
-runs `uv sync`, runs alembic, or touches Postgres; the live gate is exercised by
-running it, not by a pytest that costs four minutes.
+Most coverage here is pure and stubbed. The resource checks run when their
+selected Compose PostgreSQL service is available, and the sibling identity case
+uses a real owned Compose service. No test creates a git worktree, runs `uv
+sync`, or runs alembic; the full live gate is exercised by its dedicated driver.
 """
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import importlib.util
 import json
+import os
+import socket
 import sys
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -89,6 +94,748 @@ def gate() -> ModuleType:
 @pytest.fixture(scope="module")
 def readback() -> ModuleType:
     return _load_script("released_upgrade_readback", READBACK_SCRIPT)
+
+
+_RELEASED_UPGRADE_ENV = (
+    "CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT",
+    "CURIE_RELEASED_UPGRADE_COMPOSE_FILES",
+    "CURIE_RELEASED_UPGRADE_POSTGRES_HOST",
+    "CURIE_RELEASED_UPGRADE_POSTGRES_PORT",
+)
+_CAPTURED_RELEASED_UPGRADE_ENV = {
+    name: os.environ.get(name) for name in _RELEASED_UPGRADE_ENV
+}
+_RELEASED_UPGRADE_INTEGRATION = os.environ.get(
+    "CURIE_RELEASED_UPGRADE_INTEGRATION"
+)
+
+
+def _clear_released_upgrade_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _RELEASED_UPGRADE_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _clear_isolated_released_upgrade_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_released_upgrade_env(monkeypatch)
+
+
+@pytest.fixture
+def isolated_released_upgrade_resources(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    captured = _CAPTURED_RELEASED_UPGRADE_ENV
+    present = [name for name, value in captured.items() if value is not None]
+    if present and len(present) != len(captured):
+        pytest.fail(
+            "isolated PostgreSQL proof captured only some resource settings: "
+            f"{', '.join(present)}"
+        )
+    for name, value in captured.items():
+        if value is not None:
+            monkeypatch.setenv(name, value)
+    resources = gate._released_upgrade_resources_from_env()
+    try:
+        containers = gate._checked_output(
+            gate._compose_command(
+                "ps",
+                "--all",
+                "-q",
+                "postgres",
+                resources=resources,
+            ),
+            description="locating selected PostgreSQL for integration proof",
+        )
+    except gate.GateError:
+        if _RELEASED_UPGRADE_INTEGRATION == "1" or os.environ.get("CI"):
+            raise
+        pytest.skip("selected Compose PostgreSQL is not available")
+    if not containers.strip():
+        if _RELEASED_UPGRADE_INTEGRATION == "1" or os.environ.get("CI"):
+            pytest.fail("selected Compose PostgreSQL is not running")
+        pytest.skip("selected Compose PostgreSQL is not running")
+    gate._check_postgres(resources=resources)
+    return resources
+
+
+def _database_exists(
+    gate: ModuleType,
+    database_name: str,
+    *,
+    resources: Any,
+) -> bool:
+    output = gate._checked_output(
+        gate._database_command(
+            "SELECT 1 FROM pg_database WHERE datname = "
+            f"'{database_name}'",
+            flags=("-t", "-A"),
+            resources=resources,
+        ),
+        description=f"checking owned control database {database_name}",
+    )
+    return output.strip() == "1"
+
+
+def _upgrade_database_catalog(
+    gate: ModuleType,
+    *,
+    resources: Any,
+) -> tuple[str, ...]:
+    prefix = f"curie_upgrade_{os.getpid()}_%"
+    output = gate._checked_output(
+        gate._database_command(
+            "SELECT datname FROM pg_database "
+            f"WHERE datname LIKE '{prefix}' ORDER BY datname",
+            flags=("-t", "-A"),
+            resources=resources,
+        ),
+        description="reading owned released upgrade database catalog",
+    )
+    return tuple(name for name in output.splitlines() if name)
+
+
+@pytest.fixture
+def sibling_postgres(
+    gate: ModuleType,
+    isolated_released_upgrade_resources: Any,
+    tmp_path: Path,
+) -> Any:
+    override = tmp_path / "sibling.yaml"
+    override.write_text(
+        "services:\n"
+        "  postgres:\n"
+        "    ports: !override [\"127.0.0.1::5432\"]\n",
+        encoding="utf-8",
+    )
+    project = f"curie2751sibling{uuid.uuid4().hex[:8]}"
+    scope = gate.ReleaseUpgradeResources(
+        compose_project=project,
+        compose_files=(gate.COMPOSE_FILE, override),
+        postgres_host="127.0.0.1",
+        postgres_port=1,
+    )
+    try:
+        gate._checked_output(
+            gate._compose_command(
+                "--profile",
+                "full",
+                "up",
+                "-d",
+                "--wait",
+                "--wait-timeout",
+                "120",
+                "postgres",
+                resources=scope,
+            ),
+            description="starting owned sibling PostgreSQL",
+        )
+        endpoints = gate._published_postgres_endpoints(resources=scope)
+        assert len(endpoints) == 1
+        host, port = endpoints[0]
+        assert host == "127.0.0.1"
+        sibling = dataclasses.replace(scope, postgres_port=port)
+        gate._check_postgres(resources=sibling)
+        yield sibling
+    finally:
+        down = gate._run(
+            gate._compose_command(
+                "--profile",
+                "full",
+                "down",
+                "-v",
+                resources=scope,
+            )
+        )
+        if down.returncode != 0:
+            pytest.fail(
+                "owned sibling PostgreSQL teardown failed: "
+                f"{down.output.strip()}"
+            )
+        remaining = gate._checked_output(
+            gate._compose_command("ps", "--all", "-q", resources=scope),
+            description="checking owned sibling PostgreSQL teardown",
+        )
+        if remaining.strip():
+            pytest.fail("owned sibling PostgreSQL containers remain after teardown")
+        for resource_kind in ("network", "volume"):
+            leftovers = gate._checked_output(
+                [
+                    "docker",
+                    resource_kind,
+                    "ls",
+                    "--filter",
+                    f"label=com.docker.compose.project={project}",
+                    "-q",
+                ],
+                description=f"checking owned sibling {resource_kind} teardown",
+            )
+            if leftovers.strip():
+                pytest.fail(
+                    f"owned sibling PostgreSQL {resource_kind} remains after teardown"
+                )
+
+
+# --------------------------------------------------------------------------
+# T0: isolated released upgrade resources
+# --------------------------------------------------------------------------
+
+
+def test_released_upgrade_resources_default_to_the_shared_baseline(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_released_upgrade_env(monkeypatch)
+    monkeypatch.setenv("COMPOSE_PROJECT_NAME", "curieambient")
+
+    resources = gate._released_upgrade_resources_from_env()
+
+    assert resources.compose_project == "curieambient"
+    assert resources.compose_files == (gate.COMPOSE_FILE,)
+    assert resources.postgres_host == "localhost"
+    assert resources.postgres_port == 25432
+
+
+def test_released_upgrade_resources_keep_the_project_files_and_endpoint_together(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_released_upgrade_env(monkeypatch)
+    override = tmp_path / "private.yaml"
+    override.write_text("services: {}\n", encoding="utf-8")
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT", "curie2751")
+    monkeypatch.setenv(
+        "CURIE_RELEASED_UPGRADE_COMPOSE_FILES",
+        os.pathsep.join((str(gate.COMPOSE_FILE), str(override))),
+    )
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_POSTGRES_HOST", "127.0.0.1")
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_POSTGRES_PORT", "35432")
+
+    resources = gate._released_upgrade_resources_from_env()
+
+    assert resources.compose_project == "curie2751"
+    assert resources.compose_files == (gate.COMPOSE_FILE, override)
+    assert resources.postgres_host == "127.0.0.1"
+    assert resources.postgres_port == 35432
+    assert gate._database_url("curie_upgrade_isolated", resources=resources) == (
+        "postgresql+asyncpg://postgres:postgres@127.0.0.1:35432/"
+        "curie_upgrade_isolated"
+    )
+
+
+@pytest.mark.parametrize("compose_files_kind", ("base", "override"))
+def test_isolated_released_upgrade_resources_require_base_then_override(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    compose_files_kind: str,
+) -> None:
+    _clear_released_upgrade_env(monkeypatch)
+    override = tmp_path / "private.yaml"
+    override.write_text("services: {}\n", encoding="utf-8")
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT", "curie2751")
+    monkeypatch.setenv(
+        "CURIE_RELEASED_UPGRADE_COMPOSE_FILES",
+        str(gate.COMPOSE_FILE if compose_files_kind == "base" else override),
+    )
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_POSTGRES_HOST", "127.0.0.1")
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_POSTGRES_PORT", "35432")
+
+    with pytest.raises(gate.GateError, match="COMPOSE"):
+        gate._released_upgrade_resources_from_env()
+
+
+def test_isolated_resource_command_builder_uses_the_same_compose_scope(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_released_upgrade_env(monkeypatch)
+    override = tmp_path / "private.yaml"
+    override.write_text("services: {}\n", encoding="utf-8")
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT", "curie2751")
+    monkeypatch.setenv(
+        "CURIE_RELEASED_UPGRADE_COMPOSE_FILES",
+        os.pathsep.join((str(gate.COMPOSE_FILE), str(override))),
+    )
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_POSTGRES_HOST", "127.0.0.1")
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_POSTGRES_PORT", "35432")
+    resources = gate._released_upgrade_resources_from_env()
+
+    expected_prefix = [
+        "docker",
+        "compose",
+        "-p",
+        "curie2751",
+        "-f",
+        str(gate.COMPOSE_FILE),
+        "-f",
+        str(override),
+    ]
+    assert gate._compose_command("ps", resources=resources) == [
+        *expected_prefix,
+        "ps",
+    ]
+    create = gate._database_command(
+        'CREATE DATABASE "curie_upgrade_isolated"', resources=resources
+    )
+    cleanup = gate._database_command(
+        'DROP DATABASE IF EXISTS "curie_upgrade_isolated" WITH (FORCE)',
+        resources=resources,
+    )
+    for command in (create, cleanup):
+        assert command[: len(expected_prefix)] == expected_prefix
+        assert command[len(expected_prefix) : len(expected_prefix) + 4] == [
+            "exec",
+            "-T",
+            "postgres",
+            "psql",
+        ]
+        assert command[-4:-1] == ["-v", "ON_ERROR_STOP=1", "-c"]
+
+
+def _metadata_resources(gate: ModuleType) -> Any:
+    return gate.ReleaseUpgradeResources(
+        compose_project="curie2751",
+        compose_files=(gate.COMPOSE_FILE,),
+        postgres_host="localhost",
+        postgres_port=25432,
+    )
+
+
+@pytest.mark.parametrize(
+    ("container_ids", "labels", "running", "expected"),
+    [
+        ("", None, None, "exactly one Postgres container"),
+        ("one\ntwo\n", None, None, "exactly one Postgres container"),
+        (
+            "one\n",
+            {"com.docker.compose.project": "other", "com.docker.compose.service": "postgres"},
+            None,
+            "ownership labels",
+        ),
+        (
+            "one\n",
+            {"com.docker.compose.project": "curie2751", "com.docker.compose.service": "valkey"},
+            None,
+            "ownership labels",
+        ),
+        (
+            "one\n",
+            {"com.docker.compose.project": "curie2751", "com.docker.compose.service": "postgres"},
+            "false",
+            "not running",
+        ),
+    ],
+)
+def test_selected_postgres_metadata_rejects_unowned_or_unavailable_containers(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    container_ids: str,
+    labels: dict[str, str] | None,
+    running: str | None,
+    expected: str,
+) -> None:
+    observed: list[list[str]] = []
+
+    def _metadata_output(
+        command: list[str],
+        *,
+        description: str,
+        **_kwargs: Any,
+    ) -> str:
+        observed.append(command)
+        if command[:2] == ["docker", "compose"] and "ps" in command:
+            return container_ids
+        if command[:3] == ["docker", "inspect", "--format"]:
+            if ".Config.Labels" in command[3]:
+                assert labels is not None
+                return json.dumps(labels)
+            if ".State.Running" in command[3]:
+                assert running is not None
+                return running
+        pytest.fail(f"unexpected Docker metadata command: {command}")
+
+    monkeypatch.setattr(gate, "_checked_output", _metadata_output)
+
+    with pytest.raises(gate.GateError, match=expected):
+        gate._postgres_container_id(resources=_metadata_resources(gate))
+
+    assert all("psql" not in command for command in observed)
+
+
+@pytest.mark.parametrize(
+    "published",
+    ("127.0.0.1", "127.0.0.1:not_a_port", "[::1]", "[::1]:65536"),
+)
+def test_selected_postgres_metadata_rejects_malformed_published_ports(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    published: str,
+) -> None:
+    observed: list[list[str]] = []
+
+    def _metadata_output(
+        command: list[str],
+        *,
+        description: str,
+        **_kwargs: Any,
+    ) -> str:
+        observed.append(command)
+        assert command[:2] == ["docker", "compose"]
+        assert "port" in command
+        return published
+
+    monkeypatch.setattr(gate, "_checked_output", _metadata_output)
+
+    with pytest.raises(gate.GateError, match="parse published Postgres endpoint"):
+        gate._published_postgres_endpoints(resources=_metadata_resources(gate))
+
+    assert all("psql" not in command for command in observed)
+
+
+@pytest.mark.parametrize(
+    ("published_host", "requested_host", "expected"),
+    [
+        ("127.0.0.1", "localhost", True),
+        ("::1", "localhost", True),
+        ("0.0.0.0", "localhost", True),
+        ("::", "localhost", True),
+        ("::1", "127.0.0.1", False),
+        ("127.0.0.1", "::1", False),
+        ("0.0.0.0", "::1", False),
+        ("::", "::1", True),
+    ],
+)
+def test_published_postgres_address_family_matches_the_requested_host(
+    gate: ModuleType,
+    published_host: str,
+    requested_host: str,
+    expected: bool,
+) -> None:
+    assert (
+        gate._published_host_serves_requested_host(published_host, requested_host)
+        is expected
+    )
+
+
+def test_run_pair_rejects_unowned_metadata_before_database_or_worktree_mutation(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resources = _metadata_resources(gate)
+    observed: list[list[str]] = []
+    mutations: list[str] = []
+
+    def _metadata_output(
+        command: list[str],
+        *,
+        description: str,
+        **_kwargs: Any,
+    ) -> str:
+        observed.append(command)
+        if command == ["docker", "compose", "version"]:
+            return "Docker Compose version"
+        if command[:2] == ["docker", "compose"] and "ps" in command:
+            return "selected\n"
+        if command[:3] == ["docker", "inspect", "--format"]:
+            assert ".Config.Labels" in command[3]
+            return json.dumps(
+                {
+                    "com.docker.compose.project": "other",
+                    "com.docker.compose.service": "postgres",
+                }
+            )
+        pytest.fail(f"unexpected external metadata command: {command}")
+
+    def _record_reset(*_args: Any, **_kwargs: Any) -> None:
+        mutations.append("database")
+
+    def _record_worktree(*_args: Any, **_kwargs: Any) -> None:
+        mutations.append("worktree")
+
+    monkeypatch.setattr(gate, "_checked_output", _metadata_output)
+    monkeypatch.setattr(gate, "_reset_database", _record_reset)
+    monkeypatch.setattr(gate, "_add_worktree", _record_worktree)
+
+    with pytest.raises(gate.GateError, match="ownership labels"):
+        gate._run_pair(
+            resources=resources,
+            released_ref="released",
+            released_commit="1" * 40,
+            candidate_ref="candidate",
+            candidate_commit="2" * 40,
+            current_candidate=False,
+        )
+
+    assert mutations == []
+    rendered = "\n".join(" ".join(command) for command in observed)
+    assert "DROP DATABASE" not in rendered
+    assert "CREATE DATABASE" not in rendered
+    assert not any(command[:3] == ["git", "worktree", "add"] for command in observed)
+
+
+def test_isolated_upgrade_resources_reject_mismatch_and_cleanup_only_owned_database(
+    gate: ModuleType,
+    isolated_released_upgrade_resources: Any,
+) -> None:
+    resources = isolated_released_upgrade_resources
+    gate._check_postgres(resources=resources)
+    sentinel = f"curie_upgrade_control_{uuid.uuid4().hex[:12]}"
+    scratch = f"curie_upgrade_scratch_{uuid.uuid4().hex[:12]}"
+    sentinel_created = False
+    scratch_created = False
+    try:
+        gate._reset_database(sentinel, resources=resources)
+        sentinel_created = True
+        assert _database_exists(gate, sentinel, resources=resources)
+
+        mismatched_port = 1 if resources.postgres_port != 1 else 2
+        mismatched_resources = dataclasses.replace(
+            resources,
+            postgres_port=mismatched_port,
+        )
+        with pytest.raises(gate.GateError):
+            gate._check_postgres(resources=mismatched_resources)
+        assert _database_exists(gate, sentinel, resources=resources)
+
+        gate._reset_database(scratch, resources=resources)
+        scratch_created = True
+        gate._cleanup(
+            [],
+            database_name=scratch,
+            database_touched=True,
+            resources=resources,
+        )
+        scratch_created = False
+        assert _database_exists(gate, sentinel, resources=resources)
+        assert not _database_exists(gate, scratch, resources=resources)
+    finally:
+        if scratch_created:
+            gate._cleanup(
+                [],
+                database_name=scratch,
+                database_touched=True,
+                resources=resources,
+            )
+        if sentinel_created:
+            gate._cleanup(
+                [],
+                database_name=sentinel,
+                database_touched=True,
+                resources=resources,
+            )
+
+
+def test_run_pair_rejects_sibling_postgres_identity_before_database_mutation(
+    gate: ModuleType,
+    isolated_released_upgrade_resources: Any,
+    sibling_postgres: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = dataclasses.replace(
+        isolated_released_upgrade_resources,
+        postgres_host="localhost",
+    )
+    selected_identifier = gate._checked_output(
+        gate._database_command(
+            "SELECT system_identifier FROM pg_control_system()",
+            flags=("-t", "-A"),
+            resources=selected,
+        ),
+        description="reading selected PostgreSQL system identifier",
+    ).strip()
+    sibling_identifier = asyncio.run(
+        gate._host_postgres_system_identifier(resources=sibling_postgres)
+    )
+    assert selected_identifier
+    assert sibling_identifier
+    assert selected_identifier != sibling_identifier
+    selected_catalog_before = _upgrade_database_catalog(
+        gate,
+        resources=selected,
+    )
+    sibling_catalog_before = _upgrade_database_catalog(
+        gate,
+        resources=sibling_postgres,
+    )
+
+    original_getaddrinfo = socket.getaddrinfo
+
+    def _redirect_localhost(
+        host: str,
+        port: int | str,
+        family: int = 0,
+        type: int = 0,
+        proto: int = 0,
+        flags: int = 0,
+    ) -> list[tuple[Any, ...]]:
+        if host == "localhost" and str(port) == str(selected.postgres_port):
+            return original_getaddrinfo(
+                sibling_postgres.postgres_host,
+                sibling_postgres.postgres_port,
+                family,
+                type,
+                proto,
+                flags,
+            )
+        return original_getaddrinfo(host, port, family, type, proto, flags)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(socket, "getaddrinfo", _redirect_localhost)
+        assert asyncio.run(
+            gate._host_postgres_system_identifier(resources=selected)
+        ) == sibling_identifier
+        with pytest.raises(gate.GateError, match="not the selected compose"):
+            gate._run_pair(
+                resources=selected,
+                released_ref="released",
+                released_commit="1" * 40,
+                candidate_ref="candidate",
+                candidate_commit="2" * 40,
+                current_candidate=False,
+            )
+
+    assert _upgrade_database_catalog(gate, resources=selected) == selected_catalog_before
+    assert (
+        _upgrade_database_catalog(gate, resources=sibling_postgres)
+        == sibling_catalog_before
+    )
+
+
+@pytest.mark.parametrize(
+    "set_values",
+    [
+        {"CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT": "curie2751"},
+        {"CURIE_RELEASED_UPGRADE_COMPOSE_FILES": "compose.yaml"},
+        {"CURIE_RELEASED_UPGRADE_POSTGRES_HOST": "127.0.0.1"},
+        {"CURIE_RELEASED_UPGRADE_POSTGRES_PORT": "35432"},
+    ],
+)
+def test_released_upgrade_resources_reject_partial_environment_before_any_gate_phase(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    set_values: dict[str, str],
+) -> None:
+    _clear_released_upgrade_env(monkeypatch)
+    for name, value in set_values.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(gate.GateError, match="all together"):
+        gate._released_upgrade_resources_from_env()
+
+
+def _set_isolated_released_upgrade_env(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    override: Path,
+    *,
+    compose_project: str = "curie2751",
+    compose_files: str | None = None,
+    postgres_host: str = "127.0.0.1",
+    postgres_port: str = "35432",
+) -> None:
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT", compose_project)
+    monkeypatch.setenv(
+        "CURIE_RELEASED_UPGRADE_COMPOSE_FILES",
+        (
+            compose_files
+            if compose_files is not None
+            else os.pathsep.join((str(gate.COMPOSE_FILE), str(override)))
+        ),
+    )
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_POSTGRES_HOST", postgres_host)
+    monkeypatch.setenv("CURIE_RELEASED_UPGRADE_POSTGRES_PORT", postgres_port)
+
+
+@pytest.mark.parametrize("compose_files", ("", os.pathsep, "compose.yaml"))
+def test_released_upgrade_resources_reject_invalid_compose_files(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    compose_files: str,
+) -> None:
+    _clear_released_upgrade_env(monkeypatch)
+    override = tmp_path / "private.yaml"
+    override.write_text("services: {}\n", encoding="utf-8")
+    _set_isolated_released_upgrade_env(
+        gate,
+        monkeypatch,
+        override,
+        compose_files=compose_files,
+    )
+
+    with pytest.raises(gate.GateError, match="COMPOSE_FILES"):
+        gate._released_upgrade_resources_from_env()
+
+
+def test_released_upgrade_resources_reject_missing_compose_override(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_released_upgrade_env(monkeypatch)
+    missing_override = tmp_path / "missing.yaml"
+    _set_isolated_released_upgrade_env(
+        gate,
+        monkeypatch,
+        missing_override,
+    )
+
+    with pytest.raises(gate.GateError, match="COMPOSE_FILES"):
+        gate._released_upgrade_resources_from_env()
+
+
+def test_released_upgrade_resources_reject_empty_compose_project(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_released_upgrade_env(monkeypatch)
+    override = tmp_path / "private.yaml"
+    override.write_text("services: {}\n", encoding="utf-8")
+    _set_isolated_released_upgrade_env(
+        gate,
+        monkeypatch,
+        override,
+        compose_project="",
+    )
+
+    with pytest.raises(gate.GateError, match="COMPOSE_PROJECT"):
+        gate._released_upgrade_resources_from_env()
+
+
+@pytest.mark.parametrize(
+    ("postgres_host", "postgres_port", "expected_field"),
+    [
+        ("database.example.com", "35432", "POSTGRES_HOST"),
+        ("127.0.0.1", "not_a_port", "POSTGRES_PORT"),
+        ("127.0.0.1", "0", "POSTGRES_PORT"),
+        ("127.0.0.1", "65536", "POSTGRES_PORT"),
+    ],
+)
+def test_released_upgrade_resources_reject_invalid_endpoint_values(
+    gate: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    postgres_host: str,
+    postgres_port: str,
+    expected_field: str,
+) -> None:
+    _clear_released_upgrade_env(monkeypatch)
+    override = tmp_path / "private.yaml"
+    override.write_text("services: {}\n", encoding="utf-8")
+    _set_isolated_released_upgrade_env(
+        gate,
+        monkeypatch,
+        override,
+        postgres_host=postgres_host,
+        postgres_port=postgres_port,
+    )
+
+    with pytest.raises(gate.GateError, match=expected_field):
+        gate._released_upgrade_resources_from_env()
 
 
 def _direction(
@@ -239,7 +986,9 @@ def test_self_test_passes_when_every_direction_matches_its_expectation(
     """Positive control: without it the mismatch tests could pass vacuously."""
     _stub_pair_walk(gate, monkeypatch, {})
 
-    assert gate._run_self_test() == 0
+    assert gate._run_self_test(
+        resources=gate._released_upgrade_resources_from_env()
+    ) == 0
 
 
 def test_an_expected_failure_that_passed_names_that_direction(
@@ -251,7 +1000,7 @@ def test_an_expected_failure_that_passed_names_that_direction(
     )
 
     with pytest.raises(gate.GateError) as excinfo:
-        gate._run_self_test()
+        gate._run_self_test(resources=gate._released_upgrade_resources_from_env())
 
     message = str(excinfo.value)
     assert "v0.7.3" in message
@@ -270,7 +1019,7 @@ def test_an_expected_pass_that_failed_names_the_direction_and_the_phase(
     )
 
     with pytest.raises(gate.GateError) as excinfo:
-        gate._run_self_test()
+        gate._run_self_test(resources=gate._released_upgrade_resources_from_env())
 
     message = str(excinfo.value)
     assert "v0.8.0" in message
@@ -297,7 +1046,7 @@ def test_a_failure_in_the_right_phase_missing_a_marker_names_the_marker(
     )
 
     with pytest.raises(gate.GateError) as excinfo:
-        gate._run_self_test()
+        gate._run_self_test(resources=gate._released_upgrade_resources_from_env())
 
     message = str(excinfo.value)
     assert "0022_approvals_reply_kind.py" in message
@@ -641,14 +1390,17 @@ def test_released_state_introspection_includes_the_workflow_state_table(
 ) -> None:
     captured: dict[str, str] = {}
 
-    def _fake_query(database_name: str, sql: str) -> str:
+    def _fake_query(database_name: str, sql: str, *, resources: Any) -> str:
         captured["database_name"] = database_name
         captured["sql"] = sql
         return "workflow_state_entries|namespace|NO|"
 
     monkeypatch.setattr(gate, "_scratch_query", _fake_query)
 
-    columns = gate._introspect_columns("released_state_introspection")
+    columns = gate._introspect_columns(
+        "released_state_introspection",
+        resources=gate._released_upgrade_resources_from_env(),
+    )
 
     assert captured["database_name"] == "released_state_introspection"
     assert "workflow_state_entries" in captured["sql"]
@@ -867,7 +1619,11 @@ def test_seed_released_database_returns_the_exact_released_state_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     metadata = _metadata_with_released_state(gate)
-    monkeypatch.setattr(gate, "_introspect_columns", lambda _database: ())
+    monkeypatch.setattr(
+        gate,
+        "_introspect_columns",
+        lambda _database, *, resources: (),
+    )
     monkeypatch.setattr(
         gate,
         "_plan_seed_statements",
@@ -882,6 +1638,7 @@ def test_seed_released_database_returns_the_exact_released_state_metadata(
         "released_state_seed",
         phase=gate.SEED_PHASE,
         approval_route_era=gate.APPROVAL_ROUTE_ERA_SPLIT,
+        resources=gate._released_upgrade_resources_from_env(),
     )
 
     assert returned is metadata
@@ -897,7 +1654,11 @@ def test_seed_released_database_refuses_state_capable_schema_without_a_sentinel(
     )
     metadata = _metadata_with_released_state(gate)
     empty_metadata = dataclasses.replace(metadata, legacy_state=None)
-    monkeypatch.setattr(gate, "_introspect_columns", lambda _database: columns)
+    monkeypatch.setattr(
+        gate,
+        "_introspect_columns",
+        lambda _database, *, resources: columns,
+    )
     monkeypatch.setattr(
         gate,
         "_plan_seed_statements",
@@ -912,6 +1673,7 @@ def test_seed_released_database_refuses_state_capable_schema_without_a_sentinel(
             "released_state_vacuity",
             phase=gate.SEED_PHASE,
             approval_route_era=gate.APPROVAL_ROUTE_ERA_SPLIT,
+            resources=gate._released_upgrade_resources_from_env(),
         )
 
     message = str(excinfo.value)
@@ -958,6 +1720,7 @@ def test_upgrade_pair_threads_the_exact_released_state_metadata_into_readback(
         released_commit="1" * 40,
         candidate_ref="HEAD",
         candidate_commit="2" * 40,
+        resources=gate._released_upgrade_resources_from_env(),
     )
 
     assert result == gate.PairResult(gate.READBACK_PHASE, 0, "read-back ok")
@@ -1028,6 +1791,7 @@ def test_upgrade_pair_from_released_0037_seeds_a_valid_shared_state_owner(
         released_commit="1" * 40,
         candidate_ref="HEAD",
         candidate_commit="2" * 40,
+        resources=gate._released_upgrade_resources_from_env(),
     )
 
     assert result == gate.PairResult(gate.READBACK_PHASE, 0, "read-back ok")

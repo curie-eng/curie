@@ -22,6 +22,7 @@ requires that they load.
 """
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -35,10 +36,13 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
+import asyncpg
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = REPO_ROOT / "compose.dev.yaml"
 STABLE_TAG_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]+$")
+COMPOSE_PROJECT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 # Always HEAD's copy of the runner, never the tree being judged. See that file's
 # docstring: it is one fixed assertion harness executed inside the candidate's
 # environment, so the thing that varies across directions is the package it
@@ -249,6 +253,117 @@ class PairResult:
     output: str
 
 
+@dataclass(frozen=True)
+class ReleaseUpgradeResources:
+    """One immutable Compose and Postgres scope for a gate invocation."""
+
+    compose_project: str
+    compose_files: tuple[Path, ...]
+    postgres_host: str
+    postgres_port: int
+
+
+_RELEASED_UPGRADE_RESOURCE_ENV = (
+    "CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT",
+    "CURIE_RELEASED_UPGRADE_COMPOSE_FILES",
+    "CURIE_RELEASED_UPGRADE_POSTGRES_HOST",
+    "CURIE_RELEASED_UPGRADE_POSTGRES_PORT",
+)
+
+
+def _released_upgrade_resources_from_env() -> ReleaseUpgradeResources:
+    """Read the all or nothing isolated-resource contract.
+
+    Without the contract, retain the shared baseline endpoint while respecting
+    an ambient Compose project. A caller that supplies any isolation value must
+    supply all four, so a partially redirected gate cannot mutate a database
+    selected by a different Compose invocation.
+    """
+
+    values = {name: os.environ.get(name) for name in _RELEASED_UPGRADE_RESOURCE_ENV}
+    present = [name for name, value in values.items() if value is not None]
+    if not present:
+        return ReleaseUpgradeResources(
+            compose_project=os.environ.get("COMPOSE_PROJECT_NAME") or "curie",
+            compose_files=(COMPOSE_FILE,),
+            postgres_host="localhost",
+            postgres_port=25432,
+        )
+    if len(present) != len(_RELEASED_UPGRADE_RESOURCE_ENV):
+        missing = [
+            name for name in _RELEASED_UPGRADE_RESOURCE_ENV if values[name] is None
+        ]
+        raise GateError(
+            "CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT, "
+            "CURIE_RELEASED_UPGRADE_COMPOSE_FILES, "
+            "CURIE_RELEASED_UPGRADE_POSTGRES_HOST, and "
+            "CURIE_RELEASED_UPGRADE_POSTGRES_PORT must be set all together; "
+            f"missing {', '.join(missing)}"
+        )
+
+    compose_project = values["CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT"]
+    compose_files_value = values["CURIE_RELEASED_UPGRADE_COMPOSE_FILES"]
+    postgres_host = values["CURIE_RELEASED_UPGRADE_POSTGRES_HOST"]
+    postgres_port_value = values["CURIE_RELEASED_UPGRADE_POSTGRES_PORT"]
+    assert compose_project is not None
+    assert compose_files_value is not None
+    assert postgres_host is not None
+    assert postgres_port_value is not None
+
+    if not COMPOSE_PROJECT_PATTERN.fullmatch(compose_project):
+        raise GateError(
+            "CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT must be a nonempty "
+            "lowercase Compose project name"
+        )
+
+    compose_file_values = compose_files_value.split(os.pathsep)
+    if not compose_file_values or any(not value for value in compose_file_values):
+        raise GateError(
+            "CURIE_RELEASED_UPGRADE_COMPOSE_FILES must contain one or more "
+            "ordered compose files"
+        )
+    compose_file_paths = tuple(Path(value) for value in compose_file_values)
+    if any(not path.is_absolute() for path in compose_file_paths):
+        raise GateError(
+            "CURIE_RELEASED_UPGRADE_COMPOSE_FILES must contain existing absolute "
+            "compose files"
+        )
+    compose_files = tuple(path.resolve() for path in compose_file_paths)
+    missing_files = [str(path) for path in compose_files if not path.is_file()]
+    if missing_files:
+        raise GateError(
+            "CURIE_RELEASED_UPGRADE_COMPOSE_FILES names missing files: "
+            f"{', '.join(missing_files)}"
+        )
+    if len(compose_files) < 2 or compose_files[0] != COMPOSE_FILE:
+        raise GateError(
+            "CURIE_RELEASED_UPGRADE_COMPOSE_FILES must contain the base "
+            "compose.dev.yaml followed by an isolated override"
+        )
+
+    if postgres_host not in {"localhost", "127.0.0.1", "::1"}:
+        raise GateError(
+            "CURIE_RELEASED_UPGRADE_POSTGRES_HOST must be localhost, 127.0.0.1, "
+            "or ::1"
+        )
+    if not postgres_port_value.isascii() or not postgres_port_value.isdecimal():
+        raise GateError(
+            "CURIE_RELEASED_UPGRADE_POSTGRES_PORT must be a decimal TCP port"
+        )
+    postgres_port = int(postgres_port_value)
+    if not 1 <= postgres_port <= 65535:
+        raise GateError(
+            "CURIE_RELEASED_UPGRADE_POSTGRES_PORT must be between 1 and 65535"
+        )
+
+    return ReleaseUpgradeResources(
+        compose_project=compose_project,
+        compose_files=compose_files,
+        postgres_host=postgres_host,
+        postgres_port=postgres_port,
+    )
+
+
 def _run(command: list[str], *, cwd: Path = REPO_ROOT) -> CommandResult:
     try:
         completed = subprocess.run(
@@ -307,15 +422,149 @@ def _latest_released_tag() -> tuple[str, str]:
     return latest_tag, _resolve_ref(latest_tag)
 
 
-def _compose_command(*arguments: str) -> list[str]:
-    return ["docker", "compose", "-f", str(COMPOSE_FILE), *arguments]
+def _compose_command(
+    *arguments: str, resources: ReleaseUpgradeResources
+) -> list[str]:
+    command = ["docker", "compose", "-p", resources.compose_project]
+    for compose_file in resources.compose_files:
+        command.extend(("-f", str(compose_file)))
+    return [*command, *arguments]
 
 
-def _check_postgres() -> None:
+def _database_url(database_name: str, *, resources: ReleaseUpgradeResources) -> str:
+    host = resources.postgres_host
+    if ":" in host:
+        host = f"[{host}]"
+    return (
+        "postgresql+asyncpg://postgres:postgres@"
+        f"{host}:{resources.postgres_port}/{database_name}"
+    )
+
+
+def _postgres_container_id(*, resources: ReleaseUpgradeResources) -> str:
+    output = _checked_output(
+        _compose_command("ps", "--all", "-q", "postgres", resources=resources),
+        description="locating the selected compose Postgres service",
+    )
+    container_ids = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(container_ids) != 1:
+        raise GateError(
+            "the selected compose scope must contain exactly one Postgres "
+            f"container, found {len(container_ids)}"
+        )
+    container_id = container_ids[0]
+    labels_output = _checked_output(
+        ["docker", "inspect", "--format", "{{json .Config.Labels}}", container_id],
+        description="checking selected Postgres container ownership",
+    )
+    try:
+        labels = json.loads(labels_output)
+    except json.JSONDecodeError as exc:
+        raise GateError(
+            "could not parse selected Postgres container ownership labels"
+        ) from exc
+    if not isinstance(labels, dict):
+        raise GateError("selected Postgres container has no ownership labels")
+    if (
+        labels.get("com.docker.compose.project") != resources.compose_project
+        or labels.get("com.docker.compose.service") != "postgres"
+    ):
+        raise GateError(
+            "selected Postgres container ownership labels do not match the "
+            "requested compose project and service"
+        )
+    running = _checked_output(
+        ["docker", "inspect", "--format", "{{.State.Running}}", container_id],
+        description="checking selected Postgres container state",
+    ).strip()
+    if running != "true":
+        raise GateError("selected Postgres container is not running")
+    return container_id
+
+
+def _published_postgres_endpoints(
+    *, resources: ReleaseUpgradeResources
+) -> tuple[tuple[str, int], ...]:
+    output = _checked_output(
+        _compose_command("port", "postgres", "5432", resources=resources),
+        description="reading the selected compose Postgres published port",
+    )
+    endpoints: list[tuple[str, int]] = []
+    for line in output.splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        if value.startswith("["):
+            host, separator, port_value = value[1:].partition("]:")
+            if not separator:
+                raise GateError(
+                    f"could not parse published Postgres endpoint {value!r}"
+                )
+        else:
+            host, separator, port_value = value.rpartition(":")
+            if not separator or not host:
+                raise GateError(
+                    f"could not parse published Postgres endpoint {value!r}"
+                )
+        if not port_value.isascii() or not port_value.isdecimal():
+            raise GateError(f"could not parse published Postgres endpoint {value!r}")
+        port = int(port_value)
+        if not 1 <= port <= 65535:
+            raise GateError(f"could not parse published Postgres endpoint {value!r}")
+        endpoints.append((host, port))
+    if not endpoints:
+        raise GateError("the selected compose Postgres service has no published port")
+    return tuple(endpoints)
+
+
+def _published_host_serves_requested_host(
+    published_host: str, requested_host: str
+) -> bool:
+    if requested_host == "localhost":
+        return published_host in {"127.0.0.1", "::1", "0.0.0.0", "::"}
+    if requested_host == "127.0.0.1":
+        return published_host in {"127.0.0.1", "0.0.0.0"}
+    return published_host in {"::1", "::"}
+
+
+async def _host_postgres_system_identifier(
+    *, resources: ReleaseUpgradeResources
+) -> str:
+    try:
+        connection = await asyncpg.connect(
+            host=resources.postgres_host,
+            port=resources.postgres_port,
+            user="postgres",
+            password="postgres",
+            database="postgres",
+            timeout=5,
+            command_timeout=5,
+        )
+    except Exception as exc:
+        raise GateError(
+            "connecting to the configured host Postgres endpoint failed"
+        ) from exc
+    try:
+        identifier = await connection.fetchval(
+            "SELECT system_identifier FROM pg_control_system()"
+        )
+    except Exception as exc:
+        raise GateError(
+            "reading the configured host Postgres system identifier failed"
+        ) from exc
+    finally:
+        await connection.close()
+    if not isinstance(identifier, int | str) or not str(identifier):
+        raise GateError("configured host Postgres returned no system identifier")
+    return str(identifier)
+
+
+def _check_postgres(*, resources: ReleaseUpgradeResources) -> None:
     _checked_output(
         ["docker", "compose", "version"],
         description="checking Docker Compose availability",
     )
+    _postgres_container_id(resources=resources)
     _checked_output(
         _compose_command(
             "exec",
@@ -326,14 +575,44 @@ def _check_postgres() -> None:
             "postgres",
             "-d",
             "postgres",
+            resources=resources,
         ),
         description="checking the compose Postgres service",
     )
+    published_endpoints = _published_postgres_endpoints(resources=resources)
+    if not any(
+        port == resources.postgres_port
+        and _published_host_serves_requested_host(host, resources.postgres_host)
+        for host, port in published_endpoints
+    ):
+        rendered = ", ".join(f"{host}:{port}" for host, port in published_endpoints)
+        raise GateError(
+            "the configured host Postgres endpoint does not match the selected "
+            f"compose published port: expected {resources.postgres_host}:"
+            f"{resources.postgres_port}, found {rendered}"
+        )
+    container_identifier = _checked_output(
+        _database_command(
+            "SELECT system_identifier FROM pg_control_system()",
+            resources=resources,
+            flags=("-t", "-A"),
+        ),
+        description="reading selected compose Postgres system identifier",
+    ).strip()
+    if not container_identifier:
+        raise GateError("selected compose Postgres returned no system identifier")
+    host_identifier = asyncio.run(_host_postgres_system_identifier(resources=resources))
+    if host_identifier != container_identifier:
+        raise GateError(
+            "configured host Postgres endpoint is not the selected compose "
+            "Postgres service"
+        )
 
 
 def _database_command(
     sql: str,
     *,
+    resources: ReleaseUpgradeResources,
     database_name: str = "postgres",
     flags: tuple[str, ...] = (),
 ) -> list[str]:
@@ -362,10 +641,13 @@ def _database_command(
         "ON_ERROR_STOP=1",
         "-c",
         sql,
+        resources=resources,
     )
 
 
-def _scratch_query(database_name: str, sql: str) -> str:
+def _scratch_query(
+    database_name: str, sql: str, *, resources: ReleaseUpgradeResources
+) -> str:
     """Run a read-only query against the scratch database and return stdout.
 
     `-t -A` strips the header, the row-count footer and the column padding, so
@@ -373,18 +655,26 @@ def _scratch_query(database_name: str, sql: str) -> str:
     """
 
     return _checked_output(
-        _database_command(sql, database_name=database_name, flags=("-t", "-A")),
+        _database_command(
+            sql,
+            resources=resources,
+            database_name=database_name,
+            flags=("-t", "-A"),
+        ),
         description=f"querying scratch database {database_name}",
     )
 
 
-def _reset_database(database_name: str) -> None:
+def _reset_database(database_name: str, *, resources: ReleaseUpgradeResources) -> None:
     _checked_output(
-        _database_command(f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)'),
+        _database_command(
+            f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)',
+            resources=resources,
+        ),
         description=f"dropping stale scratch database {database_name}",
     )
     _checked_output(
-        _database_command(f'CREATE DATABASE "{database_name}"'),
+        _database_command(f'CREATE DATABASE "{database_name}"', resources=resources),
         description=f"creating scratch database {database_name}",
     )
 
@@ -544,7 +834,9 @@ def _json_literal(payload: dict[str, Any] | None) -> str:
     return f"{_sql_literal(json.dumps(payload))}::jsonb"
 
 
-def _introspect_columns(database_name: str) -> tuple[ColumnInfo, ...]:
+def _introspect_columns(
+    database_name: str, *, resources: ReleaseUpgradeResources
+) -> tuple[ColumnInfo, ...]:
     """Read the scratch database's `curie` schema after the released upgrade.
 
     The seed cannot be written against one hard-coded schema: the released ref is
@@ -565,6 +857,7 @@ def _introspect_columns(database_name: str) -> tuple[ColumnInfo, ...]:
         "AND table_name IN "
         "('agents', 'agent_channels', 'workflow_state_entries') "
         "ORDER BY table_name, ordinal_position",
+        resources=resources,
     )
     columns: list[ColumnInfo] = []
     for line in rows.splitlines():
@@ -870,6 +1163,7 @@ def _plan_seed_statements(
 def _seed_released_database(
     database_name: str,
     *,
+    resources: ReleaseUpgradeResources,
     phase: str,
     approval_route_era: str,
     released_state_repaired: bool = False,
@@ -883,7 +1177,7 @@ def _seed_released_database(
     """
 
     print(f"=== {phase}: {database_name} ===", flush=True)
-    columns = _introspect_columns(database_name)
+    columns = _introspect_columns(database_name, resources=resources)
     statements, metadata = _plan_seed_statements(
         columns,
         approval_route_era=approval_route_era,
@@ -908,7 +1202,11 @@ def _seed_released_database(
     # fixture now lands whole or not at all -- and a PARTIAL seed is worse than
     # none, because the read-back would then pass on whichever rows survived.
     _checked_output(
-        _database_command(";\n".join(statements), database_name=database_name),
+        _database_command(
+            ";\n".join(statements),
+            resources=resources,
+            database_name=database_name,
+        ),
         description=f"seeding the released database {database_name}",
     )
     print(
@@ -922,6 +1220,7 @@ def _upgrade_pair(
     released_tree: Path,
     candidate_tree: Path,
     *,
+    resources: ReleaseUpgradeResources,
     database_url: str,
     database_name: str,
     released_ref: str,
@@ -997,6 +1296,7 @@ def _upgrade_pair(
     # released ref can sit between them (#2098).
     seed_metadata = _seed_released_database(
         database_name,
+        resources=resources,
         phase=SEED_PHASE,
         approval_route_era=_detect_approval_route_era(released_tree),
         released_state_repaired=_candidate_supports_legacy_state(released_tree),
@@ -1020,6 +1320,7 @@ def _upgrade_pair(
 def _cleanup(
     worktrees: list[Path],
     *,
+    resources: ReleaseUpgradeResources,
     database_name: str,
     database_touched: bool,
 ) -> None:
@@ -1041,7 +1342,8 @@ def _cleanup(
         try:
             result = _run(
                 _database_command(
-                    f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)'
+                    f'DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)',
+                    resources=resources,
                 )
             )
         except GateError as exc:
@@ -1059,25 +1361,23 @@ def _cleanup(
 
 def _run_pair(
     *,
+    resources: ReleaseUpgradeResources,
     released_ref: str,
     released_commit: str,
     candidate_ref: str,
     candidate_commit: str,
     current_candidate: bool,
 ) -> PairResult:
-    _check_postgres()
+    _check_postgres(resources=resources)
     database_name = f"curie_upgrade_{os.getpid()}_{secrets.token_hex(4)}"
-    database_url = (
-        "postgresql+asyncpg://postgres:postgres@localhost:25432/"
-        f"{database_name}"
-    )
+    database_url = _database_url(database_name, resources=resources)
     worktrees: list[Path] = []
     database_touched = False
     with tempfile.TemporaryDirectory(prefix="curie-released-upgrade-") as temp_dir:
         temp_root = Path(temp_dir)
         try:
             database_touched = True
-            _reset_database(database_name)
+            _reset_database(database_name, resources=resources)
 
             released_tree = temp_root / "released"
             _add_worktree(released_tree, released_commit, label="released")
@@ -1093,6 +1393,7 @@ def _run_pair(
             return _upgrade_pair(
                 released_tree,
                 candidate_tree,
+                resources=resources,
                 database_url=database_url,
                 database_name=database_name,
                 released_ref=released_ref,
@@ -1103,6 +1404,7 @@ def _run_pair(
         finally:
             _cleanup(
                 worktrees,
+                resources=resources,
                 database_name=database_name,
                 database_touched=database_touched,
             )
@@ -1112,7 +1414,9 @@ def _describe(direction: SelfTestDirection) -> str:
     return f"{direction.released_ref} to {direction.candidate_ref}"
 
 
-def _check_direction(direction: SelfTestDirection) -> str | None:
+def _check_direction(
+    direction: SelfTestDirection, *, resources: ReleaseUpgradeResources
+) -> str | None:
     """Run one pinned direction. Returns a mismatch description, or None on match.
 
     It RETURNS the mismatch instead of raising it so `_run_self_test` can walk
@@ -1122,6 +1426,7 @@ def _check_direction(direction: SelfTestDirection) -> str | None:
     """
 
     result = _run_pair(
+        resources=resources,
         released_ref=direction.released_ref,
         released_commit=_resolve_ref(direction.released_ref),
         candidate_ref=direction.candidate_ref,
@@ -1165,7 +1470,7 @@ def _check_direction(direction: SelfTestDirection) -> str | None:
     return None
 
 
-def _run_self_test() -> int:
+def _run_self_test(*, resources: ReleaseUpgradeResources) -> int:
     mismatches: list[str] = []
     for direction in SELF_TEST_DIRECTIONS:
         expectation = (
@@ -1177,7 +1482,7 @@ def _run_self_test() -> int:
             f"=== self test direction {_describe(direction)} ({expectation}) ===",
             flush=True,
         )
-        mismatch = _check_direction(direction)
+        mismatch = _check_direction(direction, resources=resources)
         if mismatch is not None:
             mismatches.append(mismatch)
 
@@ -1192,10 +1497,16 @@ def _run_self_test() -> int:
     return 0
 
 
-def _run_requested_pair(released_ref: str, candidate_ref: str) -> int:
+def _run_requested_pair(
+    released_ref: str,
+    candidate_ref: str,
+    *,
+    resources: ReleaseUpgradeResources,
+) -> int:
     released_commit = _resolve_ref(released_ref)
     candidate_commit = _resolve_ref(candidate_ref)
     result = _run_pair(
+        resources=resources,
         released_ref=released_ref,
         released_commit=released_commit,
         candidate_ref=candidate_ref,
@@ -1211,7 +1522,7 @@ def _run_requested_pair(released_ref: str, candidate_ref: str) -> int:
     return result.returncode
 
 
-def _run_normal() -> int:
+def _run_normal(*, resources: ReleaseUpgradeResources) -> int:
     released_ref, released_commit = _latest_released_tag()
     candidate_commit = _resolve_ref("HEAD")
     print(
@@ -1219,6 +1530,7 @@ def _run_normal() -> int:
         "reachable from origin/main."
     )
     result = _run_pair(
+        resources=resources,
         released_ref=released_ref,
         released_commit=released_commit,
         candidate_ref="HEAD",
@@ -1272,11 +1584,14 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, _raise_interrupted)
     try:
+        resources = _released_upgrade_resources_from_env()
         if args.self_test:
-            return _run_self_test()
+            return _run_self_test(resources=resources)
         if args.released_ref and args.candidate_ref:
-            return _run_requested_pair(args.released_ref, args.candidate_ref)
-        return _run_normal()
+            return _run_requested_pair(
+                args.released_ref, args.candidate_ref, resources=resources
+            )
+        return _run_normal(resources=resources)
     except KeyboardInterrupt:
         print("Released upgrade gate interrupted after cleanup.", file=sys.stderr)
         return 130
