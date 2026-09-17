@@ -39,6 +39,7 @@ from aci_protocol import (
 from claude_agent_sdk import AssistantMessage, ResultMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .adapter import (
     McpServerReconnector,
@@ -47,7 +48,7 @@ from .adapter import (
     StreamedToolUseBoundary,
     model_message_to_conversation,
 )
-from .approval import PUBLISH_TOOL_NAME, ApprovalGate
+from .approval import ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import (
     ApprovalContext,
@@ -1150,7 +1151,7 @@ class SessionRunner:
         while state.publication_calls_observed < len(state.publication_calls):
             payload = state.publication_calls[state.publication_calls_observed]
             state.publication_calls_observed += 1
-            if gate is None or PUBLISH_TOOL_NAME not in gate.required:
+            if gate is None or PLATFORM_PUBLISH_TOOL_NAME not in gate.required:
                 # The model named the publication tool where the platform has no
                 # gated checkout to publish from. Recording it anyway would ask a
                 # human to authorize an action that cannot exist, so fail closed.
@@ -1220,7 +1221,7 @@ class SessionRunner:
             not state.publication_calls
             or gate is None
             or gate.pending_summary is None
-            or gate.pending_granted_tool != PUBLISH_TOOL_NAME
+            or gate.pending_granted_tool != PLATFORM_PUBLISH_TOOL_NAME
             or gate.pending_halt
             or self._interrupt_requested
             or self._timeout_requested
@@ -1254,7 +1255,7 @@ class SessionRunner:
         if (
             not state.publication_calls
             or final.status is not SessionStatus.AWAITING_APPROVAL
-            or final.approval_granted_tool == PUBLISH_TOOL_NAME
+            or final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
         ):
             return
         if state.publication_unrecorded is not None:
@@ -1466,7 +1467,7 @@ class SessionRunner:
 
         permission_is_actionable_tool = (
             gate.pending_summary is not None
-            and gate.pending_granted_tool != PUBLISH_TOOL_NAME
+            and gate.pending_granted_tool != PLATFORM_PUBLISH_TOOL_NAME
         )
         if permission_is_actionable_tool:
             # A gated tool call is the card. Copy it even when translate.py
