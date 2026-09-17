@@ -1460,7 +1460,7 @@ fn parse_approvers(raw: &[String]) -> Result<Vec<String>> {
 fn operator_gap_notice() -> String {
     format!(
         "route {SRE_APPROVALS_ROUTE} binds no explicit approver user list: operator principals \
-         cannot resolve the six Kubernetes gates on it until users are bound; approval stays \
+         cannot resolve the six Kubernetes mutations and platform publication on it until users are bound; approval stays \
          with the route's Slack channel members or approver group. Re-run with --approvers \
          <USER_IDS>, or run `curie cluster approvals {SRE_BOT_AGENT} --route-resolution \
          {SRE_APPROVALS_ROUTE}=<CHANNEL> --route-approvers {SRE_APPROVALS_ROUTE}=users:<ids>` (a \
