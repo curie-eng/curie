@@ -129,7 +129,6 @@ class PublicationStore(Protocol):
         outcome: str,
         pr_url: str | None,
         error: str | None,
-        **lineage: Any,
     ) -> None | Awaitable[None]: ...
 
     def pending_result(self, publication_id: uuid.UUID | None = None) -> Any: ...
@@ -167,6 +166,23 @@ class PublicationCredentialSource(Protocol):
     def redeem(
         self, publication_id: uuid.UUID
     ) -> PublicationCredential | Awaitable[PublicationCredential]: ...
+
+
+class PublicationLineageRefused(PublicationReconcileError):
+    """The API refused the lineage advance for this exact publication outcome."""
+
+
+class PublicationLineageAuthority(Protocol):
+    def advance(
+        self,
+        publication_id: uuid.UUID,
+        *,
+        expected_version: int,
+        expected_head_sha: str | None,
+        pr_number: int,
+        pr_url: str,
+        head_sha: str,
+    ) -> None | Awaitable[None]: ...
 
 
 class PublicationCluster(Protocol):
@@ -297,11 +313,13 @@ class PublicationReconciler:
         cluster: PublicationCluster,
         github: PublicationGitHub,
         replies: ReplySink,
+        lineage: PublicationLineageAuthority,
         job_settings: PublicationJobSettings,
         card_store: ApprovalCardStore | None = None,
         transcript: PublicationTranscript | None = None,
     ) -> None:
         self._store = store
+        self._lineage = lineage
         self._credentials = credentials
         self._cluster = cluster
         self._github = github
@@ -420,8 +438,6 @@ class PublicationReconciler:
         outcome: str,
         pr_url: str | None = None,
         error: str | None = None,
-        pr_number: int | None = None,
-        new_head: str | None = None,
     ) -> None:
         await _resolve(
             self._store.persist_result(
@@ -429,12 +445,6 @@ class PublicationReconciler:
                 outcome=outcome,
                 pr_url=pr_url,
                 error=error,
-                lineage_id=work.lineage_id,
-                lineage_version=work.lineage_version,
-                revision_id=work.revision_id,
-                expected_prior_head=work.expected_prior_head,
-                pr_number=pr_number,
-                new_head=new_head,
             )
         )
 
@@ -630,13 +640,33 @@ class PublicationReconciler:
         # The durable outcome is the source of truth. Resource cleanup and reply
         # delivery are independent outboxes; result claims remain gated until
         # cleanup has durably completed.
+        if new_head is not None:
+            if pr_url is None or pr_number is None:
+                raise PublicationReconcileError(
+                    "publication success omitted pull request identity"
+                )
+            # ADR 0143: the API verifies GitHub identity and advances the
+            # lineage with the publication outcome in one compare-and-set.
+            try:
+                await _resolve(
+                    self._lineage.advance(
+                        work.publication_id,
+                        expected_version=work.lineage_version,
+                        expected_head_sha=work.expected_remote_head,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                        head_sha=new_head,
+                    )
+                )
+            except PublicationLineageRefused:
+                # A replay after a lost response finds its own settled outcome.
+                if not await _resolve(self._store.is_terminal(work.publication_id)):
+                    raise
         await self._persist_result(
             work,
             outcome=outcome,
             pr_url=pr_url,
             error=error,
-            pr_number=pr_number,
-            new_head=new_head,
         )
         await self.deliver_pending_cleanup()
         await self.deliver_pending_result(work.publication_id)
@@ -1169,6 +1199,8 @@ class PublicationReconcileLoop:
 __all__ = [
     "PublicationCredential",
     "PublicationJobObservation",
+    "PublicationLineageAuthority",
+    "PublicationLineageRefused",
     "PublicationPullState",
     "PublicationReconcileError",
     "PublicationReconciler",

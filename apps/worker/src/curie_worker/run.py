@@ -47,6 +47,7 @@ from .markers import Markers
 from .publication_clients import (
     GitHubPublicationLookup,
     PublicationCredentialClient,
+    PublicationLineageClient,
     PublicationTranscriptClient,
 )
 from .publication_k8s import KubernetesPublicationCluster, PublicationJobSettings
@@ -746,6 +747,11 @@ def _build_publication_loop(
         ),
         cluster=cluster,
         github=GitHubPublicationLookup(http),
+        lineage=PublicationLineageClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=http,
+        ),
         # Publication delivery runs outside the kernel, so it must decorate the
         # shared router independently. The reply observation depth suppresses
         # the HTTP adapter's nested instrumentation and keeps one logical

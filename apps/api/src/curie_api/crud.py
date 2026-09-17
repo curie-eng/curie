@@ -1493,6 +1493,10 @@ async def advance_publication_lineage(
         "status": publication_status,
         "version": Publication.version + 1,
         "patch_bytes": None,
+        # Settle the worker's publication lease with the outcome, exactly as
+        # its terminal CAS would, so the result outbox is claimable at once.
+        "lease_owner": None,
+        "lease_expires_at": None,
         "terminal_at": func.now(),
         "updated_at": func.now(),
         "result_url": data.pr_url,
