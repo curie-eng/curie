@@ -396,4 +396,5 @@ CURIE_PUBLICATION_FIXTURE_API="https://127.0.0.1:$FIXTURE_PORT" \
 CURIE_PUBLICATION_FIXTURE_CLUSTER_API="https://$FIXTURE_DNS:8443" \
 CURIE_PUBLICATION_FIXTURE_CA="$TMP_DIR/ca.crt" \
 TEST_DATABASE_URL="$DATABASE_URL" \
-  uv run pytest -q -rA apps/worker/tests/test_publication_cluster.py
+  env -u KUBERNETES_SERVICE_HOST -u KUBERNETES_SERVICE_PORT \
+    uv run pytest -q -rA apps/worker/tests/test_publication_cluster.py

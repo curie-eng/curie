@@ -430,7 +430,8 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
                     await connection.execute(
                         text(
                             "SELECT status, error, patch_bytes, reconcile_attempts, "
-                            "terminal_at, resource_cleanup_completed_at "
+                            "terminal_at, resource_cleanup_completed_at, version, "
+                            "result_reported_at "
                             "FROM curie.publications WHERE id = :id"
                         ),
                         {"id": FAILURE_ID},
@@ -441,6 +442,7 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
             assert terminal["reconcile_attempts"] == 0
             assert terminal["terminal_at"] is not None
             assert terminal["resource_cleanup_completed_at"] is not None
+            assert terminal["result_reported_at"] is not None
             assert "error: No valid patches in input" in terminal["error"]
             assert terminal["error"].endswith(
                 f"Nothing was pushed to {REPO_FULL_NAME}; "
@@ -458,13 +460,16 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
                     await connection.execute(
                         text(
                             "SELECT status, error, patch_bytes, reconcile_attempts, "
-                            "terminal_at, resource_cleanup_completed_at "
+                            "terminal_at, resource_cleanup_completed_at, version, "
+                            "result_reported_at "
                             "FROM curie.publications WHERE id = :id"
                         ),
                         {"id": FAILURE_ID},
                     )
                 ).mappings().one()
             assert dict(replay) == before_replay
+            assert len(replies.texts) == 1
+            assert transcript.texts == replies.texts
     finally:
         await engine.dispose()
 
