@@ -134,6 +134,28 @@ const ENDPOINTS: &[(&str, &str, bool)] = &[
     ("OTel HTTP", "localhost:24318", false),
 ];
 
+fn advertised_endpoints(resources: &LocalResources, minimal: bool) -> Vec<(String, String)> {
+    if !resources.isolated() {
+        return ENDPOINTS
+            .iter()
+            .filter(|(_, _, is_core)| !minimal || *is_core)
+            .map(|(label, url, _)| ((*label).to_string(), (*url).to_string()))
+            .collect();
+    }
+    vec![
+        ("Curie API".into(), resources.api_url.clone()),
+        (
+            "Postgres".into(),
+            format!("{}:{}", resources.postgres_host, resources.postgres_port),
+        ),
+        (
+            "Valkey".into(),
+            format!("{}:{}", resources.valkey_host, resources.valkey_port),
+        ),
+        ("RustFS S3".into(), resources.s3_endpoint.clone()),
+    ]
+}
+
 /// Credential env vars the compose stack forwards from the shell (bare names in
 /// `compose.dev.yaml`). Any one set non-empty makes `local up` go live, matching
 /// `skill up`. Empty counts as unset (the empty-string-is-not-a-credential rule).
@@ -1396,9 +1418,14 @@ impl crate::ui::CliOutput for LocalUpOutput {
                     ui.note("Slack dispatcher started (Socket Mode; no host port).");
                 }
                 ui.note("Drive the local product loop (no Slack, no Kubernetes):");
-                ui.note(
-                    "  curie local deploy --plugin-dir <dir> --slack-channel <C...> --api-url http://localhost:28000",
-                );
+                let api = endpoints
+                    .iter()
+                    .find(|(name, _)| name == "Curie API")
+                    .map(|(_, url)| url.as_str())
+                    .unwrap_or(crate::message::DEFAULT_LOCAL_API_URL);
+                ui.note(&format!(
+                    "  curie local deploy --plugin-dir <dir> --slack-channel <C...> --api-url {api}",
+                ));
                 ui.note("  curie local message \"<your question>\"");
             }
         }
@@ -1570,13 +1597,7 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
             ),
         }
     }
-    let endpoints = ENDPOINTS
-        .iter()
-        // Under `--minimal` only the `core` services started, so advertise only
-        // their endpoints; the `full`-only URLs would 404.
-        .filter(|(_, _, is_core)| !o.minimal || *is_core)
-        .map(|(label, url, _)| (label.to_string(), url.to_string()))
-        .collect();
+    let endpoints = advertised_endpoints(&o.resources, o.minimal);
     Ok(LocalUpOutput::Up {
         endpoints,
         slack: o.slack,
