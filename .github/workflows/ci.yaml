@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, next]
   pull_request:
-    branches: [main, next]
+    branches: [main, next, "task/**"]
     types: [opened, synchronize, reopened, edited]
 
 # Supersede an in-flight run when a branch is pushed again so runs stop
@@ -263,6 +263,7 @@ jobs:
       # `issues: read` is what lets this gate read the labels of the closed
       # issues a pull request names, through the Issues API.
       issues: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:

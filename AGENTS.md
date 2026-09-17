@@ -322,11 +322,21 @@ pass by weakening assertions is a regression. At parity seams, include at least
 one negative or secondary-path test per AC (see the parity-seam registry).
 A fix PR changing `apps/*/tests/`, `packages/*/tests/`, `runner/tests/`, `cli/tests/`, or `charts/curie/ci/` is expected to be verifiable with the exact command
 `curie dev verify-fix-pin <CHANGE> <SELECTOR>`.
+The `cli/tests/local/test_*.py::test...` selector is the local tier. Its test
+must start the actual isolated local services it owns. The verifier invokes the
+selector twice in separate pytest processes, so each baseline and reversed
+invocation must begin from fresh state, register cleanup before startup, and
+verify cleanup before it finishes. Unavailable Docker, ports, binaries, or
+services are errors, never skips or green results. Put prerequisite checks,
+service startup, and cleanup verification in pytest fixture setup or teardown
+so environmental failures are reported as errors, which the verifier refuses.
+Only product behavior assertions belong in the test body.
 A PR closing a `bug`-labeled issue includes exactly one `Fix pin: <SELECTOR>` line in its body,
 or an explicit `Fix pin: n/a - <reason>` line; CI enforces this. A PR closing no bug-labeled issue may omit
 the declaration, but a selector supplied voluntarily on any PR is still verified.
-The pin's tier is derived from the selector's location (unit tests, `charts/curie/ci/*`,
-`test_live.py`), not from prose. A pin below the closed issue's `found:unit` /
+The pin's tier is derived from the selector's location (unit tests,
+`cli/tests/local/test_*.py` local tests, `charts/curie/ci/*` cluster checks,
+and other `test_live.py` live tests), not from prose. A pin below the closed issue's `found:unit` /
 `found:local` / `found:cluster` / `found:live` label fails unless the body also carries
 `Fix pin waiver: <reason>`.
 Assertions about an external API or SDK's shape or auth must be grounded in

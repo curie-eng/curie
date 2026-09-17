@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, next]
   pull_request:
-    branches: [main, next]
+    branches: [main, next, "task/**"]
   schedule:
     # Advisory databases change independently of the code, so re-run weekly to
     # catch newly-published CVEs against dependencies that never changed.
