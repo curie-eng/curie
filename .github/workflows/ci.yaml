@@ -2312,47 +2312,6 @@ jobs:
           test "$attester" != "$api_key"
           EOF
           chmod +x "$RUNNER_TEMP/verify-managed-attester.sh"
-      - name: Nil unsafe helper negative control
-        run: |
-          set -euo pipefail
-          placement_mutant="$RUNNER_TEMP/nil-unsafe-placement-chart"
-          cp -a charts/curie "$placement_mutant"
-          mutant="$RUNNER_TEMP/nil-unsafe-chart"
-          cp -a charts/curie "$mutant"
-          python3 charts/curie/ci/make-upgrade-mutants.py \
-            "$placement_mutant/templates/_helpers.tpl" \
-            "$mutant/templates/_helpers.tpl"
-          helm install curie-negative "$RELEASED_CHART" \
-            -n curie-negative --create-namespace -f "$LEGACY_VALUES" --timeout 15m \
-            --set api.image.digest=sha256:71aa652c0af87084e4254402268e2d08c0cdbc2f197b6f1f1cf136b49aa93dc0 \
-            --set dispatcher.image.digest=sha256:154e874d735131c64e449af281178bed0c4e30d6dcc7b72ebecda6337aea8f93 \
-            --set worker.image.digest=sha256:5368f1a6be11b79fa28d9cea197539f15b56caae280a4d9dee39b72d47bfdd38 \
-            --set ui.image.digest=sha256:1348c3cc03ecae315829a0cf6170ba5aaa2af8e31436cc76b0d24f12967b74b7 \
-            --set agentSandbox.runner.digest=sha256:bd871217023604c7d2934fd4534c08efb5448a739e5e5603ac35c100f9c8949c
-          if helm upgrade curie-negative "$placement_mutant" -n curie-negative \
-              --reset-then-reuse-values --timeout 15m; then
-            echo "nil-unsafe placement mutant unexpectedly upgraded legacy placement:null values" >&2
-            exit 1
-          fi
-          echo "Released-upgrade rung rejected the nil-unsafe placement mutant as expected"
-          kubectl patch secret curie-negative-secrets -n curie-negative --type merge \
-            -p '{"stringData":{"approvalChatAttesterSecret":""}}'
-          # Candidate hooks must run the candidate worker command surface.
-          helm upgrade curie-negative "$mutant" -n curie-negative \
-            --reset-then-reuse-values \
-            --set api.approvalChatAttesterSecret=null \
-            --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
-            --timeout 15m
-          if "$RUNNER_TEMP/verify-managed-attester.sh" curie-negative curie-negative; then
-            echo "nil-unsafe negative control unexpectedly passed the released-upgrade assertion" >&2
-            exit 1
-          fi
-          negative_attester="$(kubectl get secret curie-negative-secrets -n curie-negative \
-            -o jsonpath='{.data.approvalChatAttesterSecret}' | base64 --decode)"
-          test -z "$negative_attester"
-          echo "Released-upgrade assertion rejected the nil-unsafe mutant's blank attester as expected"
-          helm uninstall curie-negative -n curie-negative --wait --timeout 5m
-          kubectl delete namespace curie-negative --wait=true --timeout=300s
       - name: Install the exact public v0.8.2 release
         run: |
           set -euo pipefail
@@ -2578,6 +2537,164 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade 2>/dev/null || true
 
+  # Split from e2e-released-upgrade so the nil unsafe helper negative control
+  # runs on its own runner and kind cluster, concurrently with the positive
+  # upgrade path. It needs only the candidate chart source, the candidate
+  # worker image, the released v0.8.2 chart, the legacy values, and the verifier.
+  e2e-released-upgrade-negative:
+    name: E2E released chart upgrade negative control (nil unsafe helpers)
+    runs-on: ubuntu-latest
+    needs: [rust-build, changes]
+    if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Set up a cache-only buildx builder (named, NOT the default)
+        id: upgradecache
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          use: false
+      - name: Build the candidate worker image locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/worker/Dockerfile
+          builder: ${{ steps.upgradecache.outputs.name }}
+          tags: curie-worker:upgrade-candidate
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-worker
+          cache-to: type=gha,mode=max,scope=ladder-worker
+      - name: Write the kind cluster config
+        run: |
+          cat > kind-upgrade-negative-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          networking:
+            disableDefaultCNI: true
+            podSubnet: "192.168.0.0/16"
+          nodes:
+            - role: control-plane
+          EOF
+      - name: Create the disposable kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          cluster_name: curie-upgrade-negative
+          config: kind-upgrade-negative-config.yaml
+      - name: Install Calico so NetworkPolicy is enforced
+        run: |
+          set -euo pipefail
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
+          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
+          kubectl wait --for=condition=Ready node --all --timeout=300s
+      - name: Load the candidate worker image into the kind cluster
+        run: kind load docker-image curie-worker:upgrade-candidate --name curie-upgrade-negative
+      - name: Download and verify the exact public v0.8.2 chart
+        run: |
+          set -euo pipefail
+          released_chart="$RUNNER_TEMP/curie-0.8.2.tgz"
+          curl -fsSL -o "$released_chart" \
+            https://github.com/curie-eng/curie/releases/download/v0.8.2/curie-0.8.2.tgz
+          echo "b7fb394e29cbb3267c149aed6a9cda53570e71e338f873ed02f1902a138f37c7  $released_chart" \
+            | sha256sum --check --strict
+          test "$(helm show chart "$released_chart" | awk '$1 == "version:" {print $2}')" = "0.8.2"
+          echo "RELEASED_CHART=$released_chart" >> "$GITHUB_ENV"
+      - name: Write the legacy retained values fixture
+        run: |
+          cat > "$RUNNER_TEMP/legacy-values.yaml" <<'EOF'
+          dispatcher:
+            placeholderText: legacy-retained
+            slack:
+              appToken: xapp-example-upgrade
+              botToken: xoxb-example-upgrade
+          security:
+            gvisor:
+              mode: "off"
+          placement: null
+          EOF
+          echo "LEGACY_VALUES=$RUNNER_TEMP/legacy-values.yaml" >> "$GITHUB_ENV"
+      - name: Write the managed attester verifier
+        run: |
+          cat > "$RUNNER_TEMP/verify-managed-attester.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          release="$1"
+          namespace="$2"
+          attester="$(kubectl get secret "${release}-secrets" -n "$namespace" \
+            -o jsonpath='{.data.approvalChatAttesterSecret}' | base64 --decode)"
+          api_key="$(kubectl get secret "${release}-secrets" -n "$namespace" \
+            -o jsonpath='{.data.apiKey}' | base64 --decode)"
+          test -n "$attester"
+          test "$attester" != "$api_key"
+          EOF
+          chmod +x "$RUNNER_TEMP/verify-managed-attester.sh"
+      - name: Nil unsafe helper negative control
+        run: |
+          set -euo pipefail
+          placement_mutant="$RUNNER_TEMP/nil-unsafe-placement-chart"
+          cp -a charts/curie "$placement_mutant"
+          mutant="$RUNNER_TEMP/nil-unsafe-chart"
+          cp -a charts/curie "$mutant"
+          python3 charts/curie/ci/make-upgrade-mutants.py \
+            "$placement_mutant/templates/_helpers.tpl" \
+            "$mutant/templates/_helpers.tpl"
+          helm install curie-negative "$RELEASED_CHART" \
+            -n curie-negative --create-namespace -f "$LEGACY_VALUES" --timeout 15m \
+            --set api.image.digest=sha256:71aa652c0af87084e4254402268e2d08c0cdbc2f197b6f1f1cf136b49aa93dc0 \
+            --set dispatcher.image.digest=sha256:154e874d735131c64e449af281178bed0c4e30d6dcc7b72ebecda6337aea8f93 \
+            --set worker.image.digest=sha256:5368f1a6be11b79fa28d9cea197539f15b56caae280a4d9dee39b72d47bfdd38 \
+            --set ui.image.digest=sha256:1348c3cc03ecae315829a0cf6170ba5aaa2af8e31436cc76b0d24f12967b74b7 \
+            --set agentSandbox.runner.digest=sha256:bd871217023604c7d2934fd4534c08efb5448a739e5e5603ac35c100f9c8949c
+          if helm upgrade curie-negative "$placement_mutant" -n curie-negative \
+              --reset-then-reuse-values --timeout 15m; then
+            echo "nil-unsafe placement mutant unexpectedly upgraded legacy placement:null values" >&2
+            exit 1
+          fi
+          echo "Released-upgrade rung rejected the nil-unsafe placement mutant as expected"
+          kubectl patch secret curie-negative-secrets -n curie-negative --type merge \
+            -p '{"stringData":{"approvalChatAttesterSecret":""}}'
+          # Candidate hooks must run the candidate worker command surface.
+          helm upgrade curie-negative "$mutant" -n curie-negative \
+            --reset-then-reuse-values \
+            --set api.approvalChatAttesterSecret=null \
+            --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
+            --timeout 15m
+          if "$RUNNER_TEMP/verify-managed-attester.sh" curie-negative curie-negative; then
+            echo "nil-unsafe negative control unexpectedly passed the released-upgrade assertion" >&2
+            exit 1
+          fi
+          negative_attester="$(kubectl get secret curie-negative-secrets -n curie-negative \
+            -o jsonpath='{.data.approvalChatAttesterSecret}' | base64 --decode)"
+          test -z "$negative_attester"
+          echo "Released-upgrade assertion rejected the nil-unsafe mutant's blank attester as expected"
+          helm uninstall curie-negative -n curie-negative --wait --timeout 5m
+          kubectl delete namespace curie-negative --wait=true --timeout=300s
+      - name: Dump negative control diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get events -n curie-negative --sort-by=.lastTimestamp | tail -50 || true
+          kubectl logs -n curie-negative deploy/curie-api --tail=100 || true
+          kubectl logs -n curie-negative deploy/curie-worker --tail=100 || true
+      - name: Tear down the disposable negative control cluster
+        if: always()
+        run: |
+          kubectl delete namespace curie-negative \
+            --ignore-not-found --wait=false 2>/dev/null || true
+          kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
+
   # Temporarily disabled on every train. The serial eleven scenario matrix took
   # more than two hours on ordinary next PRs, including documentation only
   # release metadata. Issue #2733 owns a scalable replacement.
@@ -2756,7 +2873,7 @@ jobs:
   e2e-required:
     name: E2E required
     runs-on: ubuntu-latest
-    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-released-upgrade, e2e-cluster-upgrade-matrix]
+    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -2774,6 +2891,7 @@ jobs:
           LOCAL_RELEASE_RESULT: ${{ needs.e2e-ladder-release.result }}
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
           RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
+          RELEASED_UPGRADE_NEGATIVE_RESULT: ${{ needs.e2e-released-upgrade-negative.result }}
           UPGRADE_MATRIX_RESULT: ${{ needs.e2e-cluster-upgrade-matrix.result }}
         run: |
           set -euo pipefail
@@ -2783,6 +2901,7 @@ jobs:
                   "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
                   "$CLUSTER_RESULT" != "$cluster_expected" ||
                   "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
+                  "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_expected" ||
                   "$UPGRADE_MATRIX_RESULT" != "$upgrade_matrix_expected" ]]; then
               return 1
             fi

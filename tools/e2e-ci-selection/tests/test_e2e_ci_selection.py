@@ -457,6 +457,9 @@ AGGREGATE_EXPRESSIONS = {
     "local_release_result": "${{ needs.e2e-ladder-release.result }}",
     "cluster_result": "${{ needs.e2e-ladder-cluster.result }}",
     "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
+    "released_upgrade_negative_result": (
+        "${{ needs.e2e-released-upgrade-negative.result }}"
+    ),
     "upgrade_matrix_result": "${{ needs.e2e-cluster-upgrade-matrix.result }}",
 }
 
@@ -496,6 +499,12 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     )
     assert jobs["e2e-released-upgrade"]["if"] == (
         "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+    )
+    assert jobs["e2e-released-upgrade-negative"]["if"] == (
+        jobs["e2e-released-upgrade"]["if"]
+    )
+    assert set(jobs["e2e-released-upgrade-negative"]["needs"]) == set(
+        jobs["e2e-released-upgrade"]["needs"]
     )
     assert jobs["e2e-cluster-upgrade-matrix"]["if"] == "${{ false }}"
 
@@ -664,7 +673,46 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
     verifier_call = '"$RUNNER_TEMP/verify-managed-attester.sh"'
     assert verifier_call in first_upgrade
 
-    negative_run = named_steps["Nil unsafe helper negative control"]["run"]
+    assert "Nil unsafe helper negative control" not in named_steps
+    negative_job = jobs["e2e-released-upgrade-negative"]
+    assert negative_job["name"] == (
+        "E2E released chart upgrade negative control (nil unsafe helpers)"
+    )
+    assert negative_job["runs-on"] == "ubuntu-latest"
+    assert negative_job["if"] == job["if"]
+    assert set(negative_job["needs"]) == set(job["needs"])
+    negative_steps = {
+        step["name"]: step
+        for step in negative_job["steps"]
+        if isinstance(step.get("name"), str)
+    }
+    assert len(negative_steps) == sum("name" in step for step in negative_job["steps"])
+    for shared in (
+        "Install Helm",
+        "Set up a cache-only buildx builder (named, NOT the default)",
+        "Build the candidate worker image locally",
+        "Install Calico so NetworkPolicy is enforced",
+        "Download and verify the exact public v0.8.2 chart",
+        "Write the legacy retained values fixture",
+        "Write the managed attester verifier",
+    ):
+        assert negative_steps[shared] == named_steps[shared], shared
+    assert negative_job["steps"][0] == job["steps"][0]
+    assert 'kind load docker-image curie-worker:upgrade-candidate' in negative_steps[
+        "Load the candidate worker image into the kind cluster"
+    ]["run"]
+    negative_names = [step.get("name") for step in negative_job["steps"]]
+    assert negative_names.index("Write the managed attester verifier") < (
+        negative_names.index("Nil unsafe helper negative control")
+    )
+    assert negative_steps[
+        "Tear down the disposable negative control cluster"
+    ]["if"] == "always()"
+    assert negative_steps["Dump negative control diagnostics on failure"]["if"] == (
+        "failure()"
+    )
+
+    negative_run = negative_steps["Nil unsafe helper negative control"]["run"]
     placement_mutant_setup = '''placement_mutant="$RUNNER_TEMP/nil-unsafe-placement-chart"
 cp -a charts/curie "$placement_mutant"'''
     assert placement_mutant_setup in negative_run
@@ -749,7 +797,8 @@ def test_released_upgrade_candidate_images_opt_into_forward_only_migrations() ->
 
 def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
-    job = workflow["jobs"]["e2e-released-upgrade"]
+    jobs = workflow["jobs"]
+    job = jobs["e2e-released-upgrade"]
     named_steps = {
         step["name"]: step for step in job["steps"] if isinstance(step.get("name"), str)
     }
@@ -851,7 +900,10 @@ def test_released_upgrade_workflow_pins_issue_2097_live_manifest_parity() -> Non
     assert install_names.index("Install the exact public v0.8.4 release") < (
         install_names.index("Existing cluster rung smoke on the upgraded candidate")
     )
-    assert "Nil unsafe helper negative control" in named_steps
+    negative_job = jobs["e2e-released-upgrade-negative"]
+    assert "Nil unsafe helper negative control" in {
+        step.get("name") for step in negative_job["steps"]
+    }
 
     helm_ci = yaml.safe_load(
         (REPO_ROOT / ".github" / "workflows" / "helm-ci.yaml").read_text()
@@ -874,6 +926,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-ladder-release",
         "e2e-ladder-cluster",
         "e2e-released-upgrade",
+        "e2e-released-upgrade-negative",
         "e2e-cluster-upgrade-matrix",
     }
     assert job["if"] == "${{ !cancelled() }}"
@@ -917,6 +970,7 @@ def _run_aggregate(
         "local_release_result": "skipped",
         "cluster_result": "skipped",
         "released_upgrade_result": "skipped",
+        "released_upgrade_negative_result": "skipped",
         "upgrade_matrix_result": "skipped",
     }
     state.update(overrides)
@@ -971,6 +1025,11 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
             "local_release_result": "success",
             "cluster_result": "success",
         },
+        {
+            "released_upgrade_selected": "true",
+            "released_upgrade_result": "success",
+            "released_upgrade_negative_result": "success",
+        },
     ],
 )
 def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> None:
@@ -1001,6 +1060,22 @@ def test_aggregate_requires_upgrade_matrix_to_stay_skipped() -> None:
         {"cluster_result": "success"},
         {"upgrade_matrix_result": "success"},
         {"upgrade_matrix_result": "failure"},
+        {"released_upgrade_negative_result": "success"},
+        {
+            "released_upgrade_selected": "true",
+            "released_upgrade_result": "success",
+            "released_upgrade_negative_result": "skipped",
+        },
+        {
+            "released_upgrade_selected": "true",
+            "released_upgrade_result": "success",
+            "released_upgrade_negative_result": "failure",
+        },
+        {
+            "released_upgrade_selected": "true",
+            "released_upgrade_result": "skipped",
+            "released_upgrade_negative_result": "success",
+        },
     ],
 )
 def test_aggregate_rejects_inconsistent_outcomes(state: dict[str, str]) -> None:
