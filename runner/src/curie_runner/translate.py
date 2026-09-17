@@ -68,6 +68,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
+    "history-persistence-error",
 })
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 
