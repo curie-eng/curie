@@ -150,7 +150,7 @@ def test_eval_boot_env_carries_fake_and_credentials() -> None:
         bundle_ref="bundles/x.zip",
         requested_at="2026-07-05T00:00:00+00:00",
     )
-    env = consumer._boot_env(item)
+    env = consumer._boot_env(item, None, None, model=None)
     assert env[FAKE_MODEL_ENV] == "1"
     assert env[CREDENTIALS_ENV] == "cred-eval"
 
@@ -311,7 +311,7 @@ def test_eval_boot_env_carries_api_backend_and_env_key() -> None:
         requested_at="2026-07-05T00:00:00+00:00",
     )
 
-    env = consumer._boot_env(item)
+    env = consumer._boot_env(item, None, None, model=None)
     assert env[API_BACKEND_ENV] == "messages"
     assert env[MODEL_ENV_KEY_ENV] == "MY_PROVIDER_KEY"
 
@@ -560,7 +560,7 @@ def test_eval_boot_env_carries_false_completion_check() -> None:
         requested_at="2026-07-05T00:00:00+00:00",
     )
 
-    env = consumer._boot_env(item)
+    env = consumer._boot_env(item, None, None, model=None)
     assert env[FALSE_COMPLETION_CHECK_ENV] == "1"
 
 
