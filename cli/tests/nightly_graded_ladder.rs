@@ -35,6 +35,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 
+use sha2::{Digest, Sha256};
+
 /// Read a workflow file's raw text, or an empty string when it does not exist
 /// yet. Assertions on an empty string fail with their own readable messages
 /// rather than panicking on a missing file, so a missing nightly workflow
@@ -69,6 +71,19 @@ fn ladder_function(name: &str) -> String {
         .split_once("\n}\n")
         .unwrap_or_else(|| panic!("ladder function {name} must close"));
     format!("{marker}{body}\n}}\n")
+}
+
+fn ladder_function_before(name: &str, next_name: &str) -> String {
+    let source = ladder();
+    let marker = format!("{name}() {{");
+    let (_, tail) = source
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("ladder must define {name}"));
+    let next_marker = format!("\n{next_name}() {{");
+    let (body, _) = tail
+        .split_once(&next_marker)
+        .unwrap_or_else(|| panic!("ladder function {name} must precede {next_name}"));
+    format!("{marker}{body}\n")
 }
 
 fn repo_root() -> PathBuf {
@@ -4031,4 +4046,465 @@ fn cli_observation_node_carries_the_langfuse_tool_name() {
         node.contains(r#"rename = "toolName""#) && node.contains("tool_name"),
         "the CLI must carry the hoisted toolName instead of silently stripping the tool identity the API now returns: {node}"
     );
+}
+
+const CLUSTER_ORDINARY_MARKER: &str = "curie-seed-external-ordinary-receipt";
+const CLUSTER_MCP_MARKER: &str = "curie-seed-external-mcp-receipt";
+const CLUSTER_CODING_MARKER: &str = "curie-seed-external-coding-receipt";
+const CLUSTER_APPROVAL_MARKER: &str = "curie-seed-external-approval-receipt";
+
+const CLUSTER_ORDINARY_TRACE: &str = "10000000000000000000000000000001";
+const CLUSTER_MCP_TRACE: &str = "20000000000000000000000000000002";
+const CLUSTER_CODING_TRACE: &str = "30000000000000000000000000000003";
+const CLUSTER_APPROVAL_TRACE: &str = "40000000000000000000000000000004";
+
+fn cluster_receipt_seed(
+    kind: &str,
+    marker: &str,
+    start: &str,
+    end: &str,
+    accepted: f64,
+    sent: f64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "marker": marker,
+        "stream_start": start,
+        "stream_end": end,
+        "reply_observed": true,
+        "completion_observed": true,
+        "otelcol_receiver_accepted_spans_delta": accepted,
+        "otelcol_exporter_sent_spans_delta": sent,
+    })
+}
+
+fn cluster_external_receipt(live: bool, coding_receipt: Option<&str>) -> serde_json::Value {
+    let ordinary = cluster_receipt_seed(
+        "ordinary",
+        CLUSTER_ORDINARY_MARKER,
+        "20-0",
+        "21-0",
+        1.0,
+        2.0,
+    );
+    let mut seeds = vec![ordinary];
+    if live {
+        let mut mcp = cluster_receipt_seed("mcp", CLUSTER_MCP_MARKER, "30-0", "31-0", 2.0, 3.0);
+        mcp["mcp_call_count_delta"] = serde_json::json!(1);
+        seeds.push(mcp);
+        if let Some(receipt) = coding_receipt {
+            let mut coding =
+                cluster_receipt_seed("coding", CLUSTER_CODING_MARKER, "40-0", "41-0", 4.0, 5.0);
+            if !receipt.is_empty() {
+                coding["coding_execution_receipt"] = serde_json::json!(receipt);
+            }
+            seeds.push(coding);
+        }
+    } else {
+        let mut approval = cluster_receipt_seed(
+            "approval",
+            CLUSTER_APPROVAL_MARKER,
+            "50-0",
+            "51-0",
+            2.0,
+            3.0,
+        );
+        approval["approval_transition_observed"] = serde_json::json!(true);
+        seeds.push(approval);
+    }
+    serde_json::json!({"run_id": "run-cluster-receipts", "seeds": seeds})
+}
+
+fn cluster_trace(
+    trace_id: &str,
+    operations: &[&str],
+    tool_name: Option<&str>,
+    approval_decision: Option<&str>,
+) -> serde_json::Value {
+    let mut tree = operations
+        .iter()
+        .enumerate()
+        .map(|(index, operation)| {
+            serde_json::json!({
+                "id": format!("span-{index}"),
+                "type": "SPAN",
+                "name": operation,
+                "children": [],
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(tool) = tool_name {
+        tree.push(serde_json::json!({
+            "id": "tool-1",
+            "type": "TOOL",
+            "name": tool,
+            "toolName": tool,
+            "children": [],
+        }));
+    }
+    serde_json::json!({
+        "trace": {"id": trace_id},
+        "tree": tree,
+        "approval_decision": approval_decision,
+    })
+}
+
+fn cluster_stream_rows() -> serde_json::Value {
+    let seeds = [
+        ("21-0", CLUSTER_ORDINARY_MARKER, CLUSTER_ORDINARY_TRACE),
+        ("31-0", CLUSTER_MCP_MARKER, CLUSTER_MCP_TRACE),
+        ("41-0", CLUSTER_CODING_MARKER, CLUSTER_CODING_TRACE),
+        ("51-0", CLUSTER_APPROVAL_MARKER, CLUSTER_APPROVAL_TRACE),
+    ];
+    serde_json::Value::Array(
+        seeds
+            .into_iter()
+            .map(|(entry_id, marker, trace_id)| {
+                serde_json::json!([
+                    entry_id,
+                    [
+                        "payload",
+                        serde_json::json!({
+                            "text": format!("Slack correlation {marker}"),
+                            "reply_handle": {"kind": "slack"},
+                        })
+                        .to_string(),
+                        "traceparent",
+                        format!("00-{trace_id}-1111111111111111-01"),
+                    ]
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn run_cluster_receipt_consumers(
+    receipt: &serde_json::Value,
+    coding_tool: &str,
+    command: &str,
+) -> (Output, String, Option<serde_json::Value>) {
+    let harness = tempfile::tempdir().expect("create cluster receipt harness");
+    let receipt_path = harness.path().join("receipt.json");
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec(receipt).expect("serialize cluster receipt"),
+    )
+    .expect("write cluster receipt");
+    let mut receipt_permissions = fs::metadata(&receipt_path)
+        .expect("read cluster receipt metadata")
+        .permissions();
+    receipt_permissions.set_mode(0o600);
+    fs::set_permissions(&receipt_path, receipt_permissions).expect("protect cluster receipt");
+
+    fs::write(
+        harness.path().join("stream.json"),
+        serde_json::to_vec(&cluster_stream_rows()).expect("serialize cluster stream"),
+    )
+    .expect("write cluster stream");
+    let traces = harness.path().join("traces");
+    fs::create_dir(&traces).expect("create trace fixture directory");
+    let fixtures = [
+        (
+            CLUSTER_ORDINARY_TRACE,
+            cluster_trace(
+                CLUSTER_ORDINARY_TRACE,
+                &[
+                    "curie.turn.ingress",
+                    "curie.queue.enqueue",
+                    "curie.queue.process",
+                    "curie.turn.process",
+                    "curie.sandbox.claim",
+                    "curie.runner.rpc",
+                    "agent.run",
+                    "curie.reply.post",
+                ],
+                None,
+                None,
+            ),
+        ),
+        (
+            CLUSTER_MCP_TRACE,
+            cluster_trace(
+                CLUSTER_MCP_TRACE,
+                &[
+                    "curie.turn.ingress",
+                    "curie.queue.enqueue",
+                    "curie.reply.post",
+                ],
+                Some("mcp__receipt__receipt_read"),
+                None,
+            ),
+        ),
+        (
+            CLUSTER_CODING_TRACE,
+            cluster_trace(
+                CLUSTER_CODING_TRACE,
+                &[
+                    "curie.turn.ingress",
+                    "curie.queue.enqueue",
+                    "curie.reply.post",
+                ],
+                Some(coding_tool),
+                None,
+            ),
+        ),
+        (
+            CLUSTER_APPROVAL_TRACE,
+            cluster_trace(
+                CLUSTER_APPROVAL_TRACE,
+                &[
+                    "curie.turn.ingress",
+                    "curie.queue.enqueue",
+                    "curie.approval.suspend",
+                    "curie.approval.resolve",
+                    "curie.approval.resume",
+                    "curie.reply.post",
+                ],
+                None,
+                Some("approved"),
+            ),
+        ),
+    ];
+    for (trace_id, fixture) in fixtures {
+        fs::write(
+            traces.join(format!("{trace_id}.json")),
+            serde_json::to_vec(&fixture).expect("serialize trace fixture"),
+        )
+        .expect("write trace fixture");
+    }
+
+    write_executable(
+        &harness.path().join("curie"),
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$BOUNDARY_LOG"
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$*" in
+    *" cluster observability "*" run "*)
+        cat "$TRACE_FIXTURES/$last.json"
+        ;;
+    *) exit 97 ;;
+esac
+"#,
+    );
+
+    let functions = [
+        "cluster_external_ingress_seed",
+        "discover_cluster_external_trace_id",
+        "sanitize_exact_trace_read",
+        "query_exact_seed_trace",
+        "write_product_observability_evidence",
+        "run_cluster_product_observability",
+    ]
+    .into_iter()
+    .map(|name| {
+        if name == "write_product_observability_evidence" {
+            ladder_function_before(name, "run_cluster_product_observability")
+        } else {
+            ladder_function(name)
+        }
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+    let script = format!(
+        r#"set -euo pipefail
+WORKDIR="$1"
+BIN="$WORKDIR/curie"
+CLUSTER_EXTERNAL_INGRESS_RECEIPT="$WORKDIR/receipt.json"
+CLUSTER_PRODUCT_EVIDENCE="$WORKDIR/evidence.json"
+PRODUCT_OBSERVABILITY_RUN_ID=run-cluster-receipts
+OBSERVABILITY_POLL_ATTEMPTS=1
+OBSERVABILITY_POLL_INTERVAL_SECONDS=0
+CURIE_NAMESPACE=test-cluster-receipts
+CURIE_RELEASE=test-cluster-receipts
+CLUSTER_IMAGE_IDS_MATCH=false
+LIVE="${{HARNESS_LIVE:-1}}"
+ns_rel=(--namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE")
+preflight_cluster_product_observability() {{ CLUSTER_IMAGE_IDS_MATCH=true; }}
+seed_cluster_missing_carrier_control() {{ :; }}
+product_stream_json() {{
+    printf '%s\n' "stream $*" >> "$BOUNDARY_LOG"
+    cat "$WORKDIR/stream.json"
+}}
+{functions}
+{command}
+"#,
+    );
+    let boundary_log = harness.path().join("boundaries.log");
+    let path = format!(
+        "{}:{}",
+        harness.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .arg("cluster receipt harness")
+        .arg(harness.path())
+        .env("PATH", path)
+        .env("BOUNDARY_LOG", &boundary_log)
+        .env("TRACE_FIXTURES", &traces)
+        .env(
+            "HARNESS_LIVE",
+            if receipt["seeds"]
+                .as_array()
+                .is_some_and(|seeds| seeds.iter().any(|seed| seed["kind"] == "approval"))
+            {
+                "0"
+            } else {
+                "1"
+            },
+        )
+        .output()
+        .expect("run extracted cluster receipt consumers");
+    let boundaries = fs::read_to_string(&boundary_log).unwrap_or_default();
+    let evidence = fs::read_to_string(harness.path().join("evidence.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    (output, boundaries, evidence)
+}
+
+fn correct_cluster_coding_receipt() -> String {
+    Sha256::digest(CLUSTER_CODING_MARKER.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[test]
+fn cluster_external_coding_receipt_rejects_wrong_or_missing_digest_before_telemetry() {
+    let correct = correct_cluster_coding_receipt();
+    let positive_receipt = cluster_external_receipt(true, Some(&correct));
+    let (positive, boundaries, _) = run_cluster_receipt_consumers(
+        &positive_receipt,
+        "Bash",
+        r#"cluster_external_ingress_seed coding "execute_tool"
+printf 'membership=%s\n' "$LAST_QUERY_MEMBERSHIP""#,
+    );
+    assert!(
+        positive.status.success(),
+        "a bounded Slack entry with the marker digest and Bash observation must pass: {}",
+        transcript(&positive)
+    );
+    assert!(
+        String::from_utf8_lossy(&positive.stdout).contains("membership=true"),
+        "the positive coding seed must establish exact Bash membership: {}",
+        transcript(&positive)
+    );
+    assert!(
+        boundaries.contains("stream cluster XRANGE curie:runs (40-0 41-0")
+            && boundaries.contains(&format!("run {CLUSTER_CODING_TRACE}")),
+        "the positive must consume its bounded Slack entry and exact trace: {boundaries}"
+    );
+
+    for (label, receipt) in [
+        (
+            "wrong",
+            cluster_external_receipt(true, Some(&"0".repeat(64))),
+        ),
+        ("missing", cluster_external_receipt(true, Some(""))),
+    ] {
+        let (output, boundaries, _) = run_cluster_receipt_consumers(
+            &receipt,
+            "Bash",
+            r#"cluster_external_ingress_seed coding "execute_tool""#,
+        );
+        assert!(
+            !output.status.success(),
+            "a {label} coding digest must be rejected: {}",
+            transcript(&output)
+        );
+        assert!(
+            boundaries.is_empty(),
+            "a {label} coding digest must fail before stream or telemetry access: {boundaries}"
+        );
+    }
+}
+
+#[test]
+fn cluster_external_coding_seed_rejects_an_unrelated_tool_with_execute_tool_present() {
+    let receipt = cluster_external_receipt(true, Some(&correct_cluster_coding_receipt()));
+    let (output, _, _) = run_cluster_receipt_consumers(
+        &receipt,
+        "mcp__receipt__receipt_read",
+        r#"cluster_external_ingress_seed coding "execute_tool"
+printf 'membership=%s\n' "$LAST_QUERY_MEMBERSHIP""#,
+    );
+    assert!(
+        output.status.success(),
+        "an observable but incomplete exact trace must return evidence: {}",
+        transcript(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("membership=false"),
+        "execute_tool from an unrelated tool must not satisfy the coding seed: {}",
+        transcript(&output)
+    );
+}
+
+#[test]
+fn cluster_product_observability_requires_coding_and_aggregates_all_live_seeds() {
+    let receipt = cluster_external_receipt(true, Some(&correct_cluster_coding_receipt()));
+    let (positive, _, evidence) = run_cluster_receipt_consumers(
+        &receipt,
+        "Bash",
+        r#"run_cluster_product_observability agent-id agent-name"#,
+    );
+    assert!(
+        positive.status.success(),
+        "ordinary, MCP, and coding receipts must pass together: {}",
+        transcript(&positive)
+    );
+    let evidence = evidence.expect("live aggregate must write evidence");
+    assert_eq!(evidence["otelcol_receiver_accepted_spans"], 7.0);
+    assert_eq!(evidence["otelcol_exporter_sent_spans"], 10.0);
+    assert_eq!(evidence["langfuse_observation_membership"], true);
+
+    let missing = cluster_external_receipt(true, None);
+    let (output, _, _) = run_cluster_receipt_consumers(
+        &missing,
+        "Bash",
+        r#"run_cluster_product_observability agent-id agent-name"#,
+    );
+    assert!(
+        !output.status.success(),
+        "a live aggregate without the coding seed must fail: {}",
+        transcript(&output)
+    );
+
+    let (unrelated, _, evidence) = run_cluster_receipt_consumers(
+        &receipt,
+        "mcp__receipt__receipt_read",
+        r#"run_cluster_product_observability agent-id agent-name"#,
+    );
+    assert!(
+        unrelated.status.success(),
+        "the aggregate must retain negative membership evidence: {}",
+        transcript(&unrelated)
+    );
+    assert_eq!(
+        evidence.expect("negative aggregate evidence")["langfuse_observation_membership"],
+        false,
+        "an unrelated tool must force aggregate membership false"
+    );
+}
+
+#[test]
+fn cluster_product_observability_preserves_the_fake_approval_path() {
+    let receipt = cluster_external_receipt(false, None);
+    let (output, _, evidence) = run_cluster_receipt_consumers(
+        &receipt,
+        "Bash",
+        r#"run_cluster_product_observability agent-id agent-name"#,
+    );
+    assert!(
+        output.status.success(),
+        "the fake path must still require ordinary plus approved resume evidence: {}",
+        transcript(&output)
+    );
+    let evidence = evidence.expect("fake aggregate evidence");
+    assert_eq!(evidence["otelcol_receiver_accepted_spans"], 3.0);
+    assert_eq!(evidence["otelcol_exporter_sent_spans"], 5.0);
+    assert_eq!(evidence["langfuse_observation_membership"], true);
 }
