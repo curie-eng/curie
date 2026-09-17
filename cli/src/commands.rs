@@ -602,7 +602,7 @@ pub(crate) fn platform_image_tags(dockerfile: &str, tag: &str) -> Vec<String> {
     let mut tags = vec![tag.to_string()];
     if dockerfile == "runner/Dockerfile" {
         let short = crate::docker::RUNNER_IMAGE;
-        let qualified = crate::local::source_image_ref(short);
+        let qualified = crate::local::source_image_ref(short, crate::local::SOURCE_IMAGE_TAG);
         if tag == short || tag == qualified {
             if tag != short {
                 tags.push(short.to_string());
@@ -687,13 +687,16 @@ mod platform_image_tags_tests {
         let tags = platform_image_tags("runner/Dockerfile", RUNNER_IMAGE);
         assert_eq!(
             tags,
-            vec![RUNNER_IMAGE.to_string(), source_image_ref(RUNNER_IMAGE),]
+            vec![
+                RUNNER_IMAGE.to_string(),
+                source_image_ref(RUNNER_IMAGE, crate::local::SOURCE_IMAGE_TAG),
+            ]
         );
     }
 
     #[test]
     fn runner_build_stack_ref_also_tags_the_short_name() {
-        let qualified = source_image_ref(RUNNER_IMAGE);
+        let qualified = source_image_ref(RUNNER_IMAGE, crate::local::SOURCE_IMAGE_TAG);
         let tags = platform_image_tags("runner/Dockerfile", &qualified);
         assert_eq!(tags, vec![qualified, RUNNER_IMAGE.to_string()]);
     }
@@ -706,7 +709,7 @@ mod platform_image_tags_tests {
 
     #[test]
     fn non_runner_image_keeps_its_single_tag() {
-        let tag = source_image_ref("curie-api");
+        let tag = source_image_ref("curie-api", crate::local::SOURCE_IMAGE_TAG);
         let tags = platform_image_tags("apps/api/Dockerfile", &tag);
         assert_eq!(tags, vec![tag]);
     }

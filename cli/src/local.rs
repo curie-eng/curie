@@ -563,7 +563,7 @@ fn merged_compose_config(resources: &LocalResources, build: bool) -> Result<serd
         cmd.env("CURIE_BASE_TAG", &resources.image_tag);
         for image in source_images_for(false) {
             if let Some(name) = image.env {
-                cmd.env(name, image_ref(image.image, &resources.image_tag));
+                cmd.env(name, source_image_ref(image.image, &resources.image_tag));
             }
         }
     }
@@ -699,9 +699,10 @@ pub const SOURCE_IMAGE_TAG: &str = "dev";
 /// The ghcr ref `--build` writes and the stack runs, for one published image.
 ///
 /// Named once so `build_source_images` and `compose_model_env` cannot drift:
-/// the tag a `--build` stack runs is the tag it just built (#1931).
-pub fn source_image_ref(image: &str) -> String {
-    image_ref(image, SOURCE_IMAGE_TAG)
+/// the tag a `--build` stack runs is the tag it just built (#1931). Isolation
+/// passes `LocalResources.image_tag`; the default path passes [`SOURCE_IMAGE_TAG`].
+pub fn source_image_ref(image: &str, tag: &str) -> String {
+    image_ref(image, tag)
 }
 
 /// The ghcr ref for one published image at an arbitrary tag.
@@ -1195,7 +1196,10 @@ fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)
         env.push(("CURIE_BASE_TAG".into(), o.resources.image_tag.clone()));
         for image in source_images(o) {
             if let Some(name) = image.env {
-                env.push((name.into(), image_ref(image.image, &o.resources.image_tag)));
+                env.push((
+                    name.into(),
+                    source_image_ref(image.image, &o.resources.image_tag),
+                ));
             }
         }
     } else {
@@ -1527,7 +1531,7 @@ async fn build_source_images(o: &LocalOpts, reach: BuildReach) -> Result<()> {
         root.display()
     ));
     for image in &images {
-        let ref_ = image_ref(image.image, tag);
+        let ref_ = source_image_ref(image.image, tag);
         crate::commands::build_image(image.dockerfile, &ref_).await?;
     }
     match reach {
@@ -3764,7 +3768,7 @@ mod tests {
         assert!(
             display.contains(&format!(
                 "CURIE_RUNNER_IMAGE={}",
-                source_image_ref("curie-runner")
+                source_image_ref("curie-runner", SOURCE_IMAGE_TAG)
             )),
             "got: {display}"
         );
