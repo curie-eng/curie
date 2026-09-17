@@ -12,6 +12,7 @@ the dispatcher `local message` runs as a one-shot).
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import tempfile
@@ -23,16 +24,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 GENERATE = Path(__file__).resolve().parent / "generate_release_compose.py"
 
 CURIE_IMAGE_PREFIX = "ghcr.io/curie-eng/"
-
-# Always required by the local-release rung even when the compose profile
-# does not start them as long-running services. `curie local message` runs a
-# one-shot dispatcher container; the worker spawns the runner from
-# CURIE_RUNNER_IMAGE. Keying the build set on compose profiles alone is what
-# left those two off the list (cli/src/local.rs source_images).
-ALWAYS_REQUIRED = (
-    "ghcr.io/curie-eng/curie-dispatcher:latest",
-    "ghcr.io/curie-eng/curie-runner:latest",
-)
 
 
 @dataclass(frozen=True)
@@ -104,13 +95,19 @@ def _service_profiles(service: dict[str, object]) -> set[str]:
     return set()
 
 
-def curie_images_for_profiles(compose_text: str, profiles: Sequence[str]) -> list[str]:
-    """ghcr curie image refs from services selected by `profiles`."""
-    import yaml
-
-    wanted = set(profiles)
-    doc = yaml.safe_load(compose_text)
+def _compose_services(doc: object) -> dict[str, object]:
+    if not isinstance(doc, dict):
+        raise SystemExit("error: resolved compose config is not an object")
     services = doc.get("services") or {}
+    if not isinstance(services, dict):
+        raise SystemExit("error: resolved compose config services is not an object")
+    return services
+
+
+def _curie_images_for_profiles(
+    services: dict[str, object], profiles: Sequence[str]
+) -> list[str]:
+    wanted = set(profiles)
     images: list[str] = []
     seen: set[str] = set()
     for service in services.values():
@@ -128,14 +125,71 @@ def curie_images_for_profiles(compose_text: str, profiles: Sequence[str]) -> lis
     return images
 
 
-def required_release_images(compose_text: str, profiles: Sequence[str]) -> list[str]:
-    images = curie_images_for_profiles(compose_text, profiles)
+def _required_service_image(
+    services: dict[str, object], service_name: str
+) -> str:
+    path = f"services.{service_name}.image"
+    service = services.get(service_name)
+    if not isinstance(service, dict):
+        raise SystemExit(f"error: resolved compose config is missing {path}")
+    image = service.get("image")
+    if not isinstance(image, str) or not image.strip():
+        raise SystemExit(f"error: resolved compose config is missing {path}")
+    return image
+
+
+def _required_worker_runner_image(services: dict[str, object]) -> str:
+    path = "services.curie-worker.environment.CURIE_RUNNER_IMAGE"
+    worker = services.get("curie-worker")
+    if not isinstance(worker, dict):
+        raise SystemExit(f"error: resolved compose config is missing {path}")
+    environment = worker.get("environment")
+    image: object | None = None
+    if isinstance(environment, dict):
+        image = environment.get("CURIE_RUNNER_IMAGE")
+    elif isinstance(environment, list):
+        prefix = "CURIE_RUNNER_IMAGE="
+        for entry in environment:
+            if isinstance(entry, str) and entry.startswith(prefix):
+                image = entry.removeprefix(prefix)
+                break
+    if not isinstance(image, str) or not image.strip():
+        raise SystemExit(f"error: resolved compose config is missing {path}")
+    return image
+
+
+def _required_release_images(
+    services: dict[str, object], profiles: Sequence[str]
+) -> list[str]:
+    images = _curie_images_for_profiles(services, profiles)
     seen = set(images)
-    for extra in ALWAYS_REQUIRED:
+    extras = (
+        _required_service_image(services, "curie-dispatcher"),
+        _required_worker_runner_image(services),
+    )
+    for extra in extras:
         if extra not in seen:
             images.append(extra)
             seen.add(extra)
     return images
+
+
+def curie_images_for_profiles(compose_text: str, profiles: Sequence[str]) -> list[str]:
+    """ghcr curie image refs from services selected by `profiles`."""
+    import yaml
+
+    return _curie_images_for_profiles(
+        _compose_services(yaml.safe_load(compose_text)), profiles
+    )
+
+
+def required_release_images(compose_text: str, profiles: Sequence[str]) -> list[str]:
+    """Required refs from resolved compose text, including one shot images."""
+    import yaml
+
+    return _required_release_images(
+        _compose_services(yaml.safe_load(compose_text)), profiles
+    )
 
 
 def _image_present(image: str) -> bool:
@@ -174,6 +228,12 @@ def build_missing(images: Iterable[str], *, cwd: Path) -> list[str]:
                 f"error: no build mapping for required image {image!r}; "
                 "add it to compose/ensure_release_images.py IMAGE_BUILDS"
             )
+        if image not in spec.tags:
+            available = ", ".join(spec.tags)
+            raise SystemExit(
+                f"error: build mapping for required image {image!r} creates "
+                f"different tags: {available}"
+            )
         _build(spec, cwd=cwd)
         built.append(image)
     return built
@@ -190,31 +250,37 @@ def generate_compose(cwd: Path) -> str:
     return result.stdout
 
 
-def curie_images_from_compose_file(path: Path, profiles: Sequence[str]) -> list[str]:
-    """Ask compose for the selected profile's images so this CLI needs no PyYAML."""
-    cmd = ["docker", "compose", "-f", str(path)]
-    for profile in profiles:
-        cmd.extend(["--profile", profile])
-    cmd.extend(["config", "--images"])
+def _compose_services_from_file(path: Path) -> dict[str, object]:
+    """Read normalized compose config without requiring PyYAML at runtime."""
+    cmd = [
+        "docker",
+        "compose",
+        "-f",
+        str(path),
+        "--profile",
+        "*",
+        "config",
+        "--format",
+        "json",
+    ]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    images: list[str] = []
-    seen: set[str] = set()
-    for line in result.stdout.splitlines():
-        image = line.strip()
-        if image.startswith(CURIE_IMAGE_PREFIX) and image not in seen:
-            seen.add(image)
-            images.append(image)
-    return images
+    try:
+        doc = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"error: docker compose returned invalid config JSON for {path}: {exc}"
+        ) from exc
+    return _compose_services(doc)
+
+
+def curie_images_from_compose_file(path: Path, profiles: Sequence[str]) -> list[str]:
+    """ghcr curie image refs from normalized compose config."""
+    return _curie_images_for_profiles(_compose_services_from_file(path), profiles)
 
 
 def required_release_images_from_file(path: Path, profiles: Sequence[str]) -> list[str]:
-    images = curie_images_from_compose_file(path, profiles)
-    seen = set(images)
-    for extra in ALWAYS_REQUIRED:
-        if extra not in seen:
-            images.append(extra)
-            seen.add(extra)
-    return images
+    """Required refs from normalized compose config, including one shot images."""
+    return _required_release_images(_compose_services_from_file(path), profiles)
 
 
 def main(argv: list[str] | None = None) -> int:

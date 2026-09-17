@@ -37,8 +37,8 @@ before.
 ## Fresh install
 
 The commands below use the current Kubernetes context and the installer
-defaults: the `curie` release in the `curie` namespace and the observability
-stack in the `observability` namespace. A stock kind cluster provides a default
+defaults: the curie release in the curie namespace and the observability
+stack in the observability namespace. A stock kind cluster provides a default
 storage class, so each retained volume uses that class without an override.
 
 Install the SRE bot first. This creates the platform on its fake model default,
