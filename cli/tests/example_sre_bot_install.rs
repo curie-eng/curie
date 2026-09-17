@@ -1675,6 +1675,83 @@ fn released_binary_path_uses_cached_chart_and_embedded_assets_outside_checkout()
 }
 
 #[test]
+fn recorded_model_credential_refusal_explains_the_fresh_install_order() {
+    const MODEL_CREDENTIAL: &str = "fixture_model_credential_value";
+
+    let fixture = Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    )
+    .with_helm_values(json!({
+        "agentSandbox": {"runner": {"credentials": MODEL_CREDENTIAL}}
+    }));
+    let output = fixture.run(&[]);
+    let text = shown(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a recorded model credential must be a usage refusal: {text}"
+    );
+    for consequence in [
+        "would clear it",
+        "fakeModel default",
+        "pods stay Ready",
+        "turns still answer",
+    ] {
+        assert!(
+            text.contains(consequence),
+            "refusal must retain consequence `{consequence}`: {text}"
+        );
+    }
+
+    let guidance = text.to_ascii_lowercase();
+    let fresh_install = guidance
+        .find("fresh install")
+        .unwrap_or_else(|| panic!("refusal must explain fresh install ordering: {text}"));
+    let fresh_install_guidance = &guidance[fresh_install..];
+    let before = fresh_install_guidance.find("before");
+    let model_credential = fresh_install_guidance.find("model credential");
+    assert!(
+        before
+            .zip(model_credential)
+            .is_some_and(|(before, model_credential)| before < model_credential),
+        "fresh install guidance must place this installer before model credential configuration: {text}"
+    );
+    for stale_advice in ["preserve it first", "helm get values", "helm upgrade"] {
+        assert!(
+            !guidance.contains(stale_advice),
+            "refusal must not prescribe the ineffective recovery `{stale_advice}`: {text}"
+        );
+    }
+
+    let helm_calls = fixture.helm_calls();
+    assert!(
+        helm_calls.iter().all(|call| {
+            !call.starts_with("upgrade --install curie ") && !call.starts_with("upgrade curie ")
+        }),
+        "refusal must precede every Curie platform upgrade: {helm_calls:?}"
+    );
+    assert!(
+        fixture.api.recorded().is_empty(),
+        "refusal must precede every Curie platform API call"
+    );
+    let observable = format!(
+        "{text}\n{:?}\n{:?}\n{:?}",
+        fixture.helm_calls(),
+        fixture.kubectl_calls(),
+        fixture.actions(),
+    );
+    assert!(
+        !observable.contains(MODEL_CREDENTIAL),
+        "the recorded model credential must not reach output or command logs"
+    );
+}
+
+#[test]
 fn guarded_platform_apply_precedes_additive_integration_and_reader_access() {
     let fixture = Fixture::with_modes(
         nodes(vec![node("node-a", "4Gi", true)]),
