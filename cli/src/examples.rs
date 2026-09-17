@@ -237,6 +237,10 @@ pub struct SreBotInstallOpts {
     pub observability_namespace: String,
     /// Repeatable `owner/repo` or `owner/*` entries for `api.githubRepoAllowlist`.
     pub workspace_repo: Vec<String>,
+    /// Slack user IDs bound as the explicit approvers of the `sre-approvals`
+    /// route. Each raw `--approvers` value may be comma separated; empty means
+    /// the channel-member default, which operator principals cannot resolve.
+    pub approvers: Vec<String>,
 }
 
 struct InstallIdentity {
@@ -504,6 +508,7 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         crate::api::validate_allowlist_entry(entry)
             .map_err(|err| crate::exit::usage(err.to_string()))?;
     }
+    let approvers = parse_approvers(&opts.approvers)?;
 
     let identity = InstallIdentity::from_opts(&opts);
 
@@ -541,6 +546,26 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             "build the Kubernetes connector kubeconfig in memory from the ServiceAccount token"
                 .to_string(),
         );
+        let resolution = opts
+            .slack_channel
+            .clone()
+            .unwrap_or_else(|| "<the agent's bound Slack channel>".to_string());
+        lines.push(match approvers.is_empty() {
+            false => format!(
+                "bind approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT} (creating the \
+                 agent if absent): resolution {resolution}, approvers users {} (the only users, \
+                 operator principals minted for them included, who may resolve its gates)",
+                approvers.join(",")
+            ),
+            true => format!(
+                "bind approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT} (creating the \
+                 agent if absent): resolution {resolution}, approvers left to the channel member \
+                 default unless already bound"
+            ),
+        });
+        if approvers.is_empty() {
+            lines.push(operator_gap_notice());
+        }
         let mut deploy = format!(
             "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace {} --release {}",
             identity.namespace, identity.release
@@ -617,6 +642,8 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
 
     let bundle_dir = workspace.bundle_dir();
     let connection = resolve_embedded_cluster_connection(&identity).await?;
+    // Before the deploy: it refuses a bundle whose declared routes are unbound.
+    bind_sre_approvals_route(&connection, opts.slack_channel.as_deref(), &approvers).await?;
     let deployed =
         deploy_embedded_sre_bot(&bundle_dir, &connection, opts.slack_channel.as_deref()).await?;
     // ALWAYS after the deploy, never before. `install_sre_bot` orders privileged
@@ -1400,6 +1427,182 @@ async fn resolve_embedded_cluster_connection(
         api_key,
         _port_forward: port_forward,
     })
+}
+
+/// The approval route every shipped Kubernetes mutation gate names.
+const SRE_APPROVALS_ROUTE: &str = "sre-approvals";
+/// The agent the embedded bundle deploys as (its plugin name).
+const SRE_BOT_AGENT: &str = "sre-bot";
+
+/// Split, trim, and validate the raw `--approvers` values. A blank id is a usage
+/// error raised before any cluster work, never silently skipped: dropping it
+/// would bind a narrower approver set than the operator typed.
+fn parse_approvers(raw: &[String]) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for value in raw {
+        for id in value.split(',') {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(crate::exit::usage(format!(
+                    "--approvers {value:?} contains a blank user ID; pass comma separated Slack \
+                     user IDs such as --approvers U0123ABCD,U0456DEFG"
+                )));
+            }
+            if !ids.iter().any(|seen: &String| seen == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn operator_gap_notice() -> String {
+    format!(
+        "no --approvers given: operator principals cannot resolve the six Kubernetes gates on \
+         route {SRE_APPROVALS_ROUTE} until approvers are bound; only members of the bound Slack \
+         channel can approve. Re-run with --approvers <USER_IDS>, or run `curie cluster \
+         approvals {SRE_BOT_AGENT} --route-resolution {SRE_APPROVALS_ROUTE}=<CHANNEL> \
+         --route-approvers {SRE_APPROVALS_ROUTE}=users:<ids>` (a full replacement of the route \
+         map; use --routes-from to keep other routes)"
+    )
+}
+
+fn route_binding_as_write(
+    binding: &crate::api::ApprovalRouteBindingResponse,
+) -> crate::api::ApprovalRouteBindingWrite {
+    crate::api::ApprovalRouteBindingWrite {
+        resolution: crate::api::ApprovalResolutionTargetWrite {
+            kind: binding.resolution.kind.clone(),
+            address: binding.resolution.address.clone(),
+        },
+        // The response omits the notification's transport (endpoint, adapter),
+        // so it cannot be written back faithfully. Callers refuse any bound
+        // notification first (`refuse_unwritable_notifications`).
+        notification: None,
+        approvers: binding.approvers.clone(),
+    }
+}
+
+/// The full-replacement route map the installer writes: every other bound route
+/// kept as is, `sre-approvals` kept if already bound (only its approvers
+/// replaced, and only when some are given), else bound to `channel`.
+///
+/// Notifications do not survive this map; call
+/// [`refuse_unwritable_notifications`] on `existing` before writing it.
+fn sre_approvals_route_map(
+    existing: Option<&BTreeMap<String, crate::api::ApprovalRouteBindingResponse>>,
+    channel: &str,
+    approvers: &[String],
+) -> BTreeMap<String, crate::api::ApprovalRouteBindingWrite> {
+    let mut map: BTreeMap<String, crate::api::ApprovalRouteBindingWrite> = existing
+        .map(|routes| {
+            routes
+                .iter()
+                .map(|(name, binding)| (name.clone(), route_binding_as_write(binding)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let binding = map
+        .entry(SRE_APPROVALS_ROUTE.to_string())
+        .or_insert_with(|| crate::api::ApprovalRouteBindingWrite {
+            resolution: crate::api::ApprovalResolutionTargetWrite {
+                kind: "slack".to_string(),
+                address: channel.to_string(),
+            },
+            notification: None,
+            approvers: None,
+        });
+    if !approvers.is_empty() {
+        binding.approvers = Some(crate::api::ApprovalApprovers {
+            group: None,
+            users: Some(approvers.to_vec()),
+        });
+    }
+    map
+}
+
+/// Refuse to rewrite a route map that carries a notification target. The API
+/// response redacts its endpoint and adapter, and a route write replaces the
+/// whole map, so writing it back would silently drop or corrupt that ping.
+fn refuse_unwritable_notifications(
+    existing: Option<&BTreeMap<String, crate::api::ApprovalRouteBindingResponse>>,
+) -> Result<()> {
+    let with_notification: Vec<&str> = existing
+        .into_iter()
+        .flatten()
+        .filter(|(_, binding)| binding.notification.is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if with_notification.is_empty() {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::usage(format!(
+        "refusing to bind route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT}: route(s) {} \
+         carry a notification target whose transport the API does not return, and a route \
+         write replaces the whole map, so this installer cannot keep it. Nothing was deployed.",
+        with_notification.join(", ")
+    ))
+    .with_fix(format!(
+        "write the full route map yourself, including {SRE_APPROVALS_ROUTE} and every \
+         notification, with `curie cluster approvals {SRE_BOT_AGENT} --routes-from <file>`, then \
+         re-run this installer"
+    ))
+    .into())
+}
+
+/// Ensure the `sre-bot` agent exists and its `sre-approvals` route is bound,
+/// writing only when the computed map differs from what is bound.
+async fn bind_sre_approvals_route(
+    connection: &EmbeddedClusterConnection,
+    slack_channel: Option<&str>,
+    approvers: &[String],
+) -> Result<()> {
+    let ui = crate::ui::ui();
+    let client = crate::api::ApiClient::new(&connection.api_url, &connection.api_key)?;
+    // The same resolution the deploy performs next: an absent agent is created
+    // on --slack-channel or the platform default channel, so this adds nothing
+    // the deploy would not.
+    let (agent, _, _) = client
+        .resolve_agent(SRE_BOT_AGENT, slack_channel, None)
+        .await?;
+    let existing = agent.approval_routes.as_ref();
+    let channel = match slack_channel {
+        Some(channel) => channel.to_string(),
+        None => agent
+            .channels
+            .iter()
+            .find(|binding| binding.kind == "slack")
+            .map(|binding| binding.address.clone())
+            .ok_or_else(|| {
+                crate::exit::usage(format!(
+                    "agent {SRE_BOT_AGENT} has no Slack channel binding to resolve route \
+                     {SRE_APPROVALS_ROUTE} on; pass --slack-channel <CHANNEL>"
+                ))
+            })?,
+    };
+    let desired = sre_approvals_route_map(existing, &channel, approvers);
+    let current: BTreeMap<String, crate::api::ApprovalRouteBindingWrite> = existing
+        .map(|routes| {
+            routes
+                .iter()
+                .map(|(name, binding)| (name.clone(), route_binding_as_write(binding)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if desired != current {
+        refuse_unwritable_notifications(existing)?;
+        client.set_approval_routes(&agent.id, &desired).await?;
+        ui.note(&format!(
+            "bound approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT}"
+        ));
+    }
+    let bound_approvers = desired
+        .get(SRE_APPROVALS_ROUTE)
+        .and_then(|binding| binding.approvers.as_ref());
+    if bound_approvers.is_none() {
+        ui.warn(&operator_gap_notice());
+    }
+    Ok(())
 }
 
 async fn deploy_embedded_sre_bot(
@@ -2369,7 +2572,10 @@ fn parse_memory_quantity(quantity: &str) -> Result<u128> {
 mod tests {
     use super::*;
 
-    fn sre_route(channel: &str, users: Option<&[&str]>) -> crate::api::ApprovalRouteBindingResponse {
+    fn sre_route(
+        channel: &str,
+        users: Option<&[&str]>,
+    ) -> crate::api::ApprovalRouteBindingResponse {
         serde_json::from_value(match users {
             Some(users) => serde_json::json!({
                 "resolution": {"kind": "slack", "address": channel},
@@ -2412,7 +2618,10 @@ mod tests {
     #[test]
     fn sre_approvals_route_map_preserves_other_bound_routes() {
         let mut existing = std::collections::BTreeMap::new();
-        existing.insert("deploys".to_string(), sre_route("C0DEPLOY", Some(&["U0ZZZ"])));
+        existing.insert(
+            "deploys".to_string(),
+            sre_route("C0DEPLOY", Some(&["U0ZZZ"])),
+        );
         let map = sre_approvals_route_map(Some(&existing), "C0SREOPS", &approvers(&["U0AAA"]));
         let value = serde_json::to_value(&map).unwrap();
         assert_eq!(
@@ -2422,14 +2631,20 @@ mod tests {
                 "approvers": {"users": ["U0ZZZ"]},
             })
         );
-        assert_eq!(value["sre-approvals"]["approvers"], serde_json::json!({"users": ["U0AAA"]}));
+        assert_eq!(
+            value["sre-approvals"]["approvers"],
+            serde_json::json!({"users": ["U0AAA"]})
+        );
         assert_eq!(value.as_object().unwrap().len(), 2);
     }
 
     #[test]
     fn sre_approvals_route_map_keeps_an_existing_binding_and_replaces_only_approvers() {
         let mut existing = std::collections::BTreeMap::new();
-        existing.insert("sre-approvals".to_string(), sre_route("C0KEPT", Some(&["U0OLD"])));
+        existing.insert(
+            "sre-approvals".to_string(),
+            sre_route("C0KEPT", Some(&["U0OLD"])),
+        );
 
         let replaced = sre_approvals_route_map(Some(&existing), "C0NEW", &approvers(&["U0NEW"]));
         assert_eq!(
@@ -2530,7 +2745,10 @@ mod tests {
         assert!(gates.contains(&PLATFORM_UPGRADE_GATE));
         let mut expected = kubernetes_gate_set();
         expected.insert((UPGRADE_GATE.to_string(), "sre-approvals".to_string()));
-        expected.insert((PLATFORM_UPGRADE_GATE.to_string(), "sre-approvals".to_string()));
+        expected.insert((
+            PLATFORM_UPGRADE_GATE.to_string(),
+            "sre-approvals".to_string(),
+        ));
         assert_eq!(routed_gates(&parsed), expected);
         assert_eq!(gates.len(), 8);
         let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
@@ -2873,7 +3091,10 @@ mod tests {
         let on: serde_json::Value = serde_json::from_slice(&on).unwrap();
         let mut expected = kubernetes_gate_set();
         expected.insert((UPGRADE_GATE.to_string(), "sre-approvals".to_string()));
-        expected.insert((PLATFORM_UPGRADE_GATE.to_string(), "sre-approvals".to_string()));
+        expected.insert((
+            PLATFORM_UPGRADE_GATE.to_string(),
+            "sre-approvals".to_string(),
+        ));
         assert_eq!(routed_gates(&on), expected);
         assert_eq!(on["approvalPolicy"]["gates"].as_array().unwrap().len(), 8);
     }

@@ -344,15 +344,32 @@ exit 64
 "#,
         );
 
-        let api = serve(
-            move |request| match (request.method.as_str(), request.path.as_str()) {
-                ("GET", "/agents") => Response::json(200, "[]"),
-                ("POST", "/agents") => Response::json(
-                    201,
-                    &format!(
-                        r##"{{"id":"{AGENT_ID}","name":"sre-bot","channels":[{{"kind":"slack","address":"#local-dev"}}],"created_at":"2026-08-21T00:00:00Z","memory":false}}"##
-                    ),
-                ),
+        // `resolve_agent` (cli/src/api.rs) re-lists `GET /agents` on every
+        // call -- including the one `deploy_with_commit_sha` performs after
+        // `bind_sre_approvals_route`'s PATCH -- so the fake keeps the created
+        // agent's state (namely `approval_routes`) in this cell rather than
+        // replying with the same fixed, routeless JSON every time. `None`
+        // means "not created yet", matching `GET /agents` => `[]`.
+        let agent_state: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let api = serve(move |request| {
+            let mut agent_state = agent_state.lock().unwrap();
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/agents") => match agent_state.as_ref() {
+                    Some(agent) => Response::json(200, &json!([agent]).to_string()),
+                    None => Response::json(200, "[]"),
+                },
+                ("POST", "/agents") => {
+                    let agent = json!({
+                        "id": AGENT_ID,
+                        "name": "sre-bot",
+                        "channels": [{"kind": "slack", "address": "#local-dev"}],
+                        "created_at": "2026-08-21T00:00:00Z",
+                        "memory": false,
+                    });
+                    *agent_state = Some(agent.clone());
+                    Response::json(201, &agent.to_string())
+                }
                 ("POST", path) if path == format!("/agents/{AGENT_ID}/versions") => Response::json(
                     201,
                     &format!(
@@ -385,9 +402,66 @@ exit 64
                         r#"{"manifests":[{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"curie-sre-bot-kubernetes"}}],"owned_secret_name":"curie-sre-bot-connector-secrets","owned_secret_keys":["K8S_KUBECONFIG"],"mcp_entries":{"kubernetes":{"url":"http://curie-sre-bot-kubernetes.curie.svc.cluster.local:8000/mcp"}}}"#,
                     )
                 }
+                ("POST", path) if path == format!("/agents/{AGENT_ID}/channels") => {
+                    // `add_agent_channel` (cli/src/api.rs) adds a Slack channel
+                    // binding when `--slack-channel` names one the resolved
+                    // agent does not already answer on (ADR-0118). Append it to
+                    // the recorded state and return the updated agent so the
+                    // deploy's next `resolve_agent` lookup sees it too.
+                    let mut agent = agent_state.clone().unwrap_or_else(|| {
+                        json!({
+                            "id": AGENT_ID,
+                            "name": "sre-bot",
+                            "channels": [{"kind": "slack", "address": "#local-dev"}],
+                            "created_at": "2026-08-21T00:00:00Z",
+                            "memory": false,
+                        })
+                    });
+                    if let Ok(body) = serde_json::from_slice::<Value>(&request.body) {
+                        if let (Some(kind), Some(address)) = (
+                            body.get("kind").and_then(Value::as_str),
+                            body.get("address").and_then(Value::as_str),
+                        ) {
+                            agent["channels"]
+                                .as_array_mut()
+                                .expect("agent channels must be an array")
+                                .push(json!({"kind": kind, "address": address}));
+                        }
+                    }
+                    *agent_state = Some(agent.clone());
+                    Response::json(200, &agent.to_string())
+                }
+                ("PATCH", path) if path == format!("/agents/{AGENT_ID}") => {
+                    // `set_approval_routes` (cli/src/api.rs) PATCHes
+                    // `{"approval_routes": {...}}` and decodes the response as
+                    // `Agent`. `ApprovalRouteBindingWrite` and
+                    // `ApprovalRouteBindingResponse` share the same field names
+                    // on the wire (resolution/notification/approvers), so the
+                    // request body's `approval_routes` value can be echoed back
+                    // verbatim as the response's `approval_routes`. The updated
+                    // agent is written back into `agent_state` so the next `GET
+                    // /agents` (the deploy step's own `resolve_agent` lookup)
+                    // sees the bound routes instead of a fresh, routeless agent.
+                    let routes = serde_json::from_slice::<Value>(&request.body)
+                        .ok()
+                        .and_then(|body| body.get("approval_routes").cloned())
+                        .unwrap_or_else(|| json!({}));
+                    let mut agent = agent_state.clone().unwrap_or_else(|| {
+                        json!({
+                            "id": AGENT_ID,
+                            "name": "sre-bot",
+                            "channels": [{"kind": "slack", "address": "#local-dev"}],
+                            "created_at": "2026-08-21T00:00:00Z",
+                            "memory": false,
+                        })
+                    });
+                    agent["approval_routes"] = routes;
+                    *agent_state = Some(agent.clone());
+                    Response::json(200, &agent.to_string())
+                }
                 _ => Response::json(500, r#"{"error":"unexpected API request"}"#),
-            },
-        );
+            }
+        });
         let registry = serve(|request| {
             if request.path.starts_with("/failure/") {
                 return Response::json(503, r#"{"error":"registry unavailable"}"#);
@@ -1384,9 +1458,21 @@ fn successful_install_uploads_the_pinned_upstream_kubernetes_connector_and_tool_
         plugin.get("toolPolicy").is_some(),
         "the tri-state Kubernetes policy must reach the deployed bundle"
     );
+    // approvalPolicy is never removed (it always carries the always-present
+    // Kubernetes mutation gates, routed to sre-approvals); only the
+    // self-upgrade gates come and go with the self-upgrade connector.
+    let gates = plugin["approvalPolicy"]["gates"]
+        .as_array()
+        .expect("approvalPolicy.gates must be present");
     assert!(
-        plugin.get("approvalPolicy").is_none(),
-        "self-upgrade gates must be stripped when the connector is not installed"
+        !gates.is_empty(),
+        "the always-present Kubernetes mutation gates must reach the deployed bundle"
+    );
+    assert!(
+        !gates.iter().any(|gate| gate["gate"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("mcp__self-upgrade__"))),
+        "self-upgrade gates must be stripped when the connector is not installed: {gates:?}"
     );
 
     let registry = fixture.registry.recorded();
@@ -2769,7 +2855,9 @@ fn route_binding_line(lines: &[String]) -> (usize, String) {
     lines
         .iter()
         .enumerate()
-        .find(|(_, line)| line.contains("sre-approvals") && line.to_ascii_lowercase().contains("bind"))
+        .find(|(_, line)| {
+            line.contains("sre-approvals") && line.to_ascii_lowercase().contains("bind")
+        })
         .map(|(index, line)| (index, line.clone()))
         .unwrap_or_else(|| panic!("dry run plan must bind route sre-approvals: {lines:?}"))
 }
@@ -2783,7 +2871,10 @@ fn dry_run_plans_the_sre_approvals_binding_with_comma_separated_approvers_before
     );
     let (bind, line) = route_binding_line(&lines);
     for user in ["U0AAA", "U0BBB"] {
-        assert!(line.contains(user), "binding line must name approver {user}: {line}");
+        assert!(
+            line.contains(user),
+            "binding line must name approver {user}: {line}"
+        );
     }
     let deploy = lines
         .iter()
@@ -2809,7 +2900,10 @@ fn repeated_approvers_flags_accumulate_into_one_binding() {
     );
     let (_, line) = route_binding_line(&lines);
     for user in ["U0AAA", "U0BBB", "U0CCC"] {
-        assert!(line.contains(user), "binding line must name approver {user}: {line}");
+        assert!(
+            line.contains(user),
+            "binding line must name approver {user}: {line}"
+        );
     }
 }
 
