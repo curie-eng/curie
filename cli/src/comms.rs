@@ -7,10 +7,12 @@ use anyhow::{bail, Result};
 use crate::local::{fake_model_env_override, otel_endpoint_env_override, ModelMode};
 use crate::ops::{plain, require_on_path, run_step, secret_set, CmdArg, CommonOpts, OpsCommand};
 
-/// The worker's Slack stub sink URL (compose default); restored on disconnect.
-const LOCAL_SLACK_STUB_URL: &str = "http://localhost:8155/api/";
 /// The worker's stub bot token (compose default); restored on disconnect.
 const LOCAL_SLACK_STUB_BOT_TOKEN: &str = "xoxb-dev";
+
+fn local_slack_stub_url(port: u16) -> String {
+    format!("http://localhost:{port}/api/")
+}
 
 /// Shared connect-time copy: exactly one Curie release may own a Slack app.
 pub const SLACK_ONE_APP_PER_RELEASE_NOTE: &str =
@@ -39,6 +41,7 @@ pub struct CommsOpts {
 pub struct LocalCommsOpts {
     pub project: String,
     pub files: Vec<String>,
+    pub stub_port: u16,
     pub dry_run: bool,
     pub app_token: String,
     pub bot_token: String,
@@ -155,8 +158,9 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
 }
 
 pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
+    let stub_url = local_slack_stub_url(o.stub_port);
     let mut worker_env = vec![
-        ("SLACK_API_BASE_URL".into(), LOCAL_SLACK_STUB_URL.into()),
+        ("SLACK_API_BASE_URL".into(), stub_url),
         ("SLACK_BOT_TOKEN".into(), LOCAL_SLACK_STUB_BOT_TOKEN.into()),
     ];
     worker_env.extend(fake_model_env_override(o.model_mode));
@@ -753,6 +757,7 @@ mod tests {
         LocalCommsOpts {
             project: crate::local::COMPOSE_PROJECT.into(),
             files: vec!["compose.dev.yaml".into()],
+            stub_port: crate::message::DEFAULT_LOCAL_STUB_PORT,
             dry_run: false,
             app_token: if disconnect {
                 String::new()
@@ -778,6 +783,7 @@ mod tests {
         let cmds = local_connect_commands(&LocalCommsOpts {
             project: crate::local::COMPOSE_PROJECT.into(),
             files: vec!["compose.dev.yaml".into()],
+            stub_port: crate::message::DEFAULT_LOCAL_STUB_PORT,
             dry_run: false,
             app_token: "xapp-1-secretsecret".into(),
             bot_token: "xoxb-1-secretsecret".into(),
@@ -893,7 +899,7 @@ mod tests {
             .contains(&("CURIE_FAKE_MODEL".to_string(), "0".to_string())));
         assert!(worker_cmd.env.contains(&(
             "SLACK_API_BASE_URL".to_string(),
-            LOCAL_SLACK_STUB_URL.to_string(),
+            local_slack_stub_url(crate::message::DEFAULT_LOCAL_STUB_PORT),
         )));
         assert!(worker_cmd.env.contains(&(
             "SLACK_BOT_TOKEN".to_string(),

@@ -5182,9 +5182,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
             agent: outcome.agent.name.clone(),
             namespace: "default".to_string(),
         };
-        let project = crate::local::current_resources()
-            .map(|resources| resources.project)
-            .unwrap_or_else(|_| crate::local::COMPOSE_PROJECT.to_string());
+        let project = crate::local::current_resources()?.project;
         bring_up_local(&plugin_dir, &lock, &identity, &project).await?;
     }
 

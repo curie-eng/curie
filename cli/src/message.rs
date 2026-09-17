@@ -1323,27 +1323,21 @@ async fn bounded_diagnostics(
 async fn observe_message_claims(
     opts: &MessageOpts,
     verb: TurnVerb,
-) -> crate::worker_claims::ClaimsState {
+) -> Result<crate::worker_claims::ClaimsState> {
     match verb {
         TurnVerb::Local => {
-            let resources = crate::local::current_resources().unwrap_or_else(|_| {
-                crate::local::LocalResources::shared_default(crate::local::DEFAULT_COMPOSE_FILE)
-            });
-            crate::worker_claims::observe_local(
-                &resources.project,
-                resources
-                    .compose_files
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or(crate::local::DEFAULT_COMPOSE_FILE),
+            let resources = crate::local::current_resources()?;
+            Ok(
+                crate::worker_claims::observe_local(&resources.project, &resources.compose_files)
+                    .await,
             )
-            .await
         }
-        TurnVerb::Cluster => {
-            crate::worker_claims::observe_cluster(&opts.namespace, &opts.release)
-                .await
-                .state
-        }
+        TurnVerb::Cluster => Ok(crate::worker_claims::observe_cluster(
+            &opts.namespace,
+            &opts.release,
+        )
+        .await
+        .state),
     }
 }
 
@@ -1459,11 +1453,9 @@ fn compose_config_files(label: &str) -> Result<Vec<String>> {
 /// Both halves now live in `local.rs` (#1925), because every `local` verb that
 /// recreates a service needs the same derivation -- this one just narrows it to
 /// the single image the one-shot producer runs.
-async fn one_shot_dispatcher_image() -> Option<String> {
-    let project = crate::local::current_resources()
-        .map(|resources| resources.project)
-        .unwrap_or_else(|_| crate::local::COMPOSE_PROJECT.to_string());
-    crate::local::running_stack_image("curie-dispatcher", &project).await
+async fn one_shot_dispatcher_image() -> Result<Option<String>> {
+    let project = crate::local::current_resources()?.project;
+    Ok(crate::local::running_stack_image("curie-dispatcher", &project).await)
 }
 
 fn worker_compose_config_command(container: &str) -> OpsCommand {
@@ -1584,8 +1576,8 @@ async fn local_dispatcher_context() -> Result<LocalDispatcherContext> {
     // #1915: the stack's own image tag, so the one-shot producer below runs what
     // the stack runs. Best-effort: an unreadable image is not worth failing an
     // enqueue over, and compose's default then applies exactly as before.
-    let dispatcher_image = one_shot_dispatcher_image().await;
     let resources = crate::local::current_resources()?;
+    let dispatcher_image = one_shot_dispatcher_image().await?;
     let compose_files = if resources.isolated() {
         resources.compose_files.clone()
     } else {
@@ -1941,7 +1933,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
 
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
-    let initial_claims = observe_message_claims(&opts, TurnVerb::Local).await;
+    let initial_claims = observe_message_claims(&opts, TurnVerb::Local).await?;
     report_initial_claim_wait(ui, &step, &initial_claims);
     let wait_started = Instant::now();
     let outcome = {
@@ -2056,7 +2048,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             // next `local message` can bind successfully right away regardless of
             // how long anything after this line takes (#751).
             drop(stub);
-            let latest_claims = observe_message_claims(&opts, TurnVerb::Local).await;
+            let latest_claims = observe_message_claims(&opts, TurnVerb::Local).await?;
             let latest_reason = latest_claims.wait_reason();
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
@@ -2666,10 +2658,6 @@ async fn resume_cluster_after_approval(
 /// dispatcher is wired to the local stub -- NOT a real workspace.
 const LOCAL_STUB_BOT_TOKEN: &str = "xoxb-dev";
 
-/// The host in `comms::LOCAL_SLACK_STUB_URL`. A worker whose `SLACK_API_BASE_URL`
-/// points here talks to the in-compose stub, never to Slack.
-const LOCAL_SLACK_STUB_HOST: &str = "localhost:8155";
-
 /// The Slack transport the RUNNING compose worker is actually configured with:
 /// `(SLACK_API_BASE_URL, SLACK_BOT_TOKEN)` as the container holds them.
 type WorkerTransport = (Option<String>, Option<String>);
@@ -2729,7 +2717,10 @@ fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack
     let api_base = api_base?;
     // Wired to the stub is not connected: the stub is literally the transport the
     // worker will edit the placeholder over, so no real post can ever be updated.
-    if api_base.contains(LOCAL_SLACK_STUB_HOST) {
+    let Ok(resources) = crate::local::current_resources() else {
+        return None;
+    };
+    if api_base.contains(&format!("localhost:{}", resources.stub_port)) {
         return None;
     }
     let token = token?.trim().to_string();
@@ -3190,7 +3181,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
-    let initial_claims = observe_message_claims(&opts, TurnVerb::Cluster).await;
+    let initial_claims = observe_message_claims(&opts, TurnVerb::Cluster).await?;
     report_initial_claim_wait(ui, &step, &initial_claims);
     let wait_started = Instant::now();
     let observed = {
@@ -3285,7 +3276,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
         }
         Outcome::TimedOut => {
             step.fail(&format!("timed out after {}s", opts.timeout_secs));
-            let latest_claims = observe_message_claims(&opts, TurnVerb::Cluster).await;
+            let latest_claims = observe_message_claims(&opts, TurnVerb::Cluster).await?;
             let latest_reason = latest_claims.wait_reason();
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
@@ -3451,7 +3442,11 @@ pub fn reply_passes(case: &EvalCase, outcome: &Outcome) -> bool {
 /// The plan a `--dry-run` eval prints: the tier, the suite/case count, and the
 /// same enqueue/port-forward description a real run would produce. Pure so the
 /// rendering is unit-testable with no stack or cluster (mirrors `dry_run_lines`).
-pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) -> Vec<String> {
+pub fn eval_dry_run_lines(
+    opts: &EvalOpts,
+    suite_name: &str,
+    case_count: usize,
+) -> Result<Vec<String>> {
     let tier = if opts.local { "local" } else { "cluster" };
     // A `--model` sweep (#526) is the platform eval plane, so its plan is the
     // trigger-per-model + matrix-poll shape, not the message enqueue path.
@@ -3484,15 +3479,13 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
         lines.push(format!(
             "then poll {api_base}/evals/matrix?suite={suite_name} for per-model pass-rate"
         ));
-        return lines;
+        return Ok(lines);
     }
     let mut lines = vec![format!(
         "grade {case_count} case(s) from suite {suite_name:?} against the {tier} tier"
     )];
     if opts.local {
-        let resources = crate::local::current_resources().unwrap_or_else(|_| {
-            crate::local::LocalResources::shared_default(crate::local::DEFAULT_COMPOSE_FILE)
-        });
+        let resources = crate::local::current_resources()?;
         let valkey_url = local_valkey_url(
             &opts.valkey_password,
             &resources.valkey_host,
@@ -3559,7 +3552,7 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
     lines.push(
         "without ambient durable agent memory (eval: conversation prefix per case)".to_string(),
     );
-    lines
+    Ok(lines)
 }
 
 /// Resolve the eval suite the way `skill eval` does: an explicit `--cases`
@@ -4096,10 +4089,7 @@ fn select_worker_container(stdout: &str) -> Result<String> {
 }
 
 async fn local_worker_container() -> Result<String> {
-    let project = std::env::var("COMPOSE_PROJECT_NAME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| crate::local::COMPOSE_PROJECT.to_string());
+    let project = crate::local::current_resources()?.project;
     let cmd = worker_ps_command(&project);
     let (ok, stdout, stderr) = run_capture(&cmd).await?;
     if !ok {
@@ -4119,7 +4109,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         // A dry run is an offline, non-mutating plan: it does not probe the
         // runtime, so it must not claim what the current stack would do.
         ui.emit(&crate::ui::DryRunPlan {
-            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len()),
+            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len())?,
         });
         return Ok(());
     }
@@ -4537,7 +4527,7 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 
     if opts.dry_run {
         ui.emit(&crate::ui::DryRunPlan {
-            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len()),
+            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len())?,
         });
         return Ok(());
     }
@@ -4618,7 +4608,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 
     if opts.dry_run {
         ui.emit(&crate::ui::DryRunPlan {
-            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len()),
+            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len())?,
         });
         return Ok(());
     }
@@ -6542,6 +6532,7 @@ mod tests {
         crate::comms::LocalCommsOpts {
             project: crate::local::COMPOSE_PROJECT.to_string(),
             files: vec!["compose.dev.yaml".to_string()],
+            stub_port: DEFAULT_LOCAL_STUB_PORT,
             dry_run: false,
             app_token: "xapp-real-workspace".to_string(),
             bot_token: "xoxb-real-workspace".to_string(),
@@ -6597,7 +6588,7 @@ mod tests {
             disconnected_env
                 .0
                 .as_deref()
-                .is_some_and(|base| base.contains(LOCAL_SLACK_STUB_HOST)),
+                .is_some_and(|base| base.contains(&format!("localhost:{DEFAULT_LOCAL_STUB_PORT}"))),
             "`local comms --disconnect` must point the worker back at the stub: {:?}",
             disconnected_env.0
         );
@@ -7124,7 +7115,8 @@ mod tests {
     #[test]
     fn local_eval_dry_run_plan_names_the_tier_suite_and_enqueue() {
         // The `local eval` path with no live stack: the plan is a pure render.
-        let lines = eval_dry_run_lines(&eval_opts(true, Some("C123")), "smoke", 3);
+        let lines = eval_dry_run_lines(&eval_opts(true, Some("C123")), "smoke", 3)
+            .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7161,7 +7153,8 @@ mod tests {
 
     #[test]
     fn eval_dry_run_plan_names_sampling_policy() {
-        let lines = eval_dry_run_lines(&eval_opts(true, None), "smoke", 1);
+        let lines =
+            eval_dry_run_lines(&eval_opts(true, None), "smoke", 1).expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7172,7 +7165,8 @@ mod tests {
 
     #[test]
     fn local_eval_dry_run_names_the_channel_lookup_when_omitted() {
-        let lines = eval_dry_run_lines(&eval_opts(true, None), "smoke", 1);
+        let lines =
+            eval_dry_run_lines(&eval_opts(true, None), "smoke", 1).expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7183,7 +7177,8 @@ mod tests {
 
     #[test]
     fn cluster_eval_dry_run_plan_lists_the_valkey_forward_and_stub() {
-        let lines = eval_dry_run_lines(&eval_opts(false, Some("C1")), "smoke", 2);
+        let lines = eval_dry_run_lines(&eval_opts(false, Some("C1")), "smoke", 2)
+            .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7223,7 +7218,8 @@ mod tests {
             &sweep_opts(true, Some("C7"), &["opus", "sonnet"]),
             "smoke",
             2,
-        );
+        )
+        .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7254,7 +7250,8 @@ mod tests {
 
     #[test]
     fn cluster_model_sweep_dry_run_reaches_the_api_via_port_forward() {
-        let lines = eval_dry_run_lines(&sweep_opts(false, None, &["opus"]), "smoke", 1);
+        let lines = eval_dry_run_lines(&sweep_opts(false, None, &["opus"]), "smoke", 1)
+            .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()

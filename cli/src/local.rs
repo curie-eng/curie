@@ -6,6 +6,7 @@
 //! (or the `--dry-run` printer) consumes it, so argv construction stays
 //! unit-testable with no Docker daemon.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 
@@ -523,18 +524,79 @@ pub fn resolve_local_resources(
     Ok(resources)
 }
 
-fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result<()> {
-    let mut combined = String::new();
-    for path in resources.compose_files.iter().skip(1) {
-        combined.push_str(&std::fs::read_to_string(path).map_err(|err| {
-            crate::exit::CliError::usage(format!("could not read compose override {path}: {err}"))
-        })?);
+fn merged_compose_config(resources: &LocalResources, build: bool) -> Result<serde_json::Value> {
+    let mut cmd = std::process::Command::new("docker");
+    cmd.arg("compose").arg("-p").arg(&resources.project);
+    for file in &resources.compose_files {
+        cmd.arg("-f").arg(file);
     }
+    cmd.args(["config", "--format", "json"]);
+    cmd.env("COMPOSE_PROJECT_NAME", &resources.project);
+    cmd.env("CURIE_DOCKER_NETWORK", &resources.docker_network);
+    if build {
+        cmd.env("CURIE_BASE_TAG", &resources.image_tag);
+        for image in source_images_for(false) {
+            if let Some(name) = image.env {
+                cmd.env(name, image_ref(image.image, &resources.image_tag));
+            }
+        }
+    }
+    let output = cmd.output().map_err(|err| {
+        crate::exit::CliError::usage(format!(
+            "isolated compose config could not run docker compose: {err}"
+        ))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::exit::CliError::usage(format!(
+            "isolated docker compose config failed: {}",
+            stderr.trim()
+        ))
+        .into());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|err| {
+        crate::exit::CliError::usage(format!(
+            "isolated docker compose config was not JSON: {err}"
+        ))
+        .into()
+    })
+}
+
+fn service_environment(config: &serde_json::Value, service: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    let env = &config["services"][service]["environment"];
+    if let Some(obj) = env.as_object() {
+        for (key, value) in obj {
+            let rendered = match value {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Number(number) => number.to_string(),
+                serde_json::Value::Bool(flag) => flag.to_string(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            map.insert(key.clone(), rendered);
+        }
+    } else if let Some(entries) = env.as_array() {
+        for item in entries {
+            if let Some(entry) = item.as_str() {
+                if let Some((key, value)) = entry.split_once('=') {
+                    map.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result<()> {
+    let config = merged_compose_config(resources, build)?;
+    let worker = service_environment(&config, "curie-worker");
     let required = [
         (
             "DATABASE_URL",
             format!("{}:{}", resources.postgres_host, resources.postgres_port),
         ),
+        ("VALKEY_HOST", resources.valkey_host.clone()),
         ("VALKEY_PORT", resources.valkey_port.to_string()),
         ("S3_ENDPOINT_URL", resources.s3_endpoint.clone()),
         ("CURIE_API_URL", resources.api_url.clone()),
@@ -543,7 +605,8 @@ fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result
         ("SLACK_API_BASE_URL", format!(":{}", resources.stub_port)),
     ];
     for (key, needle) in required {
-        if !combined.contains(key) || !combined.contains(&needle) {
+        let value = worker.get(key).map(String::as_str).unwrap_or("");
+        if !value.contains(&needle) {
             return Err(crate::exit::CliError::usage(format!(
                 "isolated override does not rebind host-network worker {key} to {needle}; \
                  a ports-only override leaves the worker on the shared stack"
@@ -556,12 +619,29 @@ fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result
             .into());
         }
     }
+    let network_name = config["networks"]["curie_runner"]["name"]
+        .as_str()
+        .unwrap_or("");
+    if network_name != resources.docker_network {
+        return Err(crate::exit::CliError::usage(format!(
+            "isolated override does not name the runner network {}; resolved name is {network_name}",
+            resources.docker_network
+        ))
+        .with_fix("set networks.curie_runner.name to ${COMPOSE_PROJECT_NAME}_runner")
+        .into());
+    }
     if build {
-        for path in resources.compose_files.iter().skip(1) {
-            let body = std::fs::read_to_string(path).unwrap_or_default();
-            if body.contains("image: ghcr.io/curie-eng/") && !body.contains("${CURIE_") {
+        for service in [
+            "curie-api",
+            "curie-worker",
+            "curie-dispatcher",
+            "curie-runner",
+            "curie-ui",
+        ] {
+            let image = config["services"][service]["image"].as_str().unwrap_or("");
+            if image.contains("ghcr.io/curie-eng/") && !image.contains(&resources.image_tag) {
                 return Err(crate::exit::CliError::usage(format!(
-                    "isolated override {path} pins a published image and would disconnect --build from the candidate"
+                    "isolated override pins {service} to {image} and would disconnect --build from the candidate"
                 ))
                 .into());
             }
@@ -1631,7 +1711,7 @@ pub async fn status(o: LocalOpts) -> Result<LocalStatusOutput> {
     // the additive diagnosis on stderr so LocalStatusOutput remains unchanged.
     let (status_read, claim_state) = tokio::join!(
         run_capture(&cmd),
-        crate::worker_claims::observe_local(o.project(), o.file()),
+        crate::worker_claims::observe_local(o.project(), o.files()),
     );
     let (ok, out, err) = status_read?;
     ui.note(&claim_state.status_diagnosis());
@@ -2221,6 +2301,7 @@ mod tests {
         let comms = |disconnect: bool| crate::comms::LocalCommsOpts {
             project: COMPOSE_PROJECT.into(),
             files: vec![DEFAULT_COMPOSE_FILE.into()],
+            stub_port: crate::message::DEFAULT_LOCAL_STUB_PORT,
             dry_run: false,
             app_token: if disconnect {
                 String::new()

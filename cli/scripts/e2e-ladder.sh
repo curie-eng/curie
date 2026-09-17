@@ -188,6 +188,10 @@ fi
 # Default matches message::DEFAULT_LOCAL_STUB_PORT. Isolation sets
 # CURIE_LOCAL_STUB_PORT to the worker's rebound SLACK_API_BASE_URL port.
 STUB_PORT="${CURIE_LOCAL_STUB_PORT:-8155}"
+# Host-network worker OTLP and Collector self-metrics. Isolation remaps the
+# published collector ports; the default matches compose.dev.yaml.
+PRODUCT_COLLECTOR_WORKER_ENDPOINT="${CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT:-http://127.0.0.1:24318}"
+PRODUCT_COLLECTOR_METRICS_URL="${CURIE_LOCAL_OTEL_METRICS_URL:-http://127.0.0.1:28888/metrics}"
 
 local_compose_cli_args() {
   local args=("$@")
@@ -3885,7 +3889,7 @@ route_local_observability_to_product_collector() {
     fi
 
     export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
-    export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318
+    export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT="$PRODUCT_COLLECTOR_WORKER_ENDPOINT"
     export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
     local stale runner dispatcher=""
     # An already-running curie-runner inherited the disposable endpoint. Reap
@@ -3923,7 +3927,7 @@ route_local_observability_to_product_collector() {
     assert_product_collector_endpoint curie-api "$api" \
         "http://otel-collector:4318" "http/protobuf"
     assert_product_collector_endpoint curie-worker "$worker" \
-        "http://127.0.0.1:24318" "http/protobuf"
+        "$PRODUCT_COLLECTOR_WORKER_ENDPOINT" "http/protobuf"
     if [[ -n "$dispatcher" ]]; then
         dispatcher="$(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
             --filter 'label=com.docker.compose.service=curie-dispatcher' --format '{{.Names}}')"
@@ -3942,7 +3946,7 @@ route_local_observability_to_product_collector() {
 
 product_collector_metric_value() {
     local metric="$1"
-    curl -fsS http://127.0.0.1:28888/metrics | python3 -c '
+    curl -fsS "$PRODUCT_COLLECTOR_METRICS_URL" | python3 -c '
 import re, sys
 name = sys.argv[1]
 total = 0.0
@@ -3956,7 +3960,7 @@ print(total)
 wait_product_collector_ready() {
     local attempt
     for attempt in $(seq 1 60); do
-        if curl -fsS http://127.0.0.1:28888/metrics >/dev/null 2>&1; then
+        if curl -fsS "$PRODUCT_COLLECTOR_METRICS_URL" >/dev/null 2>&1; then
             # The Collector's startup contract logs "Everything is ready";
             # the live self-metrics endpoint is the stronger Ready probe.
             return 0
@@ -4306,13 +4310,12 @@ rung_local() {
         # project the CLI pins (cli/src/local.rs COMPOSE_PROJECT).
         local worker
         worker="$(local_worker_container)"
-        assert_declared_connectors_hosted "local" curie \
+        assert_declared_connectors_hosted "local" "$COMPOSE_PROJECT" \
             "$(container_env_value "$worker" CURIE_RELEASE)" "$agent_name"
     else
-        # `curie` is the compose project the CLI pins (cli/src/local.rs
-        # COMPOSE_PROJECT), and the project this tier stamps on a connector
-        # container is that same name.
-        assert_no_connector_containers "local" curie
+        # The project this tier stamps on a connector container is the selected
+        # compose project, default curie.
+        assert_no_connector_containers "local" "$COMPOSE_PROJECT"
     fi
 
     echo
@@ -4552,10 +4555,18 @@ rung_local_release() {
         # stack this run is about to reuse. Wiping first makes this rung an
         # actual cold start rather than one that might silently inherit state
         # and mask the exact compose-env-wiring drift (#545) it exists to catch.
-        "$BIN" local down --wipe --yes -f "$release_compose" >/dev/null 2>&1 || true
+        local down_args=(local down --wipe --yes --project "$COMPOSE_PROJECT" -f "$release_compose")
+        local extra_i
+        for ((extra_i = 1; extra_i < ${#COMPOSE_FILES[@]}; extra_i++)); do
+            down_args+=(-f "${COMPOSE_FILES[$extra_i]}")
+        done
+        "$BIN" "${down_args[@]}" >/dev/null 2>&1 || true
 
         echo
-        local up_args=(local up -f "$release_compose")
+        local up_args=(local up --project "$COMPOSE_PROJECT" -f "$release_compose")
+        for ((extra_i = 1; extra_i < ${#COMPOSE_FILES[@]}; extra_i++)); do
+            up_args+=(-f "${COMPOSE_FILES[$extra_i]}")
+        done
         if [[ "$compose_profile" == "core" ]]; then
             up_args+=(--minimal)
         fi
@@ -4609,12 +4620,11 @@ rung_local_release() {
         # shares the pinned project name and the same delivery overlay.
         local worker
         worker="$(local_worker_container)"
-        assert_declared_connectors_hosted "local-release" curie \
+        assert_declared_connectors_hosted "local-release" "$COMPOSE_PROJECT" \
             "$(container_env_value "$worker" CURIE_RELEASE)" "$agent_name"
     else
-        # Same compose project as rung 2: the release compose file the CLI
-        # generates carries the same pinned project name.
-        assert_no_connector_containers "local-release" curie
+        # Same compose project as rung 2: the selected project, default curie.
+        assert_no_connector_containers "local-release" "$COMPOSE_PROJECT"
     fi
 
     echo

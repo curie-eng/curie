@@ -925,12 +925,15 @@ pub(crate) fn plain_command(program: &str, args: Vec<String>) -> crate::ops::Ops
 /// The tag a local-daemon build produces, before the daemon's image id replaces
 /// it in the lock. Ephemeral by construction: nothing pulls it, and a rebuild
 /// reuses it, which is exactly why the lock records the id instead.
-fn local_build_tag(bundle_name: &str, connector: &str) -> String {
-    match std::env::var("COMPOSE_PROJECT_NAME") {
-        Ok(project) if !project.is_empty() && project != crate::local::COMPOSE_PROJECT => {
-            format!("curie-connector-{project}-{bundle_name}-{connector}:build")
-        }
-        _ => format!("curie-connector-{bundle_name}-{connector}:build"),
+fn local_build_tag(bundle_name: &str, connector: &str) -> Result<String> {
+    let resources = crate::local::current_resources()?;
+    if resources.isolated() {
+        Ok(format!(
+            "curie-connector-{}-{bundle_name}-{connector}:build",
+            resources.project
+        ))
+    } else {
+        Ok(format!("curie-connector-{bundle_name}-{connector}:build"))
     }
 }
 
@@ -1016,7 +1019,7 @@ pub fn build_plan(
         ),
         None => (
             Delivery::LocalDaemon,
-            local_build_tag(bundle_name, connector),
+            local_build_tag(bundle_name, connector)?,
             None,
         ),
     };
@@ -1536,9 +1539,7 @@ pub fn compose_overlay(
     project: &str,
     plugin_dir: &Path,
 ) -> Result<serde_json::Value> {
-    let network = crate::local::current_resources()
-        .map(|resources| resources.docker_network)
-        .unwrap_or_else(|_| RUNNER_NETWORK.to_string());
+    let network = crate::local::current_resources()?.docker_network;
     let mut services = serde_json::Map::new();
     for (connector, spec) in &decl.connectors {
         if !is_hosted(spec) {
@@ -1605,9 +1606,6 @@ pub fn compose_overlay(
         if !volumes.is_empty() {
             service.insert("volumes".into(), serde_json::Value::Array(volumes));
         }
-        let network = crate::local::current_resources()
-            .map(|resources| resources.docker_network)
-            .unwrap_or_else(|_| RUNNER_NETWORK.to_string());
         let mut attachment = serde_json::Map::new();
         attachment.insert(network.clone(), serde_json::json!({ "aliases": [alias] }));
         service.insert("networks".into(), serde_json::Value::Object(attachment));

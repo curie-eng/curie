@@ -265,6 +265,8 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    export CURIE_LOCAL_POSTGRES_HOST=127.0.0.1 CURIE_LOCAL_POSTGRES_PORT=35432
    export CURIE_LOCAL_STAGING_DIR=/tmp/curie-bundles-2780-a
    export CURIE_LOCAL_IMAGE_TAG=dev-2780-a
+   export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:34318
+   export CURIE_LOCAL_OTEL_METRICS_URL=http://127.0.0.1:38888/metrics
    curie local up --build
    CURIE_E2E_TIERS=local curie dev e2e-ladder
    curie local down

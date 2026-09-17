@@ -1391,8 +1391,15 @@ fn product_collector_restore_covers_every_emitter_and_invalid_auth_is_observable
         "product restoration must override unrelated shell or ignored-file routing"
     );
     assert!(
-        restore.contains("export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318"),
-        "host-network worker must use the collector's published host port"
+        restore.contains(
+            "export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=\"$PRODUCT_COLLECTOR_WORKER_ENDPOINT\""
+        ),
+        "host-network worker must use the selected collector host port"
+    );
+    assert!(
+        ladder().contains("PRODUCT_COLLECTOR_WORKER_ENDPOINT=")
+            && ladder().contains("http://127.0.0.1:24318"),
+        "the default collector host port remains 24318 when isolation is unset"
     );
     assert!(
         restore.contains("export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf"),
