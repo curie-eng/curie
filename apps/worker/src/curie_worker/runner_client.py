@@ -95,7 +95,7 @@ class RunnerError(Exception):
 
 
 class RunnerStreamTimeout(TimeoutError):
-    """The streamed turn body exceeded the client's total/sock-read budget.
+    """The turn exceeded its deadline during transport or frame handling.
 
     A ``TimeoutError`` subclass on purpose (#2011): every existing
     ``except TimeoutError`` / ``except (aiohttp.ClientError, TimeoutError)``
@@ -126,15 +126,17 @@ class TurnStream:
     def __init__(
         self,
         response: aiohttp.ClientResponse,
-        budget_s: float | None = None,
+        budget_s: float,
+        deadline: float,
         timeout_callback: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._response = response
         self._saw_final = False
         # The streaming budget this stream is running under, carried from the
-        # client so the stream can NAME the budget it blew (#2011). Optional so
-        # a directly-constructed TurnStream (tests, evals) still works.
+        # client so the stream can NAME the budget it blew (#2011).
         self._budget_s = budget_s
+        self._deadline_timeout = asyncio.timeout_at(deadline)
+        self._stream_timeout_error: RunnerStreamTimeout | None = None
         # A successful /v1/event response may bind its opaque turn epoch to a
         # separately bounded control call. Consume it before awaiting so a
         # repeated iterator cannot notify the same turn twice.
@@ -164,9 +166,18 @@ class TurnStream:
             # runner-error it has always been. asyncio.CancelledError does not
             # subclass TimeoutError, so cooperative cancellation still passes
             # straight through -- do not broaden this clause.
+            raise await self._normalize_stream_timeout(cause) from cause
+
+    async def _normalize_stream_timeout(
+        self, cause: BaseException
+    ) -> RunnerStreamTimeout:
+        terminal = self._stream_timeout_error
+        if terminal is None:
+            terminal = RunnerStreamTimeout(self._timeout_reason(cause))
+            self._stream_timeout_error = terminal
             self._record_stream_timeout(cause)
             await self._notify_timeout()
-            raise RunnerStreamTimeout(self._timeout_reason(cause)) from cause
+        return terminal
 
     async def _notify_timeout(self) -> None:
         callback = self._timeout_callback
@@ -185,9 +196,8 @@ class TurnStream:
             )
 
     def _timeout_reason(self, cause: BaseException) -> str:
-        budget = "unbounded" if self._budget_s is None else f"{self._budget_s}s"
         return (
-            f"runner turn stream exceeded its {budget} total/sock-read budget "
+            f"runner turn stream exceeded its {self._budget_s}s total/sock-read budget "
             f"({type(cause).__name__})"
         )
 
@@ -195,9 +205,10 @@ class TurnStream:
         """Emit the terminal record this boundary previously never produced.
 
         ``RunnerClient._rpc``'s span for ``start_turn`` closes as soon as the
-        response HEADERS arrive, so a budget expiring while the NDJSON BODY is
-        read left no evidence at the RPC boundary at all -- the only
-        ``curie.runner.rpc.result`` point for the turn said ``success`` (#2011).
+        response HEADERS arrive, so a deadline expiring while the NDJSON BODY
+        is read or while a yielded frame is handled left no evidence at the
+        RPC boundary. The only ``curie.runner.rpc.result`` point for the turn
+        said ``success`` (#2011).
         The attribute values here are already in the shared allowlist, and the
         span/event keys are the same closed vocabulary ``_rpc`` uses.
         """
@@ -249,6 +260,7 @@ class TurnStream:
         self._response.release()
 
     async def __aenter__(self) -> TurnStream:
+        await self._deadline_timeout.__aenter__()
         return self
 
     async def __aexit__(
@@ -258,6 +270,10 @@ class TurnStream:
         tb: TracebackType | None,
     ) -> None:
         try:
+            try:
+                await self._deadline_timeout.__aexit__(exc_type, exc, tb)
+            except TimeoutError as cause:
+                raise await self._normalize_stream_timeout(cause) from cause
             if exc_type is None:
                 await self._discard_post_final()
         finally:
@@ -405,6 +421,8 @@ class RunnerClient:
             )
 
         async def request(headers: dict[str, str] | None) -> tuple[TurnStream, str]:
+            assert stream_timeout_s is not None
+            deadline = asyncio.get_running_loop().time() + stream_timeout_s
             resp = await self._session.post(
                 f"{base_url}/v1/event",
                 json=event.model_dump(),
@@ -426,7 +444,10 @@ class RunnerClient:
                     await self._notify_timeout(base_url, turn_epoch, token)
 
                 timeout_callback = notify_timeout
-            return TurnStream(resp, stream_timeout_s, timeout_callback), "success"
+            return (
+                TurnStream(resp, stream_timeout_s, deadline, timeout_callback),
+                "success",
+            )
 
         return await self._rpc("event", token, request)
 
