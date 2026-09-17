@@ -198,6 +198,15 @@ local_compose_cli_args() {
   done
   printf '%s\n' "${args[@]}"
 }
+
+ladder_compose() {
+  local args=(docker compose -p "$COMPOSE_PROJECT")
+  local f
+  for f in "${COMPOSE_FILES[@]}"; do
+    args+=(-f "$f")
+  done
+  "${args[@]}" "$@"
+}
 PROMPT="What is the weather in Denver right now?"
 # The live approval-gate case's turn (#2094). Deliberately explicit and
 # imperative, and deliberately NOT a weather question: the bundle's skill only
@@ -3762,9 +3771,10 @@ pin_local_source_images() {
     if (( ! LOCAL_STACK_OWNED )); then
         return 0
     fi
-    export CURIE_BASE_TAG=dev
-    export CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:dev
-    export CURIE_DISPATCHER_IMAGE=ghcr.io/curie-eng/curie-dispatcher:dev
+    local tag="${CURIE_LOCAL_IMAGE_TAG:-dev}"
+    export CURIE_BASE_TAG="$tag"
+    export CURIE_RUNNER_IMAGE="ghcr.io/curie-eng/curie-runner:$tag"
+    export CURIE_DISPATCHER_IMAGE="ghcr.io/curie-eng/curie-dispatcher:$tag"
 }
 
 # Affinity reuses a live sandbox across worker recreation. Reap so the next
@@ -3802,7 +3812,7 @@ inject_local_runner_failure() {
     export CURIE_CREDENTIALS=""
     export ANTHROPIC_API_KEY=""
     export CLAUDE_CODE_OAUTH_TOKEN=""
-    docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+    ladder_compose --profile core --profile full \
         up -d --force-recreate --no-deps curie-worker >/dev/null
     reap_local_runner_sandboxes
     sleep 3
@@ -3830,7 +3840,7 @@ restore_local_runner_health() {
     else
         unset CLAUDE_CODE_OAUTH_TOKEN
     fi
-    docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+    ladder_compose --profile core --profile full \
         up -d --force-recreate --no-deps curie-worker >/dev/null
     reap_local_runner_sandboxes
     LOCAL_OTEL_FAILURE_MODE=0
@@ -3894,14 +3904,14 @@ route_local_observability_to_product_collector() {
             fi
         done < <(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')
     fi
-    docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+    ladder_compose --profile core --profile full \
         up -d --force-recreate --no-deps curie-api curie-worker >/dev/null
     dispatcher="$(docker ps \
         --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
         --filter 'label=com.docker.compose.service=curie-dispatcher' \
         --format '{{.Names}}')"
     if [[ -n "$dispatcher" ]]; then
-        docker compose --profile slack -f "$REPO_ROOT/compose.dev.yaml" \
+        ladder_compose --profile slack \
             up -d --force-recreate --no-deps curie-dispatcher >/dev/null
     fi
     sleep 3
@@ -3958,7 +3968,7 @@ wait_product_collector_ready() {
 }
 
 restart_local_product_collector() {
-    docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+    ladder_compose --profile full \
         up -d --force-recreate --no-deps otel-collector >/dev/null || return 1
     wait_product_collector_ready
 }
@@ -3990,7 +4000,7 @@ case_local_langfuse_invalid_auth() {
         original_set=1
         original="$LANGFUSE_OTLP_AUTH_HEADER"
     fi
-    langfuse_web="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q langfuse-web)" || return 1
+    langfuse_web="$(ladder_compose --profile full ps -q langfuse-web)" || return 1
     [[ -n "$langfuse_web" ]] || {
         echo "pinned langfuse-web is not running for the real exporter negative" >&2
         return 1
@@ -4015,7 +4025,7 @@ case_local_langfuse_invalid_auth() {
             echo "Collector failed the Ready check after invalid-auth restart" >&2
             exit 1
         }
-        collector="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q otel-collector)" || exit 1
+        collector="$(ladder_compose --profile full ps -q otel-collector)" || exit 1
         [[ -n "$collector" ]] || exit 1
         accepted_baseline="$(product_collector_metric_value otelcol_receiver_accepted_spans)" || exit 1
         failed_baseline="$(product_collector_metric_value otelcol_exporter_send_failed_spans)" || exit 1

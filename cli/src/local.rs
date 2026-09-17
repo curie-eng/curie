@@ -89,6 +89,11 @@ impl LocalResources {
     }
 }
 
+/// Resolve isolation from the process environment, or the shared default stack.
+pub fn current_resources() -> Result<LocalResources> {
+    resolve_local_resources(None, Vec::new(), DEFAULT_COMPOSE_FILE.to_string(), false)
+}
+
 /// The Docker volume holding this tier's Ollama model cache: compose's
 /// `ollama_data` under the pinned `curie` project name that `up_command`
 /// injects as `COMPOSE_PROJECT_NAME`. Hardcoded to match the compose file, the
@@ -471,11 +476,16 @@ pub fn resolve_local_resources(
     }
     if build {
         let base = std::path::Path::new(&files[0]);
-        if base.file_name().and_then(|n| n.to_str()) != Some(DEFAULT_COMPOSE_FILE) {
+        let canonical = std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join(DEFAULT_COMPOSE_FILE))
+            .and_then(|path| path.canonicalize().ok());
+        let base_canonical = base.canonicalize().ok();
+        if canonical.is_none() || base_canonical != canonical {
             return Err(crate::exit::CliError::usage(
-                "--build isolation requires the candidate compose.dev.yaml as the first compose file",
+                "--build isolation requires this checkout's compose.dev.yaml as the first compose file",
             )
-            .with_fix("pass -f /abs/path/compose.dev.yaml -f /abs/path/override.yaml")
+            .with_fix("pass -f $PWD/compose.dev.yaml -f /abs/path/override.yaml")
             .into());
         }
     }
@@ -1399,24 +1409,24 @@ async fn build_source_images(o: &LocalOpts, reach: BuildReach) -> Result<()> {
          source; a release binary runs the published images and has nothing to build.",
     )?;
     let images = source_images(o);
+    let tag = o.resources.image_tag.as_str();
     ui.note(&format!(
-        "building {} image(s) from {} as :{SOURCE_IMAGE_TAG}",
+        "building {} image(s) from {} as :{tag}",
         images.len(),
         root.display()
     ));
     for image in &images {
-        let tag = source_image_ref(image.image);
-        crate::commands::build_image(image.dockerfile, &tag).await?;
+        let ref_ = image_ref(image.image, tag);
+        crate::commands::build_image(image.dockerfile, &ref_).await?;
     }
     match reach {
         BuildReach::Substitutes => ui.success(&format!(
-            "built {} image(s) as :{SOURCE_IMAGE_TAG}; the stack below runs them",
+            "built {} image(s) as :{tag}; the stack below runs them",
             images.len()
         )),
-        BuildReach::Unconfirmed => ui.success(&format!(
-            "built {} image(s) as :{SOURCE_IMAGE_TAG}",
-            images.len()
-        )),
+        BuildReach::Unconfirmed => {
+            ui.success(&format!("built {} image(s) as :{tag}", images.len()))
+        }
     }
     Ok(())
 }
@@ -1452,7 +1462,7 @@ pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput
         if !o.pull_model {
             docker::preflight_local_model(
                 crate::commands::DEFAULT_OLLAMA_IMAGE,
-                COMPOSE_OLLAMA_VOLUME,
+                &format!("{}_ollama_data", o.project()),
                 model,
                 &format!("curie local up --local-model {model} --pull-model"),
             )
@@ -1724,8 +1734,9 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
         let mut lines = vec![
             cmd.display(),
             format!(
-                "docker rm -f $(docker ps -a --filter label={} -q)",
-                docker::SANDBOX_LABEL
+                "docker rm -f $(docker ps -a --filter label={} --filter network={} -q)",
+                docker::SANDBOX_LABEL,
+                o.common.resources.docker_network
             ),
             format!(
                 "docker rm -f $(docker ps -a -q --filter label={} --filter label={})",
@@ -1770,7 +1781,11 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     for problem in docker::run_connector_teardown(&teardown).await {
         ui.warn(&problem);
     }
-    let report = docker::reap_labeled(docker::SANDBOX_LABEL).await;
+    let report = docker::reap_filtered(&[
+        ("label", docker::SANDBOX_LABEL),
+        ("network", o.common.resources.docker_network.as_str()),
+    ])
+    .await;
     if let Some(err) = report.error {
         // The stack stopped, but the runner reap did not complete cleanly. Fail
         // loudly rather than report success with orphaned containers still
@@ -2205,7 +2220,7 @@ mod tests {
 
         let comms = |disconnect: bool| crate::comms::LocalCommsOpts {
             project: COMPOSE_PROJECT.into(),
-            file: DEFAULT_COMPOSE_FILE.into(),
+            files: vec![DEFAULT_COMPOSE_FILE.into()],
             dry_run: false,
             app_token: if disconnect {
                 String::new()

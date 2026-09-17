@@ -3735,7 +3735,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 emit(
                     comms::local_comms(LocalCommsOpts {
                         project: model_opts.project().to_string(),
-                        file: model_opts.file().to_string(),
+                        files: model_opts.files().to_vec(),
                         dry_run,
                         app_token,
                         bot_token,

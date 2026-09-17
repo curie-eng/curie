@@ -1358,9 +1358,12 @@ fn coding_tool_seed_membership_gates_product_observability() {
 fn product_collector_restore_covers_every_emitter_and_invalid_auth_is_observable() {
     let pins = ladder_function("pin_local_source_images");
     for required in [
-        "export CURIE_BASE_TAG=dev",
-        "export CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:dev",
-        "export CURIE_DISPATCHER_IMAGE=ghcr.io/curie-eng/curie-dispatcher:dev",
+        "CURIE_LOCAL_IMAGE_TAG:-dev",
+        "export CURIE_BASE_TAG=",
+        "export CURIE_RUNNER_IMAGE=",
+        "export CURIE_DISPATCHER_IMAGE=",
+        "curie-runner:",
+        "curie-dispatcher:",
     ] {
         assert!(
             pins.contains(required),

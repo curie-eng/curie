@@ -1536,6 +1536,9 @@ pub fn compose_overlay(
     project: &str,
     plugin_dir: &Path,
 ) -> Result<serde_json::Value> {
+    let network = crate::local::current_resources()
+        .map(|resources| resources.docker_network)
+        .unwrap_or_else(|_| RUNNER_NETWORK.to_string());
     let mut services = serde_json::Map::new();
     for (connector, spec) in &decl.connectors {
         if !is_hosted(spec) {
@@ -1602,11 +1605,11 @@ pub fn compose_overlay(
         if !volumes.is_empty() {
             service.insert("volumes".into(), serde_json::Value::Array(volumes));
         }
+        let network = crate::local::current_resources()
+            .map(|resources| resources.docker_network)
+            .unwrap_or_else(|_| RUNNER_NETWORK.to_string());
         let mut attachment = serde_json::Map::new();
-        attachment.insert(
-            RUNNER_NETWORK.to_string(),
-            serde_json::json!({ "aliases": [alias] }),
-        );
+        attachment.insert(network.clone(), serde_json::json!({ "aliases": [alias] }));
         service.insert("networks".into(), serde_json::Value::Object(attachment));
         let mut labels = serde_json::Map::new();
         labels.insert(
@@ -1641,8 +1644,8 @@ pub fn compose_overlay(
 
     let mut networks = serde_json::Map::new();
     networks.insert(
-        RUNNER_NETWORK.to_string(),
-        serde_json::json!({ "external": true, "name": RUNNER_NETWORK }),
+        network.clone(),
+        serde_json::json!({ "external": true, "name": network }),
     );
     Ok(serde_json::json!({
         "services": services,

@@ -5,7 +5,7 @@
 use anyhow::{bail, Result};
 
 use crate::local::{fake_model_env_override, otel_endpoint_env_override, ModelMode};
-use crate::ops::{plain, require_on_path, run_step, secret_set, CommonOpts, OpsCommand};
+use crate::ops::{plain, require_on_path, run_step, secret_set, CmdArg, CommonOpts, OpsCommand};
 
 /// The worker's Slack stub sink URL (compose default); restored on disconnect.
 const LOCAL_SLACK_STUB_URL: &str = "http://localhost:8155/api/";
@@ -38,7 +38,7 @@ pub struct CommsOpts {
 
 pub struct LocalCommsOpts {
     pub project: String,
-    pub file: String,
+    pub files: Vec<String>,
     pub dry_run: bool,
     pub app_token: String,
     pub bot_token: String,
@@ -113,6 +113,19 @@ pub fn disconnect_commands(opts: &CommsOpts) -> Vec<OpsCommand> {
     )]
 }
 
+fn comms_compose_args(o: &LocalCommsOpts, profiles: &[&str], tail: &[&str]) -> Vec<CmdArg> {
+    let mut args = vec![plain("compose")];
+    for profile in profiles {
+        args.extend([plain("--profile"), plain(*profile)]);
+    }
+    args.extend([plain("-p"), plain(&o.project)]);
+    for file in &o.files {
+        args.extend([plain("-f"), plain(file)]);
+    }
+    args.extend(tail.iter().copied().map(plain));
+    args
+}
+
 pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
     let mut env = vec![("SLACK_API_BASE_URL".into(), String::new())];
     env.extend(fake_model_env_override(o.model_mode));
@@ -124,22 +137,11 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
     env.extend(o.stack_image_env.iter().cloned());
     vec![OpsCommand::new(
         "docker",
-        vec![
-            plain("compose"),
-            plain("--profile"),
-            plain("core"),
-            plain("--profile"),
-            plain("slack"),
-            plain("-p"),
-            plain(&o.project),
-            plain("-f"),
-            plain(&o.file),
-            plain("up"),
-            plain("-d"),
-            plain("--wait"),
-            plain("curie-worker"),
-            plain("curie-dispatcher"),
-        ],
+        comms_compose_args(
+            o,
+            &["core", "slack"],
+            &["up", "-d", "--wait", "curie-worker", "curie-dispatcher"],
+        ),
     )
     .with_env(env)
     .with_secret_env({
@@ -167,35 +169,11 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
     vec![
         OpsCommand::new(
             "docker",
-            vec![
-                plain("compose"),
-                plain("--profile"),
-                plain("core"),
-                plain("--profile"),
-                plain("slack"),
-                plain("-p"),
-                plain(&o.project),
-                plain("-f"),
-                plain(&o.file),
-                plain("stop"),
-                plain("curie-dispatcher"),
-            ],
+            comms_compose_args(o, &["core", "slack"], &["stop", "curie-dispatcher"]),
         ),
         OpsCommand::new(
             "docker",
-            vec![
-                plain("compose"),
-                plain("--profile"),
-                plain("core"),
-                plain("-p"),
-                plain(&o.project),
-                plain("-f"),
-                plain(&o.file),
-                plain("up"),
-                plain("-d"),
-                plain("--wait"),
-                plain("curie-worker"),
-            ],
+            comms_compose_args(o, &["core"], &["up", "-d", "--wait", "curie-worker"]),
         )
         .with_env(worker_env)
         .with_secret_env(o.model_credentials.clone()),
@@ -774,7 +752,7 @@ mod tests {
     fn local_comms_opts_with(disconnect: bool, mode: ModelMode, minimal: bool) -> LocalCommsOpts {
         LocalCommsOpts {
             project: crate::local::COMPOSE_PROJECT.into(),
-            file: "compose.dev.yaml".into(),
+            files: vec!["compose.dev.yaml".into()],
             dry_run: false,
             app_token: if disconnect {
                 String::new()
@@ -799,7 +777,7 @@ mod tests {
     fn local_connect_command_wires_dispatcher_and_unwires_stub() {
         let cmds = local_connect_commands(&LocalCommsOpts {
             project: crate::local::COMPOSE_PROJECT.into(),
-            file: "compose.dev.yaml".into(),
+            files: vec!["compose.dev.yaml".into()],
             dry_run: false,
             app_token: "xapp-1-secretsecret".into(),
             bot_token: "xoxb-1-secretsecret".into(),
