@@ -2344,6 +2344,128 @@ PY
     echo "connector fixture applied to $dir (connectors.yaml)"
 }
 
+# Bind every approval route that survived prepare_connector_bundle before the
+# local deploy precheck judges the manifest. An absent agent is created through
+# the same API the deploy uses. For an existing agent, the public approvals verb
+# performs the full map update so its validation and API preflight stay in the
+# path; only missing routes are added to the map it receives.
+bind_local_connector_approval_routes() {
+    local dir="$1"
+    local plugin="$dir/.claude-plugin/plugin.json"
+    local api_base="${CURIE_API_URL:-http://localhost:28000}"
+    local routes_file agent_name approval_status
+    routes_file="$(mktemp)"
+    if ! agent_name="$(python3 - "$plugin" "$api_base" "$routes_file" <<'PY'
+import json, os, sys, urllib.error, urllib.request
+from pathlib import Path
+
+plugin_path, api_base, routes_path = sys.argv[1:4]
+api_key = os.environ.get("CURIE_API_KEY") or "curie-dev-key"
+manifest = json.loads(Path(plugin_path).read_text())
+agent_name = manifest["name"]
+gates = manifest.get("approvalPolicy", dict()).get("gates", [])
+routes = sorted({gate["route"] for gate in gates})
+if not routes:
+    raise SystemExit(0)
+
+
+def request(method, path, payload=None):
+    data = None if payload is None else json.dumps(payload).encode()
+    headers = dict(Accept="application/json", **{"X-API-Key": api_key})
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        api_base.rstrip("/") + path,
+        data=data,
+        method=method,
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise SystemExit("%s %s failed with HTTP %s: %s" % (method, path, exc.code, detail))
+    except urllib.error.URLError as exc:
+        raise SystemExit("%s %s failed: %s" % (method, path, exc.reason))
+    return json.loads(raw) if raw else None
+
+
+agents = request("GET", "/agents")
+if not isinstance(agents, list):
+    raise SystemExit("GET /agents returned an unexpected response")
+agent = next((item for item in agents if item.get("name") == agent_name), None)
+new_binding = dict(resolution=dict(kind="slack", address="C0LOCALDEV"))
+if agent is None:
+    request(
+        "POST",
+        "/agents",
+        dict(
+            name=agent_name,
+            channel=dict(kind="slack", address="C0LOCALDEV"),
+            approval_routes=dict((route, new_binding) for route in routes),
+        ),
+    )
+    raise SystemExit(0)
+
+existing = agent.get("approval_routes") or dict()
+if not isinstance(existing, dict):
+    raise SystemExit("agent %s returned malformed approval_routes" % agent_name)
+missing = [route for route in routes if route not in existing]
+if not missing:
+    raise SystemExit(0)
+with_notification = sorted(
+    name
+    for name, binding in existing.items()
+    if isinstance(binding, dict) and binding.get("notification") is not None
+)
+if with_notification:
+    raise SystemExit(
+        "refusing to add approval route(s) %s on agent %s: existing route(s) %s "
+        "carry notification targets whose hidden transport the API response does not expose, "
+        "so a full route map write cannot preserve them. Re-run this connector ladder on a "
+        "fresh isolated stack instead of dropping notification policy."
+        % (", ".join(missing), agent_name, ", ".join(with_notification))
+    )
+merged = dict(existing)
+for route in missing:
+    merged[route] = new_binding
+Path(routes_path).write_text(json.dumps(merged, separators=(",", ":")) + "\n")
+print(agent_name)
+PY
+    )"; then
+        rm -f "$routes_file"
+        return 1
+    fi
+    if [[ -s "$routes_file" ]]; then
+        if "$BIN" --json local approvals "$agent_name" --routes-from "$routes_file"; then
+            approval_status=0
+        else
+            approval_status=$?
+        fi
+        rm -f "$routes_file"
+        return "$approval_status"
+    fi
+    rm -f "$routes_file"
+}
+
+# Command substitution is confined to the CLI invocation inside this helper.
+# Bash's dynamic scope assigns the captured payload to the caller's local
+# deploy_json, while the direct helper call preserves the CLI's status and lets
+# the enclosing EXIT trap observe it after the diagnostic is printed.
+capture_local_deploy() {
+    local dir="$1"
+    local captured deploy_status
+    if captured="$("$BIN" --json local deploy --plugin-dir "$dir")"; then
+        deploy_status=0
+    else
+        deploy_status=$?
+    fi
+    deploy_json="$captured"
+    printf '%s\n' "$deploy_json"
+    return "$deploy_status"
+}
+
 # Add the independently countable, read-only MCP receipt server to a scratch
 # bundle. It goes through the ordinary connector build/lock path; no in-sandbox
 # file can be evidence because the sandbox is destroyed with the turn.
@@ -4265,8 +4387,10 @@ rung_local() {
     echo
     echo "=== curie --json local deploy ==="
     # No --api-url: the default IS the cold-start path a real user hits, and
-    # exercising the default is the point. First create binds C0LOCALDEV, so the
-    # message below can resolve the sole deployed agent with no --channel.
+    # exercising the default is the point. In connector mode the route binding
+    # helper performs the first create and binds C0LOCALDEV; otherwise deploy
+    # performs that create and binding. The message below can therefore resolve
+    # the sole deployed agent with no --channel.
     #
     # --json for the receipt: `local status --json` carries no digest
     # (cli/schema/local-status.schema.json is only `services`), so the deploy
@@ -4274,8 +4398,10 @@ rung_local() {
     # rung uploaded -- is the ONLY surface that reports this tier's artifact
     # identity. Read from stdout only; the human text is on stderr.
     local deploy_json digest agent_id agent_name deployment_id
-    deploy_json="$("$BIN" --json local deploy --plugin-dir "$WORKDIR/bundle")"
-    printf '%s\n' "$deploy_json"
+    if connector_mode; then
+        bind_local_connector_approval_routes "$WORKDIR/bundle"
+    fi
+    capture_local_deploy "$WORKDIR/bundle"
     digest="$(deploy_field "local" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "local" "$deploy_json" agent.id)"
     agent_name="$(deploy_field "local" "$deploy_json" agent.name)"
@@ -4584,8 +4710,10 @@ rung_local_release() {
     # (their regular-file mtimes are normalized where they are created), so a
     # separate copy no longer means a separate identity.
     local deploy_json digest agent_id agent_name deployment_id
-    deploy_json="$("$BIN" --json local deploy --plugin-dir "$WORKDIR/bundle-release")"
-    printf '%s\n' "$deploy_json"
+    if connector_mode; then
+        bind_local_connector_approval_routes "$WORKDIR/bundle-release"
+    fi
+    capture_local_deploy "$WORKDIR/bundle-release"
     digest="$(deploy_field "local-release" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "local-release" "$deploy_json" agent.id)"
     agent_name="$(deploy_field "local-release" "$deploy_json" agent.name)"
