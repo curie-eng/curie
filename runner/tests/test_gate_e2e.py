@@ -29,7 +29,7 @@ from curie_runner.approval import (
     build_can_use_tool,
 )
 from curie_runner.config import RunnerConfig
-from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME, validate_bundle
 
 # A budget high enough that default_turn's 8 output tokens never trip the halt
 # (a halt would outrank a pending approval and mask the gate under test).
@@ -238,3 +238,73 @@ def test_managed_workspace_arms_mandatory_publish_on_fake_boot_path(tmp_path) ->
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
     assert gate is not None
     assert gate.required == frozenset({PLATFORM_PUBLISH_TOOL_NAME})
+
+
+def _publication_bundle(tmp_path, gates: list[dict[str, str]]) -> str:
+    manifest: dict[str, object] = {"name": "publisher"}
+    if gates:
+        manifest["approvalPolicy"] = {"gates": gates}
+    return _write_manifest(tmp_path / "plugin", manifest)
+
+
+def _block_publication_on_boot_path(tmp_path, plugin_dir: str):
+    workspace = tmp_path / "workspace"
+    (workspace / ".git").mkdir(parents=True)
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)),
+        fake_model=True,
+        workspace_path=workspace,
+    )
+    gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
+    assert gate is not None
+    hook = build_approval_hook(gate)["PreToolUse"][0].hooks[0]
+
+    async def go() -> None:
+        result = await hook(
+            {
+                "tool_name": PLATFORM_PUBLISH_TOOL_NAME,
+                "tool_input": {"title": "Fix the README", "body": ""},
+            },
+            None,
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    anyio.run(go)
+    assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
+    return gate
+
+
+def test_declared_publication_gate_route_reaches_the_blocked_publication(
+    tmp_path,
+) -> None:
+    """#2719: a bundle that declares the publication gate with a route must
+    validate and carry that route onto the blocked publication. Before #2776 the
+    validator refused ``mcp__curie__publish_changes`` so no bundle could bind a
+    route and #2705 was inert. The worker then passes ``pending_route`` as
+    ``PublicationCreateRequest.route`` (pinned in the worker approval lifecycle
+    suite) and the API stores it on the approval (test_publication_operator_route).
+    """
+
+    plugin_dir = _publication_bundle(
+        tmp_path,
+        [{"gate": PLATFORM_PUBLISH_TOOL_NAME, "route": "publish-approvers"}],
+    )
+    validation = validate_bundle(plugin_dir)
+    assert validation.valid, validation.errors
+
+    gate = _block_publication_on_boot_path(tmp_path, plugin_dir)
+    assert gate.pending_route == "publish-approvers"
+
+
+def test_undeclared_publication_gate_leaves_the_publication_route_empty(
+    tmp_path,
+) -> None:
+    """Missing-route control: with no declared gate the publication still blocks
+    but carries no route, which the API refuses to an operator principal."""
+
+    plugin_dir = _publication_bundle(tmp_path, [])
+    assert validate_bundle(plugin_dir).valid
+
+    gate = _block_publication_on_boot_path(tmp_path, plugin_dir)
+    assert gate.pending_route is None
