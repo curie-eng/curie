@@ -5758,7 +5758,6 @@ def test_stream_timeout_classifies_as_runner_timeout_with_a_named_reason(
     async def go() -> None:
         async with make_harness(runner_total_timeout_s=0.5) as h:
             hold = asyncio.Event()  # never set: the response hangs open
-            h.runner.timeout_status = 200
             h.runner.hold = hold
             h.runner.default_script = [SideEffectFlag(tool="deploy")]
             released: list[bool] = []
@@ -5812,7 +5811,6 @@ def test_stream_timeout_after_a_side_effect_escalates_without_retry(make_harness
     async def go() -> None:
         async with make_harness(runner_total_timeout_s=0.5, max_attempts=3) as h:
             hold = asyncio.Event()
-            h.runner.timeout_status = 200
             h.runner.hold = hold
             h.runner.default_script = [SideEffectFlag(tool="deploy")]
             ev = _qevent("do it", thread="tTimeoutSideEffect")
@@ -5832,27 +5830,47 @@ def test_stream_timeout_after_a_side_effect_escalates_without_retry(make_harness
 
 
 @pytest.mark.parametrize(
-    "timeout_status",
-    [None, 409],
-    ids=["missing-epoch", "conflict"],
+    ("timeout_status", "timeout_delay_seconds", "expected_timeout_calls"),
+    [
+        (None, 0.0, 0),
+        (409, 0.0, 1),
+        # The runner owns the request on handler entry, then blocks longer than
+        # the worker's five second control budget before it can return HTTP 200.
+        (200, 6.0, 1),
+    ],
+    ids=["missing-epoch", "conflict", "handler-entry-before-control-timeout"],
 )
 def test_unconfirmed_stream_timeout_never_retries_and_settles_once(
     make_harness,
     timeout_status: int | None,
+    timeout_delay_seconds: float,
+    expected_timeout_calls: int,
 ) -> None:
     async def go() -> None:
         async with make_harness(runner_total_timeout_s=0.2, max_attempts=3) as h:
             hold = asyncio.Event()
             h.runner.timeout_status = timeout_status
+            h.runner.timeout_delay_seconds = timeout_delay_seconds
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="partial")]
             event = _qevent("go", thread="tTimeoutUnconfirmed")
+            processing = asyncio.create_task(h.kernel.process_event(event))
             try:
-                await h.kernel.process_event(event)
+                if timeout_delay_seconds:
+                    await asyncio.wait_for(
+                        h.runner.timeout_handler_entered.wait(), timeout=1.0
+                    )
+                    assert not processing.done()
+                await processing
             finally:
                 hold.set()
+                if not processing.done():
+                    processing.cancel()
+                    await asyncio.gather(processing, return_exceptions=True)
 
             assert h.runner.opened == ["go"]
+            assert h.runner.steers == []
+            assert h.runner.timeout_calls == expected_timeout_calls
             assert h.sink.last_text is not None
             assert "(runner-timeout-unconfirmed)" in h.sink.last_text
             assert "(unclassified)" not in h.sink.last_text
@@ -5991,7 +6009,6 @@ def test_buffered_runner_eof_does_not_release_action_recording_from_turn_deadlin
                 runner_total_timeout_s=0.5,
                 max_attempts=3,
             ) as h:
-                h.runner.timeout_status = 200
                 h.runner.default_script = [
                     SideEffectFlag(
                         tool="deploy",
@@ -6064,7 +6081,6 @@ def test_stream_timeout_without_a_side_effect_still_retries(make_harness, monkey
             retry_backoff_max_s=0.6,
         ) as h:
             hold = asyncio.Event()
-            h.runner.timeout_status = 200
             h.runner.hold = hold
             h.runner.turn_scripts = [
                 [TextDelta(text="partial")],

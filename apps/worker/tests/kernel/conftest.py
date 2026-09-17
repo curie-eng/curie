@@ -512,12 +512,15 @@ class FakeRunner:
         self.accept: asyncio.Event | None = None  # gate after opened, before prepare
         self.tail: list[OutboundEvent] = []
         self.event_fail_times: int = 0  # return 500 on the next N /v1/event calls
-        # None omits the turn epoch and therefore exercises the client's
-        # constructed unconfirmed timeout result. A concrete status exposes an
-        # epoch and controls the causal /v1/timeout response.
-        self.timeout_status: int | None = None
+        # Match the real runner: every accepted turn carries an epoch and its
+        # timeout callback succeeds. Tests for an older or malformed runner opt
+        # into the missing epoch shape explicitly with None.
+        self.timeout_status: int | None = 200
         self.timeout_delay_seconds = 0.0
         self.timeout_calls = 0
+        # Handler entry means the runner has received the callback. It is not
+        # causal confirmation to the worker until the HTTP 200 reaches it.
+        self.timeout_handler_entered = asyncio.Event()
         # Per-route captured request headers (the ACI auth Bearer check reads
         # these): the most recent request's headers for each route, so a test can
         # assert the worker delivered its per-sandbox token as Authorization.
@@ -604,6 +607,7 @@ class FakeRunner:
     async def _timeout(self, request: web.Request) -> web.Response:
         self.timeout_headers.append(dict(request.headers))
         self.timeout_calls += 1
+        self.timeout_handler_entered.set()
         if self.timeout_delay_seconds:
             await asyncio.sleep(self.timeout_delay_seconds)
         status = self.timeout_status if self.timeout_status is not None else 404
