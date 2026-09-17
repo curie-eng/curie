@@ -19,7 +19,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 
 import httpx
@@ -511,12 +511,139 @@ def review_rows(statement: str, parameters: dict | None = None) -> list[dict]:
     return asyncio.run(execute())
 
 
+class _TestClientTransport(httpx.AsyncBaseTransport):
+    """Carry the worker's real HTTP client into the in-process API app."""
+
+    def __init__(self, client: TestClient) -> None:
+        self._client = client
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        body = await request.aread()
+        response = await asyncio.to_thread(
+            self._client.request,
+            request.method,
+            request.url.raw_path.decode(),
+            content=body,
+            headers=dict(request.headers),
+        )
+        return httpx.Response(
+            response.status_code, headers=response.headers, content=response.content
+        )
+
+
+def publish_through_worker(
+    client: TestClient, *, pr_number: int, head_sha: str = HEAD, pr_repo: str = REPO
+) -> dict:
+    """Drive the production worker success path for the one approved publication.
+
+    The real Postgres store, reconciler and API lineage client execute; only the
+    Kubernetes Job, write credential, GitHub branch lookup and reply transport
+    are the worker suite's fixtures. The Job reports these exact PR markers.
+    """
+    from curie_worker.publication_clients import PublicationLineageClient
+    from curie_worker.publication_k8s import PublicationJobSettings
+    from curie_worker.publication_loop import PublicationJobObservation, PublicationReconciler
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    from apps.worker.tests.test_publication_loop import (
+        _Cluster,
+        _Credentials,
+        _GitHub,
+        _Replies,
+    )
+
+    pr_url = f"https://github.com/{pr_repo}/pull/{pr_number}"
+
+    async def run() -> dict:
+        import curie_worker.publication_loop as module
+
+        engine = create_async_engine(get_settings().database_url)
+        api = httpx.AsyncClient(transport=_TestClientTransport(client), base_url="http://api")
+        try:
+            store = PostgresPublicationStore(
+                engine, schema="curie", lease_owner=f"review-producer-{uuid.uuid4().hex}"
+            )
+            card = await store.claim_pending_card()
+            if card is not None:
+                await store.mark_card_delivered(card.publication_id)
+            work = await store.claim_next()
+            assert work is not None
+            cluster = _Cluster(module)
+            cluster.observation = PublicationJobObservation(
+                phase="succeeded",
+                pr_url=pr_url,
+                pr_number=pr_number,
+                commit_sha=head_sha,
+                logs="",
+            )
+            reconciler = PublicationReconciler(
+                store=store,
+                credentials=_Credentials(module),
+                cluster=cluster,
+                github=_GitHub(),
+                replies=_Replies(),
+                lineage=PublicationLineageClient(
+                    api_base_url="http://api",
+                    worker_token="fixture-review-worker-token",
+                    client=api,
+                ),
+                job_settings=PublicationJobSettings(
+                    namespace="curie",
+                    runner_image="curie-runner",
+                    image_pull_policy="IfNotPresent",
+                    image_pull_secrets=(),
+                    priority_class_name="curie-platform-critical",
+                    service_account_name="curie-publication",
+                    owner_name="curie-publication-owner",
+                    git_user_name="Curie Publisher",
+                    git_user_email="publisher@example.com",
+                    cpu_request="100m",
+                    cpu_limit="1",
+                    memory_request="256Mi",
+                    memory_limit="1Gi",
+                    ephemeral_request="1Gi",
+                    ephemeral_limit="4Gi",
+                ),
+            )
+            await reconciler.reconcile(work)
+            return {"publication_id": str(work.publication_id)}
+        finally:
+            await api.aclose()
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
 @pytest.fixture
 def review_stack(
     clean_db: None,
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
     review_app_key: str,
+) -> Iterator[tuple[TestClient, GitHubTruth, object, str]]:
+    with _review_stack(request, monkeypatch, review_app_key, publish=True) as stack:
+        yield stack
+
+
+@pytest.fixture
+def approved_review_producer(
+    clean_db: None,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    review_app_key: str,
+) -> Iterator[tuple[TestClient, GitHubTruth, object, str]]:
+    """The same producer stopped after approval, before the worker publishes."""
+    with _review_stack(request, monkeypatch, review_app_key, publish=False) as stack:
+        yield stack
+
+
+@contextmanager
+def _review_stack(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    review_app_key: str,
+    *,
+    publish: bool,
 ) -> Iterator[tuple[TestClient, GitHubTruth, object, str]]:
     """Real migrated Postgres/Valkey/API, with only GitHub HTTP replaced.
 
@@ -650,19 +777,10 @@ def review_stack(
             headers={**auth, "X-Curie-Approval-Principal": principal},
         )
         assert resolved.status_code == 200, resolved.text
-        advanced = client.patch(
-            f"/v1/internal/publications/{publication.json()['id']}/lineage",
-            headers={"X-Curie-Worker-Token": "fixture-review-worker-token"},
-            json={
-                "expected_version": 1,
-                "expected_head_sha": None,
-                "state": "open",
-                "pr_number": 17,
-                "pr_url": f"https://github.com/{REPO}/pull/17",
-                "head_sha": HEAD,
-            },
-        )
-        assert advanced.status_code == 200, advanced.text
+        if not publish:
+            yield client, truth, valkey, stream
+            return
+        publish_through_worker(client, pr_number=17)
         review_rows(
             "UPDATE curie.publications SET outcome_history_ready_at=now(), "
             "result_reported_at=now(), terminal_at=now() WHERE id=:id",
@@ -747,6 +865,76 @@ def test_real_ingress_persists_and_enqueues_exactly_one_honest_bound_turn(review
     assert "fixture-app-token" not in entries[0][1]["payload"]
     rows = review_rows("SELECT status, stream_id, version FROM curie.github_review_feedback")
     assert rows == [{"status": "queued", "stream_id": entries[0][0], "version": 2}]
+
+
+def test_worker_publication_success_stamps_verified_identity_on_the_lineage(
+    approved_review_producer,
+) -> None:
+    client, truth, valkey, stream = approved_review_producer
+    publish_through_worker(client, pr_number=17)
+    assert review_rows(
+        "SELECT l.pr_number, l.head_sha, l.github_repository_id, l.github_installation_id, "
+        "l.github_pr_node_id, l.base_ref, p.status, p.lease_owner "
+        "FROM curie.thread_publication_lineages l "
+        "JOIN curie.publications p ON p.lineage_id = l.id"
+    ) == [{
+        "pr_number": 17,
+        "head_sha": HEAD,
+        "github_repository_id": 21,
+        "github_installation_id": 11,
+        "github_pr_node_id": "PR_example_17",
+        "base_ref": "main",
+        "status": "succeeded",
+        "lease_owner": None,
+    }]
+
+
+def test_worker_publication_accepts_github_canonical_repository_casing(
+    approved_review_producer,
+) -> None:
+    client, truth, valkey, stream = approved_review_producer
+    # GitHub may return the canonical owner/name spelling for a repository the
+    # operator configured in lowercase; repository names are case-insensitive.
+    publish_through_worker(client, pr_number=17, pr_repo="Acme-Corp/Acme-Bot")
+    assert review_rows(
+        "SELECT l.pr_number, l.github_repository_id, p.status "
+        "FROM curie.thread_publication_lineages l "
+        "JOIN curie.publications p ON p.lineage_id = l.id"
+    ) == [{"pr_number": 17, "github_repository_id": 21, "status": "succeeded"}]
+
+
+def test_worker_publication_with_mismatched_github_identity_is_refused(
+    approved_review_producer,
+) -> None:
+    client, truth, valkey, stream = approved_review_producer
+    truth.repo["id"] = 22  # GitHub's repository no longer matches the PR's base repo.
+    publish_through_worker(client, pr_number=17)
+    assert review_rows(
+        "SELECT l.pr_number, l.head_sha, l.github_repository_id, l.github_installation_id, "
+        "l.github_pr_node_id, l.base_ref, p.status, p.reconcile_attempts, p.error "
+        "FROM curie.thread_publication_lineages l "
+        "JOIN curie.publications p ON p.lineage_id = l.id"
+    ) == [{
+        "pr_number": None,
+        "head_sha": None,
+        "github_repository_id": None,
+        "github_installation_id": None,
+        "github_pr_node_id": None,
+        "base_ref": None,
+        "status": "launching",
+        "reconcile_attempts": 1,
+        "error": (
+            "publication lineage advance was refused: "
+            '{"detail":{"code":"publication.lineage_stale",'
+            '"message":"current GitHub publication identity was refused"}}'
+        ),
+    }]
+    valkey.delete(stream)
+    truth.repo["id"] = 21
+    response = post_review(client, truth)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] != "feedback_queued"
+    assert valkey.xlen(stream) == 0
 
 
 def test_invalid_hmac_cannot_read_github_persist_or_enqueue(review_stack) -> None:

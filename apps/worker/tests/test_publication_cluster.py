@@ -14,7 +14,7 @@ from urllib.parse import quote
 import httpx
 import pytest
 from channel_protocol.reply import ReplyAck
-from curie_worker.publication_clients import GitHubPublicationLookup
+from curie_worker.publication_clients import GitHubPublicationLookup, PublicationLineageClient
 from curie_worker.publication_k8s import (
     KubernetesPublicationCluster,
     PublicationJobSettings,
@@ -411,6 +411,12 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
                     api_base_url=_required("CURIE_PUBLICATION_FIXTURE_API"),
                 ),
                 replies=replies,
+                # This Job fails before any success marker, so the API is never called.
+                lineage=PublicationLineageClient(
+                    api_base_url="http://curie-api.invalid",
+                    worker_token="fixture-worker-token",
+                    client=client,
+                ),
                 transcript=transcript,
                 job_settings=_settings(),
             )

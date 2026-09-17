@@ -78,7 +78,6 @@ class _Store:
         self.cleanup_claimed: set[uuid.UUID] = set()
         self.cleanup_completed: set[uuid.UUID] = set()
         self.cleanup_retries: list[tuple[uuid.UUID, str]] = []
-        self.lineage_advances: list[dict[str, Any]] = []
         self.lineage_terminals: list[dict[str, Any]] = []
         self.history_ready: set[uuid.UUID] = set()
 
@@ -163,7 +162,6 @@ class _Store:
         outcome: str,
         pr_url: str | None,
         error: str | None,
-        **lineage: Any,
     ) -> None:
         self.completed[publication_id] = (outcome, pr_url)
         if outcome == "failed" and error is not None:
@@ -177,8 +175,6 @@ class _Store:
         }
         if outcome in {"published", "failed"}:
             self.cleanup_pending.add(publication_id)
-        if lineage:
-            self.lineage_advances.append(dict(lineage))
 
     def mark_result_delivered(self, publication_id: uuid.UUID) -> None:
         self.delivered.add(publication_id)
@@ -227,6 +223,17 @@ class _Store:
 
     async def claim_next(self) -> None:
         return None
+
+
+class _Lineage:
+    def __init__(self) -> None:
+        self.advances: list[dict[str, Any]] = []
+        self.error: Exception | None = None
+
+    def advance(self, publication_id: uuid.UUID, **advance: Any) -> None:
+        if self.error is not None:
+            raise self.error
+        self.advances.append({"publication_id": publication_id, **advance})
 
 
 class _Credentials:
@@ -568,6 +575,7 @@ def _work(module: Any, *, decision: str = "approved", kind: str = "slack") -> An
             adapter=None if kind == "slack" else "agentmail-sandbox",
         ),
         version=1,
+        lease_owner="publication-loop-test",
     )
 
 
@@ -604,6 +612,7 @@ def _lineage_work(
         target=_target(),
         route=TargetRoute(endpoint=None, adapter=None),
         version=1,
+        lease_owner="publication-loop-test",
     )
 
 
@@ -642,6 +651,7 @@ def _loop(
     loop = module.PublicationReconciler(
         store=store,
         credentials=credentials,
+        lineage=_Lineage(),
         cluster=cluster,
         github=github,
         replies=replies,
@@ -954,7 +964,7 @@ async def test_two_approved_revisions_keep_one_lineage_branch_and_pull_number(
         str(REVISION_ID),
         str(second_revision_id),
     ]
-    assert [advance["new_head"] for advance in store.lineage_advances] == [
+    assert [advance["head_sha"] for advance in loop._lineage.advances] == [
         REVISION_HEAD,
         second_head,
     ]
@@ -1023,7 +1033,7 @@ async def test_foreign_remote_head_is_never_adopted_as_the_approved_revision(
     ]
     assert cluster.applied == []
     assert store.completed == {}
-    assert store.lineage_advances == []
+    assert loop._lineage.advances == []
     assert replies.events == []
     assert store.retries == [
         (PUBLICATION_ID, "pull request head no longer matches the stored lineage head")
@@ -1161,8 +1171,8 @@ async def test_ttl_deleted_first_revision_job_recovers_exact_marked_commit_and_p
         "Bearer rotated-installation-token-2",
     ]
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
-    assert store.lineage_advances[0]["pr_number"] == 123
-    assert store.lineage_advances[0]["new_head"] == REVISION_HEAD
+    assert loop._lineage.advances[0]["pr_number"] == 123
+    assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
     assert len(replies.events) == 1
 
 
@@ -1185,7 +1195,7 @@ async def test_first_revision_recovery_refuses_pr_head_replaced_after_commit_pro
     ]
     assert cluster.applied == []
     assert store.completed == {}
-    assert store.lineage_advances == []
+    assert loop._lineage.advances == []
     assert store.retries == [
         (
             PUBLICATION_ID,
@@ -1230,7 +1240,7 @@ async def test_first_revision_recovery_persists_terminal_pull_without_repost(
     ]
     assert cluster.applied == []
     assert store.completed == {}
-    assert store.lineage_advances == []
+    assert loop._lineage.advances == []
     assert replies.events == []
 
 
@@ -1269,8 +1279,38 @@ async def test_stored_terminal_pull_never_adopts_a_foreign_replacement_head(
     ]
     assert cluster.applied == []
     assert store.completed == {}
-    assert store.lineage_advances == []
+    assert loop._lineage.advances == []
     assert replies.events == []
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    ["refused", "unavailable"],
+)
+async def test_existing_pr_recovery_charges_lineage_advance_failures_to_bounded_retry(
+    publication: Any,
+    refusal: str,
+) -> None:
+    loop, store, _, cluster, github, replies = _loop(publication)
+    github.head_sha = REVISION_HEAD
+    github.allow_exact_revision(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
+    loop._lineage.error = (
+        publication.PublicationLineageRefused("publication lineage advance was refused")
+        if refusal == "refused"
+        else PublicationReconcileError("publication lineage advance returned HTTP 503")
+    )
+    store.retry_terminal_after = 2
+    work = _lineage_work(publication)
+
+    await loop.reconcile(work)
+    assert len(store.retries) == 1
+    assert store.completed == {}
+
+    await loop.reconcile(work)
+    assert len(store.retries) == 2
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert loop._lineage.advances == []
+    assert cluster.applied == []
 
 
 async def test_stored_terminal_pull_accepts_an_exact_verified_revision_head(
@@ -1299,7 +1339,7 @@ async def test_stored_terminal_pull_accepts_an_exact_verified_revision_head(
     ]
     assert cluster.applied == []
     assert store.completed == {}
-    assert store.lineage_advances == []
+    assert loop._lineage.advances == []
     assert replies.events == []
 
 
@@ -1349,7 +1389,7 @@ async def test_terminal_first_pr_job_marker_persists_lineage_without_recovery(
     ]
     assert cluster.applied == []
     assert store.completed == {}
-    assert store.lineage_advances == []
+    assert loop._lineage.advances == []
     assert replies.events == []
 
 
@@ -1379,7 +1419,7 @@ async def test_terminal_job_state_without_exact_facts_cannot_close_lineage(
     assert credentials.calls == []
     assert github.recover_calls == []
     assert store.completed == {}
-    assert store.lineage_advances == []
+    assert loop._lineage.advances == []
     assert replies.events == []
 
 
@@ -1485,7 +1525,7 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
         assert credentials.calls == []
         assert github.recover_calls == []
         assert store.completed == {}
-        assert store.lineage_advances == []
+        assert loop._lineage.advances == []
         assert replies.events == []
 
         for conflict_state, conflict_head in (
@@ -1561,7 +1601,7 @@ async def test_missing_job_never_overwrites_an_unmarked_lineage_branch_head(
     assert github.recover_calls == []
     assert cluster.applied == []
     assert store.completed == {}
-    assert store.lineage_advances == []
+    assert loop._lineage.advances == []
     assert store.retries == [
         (
             PUBLICATION_ID,
@@ -1592,7 +1632,7 @@ async def test_exact_marked_remote_revision_is_adopted_before_recreating_a_missi
     ]
     assert cluster.applied == [], "remote adoption must happen before a replacement Job"
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
-    assert store.lineage_advances[0]["new_head"] == REVISION_HEAD
+    assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
     assert PR_URL in replies.events[0][0].text
 
 

@@ -12,6 +12,7 @@ import httpx
 
 from .publication_loop import (
     PublicationCredential,
+    PublicationLineageRefused,
     PublicationPullState,
     PublicationReconcileError,
     PublicationTranscriptPermanentError,
@@ -180,6 +181,64 @@ class PublicationCredentialClient:
             clean_clone_url=clone_url,
             authorization_header=authorization,
         )
+
+
+class PublicationLineageClient:
+    """Ask the API to verify GitHub identity and advance a published lineage."""
+
+    def __init__(
+        self,
+        *,
+        api_base_url: str,
+        worker_token: str,
+        client: httpx.AsyncClient,
+    ) -> None:
+        if not worker_token:
+            raise ValueError("publication lineage requires internal worker auth")
+        self._base = api_base_url.rstrip("/")
+        self._headers = {"X-Curie-Worker-Token": worker_token}
+        self._client = client
+
+    async def advance(
+        self,
+        publication_id: uuid.UUID,
+        *,
+        expected_version: int,
+        expected_head_sha: str | None,
+        expected_publication_version: int,
+        lease_owner: str,
+        pr_number: int,
+        pr_url: str,
+        head_sha: str,
+    ) -> None:
+        try:
+            response = await self._client.patch(
+                f"{self._base}/v1/internal/publications/{publication_id}/lineage",
+                headers=self._headers,
+                json={
+                    "expected_version": expected_version,
+                    "expected_head_sha": expected_head_sha,
+                    "expected_publication_version": expected_publication_version,
+                    "lease_owner": lease_owner,
+                    "state": "open",
+                    "pr_number": pr_number,
+                    "pr_url": pr_url,
+                    "head_sha": head_sha,
+                },
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise PublicationReconcileError(
+                "publication lineage endpoint is unreachable"
+            ) from exc
+        if response.status_code == 409:
+            raise PublicationLineageRefused(
+                f"publication lineage advance was refused: {response.text[:500]}"
+            )
+        if response.status_code != 200:
+            raise PublicationReconcileError(
+                f"publication lineage advance returned HTTP {response.status_code}"
+            )
 
 
 class GitHubPublicationLookup:
