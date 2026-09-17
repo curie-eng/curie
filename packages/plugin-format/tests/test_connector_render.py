@@ -44,6 +44,52 @@ def _objs(
     )
 
 
+def test_shipped_sre_bot_connector_names_and_secret_refs_match_renderer() -> None:
+    root = Path(__file__).resolve().parents[3]
+    bundle = root / "examples" / "sre-bot"
+    connectors_data = yaml.safe_load((bundle / "connectors.yaml").read_text(encoding="utf-8"))
+    values = yaml.safe_load(
+        (bundle / "observability" / "curie-values.yaml").read_text(encoding="utf-8")
+    )
+    parsed, errors = validate_connectors(connectors_data)
+    assert errors == []
+    assert parsed is not None
+
+    connector_names = ("grafana", "tempo")
+    grafana_values = values["grafanaConnector"]
+    expected_names = {r.object_name("curie", "sre-bot", name) for name in connector_names}
+    assert set(grafana_values["restartDeploymentNames"]) == expected_names
+
+    for name in connector_names:
+        spec = parsed.connectors[name]
+        expected_name = r.object_name("curie", "sre-bot", name)
+        secret_refs = [item for item in spec.secrets if isinstance(item, SecretRef)]
+        assert len(secret_refs) == 1
+        secret_ref = secret_refs[0]
+        assert secret_ref.from_secret == grafana_values["secretName"]
+        assert secret_ref.secret_key() == grafana_values["secretKey"]
+
+        deployment = r.render_deployment(
+            "curie",
+            "sre-bot",
+            "curie",
+            name,
+            spec.model_copy(update={"image": "example.invalid/mcp:unit"}),
+            grafana_values["secretName"],
+        )
+        assert deployment["metadata"]["name"] == expected_name
+        entry = next(
+            item
+            for item in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+            if item["name"] == grafana_values["secretKey"]
+        )
+        assert entry["valueFrom"]["secretKeyRef"] == {
+            "name": grafana_values["secretName"],
+            "key": grafana_values["secretKey"],
+            "optional": False,
+        }
+
+
 # Two NetworkPolicies ship per connector now, so selecting "the NetworkPolicy"
 # by kind picks whichever happens to be first and silently tests the wrong
 # object. Select by direction.
