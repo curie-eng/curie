@@ -105,9 +105,10 @@ s07 setup interrupt-resume:checkpoint+migrate
 s08 setup interrupt-resume:apply+commit
 s09 setup n-to-n1 compatible-rollback
 s10 setup rollback-published-088
-s11 nosetup rollback-published-089 migration-crash
-s12 setup converge-negative
-s13 setup previous-serves"
+s11 nosetup rollback-published-089
+s12 nosetup migration-crash
+s13 setup converge-negative
+s14 setup previous-serves"
 SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
 
 log() { printf '%s\n' "$*" >&2; }
@@ -445,6 +446,20 @@ run_self_test() {
         log "self-test: rollback-published-089 must run the compatible rollback proof"
         failed=1
     fi
+    if awk '/^run_migration_crash\(\)/,/^}/' "$script_path" | awk '
+        /interrupt_schema_migrate$/ { interrupt=NR }
+        /SECONDS \+ 120/ { if (interrupt) bound=NR }
+        /terminate_tree "\$pid"/ { if (bound) kill=NR }
+        /recover_killed_upgrade_ownership/ { if (kill) owner=NR }
+        /recover_helm_lock/ { if (owner) lock=NR }
+        /migration-crash-retry/ { if (lock) retry=NR }
+        END { exit retry ? 0 : 1 }
+    '; then
+        log "migration-crash bounds the interrupted upgrade wait"
+    else
+        log "self-test: migration-crash must wait at most 120s for the interrupted upgrade, then terminate it and recover ownership and the helm lock before retrying"
+        failed=1
+    fi
     if shard_manifest check "$SHARDS"; then
         log "shard manifest covers every scenario exactly once"
     else
@@ -455,7 +470,7 @@ run_self_test() {
     for label in "dropped scenario" "duplicated scenario" "dropped phase" "duplicated phase"; do
         case "$label" in
             "dropped scenario") mutated="${SHARDS_CANONICAL/ migration-crash/}" ;;
-            "duplicated scenario") mutated="${SHARDS_CANONICAL/s11 nosetup rollback-published-089/s11 nosetup rollback-published-089 fresh-n}" ;;
+            "duplicated scenario") mutated="${SHARDS_CANONICAL/s12 nosetup migration-crash/s12 nosetup migration-crash fresh-n}" ;;
             "dropped phase") mutated="${SHARDS_CANONICAL/interrupt-resume:checkpoint+migrate/interrupt-resume:checkpoint}" ;;
             "duplicated phase") mutated="${SHARDS_CANONICAL/fail-every-phase:converge/fail-every-phase:converge+plan}" ;;
         esac
@@ -1510,7 +1525,29 @@ run_migration_crash() {
         kubectl_ns get jobs,pods -o wide >"$EVIDENCE_DIR/migration-crash-timeout.txt" 2>&1 || true
         die "schema-migrate Job was not observed running; refusing a no-op retry as crash proof"
     fi
-    wait "$pid" || status=$?
+    # helm blocks ~900s on the deleted hook Job. Give the interrupted upgrade
+    # 120s to fail on its own, then kill it and recover what the kill leaves.
+    local exit_deadline=$((SECONDS + 120))
+    while (( SECONDS < exit_deadline )) && kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        terminate_tree "$pid"
+        local kill_deadline=$((SECONDS + 30))
+        while (( SECONDS < kill_deadline )) && kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" || status=$?
+        log "first migration-crash upgrade terminated after 120s (exit $status); recovering ownership and helm lock"
+        recover_killed_upgrade_ownership
+        recover_helm_lock
+    else
+        wait "$pid" || status=$?
+        log "first migration-crash upgrade exited on its own with $status"
+    fi
     log "first migration-crash upgrade exited $status; retrying"
     set +e
     cluster_upgrade "0.9.0" "$CHART_090" --forward-only

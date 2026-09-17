@@ -2751,61 +2751,28 @@ jobs:
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
-      - name: Build the candidate api image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      # One parallel bake of all five candidate images (#2733); the serial
+      # builds cost ~3m15s per shard. Tags, Dockerfiles and gha cache scopes
+      # match the previous per-image build steps.
+      - name: Write the candidate image bake definition
+        run: |
+          cat > "$RUNNER_TEMP/matrix-bake.json" <<'EOF'
+          {"group": {"default": {"targets": ["api", "dispatcher", "worker", "ui", "runner"]}},
+          "target": {
+            "api": {"context": ".", "dockerfile": "apps/api/Dockerfile", "tags": ["curie-api:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-api"], "cache-to": ["type=gha,mode=max,scope=ladder-api"]},
+            "dispatcher": {"context": ".", "dockerfile": "apps/dispatcher/Dockerfile", "tags": ["curie-dispatcher:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-dispatcher"], "cache-to": ["type=gha,mode=max,scope=ladder-dispatcher"]},
+            "worker": {"context": ".", "dockerfile": "apps/worker/Dockerfile", "tags": ["curie-worker:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-worker"], "cache-to": ["type=gha,mode=max,scope=ladder-worker"]},
+            "ui": {"context": ".", "dockerfile": "apps/ui/Dockerfile", "tags": ["curie-ui:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-ui"], "cache-to": ["type=gha,mode=max,scope=ladder-ui"]},
+            "runner": {"context": ".", "dockerfile": "runner/Dockerfile", "tags": ["curie-runner:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-runner"], "cache-to": ["type=gha,mode=max,scope=ladder-runner"]}
+          }}
+          EOF
+      - name: Build the candidate images locally in parallel
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
         with:
-          context: .
-          file: apps/api/Dockerfile
           builder: ${{ steps.matrixcache.outputs.name }}
-          tags: curie-api:matrix-candidate
+          files: ${{ runner.temp }}/matrix-bake.json
           push: false
           load: true
-          cache-from: type=gha,scope=ladder-api
-          cache-to: type=gha,mode=max,scope=ladder-api
-      - name: Build the candidate dispatcher image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: apps/dispatcher/Dockerfile
-          builder: ${{ steps.matrixcache.outputs.name }}
-          tags: curie-dispatcher:matrix-candidate
-          push: false
-          load: true
-          cache-from: type=gha,scope=ladder-dispatcher
-          cache-to: type=gha,mode=max,scope=ladder-dispatcher
-      - name: Build the candidate worker image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: apps/worker/Dockerfile
-          builder: ${{ steps.matrixcache.outputs.name }}
-          tags: curie-worker:matrix-candidate
-          push: false
-          load: true
-          cache-from: type=gha,scope=ladder-worker
-          cache-to: type=gha,mode=max,scope=ladder-worker
-      - name: Build the candidate ui image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: apps/ui/Dockerfile
-          builder: ${{ steps.matrixcache.outputs.name }}
-          tags: curie-ui:matrix-candidate
-          push: false
-          load: true
-          cache-from: type=gha,scope=ladder-ui
-          cache-to: type=gha,mode=max,scope=ladder-ui
-      - name: Build the candidate runner image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: runner/Dockerfile
-          builder: ${{ steps.matrixcache.outputs.name }}
-          tags: curie-runner:matrix-candidate
-          push: false
-          load: true
-          cache-from: type=gha,scope=ladder-runner
-          cache-to: type=gha,mode=max,scope=ladder-runner
       - name: Write the kind cluster config
         run: |
           cat > kind-upgrade-matrix-config.yaml <<'EOF'
@@ -2856,17 +2823,8 @@ jobs:
           kubectl apply -f "$calico_manifest"
           kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
           kubectl wait --for=condition=Ready node --all --timeout=300s
-      - name: Load candidate images into the kind cluster
-        run: |
-          set -euo pipefail
-          for image in \
-            curie-api:matrix-candidate \
-            curie-dispatcher:matrix-candidate \
-            curie-worker:matrix-candidate \
-            curie-ui:matrix-candidate \
-            curie-runner:matrix-candidate; do
-            kind load docker-image "$image" --name curie-upgrade-matrix
-          done
+      # No workflow-level kind load: the script retags matrix-candidate to
+      # 0.9.0/0.9.1 from local docker and kind-loads exclusive tags itself.
       - name: Run the cluster upgrade matrix
         env:
           CURIE_BIN: cli/target/release/curie

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -561,6 +562,49 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
     assert teardown["if"] == "always()"
     assert "kind delete cluster --name curie-upgrade-matrix" in teardown["run"]
     assert "kind delete cluster --name curie-upgrade " not in teardown["run"]
+
+    # #2733: one parallel bake replaces five serial image builds. The script
+    # retags matrix-candidate from local docker and kind-loads exclusive tags
+    # itself, so the workflow-level kind load of matrix-candidate is gone.
+    assert not any(
+        str(step.get("uses", "")).startswith("docker/build-push-action@")
+        for step in job["steps"]
+    )
+    assert "Load candidate images into the kind cluster" not in named_steps
+    assert not any(
+        "kind load" in str(step.get("run", "")) for step in job["steps"]
+    )
+    builder = named_steps["Set up a cache-only buildx builder (named, NOT the default)"]
+    assert builder["with"]["use"] is False
+    bake = named_steps["Build the candidate images locally in parallel"]
+    assert bake["uses"].startswith("docker/bake-action@")
+    assert len(bake["uses"].split("@", 1)[1].split()[0]) == 40
+    assert bake["with"]["builder"] == "${{ steps.matrixcache.outputs.name }}"
+    assert bake["with"]["load"] is True
+    assert bake["with"]["push"] is False
+    assert bake["with"]["files"] == "${{ runner.temp }}/matrix-bake.json"
+    writer = named_steps["Write the candidate image bake definition"]["run"]
+    body = writer.split("<<'EOF'\n", 1)[1].rsplit("\nEOF", 1)[0]
+    definition = json.loads(body)
+    targets = definition["target"]
+    assert set(definition["group"]["default"]["targets"]) == set(targets)
+    expected = {
+        "api": "apps/api/Dockerfile",
+        "dispatcher": "apps/dispatcher/Dockerfile",
+        "worker": "apps/worker/Dockerfile",
+        "ui": "apps/ui/Dockerfile",
+        "runner": "runner/Dockerfile",
+    }
+    assert set(targets) == set(expected)
+    for component, dockerfile in expected.items():
+        target = targets[component]
+        assert target["context"] == "."
+        assert target["dockerfile"] == dockerfile
+        assert target["tags"] == [f"curie-{component}:matrix-candidate"]
+        assert target["cache-from"] == [f"type=gha,scope=ladder-{component}"]
+        assert target["cache-to"] == [f"type=gha,mode=max,scope=ladder-{component}"]
+    step_names = [step.get("name") for step in job["steps"]]
+    assert step_names.index(bake["name"]) < step_names.index(run_step["name"])
 
 
 def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:

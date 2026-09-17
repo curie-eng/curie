@@ -367,7 +367,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         ids,
         [
             "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11", "s12",
-            "s13"
+            "s13", "s14"
         ],
         "canonical shard ids\n{manifest}"
     );
@@ -379,7 +379,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         let setup = shard["setup"].as_bool().expect("shard setup flag");
         assert_eq!(
             setup,
-            !matches!(id, "s01" | "s11"),
+            !matches!(id, "s01" | "s11" | "s12"),
             "setup flag wrong for {id}"
         );
         for item in shard["scenarios"].as_array().expect("scenarios array") {
@@ -481,9 +481,10 @@ s07 setup interrupt-resume:checkpoint+migrate
 s08 setup interrupt-resume:apply+commit
 s09 setup n-to-n1 compatible-rollback
 s10 setup rollback-published-088
-s11 nosetup rollback-published-089 migration-crash
-s12 setup converge-negative
-s13 setup previous-serves";
+s11 nosetup rollback-published-089
+s12 nosetup migration-crash
+s13 setup converge-negative
+s14 setup previous-serves";
 
 fn assert_override_refused(manifest: &str, what: &str) {
     assert_ne!(
@@ -528,8 +529,8 @@ fn self_test_fails_when_override_drops_a_scenario() {
 fn self_test_fails_when_override_duplicates_a_scenario() {
     assert_override_refused(
         &GOOD_SHARDS.replace(
-            "s11 nosetup rollback-published-089",
-            "s11 nosetup rollback-published-089 fresh-n",
+            "s12 nosetup migration-crash",
+            "s12 nosetup migration-crash fresh-n",
         ),
         "duplicated scenario",
     );
@@ -618,4 +619,39 @@ fn cluster_upgrade_matrix_every_listed_shard_id_resolves() {
             "listed shard {id} must resolve\n{text}"
         );
     }
+}
+
+#[test]
+fn migration_crash_bounds_the_interrupted_upgrade_wait() {
+    // #2733: the interrupted first upgrade blocked ~900s on helm's hook wait.
+    // It gets 120s to exit, then is killed with ownership and helm lock recovered.
+    let source = fs::read_to_string(script()).expect("read script");
+    let start = source
+        .find("run_migration_crash() {")
+        .expect("run_migration_crash defined");
+    let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+    let pos = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("run_migration_crash must contain `{needle}`\n{body}"))
+    };
+    let interrupt = pos("interrupt_schema_migrate");
+    let bound = pos("SECONDS + 120");
+    let kill = pos("terminate_tree \"$pid\"");
+    let ownership = pos("recover_killed_upgrade_ownership");
+    let lock = pos("recover_helm_lock");
+    let waited = pos("wait \"$pid\"");
+    let retry = pos("migration-crash-retry");
+    assert!(
+        interrupt < bound && bound < kill,
+        "bounded wait must follow the interrupt"
+    );
+    assert!(kill < ownership && ownership < lock && lock < retry);
+    assert!(kill < waited && waited < retry);
+    assert!(body.contains("exited on its own") && body.contains("terminated after"));
+    let output = run_script(&["--self-test"], &[]);
+    let text = output_text(&output);
+    assert!(
+        text.contains("migration-crash bounds the interrupted upgrade wait"),
+        "{text}"
+    );
 }
