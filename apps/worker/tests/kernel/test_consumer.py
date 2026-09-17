@@ -1534,15 +1534,19 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness)
 
             h.fake_k8s.quota_rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
-                resource="limits.cpu",
-                requested="1",
-                used="8",
-                hard="8",
+                requested={"limits.cpu": "1"},
+                used={"limits.cpu": "8"},
+                hard={"limits.cpu": "8"},
             )
             original_delete = h.fake_k8s.delete_claim
 
-            def delete_and_free(name: str) -> None:
-                original_delete(name)
+            def delete_and_free(
+                name: str, *, request_timeout_seconds: float
+            ) -> None:
+                original_delete(
+                    name,
+                    request_timeout_seconds=request_timeout_seconds,
+                )
                 h.fake_k8s.quota_rejection = None
 
             h.fake_k8s.delete_claim = delete_and_free  # type: ignore[method-assign]

@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import redis
 from aci_protocol import (
     Attachment,
     ErrorEvent,
@@ -32,11 +33,12 @@ from aci_protocol import (
 )
 from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
 from curie_worker import kernel as kernel_module
+from curie_worker.attachments import PreparedAttachments
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import ThreadBusyError
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError, TurnStream
-from curie_worker.sandbox import QuotaRejection, SandboxHandle
+from curie_worker.sandbox import QuotaRejection, RouteRecord, SandboxHandle
 from curie_worker.workspace import (
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
@@ -105,6 +107,102 @@ def _safe_candidate_status(candidate: SandboxHandle) -> dict[str, object]:
         "managed_workspace": True,
         "cwd": "/workspace",
     }
+
+
+class _HistoryBinding:
+    async def resolve(self, _kind: str, _channel: str) -> _FakeResolved:
+        return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
+
+    def boot_env(
+        self,
+        _resolved: object,
+        thread_key: str,
+        *,
+        kind: str | None = None,
+        address: str | None = None,
+    ) -> dict[str, str]:
+        del kind, address
+        return {
+            "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
+            "CURIE_RUNNER_TOKEN": f"token-{thread_key}",
+        }
+
+    def packs_for(self, _resolved: object) -> BehaviorPacks:
+        return BehaviorPacks()
+
+
+def _quota_rejection() -> QuotaRejection:
+    return QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"limits.cpu": "1"},
+        used={"limits.cpu": "2"},
+        hard={"limits.cpu": "2"},
+    )
+
+
+async def _safe_pressure_candidate(h: Any, thread: str) -> SandboxHandle:
+    thread_key = _thread_key(thread)
+    return await asyncio.to_thread(
+        h.substrate.claim,
+        thread_key,
+        env={
+            "CURIE_HISTORY_REF": (
+                f"https://api.example.com/state/transcript/{thread_key}"
+            ),
+            "CURIE_RUNNER_TOKEN": f"token-{thread_key}",
+        },
+    )
+
+
+async def _pressure_lease(h: Any, event_id: str) -> Any:
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    store = DeliveryLeaseStore(h.async_redis, h.config)
+    await h.async_redis.xgroup_create(
+        h.config.stream,
+        h.config.consumer_group,
+        id="0",
+        mkstream=True,
+    )
+    return await _leased_entry(h, store, event_id=event_id, generation=1)
+
+
+class _PressureAttachmentLane:
+    def __init__(self, on_resolve: Callable[[int], None] | None = None) -> None:
+        self.on_resolve = on_resolve
+        self.resolve_calls = 0
+        self.discard_calls = 0
+
+    def resolve(self, **_kwargs: object) -> PreparedAttachments:
+        self.resolve_calls += 1
+        if self.on_resolve is not None:
+            self.on_resolve(self.resolve_calls)
+        return PreparedAttachments((), (), 0)
+
+    def discard_prepared(self, **_kwargs: object) -> None:
+        self.discard_calls += 1
+
+
+def _capture_pressure_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    real_record_metric = kernel_module.record_metric
+    outcomes: list[str] = []
+
+    def record(
+        name: str,
+        value: float = 1,
+        *,
+        attributes: dict[str, str] | None = None,
+    ) -> None:
+        real_record_metric(name, value, attributes=attributes)
+        if (
+            name == "curie.sandbox.lifecycle"
+            and attributes is not None
+            and attributes.get("operation") == "reclaim"
+        ):
+            outcomes.append(attributes["outcome"])
+
+    monkeypatch.setattr(kernel_module, "record_metric", record)
+    return outcomes
 
 
 async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
@@ -2902,10 +3000,9 @@ def test_quota_capacity_is_terminal_without_retry_or_runner_turn(
         ) as h:
             h.fake_k8s.quota_rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
-                resource="limits.cpu",
-                requested="2",
-                used="7",
-                hard="8",
+                requested={"limits.cpu": "2"},
+                used={"limits.cpu": "7"},
+                hard={"limits.cpu": "8"},
             )
             endpoint = "http://127.0.0.1:43199"
             ev = _qevent("go", endpoint=endpoint)
@@ -2913,8 +3010,7 @@ def test_quota_capacity_is_terminal_without_retry_or_runner_turn(
             await h.kernel.process_event(ev)
 
             expected = (
-                "This agent is at capacity right now. It frees up when another "
-                "conversation finishes, so please try again shortly."
+                "This agent is at capacity right now. Please try again shortly."
             )
             expected_updates = [("C1", "p-1", expected)]
             if not slack_no_edit_streaming:
@@ -2929,14 +3025,1357 @@ def test_quota_capacity_is_terminal_without_retry_or_runner_turn(
     asyncio.run(go())
 
 
+@pytest.mark.parametrize(
+    ("quota_name", "requested", "used", "hard"),
+    [
+        (
+            "curie-sandbox-quota",
+            {"limits.cpu": "500m"},
+            {"limits.cpu": "1"},
+            {"limits.cpu": "1"},
+        ),
+        (
+            "curie-sandbox-quota",
+            {"limits.memory": "512Mi"},
+            {"limits.memory": "1Gi"},
+            {"limits.memory": "1Gi"},
+        ),
+        (
+            "curie-sandbox-quota",
+            {"pods": "1"},
+            {"pods": "2"},
+            {"pods": "2"},
+        ),
+        (
+            "curie-sandbox-quota",
+            {
+                "limits.cpu": "500m",
+                "limits.memory": "512Mi",
+                "pods": "1",
+            },
+            {"limits.cpu": "1", "limits.memory": "1Gi", "pods": "2"},
+            {"limits.cpu": "1", "limits.memory": "1Gi", "pods": "2"},
+        ),
+    ],
+    ids=["cpu", "memory", "pods", "combined"],
+)
+def test_valid_quota_evidence_reaches_budget_gate_before_inventory(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    quota_name: str,
+    requested: dict[str, str],
+    used: dict[str, str],
+    hard: dict[str, str],
+) -> None:
+    rejection = QuotaRejection(
+        quota_name=quota_name,
+        requested=requested,
+        used=used,
+        hard=hard,
+    )
+
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+        ) as h:
+            def scan_must_not_run(**_kwargs: object) -> object:
+                raise AssertionError("missing budget reached pressure inventory")
+
+            monkeypatch.setattr(
+                h.substrate._affinity,  # noqa: SLF001
+                "pressure_candidates",
+                scan_must_not_run,
+            )
+            h.fake_k8s.quota_rejection = rejection
+
+            await h.kernel.process_event(_qevent("start", thread="tValidQuota"))
+
+            assert outcomes == ["refused-no-budget"]
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("quota_name", "requested", "used", "hard"),
+    [
+        ("INVALID_NAME", {"pods": "1"}, {"pods": "2"}, {"pods": "2"}),
+        ("curie-sandbox-quota", {}, {}, {}),
+        (
+            "curie-sandbox-quota",
+            {"pods": "1"},
+            {"limits.cpu": "2"},
+            {"pods": "2"},
+        ),
+        ("curie-sandbox-quota", {"pods": "NaN"}, {"pods": "2"}, {"pods": "2"}),
+        ("curie-sandbox-quota", {"pods": "0"}, {"pods": "2"}, {"pods": "2"}),
+        ("curie-sandbox-quota", {"pods": "1"}, {"pods": "-1"}, {"pods": "2"}),
+        ("curie-sandbox-quota", {"pods": "1"}, {"pods": "2"}, {"pods": "-1"}),
+        ("curie-sandbox-quota", {"pods": "1"}, {"pods": "1"}, {"pods": "2"}),
+    ],
+    ids=[
+        "quota_name",
+        "empty",
+        "unequal_keys",
+        "nonfinite",
+        "zero_request",
+        "negative_used",
+        "negative_hard",
+        "not_over_quota",
+    ],
+)
+def test_invalid_quota_evidence_refuses_before_inventory_or_deletion(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    quota_name: str,
+    requested: dict[str, str],
+    used: dict[str, str],
+    hard: dict[str, str],
+) -> None:
+    rejection = QuotaRejection(
+        quota_name=quota_name,
+        requested=requested,
+        used=used,
+        hard=hard,
+    )
+
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            candidate = await _safe_pressure_candidate(h, "tInvalidQuotaCandidate")
+
+            def scan_must_not_run(**_kwargs: object) -> object:
+                raise AssertionError("invalid quota reached pressure inventory")
+
+            def delete_must_not_run(*_args: object, **_kwargs: object) -> bool:
+                raise AssertionError("invalid quota reached pressure deletion")
+
+            monkeypatch.setattr(
+                h.substrate._affinity,  # noqa: SLF001
+                "pressure_candidates",
+                scan_must_not_run,
+            )
+            monkeypatch.setattr(h.substrate, "delete_detached", delete_must_not_run)
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_rejection = rejection
+            event_id = "invalid-quota-trigger"
+            lease = await _pressure_lease(h, event_id)
+
+            await h.kernel.process_event(
+                _qevent("start", thread="tInvalidQuotaTrigger", event_id=event_id),
+                lease=lease,
+            )
+
+            assert h.substrate.lookup(candidate.thread_key) == candidate
+            assert candidate.claim_name not in h.fake_k8s.deleted_claims
+            assert outcomes == ["refused-invalid-quota"]
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
+def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from curie_worker.sandbox.k8s import _claim_view
+
+    class HistoryBinding:
+        async def resolve(self, _kind: str, _channel: str) -> _FakeResolved:
+            return _FakeResolved(uuid.UUID("22222222-2222-4222-8222-222222222222"))
+
+        def boot_env(
+            self,
+            _resolved: object,
+            thread_key: str,
+            *,
+            kind: str | None = None,
+            address: str | None = None,
+        ) -> dict[str, str]:
+            return {
+                "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
+                "CURIE_RUNNER_TOKEN": f"token-{thread_key}",
+            }
+
+        def packs_for(self, _resolved: object) -> BehaviorPacks:
+            return BehaviorPacks()
+
+    async def go() -> None:
+        outcomes: list[str] = []
+        async with make_harness(
+            binding=HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            oldest_thread = "tOldestIdle"
+            newer_thread = "tNewerIdle"
+            trigger_thread = "tCapacityTrigger"
+
+            for thread in (oldest_thread, newer_thread):
+                thread_key = _thread_key(thread)
+                await asyncio.to_thread(
+                    h.substrate.claim,
+                    thread_key,
+                    env={
+                        "CURIE_HISTORY_REF": (
+                            f"https://api.example.com/state/transcript/{thread_key}"
+                        ),
+                        "CURIE_RUNNER_TOKEN": f"token-{thread_key}",
+                    },
+                )
+
+            oldest = h.substrate.lookup(_thread_key(oldest_thread))
+            newer = h.substrate.lookup(_thread_key(newer_thread))
+            assert oldest is not None
+            assert newer is not None
+            assert oldest.history_ref is not None
+            assert h.substrate._affinity.touch(  # noqa: SLF001
+                _thread_key(oldest_thread), 30
+            )
+
+            h.fake_k8s.quota_claim_capacity = 2
+            h.fake_k8s.quota_headroom_results = [True]
+            quota_view = _claim_view(
+                {
+                    "metadata": {"name": "acme-trigger-claim"},
+                    "status": {
+                        "conditions": [
+                            {
+                                "type": "Ready",
+                                "status": "False",
+                                "reason": "ReconcilerError",
+                                "message": (
+                                    'Error seen: pods "acme-trigger-claim" is '
+                                    "forbidden: exceeded quota: curie-sandbox-quota, "
+                                    "requested: limits.cpu=1, used: limits.cpu=2, "
+                                    "limited: limits.cpu=2"
+                                ),
+                            }
+                        ]
+                    },
+                }
+            )
+            assert quota_view.quota_rejection is not None
+            h.fake_k8s.quota_rejection = quota_view.quota_rejection
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            await h.async_redis.xgroup_create(
+                h.config.stream, h.config.consumer_group, id="0", mkstream=True
+            )
+            event_id = "idle-route-capacity-trigger"
+            lease = await _leased_entry(h, store, event_id=event_id, generation=1)
+            h.runner.default_script = [Final(text="started after reclaim", status=DONE)]
+            real_record_metric = kernel_module.record_metric
+
+            def record(
+                name: str,
+                value: float = 1,
+                *,
+                attributes: dict[str, str] | None = None,
+            ) -> None:
+                real_record_metric(name, value, attributes=attributes)
+                if (
+                    name == "curie.sandbox.lifecycle"
+                    and attributes is not None
+                    and attributes.get("operation") == "reclaim"
+                ):
+                    assert h.runner.opened == ["start a new turn"]
+                    assert oldest.claim_name in h.fake_k8s.deleted_claims
+                    assert h.substrate.lookup(_thread_key(oldest_thread)) is None
+                    outcomes.append(attributes["outcome"])
+
+            monkeypatch.setattr(kernel_module, "record_metric", record)
+
+            await h.kernel.process_event(
+                _qevent("start a new turn", thread=trigger_thread, event_id=event_id),
+                lease=lease,
+            )
+
+            assert h.runner.opened == ["start a new turn"]
+            assert oldest.claim_name in h.fake_k8s.deleted_claims
+            assert newer.claim_name not in h.fake_k8s.deleted_claims
+            assert h.substrate.lookup(_thread_key(oldest_thread)) is None
+            assert h.substrate.lookup(_thread_key(newer_thread)) == newer
+            assert h.sink.last_text == "started after reclaim"
+
+            await asyncio.to_thread(h.substrate.release, _thread_key(trigger_thread))
+            await h.kernel.process_event(
+                _qevent("resume the reclaimed thread", thread=oldest_thread)
+            )
+
+            resumed = h.substrate.lookup(_thread_key(oldest_thread))
+            assert resumed is not None
+            assert resumed.history_ref == oldest.history_ref
+            assert h.runner.opened == ["start a new turn", "resume the reclaimed thread"]
+            assert outcomes == ["reclaimed"]
+
+    asyncio.run(go())
+
+
+def test_quota_capacity_waits_for_external_headroom_before_retry(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            victim = await _safe_pressure_candidate(h, "tQuotaLagVictim")
+            rejection = _quota_rejection()
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_rejection = rejection
+
+            headroom_proved = False
+            quota_reads: list[tuple[QuotaRejection, float]] = []
+            original_create = h.fake_k8s.create_claim
+
+            def create_with_quota_lag(
+                name: str,
+                *,
+                pool: str,
+                env: dict[str, str] | None = None,
+                labels: dict[str, str] | None = None,
+            ) -> None:
+                capacity = h.fake_k8s.quota_claim_capacity
+                if not headroom_proved:
+                    h.fake_k8s.quota_claim_capacity = None
+                try:
+                    original_create(name, pool=pool, env=env, labels=labels)
+                finally:
+                    h.fake_k8s.quota_claim_capacity = capacity
+
+            def quota_has_headroom(
+                observed: QuotaRejection,
+                *,
+                request_timeout_seconds: float,
+            ) -> bool:
+                nonlocal headroom_proved
+                assert 0 < request_timeout_seconds <= 1.0
+                quota_reads.append((observed, request_timeout_seconds))
+                if len(quota_reads) == 1:
+                    return False
+                headroom_proved = True
+                return True
+
+            monkeypatch.setattr(h.fake_k8s, "create_claim", create_with_quota_lag)
+            monkeypatch.setattr(
+                h.fake_k8s,
+                "quota_has_headroom",
+                quota_has_headroom,
+                raising=False,
+            )
+
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            await h.async_redis.xgroup_create(
+                h.config.stream, h.config.consumer_group, id="0", mkstream=True
+            )
+            event_id = "quota-lag-trigger"
+            lease = await _leased_entry(h, store, event_id=event_id, generation=1)
+            h.runner.default_script = [Final(text="started after quota release", status=DONE)]
+
+            await h.kernel.process_event(
+                _qevent(
+                    "start after quota release",
+                    thread="tQuotaLagTrigger",
+                    event_id=event_id,
+                ),
+                lease=lease,
+            )
+
+            assert victim.claim_name in h.fake_k8s.deleted_claims
+            assert h.runner.opened == ["start after quota release"]
+            assert h.sink.last_text == "started after quota release"
+            assert [observed for observed, _timeout in quota_reads] == [
+                rejection,
+                rejection,
+            ]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "unsafe_shape",
+    [
+        "missing-history",
+        "unauthenticated",
+        "foreign-namespace",
+        "workspace-repo",
+        "workspace-head",
+        "publication",
+    ],
+)
+def test_quota_pressure_preserves_routes_with_unsafe_persisted_state(
+    make_harness,
+    unsafe_shape: str,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            thread = f"tUnsafe{unsafe_shape}"
+            thread_key = _thread_key(thread)
+            candidate = await _safe_pressure_candidate(h, thread)
+            later = await _safe_pressure_candidate(h, f"{thread}LaterSafe")
+            assert h.substrate._affinity.touch(thread_key, 30)  # noqa: SLF001
+            record = h.substrate._affinity.get(thread_key)  # noqa: SLF001
+            assert record is not None
+            changes: dict[str, object] = {}
+            if unsafe_shape == "missing-history":
+                changes["history_ref"] = None
+            elif unsafe_shape == "unauthenticated":
+                changes["token"] = ""
+            elif unsafe_shape == "foreign-namespace":
+                changes["namespace"] = "other-ns"
+            elif unsafe_shape == "workspace-repo":
+                changes["workspace_repo"] = "acme-corp/acme-bot"
+            elif unsafe_shape == "workspace-head":
+                changes["workspace_materialized_head"] = "abc123"
+            else:
+                changes["publication_visible_outcome_revision"] = 3
+            changed = replace(record, handle=replace(record.handle, **changes))
+            real_pressure_get = h.substrate.pressure_get
+            changed_after_scan = False
+
+            async def pressure_get(candidate_thread_key: str) -> RouteRecord | None:
+                nonlocal changed_after_scan
+                if candidate_thread_key == thread_key and not changed_after_scan:
+                    h.substrate._affinity.replace(  # noqa: SLF001
+                        thread_key,
+                        changed,
+                        60,
+                    )
+                    changed_after_scan = True
+                return await real_pressure_get(candidate_thread_key)
+
+            status_tokens: list[str | None] = []
+
+            async def status(
+                _base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                assert remaining_s is not None
+                status_tokens.append(token)
+                assert token == later.token
+                return _safe_candidate_status(later)
+
+            h.substrate.pressure_get = pressure_get  # type: ignore[method-assign]
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+            h.fake_k8s.quota_claim_capacity = 2
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = f"unsafe-pressure-{unsafe_shape}"
+            lease = await _pressure_lease(h, event_id)
+            h.runner.default_script = [Final(text="started safely", status=DONE)]
+
+            await h.kernel.process_event(
+                _qevent("start", thread="tUnsafeTrigger", event_id=event_id),
+                lease=lease,
+            )
+
+            assert changed_after_scan
+            assert status_tokens == [later.token]
+            assert h.substrate._affinity.get(thread_key) == changed  # noqa: SLF001
+            assert candidate.claim_name not in h.fake_k8s.deleted_claims
+            assert h.substrate.lookup(later.thread_key) is None
+            assert later.claim_name in h.fake_k8s.deleted_claims
+            assert h.runner.opened == ["start"]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [redis.exceptions.TimeoutError, redis.exceptions.ConnectionError],
+)
+def test_unknown_detach_stops_after_real_eval_without_later_probe_or_retry(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    transport_error: type[redis.exceptions.RedisError],
+) -> None:
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            oldest = await _safe_pressure_candidate(h, "tUnknownDetachOldest")
+            later = await _safe_pressure_candidate(h, "tUnknownDetachLater")
+            assert h.substrate._affinity.touch(oldest.thread_key, 30)  # noqa: SLF001
+            detach_threads: list[str] = []
+            real_detach = h.substrate.detach_if_unchanged
+            real_status = h.kernel._runner.status
+            status_tokens: list[str | None] = []
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                status_tokens.append(token)
+                return await real_status(
+                    base_url,
+                    token=token,
+                    remaining_s=remaining_s,
+                )
+
+            async def detach_if_unchanged(
+                candidate_thread_key: str,
+                **kwargs: object,
+            ) -> bool:
+                detach_threads.append(candidate_thread_key)
+                if candidate_thread_key == oldest.thread_key:
+                    detached = await real_detach(
+                        candidate_thread_key,
+                        **kwargs,  # type: ignore[arg-type]
+                    )
+                    assert detached
+                    raise transport_error("detach reply was lost")
+                raise AssertionError("later candidate reached detach")
+
+            h.substrate.detach_if_unchanged = (  # type: ignore[method-assign]
+                detach_if_unchanged
+            )
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+            h.fake_k8s.quota_claim_capacity = 2
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = "pressure-unknown-detach"
+            lease = await _pressure_lease(h, event_id)
+            claims_before = len(h.fake_k8s.claim_envs)
+
+            await h.kernel.process_event(
+                _qevent("start", thread="tUnknownDetachTrigger", event_id=event_id),
+                lease=lease,
+            )
+
+            assert detach_threads == [oldest.thread_key]
+            assert status_tokens == [oldest.token]
+            assert h.substrate.lookup(oldest.thread_key) is None
+            assert h.substrate.lookup(later.thread_key) == later
+            assert oldest.claim_name not in h.fake_k8s.deleted_claims
+            assert later.claim_name not in h.fake_k8s.deleted_claims
+            assert len(h.fake_k8s.claim_envs) == claims_before + 1
+            assert h.runner.opened == []
+            assert outcomes == ["timeout"]
+
+    asyncio.run(go())
+
+
+def test_pressure_inventory_hard_stops_at_two_seconds(
+    make_harness,
+) -> None:
+    class PausedScanRedis:
+        def __init__(self, client: Any, admin: Any) -> None:
+            self._client = client
+            self._admin = admin
+            self.scan_calls = 0
+            self.reply_durations: list[float] = []
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._client, name)
+
+        async def scan(self, *args: object, **kwargs: object) -> Any:
+            self.scan_calls += 1
+            await asyncio.to_thread(
+                self._admin.execute_command,
+                "CLIENT",
+                "PAUSE",
+                800,
+                "ALL",
+            )
+            started = time.monotonic()
+            result = await self._client.scan(*args, **kwargs)
+            self.reply_durations.append(time.monotonic() - started)
+            return result
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            candidate = await _safe_pressure_candidate(h, "tPausedInventory")
+            sync_client = h.substrate._affinity._redis  # noqa: SLF001
+            prefix = h.substrate._affinity._prefix  # noqa: SLF001
+            redis_client = h.substrate._affinity._pressure_redis  # noqa: SLF001
+            delayed = PausedScanRedis(redis_client, sync_client)
+            h.substrate._affinity._pressure_redis = (  # type: ignore[assignment]  # noqa: SLF001
+                delayed
+            )
+            padding = {
+                f"{prefix}:unrelated:{number}": "padding"
+                for number in range(18_000)
+            }
+            await asyncio.to_thread(sync_client.mset, padding)
+            try:
+                started = time.monotonic()
+                result = await h.kernel._reclaim_idle_route(  # noqa: SLF001
+                    "requesting-thread",
+                    _quota_rejection(),
+                    remaining_s=120.0,
+                )
+                elapsed = time.monotonic() - started
+            finally:
+                await asyncio.to_thread(
+                    sync_client.execute_command,
+                    "CLIENT",
+                    "UNPAUSE",
+                )
+                h.substrate._affinity._pressure_redis = redis_client  # noqa: SLF001
+
+            assert 2.0 <= elapsed < 2.2
+            assert delayed.scan_calls >= 3
+            assert len(delayed.reply_durations) >= 2
+            assert all(0.6 <= duration < 1.0 for duration in delayed.reply_durations)
+            assert not result.reclaimed
+            assert result.outcome == "timeout"
+            assert h.substrate.lookup(candidate.thread_key) == candidate
+
+    asyncio.run(go())
+
+
+def test_pressure_inventory_socket_timeout_precedes_wall_deadline(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            candidate = await _safe_pressure_candidate(h, "tSocketTimeoutInventory")
+            sync_client = h.substrate._affinity._redis  # noqa: SLF001
+            await asyncio.to_thread(
+                sync_client.execute_command,
+                "CLIENT",
+                "PAUSE",
+                3_000,
+                "ALL",
+            )
+            try:
+                started = time.monotonic()
+                result = await h.kernel._reclaim_idle_route(  # noqa: SLF001
+                    "requesting-thread",
+                    _quota_rejection(),
+                    remaining_s=120.0,
+                )
+                elapsed = time.monotonic() - started
+            finally:
+                await asyncio.to_thread(
+                    sync_client.execute_command,
+                    "CLIENT",
+                    "UNPAUSE",
+                )
+
+            assert 0.8 <= elapsed < 1.5
+            assert not result.reclaimed
+            assert result.outcome == "timeout"
+            assert h.substrate.lookup(candidate.thread_key) == candidate
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "unsafe_status",
+    ["active", "nondurable", "awaiting-approval", "unreadable"],
+)
+def test_quota_pressure_preserves_routes_without_safe_idle_history_status(
+    make_harness,
+    unsafe_status: str,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            thread = f"tStatus{unsafe_status}"
+            candidate = await _safe_pressure_candidate(h, thread)
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                assert remaining_s is not None
+                assert 0 < remaining_s <= 1.0
+                if unsafe_status == "unreadable":
+                    raise TimeoutError("status timed out")
+                payload = _safe_candidate_status(candidate)
+                if unsafe_status == "active":
+                    payload["turn_active"] = True
+                elif unsafe_status == "nondurable":
+                    payload["history_durable"] = False
+                else:
+                    payload["status"] = SessionStatus.AWAITING_APPROVAL.value
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = f"status-pressure-{unsafe_status}"
+            lease = await _pressure_lease(h, event_id)
+
+            await h.kernel.process_event(
+                _qevent("start", thread="tStatusTrigger", event_id=event_id),
+                lease=lease,
+            )
+
+            assert h.substrate.lookup(_thread_key(thread)) == candidate
+            assert candidate.claim_name not in h.fake_k8s.deleted_claims
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
+def test_unreadable_oldest_runner_does_not_block_later_safe_reclamation(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            oldest = await _safe_pressure_candidate(h, "tUnreadableOldest")
+            newer = await _safe_pressure_candidate(h, "tSafeAfterUnreadable")
+            assert h.substrate._affinity.touch(oldest.thread_key, 30)  # noqa: SLF001
+
+            status_tokens: list[str | None] = []
+
+            async def status(
+                _base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                assert remaining_s is not None
+                status_tokens.append(token)
+                if token == oldest.token:
+                    raise TimeoutError("oldest runner did not answer")
+                assert token == newer.token
+                return _safe_candidate_status(newer)
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+            h.fake_k8s.quota_claim_capacity = 2
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = "pressure-unreadable-oldest-status"
+            lease = await _pressure_lease(h, event_id)
+            h.runner.default_script = [Final(text="started after fallback", status=DONE)]
+
+            await h.kernel.process_event(
+                _qevent("start", thread="tUnreadableTrigger", event_id=event_id),
+                lease=lease,
+            )
+
+            assert status_tokens[:2] == [oldest.token, newer.token]
+            assert h.substrate.lookup(oldest.thread_key) == oldest
+            assert h.substrate.lookup(newer.thread_key) is None
+            assert oldest.claim_name not in h.fake_k8s.deleted_claims
+            assert newer.claim_name in h.fake_k8s.deleted_claims
+            assert h.runner.opened == ["start"]
+            assert h.sink.last_text == "started after fallback"
+            assert outcomes == ["reclaimed"]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("race", ["touch", "replace", "lease-loss"])
+def test_quota_pressure_loses_races_without_deleting_the_candidate(
+    make_harness,
+    race: str,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            thread = f"tRace{race}"
+            thread_key = _thread_key(thread)
+            candidate = await _safe_pressure_candidate(h, thread)
+            original = h.substrate._affinity.get(thread_key)  # noqa: SLF001
+            assert original is not None
+            replacement: RouteRecord | None = None
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                nonlocal replacement
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                assert remaining_s is not None
+                if race == "touch":
+                    assert h.substrate._affinity.touch(thread_key, 120)  # noqa: SLF001
+                elif race == "replace":
+                    replacement = replace(
+                        original,
+                        handle=replace(
+                            original.handle,
+                            generation=original.handle.generation + 1,
+                        ),
+                    )
+                    h.substrate._affinity.replace(  # noqa: SLF001
+                        thread_key,
+                        replacement,
+                        60,
+                    )
+                else:
+                    await h.async_redis.delete(h.config.lock_key(thread_key))
+                return _safe_candidate_status(candidate)
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = f"pressure-race-{race}"
+            lease = await _pressure_lease(h, event_id)
+
+            await h.kernel.process_event(
+                _qevent("start", thread="tRaceTrigger", event_id=event_id),
+                lease=lease,
+            )
+
+            route = h.substrate._affinity.get(thread_key)  # noqa: SLF001
+            assert route == (replacement or original)
+            assert candidate.claim_name not in h.fake_k8s.deleted_claims
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
+def test_contended_pressure_lock_is_skipped_within_its_short_bound(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            thread = "tContendedCandidate"
+            thread_key = _thread_key(thread)
+            candidate = await _safe_pressure_candidate(h, thread)
+            await h.async_redis.set(
+                h.config.lock_key(thread_key),
+                "another-owner",
+                px=5_000,
+            )
+
+            async def status_must_not_run(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("contended candidate reached status")
+
+            h.kernel._runner.status = status_must_not_run  # type: ignore[method-assign]
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = "pressure-lock-contention"
+            lease = await _pressure_lease(h, event_id)
+
+            started = time.monotonic()
+            await h.kernel.process_event(
+                _qevent("start", thread="tContentionTrigger", event_id=event_id),
+                lease=lease,
+            )
+            elapsed = time.monotonic() - started
+
+            assert elapsed < 0.75
+            assert h.substrate.lookup(thread_key) == candidate
+            assert candidate.claim_name not in h.fake_k8s.deleted_claims
+
+    asyncio.run(go())
+
+
+def test_same_thread_followup_cannot_overtake_pressure_retry(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            candidate = await _safe_pressure_candidate(h, "tFifoCandidate")
+            real_status = h.kernel._runner.status
+            status_entered = asyncio.Event()
+            allow_status = asyncio.Event()
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                if base_url != candidate.base_url:
+                    return await real_status(
+                        base_url,
+                        token=token,
+                        remaining_s=remaining_s,
+                    )
+                status_entered.set()
+                await allow_status.wait()
+                return _safe_candidate_status(candidate)
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = "pressure-fifo-first"
+            lease = await _pressure_lease(h, event_id)
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=DONE)]
+
+            first = asyncio.create_task(
+                h.kernel.process_event(
+                    _qevent("first", thread="tFifoTrigger", event_id=event_id),
+                    lease=lease,
+                )
+            )
+            await asyncio.wait_for(status_entered.wait(), timeout=2.0)
+            second = asyncio.create_task(
+                h.kernel.process_event(
+                    _qevent("followup", thread="tFifoTrigger")
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert h.runner.opened == []
+            assert h.runner.steers == []
+
+            allow_status.set()
+            await _wait_until(lambda: h.runner.opened == ["first"])
+            await second
+            assert h.runner.opened == ["first"]
+            assert h.runner.steers == ["followup"]
+
+            hold.set()
+            await first
+
+    asyncio.run(go())
+
+
+def test_capacity_refusal_releases_fifo_immediately_before_reply(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            slack_no_edit_streaming=True,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            refusal_entered = asyncio.Event()
+            allow_refusal = asyncio.Event()
+            real_emit = h.sink.emit
+
+            async def emit(
+                event: ReplyEvent,
+                *,
+                route: TargetRoute,
+                best_effort_unreachable: bool = False,
+            ) -> ReplyAck:
+                if (
+                    event.event == "reply.update"
+                    and "capacity" in str(getattr(event, "text", "")).lower()
+                ):
+                    h.fake_k8s.quota_rejection = None
+                    refusal_entered.set()
+                    await allow_refusal.wait()
+                return await real_emit(
+                    event,
+                    route=route,
+                    best_effort_unreachable=best_effort_unreachable,
+                )
+
+            h.sink.emit = emit  # type: ignore[method-assign]
+            first = asyncio.create_task(
+                h.kernel.process_event(
+                    _qevent("first", thread="tRefusalOrder")
+                )
+            )
+            await asyncio.wait_for(refusal_entered.wait(), timeout=2.0)
+
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=DONE)]
+            second = asyncio.create_task(
+                h.kernel.process_event(
+                    _qevent("followup", thread="tRefusalOrder")
+                )
+            )
+            await _wait_until(lambda: h.runner.opened == ["followup"])
+
+            allow_refusal.set()
+            await first
+            hold.set()
+            await second
+            assert h.kernel._order_locks == {}
+
+    asyncio.run(go())
+
+
+def test_second_quota_rejection_refuses_after_exactly_one_pressure_retry(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            candidate = await _safe_pressure_candidate(h, "tRetryCandidate")
+            h.fake_k8s.quota_claim_capacity = 0
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = "pressure-second-quota"
+            lease = await _pressure_lease(h, event_id)
+
+            await h.kernel.process_event(
+                _qevent("start", thread="tRetryTrigger", event_id=event_id),
+                lease=lease,
+            )
+
+            assert len(h.fake_k8s.claim_envs) == 3
+            assert h.fake_k8s.deleted_claims.count(candidate.claim_name) == 1
+            assert h.runner.opened == []
+            assert h.sink.last_text is not None
+            assert "try again" in h.sink.last_text.lower()
+            assert outcomes == ["reclaimed-retry-refused"]
+
+    asyncio.run(go())
+
+
+def test_pressure_retry_restarts_attachment_resolution_from_the_top(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            lane = _PressureAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            await _safe_pressure_candidate(h, "tAttachmentCandidate")
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = "pressure-attachment-retry"
+            lease = await _pressure_lease(h, event_id)
+            h.runner.default_script = [Final(text="attachment started", status=DONE)]
+
+            await h.kernel.process_event(
+                _qevent(
+                    "read this",
+                    thread="tAttachmentTrigger",
+                    event_id=event_id,
+                    attachments=[Attachment(id="F1", name="report.txt")],
+                ),
+                lease=lease,
+            )
+
+            assert lane.resolve_calls == 2
+            assert lane.discard_calls == 1
+            assert h.runner.opened == ["read this"]
+            assert h.sink.last_text == "attachment started"
+
+    asyncio.run(go())
+
+
+def test_route_created_between_attachment_retry_locks_keeps_changed_route_outcome(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            trigger_thread = "tAttachmentChanged"
+            trigger_key = _thread_key(trigger_thread)
+
+            def on_resolve(call: int) -> None:
+                if call == 2:
+                    h.substrate.claim(
+                        trigger_key,
+                        env={
+                            "CURIE_HISTORY_REF": (
+                                f"https://api.example.com/state/transcript/{trigger_key}"
+                            ),
+                            "CURIE_RUNNER_TOKEN": f"token-{trigger_key}",
+                        },
+                    )
+
+            lane = _PressureAttachmentLane(on_resolve)
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            await _safe_pressure_candidate(h, "tAttachmentRaceCandidate")
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = "pressure-attachment-route-race"
+            lease = await _pressure_lease(h, event_id)
+
+            await h.kernel.process_event(
+                _qevent(
+                    "read this",
+                    thread=trigger_thread,
+                    event_id=event_id,
+                    attachments=[Attachment(id="F2", name="route.txt")],
+                ),
+                lease=lease,
+            )
+
+            assert lane.resolve_calls == 2
+            assert lane.discard_calls == 2
+            assert h.substrate.lookup(trigger_key) is not None
+            assert h.runner.opened == []
+            assert h.sink.last_text == kernel_module._CHANGED_ATTACHMENT_REPLY
+
+    asyncio.run(go())
+
+
+def test_pressure_can_reclaim_victim_between_its_attachment_locks(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        resolve_entered = threading.Event()
+        allow_resolve = threading.Event()
+
+        class BlockingAttachmentLane(_PressureAttachmentLane):
+            def resolve(self, **_kwargs: object) -> PreparedAttachments:
+                self.resolve_calls += 1
+                resolve_entered.set()
+                assert allow_resolve.wait(timeout=5.0)
+                return PreparedAttachments((), (), 0)
+
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            victim_thread = "tAttachmentVictim"
+            victim = await _safe_pressure_candidate(h, victim_thread)
+            lane = BlockingAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            h.runner.default_script = [Final(text="trigger started", status=DONE)]
+
+            victim_task = asyncio.create_task(
+                h.kernel.process_event(
+                    _qevent(
+                        "read victim attachment",
+                        thread=victim_thread,
+                        attachments=[Attachment(id="F3", name="victim.txt")],
+                    )
+                )
+            )
+            assert await asyncio.to_thread(resolve_entered.wait, 2.0)
+
+            event_id = "pressure-between-victim-attachment-locks"
+            lease = await _pressure_lease(h, event_id)
+            await h.kernel.process_event(
+                _qevent("start", thread="tAttachmentPressureTrigger", event_id=event_id),
+                lease=lease,
+            )
+
+            assert h.substrate.lookup(victim.thread_key) is None
+            assert victim.claim_name in h.fake_k8s.deleted_claims
+            assert h.runner.opened == ["start"]
+            assert outcomes == ["reclaimed"]
+
+            allow_resolve.set()
+            await victim_task
+
+            assert lane.resolve_calls == 1
+            assert lane.discard_calls == 1
+            assert any(
+                update[2] == kernel_module._CHANGED_ATTACHMENT_REPLY
+                for update in h.sink.updates
+            )
+
+    asyncio.run(go())
+
+
+def test_quota_without_delivery_budget_refuses_before_pressure_inventory(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            candidate = await _safe_pressure_candidate(h, "tNoBudgetCandidate")
+
+            def scan_must_not_run(**_kwargs: object) -> object:
+                raise AssertionError("missing budget reached pressure inventory")
+
+            monkeypatch.setattr(
+                h.substrate._affinity,  # noqa: SLF001
+                "pressure_candidates",
+                scan_must_not_run,
+            )
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_rejection = _quota_rejection()
+
+            await h.kernel.process_event(
+                _qevent("start", thread="tNoBudgetTrigger")
+            )
+
+            assert h.substrate.lookup(_thread_key("tNoBudgetCandidate")) == candidate
+            assert candidate.claim_name not in h.fake_k8s.deleted_claims
+            assert h.runner.opened == []
+            assert outcomes == ["refused-no-budget"]
+
+    asyncio.run(go())
+
+
+def test_pressure_ceiling_is_derived_from_named_transport_slices() -> None:
+    cold_redis_operation = (
+        kernel_module._PRESSURE_REDIS_CONNECT_S
+        + 3 * kernel_module._PRESSURE_REDIS_READ_S
+    )
+    inventory = kernel_module._PRESSURE_SCAN_DEADLINE_S
+    candidate = (
+        2 * cold_redis_operation
+        + kernel_module._PRESSURE_RUNNER_STATUS_S
+        + 3 * kernel_module._PRESSURE_REDIS_READ_S
+    )
+    cleanup = (
+        kernel_module._PRESSURE_DELETE_S
+        + kernel_module._PRESSURE_GONE_WAIT_S
+    )
+
+    assert kernel_module._PRESSURE_REDIS_COLD_OPERATION_S == cold_redis_operation
+    assert kernel_module._PRESSURE_INVENTORY_CEILING_S == inventory
+    assert kernel_module._PRESSURE_CANDIDATE_CEILING_S == candidate
+    assert kernel_module._PRESSURE_CLEANUP_CEILING_S == cleanup
+    assert kernel_module._PRESSURE_CEILING_S == (
+        inventory + kernel_module._PRESSURE_CANDIDATES * candidate + cleanup
+    )
+
+
+def test_pressure_entry_refuses_when_current_budget_is_below_derived_floor(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        claim_timeout = 0.05
+        budget = kernel_module._PRESSURE_CEILING_S + claim_timeout - 0.01
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=claim_timeout,
+            delivery_budget_s=budget,
+            delivery_lease_ttl_s=1.0,
+            delivery_lease_heartbeat_s=0.3,
+            runner_total_timeout_s=30.0,
+        ) as h:
+            candidate = await _safe_pressure_candidate(h, "tLowBudgetCandidate")
+
+            def scan_must_not_run(**_kwargs: object) -> object:
+                raise AssertionError("insufficient budget reached pressure inventory")
+
+            monkeypatch.setattr(
+                h.substrate._affinity,  # noqa: SLF001
+                "pressure_candidates",
+                scan_must_not_run,
+            )
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = "pressure-low-budget"
+            lease = await _pressure_lease(h, event_id)
+
+            await h.kernel.process_event(
+                _qevent("start", thread="tLowBudgetTrigger", event_id=event_id),
+                lease=lease,
+            )
+
+            assert h.substrate.lookup(_thread_key("tLowBudgetCandidate")) == candidate
+            assert candidate.claim_name not in h.fake_k8s.deleted_claims
+
+    asyncio.run(go())
+
+
+def test_scan_cap_emits_one_incomplete_pressure_outcome(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _capture_pressure_outcomes(monkeypatch)
+    monkeypatch.setattr(kernel_module, "_PRESSURE_SCAN_RECORDS", 0)
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            candidate = await _safe_pressure_candidate(h, "tScanCapCandidate")
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            event_id = "pressure-scan-cap"
+            lease = await _pressure_lease(h, event_id)
+
+            await h.kernel.process_event(
+                _qevent("start", thread="tScanCapTrigger", event_id=event_id),
+                lease=lease,
+            )
+
+            assert h.substrate.lookup(_thread_key("tScanCapCandidate")) == candidate
+            assert candidate.claim_name not in h.fake_k8s.deleted_claims
+            assert outcomes == ["scan-incomplete"]
+
+    asyncio.run(go())
+
+
+def test_expiry_unsupported_is_a_declared_finite_pressure_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = _capture_pressure_outcomes(monkeypatch)
+
+    kernel_module.Kernel._record_pressure_outcome("expiry-unsupported")
+
+    assert outcomes == ["expiry-unsupported"]
+
+
 def test_quota_refusal_keeps_operator_accounting_out_of_the_reply(
     make_harness, caplog
 ) -> None:
     """The quota's identity and numbers go to the log, never to the person.
 
-    #2434: the reply body interpolated `quota_name`, `resource`, `requested`,
-    `used` and `hard` verbatim, and on 2026-09-06 that reached a customer Slack
-    channel three times. Those five fields are operator data -- they say nothing
+    #2434: the reply body interpolated the quota identity and accounting maps
+    verbatim, and on 2026-09-06 that reached a customer Slack channel three
+    times. Those fields are operator data -- they say nothing
     to whoever asked the question, and they disclose cluster capacity to anyone
     who can talk to the bot.
 
@@ -2954,10 +4393,9 @@ def test_quota_refusal_keeps_operator_accounting_out_of_the_reply(
             # time, say) and fail for the wrong reason.
             rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
-                resource="limits.cpu",
-                requested="11",
-                used="47",
-                hard="53",
+                requested={"limits.cpu": "11"},
+                used={"limits.cpu": "47"},
+                hard={"limits.cpu": "53"},
             )
             h.fake_k8s.quota_rejection = rejection
 
@@ -2967,14 +4405,14 @@ def test_quota_refusal_keeps_operator_accounting_out_of_the_reply(
             # Read off the rejection rather than retyping literals, so the two
             # halves of the boundary cannot drift apart.
             reply = h.sink.updates[-1][2]
-            for leaked in (
+            for leaked in {
                 rejection.quota_name,
-                rejection.resource,
-                rejection.requested,
-                rejection.used,
-                rejection.hard,
+                *rejection.requested,
+                *rejection.requested.values(),
+                *rejection.used.values(),
+                *rejection.hard.values(),
                 "ResourceQuota",
-            ):
+            }:
                 assert leaked not in reply, (
                     f"the capacity refusal must not carry {leaked!r}: it is operator "
                     f"data and this text is read by a customer. Got: {reply!r}"
@@ -2987,7 +4425,6 @@ def test_quota_refusal_keeps_operator_accounting_out_of_the_reply(
             logged = "\n".join(record.getMessage() for record in caplog.records)
             for kept in (
                 f"quota={rejection.quota_name}",
-                f"resource={rejection.resource}",
                 f"requested={rejection.requested}",
                 f"used={rejection.used}",
                 f"hard={rejection.hard}",
@@ -3001,7 +4438,10 @@ def test_quota_refusal_keeps_operator_accounting_out_of_the_reply(
     asyncio.run(go())
 
 
-def test_approval_resume_capacity_retries_then_escalates(make_harness) -> None:
+def test_approval_resume_capacity_retries_then_escalates(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def go() -> None:
         async with make_harness(
             max_attempts=3,
@@ -3009,15 +4449,24 @@ def test_approval_resume_capacity_retries_then_escalates(make_harness) -> None:
             claim_timeout_seconds=0.05,
         ) as h:
             thread = "t-approval-capacity"
+            candidate = await _safe_pressure_candidate(h, "tApprovalSafeCandidate")
             await asyncio.to_thread(h.substrate.claim, thread)
             await asyncio.to_thread(h.substrate.suspend, thread, history_ref="history-1")
+
+            def scan_must_not_run(**_kwargs: object) -> object:
+                raise AssertionError("approval resume reached pressure inventory")
+
+            monkeypatch.setattr(
+                h.substrate._affinity,  # noqa: SLF001
+                "pressure_candidates",
+                scan_must_not_run,
+            )
             h.fake_k8s.claim_envs.clear()
             h.fake_k8s.quota_rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
-                resource="limits.cpu",
-                requested="1",
-                used="8",
-                hard="8",
+                requested={"limits.cpu": "NaN"},
+                used={"limits.cpu": "8"},
+                hard={"limits.cpu": "8"},
             )
             endpoint = "http://127.0.0.1:43199"
             ev = _qevent(
@@ -3040,6 +4489,7 @@ def test_approval_resume_capacity_retries_then_escalates(make_harness) -> None:
                 )
             ]
             assert h.sink.update_endpoints == [endpoint]
+            assert h.substrate.lookup(_thread_key("tApprovalSafeCandidate")) == candidate
             assert h.kernel._order_locks == {}
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
 
@@ -3844,6 +5294,7 @@ def test_lock_acquire_timeout_is_a_retryable_turn_start_failure(make_harness) ->
             qe = _qevent("go", thread=thread)
             outcome = await h.kernel._attempt(
                 qe, TargetRoute(), release_order,
+                pressure_retried=False,
                 workspace_inference=kernel_module._WorkspaceInferenceCarry(),
             )
 
@@ -3906,6 +5357,11 @@ _LEASE_KNOBS: dict[str, object] = {
     "delivery_lease_ttl_s": _LEASE_TTL_S,
     "delivery_lease_heartbeat_s": 0.3,
     "runner_total_timeout_s": 30.0,
+}
+
+_PRESSURE_LEASE_KNOBS: dict[str, object] = {
+    **_LEASE_KNOBS,
+    "delivery_budget_s": 120.0,
 }
 
 
@@ -4290,6 +5746,7 @@ def test_stream_timeout_classifies_as_runner_timeout_with_a_named_reason(
                         qe,
                         TargetRoute(),
                         release_order,
+                        pressure_retried=False,
                         workspace_inference=kernel_module._WorkspaceInferenceCarry(),
                     )
             finally:
@@ -4450,6 +5907,7 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
             with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
                 outcome = await h.kernel._attempt(
                     qe, TargetRoute(), lambda: None,
+                    pressure_retried=False,
                     workspace_inference=kernel_module._WorkspaceInferenceCarry(),
                 )
 

@@ -46,6 +46,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -91,6 +92,7 @@ from .types import (
     MANAGED_BY_VALUE,
     ClaimView,
     OperatingMode,
+    QuotaRejection,
     SandboxError,
     SandboxView,
     filter_agent_child_env,
@@ -117,6 +119,10 @@ logger = logging.getLogger(__name__)
 # The runner listens on this fixed port inside every container; the host port it
 # is published to is Docker-assigned and read back per-container.
 RUNNER_CONTAINER_PORT = 8080
+_DOCKER_CONTROL_TIMEOUT_S = 30.0
+_DOCKER_CREATE_TIMEOUT_S = 90.0
+_DOCKER_IMAGE_PULL_TIMEOUT_S = 300.0
+_LIST_INSPECTION_TIMEOUT_S = 30.0
 
 # Declared boot keys this substrate produces. Docker is the OTel producer here
 # (the chart's env block is its Kubernetes counterpart), and the runner parses
@@ -475,7 +481,10 @@ class DockerSandboxClient:
         args.append(self._image)
 
         try:
-            self._docker(args)
+            self._docker(
+                args,
+                request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+            )
         except DockerError:
             # A failed boot must not leak staged claim data.
             self._cleanup_bundle(name)
@@ -483,12 +492,15 @@ class DockerSandboxClient:
             self._cleanup_attachments(name)
             raise
 
-    def get_claim(self, name: str) -> ClaimView | None:
-        inspected = self._inspect(name)
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        deadline = time.monotonic() + request_timeout_seconds
+        inspected = self._inspect(name, deadline=deadline)
         if inspected is None:
             return None
         status, _labels, created = inspected
-        ready = status == "running" and self._healthz_ok(name)
+        ready = status == "running" and self._healthz_ok(name, deadline=deadline)
         return ClaimView(
             name=name,
             ready=ready,
@@ -504,9 +516,13 @@ class DockerSandboxClient:
             ready_message=None,
         )
 
-    def delete_claim(self, name: str) -> None:
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
         # -f removes a running/paused container too; ignore "no such container".
-        self._docker(["rm", "-f", name], check=False)
+        self._docker(
+            ["rm", "-f", name],
+            request_timeout_seconds=request_timeout_seconds,
+            check=False,
+        )
         self._cleanup_bundle(name)
         self._cleanup_workspace(name)
         self._cleanup_attachments(name)
@@ -520,20 +536,26 @@ class DockerSandboxClient:
                 f"label={label_selector}",
                 "--format",
                 "{{.Names}}",
-            ]
+            ],
+            request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
         )
         names = [line.strip() for line in out.splitlines() if line.strip()]
         views: list[ClaimView] = []
         for cname in names:
-            view = self.get_claim(cname)
+            view = self.get_claim(
+                cname, request_timeout_seconds=_LIST_INSPECTION_TIMEOUT_S
+            )
             if view is not None:
                 views.append(view)
         return views
 
     # -- sandbox lifecycle ----------------------------------------------------
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
-        inspected = self._inspect(name)
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        deadline = time.monotonic() + request_timeout_seconds
+        inspected = self._inspect(name, deadline=deadline)
         if inspected is None:
             return None
         # A Sandbox has no age question; this unpacks three only because
@@ -549,7 +571,7 @@ class DockerSandboxClient:
             operating_mode = "Running"
         else:
             return None
-        endpoint = self._dial_endpoint(name)
+        endpoint = self._dial_endpoint(name, deadline=deadline)
         return SandboxView(
             name=name,
             ready=status == "running",
@@ -560,11 +582,24 @@ class DockerSandboxClient:
             port=endpoint[1] if endpoint is not None else None,
         )
 
+    def quota_has_headroom(
+        self,
+        rejection: QuotaRejection,
+        *,
+        request_timeout_seconds: float,
+    ) -> bool:
+        del rejection, request_timeout_seconds
+        return False
+
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:
         # Docker has no cold suspend; pause freezes the process while keeping the
         # published port, which is all the substrate's liveness check reads back.
         verb = "pause" if mode == "Suspended" else "unpause"
-        self._docker([verb, name], check=False)
+        self._docker(
+            [verb, name],
+            request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+            check=False,
+        )
 
     # -- helpers --------------------------------------------------------------
 
@@ -754,7 +789,9 @@ class DockerSandboxClient:
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def _inspect(self, name: str) -> tuple[str, dict[str, str], datetime | None] | None:
+    def _inspect(
+        self, name: str, *, deadline: float
+    ) -> tuple[str, dict[str, str], datetime | None] | None:
         """(status, labels, created) for the container, or None when it does not
         exist.
 
@@ -768,6 +805,7 @@ class DockerSandboxClient:
                 "{{.State.Status}}\t{{json .Config.Labels}}\t{{.Created}}",
                 name,
             ],
+            request_timeout_seconds=self._remaining_seconds(deadline),
             check=False,
         )
         if not out.strip():
@@ -778,8 +816,12 @@ class DockerSandboxClient:
         labels = {str(k): str(v) for k, v in labels_raw.items()}
         return status, labels, _parse_created(created_raw)
 
-    def _published_port(self, name: str) -> int | None:
-        out = self._docker(["port", name, f"{RUNNER_CONTAINER_PORT}/tcp"], check=False)
+    def _published_port(self, name: str, *, deadline: float) -> int | None:
+        out = self._docker(
+            ["port", name, f"{RUNNER_CONTAINER_PORT}/tcp"],
+            request_timeout_seconds=self._remaining_seconds(deadline),
+            check=False,
+        )
         for line in out.splitlines():
             line = line.strip()
             if not line:
@@ -790,7 +832,7 @@ class DockerSandboxClient:
                 return int(port)
         return None
 
-    def _container_ip(self, name: str) -> str | None:
+    def _container_ip(self, name: str, *, deadline: float) -> str | None:
         """The runner's IP on the configured docker network, or None.
 
         A host-networked worker *container* on Docker Desktop (macOS/Windows)
@@ -806,6 +848,7 @@ class DockerSandboxClient:
             return None
         out = self._docker(
             ["inspect", "--format", "{{json .NetworkSettings.Networks}}", name],
+            request_timeout_seconds=self._remaining_seconds(deadline),
             check=False,
         )
         if not out.strip():
@@ -823,38 +866,62 @@ class DockerSandboxClient:
         ip = entry.get("IPAddress") if isinstance(entry, dict) else None
         return ip or None
 
-    def _dial_endpoint(self, name: str) -> tuple[str, int] | None:
+    def _dial_endpoint(
+        self, name: str, *, deadline: float
+    ) -> tuple[str, int] | None:
         """(host, port) the worker reaches the runner on, or None if not yet
         dialable. Prefer the container's shared-network address (reachable from
         a Docker Desktop VM netns); fall back to the Docker-assigned loopback
         host port for a host-process worker with no shared network."""
-        ip = self._container_ip(name)
+        ip = self._container_ip(name, deadline=deadline)
         if ip is not None:
             return ip, RUNNER_CONTAINER_PORT
-        port = self._published_port(name)
+        port = self._published_port(name, deadline=deadline)
         if port is None:
             return None
         return self._host, port
 
-    def _healthz_ok(self, name: str) -> bool:
-        endpoint = self._dial_endpoint(name)
+    def _healthz_ok(self, name: str, *, deadline: float) -> bool:
+        endpoint = self._dial_endpoint(name, deadline=deadline)
         if endpoint is None:
             return False
         host, port = endpoint
         url = f"http://{host}:{port}/healthz"
         try:
-            with urllib.request.urlopen(url, timeout=self._healthz_timeout_s) as resp:
+            remaining = self._remaining_seconds(deadline)
+            timeout = min(self._healthz_timeout_s, remaining)
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
                 return bool(200 <= resp.status < 300)
         except (urllib.error.URLError, OSError):
             return False
 
-    def _docker(self, args: list[str], *, check: bool = True) -> str:
-        proc = subprocess.run(  # noqa: S603 -- fixed argv, no shell.
-            ["docker", *args],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+    @staticmethod
+    def _remaining_seconds(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DockerError("docker request deadline expired")
+        return remaining
+
+    def _docker(
+        self,
+        args: list[str],
+        *,
+        request_timeout_seconds: float,
+        check: bool = True,
+    ) -> str:
+        try:
+            proc = subprocess.run(  # noqa: S603 -- fixed argv, no shell.
+                ["docker", *args],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=request_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Never echo args: they may carry CURIE_CREDENTIALS.
+            raise DockerError(
+                f"docker {args[0]} exceeded its request timeout"
+            ) from exc
         if proc.returncode != 0:
             if check:
                 stderr = proc.stderr.strip()
@@ -903,10 +970,17 @@ class DockerSandboxClient:
         later at claim time.
         """
         try:
-            present = self._docker(["image", "inspect", self._image], check=False)
+            present = self._docker(
+                ["image", "inspect", self._image],
+                request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+                check=False,
+            )
             if present.strip():
                 return
-            self._docker(["pull", self._image])
+            self._docker(
+                ["pull", self._image],
+                request_timeout_seconds=_DOCKER_IMAGE_PULL_TIMEOUT_S,
+            )
         except (DockerError, OSError):
             # Log the image name only -- never the argv or stderr (house rule
             # above: args may carry credentials).

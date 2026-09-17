@@ -67,9 +67,12 @@ from curie_worker.eval import (
 from curie_worker.eval import stream as eval_stream_module
 from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
-from curie_worker.sandbox.types import ClaimView, SandboxError, SandboxView
+from curie_worker.sandbox.types import ClaimView, QuotaRejection, SandboxError, SandboxView
 from opentelemetry import trace
 from redis.asyncio import Redis as AsyncRedis
+from redis.asyncio.retry import Retry as AsyncRetry
+from redis.backoff import NoBackoff
+from redis.maint_notifications import MaintNotificationsConfig
 
 CONTAINS = GraderKind.CONTAINS
 
@@ -161,7 +164,10 @@ class _FakeK8s:
             pool=pool,
         )
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
             return None
@@ -176,7 +182,8 @@ class _FakeK8s:
             ready_message=None,
         )
 
-    def delete_claim(self, name: str) -> None:
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        assert request_timeout_seconds > 0
         self.claims.pop(name, None)
         self.deleted.append(name)
 
@@ -185,17 +192,30 @@ class _FakeK8s:
         out = []
         for claim in self.claims.values():
             if claim.labels.get(key) == value:
-                view = self.get_claim(claim.name)
+                view = self.get_claim(claim.name, request_timeout_seconds=1.0)
                 assert view is not None
                 out.append(view)
         return out
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        assert request_timeout_seconds > 0
         if not any(c.sandbox_name == name for c in self.claims.values()):
             return None
         return SandboxView(
             name=name, ready=True, service_fqdn="127.0.0.1", operating_mode="Running"
         )
+
+    def quota_has_headroom(
+        self,
+        rejection: QuotaRejection,
+        *,
+        request_timeout_seconds: float,
+    ) -> bool:
+        del rejection
+        assert 0 < request_timeout_seconds <= 1.0
+        return False
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:  # pragma: no cover - unused here
         pass
@@ -815,10 +835,25 @@ def test_provisioned_runner_end_to_end(
             sync_client = redis.Redis(
                 host=_VH, port=_VP, password=_VPW or None, decode_responses=False
             )
+            pressure_client = AsyncRedis(
+                host=_VH,
+                port=_VP,
+                password=_VPW or None,
+                decode_responses=False,
+                socket_timeout=1.0,
+                socket_connect_timeout=1.0,
+                retry=AsyncRetry(NoBackoff(), 0),
+                driver_info=None,
+                maint_notifications_config=MaintNotificationsConfig(enabled=False),
+            )
             fake_k8s = _FakeK8s()
             substrate = SandboxSubstrate(
                 fake_k8s,  # type: ignore[arg-type]
-                AffinityStore(sync_client, key_prefix=sandbox_prefix),
+                AffinityStore(
+                    sync_client,
+                    pressure_client=pressure_client,
+                    key_prefix=sandbox_prefix,
+                ),
                 SubstrateConfig(
                     namespace="test-ns",
                     warm_pool="test-pool",
@@ -884,6 +919,7 @@ def test_provisioned_runner_end_to_end(
             if keys:
                 sync_client.delete(*keys)
             sync_client.close()
+            await pressure_client.aclose()
             await client.aclose()
 
     asyncio.run(go())
@@ -1706,8 +1742,23 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
     monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
     fake_k8s = _FakeK8s()
     sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
+    sync_client = redis.Redis(
+        host=_VH, port=_VP, password=_VPW or None, decode_responses=False
+    )
+    pressure_client = AsyncRedis(
+        host=_VH,
+        port=_VP,
+        password=_VPW or None,
+        decode_responses=False,
+        socket_timeout=1.0,
+        socket_connect_timeout=1.0,
+        retry=AsyncRetry(NoBackoff(), 0),
+        driver_info=None,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
     affinity = AffinityStore(
-        redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False),
+        sync_client,
+        pressure_client=pressure_client,
         key_prefix=sandbox_prefix,
     )
     substrate = SandboxSubstrate(
@@ -1738,7 +1789,11 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
 
     async def go() -> None:
-        await consumer._run_and_report(item, "test-stream-id")
+        try:
+            await consumer._run_and_report(item, "test-stream-id")
+        finally:
+            await pressure_client.aclose()
+            sync_client.close()
 
     asyncio.run(go())
     assert fake_k8s.created_pools == ["curie-agent-acme-a-runner-pool"]
@@ -1759,7 +1814,8 @@ class _DelayedDeleteK8s(_FakeK8s):
     sandbox_gets: dict[str, int] = field(default_factory=dict)
     lingering_sandboxes: dict[str, str] = field(default_factory=dict)
 
-    def delete_claim(self, name: str) -> None:
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None or name in self.claim_gets:
             return
@@ -1768,15 +1824,19 @@ class _DelayedDeleteK8s(_FakeK8s):
         self.lingering_sandboxes[claim.sandbox_name] = name
         self.deleted.append(name)
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
         if name in self.claim_gets:
             self.claim_gets[name] += 1
             if self.claim_gets[name] >= self.claim_gone_after_gets:
                 self.claims.pop(name, None)
                 return None
-        return super().get_claim(name)
+        return super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
         if name in self.sandbox_gets:
             self.sandbox_gets[name] += 1
             if self.sandbox_gets[name] >= self.sandbox_gone_after_gets:
@@ -1785,7 +1845,7 @@ class _DelayedDeleteK8s(_FakeK8s):
             return SandboxView(
                 name=name, ready=True, service_fqdn="127.0.0.1", operating_mode="Running"
             )
-        return super().get_sandbox(name)
+        return super().get_sandbox(name, request_timeout_seconds=request_timeout_seconds)
 
 
 def test_eval_suite_waits_until_the_released_claim_is_gone(monkeypatch) -> None:
@@ -1803,8 +1863,23 @@ def test_eval_suite_waits_until_the_released_claim_is_gone(monkeypatch) -> None:
     monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
     fake_k8s = _DelayedDeleteK8s(claim_gone_after_gets=2, sandbox_gone_after_gets=4)
     sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
+    sync_client = redis.Redis(
+        host=_VH, port=_VP, password=_VPW or None, decode_responses=False
+    )
+    pressure_client = AsyncRedis(
+        host=_VH,
+        port=_VP,
+        password=_VPW or None,
+        decode_responses=False,
+        socket_timeout=1.0,
+        socket_connect_timeout=1.0,
+        retry=AsyncRetry(NoBackoff(), 0),
+        driver_info=None,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
     affinity = AffinityStore(
-        redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False),
+        sync_client,
+        pressure_client=pressure_client,
         key_prefix=sandbox_prefix,
     )
     substrate = SandboxSubstrate(
@@ -1837,7 +1912,11 @@ def test_eval_suite_waits_until_the_released_claim_is_gone(monkeypatch) -> None:
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
 
     async def go() -> None:
-        await consumer._run_and_report(item, "test-stream-id")
+        try:
+            await consumer._run_and_report(item, "test-stream-id")
+        finally:
+            await pressure_client.aclose()
+            sync_client.close()
 
     asyncio.run(go())
     assert fake_k8s.deleted, "eval must still issue the claim delete"

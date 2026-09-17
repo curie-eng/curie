@@ -2767,6 +2767,7 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
                 TargetRoute(),
                 lambda: None,
                 remaining_s=17.25,
+                pressure_retried=False,
                 workspace_inference=_WorkspaceInferenceCarry(),
             )
 
@@ -4412,4 +4413,3 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
             assert "unexpected approval route" not in h.sink.last_text
 
     asyncio.run(go())
-

@@ -62,6 +62,9 @@ from curie_worker.sandbox import (
 from curie_worker.sandbox.types import ClaimView, SandboxView
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
+from redis.asyncio.retry import Retry as AsyncRetry
+from redis.backoff import NoBackoff
+from redis.maint_notifications import MaintNotificationsConfig
 
 # ``sync_redis`` and ``names`` (the per-test-unique stream / group / key
 # prefixes on the shared Valkey) live in ``tests/conftest.py``: they are used
@@ -313,8 +316,12 @@ class FakeK8s:
     claims: dict[str, _FakeClaim] = field(default_factory=dict)
     sandboxes: dict[str, _FakeSandbox] = field(default_factory=dict)
     claim_envs: list[dict[str, str] | None] = field(default_factory=list)
+    deleted_claims: list[str] = field(default_factory=list)
     bind_ready: bool = True
     quota_rejection: QuotaRejection | None = None
+    quota_claim_capacity: int | None = None
+    quota_headroom_results: list[bool | BaseException] = field(default_factory=list)
+    quota_headroom_calls: list[tuple[QuotaRejection, float]] = field(default_factory=list)
     ready_reason: str | None = None
     ready_message: str | None = None
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
@@ -362,12 +369,19 @@ class FakeK8s:
     ) -> None:
         self.claim_envs.append(env)
         sandbox_name = f"sbx-{name}"
+        quota_rejection = self.quota_rejection
+        if (
+            quota_rejection is not None
+            and self.quota_claim_capacity is not None
+            and len(self.claims) < self.quota_claim_capacity
+        ):
+            quota_rejection = None
         self.claims[name] = _FakeClaim(
             name=name,
             sandbox_name=sandbox_name,
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
-            ready=self.bind_ready and self.quota_rejection is None,
-            quota_rejection=self.quota_rejection,
+            ready=self.bind_ready and quota_rejection is None,
+            quota_rejection=quota_rejection,
             ready_reason=self.ready_reason,
             ready_message=self.ready_message,
         )
@@ -375,7 +389,10 @@ class FakeK8s:
             name=sandbox_name, port=self._take_port(sandbox_name)
         )
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
             return None
@@ -390,9 +407,11 @@ class FakeK8s:
             ready_message=claim.ready_message,
         )
 
-    def delete_claim(self, name: str) -> None:
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        assert request_timeout_seconds > 0
         claim = self.claims.pop(name, None)
         if claim is not None:
+            self.deleted_claims.append(name)
             self.sandboxes.pop(claim.sandbox_name, None)
 
     def list_claims(self, *, label_selector: str) -> list[ClaimView]:
@@ -400,12 +419,15 @@ class FakeK8s:
         out = []
         for claim in self.claims.values():
             if claim.labels.get(key) == value:
-                view = self.get_claim(claim.name)
+                view = self.get_claim(claim.name, request_timeout_seconds=1.0)
                 assert view is not None
                 out.append(view)
         return out
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        assert request_timeout_seconds > 0
         sandbox = self.sandboxes.get(name)
         if sandbox is None:
             return None
@@ -423,6 +445,21 @@ class FakeK8s:
             operating_mode=sandbox.operating_mode,
             port=sandbox.port,
         )
+
+    def quota_has_headroom(
+        self,
+        rejection: QuotaRejection,
+        *,
+        request_timeout_seconds: float,
+    ) -> bool:
+        assert 0 < request_timeout_seconds <= 1.0
+        self.quota_headroom_calls.append((rejection, request_timeout_seconds))
+        if not self.quota_headroom_results:
+            return False
+        result = self.quota_headroom_results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode
@@ -464,6 +501,7 @@ class FakeRunner:
         self.status_fails = False
         # When set, /status answers 200 with no ``turn_active`` field.
         self.status_malformed = False
+        self.status_delay_seconds = 0.0
         self.turn_scripts: list[list[OutboundEvent]] = []
         self.default_script: list[OutboundEvent] = [Final(text="ok", status=SessionStatus.DONE)]
         self.opened: list[str] = []
@@ -483,6 +521,8 @@ class FakeRunner:
 
     async def _status(self, request: web.Request) -> web.Response:
         self.status_headers.append(dict(request.headers))
+        if self.status_delay_seconds > 0:
+            await asyncio.sleep(self.status_delay_seconds)
         if self.status_fails:
             return web.json_response({"error": "boom"}, status=500)
         if self.status_malformed:
@@ -759,9 +799,24 @@ async def kernel_harness(
     fleet_port = _closed_port() if per_sandbox_runners else port
 
     fake_k8s = FakeK8s(runner_ports=list(runners))
+    pressure_async_redis: AsyncRedis = AsyncRedis(
+        host=_VALKEY_HOST,
+        port=_VALKEY_PORT,
+        password=_VALKEY_PW or None,
+        decode_responses=True,
+        socket_timeout=1.0,
+        socket_connect_timeout=1.0,
+        retry=AsyncRetry(NoBackoff(), 0),
+        driver_info=None,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
     substrate = SandboxSubstrate(
         fake_k8s,  # type: ignore[arg-type]
-        AffinityStore(sync_redis, key_prefix=names["sandbox_prefix"]),
+        AffinityStore(
+            sync_redis,
+            pressure_client=pressure_async_redis,
+            key_prefix=names["sandbox_prefix"],
+        ),
         SubstrateConfig(
             namespace="test-ns",
             warm_pool="test-pool",
@@ -794,6 +849,13 @@ async def kernel_harness(
             ttl_ms=config.lock_ttl_ms,
             acquire_timeout_s=config.lock_acquire_timeout_s,
             poll_interval_s=config.lock_poll_interval_s,
+        ),
+        pressure_lock=ThreadLock(
+            pressure_async_redis,
+            ttl_ms=config.lock_ttl_ms,
+            acquire_timeout_s=0.1,
+            poll_interval_s=0.02,
+            owner=None,
         ),
         markers=Markers(async_redis, config),
         config=config,
@@ -831,6 +893,8 @@ async def kernel_harness(
             await runner_client.close()
         with contextlib.suppress(Exception):
             await async_redis.aclose()
+        with contextlib.suppress(Exception):
+            await pressure_async_redis.aclose()
         with contextlib.suppress(Exception):
             await server.close()
         # Every per-sandbox server too: a missed close leaks an aiohttp site for

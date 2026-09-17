@@ -481,7 +481,10 @@ from curie_worker.sandbox import (
 
 substrate = SandboxSubstrate(
     KubernetesSandboxClient(namespace),          # or any SandboxClient impl
-    AffinityStore(redis_client),                 # the compose/chart Valkey
+    AffinityStore(
+        redis_client,
+        pressure_client=pressure_redis_client,
+    ),                                           # bounded async pressure lane
     SubstrateConfig(namespace=..., warm_pool="<release>-runner-pool"),
 )
 
@@ -494,6 +497,41 @@ substrate.reap_orphans()              # periodic tick: claims with no live route
 ```
 
 Contract notes the kernel must know:
+
+Quota pressure reclamation runs only after a real ResourceQuota refusal and
+only when the remaining delivery budget is at least 70 seconds plus
+`claim_timeout_seconds`. A lower budget returns the capacity response without
+scanning. Reclamation adds no periodic timer, scheduler, or warm pool.
+
+The rejection retains every exceeded resource and its requested, used, and
+hard quantity. Before scanning, the worker validates the complete map with
+Kubernetes quantity semantics, including CPU DecimalSI, memory BinarySI, pod
+counts, and combined rejections. Invalid or incomplete evidence returns the
+capacity response with `outcome=refused-invalid-quota` and performs no pressure
+Redis call or deletion.
+
+After one exact idle route is detached and deleted, the worker polls the exact
+named ResourceQuota in its configured namespace within the existing 20 second
+cleanup window. It retries only when live spec and status hard limits agree and
+every rejected resource has enough current headroom. The worker Role grants
+only namespaced `get` on core `resourcequotas`. A missing permission, malformed
+quantity, mismatched spec and status limits, or timeout fails closed. The
+rejected claim or another quota can consume the freed capacity before the full
+retry. That bounded race records `reclaimed-retry-refused`; it does not delete
+another victim or schedule work.
+
+The inventory scans at most eight pages with a SCAN `COUNT` hint of 8192,
+roughly 65,000 keys in the whole logical database. `COUNT` is approximate. A
+separate limit counts at most 256 matching route keys before filtering, so
+suspended routes count toward it, and at most four candidates are probed. A
+database outside either finite window fails closed. Alert on
+`curie.sandbox.lifecycle` with `operation=reclaim` and
+`outcome=scan-incomplete`. Redis or Valkey before 7.0 does not support
+`PEXPIRETIME`, so the pass returns `expiry-unsupported`.
+
+On a terminal pressure timeout, cancellation is delivered once and victim lock
+release can add one finite cold pressure Redis operation, at most four seconds.
+That tail consumes unused claim reserve and never authorizes requester retry.
 
 - **One live session per thread.** `claim()` is claim-or-adopt: a lost
   creation race deletes the loser's claim and returns the winner's handle. The

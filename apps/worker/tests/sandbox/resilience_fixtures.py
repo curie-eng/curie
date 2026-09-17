@@ -9,6 +9,7 @@ these fixtures and always run.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import time
@@ -45,11 +46,25 @@ def resilience_substrate(cfg: ResilienceConfig) -> Iterator[object]:
         SandboxSubstrate,
         SubstrateConfig,
     )
+    from redis.asyncio import Redis as AsyncRedis
+    from redis.asyncio.retry import Retry as AsyncRetry
+    from redis.backoff import NoBackoff
+    from redis.maint_notifications import MaintNotificationsConfig
 
     client = redis.Redis(
         host=cfg.valkey_host,
         port=cfg.valkey_port,
         password=cfg.valkey_password,
+    )
+    pressure_client = AsyncRedis(
+        host=cfg.valkey_host,
+        port=cfg.valkey_port,
+        password=cfg.valkey_password,
+        socket_timeout=1.0,
+        socket_connect_timeout=1.0,
+        retry=AsyncRetry(NoBackoff(), 0),
+        driver_info=None,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
     )
     client.ping()
     prefix = "soak:curie:sandbox"
@@ -62,13 +77,14 @@ def resilience_substrate(cfg: ResilienceConfig) -> Iterator[object]:
     )
     yield SandboxSubstrate(
         KubernetesSandboxClient(cfg.namespace),
-        AffinityStore(client, key_prefix=prefix),
+        AffinityStore(client, pressure_client=pressure_client, key_prefix=prefix),
         config,
     )
     keys = list(client.scan_iter(match=f"{prefix}:*"))
     if keys:
         client.delete(*keys)
     client.close()
+    asyncio.run(pressure_client.aclose())
 
 
 @pytest.fixture(name="pool_ready")

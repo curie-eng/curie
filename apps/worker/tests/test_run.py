@@ -381,10 +381,19 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     monkeypatch, runner_endpoint: str | None, expected_endpoint: str | None
 ) -> None:
     calls: list[list[str]] = []
+
+    def capture_docker(
+        _self: DockerSandboxClient,
+        args: list[str],
+        *,
+        request_timeout_seconds: float,
+    ) -> str:
+        assert request_timeout_seconds > 0
+        calls.append(args)
+        return ""
+
     monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
-    monkeypatch.setattr(
-        DockerSandboxClient, "_docker", lambda self, args: calls.append(args) or ""
-    )
+    monkeypatch.setattr(DockerSandboxClient, "_docker", capture_docker)
     env = {
         "CURIE_SANDBOX_SUBSTRATE": "docker",
         "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318",
@@ -1010,6 +1019,7 @@ class _FakeRuntime:
         self.sink = _FakeTransport()
         self.eval_http = _FakeTransport()
         self.async_redis = _FakeTransport()
+        self.pressure_async_redis = _FakeTransport()
         self.eval_redis = _FakeTransport()
         self.engine = _FakeTransport()
 
@@ -1168,6 +1178,70 @@ def test_valkey_kwargs_carries_host_port_password_db_unchanged() -> None:
     assert kwargs["password"] == "s3cret"
     assert kwargs["db"] == 2
     assert kwargs["ssl"] is True
+
+
+def test_build_wires_dedicated_single_attempt_pressure_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    sync_redis: redis.Redis,
+) -> None:
+    endpoint = sync_redis.connection_pool.connection_kwargs
+    config = WorkerConfig(
+        fake_model=True,
+        valkey_host=str(endpoint["host"]),
+        valkey_port=int(endpoint["port"]),
+        valkey_password=str(endpoint.get("password") or ""),
+        valkey_db=int(endpoint.get("db", 0)),
+        s3_access_key="PLACEHOLDER",
+        s3_secret_key="PLACEHOLDER",
+    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+
+    async def exercise() -> None:
+        runtime = run.build(config, {"CURIE_SANDBOX_SUBSTRATE": "docker"})
+        affinity_redis = runtime.consumer._kernel._substrate._affinity._redis
+        try:
+            assert isinstance(runtime.async_redis, redis.asyncio.Redis)
+            assert isinstance(runtime.pressure_async_redis, redis.asyncio.Redis)
+            assert isinstance(runtime.eval_redis, redis.asyncio.Redis)
+            assert isinstance(affinity_redis, redis.Redis)
+            assert runtime.pressure_async_redis is not runtime.async_redis
+            assert runtime.pressure_async_redis is not runtime.eval_redis
+
+            pressure_kwargs = (
+                runtime.pressure_async_redis.connection_pool.connection_kwargs
+            )
+            assert pressure_kwargs["socket_timeout"] == 1.0
+            assert pressure_kwargs["socket_connect_timeout"] == 1.0
+            assert pressure_kwargs["retry"].get_retries() == 0
+            assert pressure_kwargs["driver_info"] is None
+            assert await runtime.async_redis.ping()
+            assert await runtime.pressure_async_redis.ping()
+            assert await runtime.eval_redis.ping()
+            assert await asyncio.to_thread(affinity_redis.ping)
+            pressure_connection = (
+                await runtime.pressure_async_redis.connection_pool.get_connection()
+            )
+            try:
+                assert pressure_connection.driver_info is None
+                assert pressure_connection.retry.get_retries() == 0
+                # Redis 8.1 normalizes an explicitly disabled configuration to
+                # no connection handler rather than retaining the input object.
+                assert pressure_connection.maint_notifications_config is None
+            finally:
+                await runtime.pressure_async_redis.connection_pool.release(
+                    pressure_connection
+                )
+        finally:
+            affinity_redis.close()
+            await runtime.runner.close()
+            await runtime.sink.aclose()
+            await runtime.eval_http.aclose()
+            await runtime.async_redis.aclose()
+            await runtime.pressure_async_redis.aclose()
+            await runtime.eval_redis.aclose()
+            await runtime.engine.dispose()
+
+    asyncio.run(exercise())
 
 
 # --- VALKEY_TLS env -> WorkerConfig.valkey_tls (the seam the chart actually

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from curie_worker.bundle_store import extract_bundle
+from curie_worker.sandbox import QuotaRejection
 from curie_worker.sandbox.docker import (
     RUNNER_CONTAINER_PORT,
     DockerError,
@@ -37,6 +38,24 @@ def _plugin_tar_gz(wrapper: str | None) -> bytes:
         info.size = len(manifest)
         tf.addfile(info, io.BytesIO(manifest))
     return buf.getvalue()
+
+
+def test_docker_cannot_prove_kubernetes_quota_headroom() -> None:
+    client = _RecordingDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(),
+    )
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"limits.cpu": "1"},
+        used={"limits.cpu": "8"},
+        hard={"limits.cpu": "8"},
+    )
+
+    assert not client.quota_has_headroom(
+        rejection,
+        request_timeout_seconds=1.0,
+    )
 
 
 def test_create_claim_argv_carries_boot_env() -> None:
@@ -398,16 +417,19 @@ def test_get_sandbox_reports_published_port_and_mode() -> None:
         "inspect": "running\t{}\t2026-08-16T12:00:00.123456789Z",
         "port": "127.0.0.1:49173\n",
     }
-    view = client.get_sandbox("t1")
+    view = client.get_sandbox("t1", request_timeout_seconds=1.0)
     assert view is not None
     assert view.service_fqdn == "127.0.0.1"
     assert view.port == 49173
     assert view.operating_mode == "Running"
+    assert client.timeouts
+    assert all(0 < timeout <= 1.0 for timeout in client.timeouts)
 
     client.outputs["inspect"] = "paused\t{}\t2026-08-16T12:00:00.123456789Z"
-    paused = client.get_sandbox("t1")
+    paused = client.get_sandbox("t1", request_timeout_seconds=1.0)
     assert paused is not None
     assert paused.operating_mode == "Suspended"
+    assert all(0 < timeout <= 1.0 for timeout in client.timeouts)
 
 
 def test_get_claim_surfaces_the_container_created_at() -> None:
@@ -422,7 +444,7 @@ def test_get_claim_surfaces_the_container_created_at() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.outputs = {"inspect": "running\t{}\t2026-08-16T12:00:00.123456789Z", "port": ""}
 
-    view = client.get_claim("t1")
+    view = client.get_claim("t1", request_timeout_seconds=1.0)
     assert view is not None
     assert view.quota_rejection is None
     assert view.ready_reason is None
@@ -439,7 +461,7 @@ def test_get_claim_surfaces_the_container_created_at() -> None:
 def test_get_sandbox_none_when_container_absent() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.outputs = {"inspect": ""}  # docker inspect on a missing container
-    assert client.get_sandbox("gone") is None
+    assert client.get_sandbox("gone", request_timeout_seconds=1.0) is None
 
 
 def test_get_sandbox_treats_dead_container_as_gone() -> None:
@@ -451,7 +473,7 @@ def test_get_sandbox_treats_dead_container_as_gone() -> None:
             "inspect": f"{dead}\t{{}}\t2026-08-16T12:00:00.123456789Z",
             "port": "",
         }
-        assert client.get_sandbox("t1") is None, dead
+        assert client.get_sandbox("t1", request_timeout_seconds=1.0) is None, dead
 
 
 class _NetworkAwareDocker(DockerSandboxClient):
@@ -462,7 +484,14 @@ class _NetworkAwareDocker(DockerSandboxClient):
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self._networks_json = networks_json
 
-    def _docker(self, args: list[str], *, check: bool = True) -> str:
+    def _docker(
+        self,
+        args: list[str],
+        *,
+        request_timeout_seconds: float,
+        check: bool = True,
+    ) -> str:
+        assert request_timeout_seconds > 0
         if args and args[0] == "inspect":
             if any("NetworkSettings.Networks" in a for a in args):
                 return self._networks_json
@@ -482,7 +511,7 @@ def test_get_sandbox_dials_container_ip_on_shared_network() -> None:
         network="curie_default",
         networks_json='{"curie_default": {"IPAddress": "172.20.0.11"}}',
     )
-    view = client.get_sandbox("t1")
+    view = client.get_sandbox("t1", request_timeout_seconds=1.0)
     assert view is not None
     assert view.service_fqdn == "172.20.0.11"
     assert view.port == RUNNER_CONTAINER_PORT  # not the Docker-assigned host port
@@ -498,7 +527,7 @@ def test_get_sandbox_falls_back_to_published_port_without_network_ip() -> None:
         network="curie_default",
         networks_json="{}",
     )
-    view = client.get_sandbox("t1")
+    view = client.get_sandbox("t1", request_timeout_seconds=1.0)
     assert view is not None
     assert view.service_fqdn == "127.0.0.1"
     assert view.port == 49173
@@ -756,7 +785,14 @@ def test_ensure_image_is_best_effort_on_pull_failure(caplog) -> None:
             super().__init__(**kwargs)  # type: ignore[arg-type]
             self.calls: list[list[str]] = []
 
-        def _docker(self, args: list[str], *, check: bool = True) -> str:
+        def _docker(
+            self,
+            args: list[str],
+            *,
+            request_timeout_seconds: float,
+            check: bool = True,
+        ) -> str:
+            assert request_timeout_seconds > 0
             self.calls.append(args)
             if args[0] == "pull":
                 raise DockerError("docker pull failed (1): SENTINEL_STDERR_LEAK")
@@ -782,7 +818,14 @@ def test_ensure_image_is_best_effort_when_docker_unavailable(caplog) -> None:
             super().__init__(**kwargs)  # type: ignore[arg-type]
             self.calls: list[list[str]] = []
 
-        def _docker(self, args: list[str], *, check: bool = True) -> str:
+        def _docker(
+            self,
+            args: list[str],
+            *,
+            request_timeout_seconds: float,
+            check: bool = True,
+        ) -> str:
+            assert request_timeout_seconds > 0
             self.calls.append(args)
             if args[:2] == ["image", "inspect"]:
                 # subprocess.run(["docker", ...]) raises this when the docker
@@ -822,7 +865,10 @@ def test_missing_runner_network_error_carries_a_remediation_hint(monkeypatch) ->
         network="curie_runner",
     )
     try:
-        client._docker(["run", "--rm", "curie-runner"])
+        client._docker(
+            ["run", "--rm", "curie-runner"],
+            request_timeout_seconds=30.0,
+        )
         raise AssertionError("expected DockerError")
     except _DockerError as exc:
         assert "curie_runner" in str(exc)

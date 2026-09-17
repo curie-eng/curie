@@ -56,6 +56,11 @@ rules:
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["get", "patch"]
+  # Pressure recovery reads only the exact quota named by the rejected claim.
+  # The worker never lists, watches, or changes ResourceQuota objects.
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get"]
 {{- if .Values.worker.connectorReconciler.enabled }}
 {{/*
 ADR-0090: the connector reconciler converges each agent's connector objects

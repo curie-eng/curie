@@ -117,14 +117,19 @@ from .runner_client import (
     TurnStream,
 )
 from .sandbox import SandboxSubstrate
+from .sandbox.quota import quota_rejection_is_valid
 from .sandbox.types import (
     CapacityExhaustedError,
+    PressureCandidate,
+    QuotaRejection,
     RouteChangedError,
+    RouteRecord,
+    RouteState,
     SandboxError,
     SandboxHandle,
     SuspendedThreadError,
 )
-from .threadlock import ThreadLock
+from .threadlock import LockAcquireTimeout, LockLeaseLost, ThreadLock
 from .workspace import (
     WORKSPACES_DISABLED_REFUSAL,
     WorkspaceClaimCoordinator,
@@ -172,6 +177,7 @@ _UNAVAILABLE_ATTACHMENT_REPLY = (
     "I could not make that file available to the agent. "
     "Please send the message again with the file attached."
 )
+_CAPACITY_REPLY = "This agent is at capacity right now. Please try again shortly."
 _REVIEW_EVENT_ID_RE = re.compile(
     r"github-feedback-"
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -470,6 +476,67 @@ _RECLAIM_PREFLIGHT_POLL_S = 0.05
 # grace covers scheduling and returning its result without leaving a worker
 # thread blocked forever if the loop stops servicing callbacks.
 _HANDOFF_REVALIDATION_BRIDGE_GRACE_S = 1.0
+
+# Capacity pressure is deliberately a one shot, fixed envelope. The async Redis
+# client disables retries and optional handshake commands. Cancellation closes
+# its actual I/O, so the wall slices below also bound a multi reply pipeline.
+# The cold operation value documents the worst configured handshake: connect,
+# optional AUTH, optional SELECT, and the command response.
+_PRESSURE_REDIS_CONNECT_S = 1.0
+_PRESSURE_REDIS_READ_S = 1.0
+_PRESSURE_REDIS_COLD_OPERATION_S = (
+    _PRESSURE_REDIS_CONNECT_S + 3 * _PRESSURE_REDIS_READ_S
+)
+_PRESSURE_SCAN_DEADLINE_S = 2.0
+# Affinity uses an approximate SCAN COUNT hint of 8192. Eight pages cover about
+# 65,000 database keys. This separate cap counts matching route keys before
+# safety filtering, including suspended routes.
+_PRESSURE_SCAN_PAGES = 8
+_PRESSURE_SCAN_RECORDS = 256
+_PRESSURE_CANDIDATES = 4
+_PRESSURE_RUNNER_STATUS_S = 1.0
+_PRESSURE_DELETE_S = 5.0
+_PRESSURE_GONE_WAIT_S = 15.0
+
+# Inventory is async and its timeout cancels and disconnects the Redis I/O.
+_PRESSURE_INVENTORY_CEILING_S = _PRESSURE_SCAN_DEADLINE_S
+# One candidate permits a cold lock command and cold affinity command, then a
+# runner probe and three warm Redis responses for detach, ownership, and
+# release. Reconnect churn is still cut off by this hard wall slice.
+# A terminal wall cancellation is delivered once. ThreadLock then releases the
+# victim lock with one finite operation that can cost one cold Redis bound, four
+# seconds. That tail consumes unused claim reserve and never authorizes retry.
+_PRESSURE_CANDIDATE_CEILING_S = (
+    2 * _PRESSURE_REDIS_COLD_OPERATION_S
+    + _PRESSURE_RUNNER_STATUS_S
+    + 3 * _PRESSURE_REDIS_READ_S
+)
+_PRESSURE_CLEANUP_CEILING_S = _PRESSURE_DELETE_S + _PRESSURE_GONE_WAIT_S
+_PRESSURE_CEILING_S = (
+    _PRESSURE_INVENTORY_CEILING_S
+    + _PRESSURE_CANDIDATES * _PRESSURE_CANDIDATE_CEILING_S
+    + _PRESSURE_CLEANUP_CEILING_S
+)
+
+_PRESSURE_OUTCOMES = frozenset(
+    {
+        "expiry-unsupported",
+        "race-lost",
+        "reclaimed",
+        "reclaimed-retry-refused",
+        "refused-invalid-quota",
+        "refused-no-budget",
+        "refused-no-safe-route",
+        "scan-incomplete",
+        "timeout",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _PressureResult:
+    reclaimed: bool
+    outcome: str
 
 
 class ReclaimPreflightUnsafe(RuntimeError):
@@ -968,6 +1035,7 @@ class Kernel:
         runner: RunnerClient,
         sink: ReplySink,
         lock: ThreadLock,
+        pressure_lock: ThreadLock,
         markers: Markers,
         config: WorkerConfig,
         binding: BindingResolver | None = None,
@@ -994,6 +1062,7 @@ class Kernel:
         # the reply-sink ContextVar suppresses that nested observation.
         self._sink = ObservedReplySink(sink)
         self._lock = lock
+        self._pressure_lock = pressure_lock
         self._markers = markers
         self._config = config
         # Deployment-to-runtime binding and the kill switch are optional: when
@@ -1698,6 +1767,7 @@ class Kernel:
                     workspace_deployment_id,
                     agent_name,
                     remaining_s=_remaining_budget(lease),
+                    pressure_retried=False,
                     workspace_inference=workspace_inference,
                 )
 
@@ -2599,9 +2669,11 @@ class Kernel:
         agent_name: str | None = None,
         *,
         remaining_s: float | None = None,
+        pressure_retried: bool,
         workspace_inference: _WorkspaceInferenceCarry,
     ) -> TurnOutcome:
         thread_key = _thread_key_for(qevent)
+        attempt_started = time.monotonic()
 
         # Surface a booting state on the placeholder so the (up to claim_timeout)
         # cold-boot wait is not silent. Best-effort and outside the per-thread lock:
@@ -2650,6 +2722,10 @@ class Kernel:
             if routed is not None and routed.turn is not None:
                 self._unregister_run(agent_id, thread_key)
                 routed.turn.close()
+
+        def record_reclaimed_retry() -> None:
+            if pressure_retried:
+                self._record_pressure_outcome("reclaimed")
 
         try:
             try:
@@ -2727,36 +2803,83 @@ class Kernel:
                 close_routed_turn()
                 raise
         except CapacityExhaustedError as exc:
-            release_order()
             rejection = exc.rejection
             logger.warning(
-                "sandbox capacity exhausted for event %s: quota=%s resource=%s "
+                "sandbox capacity exhausted for event %s: quota=%s "
                 "requested=%s used=%s hard=%s",
                 qevent.event_id,
                 rejection.quota_name,
-                rejection.resource,
                 rejection.requested,
                 rejection.used,
                 rejection.hard,
             )
             if self._is_approval_resume(qevent.event_id):
+                release_order()
                 return TurnOutcome(terminal_ok=False, classification="runner-error")
-            # Quota accounting is operator data and stops at the log line
-            # above (#2434). The quota's name, the resource axis and the three
-            # usage numbers reached a customer Slack channel verbatim on
-            # 2026-09-06; they say nothing to the person who asked a question
-            # and they disclose cluster capacity to anyone who can talk to the
-            # bot. `rejection` is still fully logged for the operator.
-            await self._reply_for(
+            if pressure_retried:
+                self._record_pressure_outcome("reclaimed-retry-refused")
+                release_order()
+                await self._reply_for(qevent, route, _CAPACITY_REPLY)
+                return TurnOutcome(terminal_ok=True)
+
+            if not quota_rejection_is_valid(rejection):
+                self._record_pressure_outcome("refused-invalid-quota")
+                release_order()
+                await self._reply_for(qevent, route, _CAPACITY_REPLY)
+                return TurnOutcome(terminal_ok=True)
+
+            pressure_started = time.monotonic()
+            current_remaining = (
+                None
+                if remaining_s is None
+                else remaining_s - (pressure_started - attempt_started)
+            )
+            required = _PRESSURE_CEILING_S + self._substrate.claim_timeout_seconds
+            if current_remaining is None or current_remaining < required:
+                self._record_pressure_outcome("refused-no-budget")
+                release_order()
+                await self._reply_for(qevent, route, _CAPACITY_REPLY)
+                return TurnOutcome(terminal_ok=True)
+
+            reclaimed = await self._reclaim_idle_route(
+                thread_key,
+                rejection,
+                remaining_s=current_remaining,
+            )
+            if not reclaimed.reclaimed:
+                self._record_pressure_outcome(reclaimed.outcome)
+                release_order()
+                await self._reply_for(qevent, route, _CAPACITY_REPLY)
+                return TurnOutcome(terminal_ok=True)
+
+            retry_remaining = current_remaining - (
+                time.monotonic() - pressure_started
+            )
+            if retry_remaining <= 0:
+                self._record_pressure_outcome("timeout")
+                release_order()
+                await self._reply_for(qevent, route, _CAPACITY_REPLY)
+                return TurnOutcome(terminal_ok=True)
+            logger.info(
+                "idle route reclamation freed sandbox capacity; retrying event %s",
+                qevent.event_id,
+            )
+            return await self._attempt(
                 qevent,
                 route,
-                (
-                    "This agent is at capacity right now. It frees up when "
-                    "another conversation finishes, so please try again shortly."
-                ),
+                release_order,
+                boot_env,
+                agent_id,
+                nav,
+                packs,
+                workspace_deployment_id,
+                agent_name,
+                remaining_s=retry_remaining,
+                pressure_retried=True,
+                workspace_inference=workspace_inference,
             )
-            return TurnOutcome(terminal_ok=True)
         except PendingPublicationError as exc:
+            record_reclaimed_retry()
             release_order()
             logger.info(
                 "pending publication refused a new turn for agent=%s deployment=%s "
@@ -2768,6 +2891,7 @@ class Kernel:
             await self._reply_for(qevent, route, exc.public_detail)
             return TurnOutcome(terminal_ok=True)
         except WorkspaceSelectionRefused as exc:
+            record_reclaimed_retry()
             release_order()
             # LOG it, not only reply (#2004). This was the one turn-ending branch
             # in this handler that ended a turn silently, and it ends it with no
@@ -2806,6 +2930,7 @@ class Kernel:
             # pointing an operator at a runner that never saw the fault. Retry
             # behavior is deliberately identical (`workspace-error` is
             # retryable); only the name and the log line change.
+            record_reclaimed_retry()
             release_order()
             self._log_workspace_start_failure(
                 qevent,
@@ -2817,6 +2942,7 @@ class Kernel:
             )
             return TurnOutcome(terminal_ok=False, classification="workspace-error")
         except AttachmentResolutionError as exc:
+            record_reclaimed_retry()
             release_order()
             reason = redact_text(_exception_reason(exc))[:_ESCALATION_DETAIL_MAX]
             logger.warning(
@@ -2839,10 +2965,12 @@ class Kernel:
             # outcome so process_event backs off and retries within max_attempts,
             # instead of letting the entry escape to the consumer and sit pending
             # for the whole reclaim window.
+            record_reclaimed_retry()
             release_order()
             logger.warning("turn start failed for %s: %r", qevent.event_id, exc)
             return TurnOutcome(terminal_ok=False, classification="runner-error")
         assert routed is not None
+        record_reclaimed_retry()
         try:
             release_order()
         except BaseException:
@@ -3748,6 +3876,211 @@ class Kernel:
             logger.warning("runner status carried no usable turn_active: %r", status)
             return True
         return active
+
+    @staticmethod
+    def _record_pressure_outcome(outcome: str) -> None:
+        """Emit one bounded, identifier free result for a pressure attempt."""
+
+        if outcome not in _PRESSURE_OUTCOMES:
+            outcome = "timeout"
+        record_metric(
+            "curie.sandbox.lifecycle",
+            attributes={
+                "service.name": "curie-worker",
+                "operation": "reclaim",
+                "outcome": outcome,
+            },
+        )
+
+    def _pressure_record_is_safe(
+        self, candidate: PressureCandidate, record: RouteRecord
+    ) -> bool:
+        """Fail closed unless the persisted route itself permits reclamation."""
+
+        handle = record.handle
+        return (
+            record.state is RouteState.LIVE
+            and handle.thread_key == candidate.thread_key
+            and handle.namespace == self._substrate.namespace
+            and isinstance(handle.history_ref, str)
+            and bool(handle.history_ref.strip())
+            and bool(handle.token)
+            and handle.workspace_repo is None
+            and handle.workspace_materialized_head is None
+            and handle.publication_visible_outcome_revision == 0
+        )
+
+    @staticmethod
+    def _pressure_status_is_safe(status: dict[str, object]) -> bool:
+        """Accept only an inactive durable runner in a completed idle state."""
+
+        return (
+            status.get("turn_active") is False
+            and status.get("history_durable") is True
+            and status.get("status")
+            in {
+                SessionStatus.DONE.value,
+                SessionStatus.IDLE_AWAITING_INPUT.value,
+            }
+        )
+
+    async def _reclaim_idle_route(
+        self,
+        requesting_thread_key: str,
+        rejection: QuotaRejection,
+        *,
+        remaining_s: float,
+    ) -> _PressureResult:
+        """Detach and delete at most one proven safe idle route."""
+
+        pressure_deadline = time.monotonic() + min(
+            remaining_s, _PRESSURE_CEILING_S
+        )
+        try:
+            async with asyncio.timeout_at(pressure_deadline):
+                return await self._reclaim_idle_route_before_deadline(
+                    requesting_thread_key,
+                    rejection,
+                    pressure_deadline=pressure_deadline,
+                )
+        except TimeoutError:
+            return _PressureResult(False, "timeout")
+
+    async def _reclaim_idle_route_before_deadline(
+        self,
+        requesting_thread_key: str,
+        rejection: QuotaRejection,
+        *,
+        pressure_deadline: float,
+    ) -> _PressureResult:
+        """Run one pressure pass under the caller's hard async deadline."""
+
+        inventory_deadline = min(
+            pressure_deadline,
+            time.monotonic() + _PRESSURE_SCAN_DEADLINE_S,
+        )
+        try:
+            async with asyncio.timeout_at(inventory_deadline):
+                inventory = await self._substrate.pressure_candidates(
+                    max_pages=_PRESSURE_SCAN_PAGES,
+                    max_records=_PRESSURE_SCAN_RECORDS,
+                    deadline=inventory_deadline,
+                )
+        except Exception as exc:  # noqa: BLE001 - pressure inventory fails closed
+            logger.warning(
+                "idle route reclamation inventory failed: %s",
+                type(exc).__name__,
+            )
+            return _PressureResult(False, "timeout")
+
+        if inventory.outcome != "complete":
+            return _PressureResult(False, inventory.outcome)
+
+        saw_race = False
+        candidates = tuple(
+            candidate
+            for candidate in inventory.candidates
+            if candidate.thread_key != requesting_thread_key
+        )[:_PRESSURE_CANDIDATES]
+        for candidate in candidates:
+            if time.monotonic() >= pressure_deadline:
+                return _PressureResult(False, "timeout")
+            candidate_deadline = min(
+                pressure_deadline,
+                time.monotonic() + _PRESSURE_CANDIDATE_CEILING_S,
+            )
+            detached: RouteRecord | None = None
+            detach_result_unknown = False
+            try:
+                async with asyncio.timeout_at(candidate_deadline):
+                    async with self._pressure_lock.hold(
+                        self._config.lock_key(candidate.thread_key)
+                    ) as lease:
+                        record = await self._substrate.pressure_get(
+                            candidate.thread_key
+                        )
+                        if record is None or not self._pressure_record_is_safe(
+                            candidate, record
+                        ):
+                            continue
+                        status_remaining = min(
+                            _PRESSURE_RUNNER_STATUS_S,
+                            candidate_deadline - time.monotonic(),
+                        )
+                        if status_remaining <= 0:
+                            raise TimeoutError
+                        try:
+                            status = await self._runner.status(
+                                record.handle.base_url,
+                                token=record.handle.token,
+                                remaining_s=status_remaining,
+                            )
+                        except (TimeoutError, aiohttp.ClientError) as exc:
+                            logger.warning(
+                                "idle route reclamation skipped an unreadable "
+                                "runner status: %s",
+                                type(exc).__name__,
+                            )
+                            continue
+                        if not self._pressure_status_is_safe(status):
+                            continue
+                        try:
+                            detached_now = (
+                                await self._substrate.detach_if_unchanged(
+                                    candidate.thread_key,
+                                    expected_claim=record.handle.claim_name,
+                                    expected_generation=record.handle.generation,
+                                    expected_expires_at_ms=candidate.expires_at_ms,
+                                    lock_key=lease.key,
+                                    lock_token=lease.token,
+                                )
+                            )
+                        except Exception:
+                            detach_result_unknown = True
+                            raise
+                        if not detached_now:
+                            saw_race = True
+                            continue
+                        detached = record
+            except (LockAcquireTimeout, LockLeaseLost):
+                if detach_result_unknown:
+                    return _PressureResult(False, "timeout")
+                saw_race = True
+            except TimeoutError:
+                return _PressureResult(False, "timeout")
+            except Exception as exc:  # noqa: BLE001 - an unreadable candidate is unsafe
+                if detach_result_unknown:
+                    logger.warning(
+                        "idle route reclamation detach result was unknown: %s",
+                        type(exc).__name__,
+                    )
+                    return _PressureResult(False, "timeout")
+                logger.warning(
+                    "idle route reclamation skipped an unreadable candidate: %s",
+                    type(exc).__name__,
+                )
+
+            if detached is None:
+                continue
+            cleanup_deadline = min(
+                pressure_deadline,
+                time.monotonic() + _PRESSURE_CLEANUP_CEILING_S,
+            )
+            try:
+                async with asyncio.timeout_at(cleanup_deadline):
+                    deleted = await asyncio.to_thread(
+                        self._substrate.delete_detached,
+                        detached,
+                        rejection,
+                        deadline=cleanup_deadline,
+                    )
+            except TimeoutError:
+                return _PressureResult(False, "timeout")
+            return _PressureResult(deleted, "reclaimed" if deleted else "timeout")
+
+        if saw_race:
+            return _PressureResult(False, "race-lost")
+        return _PressureResult(False, "refused-no-safe-route")
 
     async def _cold_handoff_readiness(
         self,
