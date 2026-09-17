@@ -526,7 +526,11 @@ pub fn resolve_local_resources(
 
 fn merged_compose_config(resources: &LocalResources, build: bool) -> Result<serde_json::Value> {
     let mut cmd = std::process::Command::new("docker");
-    cmd.arg("compose").arg("-p").arg(&resources.project);
+    cmd.arg("compose")
+        .arg("--profile")
+        .arg("full")
+        .arg("-p")
+        .arg(&resources.project);
     for file in &resources.compose_files {
         cmd.arg("-f").arg(file);
     }
