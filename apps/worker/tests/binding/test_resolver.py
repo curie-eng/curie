@@ -1375,7 +1375,7 @@ def test_resolves_connector_secrets_into_boot_env() -> None:
     asyncio.run(go())
 
 
-def test_reads_thinking_for_eval_boots_by_agent_id() -> None:
+def test_reads_model_settings_for_eval_boots_by_agent_id() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
@@ -1396,21 +1396,27 @@ def test_reads_thinking_for_eval_boots_by_agent_id() -> None:
             try:
                 async with engine.begin() as conn:
                     await conn.execute(
-                        text(f"UPDATE {_SCHEMA}.agents SET thinking = :thinking WHERE id = :id"),
-                        {"thinking": "high", "id": agent_id},
+                        text(
+                            f"UPDATE {_SCHEMA}.agents "
+                            "SET model = :model, thinking = :thinking WHERE id = :id"
+                        ),
+                        {"model": "agent_model", "thinking": "high", "id": agent_id},
                     )
 
                 resolver = _resolver(engine)
-                assert await resolver.thinking_for(agent_id) == "high"
+                assert await resolver.model_settings_for(agent_id) == ("agent_model", "high")
 
                 async with engine.begin() as conn:
                     await conn.execute(
-                        text(f"UPDATE {_SCHEMA}.agents SET thinking = NULL WHERE id = :id"),
+                        text(
+                            f"UPDATE {_SCHEMA}.agents "
+                            "SET model = NULL, thinking = NULL WHERE id = :id"
+                        ),
                         {"id": agent_id},
                     )
 
-                assert await resolver.thinking_for(agent_id) is None
-                assert await resolver.thinking_for(uuid.uuid4()) is None
+                assert await resolver.model_settings_for(agent_id) == (None, None)
+                assert await resolver.model_settings_for(uuid.uuid4()) == (None, None)
             finally:
                 await _cleanup(engine, [agent_id])
         finally:

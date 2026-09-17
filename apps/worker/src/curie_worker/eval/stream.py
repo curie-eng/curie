@@ -547,7 +547,19 @@ class EvalStreamConsumer(StreamConsumer):
             )
 
         suite = loaded.suite
-        model = self._eval_model(item)
+        thinking: str | None = None
+        if item.target_url is None:
+            stored_model, thinking = await self._repo_lookup.model_settings_for(item.agent_id)
+            resolved_model = (
+                item.model
+                if item.model is not None
+                else (
+                    stored_model if stored_model is not None else (self._config.model or None)
+                )
+            )
+        else:
+            resolved_model = item.model
+        model = self._eval_model(item, resolved_model)
         if loaded.trajectory_error is not None:
             result = EvalRunResult(
                 version=item.sha,
@@ -571,7 +583,9 @@ class EvalStreamConsumer(StreamConsumer):
             await self._report(item, repo, result, stream_id=stream_id)
             return result
 
-        base_url, release_key, token = await self._acquire_target(item)
+        base_url, release_key, token = await self._acquire_target(
+            item, model=resolved_model, thinking=thinking
+        )
         if base_url is None:
             return await self._report_failed(
                 item, repo, "runner provisioning failed", stream_id=stream_id
@@ -683,7 +697,9 @@ class EvalStreamConsumer(StreamConsumer):
         )
         return None if files is None else _select_scorer(files)
 
-    async def _acquire_target(self, item: EvalJob) -> tuple[str | None, str | None, str | None]:
+    async def _acquire_target(
+        self, item: EvalJob, *, model: str | None, thinking: str | None
+    ) -> tuple[str | None, str | None, str | None]:
         if item.target_url is not None:
             # dev/test shortcut: eval a given runner. Not a claim of ours, so no
             # token -- the driver omits the header (only-when-configured).
@@ -691,10 +707,9 @@ class EvalStreamConsumer(StreamConsumer):
         release_key = f"eval-{uuid.uuid4().hex}"
         try:
             connector_secrets = await self._repo_lookup.secrets_for(item.agent_id)
-            thinking = await self._repo_lookup.thinking_for(item.agent_id)
             name_for = getattr(self._repo_lookup, "name_for", None)
             agent_name = await name_for(item.agent_id) if name_for is not None else None
-            env = self._boot_env(item, connector_secrets, thinking)
+            env = self._boot_env(item, connector_secrets, thinking, model=model)
             # Hold a claim slot only across creation/binding (the flood source),
             # not the whole suite run: the semaphore is released the moment the
             # claim binds, so the bound sandbox runs its cases while the next
@@ -712,11 +727,11 @@ class EvalStreamConsumer(StreamConsumer):
             return None, None, None
         return handle.base_url, release_key, handle.token or None
 
-    def _eval_model(self, item: EvalJob) -> str | None:
+    def _eval_model(self, item: EvalJob, model: str | None) -> str | None:
         """The model dimension for this run: the caller-requested ``item.model``
         when set (#526, a sweep pins each run to a distinct model), else the model
-        the eval's runner is booted with (``config.model``, the same value
-        ``apply_model_env`` forwards as ``CURIE_MODEL``). The dev/test
+        the eval's runner is booted with after stored and platform settings are
+        resolved. The dev/test
         ``target_url`` shortcut evals a runner we did not boot, so unless the caller
         named a model its model is unknown and left unlabelled.
 
@@ -737,15 +752,15 @@ class EvalStreamConsumer(StreamConsumer):
                     item.model,
                 )
             return None
-        if item.model is not None:
-            return item.model
-        return self._config.model or None
+        return model
 
     def _boot_env(
         self,
         item: EvalJob,
-        connector_secrets: dict[str, str] | None = None,
-        thinking: str | None = None,
+        connector_secrets: dict[str, str] | None,
+        thinking: str | None,
+        *,
+        model: str | None,
     ) -> dict[str, str]:
         budget = Budget(
             max_output_tokens_per_run=self._config.default_max_output_tokens_per_run,
@@ -769,14 +784,12 @@ class EvalStreamConsumer(StreamConsumer):
         # this write site hardened identically to binding.boot_env. The values are
         # resolved by the async caller (they need a DB lookup) and passed in.
         inject_connector_secrets(env, connector_secrets, agent_label=item.agent_id)
-        # A caller-requested model (#526) wins over the worker default so the
-        # provisioned sandbox actually runs the model this sweep row is measuring;
-        # _eval_model tags the same value, keeping the boot and the matrix label
-        # in lock-step. None falls back to config.model exactly as before.
+        # The model was resolved once above the boot and label paths so both use
+        # the same sweep, stored, or platform setting.
         apply_model_env(
             env,
             self._config,
-            model_override=item.model,
+            model_override=model,
             thinking_override=thinking,
         )
         return env
