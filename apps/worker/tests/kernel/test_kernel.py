@@ -17,6 +17,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 import redis
 from aci_protocol import (
@@ -31,8 +32,11 @@ from aci_protocol import (
     ToolNote,
     TurnSource,
 )
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
 from curie_worker import kernel as kernel_module
+from curie_worker.actions import ActionClient
 from curie_worker.attachments import PreparedAttachments
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import ThreadBusyError
@@ -5799,6 +5803,79 @@ def test_stream_timeout_after_a_side_effect_escalates_without_retry(make_harness
             assert "runner-timeout" in h.sink.last_text
             assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_buffered_runner_eof_does_not_release_action_recording_from_turn_deadline(
+    make_harness,
+) -> None:
+    """A side effect recorder remains inside the runner turn deadline."""
+
+    async def go() -> None:
+        accepted = asyncio.Event()
+        release = asyncio.Event()
+        handler_done = asyncio.Event()
+        bodies: list[dict[str, object]] = []
+        app = web.Application()
+
+        async def record_action(request: web.Request) -> web.Response:
+            bodies.append(await request.json())
+            accepted.set()
+            try:
+                await release.wait()
+                return web.json_response(
+                    {"id": "action-example", "status": "pending"}, status=201
+                )
+            finally:
+                handler_done.set()
+
+        app.add_routes([web.post("/actions", record_action)])
+        server = TestServer(app)
+        await server.start_server()
+        http_client = httpx.AsyncClient(timeout=None)
+        actions = ActionClient(
+            api_base_url=f"http://127.0.0.1:{server.port}",
+            api_key="",
+            client=http_client,
+        )
+        try:
+            async with make_harness(
+                actions=actions,
+                runner_total_timeout_s=0.5,
+                max_attempts=3,
+            ) as h:
+                h.runner.default_script = [
+                    SideEffectFlag(
+                        tool="deploy",
+                        call_id="action-call-example",
+                        detail="deployment started",
+                    ),
+                    Final(text="done", status=DONE),
+                ]
+                event = _qevent("do it", thread="tBufferedActionTimeout")
+                started = asyncio.get_running_loop().time()
+                await asyncio.wait_for(h.kernel.process_event(event), timeout=3.0)
+                elapsed = asyncio.get_running_loop().time() - started
+
+                assert accepted.is_set()
+                assert len(bodies) == 1
+                assert bodies[0]["call_id"] == "action-call-example"
+                assert h.runner.opened == ["do it"]
+                assert elapsed < 2.0
+                assert h.sink.last_text is not None
+                assert "human" in h.sink.last_text.lower()
+                assert "runner-timeout" in h.sink.last_text
+                assert len(h.sink.completions) == 1
+                assert await h.async_redis.exists(
+                    h.config.side_effect_key(event.event_id)
+                )
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+        finally:
+            release.set()
+            await http_client.aclose()
+            await asyncio.wait_for(handler_done.wait(), timeout=1.0)
+            await server.close()
 
     asyncio.run(go())
 
