@@ -3757,6 +3757,42 @@ def test_publication_revision_refuses_a_checkout_not_at_the_lineage_head(
     assert current["version"] == 2
 
 
+def test_lineage_advance_success_clears_an_earlier_attempt_error(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id="thread-lineage-error",
+            dedupe_key="lineage-error-cleared",
+        ),
+    )
+    assert _resolve(client, auth_headers, publication["approval_id"]).status_code == 200
+    # The worker's bounded retry records the failed attempt's error, as store.retry does.
+    _execute(
+        "UPDATE curie.publications SET error = 'publication lineage endpoint is unreachable', "
+        "reconcile_attempts = reconcile_attempts + 1 WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    assert _rows(
+        "SELECT status, error FROM curie.publications WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    ) == [{"status": "succeeded", "error": None}]
+
+
 def test_lineage_advance_refuses_a_worker_whose_publication_lease_was_reclaimed(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],

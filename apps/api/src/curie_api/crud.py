@@ -1512,6 +1512,8 @@ async def advance_publication_lineage(
         "terminal_at": func.now(),
         "updated_at": func.now(),
         "result_url": data.pr_url,
+        # Success replaces an earlier attempt's error, as the worker CAS did.
+        "error": None,
     }
     if terminal_state:
         publication_values["error"] = (
