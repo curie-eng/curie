@@ -1142,6 +1142,23 @@ fn local_rung_honors_isolated_compose_project_and_ordered_files() {
 }
 
 #[test]
+fn connector_local_rungs_bind_routes_immediately_before_captured_deploy() {
+    for (rung, bundle) in [
+        ("rung_local", "$WORKDIR/bundle"),
+        ("rung_local_release", "$WORKDIR/bundle-release"),
+    ] {
+        let function = ladder_function(rung);
+        let contract = format!(
+            "if connector_mode; then\n        bind_local_connector_approval_routes \"{bundle}\"\n    fi\n    capture_local_deploy \"{bundle}\""
+        );
+        assert!(
+            function.contains(&contract),
+            "{rung} must bind every retained connector route under connector_mode immediately before the status-preserving deploy capture:\n{function}"
+        );
+    }
+}
+
+#[test]
 fn local_rung_sandbox_sweep_is_project_scoped() {
     let teardown = ladder();
     assert!(
@@ -2223,6 +2240,10 @@ print(json.dumps({
         ;;
     "--json local deploy --plugin-dir "*)
         printf '%s' "$bundle_dir" > "$STUB_STATE/last_plugin_dir"
+        if [ "${STUB_LOCAL_DEPLOY_REFUSAL:-0}" = "1" ]; then
+            printf '%s\n' '{"error":"refusing connector deploy: missing approval route sre-approvals","fix":"curie local approvals acme-bot --route-resolution sre-approvals=C0LOCALDEV"}'
+            exit 2
+        fi
         emit_deploy "${STUB_LOCAL_SHA256:-$(sha_of_bundle "$bundle_dir")}"
         ;;
     "--json cluster deploy --namespace "*" --release "*" --plugin-dir "*)
@@ -2602,12 +2623,61 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
         .env_remove("STUB_UNAVAILABLE_EXIT")
         .env_remove("STUB_UNAVAILABLE_NO_FIX")
         .env_remove("STUB_UNAVAILABLE_MARKER")
+        .env_remove("STUB_LOCAL_DEPLOY_REFUSAL")
         .env_remove("STUB_UNKNOWN_TRACE_EXIT")
         .env_remove("STUB_UNKNOWN_TRACE_NO_FIX");
     for (key, value) in envs {
         command.env(key, value);
     }
     command.output().expect("run the real ladder script")
+}
+
+#[test]
+fn capture_local_deploy_reprints_refusal_before_exit_trap_and_preserves_status() {
+    let harness = tempfile::tempdir().expect("create deploy capture harness directory");
+    write_ladder_stubs(harness.path());
+    let bundle = harness.path().join("bundle");
+    fs::create_dir_all(&bundle).expect("create stub bundle directory");
+    let function = ladder_function("capture_local_deploy");
+    let script = format!(
+        r#"set -euo pipefail
+BIN={}
+deploy_json=''
+{}
+trap 'code=$?; printf "EXIT_TRAP status=%s\n" "$code"; exit "$code"' EXIT
+capture_local_deploy {}
+"#,
+        sh_single_quote(&harness.path().join("curie")),
+        function,
+        sh_single_quote(&bundle),
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("STUB_STATE", harness.path())
+        .env("STUB_LOCAL_DEPLOY_REFUSAL", "1")
+        .output()
+        .expect("run status-preserving local deploy capture");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let refusal = r#"{"error":"refusing connector deploy: missing approval route sre-approvals","fix":"curie local approvals acme-bot --route-resolution sre-approvals=C0LOCALDEV"}"#;
+    let refusal_at = stdout
+        .find(refusal)
+        .unwrap_or_else(|| panic!("capture must reprint the refusal JSON; stdout:\n{stdout}"));
+    let trap_at = stdout
+        .find("EXIT_TRAP status=2")
+        .unwrap_or_else(|| panic!("the EXIT trap must observe status 2; stdout:\n{stdout}"));
+    assert!(
+        refusal_at < trap_at,
+        "refusal JSON must be visible before teardown observes the failure; \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "capture must return the deploy refusal status unchanged; \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 }
 
 fn run_eval_argument_control(trajectory: bool) -> (Output, String) {
