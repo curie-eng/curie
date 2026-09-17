@@ -1115,6 +1115,48 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
 }
 
 #[test]
+fn local_rung_honors_isolated_compose_project_and_ordered_files() {
+    let source = ladder();
+    let local_rung = ladder_function("rung_local");
+    assert!(
+        (source.contains("$COMPOSE_PROJECT_NAME") || source.contains("${COMPOSE_PROJECT_NAME"))
+            && (source.contains("$COMPOSE_FILE") || source.contains("${COMPOSE_FILE")),
+        "the ladder must read COMPOSE_PROJECT_NAME and COMPOSE_FILE rather than only mentioning them in comments"
+    );
+    assert!(
+        !local_rung.contains("docker ps -q --filter 'name=curie-api'"),
+        "reuse must not match any curie-api container by name substring:\n{local_rung}"
+    );
+    assert!(
+        local_rung.contains("com.docker.compose.project="),
+        "reuse and teardown must filter by the selected compose project:\n{local_rung}"
+    );
+    assert!(
+        local_rung.contains("--project") || local_rung.contains("-p "),
+        "isolated local up must pass the selected project to the CLI:\n{local_rung}"
+    );
+    assert!(
+        local_rung.contains("compose.dev.yaml") && local_rung.contains("--build"),
+        "isolation must still pin this checkout's compose.dev.yaml with --build:\n{local_rung}"
+    );
+}
+
+#[test]
+fn local_rung_sandbox_sweep_is_project_scoped() {
+    let teardown = ladder();
+    assert!(
+        !teardown
+            .contains("orphans=\"$(docker ps -aq --filter \"label=$SANDBOX_LABEL\" 2>/dev/null)\""),
+        "sandbox sweep must not select every host-wide sandbox label"
+    );
+    assert!(
+        teardown.contains("com.docker.compose.project=")
+            || teardown.contains("CURIE_DOCKER_NETWORK"),
+        "sandbox sweep must be scoped to this ladder's project or network"
+    );
+}
+
+#[test]
 fn exact_seed_matcher_recovers_embedded_marker_once_and_rejects_background() {
     let matcher = ladder_python_heredoc("discover_trace_id_for_seed");
     let marker = "curie-seed-ordinary-example";

@@ -805,7 +805,7 @@ mod tests {
             line,
             "SLACK_API_BASE_URL= 'SLACK_APP_TOKEN=xapp-1-s***' \
              'SLACK_BOT_TOKEN=xoxb-1-s***' \
-             docker compose --profile core --profile slack -f compose.dev.yaml up -d --wait \
+             docker compose --profile core --profile slack -p curie -f compose.dev.yaml up -d --wait \
              curie-worker curie-dispatcher"
         );
         assert!(!line.contains("secretsecret"), "secret leaked: {line}");
@@ -817,14 +817,14 @@ mod tests {
         assert_eq!(cmds.len(), 2);
         assert_eq!(
             cmds[0].display(),
-            "docker compose --profile core --profile slack -f compose.dev.yaml stop curie-dispatcher"
+            "docker compose --profile core --profile slack -p curie -f compose.dev.yaml stop curie-dispatcher"
         );
         let second = cmds[1].display();
         assert_eq!(
             second,
             "SLACK_API_BASE_URL=http://localhost:8155/api/ \
              SLACK_BOT_TOKEN=xoxb-dev \
-             docker compose --profile core -f compose.dev.yaml up -d --wait curie-worker"
+             docker compose --profile core -p curie -f compose.dev.yaml up -d --wait curie-worker"
         );
         assert!(
             !second.contains("curie-dispatcher"),

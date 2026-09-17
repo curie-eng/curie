@@ -1676,7 +1676,23 @@ mod tests {
         let cmd = up_command(&opts(DEFAULT_COMPOSE_FILE));
         assert_eq!(
             cmd.display(),
-            "docker compose --profile full -f compose.dev.yaml up -d --wait"
+            "docker compose --profile full -p curie -f compose.dev.yaml up -d --wait"
+        );
+    }
+
+    #[test]
+    fn up_command_always_pins_compose_project() {
+        let cmd = up_command(&opts(DEFAULT_COMPOSE_FILE));
+        let display = cmd.display();
+        assert!(
+            display.contains("-p curie"),
+            "every local up must pass -p curie rather than deriving the project from cwd: {display}"
+        );
+        assert!(
+            cmd.env
+                .contains(&(String::from("COMPOSE_PROJECT_NAME"), String::from("curie"))),
+            "every local up must inject COMPOSE_PROJECT_NAME=curie; env={:?}",
+            cmd.env
         );
     }
 
@@ -2285,7 +2301,7 @@ mod tests {
         let cmd = up_command(&opts);
         assert_eq!(
             cmd.display(),
-            "docker compose --profile full --profile slack -f compose.dev.yaml up -d --wait"
+            "docker compose --profile full --profile slack -p curie -f compose.dev.yaml up -d --wait"
         );
     }
 
@@ -2320,7 +2336,7 @@ mod tests {
         // profile starts no collector); `display` renders env before the program.
         assert_eq!(
             cmd.display(),
-            "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT= OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -f compose.dev.yaml up -d --wait"
+            "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT= OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -p curie -f compose.dev.yaml up -d --wait"
         );
     }
 
@@ -2344,7 +2360,10 @@ mod tests {
     #[test]
     fn status_runs_ps() {
         let cmd = status_command(&opts(DEFAULT_COMPOSE_FILE));
-        assert_eq!(cmd.display(), "docker compose -f compose.dev.yaml ps");
+        assert_eq!(
+            cmd.display(),
+            "docker compose -p curie -f compose.dev.yaml ps"
+        );
     }
 
     #[test]
@@ -2814,7 +2833,7 @@ mod tests {
         });
         assert_eq!(
             cmd.display(),
-            "docker compose --profile core --profile full --profile local-model --profile slack -f compose.dev.yaml down"
+            "docker compose --profile core --profile full --profile local-model --profile slack -p curie -f compose.dev.yaml down"
         );
     }
 
@@ -2827,7 +2846,7 @@ mod tests {
         });
         assert_eq!(
             cmd.display(),
-            "docker compose --profile core --profile full --profile local-model --profile slack -f compose.dev.yaml down -v"
+            "docker compose --profile core --profile full --profile local-model --profile slack -p curie -f compose.dev.yaml down -v"
         );
     }
 
@@ -2876,7 +2895,7 @@ mod tests {
         });
         assert_eq!(
             down.display(),
-            "docker compose --profile core --profile full --profile local-model --profile slack -f compose.other.yaml down -v"
+            "docker compose --profile core --profile full --profile local-model --profile slack -p curie -f compose.other.yaml down -v"
         );
     }
 
