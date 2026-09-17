@@ -65,9 +65,7 @@ def test_one_pinned_core_only_connector_replaces_bespoke_writers() -> None:
     ]
     assert "--read-only" not in args
     assert "--disable-destructive" not in args
-    assert kubernetes["secret_files"] == {
-        "K8S_KUBECONFIG": "/secrets/kubeconfig"
-    }
+    assert kubernetes["secret_files"] == {"K8S_KUBECONFIG": "/secrets/kubeconfig"}
 
 
 def test_every_pinned_core_tool_is_classified_exactly_once() -> None:
@@ -78,13 +76,8 @@ def test_every_pinned_core_tool_is_classified_exactly_once() -> None:
         for entry in policy["allow"]
         if entry.startswith("kubernetes/")
     }
-    other_allow = {
-        entry for entry in policy["allow"] if not entry.startswith("kubernetes/")
-    }
-    approval = {
-        entry.removeprefix("kubernetes/")
-        for entry in policy["approvalRequired"]
-    }
+    other_allow = {entry for entry in policy["allow"] if not entry.startswith("kubernetes/")}
+    approval = {entry.removeprefix("kubernetes/") for entry in policy["approvalRequired"]}
     assert kubernetes_allow == READ_TOOLS
     surface = json.loads((BUNDLE / "supported-surface.json").read_text())
     expected_other = {
@@ -113,10 +106,7 @@ def test_every_approval_required_tool_has_a_routed_gate() -> None:
     # A toolPolicy.approvalRequired entry with no routed gate raises a route-less
     # approval that an operator principal can never resolve (403).
     manifest = _manifest()
-    routes = {
-        gate["gate"]: gate.get("route")
-        for gate in manifest["approvalPolicy"]["gates"]
-    }
+    routes = {gate["gate"]: gate.get("route") for gate in manifest["approvalPolicy"]["gates"]}
     required = manifest["toolPolicy"]["approvalRequired"]
     assert required, "no approvalRequired entries found"
     for entry in required:
@@ -129,14 +119,11 @@ def test_every_approval_required_tool_has_a_routed_gate() -> None:
 
 def test_kubernetes_rbac_has_one_identity_and_a_demo_namespace_write_ceiling() -> None:
     documents = list(
-        yaml.safe_load_all(
-            (BUNDLE / "manifests" / "kubernetes-access.yaml").read_text()
-        )
+        yaml.safe_load_all((BUNDLE / "manifests" / "kubernetes-access.yaml").read_text())
     )
     service_accounts = [doc for doc in documents if doc.get("kind") == "ServiceAccount"]
     identities = [
-        (doc["metadata"]["namespace"], doc["metadata"]["name"])
-        for doc in service_accounts
+        (doc["metadata"]["namespace"], doc["metadata"]["name"]) for doc in service_accounts
     ]
     assert identities == [("curie", "sre-bot-kubernetes")]
     roles = [doc for doc in documents if doc.get("kind") == "Role"]
@@ -145,10 +132,7 @@ def test_kubernetes_rbac_has_one_identity_and_a_demo_namespace_write_ceiling() -
 
     cluster_roles = [doc for doc in documents if doc.get("kind") == "ClusterRole"]
     assert len(cluster_roles) == 1
-    assert all(
-        set(rule["verbs"]) <= {"get", "list", "watch"}
-        for rule in cluster_roles[0]["rules"]
-    )
+    assert all(set(rule["verbs"]) <= {"get", "list", "watch"} for rule in cluster_roles[0]["rules"])
 
     forbidden = {
         "secrets",
@@ -163,17 +147,13 @@ def test_kubernetes_rbac_has_one_identity_and_a_demo_namespace_write_ceiling() -
         "namespaces",
         "nodes",
     }
-    assert not {
-        resource
-        for rule in roles[0]["rules"]
-        for resource in rule["resources"]
-    } & forbidden
+    assert (
+        not {resource for rule in roles[0]["rules"] for resource in rule["resources"]} & forbidden
+    )
     assert all("*" not in rule["resources"] for rule in roles[0]["rules"])
     assert all("*" not in rule["verbs"] for rule in roles[0]["rules"])
     assert not {
-        resource
-        for rule in cluster_roles[0]["rules"]
-        for resource in rule["resources"]
+        resource for rule in cluster_roles[0]["rules"] for resource in rule["resources"]
     } & {
         "secrets",
         "serviceaccounts",
@@ -186,11 +166,7 @@ def test_kubernetes_rbac_has_one_identity_and_a_demo_namespace_write_ceiling() -
         "validatingwebhookconfigurations",
     }
 
-    workload_resources = {
-        resource
-        for rule in roles[0]["rules"]
-        for resource in rule["resources"]
-    }
+    workload_resources = {resource for rule in roles[0]["rules"] for resource in rule["resources"]}
     assert workload_resources == {
         "pods",
         "pods/log",
@@ -205,11 +181,7 @@ def test_kubernetes_rbac_has_one_identity_and_a_demo_namespace_write_ceiling() -
         "cronjobs",
     }
 
-    write_bindings = [
-        doc
-        for doc in documents
-        if doc.get("kind") == "RoleBinding"
-    ]
+    write_bindings = [doc for doc in documents if doc.get("kind") == "RoleBinding"]
     assert len(write_bindings) == 1
     assert write_bindings[0]["metadata"]["namespace"] == "sre-demo"
     assert write_bindings[0]["subjects"] == [
@@ -221,7 +193,6 @@ def test_kubernetes_rbac_has_one_identity_and_a_demo_namespace_write_ceiling() -
     ]
     assert write_bindings[0]["roleRef"]["name"] == "sre-bot-kubernetes-workloads"
     assert all(
-        doc.get("roleRef", {}).get("name")
-        not in {"sre-bot-upgrader", "curie-platform-upgrader"}
+        doc.get("roleRef", {}).get("name") not in {"sre-bot-upgrader", "curie-platform-upgrader"}
         for doc in documents
     )

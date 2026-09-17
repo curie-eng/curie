@@ -95,9 +95,7 @@ def test_operator_resolves_a_routed_kubernetes_tool_approval(
     stored = approvals_client.get(f"/approvals/{approval['id']}", headers=auth_headers)
     assert stored.status_code == 200, stored.text
     assert stored.json()["status"] == "approved"
-    audit = approvals_client.get(
-        f"/approvals/{approval['id']}/audit", headers=auth_headers
-    ).json()
+    audit = approvals_client.get(f"/approvals/{approval['id']}/audit", headers=auth_headers).json()
     assert audit[-1]["principal_kind"] == "operator"
     assert audit[-1]["actor"] == SUBJECT
 

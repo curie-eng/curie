@@ -85,6 +85,7 @@ struct Fixture {
     api: MockServer,
     registry: MockServer,
     registry_endpoint: String,
+    agent_state: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
 }
 
 impl Fixture {
@@ -352,6 +353,7 @@ exit 64
         // means "not created yet", matching `GET /agents` => `[]`.
         let agent_state: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
+        let fixture_agent_state = std::sync::Arc::clone(&agent_state);
         let api = serve(move |request| {
             let mut agent_state = agent_state.lock().unwrap();
             match (request.method.as_str(), request.path.as_str()) {
@@ -524,7 +526,22 @@ exit 64
             api,
             registry,
             registry_endpoint,
+            agent_state: fixture_agent_state,
         }
+    }
+
+    /// Seed the fake API with an already-created `sre-bot` agent carrying
+    /// `approval_routes`, as a rerun against a configured install would see.
+    fn with_existing_agent_routes(self, routes: Value) -> Self {
+        *self.agent_state.lock().unwrap() = Some(json!({
+            "id": AGENT_ID,
+            "name": "sre-bot",
+            "channels": [{"kind": "slack", "address": "#local-dev"}],
+            "created_at": "2026-08-21T00:00:00Z",
+            "memory": false,
+            "approval_routes": routes,
+        }));
+        self
     }
 
     fn with_grafana_secret_mode(mut self, mode: &'static str) -> Self {
@@ -2964,4 +2981,98 @@ fn blank_approver_ids_are_refused_before_any_cluster_mutation() {
             "no kubectl mutation for {bad:?}"
         );
     }
+}
+
+fn full_install_fixture() -> Fixture {
+    Fixture::with_modes(
+        nodes(vec![node("node-a", "4Gi", true)]),
+        pods(vec![]),
+        "success",
+        "success",
+        "success",
+    )
+}
+
+#[test]
+fn a_needed_route_write_that_would_drop_a_notification_is_refused_before_deploy() {
+    let fixture = full_install_fixture().with_existing_agent_routes(json!({
+        "deploys": {
+            "resolution": {"kind": "slack", "address": "C0DEPLOY"},
+            "notification": {"kind": "slack", "address": "C0NOTIFY"},
+        },
+    }));
+    let output = fixture.run(&["--approvers", "U0AAA"]);
+    let text = shown(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a route write that drops a notification must be refused: {text}"
+    );
+    assert!(
+        text.contains("route(s) deploys carry a notification target"),
+        "the refusal must name the route whose notification would be dropped: {text}"
+    );
+    let requests = fixture.api.recorded();
+    assert!(
+        !requests.iter().any(|request| request.method == "PATCH"),
+        "no route write may be sent: {requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method == "POST" && request.path == "/deployments"),
+        "nothing may be deployed: {requests:?}"
+    );
+}
+
+#[test]
+fn an_identical_binding_with_a_notification_elsewhere_proceeds_without_a_route_write() {
+    let fixture = full_install_fixture().with_existing_agent_routes(json!({
+        "deploys": {
+            "resolution": {"kind": "slack", "address": "C0DEPLOY"},
+            "notification": {"kind": "slack", "address": "C0NOTIFY"},
+        },
+        "sre-approvals": {
+            "resolution": {"kind": "slack", "address": "#local-dev"},
+            "approvers": {"users": ["U0AAA"]},
+        },
+    }));
+    let output = fixture.run(&["--approvers", "U0AAA"]);
+    let text = shown(&output);
+    assert!(
+        output.status.success(),
+        "an already-bound route needs no write: {text}"
+    );
+    let requests = fixture.api.recorded();
+    assert!(
+        !requests.iter().any(|request| request.method == "PATCH"),
+        "no route write may be sent when nothing changes: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.method == "POST" && request.path == "/deployments"),
+        "the bundle must still deploy: {requests:?}"
+    );
+    assert!(
+        !text.contains("operator principals cannot resolve"),
+        "an explicit users list closes the operator gap: {text}"
+    );
+}
+
+#[test]
+fn a_group_only_bound_route_still_warns_about_the_operator_gap() {
+    let fixture = full_install_fixture().with_existing_agent_routes(json!({
+        "sre-approvals": {
+            "resolution": {"kind": "slack", "address": "#local-dev"},
+            "approvers": {"group": "S0ONCALL"},
+        },
+    }));
+    let output = fixture.run(&[]);
+    let text = shown(&output);
+    assert!(output.status.success(), "install must complete: {text}");
+    assert!(
+        text.contains("operator principals cannot resolve") && text.contains("approver group"),
+        "a group-only route must warn about the operator gap: {text}"
+    );
 }

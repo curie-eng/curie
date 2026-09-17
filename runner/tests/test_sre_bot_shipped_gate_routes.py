@@ -11,9 +11,8 @@ approval can never be resolved by an operator principal.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import shutil
+from pathlib import Path
 
 import anyio
 import pytest
@@ -81,9 +80,7 @@ def test_shipped_kubernetes_read_is_not_gated(tmp_path: Path) -> None:
         result = await hook(
             {"tool_name": "mcp__kubernetes__pods_list", "tool_input": {}}, None, None
         )
-        decision = (result or {}).get("hookSpecificOutput", {}).get(
-            "permissionDecision"
-        )
+        decision = (result or {}).get("hookSpecificOutput", {}).get("permissionDecision")
         assert decision != "deny"
         assert gate.pending_route is None
 

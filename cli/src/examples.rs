@@ -1458,13 +1458,23 @@ fn parse_approvers(raw: &[String]) -> Result<Vec<String>> {
 
 fn operator_gap_notice() -> String {
     format!(
-        "no --approvers given: operator principals cannot resolve the six Kubernetes gates on \
-         route {SRE_APPROVALS_ROUTE} until approvers are bound; only members of the bound Slack \
-         channel can approve. Re-run with --approvers <USER_IDS>, or run `curie cluster \
-         approvals {SRE_BOT_AGENT} --route-resolution {SRE_APPROVALS_ROUTE}=<CHANNEL> \
-         --route-approvers {SRE_APPROVALS_ROUTE}=users:<ids>` (a full replacement of the route \
-         map; use --routes-from to keep other routes)"
+        "route {SRE_APPROVALS_ROUTE} binds no explicit approver user list: operator principals \
+         cannot resolve the six Kubernetes gates on it until users are bound; approval stays \
+         with the route's Slack channel members or approver group. Re-run with --approvers \
+         <USER_IDS>, or run `curie cluster approvals {SRE_BOT_AGENT} --route-resolution \
+         {SRE_APPROVALS_ROUTE}=<CHANNEL> --route-approvers {SRE_APPROVALS_ROUTE}=users:<ids>` (a \
+         full replacement of the route map; use --routes-from to keep other routes)"
     )
+}
+
+/// Whether an operator principal is locked out of `binding`: only a non-empty
+/// explicit `users` list is operator-eligible, so a missing route, a
+/// channel-member default, or a group-only binding all leave the gap.
+fn route_lacks_operator_approvers(binding: Option<&crate::api::ApprovalRouteBindingWrite>) -> bool {
+    binding
+        .and_then(|binding| binding.approvers.as_ref())
+        .and_then(|approvers| approvers.users.as_ref())
+        .is_none_or(|users| users.is_empty())
 }
 
 fn route_binding_as_write(
@@ -1596,10 +1606,7 @@ async fn bind_sre_approvals_route(
             "bound approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT}"
         ));
     }
-    let bound_approvers = desired
-        .get(SRE_APPROVALS_ROUTE)
-        .and_then(|binding| binding.approvers.as_ref());
-    if bound_approvers.is_none() {
+    if route_lacks_operator_approvers(desired.get(SRE_APPROVALS_ROUTE)) {
         ui.warn(&operator_gap_notice());
     }
     Ok(())
@@ -2590,6 +2597,29 @@ mod tests {
 
     fn approvers(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn operator_gap_is_flagged_for_a_group_only_or_empty_users_route() {
+        let group_only: crate::api::ApprovalRouteBindingResponse =
+            serde_json::from_value(serde_json::json!({
+                "resolution": {"kind": "slack", "address": "C0SREOPS"},
+                "approvers": {"group": "S0ONCALL"},
+            }))
+            .unwrap();
+        let mut existing = std::collections::BTreeMap::new();
+        existing.insert("sre-approvals".to_string(), group_only);
+        let map = sre_approvals_route_map(Some(&existing), "C0SREOPS", &[]);
+        assert!(route_lacks_operator_approvers(map.get("sre-approvals")));
+
+        let empty_users = sre_route("C0SREOPS", Some(&[]));
+        existing.insert("sre-approvals".to_string(), empty_users);
+        let map = sre_approvals_route_map(Some(&existing), "C0SREOPS", &[]);
+        assert!(route_lacks_operator_approvers(map.get("sre-approvals")));
+
+        assert!(route_lacks_operator_approvers(None));
+        let map = sre_approvals_route_map(None, "C0SREOPS", &approvers(&["U0AAA"]));
+        assert!(!route_lacks_operator_approvers(map.get("sre-approvals")));
     }
 
     #[test]

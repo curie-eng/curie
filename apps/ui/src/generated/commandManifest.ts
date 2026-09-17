@@ -5096,6 +5096,14 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
+                  "help": "Slack user IDs allowed to resolve the bot's Kubernetes mutation gates (route sre-approvals). Comma separated and repeatable. Required for operator principals (`curie cluster approvals --resolve`) to approve; without it only members of the bound Slack channel can approve",
+                  "id": "approvers",
+                  "long": "approvers",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
                   "help": "Install the upgrade path: the self-upgrade connector, the platform upgrade Job, and the two identities behind them",
                   "id": "platform_upgrade",
                   "long": "platform-upgrade",
