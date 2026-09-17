@@ -34,8 +34,20 @@ Kubernetes identity, builds its kubeconfig in memory, deploys the bundle, and
 stores the credential outside bundle content:
 
 ```bash
-curie example sre-bot install --observability
+curie example sre-bot install --observability --slack-channel C0EXAMPLE1 \
+  --approvers U0EXAMPLE1,U0EXAMPLE2
 ```
+
+The installer binds the `sre-approvals` route that gates the six Kubernetes
+mutations before it deploys. You need to add approvers with `--approvers`
+(comma separated Slack user IDs, repeatable) to resolve those approvals from the
+CLI with an operator principal. Without it the install still succeeds, but only
+members of the bound Slack channel can approve, and the installer says so. Bind
+them later with
+`curie cluster approvals sre-bot --route-resolution sre-approvals=<CHANNEL> --route-approvers sre-approvals=users:<ids>`.
+If any bound route carries a notification target, the installer refuses to
+rewrite the route map (the API does not return the notification transport);
+write the full map with `curie cluster approvals sre-bot --routes-from <file>`.
 
 Runtime repository workspaces need `api.githubRepoAllowlist`. The chart default
 is empty and denies every selection, including after `curie cluster deploy
@@ -72,6 +84,16 @@ curie cluster deploy --plugin-dir examples/sre-bot
 
 On an existing agent that already binds the route, the first deploy succeeds
 and the bind step is unnecessary.
+
+You need to add approvers to resolve these approvals from the CLI with an
+operator principal: the route must bind an explicit user list, and without one
+only members of the bound Slack channel can approve. A route write replaces the
+whole map, so repeat the resolution in the same invocation:
+
+```bash
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1 \
+  --route-approvers sre-approvals=users:U0EXAMPLE1
+```
 
 With `--observability`, the example also installs the metrics pipeline and
 reliability alerts. Follow [METRICS-ROLLOUT.md](docs/METRICS-ROLLOUT.md) for the

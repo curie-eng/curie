@@ -941,6 +941,13 @@ enum SreBotAction {
         /// Bind the installed bot to this Slack channel.
         #[arg(long, value_name = "CHANNEL")]
         slack_channel: Option<String>,
+        /// Slack user IDs allowed to resolve the bot's Kubernetes mutation
+        /// gates (route sre-approvals). Comma separated and repeatable.
+        /// Required for operator principals (`curie cluster approvals
+        /// --resolve`) to approve; without it only members of the bound Slack
+        /// channel can approve.
+        #[arg(long, value_name = "USER_IDS")]
+        approvers: Vec<String>,
         /// Install the upgrade path: the self-upgrade connector, the platform
         /// upgrade Job, and the two identities behind them.
         ///
@@ -3181,6 +3188,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             release,
                             observability_namespace,
                             workspace_repo,
+                            approvers,
                         },
                 },
         }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
@@ -3192,6 +3200,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             release,
             observability_namespace,
             workspace_repo,
+            approvers,
         })
         .await?
         {

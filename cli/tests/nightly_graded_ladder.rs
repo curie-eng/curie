@@ -3273,8 +3273,14 @@ fn connector_fixture_setup_owns_consistent_approval_gates() {
         vec![
             "mcp__self-upgrade__upgrade_self".to_string(),
             "mcp__self-upgrade__upgrade_platform".to_string(),
+            "mcp__kubernetes__pods_delete".to_string(),
+            "mcp__kubernetes__pods_exec".to_string(),
+            "mcp__kubernetes__pods_run".to_string(),
+            "mcp__kubernetes__resources_create_or_update".to_string(),
+            "mcp__kubernetes__resources_delete".to_string(),
+            "mcp__kubernetes__resources_scale".to_string(),
         ],
-        "the owned scratch copy must retain exactly the gates for the hosted self-upgrade connector"
+        "the owned scratch copy must retain exactly the gates for the hosted self-upgrade and kubernetes connectors"
     );
     let allow: Vec<&str> = plugin["toolPolicy"]["allow"]
         .as_array()

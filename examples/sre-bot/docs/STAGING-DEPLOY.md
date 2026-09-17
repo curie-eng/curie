@@ -80,8 +80,13 @@ and does not roll back. Rollback remains an operator action.
 ## Slack
 
 ```bash
-curie example sre-bot install --observability --slack-channel <channel-id>
+curie example sre-bot install --observability --slack-channel <channel-id> \
+  --approvers <user-id>[,<user-id>]
 ```
+
+`--approvers` binds explicit Slack user IDs on the `sre-approvals` route. You
+need it to resolve approvals from the CLI with an operator principal; without
+it only members of the bound Slack channel can approve.
 
 Bind by channel ID, never `#name`. `deploy.yaml` carries no active documentation
 placeholder binding. Both API and CLI refuse the `C0EXAMPLE<digits>` placeholder

@@ -125,7 +125,8 @@ def test_sre_bot_declares_policy_scoped_kubernetes_connector_and_validates(
     )
 
     # Platform upgrades keep their separate zero-argument connector gates. The
-    # general Kubernetes surface is classified by toolPolicy instead.
+    # six Kubernetes mutations also carry routed gates so an operator principal
+    # can resolve them (#2722); toolPolicy still classifies the whole surface.
     assert plugin["approvalPolicy"]["gates"] == [
         {
             "gate": "mcp__self-upgrade__upgrade_self",
@@ -135,6 +136,17 @@ def test_sre_bot_declares_policy_scoped_kubernetes_connector_and_validates(
             "gate": "mcp__self-upgrade__upgrade_platform",
             "route": "sre-approvals",
         },
+        *(
+            {"gate": f"mcp__kubernetes__{tool}", "route": "sre-approvals"}
+            for tool in (
+                "pods_delete",
+                "pods_exec",
+                "pods_run",
+                "resources_create_or_update",
+                "resources_delete",
+                "resources_scale",
+            )
+        ),
     ]
     assert set(plugin["toolPolicy"]) == {
         "enforcement",
