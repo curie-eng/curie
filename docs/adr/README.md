@@ -173,6 +173,8 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0142 | [Database compatibility is a release contract; migrations run in one upgrade phase](0142-database-compatibility-windows-and-a-single-upgrade-phase.md) | Accepted |
 | 0143 | [A coding thread owns one fenced pull request lineage](0143-thread-owned-pull-request-lineage.md) | Accepted |
 | 0144 | [The cluster lifecycle admits before it mutates, and its pause authority is installation-scoped](0144-the-upgrade-lifecycle-admits-before-it-mutates.md) | Draft |
+| 0146 | [For a headless lane, at capacity means wait, not reply](0146-headless-capacity-is-a-wait-not-a-reply.md) | Accepted |
+| 0147 | [Publication approval is a per-agent operator policy, not a platform constant](0147-publication-approval-is-a-per-agent-operator-policy.md) | Accepted |
 | 0151 | [A permission-gate card shows a bundle-authored sentence; the machine summary stays the audit record](0151-bundle-authored-human-approval-summary.md) | Draft |
 | 0152 | [Registry destinations are operator-declared, not a platform preset](0152-no-cidr-trusted-registries-preset.md) | Draft |
 <!-- END GENERATED: adr-index -->
