@@ -25,6 +25,13 @@ from .manifest import resolve_manifest
 from .models import ApprovalGate, McpConfig, PluginManifest
 from .yaml_loader import safe_load_unique
 
+# The live name of the platform-mounted publication tool (#2776). The runner
+# mounts it beside its approval tool rather than shipping it in a bundle, so it
+# is neither a bundle server nor a connector tool. The validator accepts this
+# EXACT name as an approval gate, and the runner and worker arm and recognize
+# the tool by it, so every side agrees on one spelling.
+PLATFORM_PUBLISH_TOOL_NAME = "mcp__curie__publish_changes"
+
 
 def grantable_routes(
     gates: list[ApprovalGate],

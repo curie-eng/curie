@@ -23,7 +23,6 @@ from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 from curie_runner import mcp_tool_capability
 from curie_runner.approval import (
     APPROVAL_TOOL_NAME,
-    PUBLISH_TOOL_NAME,
     ApprovalGate,
     build_approval_gate,
     build_approval_hook,
@@ -33,7 +32,7 @@ from curie_runner.approval import (
 )
 from mcp import Tool
 from mcp.types import ToolAnnotations
-from plugin_format import ToolPolicy
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME, ToolPolicy
 
 
 def _policy(**collections: list[str]) -> ToolPolicy:
@@ -316,18 +315,18 @@ def test_platform_publish_reaches_approval_gate_under_production_sre_tool_policy
     gate = _production_sre_gate(managed_workspace=True)
     tool_input = {"title": "Workspace tool check", "body": "prior-turn marker"}
     if interceptor == "hook":
-        result = _hook_call(gate, PUBLISH_TOOL_NAME, tool_input)
+        result = _hook_call(gate, PLATFORM_PUBLISH_TOOL_NAME, tool_input)
         assert _denied(result)
         reason = _reason(result)
     else:
         result = anyio.run(
-            build_can_use_tool(gate), PUBLISH_TOOL_NAME, tool_input, None
+            build_can_use_tool(gate), PLATFORM_PUBLISH_TOOL_NAME, tool_input, None
         )
         assert isinstance(result, PermissionResultDeny)
         reason = result.message
 
     assert gate.pending_gate_kind == "permission"
-    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+    assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     assert gate.publication_title == "Workspace tool check"
     assert gate.publication_body == "prior-turn marker"
     assert "denied by this agent's tool policy" not in reason

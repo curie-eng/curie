@@ -25,11 +25,11 @@ from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from claude_agent_sdk.types import ToolPermissionContext
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import (
-    PUBLISH_TOOL_NAME,
     build_approval_hook,
     build_can_use_tool,
 )
 from curie_runner.config import RunnerConfig
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 # A budget high enough that default_turn's 8 output tokens never trip the halt
 # (a halt would outrank a pending approval and mask the gate under test).
@@ -237,4 +237,4 @@ def test_managed_workspace_arms_mandatory_publish_on_fake_boot_path(tmp_path) ->
 
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
     assert gate is not None
-    assert gate.required == frozenset({PUBLISH_TOOL_NAME})
+    assert gate.required == frozenset({PLATFORM_PUBLISH_TOOL_NAME})

@@ -2126,7 +2126,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     from aci_protocol import QueuedTurn, ReplyHandle
     from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
     from claude_agent_sdk.types import PermissionResultDeny
-    from curie_runner.approval import PUBLISH_TOOL_NAME, build_approval_gate, build_can_use_tool
+    from curie_runner.approval import build_approval_gate, build_can_use_tool
     from curie_runner.fake import FakeModelSession
     from curie_runner.otel import RunTracer
     from curie_runner.server import create_app as create_runner_app
@@ -2137,6 +2137,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     from curie_worker.behaviorpacks import BehaviorPacks
     from curie_worker.binding import ResolvedDeployment
     from curie_worker.workspace import WorkspaceClaimCoordinator, WorkspaceCredentialClient
+    from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
     from apps.worker.tests.kernel.conftest import kernel_harness
 
@@ -2207,7 +2208,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                     TextBlock(text="Prepared README."),
                     ToolUseBlock(
                         id="publish",
-                        name=PUBLISH_TOOL_NAME,
+                        name=PLATFORM_PUBLISH_TOOL_NAME,
                         input={"title": "Update README", "body": "Prepared by coder."},
                     ),
                 ],

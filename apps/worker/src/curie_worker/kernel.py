@@ -72,6 +72,7 @@ from channel_protocol.reply import (
 from curie_telemetry import operation_span, record_metric
 from curie_telemetry.redact import redact_text
 from opentelemetry.trace import SpanKind, StatusCode
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from pydantic import ValidationError
 
 from .actions import ActionBackendError, ActionRecorder
@@ -143,9 +144,9 @@ from .workspace import (
 logger = logging.getLogger(__name__)
 
 # Exact runner-stamped permission provenance required before the worker captures
-# a patch. Kept local because the worker must not import the runner package.
-_PUBLISH_TOOL_NAME = "mcp__curie__publish_changes"
-_PUBLISH_PROVENANCE = ("permission", _PUBLISH_TOOL_NAME)
+# a patch. The name comes from plugin_format because the worker must not import
+# the runner package.
+_PUBLISH_PROVENANCE = ("permission", PLATFORM_PUBLISH_TOOL_NAME)
 _PUBLICATION_EXPIRES_IN_SECONDS = 24 * 60 * 60
 _ATTACHMENT_HANDOFF_PROBE_TIMEOUT_S = 5.0
 _ACTIVE_ATTACHMENT_REPLY = (
