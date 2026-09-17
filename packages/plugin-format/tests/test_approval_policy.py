@@ -16,6 +16,7 @@ from pathlib import Path
 
 import yaml
 from plugin_format import (
+    PLATFORM_PUBLISH_TOOL_NAME,
     TOOL_POLICY_ENFORCEMENT,
     ApprovalGate,
     grantable_routes,
@@ -124,10 +125,15 @@ def test_sre_bot_declares_policy_scoped_kubernetes_connector_and_validates(
         (source / "connectors.yaml").read_text(encoding="utf-8")
     )
 
-    # Platform upgrades keep their separate zero-argument connector gates. The
-    # six Kubernetes mutations also carry routed gates so an operator principal
-    # can resolve them (#2722); toolPolicy still classifies the whole surface.
+    # The runner mounted publication tool comes first. Platform upgrades keep
+    # their separate zero argument connector gates. The six Kubernetes mutations
+    # also carry routed gates so an operator principal can resolve them (#2722);
+    # toolPolicy still classifies the whole surface.
     assert plugin["approvalPolicy"]["gates"] == [
+        {
+            "gate": PLATFORM_PUBLISH_TOOL_NAME,
+            "route": "sre-approvals",
+        },
         {
             "gate": "mcp__self-upgrade__upgrade_self",
             "route": "sre-approvals",

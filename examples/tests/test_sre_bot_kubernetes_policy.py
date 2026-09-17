@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import yaml
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "examples" / "sre-bot"
@@ -99,6 +100,14 @@ def test_platform_upgrade_stays_a_separate_legacy_gate() -> None:
         "mcp__self-upgrade__upgrade_platform",
     ):
         assert {"gate": gate, "route": "sre-approvals"} in gates
+
+
+def test_platform_publication_uses_sre_approvals_route() -> None:
+    gates = _manifest()["approvalPolicy"]["gates"]
+    assert {
+        "gate": PLATFORM_PUBLISH_TOOL_NAME,
+        "route": "sre-approvals",
+    } in gates
 
 
 def test_every_approval_required_tool_has_a_routed_gate() -> None:

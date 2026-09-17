@@ -32,6 +32,10 @@
   "approvalPolicy": {
     "gates": [
       {
+        "gate": "mcp__curie__publish_changes",
+        "route": "sre-approvals"
+      },
+      {
         "gate": "mcp__self-upgrade__upgrade_self",
         "route": "sre-approvals"
       },
