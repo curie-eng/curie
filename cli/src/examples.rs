@@ -721,9 +721,9 @@ async fn apply_upgrade_path(
 /// stayed healthy, and the bot kept answering -- in three milliseconds, from the
 /// fake model, "all done" (#2129).
 ///
-/// So the installer asks first. Refusing costs a re-run with the credential
-/// named; not refusing costs the credential, and there is no signal on the way
-/// out that it went.
+/// So the installer asks first. On a fresh install, run this installer before
+/// configuring the model credential, then use `curie cluster up` to record it.
+/// On an existing release, refusing prevents an invisible credential loss.
 /// Does this release's recorded values carry a model credential?
 ///
 /// Split out so the decision is testable without a cluster: the read is the part
@@ -756,16 +756,12 @@ async fn refuse_to_drop_a_recorded_model_credential(identity: &InstallIdentity) 
          on the chart's fakeModel default, healthy in every way except that the agent \
          is no longer a model. That state is hard to see: pods stay Ready and turns \
          still answer.\n\n\
-         Preserve it first, then re-run:\n\n    \
-         helm get values {} -n {} -o yaml > /tmp/values.yaml\n    \
-         # keep the agentSandbox block, then after this installer finishes:\n    \
-         helm upgrade {} <chart> -n {} --reuse-values -f /tmp/values.yaml",
-        identity.release,
-        identity.namespace,
-        identity.release,
-        identity.namespace,
-        identity.release,
-        identity.namespace,
+         For a fresh install, run `curie example sre-bot install` before configuring \
+         a model credential. Then export CURIE_CREDENTIALS and run `curie cluster up` \
+         so the release records it. This installer is not an upgrade path for an \
+         existing release that already records a model credential; use the normal \
+         Curie cluster lifecycle for that release.",
+        identity.release, identity.namespace,
     )))
 }
 
