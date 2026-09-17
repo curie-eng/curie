@@ -382,8 +382,8 @@ fn local_stub_binding() -> LocalStubBinding {
 
 /// The reply-endpoint URL the local stub advertises, built the same way the
 /// stub's own `base_api_url` is (`http://{host}:{port}/api/`).
-fn local_stub_reply_endpoint(advertise_host: &str) -> String {
-    format!("http://{advertise_host}:{DEFAULT_LOCAL_STUB_PORT}/api/")
+fn local_stub_reply_endpoint(advertise_host: &str, port: u16) -> String {
+    format!("http://{advertise_host}:{port}/api/")
 }
 
 /// In-cluster service ports the port-forwards target.
@@ -774,8 +774,8 @@ async fn await_cluster_relay(
 /// Local mode: the Valkey URL the CLI enqueues onto -- the compose Valkey on its
 /// published host port, authenticated with the same password the compose worker
 /// uses. Pure so the construction is unit-tested without a live Valkey.
-pub fn local_valkey_url(password: &str) -> String {
-    format!("redis://:{password}@localhost:{DEFAULT_LOCAL_VALKEY_PORT}")
+pub fn local_valkey_url(password: &str, host: &str, port: u16) -> String {
+    format!("redis://:{password}@{host}:{port}")
 }
 
 /// Local mode: the platform API base for the channel lookup -- an explicit
@@ -1372,16 +1372,21 @@ async fn bounded_diagnostics(
 async fn observe_message_claims(
     opts: &MessageOpts,
     verb: TurnVerb,
-) -> crate::worker_claims::ClaimsState {
+) -> Result<crate::worker_claims::ClaimsState> {
     match verb {
         TurnVerb::Local => {
-            crate::worker_claims::observe_local(crate::local::DEFAULT_COMPOSE_FILE).await
+            let resources = crate::local::current_resources()?;
+            Ok(
+                crate::worker_claims::observe_local(&resources.project, &resources.compose_files)
+                    .await,
+            )
         }
-        TurnVerb::Cluster => {
-            crate::worker_claims::observe_cluster(&opts.namespace, &opts.release)
-                .await
-                .state
-        }
+        TurnVerb::Cluster => Ok(crate::worker_claims::observe_cluster(
+            &opts.namespace,
+            &opts.release,
+        )
+        .await
+        .state),
     }
 }
 
@@ -1497,8 +1502,9 @@ fn compose_config_files(label: &str) -> Result<Vec<String>> {
 /// Both halves now live in `local.rs` (#1925), because every `local` verb that
 /// recreates a service needs the same derivation -- this one just narrows it to
 /// the single image the one-shot producer runs.
-async fn one_shot_dispatcher_image() -> Option<String> {
-    crate::local::running_stack_image("curie-dispatcher").await
+async fn one_shot_dispatcher_image() -> Result<Option<String>> {
+    let project = crate::local::current_resources()?.project;
+    Ok(crate::local::running_stack_image("curie-dispatcher", &project).await)
 }
 
 fn worker_compose_config_command(container: &str) -> OpsCommand {
@@ -1586,6 +1592,7 @@ fn parse_worker_otel_env(stdout: &str) -> Result<Vec<(String, String)>> {
 }
 
 struct LocalDispatcherContext {
+    project: String,
     compose_files: Vec<String>,
     /// The dispatcher image the running stack would use, when it can be
     /// determined and is actually present.
@@ -1618,9 +1625,16 @@ async fn local_dispatcher_context() -> Result<LocalDispatcherContext> {
     // #1915: the stack's own image tag, so the one-shot producer below runs what
     // the stack runs. Best-effort: an unreadable image is not worth failing an
     // enqueue over, and compose's default then applies exactly as before.
-    let dispatcher_image = one_shot_dispatcher_image().await;
+    let resources = crate::local::current_resources()?;
+    let dispatcher_image = one_shot_dispatcher_image().await?;
+    let compose_files = if resources.isolated() {
+        resources.compose_files.clone()
+    } else {
+        compose_files
+    };
 
     Ok(LocalDispatcherContext {
+        project: resources.project,
         compose_files,
         otel_env,
         dispatcher_image,
@@ -1631,6 +1645,7 @@ async fn local_dispatcher_context() -> Result<LocalDispatcherContext> {
 /// environment entries, never argv; Slack variables are explicitly cleared so
 /// this process cannot acquire or use a workspace credential.
 fn dispatcher_enqueue_command(
+    project: &str,
     compose_files: &[String],
     container_name: &str,
     stream: &str,
@@ -1643,6 +1658,8 @@ fn dispatcher_enqueue_command(
     // graph before the one-shot Python producer starts.
     let mut args = vec![
         plain("compose"),
+        plain("-p"),
+        plain(project),
         plain("--profile"),
         plain("core"),
         plain("--profile"),
@@ -1688,10 +1705,7 @@ fn dispatcher_enqueue_command(
             .cloned(),
     );
     let mut env = vec![
-        (
-            "COMPOSE_PROJECT_NAME".to_string(),
-            crate::local::COMPOSE_PROJECT.to_string(),
-        ),
+        ("COMPOSE_PROJECT_NAME".to_string(), project.to_string()),
         ("CURIE_STREAM".to_string(), stream.to_string()),
     ];
     // Only when the running stack has one. Passing nothing leaves compose's
@@ -1748,6 +1762,7 @@ async fn dispatcher_enqueue_local(opts: &MessageOpts, turn: &QueuedTurn) -> Resu
     let sequence = DISPATCHER_ENQUEUE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let container_name = format!("curie-dispatcher-enqueue-{}-{sequence}", std::process::id());
     let cmd = dispatcher_enqueue_command(
+        &context.project,
         &context.compose_files,
         &container_name,
         &opts.stream,
@@ -1836,11 +1851,17 @@ async fn enqueue_for_turn_verb(
 /// `http://localhost:{DEFAULT_LOCAL_STUB_PORT}/api/`.
 async fn message_local(opts: MessageOpts) -> Result<()> {
     let ui = crate::ui::ui();
-    let valkey_url = local_valkey_url(&opts.valkey_password);
-    let api_base = local_api_base(opts.api_url.as_deref());
+    let resources = crate::local::current_resources()?;
+    let valkey_url = local_valkey_url(
+        &opts.valkey_password,
+        &resources.valkey_host,
+        resources.valkey_port,
+    );
+    let api_base = local_api_base(opts.api_url.as_deref().or(Some(resources.api_url.as_str())));
 
     if opts.dry_run {
-        let reply_endpoint = local_stub_reply_endpoint(&local_stub_binding().advertise_host);
+        let reply_endpoint =
+            local_stub_reply_endpoint(&local_stub_binding().advertise_host, resources.stub_port);
         let channel_line = match opts.channel.as_deref() {
             Some(channel) => format!("channel {channel}"),
             None => format!(
@@ -1907,7 +1928,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     let binding = local_stub_binding();
     let mut stub = SlackStub::start(
         &binding.bind_host,
-        DEFAULT_LOCAL_STUB_PORT,
+        resources.stub_port,
         &binding.advertise_host,
     )
     .await?;
@@ -1961,7 +1982,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
 
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
-    let initial_claims = observe_message_claims(&opts, TurnVerb::Local).await;
+    let initial_claims = observe_message_claims(&opts, TurnVerb::Local).await?;
     report_initial_claim_wait(ui, &step, &initial_claims);
     let wait_started = Instant::now();
     let outcome = {
@@ -2076,7 +2097,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             // next `local message` can bind successfully right away regardless of
             // how long anything after this line takes (#751).
             drop(stub);
-            let latest_claims = observe_message_claims(&opts, TurnVerb::Local).await;
+            let latest_claims = observe_message_claims(&opts, TurnVerb::Local).await?;
             let latest_reason = latest_claims.wait_reason();
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
@@ -2686,10 +2707,6 @@ async fn resume_cluster_after_approval(
 /// dispatcher is wired to the local stub -- NOT a real workspace.
 const LOCAL_STUB_BOT_TOKEN: &str = "xoxb-dev";
 
-/// The host in `comms::LOCAL_SLACK_STUB_URL`. A worker whose `SLACK_API_BASE_URL`
-/// points here talks to the in-compose stub, never to Slack.
-const LOCAL_SLACK_STUB_HOST: &str = "localhost:8155";
-
 /// The Slack transport the RUNNING compose worker is actually configured with:
 /// `(SLACK_API_BASE_URL, SLACK_BOT_TOKEN)` as the container holds them.
 type WorkerTransport = (Option<String>, Option<String>);
@@ -2749,7 +2766,10 @@ fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack
     let api_base = api_base?;
     // Wired to the stub is not connected: the stub is literally the transport the
     // worker will edit the placeholder over, so no real post can ever be updated.
-    if api_base.contains(LOCAL_SLACK_STUB_HOST) {
+    let Ok(resources) = crate::local::current_resources() else {
+        return None;
+    };
+    if api_base.contains(&format!("localhost:{}", resources.stub_port)) {
         return None;
     }
     let token = token?.trim().to_string();
@@ -3210,7 +3230,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
 
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
-    let initial_claims = observe_message_claims(&opts, TurnVerb::Cluster).await;
+    let initial_claims = observe_message_claims(&opts, TurnVerb::Cluster).await?;
     report_initial_claim_wait(ui, &step, &initial_claims);
     let wait_started = Instant::now();
     let observed = {
@@ -3305,7 +3325,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
         }
         Outcome::TimedOut => {
             step.fail(&format!("timed out after {}s", opts.timeout_secs));
-            let latest_claims = observe_message_claims(&opts, TurnVerb::Cluster).await;
+            let latest_claims = observe_message_claims(&opts, TurnVerb::Cluster).await?;
             let latest_reason = latest_claims.wait_reason();
             // Gather diagnostics only on the human path; under `--json` the
             // timeout object carries no diagnostics, so skip the extra Valkey read.
@@ -3471,7 +3491,11 @@ pub fn reply_passes(case: &EvalCase, outcome: &Outcome) -> bool {
 /// The plan a `--dry-run` eval prints: the tier, the suite/case count, and the
 /// same enqueue/port-forward description a real run would produce. Pure so the
 /// rendering is unit-testable with no stack or cluster (mirrors `dry_run_lines`).
-pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) -> Vec<String> {
+pub fn eval_dry_run_lines(
+    opts: &EvalOpts,
+    suite_name: &str,
+    case_count: usize,
+) -> Result<Vec<String>> {
     let tier = if opts.local { "local" } else { "cluster" };
     // A `--model` sweep (#526) is the platform eval plane, so its plan is the
     // trigger-per-model + matrix-poll shape, not the message enqueue path.
@@ -3504,18 +3528,24 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
         lines.push(format!(
             "then poll {api_base}/evals/matrix?suite={suite_name} for per-model pass-rate"
         ));
-        return lines;
+        return Ok(lines);
     }
     let mut lines = vec![format!(
         "grade {case_count} case(s) from suite {suite_name:?} against the {tier} tier"
     )];
     if opts.local {
-        let valkey_url = local_valkey_url(&opts.valkey_password);
-        let api_base = local_api_base(opts.api_url.as_deref());
+        let resources = crate::local::current_resources()?;
+        let valkey_url = local_valkey_url(
+            &opts.valkey_password,
+            &resources.valkey_host,
+            resources.valkey_port,
+        );
+        let api_base = local_api_base(opts.api_url.as_deref().or(Some(resources.api_url.as_str())));
         lines.push("local mode (compose stack; no kubectl/helm)".to_string());
         lines.push(format!("enqueue onto redis {valkey_url}"));
         lines.push(format!(
-            "stub advertised at http://localhost:{DEFAULT_LOCAL_STUB_PORT}/api/"
+            "stub advertised at http://localhost:{}/api/",
+            resources.stub_port
         ));
         match opts.channel.as_deref() {
             Some(channel) => lines.push(format!("channel {channel}")),
@@ -3571,7 +3601,7 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
     lines.push(
         "without ambient durable agent memory (eval: conversation prefix per case)".to_string(),
     );
-    lines
+    Ok(lines)
 }
 
 /// Resolve the eval suite the way `skill eval` does: an explicit `--cases`
@@ -4061,13 +4091,15 @@ fn worker_label_selector() -> String {
     format!("label=com.docker.compose.service={COMPOSE_WORKER_SERVICE}")
 }
 
-fn worker_ps_command() -> OpsCommand {
+fn worker_ps_command(project: &str) -> OpsCommand {
     OpsCommand::new(
         "docker",
         vec![
             plain("ps"),
             plain("--filter"),
             plain(worker_label_selector()),
+            plain("--filter"),
+            plain(format!("label=com.docker.compose.project={project}")),
             plain("--format"),
             plain("{{.Names}}"),
         ],
@@ -4106,7 +4138,8 @@ fn select_worker_container(stdout: &str) -> Result<String> {
 }
 
 async fn local_worker_container() -> Result<String> {
-    let cmd = worker_ps_command();
+    let project = crate::local::current_resources()?.project;
+    let cmd = worker_ps_command(&project);
     let (ok, stdout, stderr) = run_capture(&cmd).await?;
     if !ok {
         bail!("listing the local worker container: {}", stderr.trim());
@@ -4125,7 +4158,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         // A dry run is an offline, non-mutating plan: it does not probe the
         // runtime, so it must not claim what the current stack would do.
         ui.emit(&crate::ui::DryRunPlan {
-            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len()),
+            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len())?,
         });
         return Ok(());
     }
@@ -4533,12 +4566,17 @@ fn sweep_ready_rows(
 
 async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     let ui = crate::ui::ui();
-    let valkey_url = local_valkey_url(&opts.valkey_password);
-    let api_base = local_api_base(opts.api_url.as_deref());
+    let resources = crate::local::current_resources()?;
+    let valkey_url = local_valkey_url(
+        &opts.valkey_password,
+        &resources.valkey_host,
+        resources.valkey_port,
+    );
+    let api_base = local_api_base(opts.api_url.as_deref().or(Some(resources.api_url.as_str())));
 
     if opts.dry_run {
         ui.emit(&crate::ui::DryRunPlan {
-            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len()),
+            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len())?,
         });
         return Ok(());
     }
@@ -4549,7 +4587,7 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     let binding = local_stub_binding();
     let mut stub = SlackStub::start(
         &binding.bind_host,
-        DEFAULT_LOCAL_STUB_PORT,
+        resources.stub_port,
         &binding.advertise_host,
     )
     .await?;
@@ -4619,7 +4657,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 
     if opts.dry_run {
         ui.emit(&crate::ui::DryRunPlan {
-            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len()),
+            lines: eval_dry_run_lines(&opts, &suite.name, suite.cases.len())?,
         });
         return Ok(());
     }
@@ -4778,6 +4816,7 @@ mod tests {
             .map(|name| (name.to_string(), otel_exporter_test_value(name)))
             .collect();
         let command = dispatcher_enqueue_command(
+            crate::local::COMPOSE_PROJECT,
             &["/tmp/curie compose.yaml".to_string()],
             "curie-dispatcher-enqueue-test",
             "test:curie:runs",
@@ -4889,6 +4928,7 @@ mod tests {
                 "UNRELATED_SECRET=must-not-forward\n",
             ));
             let command = dispatcher_enqueue_command(
+                crate::local::COMPOSE_PROJECT,
                 &["/tmp/compose.yaml".to_string()],
                 "curie-dispatcher-enqueue-test",
                 "test:curie:runs",
@@ -5891,10 +5931,14 @@ mod tests {
             worker_label_selector(),
             "label=com.docker.compose.service=curie-worker"
         );
-        let argv = worker_ps_command().display();
+        let argv = worker_ps_command(crate::local::COMPOSE_PROJECT).display();
         assert!(
             argv.contains("--filter label=com.docker.compose.service=curie-worker"),
             "docker ps argv lost the service filter: {argv}"
+        );
+        assert!(
+            argv.contains("--filter label=com.docker.compose.project=curie"),
+            "docker ps argv lost the project filter: {argv}"
         );
     }
 
@@ -6392,12 +6436,12 @@ mod tests {
     #[test]
     fn local_valkey_url_targets_the_compose_valkey_with_the_password() {
         assert_eq!(
-            local_valkey_url("valkeypass"),
+            local_valkey_url("valkeypass", "localhost", DEFAULT_LOCAL_VALKEY_PORT),
             "redis://:valkeypass@localhost:26379"
         );
         // A custom password flows through unchanged.
         assert_eq!(
-            local_valkey_url("s3cr3t"),
+            local_valkey_url("s3cr3t", "localhost", DEFAULT_LOCAL_VALKEY_PORT),
             "redis://:s3cr3t@localhost:26379"
         );
     }
@@ -6439,7 +6483,7 @@ mod tests {
         assert_eq!(binding.bind_host, "0.0.0.0");
         assert_eq!(binding.advertise_host, "host.docker.internal");
 
-        let endpoint = local_stub_reply_endpoint(&binding.advertise_host);
+        let endpoint = local_stub_reply_endpoint(&binding.advertise_host, DEFAULT_LOCAL_STUB_PORT);
         assert_eq!(endpoint, "http://host.docker.internal:8155/api/");
         assert!(
             !endpoint.contains("localhost"),
@@ -6535,7 +6579,9 @@ mod tests {
 
     fn local_comms_opts(disconnect: bool) -> crate::comms::LocalCommsOpts {
         crate::comms::LocalCommsOpts {
-            file: "compose.dev.yaml".to_string(),
+            project: crate::local::COMPOSE_PROJECT.to_string(),
+            files: vec!["compose.dev.yaml".to_string()],
+            stub_port: DEFAULT_LOCAL_STUB_PORT,
             dry_run: false,
             app_token: "xapp-real-workspace".to_string(),
             bot_token: "xoxb-real-workspace".to_string(),
@@ -6591,7 +6637,7 @@ mod tests {
             disconnected_env
                 .0
                 .as_deref()
-                .is_some_and(|base| base.contains(LOCAL_SLACK_STUB_HOST)),
+                .is_some_and(|base| base.contains(&format!("localhost:{DEFAULT_LOCAL_STUB_PORT}"))),
             "`local comms --disconnect` must point the worker back at the stub: {:?}",
             disconnected_env.0
         );
@@ -7118,7 +7164,8 @@ mod tests {
     #[test]
     fn local_eval_dry_run_plan_names_the_tier_suite_and_enqueue() {
         // The `local eval` path with no live stack: the plan is a pure render.
-        let lines = eval_dry_run_lines(&eval_opts(true, Some("C123")), "smoke", 3);
+        let lines = eval_dry_run_lines(&eval_opts(true, Some("C123")), "smoke", 3)
+            .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7155,7 +7202,8 @@ mod tests {
 
     #[test]
     fn eval_dry_run_plan_names_sampling_policy() {
-        let lines = eval_dry_run_lines(&eval_opts(true, None), "smoke", 1);
+        let lines =
+            eval_dry_run_lines(&eval_opts(true, None), "smoke", 1).expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7166,7 +7214,8 @@ mod tests {
 
     #[test]
     fn local_eval_dry_run_names_the_channel_lookup_when_omitted() {
-        let lines = eval_dry_run_lines(&eval_opts(true, None), "smoke", 1);
+        let lines =
+            eval_dry_run_lines(&eval_opts(true, None), "smoke", 1).expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7177,7 +7226,8 @@ mod tests {
 
     #[test]
     fn cluster_eval_dry_run_plan_lists_the_valkey_forward_and_stub() {
-        let lines = eval_dry_run_lines(&eval_opts(false, Some("C1")), "smoke", 2);
+        let lines = eval_dry_run_lines(&eval_opts(false, Some("C1")), "smoke", 2)
+            .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7217,7 +7267,8 @@ mod tests {
             &sweep_opts(true, Some("C7"), &["opus", "sonnet"]),
             "smoke",
             2,
-        );
+        )
+        .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7248,7 +7299,8 @@ mod tests {
 
     #[test]
     fn cluster_model_sweep_dry_run_reaches_the_api_via_port_forward() {
-        let lines = eval_dry_run_lines(&sweep_opts(false, None, &["opus"]), "smoke", 1);
+        let lines = eval_dry_run_lines(&sweep_opts(false, None, &["opus"]), "smoke", 1)
+            .expect("eval dry-run plan");
         assert!(
             lines
                 .iter()
@@ -7550,6 +7602,7 @@ mod tests {
     #[test]
     fn the_one_shot_producer_runs_the_stacks_dispatcher_image() {
         let cmd = dispatcher_enqueue_command(
+            crate::local::COMPOSE_PROJECT,
             &["compose.dev.yaml".to_string()],
             "enqueue-1",
             "curie:runs",
@@ -7573,6 +7626,7 @@ mod tests {
     #[test]
     fn a_published_stack_leaves_the_image_to_compose() {
         let cmd = dispatcher_enqueue_command(
+            crate::local::COMPOSE_PROJECT,
             &["compose.dev.yaml".to_string()],
             "enqueue-1",
             "curie:runs",

@@ -248,13 +248,32 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    before database mutation. Keep all baseline assertions unchanged.
 5. Do not silently replace a required ladder with focused tests or weaken a
    gate. Preserve other jobs and run each cleanup with its exact Compose array.
-   The Python baseline and released upgrade gate always use the private resources
-   configured above. CLI local lifecycle, connector, and ladder commands remain
-   outside this baseline. For those unchanged paths, first inventory their
-   endpoints. When a required command cannot target owned resources without
-   changing its assertions, reserve a bounded exclusive window with the shared
-   baseline lock, recheck ownership after acquiring it, and preserve every other
-   stack. This exception does not apply to the Python baseline or upgrade gate.
+   The Python baseline, released upgrade gate, CLI local lifecycle, connectors,
+   and E2E ladder all consume the same isolation contract: `COMPOSE_PROJECT_NAME`,
+   ordered `COMPOSE_FILE` (candidate `compose.dev.yaml` then a private override),
+   and matching host endpoints. Do not force project `curie` or a single
+   `compose.dev.yaml` when those values are set. Example local CLI / ladder run:
+
+   ```bash
+   export COMPOSE_PROJECT_NAME=curie-check-2780-a
+   export COMPOSE_FILE="$PWD/compose.dev.yaml:$PWD/.projects/2780/compose.yaml"
+   export CURIE_API_URL=http://127.0.0.1:38000
+   export VALKEY_HOST=127.0.0.1 VALKEY_PORT=36379
+   export S3_ENDPOINT_URL=http://127.0.0.1:39000
+   export CURIE_DOCKER_NETWORK=curie-check-2780-a_runner
+   export CURIE_LOCAL_STUB_PORT=18155
+   export CURIE_LOCAL_POSTGRES_HOST=127.0.0.1 CURIE_LOCAL_POSTGRES_PORT=35432
+   export CURIE_LOCAL_STAGING_DIR=/tmp/curie-bundles-2780-a
+   export CURIE_LOCAL_IMAGE_TAG=dev-2780-a
+   export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:34318
+   export CURIE_LOCAL_OTEL_METRICS_URL=http://127.0.0.1:38888/metrics
+   curie local up --build
+   CURIE_E2E_TIERS=local curie dev e2e-ladder
+   curie local down
+   ```
+
+   Incomplete isolation is a usage error. Teardown uses the same project, files,
+   and labels; never a global `curie*` name sweep.
 6. Install cleanup before startup and remove only this execution's containers,
    networks, volumes and spawned runners. Identify resources by the project
    label and recorded container IDs, never a global `curie*` name sweep. On a

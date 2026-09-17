@@ -1102,15 +1102,57 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
          bundle cases with the suite-parity dry-run check in front of it"
     );
     assert!(
-        local_rung
-            .contains("local up_args=(local up -f \"$REPO_ROOT/compose.dev.yaml\" --build)\n        echo \"=== curie ${up_args[*]} ===\""),
+        local_rung.contains("local_compose_cli_args local up") && local_rung.contains("--build"),
         "the local rung must start the full profile required by its \
-         observability query proof; ladder contents:\n{text}"
+         observability query proof via local_compose_cli_args and --build; ladder contents:\n{text}"
     );
     assert!(
         !local_rung.contains("up_args+=(--minimal)"),
         "the local rung must never add --minimal now that its observability \
           proof requires Langfuse/ClickHouse; ladder contents:\n{text}"
+    );
+}
+
+#[test]
+fn local_rung_honors_isolated_compose_project_and_ordered_files() {
+    let source = ladder();
+    let local_rung = ladder_function("rung_local");
+    assert!(
+        (source.contains("$COMPOSE_PROJECT_NAME") || source.contains("${COMPOSE_PROJECT_NAME"))
+            && (source.contains("$COMPOSE_FILE") || source.contains("${COMPOSE_FILE")),
+        "the ladder must read COMPOSE_PROJECT_NAME and COMPOSE_FILE rather than only mentioning them in comments"
+    );
+    assert!(
+        !local_rung.contains("docker ps -q --filter 'name=curie-api'"),
+        "reuse must not match any curie-api container by name substring:\n{local_rung}"
+    );
+    assert!(
+        local_rung.contains("com.docker.compose.project="),
+        "reuse and teardown must filter by the selected compose project:\n{local_rung}"
+    );
+    assert!(
+        source.contains("local_compose_cli_args")
+            && (source.contains("--project") || source.contains("-p ")),
+        "isolated local up must pass the selected project to the CLI via local_compose_cli_args"
+    );
+    assert!(
+        source.contains("compose.dev.yaml") && local_rung.contains("--build"),
+        "isolation must still pin this checkout's compose.dev.yaml with --build"
+    );
+}
+
+#[test]
+fn local_rung_sandbox_sweep_is_project_scoped() {
+    let teardown = ladder();
+    assert!(
+        !teardown
+            .contains("orphans=\"$(docker ps -aq --filter \"label=$SANDBOX_LABEL\" 2>/dev/null)\""),
+        "sandbox sweep must not select every host-wide sandbox label"
+    );
+    assert!(
+        teardown.contains("com.docker.compose.project=")
+            || teardown.contains("CURIE_DOCKER_NETWORK"),
+        "sandbox sweep must be scoped to this ladder's project or network"
     );
 }
 
@@ -1316,9 +1358,12 @@ fn coding_tool_seed_membership_gates_product_observability() {
 fn product_collector_restore_covers_every_emitter_and_invalid_auth_is_observable() {
     let pins = ladder_function("pin_local_source_images");
     for required in [
-        "export CURIE_BASE_TAG=dev",
-        "export CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:dev",
-        "export CURIE_DISPATCHER_IMAGE=ghcr.io/curie-eng/curie-dispatcher:dev",
+        "CURIE_LOCAL_IMAGE_TAG:-dev",
+        "export CURIE_BASE_TAG=",
+        "export CURIE_RUNNER_IMAGE=",
+        "export CURIE_DISPATCHER_IMAGE=",
+        "curie-runner:",
+        "curie-dispatcher:",
     ] {
         assert!(
             pins.contains(required),
@@ -1346,8 +1391,15 @@ fn product_collector_restore_covers_every_emitter_and_invalid_auth_is_observable
         "product restoration must override unrelated shell or ignored-file routing"
     );
     assert!(
-        restore.contains("export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318"),
-        "host-network worker must use the collector's published host port"
+        restore.contains(
+            "export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=\"$PRODUCT_COLLECTOR_WORKER_ENDPOINT\""
+        ),
+        "host-network worker must use the selected collector host port"
+    );
+    assert!(
+        ladder().contains("PRODUCT_COLLECTOR_WORKER_ENDPOINT=")
+            && ladder().contains("http://127.0.0.1:24318"),
+        "the default collector host port remains 24318 when isolation is unset"
     );
     assert!(
         restore.contains("export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf"),
@@ -2161,7 +2213,7 @@ print(json.dumps({
     "local up --minimal")
         echo "stub: compose stack up"
         ;;
-    "local up -f "*/compose.dev.yaml" --build")
+    "local up --project "*|"local up -f "*/compose.dev.yaml" --build")
         if [ "${STUB_REQUIRE_DEFAULT_BUILDER:-0}" = "1" ] \
             && [ "${BUILDX_BUILDER:-}" != "default" ]; then
             echo "local source build did not select the Docker daemon builder" >&2
@@ -2273,7 +2325,7 @@ print(json.dumps({
         fi
         exit "${STUB_EVAL_EXIT:-0}"
         ;;
-    "local down -f "*/compose.dev.yaml)
+    "local down --project "*|"local down -f "*/compose.dev.yaml)
         echo "stub: compose stack down"
         ;;
     *)
@@ -2308,7 +2360,7 @@ case "$*" in
         # same session-scoped project identity the real skill tier records.
         echo "CURIE_SESSION_ID=local-stub-hermetic"
         ;;
-    *"name=curie-api"*)
+    *"name=curie-api"*|*"com.docker.compose.service=curie-api"*)
         if [ "${STUB_EXISTING_LOCAL_STACK:-0}" = "1" ]; then
             echo "stub-curie-api"
         fi
@@ -2651,19 +2703,21 @@ fn invocation_count(invocations: &str, expected: &str) -> usize {
 /// are both load-bearing parts of this argv.
 fn is_current_source_local_up(invocation: &str) -> bool {
     let args = invocation.split_whitespace().collect::<Vec<_>>();
-    args.len() == 5
-        && args[..3] == ["local", "up", "-f"]
-        && args[3].ends_with("/compose.dev.yaml")
-        && args[4] == "--build"
+    args.windows(2)
+        .any(|window| window[0] == "-f" && window[1].ends_with("/compose.dev.yaml"))
+        && args.contains(&"--build")
+        && args.first() == Some(&"local")
+        && args.get(1) == Some(&"up")
 }
 
 /// Teardown must target the same current-source compose file that the rung
 /// brought up; an unqualified `local down` could select a release compose.
 fn is_current_source_local_down(invocation: &str) -> bool {
     let args = invocation.split_whitespace().collect::<Vec<_>>();
-    args.len() == 4
-        && args[..3] == ["local", "down", "-f"]
-        && args[3].ends_with("/compose.dev.yaml")
+    args.windows(2)
+        .any(|window| window[0] == "-f" && window[1].ends_with("/compose.dev.yaml"))
+        && args.first() == Some(&"local")
+        && args.get(1) == Some(&"down")
 }
 
 fn current_source_local_down_count(invocations: &str) -> usize {

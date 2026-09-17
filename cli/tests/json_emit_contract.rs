@@ -372,7 +372,7 @@ fn eval_dry_run_plan_names_sequential_concurrency() {
         concurrency: 1,
         sampling: curie::eval_sampling::SampleConfig::default(),
     };
-    let lines = eval_dry_run_lines(&opts, "weather", 3);
+    let lines = eval_dry_run_lines(&opts, "weather", 3).expect("eval dry-run plan");
     assert!(
         lines
             .iter()
