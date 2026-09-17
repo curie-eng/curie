@@ -24,7 +24,7 @@ import urllib.request
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +104,82 @@ print(json.dumps(response))
 """
 
 
+CANDIDATE_RUNNER_PROBE = r"""
+import json
+import os
+import sys
+from pathlib import Path
+
+import anyio
+from mcp import ClientSession
+
+from curie_runner.connectors import derive_mcp_servers
+from curie_runner.mcp_tool_capability import (
+    _server_streams,
+    probe_mcp_tool_capability,
+)
+
+
+async def call_tool(config, tool, arguments):
+    async with _server_streams(
+        config,
+        plugin_dir=None,
+        inherited_env={},
+    ) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            result = await session.call_tool(tool, arguments)
+            return result.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+
+async def main():
+    bundle = Path(sys.argv[1])
+    calls = json.loads(sys.argv[2])
+    derived = derive_mcp_servers(
+        bundle,
+        release="curie",
+        agent="sre-bot",
+        namespace="curie",
+    )
+    catalog = {name: derived[name] for name in ("grafana", "tempo")}
+    capability = await probe_mcp_tool_capability(None, catalog, inherited_env={})
+    results = []
+    for call in calls:
+        results.append(
+            await call_tool(
+                catalog[call["connector"]],
+                call["tool"],
+                call["arguments"],
+            )
+        )
+    print(
+        json.dumps(
+            {
+                "catalog": catalog,
+                "environment_names": sorted(os.environ),
+                "capability": {
+                    "complete": capability.complete,
+                    "failures": list(capability.failures),
+                    "connector_failures": [
+                        {
+                            "connector": failure.connector,
+                            "credential_names": list(failure.credential_names),
+                            "reason": failure.reason,
+                        }
+                        for failure in capability.connector_failures
+                    ],
+                    "observed_tools": sorted(capability.observed_tools),
+                },
+                "calls": results,
+            }
+        )
+    )
+
+
+anyio.run(main)
+"""
+
+
 def _run(
     command: list[str],
     *,
@@ -135,11 +211,11 @@ def _docker(*args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
 
 def _require_docker() -> None:
     if shutil.which("docker") is None:
-        pytest.skip("Docker is unavailable: docker CLI is not installed")
+        raise RuntimeError("Docker is unavailable: docker CLI is not installed")
     result = _docker("info", "--format", "{{.ServerVersion}}", check=False, timeout=15)
     if result.returncode != 0:
         reason = result.stderr.strip() or result.stdout.strip()
-        pytest.skip(f"Docker is unavailable: {reason}")
+        raise RuntimeError(f"Docker is unavailable: {reason}")
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -395,17 +471,22 @@ class RuntimeStack:
     suffix: str
     front_network: str
     back_network: str
+    invalid_network: str
     tempo_probe_container: str
+    candidate_runner_container: str
+    invalid_candidate_runner_container: str
     tempo_container: str
     tempo_url: str
     tempo_envelope: TempoEnvelope
     grafana_url: str
     loki_url: str
     collector_url: str
-    token: str
+    token: str = field(repr=False)
     containers: list[str]
     volumes: list[str]
     tempo_connector_image: str
+    candidate_runner_image: str
+    invalid_token: str = field(repr=False)
 
     def connector_url(self, connector: str) -> str:
         return f"http://{service_dns(RELEASE, AGENT, connector, NAMESPACE)}:{CONNECTOR_PORT}/mcp"
@@ -453,6 +534,66 @@ class RuntimeStack:
             f"{connector}.{tool} never returned marker {marker!r}; last response: {last}"
         )
 
+    def candidate_evidence(
+        self,
+        calls: list[dict[str, Any]],
+        *,
+        invalid: bool = False,
+    ) -> dict[str, Any]:
+        container = (
+            self.invalid_candidate_runner_container
+            if invalid
+            else self.candidate_runner_container
+        )
+        result = _docker(
+            "exec",
+            "-i",
+            container,
+            "python",
+            "-",
+            "/bundle",
+            json.dumps(calls),
+            input_text=CANDIDATE_RUNNER_PROBE,
+            timeout=120,
+        )
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def candidate_call_text(
+        self,
+        connector: str,
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> str:
+        evidence = self.candidate_evidence(
+            [{"connector": connector, "tool": tool, "arguments": arguments}]
+        )
+        assert _evidence_contains_a_token_value(self, evidence) is False
+        capability = evidence["capability"]
+        assert capability["complete"], capability
+        assert capability["failures"] == [], capability
+        response = evidence["calls"][0]
+        assert response.get("isError") is not True, response
+        return _candidate_response_text(response)
+
+    def eventually_candidate_call_text(
+        self,
+        connector: str,
+        tool: str,
+        arguments: dict[str, Any],
+        marker: str,
+        timeout: float = 45,
+    ) -> str:
+        deadline = time.monotonic() + timeout
+        last = ""
+        while time.monotonic() < deadline:
+            last = self.candidate_call_text(connector, tool, arguments)
+            if marker in last:
+                return last
+            time.sleep(1)
+        raise AssertionError(
+            f"{connector}.{tool} never returned marker {marker!r}; last response: {last}"
+        )
+
 
 def _run_container(
     stack: RuntimeStack,
@@ -491,6 +632,39 @@ def _run_container(
     _docker(*command, environment=env, timeout=300)
 
 
+def _build_candidate_runner(stack: RuntimeStack) -> None:
+    # `curie build --tag` delegates to this exact Dockerfile and build context.
+    # The Python CI job does not install the Rust CLI, so the proof invokes the
+    # same build directly and gives it a tag owned only by this fixture.
+    _docker(
+        "build",
+        "-f",
+        str(REPO_ROOT / "runner" / "Dockerfile"),
+        "-t",
+        stack.candidate_runner_image,
+        str(REPO_ROOT),
+        timeout=900,
+    )
+
+
+def _start_candidate_runner(
+    stack: RuntimeStack,
+    *,
+    network: str,
+    purpose: str,
+) -> str:
+    name = _container_name(f"runner-{purpose}", stack.suffix)
+    _run_container(
+        stack,
+        name,
+        stack.candidate_runner_image,
+        network,
+        volumes=((REPO_ROOT / "examples" / "sre-bot", "/bundle"),),
+        args=("python", "-c", "import time; time.sleep(86400)"),
+    )
+    return name
+
+
 def _mint_grafana_token(grafana_url: str, password: str) -> str:
     authorization = base64.b64encode(f"admin:{password}".encode()).decode()
     headers = {"Authorization": f"Basic {authorization}"}
@@ -518,13 +692,18 @@ def _start_runtime_stack(root: Path) -> RuntimeStack:
     suffix = uuid.uuid4().hex[:10]
     front = f"curie-obs-front-{suffix}"
     back = f"curie-obs-back-{suffix}"
+    invalid = f"curie-obs-invalid-{suffix}"
     images, tempo_envelope = _write_runtime_configs(root)
     tempo_connector_image = f"curie-sre-bot-tempo-runtime:{suffix}"
+    candidate_runner_image = f"curie-sre-bot-runner-runtime:{suffix}"
     stack = RuntimeStack(
         suffix=suffix,
         front_network=front,
         back_network=back,
+        invalid_network=invalid,
         tempo_probe_container="",
+        candidate_runner_container="",
+        invalid_candidate_runner_container="",
         tempo_container="",
         tempo_url="",
         tempo_envelope=tempo_envelope,
@@ -535,10 +714,13 @@ def _start_runtime_stack(root: Path) -> RuntimeStack:
         containers=[],
         volumes=[],
         tempo_connector_image=tempo_connector_image,
+        candidate_runner_image=candidate_runner_image,
+        invalid_token=f"invalid-{uuid.uuid4().hex}",
     )
     try:
         _docker("network", "create", front)
         _docker("network", "create", back)
+        _docker("network", "create", invalid)
         _populate_runtime_stack(stack, root, images)
         return stack
     except Exception:
@@ -650,6 +832,14 @@ def _populate_runtime_stack(stack: RuntimeStack, root: Path, images: dict[str, s
         publish=(80,),
     )
     _docker("network", "connect", back, grafana)
+    _docker(
+        "network",
+        "connect",
+        "--alias",
+        "grafana.observability.svc.cluster.local",
+        stack.invalid_network,
+        grafana,
+    )
     stack.grafana_url = f"http://127.0.0.1:{_host_port(grafana, 80)}"
     _wait_http(f"{stack.grafana_url}/api/health", grafana)
     stack.token = _mint_grafana_token(stack.grafana_url, admin_password)
@@ -722,15 +912,74 @@ def _populate_runtime_stack(stack: RuntimeStack, root: Path, images: dict[str, s
         try:
             stack.call("grafana", "list_datasources", {})
             stack.call("tempo", "list_trace_tags", {})
-            return
+            break
         except Exception as error:  # noqa: BLE001
             last_error = str(error)
             time.sleep(1)
-    logs = "\n".join(
-        _docker("logs", container, check=False).stdout
-        for container in (grafana_connector, tempo_connector)
+    else:
+        logs = "\n".join(
+            _docker("logs", container, check=False).stdout
+            for container in (grafana_connector, tempo_connector)
+        )
+        raise AssertionError(f"MCP connectors never became ready: {last_error}\n{logs}")
+
+    invalid_grafana_connector = _container_name("mcp-grafana-invalid", suffix)
+    _run_container(
+        stack,
+        invalid_grafana_connector,
+        grafana_spec["image"],
+        stack.invalid_network,
+        aliases=(grafana_alias, object_name(RELEASE, AGENT, "grafana")),
+        env={
+            "GRAFANA_URL": grafana_spec["env"]["GRAFANA_URL"],
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN": stack.invalid_token,
+        },
+        args=tuple(grafana_args),
     )
-    raise AssertionError(f"MCP connectors never became ready: {last_error}\n{logs}")
+
+    invalid_tempo_connector = _container_name("mcp-tempo-invalid", suffix)
+    _run_container(
+        stack,
+        invalid_tempo_connector,
+        stack.tempo_connector_image,
+        stack.invalid_network,
+        aliases=(tempo_alias, object_name(RELEASE, AGENT, "tempo")),
+        env={
+            "GRAFANA_URL": declaration["tempo"]["env"]["GRAFANA_URL"],
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN": stack.invalid_token,
+        },
+    )
+
+    _build_candidate_runner(stack)
+    stack.candidate_runner_container = _start_candidate_runner(
+        stack,
+        network=stack.front_network,
+        purpose="candidate",
+    )
+    stack.invalid_candidate_runner_container = _start_candidate_runner(
+        stack,
+        network=stack.invalid_network,
+        purpose="invalid",
+    )
+
+    invalid_deadline = time.monotonic() + 60
+    invalid_last_error = "invalid connectors were not probed"
+    while time.monotonic() < invalid_deadline:
+        try:
+            evidence = stack.candidate_evidence([], invalid=True)
+        except Exception as error:  # noqa: BLE001
+            invalid_last_error = str(error)
+        else:
+            capability = evidence["capability"]
+            if capability["complete"]:
+                break
+            invalid_last_error = json.dumps(capability, sort_keys=True)
+        time.sleep(1)
+    else:
+        raise AssertionError(
+            "invalid MCP connectors never became ready: "
+            f"{invalid_last_error}"
+        )
 
 
 def _stop_runtime_stack(stack: RuntimeStack) -> None:
@@ -738,9 +987,26 @@ def _stop_runtime_stack(stack: RuntimeStack) -> None:
         _docker("rm", "-f", container, check=False, timeout=30)
     _docker("network", "rm", stack.front_network, check=False, timeout=30)
     _docker("network", "rm", stack.back_network, check=False, timeout=30)
+    _docker("network", "rm", stack.invalid_network, check=False, timeout=30)
     _docker("image", "rm", "-f", stack.tempo_connector_image, check=False, timeout=30)
+    _docker("image", "rm", "-f", stack.candidate_runner_image, check=False, timeout=30)
     for volume in reversed(stack.volumes):
         _docker("volume", "rm", "-f", volume, check=False, timeout=30)
+
+    remaining: list[str] = []
+    for container in stack.containers:
+        if _docker("container", "inspect", container, check=False, timeout=15).returncode == 0:
+            remaining.append(f"container:{container}")
+    for network in (stack.front_network, stack.back_network, stack.invalid_network):
+        if _docker("network", "inspect", network, check=False, timeout=15).returncode == 0:
+            remaining.append(f"network:{network}")
+    for image_name in (stack.tempo_connector_image, stack.candidate_runner_image):
+        if _docker("image", "inspect", image_name, check=False, timeout=15).returncode == 0:
+            remaining.append(f"image:{image_name}")
+    for volume in stack.volumes:
+        if _docker("volume", "inspect", volume, check=False, timeout=15).returncode == 0:
+            remaining.append(f"volume:{volume}")
+    assert remaining == [], f"fixture cleanup left owned resources: {remaining}"
 
 
 @pytest.fixture(scope="module")
@@ -761,6 +1027,136 @@ def _response_text(response: dict[str, Any]) -> str:
     return "\n".join(
         item["text"] for item in result.get("content", []) if item.get("type") == "text"
     )
+
+
+def _candidate_response_text(response: dict[str, Any]) -> str:
+    return "\n".join(
+        item["text"]
+        for item in response.get("content", [])
+        if item.get("type") == "text"
+    )
+
+
+def _candidate_environment_contains_a_token_value(
+    stack: RuntimeStack,
+    *,
+    invalid: bool = False,
+) -> bool:
+    container = (
+        stack.invalid_candidate_runner_container
+        if invalid
+        else stack.candidate_runner_container
+    )
+    environment = _inspect(container)["Config"].get("Env") or []
+    serialized = json.dumps(environment)
+    return stack.token in serialized or stack.invalid_token in serialized
+
+
+def _evidence_contains_a_token_value(
+    stack: RuntimeStack,
+    evidence: dict[str, Any],
+) -> bool:
+    serialized = json.dumps(evidence)
+    return stack.token in serialized or stack.invalid_token in serialized
+
+
+def _trace_query_for_session(session_id: str) -> str:
+    # TraceQL requires quotes around dotted custom attribute names.
+    # https://grafana.com/docs/tempo/latest/traceql/construct-traceql-queries/
+    return (
+        '{ resource.service.name = "curie-runner" '
+        f'&& span."curie.session_id" = "{session_id}" }}'
+    )
+
+
+def test_candidate_runner_derives_and_probes_both_pod_credential_connectors(
+    observability_runtime: RuntimeStack,
+) -> None:
+    evidence = observability_runtime.candidate_evidence([])
+    catalog = evidence["catalog"]
+    capability = evidence["capability"]
+    environment_contains_token = _candidate_environment_contains_a_token_value(
+        observability_runtime
+    )
+    evidence_contains_token = _evidence_contains_a_token_value(
+        observability_runtime, evidence
+    )
+
+    assert environment_contains_token is False
+    assert evidence_contains_token is False
+    assert "GRAFANA_SERVICE_ACCOUNT_TOKEN" not in evidence["environment_names"]
+    assert set(catalog) == {"grafana", "tempo"}
+    assert all("headers" not in entry for entry in catalog.values()), catalog
+    assert "${GRAFANA_SERVICE_ACCOUNT_TOKEN}" not in json.dumps(catalog)
+    assert capability["complete"], capability
+    assert capability["failures"] == [], capability
+    assert capability["connector_failures"] == [], capability
+    assert {
+        "mcp__grafana__query_loki_logs",
+        "mcp__tempo__search_traces",
+    } <= set(capability["observed_tools"])
+
+    log_marker = f"curie-api candidate-runtime-{uuid.uuid4().hex}"
+    _request(
+        f"{observability_runtime.loki_url}/loki/api/v1/push",
+        method="POST",
+        body={
+            "streams": [
+                {
+                    "stream": {
+                        "namespace": "curie",
+                        "container": "api",
+                        "job": "curie/api",
+                    },
+                    "values": [[str(time.time_ns()), log_marker]],
+                }
+            ]
+        },
+        expected=(204,),
+    )
+    log_result = observability_runtime.eventually_candidate_call_text(
+        "grafana",
+        "query_loki_logs",
+        {
+            "datasourceUid": "loki",
+            "logql": f'{{namespace="curie", container="api"}} |= "{log_marker}"',
+            "limit": 10,
+            "direction": "backward",
+        },
+        log_marker,
+    )
+    assert log_marker in log_result
+
+    trace_marker = f"candidate-runtime-{uuid.uuid4().hex}"
+    with _otel_environment(observability_runtime.collector_url):
+        provider = build_tracer_provider(
+            OtelConfig(endpoint=observability_runtime.collector_url),
+            trace_marker,
+            "runtime-sandbox",
+        )
+        assert provider is not None
+        tracer = RunTracer(provider)
+        with tracer.run_span(trace_marker, "fake-model") as generation:
+            generation.record_usage({"input_tokens": 1, "output_tokens": 1})
+        tracer.shutdown()
+
+    trace_search = observability_runtime.eventually_candidate_call_text(
+        "tempo",
+        "search_traces",
+        {"query": _trace_query_for_session(trace_marker), "limit": 20},
+        trace_marker,
+        timeout=60,
+    )
+    traces = json.loads(trace_search).get("traces", [])
+    assert traces, trace_search
+    trace = observability_runtime.eventually_candidate_call_text(
+        "tempo",
+        "get_trace",
+        {"trace_id": traces[0]["traceID"]},
+        trace_marker,
+        timeout=60,
+    )
+    assert trace_marker in trace
 
 
 def test_logql_through_the_bots_real_grafana_connector_returns_a_curie_log(
@@ -844,11 +1240,11 @@ def test_tempo_connector_returns_a_real_curie_span_through_grafanas_uid_proxy(
         tracer.shutdown()
 
     search = {
-        "query": '{ resource.service.name = "curie-runner" }',
+        "query": _trace_query_for_session(marker),
         "limit": 20,
     }
     result = observability_runtime.eventually_call_text(
-        "tempo", "search_traces", search, "curie-runner", timeout=60
+        "tempo", "search_traces", search, marker, timeout=60
     )
     payload = json.loads(result)
     traces = payload.get("traces", [])
@@ -867,6 +1263,71 @@ def test_tempo_connector_returns_a_real_curie_span_through_grafanas_uid_proxy(
         {"query": '{ resource.service.name = "curie-runtime-absent" }', "limit": 20},
     )
     assert json.loads(missing).get("traces") == []
+
+
+@pytest.mark.parametrize(
+    ("connector", "tool", "arguments"),
+    [
+        pytest.param(
+            "grafana",
+            "query_loki_logs",
+            {
+                "datasourceUid": "loki",
+                "logql": '{namespace="curie", container="api"}',
+                "limit": 1,
+                "direction": "backward",
+            },
+            id="grafana",
+        ),
+        pytest.param(
+            "tempo",
+            "search_traces",
+            {
+                "query": '{ resource.service.name = "curie-runner" }',
+                "limit": 1,
+            },
+            id="tempo",
+        ),
+    ],
+)
+def test_invalid_connector_token_fails_a_real_read_after_successful_tool_discovery(
+    observability_runtime: RuntimeStack,
+    connector: str,
+    tool: str,
+    arguments: dict[str, Any],
+) -> None:
+    # Grafana documents service account tokens as Bearer credentials for its
+    # HTTP API. Both connectors must surface rejection from that real boundary.
+    # https://grafana.com/docs/grafana/latest/administration/service-accounts/
+    evidence = observability_runtime.candidate_evidence(
+        [{"connector": connector, "tool": tool, "arguments": arguments}],
+        invalid=True,
+    )
+
+    capability = evidence["capability"]
+    environment_contains_token = _candidate_environment_contains_a_token_value(
+        observability_runtime, invalid=True
+    )
+    evidence_contains_token = _evidence_contains_a_token_value(
+        observability_runtime, evidence
+    )
+    assert environment_contains_token is False
+    assert evidence_contains_token is False
+    assert "GRAFANA_SERVICE_ACCOUNT_TOKEN" not in evidence["environment_names"]
+    assert capability["complete"], capability
+    assert capability["failures"] == [], capability
+    assert capability["connector_failures"] == [], capability
+    assert f"mcp__{connector}__{tool}" in capability["observed_tools"]
+
+    responses = evidence["calls"]
+    assert len(responses) == 1
+    response = responses[0]
+    assert response.get("isError") is True, response
+    text = _candidate_response_text(response).lower()
+    assert any(
+        marker in text
+        for marker in ("401", "403", "unauthorized")
+    ), response
 
 
 # #2059: the shipped Tempo ran every memory knob at Tempo's DISTRIBUTED

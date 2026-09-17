@@ -1477,9 +1477,9 @@ def test_the_dns_corpus_covers_the_truncation_branch() -> None:
 # <PAT>` on every request, and an unauthenticated `GET /mcp` is a 401. Until
 # now the hosted entry carried a URL and nothing else, so the probe failed and
 # the agent simply listed no `mcp__github__*` tools -- a silent no-tools, not
-# an error. The header is DERIVED from ``bearer_secret`` (or the single
-# declared secret) for the same reason the URL is derived (ADR-0086): the
-# author writes neither.
+# an error. The header is DERIVED from ``bearer_secret`` or one plain string
+# secret for the same reason the URL is derived (ADR-0086): the author writes
+# neither.
 # --------------------------------------------------------------------------- #
 GITHUB = ConnectorSpec(
     image="ghcr.io/github/github-mcp-server:v0.20.1",
@@ -1502,16 +1502,29 @@ def test_a_hosted_connector_carries_a_bearer_header_for_its_declared_secret() ->
     )
 
 
-def test_a_secret_ref_contributes_its_env_var_name_not_the_secret_it_points_at() -> None:
-    # `secrets:` is `list[str | SecretRef]`. The header names the ENV VAR the
-    # MCP client expands, which for a SecretRef is `.name` -- `from_secret` is
-    # a Kubernetes Secret name and would expand to nothing in the sandbox.
+def test_an_implicit_secret_ref_stays_in_the_connector_pod() -> None:
+    # A SecretRef is delivered only to the connector pod. Its value does not
+    # exist in the sandbox, so an implicit Bearer placeholder would make the
+    # runner report a missing credential and hide the connector tools.
     spec = ConnectorSpec(
         image="ghcr.io/github/github-mcp-server:v0.20.1",
-        secrets=[SecretRef(name="GITHUB_PERSONAL_ACCESS_TOKEN", from_secret="gh-pat")],
+        secrets=[
+            SecretRef(
+                name="GITHUB_PERSONAL_ACCESS_TOKEN",
+                from_secret="gh-pat",
+                key="token",
+            )
+        ],
     )
-    assert _github_entry(spec)["headers"] == {
-        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    assert "headers" not in _github_entry(spec)
+
+    deployment = next(obj for obj in _objs(spec=spec) if obj["kind"] == "Deployment")
+    env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    credential = next(item for item in env if item["name"] == "GITHUB_PERSONAL_ACCESS_TOKEN")
+    assert credential["valueFrom"]["secretKeyRef"] == {
+        "name": "gh-pat",
+        "key": "token",
+        "optional": False,
     }
 
 
@@ -1555,6 +1568,17 @@ def test_bearer_secret_names_the_header_when_several_secrets_are_declared() -> N
     spec = ConnectorSpec(
         image="ghcr.io/github/github-mcp-server:v0.20.1",
         secrets=["POD_ONLY", "GITHUB_PERSONAL_ACCESS_TOKEN"],
+        bearer_secret="GITHUB_PERSONAL_ACCESS_TOKEN",
+    )
+    assert _github_entry(spec)["headers"] == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
+
+
+def test_an_explicit_secret_ref_bearer_keeps_its_header() -> None:
+    spec = ConnectorSpec(
+        image="ghcr.io/github/github-mcp-server:v0.20.1",
+        secrets=[SecretRef(name="GITHUB_PERSONAL_ACCESS_TOKEN", from_secret="gh-pat")],
         bearer_secret="GITHUB_PERSONAL_ACCESS_TOKEN",
     )
     assert _github_entry(spec)["headers"] == {

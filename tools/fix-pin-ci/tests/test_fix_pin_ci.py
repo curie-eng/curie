@@ -1592,6 +1592,7 @@ def test_pull_request_template_documents_the_tier_waiver() -> None:
 
 FEATURE_MILESTONE = "v0.8.6"
 PATCH_MILESTONE = "v0.8.5"
+V0_9_2_MILESTONE = "v0.9.2"
 MAPPING_PATH = REPO_ROOT / "tools" / "fix-pin-ci" / "milestone-trains.json"
 NA_BODY = "Closes #12\n\nFix pin: n/a - the fix is a chart template with no test surface\n"
 
@@ -1640,6 +1641,7 @@ def test_v092_patch_milestone_accepts_main_and_rejects_next(tmp_path: Path) -> N
     )
     assert accepted.returncode == 0, accepted.stderr
     assert accepted.stdout.startswith("SKIPPED: Fix pin declared not applicable")
+    assert not _pull_lookup_calls(main_path), "a direct main pull request needs no stack lookup"
     assert not main_call_log.exists(), "an excused declaration must not run curie"
 
     next_path = tmp_path / "next"
@@ -1940,6 +1942,14 @@ def test_milestone_mapping_sends_patch_to_main_and_feature_to_next() -> None:
     assert milestones[PATCH_MILESTONE] == "patch"
     assert set(trains.values()) == {"main", "next"}
     assert set(milestones.values()) <= {"patch", "feature"}
+
+
+def test_v0_9_2_maps_to_the_patch_train_on_main() -> None:
+    mapping = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
+    train = mapping["milestones"].get(V0_9_2_MILESTONE)
+
+    assert train == "patch"
+    assert mapping["trains"].get(train) == "main"
 
 
 def test_agents_md_cites_the_mapping_next_to_the_release_train_table() -> None:
