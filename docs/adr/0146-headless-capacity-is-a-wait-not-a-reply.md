@@ -2,7 +2,7 @@
 
 Date: 2026-09-10
 
-Status: Draft
+Status: Accepted
 
 Proposed as part of the dark-factory decision set, discussed in
 [discussion #2551](https://github.com/curie-eng/curie/discussions/2551).
@@ -186,7 +186,8 @@ ahead of the claim in `apps/worker/src/curie_worker/consumer.py` and
 `apps/worker/src/curie_worker/kernel.py`, and the dead-letter classification in
 `apps/api/src/curie_api/graveyardwatcher.py`.
 
-This ADR is **Draft** and authorizes nothing by itself. Under
-[ADR-0085](0085-acceptance-not-implementation-authorizes-an-adr.md) as amended
-by [ADR-0102](0102-accepted-alongside-implementation-with-explicit-approval.md),
-acceptance is a maintainer act.
+This ADR is **Accepted** by explicit maintainer approval on 2026-09-17 for
+[issue #2573](https://github.com/curie-eng/curie/issues/2573). Implementation
+remains tracked there under the coordinated exception in
+[ADR-0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
+The realizing code paths are named above.
