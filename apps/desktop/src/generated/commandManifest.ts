@@ -1046,7 +1046,7 @@ export const commandManifest = {
           "name": "status"
         },
         {
-          "about": "Connect or disconnect the local compose stack from a real Slack workspace",
+          "about": "Connect or disconnect the local compose stack from a real Slack workspace. Exactly one Curie release may connect to a given Slack app",
           "args": [
             {
               "global": false,
@@ -1543,7 +1543,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Bind a per-agent connector secret by NAME (ADR-0009, #429). The value is resolved from your environment or the host secret vault (`curie secrets set <NAME>`) and sent to the platform, which stores it on the agent so the worker forwards it into the sandbox for a bundle's authed MCP server. The value never appears in argv. Repeatable",
+              "help": "Bind a per-agent connector secret by NAME (ADR-0009, #429). The value is resolved from your environment or the host secret vault (`curie secrets set <NAME>`) and sent to the platform, which stores it on the agent so the worker forwards it into the sandbox for a bundle's authed MCP server. The value never appears in argv. Repeatable. A hosted connector's Bearer secret (`bearer_secret`, or its single `secrets:` name) is bound automatically (from the value this deploy already resolved for the connector) so the runner can expand the derived header and drop the name from the sandbox env; this flag is for names beyond that (#2503, #2559)",
               "id": "secret",
               "long": "secret",
               "positional": false,
@@ -2601,6 +2601,18 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Adopt a pre-existing namespace that already has its own labels or objects. Without this, such a namespace is refused. The adoption is recorded on the namespace (curietech.ai/adopted-by, adopted-in, and the adopted-at/adopted-labels/adopted-contents annotations), and an adopted namespace is RETAINED by cluster down rather than deleted, so your pre-existing objects are never swept. It never adopts the shared agent-sandbox-system namespace or a terminating one, and it never admits a namespace whose contents cannot be read",
+              "id": "adopt",
+              "long": "adopt",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Force the sealed fake-model install even when CURIE_CREDENTIALS is set (dev/CI escape hatch); suppresses the fake-model warning",
               "id": "fake_model",
               "long": "fake-model",
@@ -2794,6 +2806,14 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Assert the live Alembic revision instead of reading it from the API pod. The schema-window check still runs against this value. Use when every API replica is unexecutable (CrashLoopBackOff, Init, ImagePullBackOff)",
+              "id": "live_schema_revision",
+              "long": "live-schema-revision",
+              "positional": false,
+              "required": false
+            },
+            {
               "default_values": [
                 "curie"
               ],
@@ -2881,7 +2901,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Helm chart. Default: the version-pinned chart for `--to` on release builds; local `charts/curie` on dev builds",
+              "help": "Helm chart. An explicit path or ref overrides the default. Default: the version-pinned release asset for `--to` on release builds; local `charts/curie` on dev builds",
               "id": "chart",
               "long": "chart",
               "positional": false,
@@ -2904,6 +2924,18 @@ export const commandManifest = {
               "help": "Print the redacted upgrade plan and exit without mutating",
               "id": "dry_run",
               "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Apply contract or irreversible schema migrations. Without this flag the upgrade Job refuses those migrations before mutation so a patch rollback window stays intact (#2300)",
+              "id": "forward_only",
+              "long": "forward-only",
               "positional": false,
               "possible_values": [
                 "true",
@@ -3262,7 +3294,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "Connect or disconnect the cluster release from a real Slack workspace",
+          "about": "Connect or disconnect the cluster release from a real Slack workspace. Exactly one Curie release may connect to a given Slack app",
           "args": [
             {
               "global": false,
@@ -4392,6 +4424,113 @@ export const commandManifest = {
           "name": "surfaces"
         },
         {
+          "about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id that owns the binding",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Channel kind to mint for (e.g. email). Required unless --show-exp",
+              "id": "kind",
+              "long": "kind",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Channel address to mint for (e.g. the inbox). Required unless --show-exp",
+              "id": "address",
+              "long": "address",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "7d"
+              ],
+              "global": false,
+              "help": "Token lifetime: 7d, 24h, 60m, or seconds. Default 7d; at most 7 days",
+              "id": "ttl",
+              "long": "ttl",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the installed token's exp and whether the platform still accepts it. Read-only: no mint, no write",
+              "id": "show_exp",
+              "long": "show-exp",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`).\n\nWrites the Secret the adapter actually reads (chart Secret or `mailAdapter.channelTokenExistingSecret`), rolls the adapter, prints `exp`, and never prints the token. `--show-exp` is read-only.",
+          "name": "channel-token"
+        },
+        {
           "about": "Set an agent's budget via the platform API (`PUT /agents/{id}/budget`)",
           "args": [
             {
@@ -5491,6 +5630,11 @@ export const commandManifest = {
           "name": "sre-demo-e2e"
         },
         {
+          "about": "Two Helm releases on one kind cluster, one Slack app, owner-only approval without retry-until-acked (#2307, `bash cli/scripts/two-release-approval-e2e.sh`)",
+          "hidden": false,
+          "name": "two-release-approval-e2e"
+        },
+        {
           "about": "Select the end to end tiers CI would run for paths or revisions",
           "args": [
             {
@@ -5593,6 +5737,221 @@ export const commandManifest = {
           "name": "schema-baseline"
         },
         {
+          "about": "Isolated worker/runner recovery drills (#2425, `bash cli/scripts/recovery-drill.sh`): worker death mid-turn, runner death, a configured deadline plus follow-up, Valkey outage, and API restart on a task-owned local or cluster install. Refuses the permanent soak namespace/release. Checkout-only",
+          "args": [
+            {
+              "default_values": [
+                "local"
+              ],
+              "global": false,
+              "help": "`local` compose stack or a task-owned `cluster` Helm install",
+              "id": "surface",
+              "long": "surface",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "all"
+              ],
+              "global": false,
+              "help": "Scenario to run, or `all`",
+              "id": "scenario",
+              "long": "scenario",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "120"
+              ],
+              "global": false,
+              "help": "Recovery bound in seconds after a healthy worker replacement is available",
+              "id": "bound_seconds",
+              "long": "bound-seconds",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Allow a kube context other than `k8scratch` (cluster surface only)",
+              "id": "force",
+              "long": "force",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "recovery-drill"
+        },
+        {
+          "about": "Disposable two-worker cluster proof for lease-expiry reclaim (#2453, `bash cli/scripts/lease-expiry-cluster-proof.sh`): default `reclaim_min_idle_ms` 900000, three concurrent test Slack mentions, in-place placeholder edits, XPENDING delivery increments, the no-lease 900 s backstop control, and SIGKILL takeover. Refuses the permanent soak. Checkout-only. Never shortens the backstop",
+          "args": [
+            {
+              "global": false,
+              "help": "Allow recreating a leftover task-owned kind cluster of the same name",
+              "id": "force",
+              "long": "force",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Leave the kind cluster and Helm release running after the proof",
+              "id": "keep",
+              "long": "keep",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Guard checks only: soak refusal, default backstop, missing Slack",
+              "id": "self_test",
+              "long": "self-test",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "lease-expiry-cluster-proof"
+        },
+        {
+          "about": "Isolated retained-upgrade and interrupted-upgrade recovery drill (#2426, `bash cli/scripts/upgrade-drill.sh`): published v0.8.6 CLI/chart/images on a task-owned kind install, candidate CLI upgrade, drain/apply interrupt recovery, leftover-hook non-quiesce, compatible rollback that serves a new turn, and incompatible 0.8.4 schema rollback refused before Helm mutates. Refuses the permanent soak. Checkout-only. Live provider/channel rows fail closed when credential references are absent",
+          "args": [
+            {
+              "default_values": [
+                "all"
+              ],
+              "global": false,
+              "help": "Scenario to run, or `all` (0.8.6 baseline matrix)",
+              "id": "scenario",
+              "long": "scenario",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Also run the published v0.8.7 predecessor happy-path (latest stable when it differs from the required 0.8.6 baseline)",
+              "id": "also_predecessor",
+              "long": "also-predecessor",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Recreate a leftover task-owned kind cluster of the same name",
+              "id": "force",
+              "long": "force",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Leave the kind cluster and Helm release running after the drill",
+              "id": "keep",
+              "long": "keep",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Guard checks only: soak refusal, checksum pins, missing live creds",
+              "id": "self_test",
+              "long": "self-test",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "upgrade-drill"
+        },
+        {
+          "about": "Isolated next-train `cluster upgrade` matrix (#2590, `bash cli/scripts/cluster-upgrade-matrix.sh`): published v0.8.8 on a task-owned kind install, packaged 0.9.0/0.9.1 charts, fail-at and interrupt-after hooks, migration crash retry, image/object convergence, and compatible plus published-window rollback. Refuses the permanent soak. Checkout-only",
+          "args": [
+            {
+              "default_values": [
+                "all"
+              ],
+              "global": false,
+              "help": "Scenario to run, or `all`",
+              "id": "scenario",
+              "long": "scenario",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Recreate a leftover task-owned kind cluster of the same name",
+              "id": "force",
+              "long": "force",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Leave the kind cluster and Helm release running after the matrix",
+              "id": "keep",
+              "long": "keep",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Guard checks only: soak refusal, checksum pins, mutator verb",
+              "id": "self_test",
+              "long": "self-test",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "cluster-upgrade-matrix"
+        },
+        {
           "about": "Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points at, not merely that its NetworkPolicies are applied (#1153, `bash scripts/check-netpol-enforcement.sh`). Structured as a non-vacuity check: it proves a DENIED direction is genuinely blocked before trusting any allowed one, so a CNI that ignores NetworkPolicy (kindnet, minikube's default) FAILS rather than passing green",
           "hidden": false,
           "name": "netpol-check"
@@ -5606,6 +5965,37 @@ export const commandManifest = {
           "about": "Assert every direct `ClassName.model_validate*(...)` call on an `_AciModel` subclass threads `READER_CONTEXT` or is a declared exception in `tools/wire-tolerance-gate/allowlist.json` (#625, following #492's forgotten-context bug, `bash scripts/check-wire-tolerance.sh`). Offline, no credential",
           "hidden": false,
           "name": "wire-tolerance"
+        },
+        {
+          "about": "Bounded synthetic restore drill for #2427: back up postgres, bundles, mail SQLite, and Valkey from a disposable compose install, restore onto a distinct target, and refuse an omitted or corrupt component (`bash cli/scripts/restore-drill.sh`). Not a production backup product and not an RPO/RTO claim",
+          "args": [
+            {
+              "global": false,
+              "help": "Validate an existing backup directory without starting a stack",
+              "id": "check_backup",
+              "long": "check-backup",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "JSON object of separately supplied key names. Required with --check-backup",
+              "id": "supplied_config",
+              "long": "supplied-config",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Omit this required component and expect the completeness guard to refuse",
+              "id": "negative",
+              "long": "negative",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "restore-drill"
         },
         {
           "about": "Set the release version across cli/Cargo.toml + Chart.yaml version/appVersion (and refresh the CLI lockfile) so a release cut can't leave the three out of sync. Does not commit or tag",
@@ -5632,6 +6022,34 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "bump-version"
+        },
+        {
+          "about": "Read-only evaluator for the seven-day / 200-canary release gate (#2430)",
+          "args": [
+            {
+              "global": false,
+              "help": "JSON evidence ledger. Evaluated as a live release result",
+              "id": "ledger",
+              "long": "ledger",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Run committed fixture controls: qualifying pass plus each independent miss. Does not evaluate a live window",
+              "id": "self_test",
+              "long": "self-test",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read-only evaluator for the seven-day / 200-canary release gate (#2430).\n\nScores a private evidence ledger against pinned window, candidate, workload, and percentile-method fields. A synthetic qualifying fixture passes `--self-test`; independently missing each campaign criterion fails closed with that criterion id. Fixture or source proof cannot qualify as a live release result. Does not start a seven-day campaign, rotate credentials, mutate the permanent soak, merge, or close #2430. Checkout-only.",
+          "name": "release-accept"
         }
       ]
     },
