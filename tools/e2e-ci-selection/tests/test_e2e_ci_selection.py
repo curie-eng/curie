@@ -460,6 +460,9 @@ AGGREGATE_EXPRESSIONS = {
     "released_upgrade_negative_result": (
         "${{ needs.e2e-released-upgrade-negative.result }}"
     ),
+    "upgrade_matrix_shards_result": (
+        "${{ needs.e2e-cluster-upgrade-matrix-shards.result }}"
+    ),
     "upgrade_matrix_result": "${{ needs.e2e-cluster-upgrade-matrix.result }}",
 }
 
@@ -506,26 +509,54 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert set(jobs["e2e-released-upgrade-negative"]["needs"]) == set(
         jobs["e2e-released-upgrade"]["needs"]
     )
-    assert jobs["e2e-cluster-upgrade-matrix"]["if"] == "${{ false }}"
+    assert "if" not in jobs["e2e-cluster-upgrade-matrix"]
+    assert "if" not in jobs["e2e-cluster-upgrade-matrix-shards"]
 
 
-def test_upgrade_matrix_workflow_is_disabled_and_retains_the_script() -> None:
+def test_upgrade_matrix_shards_job_gates_coverage_and_lists_shards() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    job = workflow["jobs"]["e2e-cluster-upgrade-matrix-shards"]
+    assert job["outputs"]["shards"] == "${{ steps.list.outputs.shards }}"
+    runs = [step["run"] for step in job["steps"] if isinstance(step.get("run"), str)]
+    assert any(
+        "cli/scripts/cluster-upgrade-matrix.sh --self-test" in run for run in runs
+    )
+    list_steps = [step for step in job["steps"] if step.get("id") == "list"]
+    assert len(list_steps) == 1
+    assert "--list-shards --json" in list_steps[0]["run"]
+    assert "$GITHUB_OUTPUT" in list_steps[0]["run"]
+
+
+def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     job = workflow["jobs"]["e2e-cluster-upgrade-matrix"]
     needs = job["needs"]
     if isinstance(needs, str):
         needs = [needs]
-    assert set(needs) == {"rust-build"}
-    assert job["if"] == "${{ false }}"
-    assert job["timeout-minutes"] == 180
+    assert set(needs) == {"rust-build", "e2e-cluster-upgrade-matrix-shards"}
+    assert "if" not in job
+    assert job["timeout-minutes"] == 45
+    assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["matrix"] == {
+        "shard": (
+            "${{ fromJSON(needs.e2e-cluster-upgrade-matrix-shards.outputs.shards) }}"
+        )
+    }
     named_steps = {
         step["name"]: step for step in job["steps"] if isinstance(step.get("name"), str)
     }
     run_step = named_steps["Run the cluster upgrade matrix"]
     assert run_step["env"]["CURIE_BIN"] == "cli/target/release/curie"
     assert run_step["env"]["CURIE_E2E_CANDIDATE_TAG"] == "matrix-candidate"
+    assert run_step["env"]["SHARD"] == "${{ matrix.shard }}"
     assert "cli/scripts/cluster-upgrade-matrix.sh" in run_step["run"]
-    assert "--scenario all" in run_step["run"]
+    assert '--shard "$SHARD"' in run_step["run"]
+    assert "--scenario all" not in run_step["run"]
+    assert "${{" not in run_step["run"]
+    evidence = named_steps["Upload upgrade matrix evidence"]
+    assert evidence["if"] == "always()"
+    assert evidence["with"]["name"] == "upgrade-matrix-evidence-${{ matrix.shard }}"
+    assert evidence["with"]["path"] == ".projects/2590-evidence"
     teardown = named_steps["Tear down the owned upgrade matrix cluster"]
     assert teardown["if"] == "always()"
     assert "kind delete cluster --name curie-upgrade-matrix" in teardown["run"]
@@ -927,6 +958,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-ladder-cluster",
         "e2e-released-upgrade",
         "e2e-released-upgrade-negative",
+        "e2e-cluster-upgrade-matrix-shards",
         "e2e-cluster-upgrade-matrix",
     }
     assert job["if"] == "${{ !cancelled() }}"
@@ -971,7 +1003,8 @@ def _run_aggregate(
         "cluster_result": "skipped",
         "released_upgrade_result": "skipped",
         "released_upgrade_negative_result": "skipped",
-        "upgrade_matrix_result": "skipped",
+        "upgrade_matrix_shards_result": "success",
+        "upgrade_matrix_result": "success",
     }
     state.update(overrides)
     environment = os.environ.copy()
@@ -1037,13 +1070,18 @@ def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> Non
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_aggregate_requires_upgrade_matrix_to_stay_skipped() -> None:
-    ok = _run_aggregate(upgrade_matrix_result="skipped")
+def test_aggregate_requires_upgrade_matrix_success_on_every_pr() -> None:
+    ok = _run_aggregate(upgrade_matrix_result="success")
     assert ok.returncode == 0, ok.stdout + ok.stderr
-    unexpected = _run_aggregate(upgrade_matrix_result="success")
-    assert unexpected.returncode != 0
-    failed = _run_aggregate(upgrade_matrix_result="failure")
-    assert failed.returncode != 0
+    for result in ("skipped", "failure", "cancelled"):
+        rejected = _run_aggregate(upgrade_matrix_result=result)
+        assert rejected.returncode != 0, result
+
+
+@pytest.mark.parametrize("result", ["skipped", "failure", "cancelled"])
+def test_aggregate_requires_upgrade_matrix_shards_success(result: str) -> None:
+    completed = _run_aggregate(upgrade_matrix_shards_result=result)
+    assert completed.returncode != 0
 
 
 @pytest.mark.parametrize(
@@ -1058,7 +1096,7 @@ def test_aggregate_requires_upgrade_matrix_to_stay_skipped() -> None:
         {"skill_local_result": "success"},
         {"local_release_result": "success"},
         {"cluster_result": "success"},
-        {"upgrade_matrix_result": "success"},
+        {"upgrade_matrix_result": "skipped"},
         {"upgrade_matrix_result": "failure"},
         {"released_upgrade_negative_result": "success"},
         {
