@@ -949,8 +949,17 @@ def test_announcement_sits_between_answer_and_receipt(
     assert unannounced.rendered_with_receipt() == "answer\n\nRECEIPT"
 
 
+@pytest.mark.parametrize(
+    ("message", "thread"),
+    [
+        (_REPO_MESSAGE, "tWorkspacesOffRootUrl"),
+        (_BARE_REPO_MESSAGE, "tWorkspacesOffBareRepo"),
+    ],
+)
 def test_named_repository_with_workspaces_off_is_a_terminal_refusal(
     make_harness,
+    message: str,
+    thread: str,
 ) -> None:
     deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777a")
 
@@ -961,7 +970,7 @@ def test_named_repository_with_workspaces_off_is_a_terminal_refusal(
         async with make_harness(binding=binding, max_attempts=3) as h:
             assert h.kernel._workspace is None
             h.runner.default_script = [Final(text="changed", status=DONE)]
-            ev = _qevent(_REPO_MESSAGE, thread="tWorkspacesOff")
+            ev = _qevent(message, thread=thread)
 
             await h.kernel.process_event(ev)
 
@@ -974,23 +983,105 @@ def test_named_repository_with_workspaces_off_is_a_terminal_refusal(
     asyncio.run(go())
 
 
-def test_no_repository_with_workspaces_off_still_escalates_as_workspace_error(
+def test_retained_generic_route_with_workspaces_off_runs_each_turn_once(
+    make_harness,
+) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777e")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding, max_attempts=3) as h:
+            assert h.kernel._workspace is None
+            h.runner.default_script = [Final(text="triaged", status=DONE)]
+            first = _qevent("Triage this alert", thread="tRetainedGeneric")
+            follow_up = _qevent("Summarize the alert", thread="tRetainedGeneric")
+
+            await h.kernel.process_event(first)
+            await h.kernel.process_event(follow_up)
+
+            assert h.runner.opened == ["Triage this alert", "Summarize the alert"]
+            assert h.sink.last_text == "triaged"
+            assert await h.async_redis.exists(h.config.done_key(first.event_id))
+            assert await h.async_redis.exists(h.config.done_key(follow_up.event_id))
+            assert len(h.fake_k8s.claim_envs) == 1
+            claim_env = h.fake_k8s.claim_envs[0] or {}
+            assert not any(key.startswith("CURIE_WORKSPACE_") for key in claim_env)
+            route = h.substrate.lookup(_thread_key("tRetainedGeneric"))
+            assert route is not None and route.workspace_repo is None
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("suspended", "event_id"),
+    [
+        (False, None),
+        (True, "approval-suspended-workspace-resolved"),
+    ],
+)
+def test_retained_workspace_route_with_workspaces_off_refuses_without_adopting(
+    make_harness,
+    suspended: bool,
+    event_id: str | None,
+) -> None:
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777f")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding, max_attempts=3) as h:
+            assert h.kernel._workspace is None
+            thread = "tSuspendedWorkspace" if suspended else "tRetainedWorkspace"
+            thread_key = _thread_key(thread)
+            existing = h.substrate.claim(
+                thread_key,
+                env={},
+                workspace_repo="acme-corp/acme-bot",
+            )
+            if suspended:
+                await asyncio.to_thread(
+                    h.substrate.suspend,
+                    thread_key,
+                    history_ref="history-suspended-workspace",
+                )
+                assert h.substrate.lookup(thread_key) is None
+            event = _qevent("Continue the task", thread=thread, event_id=event_id)
+
+            await h.kernel.process_event(event)
+
+            if suspended:
+                assert h.substrate.lookup(thread_key) is None
+            else:
+                assert h.substrate.lookup(thread_key) == existing
+            assert h.runner.opened == []
+            assert h.runner.steers == []
+            assert h.fake_k8s.claim_envs == [{}]
+            assert h.sink.last_text == _WORKSPACES_OFF_REFUSAL
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_no_repository_with_workspaces_off_runs_a_generic_turn(
     make_harness,
 ) -> None:
     deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777b")
 
     async def go() -> None:
         binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
-        async with make_harness(binding=binding, max_attempts=1) as h:
+        async with make_harness(binding=binding, max_attempts=3) as h:
             assert h.kernel._workspace is None
-            await h.kernel.process_event(
-                _qevent("Triage this alert", thread="tWorkspacesOffGeneric")
-            )
+            h.runner.default_script = [Final(text="triaged", status=DONE)]
+            event = _qevent("Triage this alert", thread="tWorkspacesOffGeneric")
+            await h.kernel.process_event(event)
 
-            assert h.runner.opened == []
-            assert h.sink.last_text is not None
-            assert "workspace-error" in h.sink.last_text, h.sink.last_text
-            assert "Flagging for a human" in h.sink.last_text
+            assert h.runner.opened == ["Triage this alert"]
+            assert h.sink.last_text == "triaged"
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert len(h.fake_k8s.claim_envs) == 1
+            claim_env = h.fake_k8s.claim_envs[0] or {}
+            assert not any(key.startswith("CURIE_WORKSPACE_") for key in claim_env)
+            route = h.substrate.lookup(_thread_key("tWorkspacesOffGeneric"))
+            assert route is not None and route.workspace_repo is None
 
     asyncio.run(go())
 
