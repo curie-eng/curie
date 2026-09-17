@@ -83,6 +83,7 @@ def _state_app(
     history_delay: float = 0.0,
     memory_status: int = 200,
     history_status: int = 200,
+    history_error_body: str | None = None,
     memory_value: list[dict[str, Any]] | None = None,
     history_value: list[dict[str, Any]] | None = None,
 ) -> web.Application:
@@ -106,7 +107,10 @@ def _state_app(
         if history_delay:
             await anyio.sleep(history_delay)
         if history_status != 200:
-            return web.json_response({"detail": "history failed"}, status=history_status)
+            return web.Response(
+                text=history_error_body or "history failed",
+                status=history_status,
+            )
         return web.json_response(
             {
                 "namespace": "transcript",
@@ -236,9 +240,14 @@ def test_boot_fetches_memory_failure_degrades_independently(
 def test_boot_fetches_history_failure_fails_loud(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    sensitive_body = (
+        "https://state.example.com/agents/A/state/transcript/private-key "
+        "private transcript text token-PLACEHOLDER"
+    )
     plugin_dir = _bundle(tmp_path / "bundle", mcp_command=[sys.executable, str(_SERVER)])
     app = _state_app(
         history_status=500,
+        history_error_body=sensitive_body,
         memory_value=[_MEMORY_ITEM],
     )
     caplog.set_level(logging.ERROR, logger="curie_runner")
@@ -255,6 +264,100 @@ def test_boot_fetches_history_failure_fails_loud(
 
     anyio.run(go)
     assert any("history load failed" in record.message for record in caplog.records)
+    assert all(sensitive_body not in record.getMessage() for record in caplog.records)
+
+
+def test_boot_summary_capacity_failure_is_fatal_before_runner_construction(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin_dir = _bundle(tmp_path / "bundle", mcp_command=[sys.executable, str(_SERVER)])
+    records = [
+        TurnRecord(
+            user=f"question {index}",
+            assistant="answer " + ("x" * 600),
+            ts=f"2026-07-14T00:00:{index:02d}+00:00",
+        ).to_dict()
+        for index in range(45)
+    ]
+    _replay, summary = build_conversation_replay(
+        [TurnRecord.from_dict(record) for record in records]
+    )
+    assert summary is not None
+    sensitive_body = (
+        "https://state.example.com/agents/A/state/transcript/private-key "
+        "private transcript text token-PLACEHOLDER"
+    )
+    append_attempts: list[dict[str, Any]] = []
+    durable_records = list(records)
+    app = web.Application()
+
+    async def get_memory(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"namespace": "memory", "key": "log", "value": [], "version": 1}
+        )
+
+    async def get_history(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "namespace": "transcript",
+                "key": "t1",
+                "value": list(durable_records),
+                "version": 1,
+            }
+        )
+
+    async def reject_summary(request: web.Request) -> web.Response:
+        append_attempts.append(await request.json())
+        return web.Response(status=413, text=sensitive_body)
+
+    app.router.add_get("/agents/A/state/memory", get_memory)
+    app.router.add_get("/agents/A/state/transcript/t1", get_history)
+    app.router.add_post("/agents/A/state/transcript/t1/append", reject_summary)
+
+    constructed: list[object] = []
+
+    def reject_runner_construction(*args: object, **kwargs: object) -> object:
+        constructed.append((args, kwargs))
+        raise AssertionError("runner construction must follow successful boot fetches")
+
+    async def reject_probe(*args: object, **kwargs: object) -> object:
+        raise AssertionError("fake model boot must not start connector tools")
+
+    monkeypatch.setattr(boot, "build_runner", reject_runner_construction)
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", reject_probe)
+    caplog.set_level(logging.ERROR, logger="curie_runner")
+
+    async def go() -> None:
+        async with TestServer(app) as server:
+            config = _config(
+                plugin_dir,
+                memory_ref=str(server.make_url("/agents/A/state/memory")),
+                history_ref=str(server.make_url("/agents/A/state/transcript/t1")),
+            )
+            with pytest.raises(BaseExceptionGroup) as caught:
+                await boot._load_boot_fetches(config, True, None)
+            public_error = repr(caught.value)
+            assert "configured structured history could not be loaded" in public_error
+            assert sensitive_body not in public_error
+
+    anyio.run(go)
+
+    assert constructed == []
+    assert len(append_attempts) == 1
+    assert append_attempts[0]["item"]["type"] == "summary"
+    assert durable_records == records
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "history load failed" in message
+        and "HistoryCapacityError" in message
+        and "413" in message
+        for message in messages
+    )
+    assert all(sensitive_body not in message for message in messages)
+    assert all("private-key" not in message for message in messages)
+    assert all("question 0" not in message for message in messages)
 
 
 def test_boot_fetches_probe_failure_degrades_independently(tmp_path: Path) -> None:

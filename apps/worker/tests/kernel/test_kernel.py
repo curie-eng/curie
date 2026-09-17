@@ -2731,6 +2731,28 @@ def test_unknown_classification_escalates_as_unclassified_with_event_id(
     asyncio.run(go())
 
 
+def test_worker_local_timeout_token_from_error_event_remains_unclassified(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=3) as h:
+            h.runner.default_script = [
+                ErrorEvent(
+                    message="injected-local-token",
+                    classification="runner-timeout-unconfirmed",
+                ),
+                Final(text="failed", status=FAIL),
+            ]
+            await h.kernel.process_event(_qevent("go"))
+
+            assert h.runner.opened == ["go"]
+            assert h.sink.last_text is not None
+            assert "(unclassified)" in h.sink.last_text
+            assert "(runner-timeout-unconfirmed)" not in h.sink.last_text
+
+    asyncio.run(go())
+
+
 def test_side_effect_unknown_classification_escalates_with_detail_and_event_id(
     make_harness,
 ) -> None:
@@ -5736,6 +5758,7 @@ def test_stream_timeout_classifies_as_runner_timeout_with_a_named_reason(
     async def go() -> None:
         async with make_harness(runner_total_timeout_s=0.5) as h:
             hold = asyncio.Event()  # never set: the response hangs open
+            h.runner.timeout_status = 200
             h.runner.hold = hold
             h.runner.default_script = [SideEffectFlag(tool="deploy")]
             released: list[bool] = []
@@ -5789,6 +5812,7 @@ def test_stream_timeout_after_a_side_effect_escalates_without_retry(make_harness
     async def go() -> None:
         async with make_harness(runner_total_timeout_s=0.5, max_attempts=3) as h:
             hold = asyncio.Event()
+            h.runner.timeout_status = 200
             h.runner.hold = hold
             h.runner.default_script = [SideEffectFlag(tool="deploy")]
             ev = _qevent("do it", thread="tTimeoutSideEffect")
@@ -5803,6 +5827,128 @@ def test_stream_timeout_after_a_side_effect_escalates_without_retry(make_harness
             assert "runner-timeout" in h.sink.last_text
             assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "timeout_status",
+    [None, 409],
+    ids=["missing-epoch", "conflict"],
+)
+def test_unconfirmed_stream_timeout_never_retries_and_settles_once(
+    make_harness,
+    timeout_status: int | None,
+) -> None:
+    async def go() -> None:
+        async with make_harness(runner_total_timeout_s=0.2, max_attempts=3) as h:
+            hold = asyncio.Event()
+            h.runner.timeout_status = timeout_status
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="partial")]
+            event = _qevent("go", thread="tTimeoutUnconfirmed")
+            try:
+                await h.kernel.process_event(event)
+            finally:
+                hold.set()
+
+            assert h.runner.opened == ["go"]
+            assert h.sink.last_text is not None
+            assert "(runner-timeout-unconfirmed)" in h.sink.last_text
+            assert "(unclassified)" not in h.sink.last_text
+            assert len(h.sink.completions) == 1
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_unconfirmed_stream_timeout_after_side_effect_displays_its_local_cause(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(runner_total_timeout_s=0.2, max_attempts=3) as h:
+            hold = asyncio.Event()
+            h.runner.timeout_status = 409
+            h.runner.hold = hold
+            h.runner.default_script = [SideEffectFlag(tool="deploy")]
+            event = _qevent("go", thread="tTimeoutUnconfirmedSideEffect")
+            try:
+                await h.kernel.process_event(event)
+            finally:
+                hold.set()
+
+            assert h.runner.opened == ["go"]
+            assert h.sink.last_text is not None
+            assert "(runner-timeout-unconfirmed)" in h.sink.last_text
+            assert "(unclassified)" not in h.sink.last_text
+            assert len(h.sink.completions) == 1
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_error_event_classification_precedes_unconfirmed_stream_timeout(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(runner_total_timeout_s=0.2) as h:
+            hold = asyncio.Event()
+            h.runner.timeout_status = 409
+            h.runner.hold = hold
+            h.runner.default_script = [
+                ErrorEvent(message="limited", classification="rate-limit")
+            ]
+            try:
+                outcome = await h.kernel._attempt(
+                    _qevent("go", thread="tTimeoutEarlierError"),
+                    TargetRoute(),
+                    lambda: None,
+                    pressure_retried=False,
+                    workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                )
+            finally:
+                hold.set()
+
+            assert outcome.terminal_ok is False
+            assert outcome.classification == "rate-limit"
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("with_side_effect", "event_id"),
+    [
+        (False, "event-capacity"),
+        (True, "event-capacity-side-effect"),
+        (False, "approval-capacity-resolved"),
+    ],
+    ids=["ordinary", "side-effect", "approval-resume"],
+)
+def test_history_persistence_error_never_retries_and_settles_once(
+    make_harness,
+    with_side_effect: bool,
+    event_id: str,
+) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=3) as h:
+            prefix = [SideEffectFlag(tool="deploy")] if with_side_effect else []
+            h.runner.default_script = [
+                *prefix,
+                ErrorEvent(
+                    message="Transcript history could not be saved.",
+                    classification="history-persistence-error",
+                ),
+                Final(text="failed", status=FAIL),
+            ]
+            event = _qevent("go", event_id=event_id)
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == ["go"]
+            assert h.sink.last_text is not None
+            assert "(history-persistence-error)" in h.sink.last_text
+            assert len(h.sink.completions) == 1
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
 
     asyncio.run(go())
 
@@ -5845,6 +5991,7 @@ def test_buffered_runner_eof_does_not_release_action_recording_from_turn_deadlin
                 runner_total_timeout_s=0.5,
                 max_attempts=3,
             ) as h:
+                h.runner.timeout_status = 200
                 h.runner.default_script = [
                     SideEffectFlag(
                         tool="deploy",
@@ -5917,6 +6064,7 @@ def test_stream_timeout_without_a_side_effect_still_retries(make_harness, monkey
             retry_backoff_max_s=0.6,
         ) as h:
             hold = asyncio.Event()
+            h.runner.timeout_status = 200
             h.runner.hold = hold
             h.runner.turn_scripts = [
                 [TextDelta(text="partial")],

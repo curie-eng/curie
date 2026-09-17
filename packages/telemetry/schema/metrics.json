@@ -112,6 +112,28 @@
       },
       "cardinality_bound": 2
     },
+    "curie.history.persistence.failure": {
+      "type": "counter",
+      "unit": "{failure}",
+      "description": "Transcript persistence failures caused by state capacity limits.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "source": [
+          "state-api"
+        ],
+        "outcome": [
+          "capacity"
+        ],
+        "limit": [
+          "value",
+          "namespace"
+        ]
+      },
+      "cardinality_bound": 2
+    },
     "curie.queue.enqueue": {
       "type": "counter",
       "unit": "{message}",

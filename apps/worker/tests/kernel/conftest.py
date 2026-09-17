@@ -491,6 +491,7 @@ class FakeRunner:
                 web.post("/v1/event", self._event),
                 web.post("/v1/steer", self._steer),
                 web.post("/v1/interrupt", self._interrupt),
+                web.post("/v1/timeout", self._timeout),
             ]
         )
         self.turn_active = False
@@ -511,12 +512,19 @@ class FakeRunner:
         self.accept: asyncio.Event | None = None  # gate after opened, before prepare
         self.tail: list[OutboundEvent] = []
         self.event_fail_times: int = 0  # return 500 on the next N /v1/event calls
+        # None omits the turn epoch and therefore exercises the client's
+        # constructed unconfirmed timeout result. A concrete status exposes an
+        # epoch and controls the causal /v1/timeout response.
+        self.timeout_status: int | None = None
+        self.timeout_delay_seconds = 0.0
+        self.timeout_calls = 0
         # Per-route captured request headers (the ACI auth Bearer check reads
         # these): the most recent request's headers for each route, so a test can
         # assert the worker delivered its per-sandbox token as Authorization.
         self.event_headers: list[dict[str, str]] = []
         self.steer_headers: list[dict[str, str]] = []
         self.interrupt_headers: list[dict[str, str]] = []
+        self.timeout_headers: list[dict[str, str]] = []
         self.status_headers: list[dict[str, str]] = []
 
     async def _status(self, request: web.Request) -> web.Response:
@@ -545,7 +553,10 @@ class FakeRunner:
             self.event_fail_times -= 1
             return web.json_response({"error": "transient runner failure"}, status=500)
         script = self.turn_scripts.pop(0) if self.turn_scripts else list(self.default_script)
-        resp = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
+        headers = {"Content-Type": "application/x-ndjson"}
+        if self.timeout_status is not None:
+            headers["X-Curie-Turn-Epoch"] = "e" * 32
+        resp = web.StreamResponse(status=200, headers=headers)
         if self.accept is not None:
             await self.accept.wait()
         await resp.prepare(request)
@@ -589,6 +600,16 @@ class FakeRunner:
         # ``accept`` is the gate before prepare. Releasing it here would hide a
         # kill that lands after the POST is received and before the stream starts.
         return web.json_response({"ok": True})
+
+    async def _timeout(self, request: web.Request) -> web.Response:
+        self.timeout_headers.append(dict(request.headers))
+        self.timeout_calls += 1
+        if self.timeout_delay_seconds:
+            await asyncio.sleep(self.timeout_delay_seconds)
+        status = self.timeout_status if self.timeout_status is not None else 404
+        if status == 200 and self.hold is not None:
+            self.hold.set()  # type: ignore[attr-defined]
+        return web.json_response({"ok": status == 200}, status=status)
 
 
 # --- Delivery-lease test helpers (ADR-0131, #1971) -----------------------------

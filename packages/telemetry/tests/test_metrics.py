@@ -200,6 +200,80 @@ def test_history_resume_cache_read_is_declared_and_rejects_unbounded_attributes(
         )
 
 
+def test_history_persistence_failure_is_exactly_two_closed_series(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    provider, reader = metrics
+    manifest = _read(_MANIFEST)["metrics"]["curie.history.persistence.failure"]
+    assert manifest == {
+        "type": "counter",
+        "unit": "{failure}",
+        "description": "Transcript persistence failures caused by state capacity limits.",
+        "monotonic": True,
+        "attributes": {
+            "service.name": ["curie-api"],
+            "source": ["state-api"],
+            "outcome": ["capacity"],
+            "limit": ["value", "namespace"],
+        },
+        "cardinality_bound": 2,
+    }
+
+    for limit in ("value", "namespace"):
+        record_metric(
+            "curie.history.persistence.failure",
+            attributes={
+                "service.name": "curie-api",
+                "source": "state-api",
+                "outcome": "capacity",
+                "limit": limit,
+            },
+        )
+    assert provider.force_flush(timeout_millis=5000)
+    series = _exported_series(reader)["curie.history.persistence.failure"]
+    assert series == {
+        tuple(
+            sorted(
+                {
+                    "service.name": "curie-api",
+                    "source": "state-api",
+                    "outcome": "capacity",
+                    "limit": limit,
+                }.items()
+            )
+        )
+        for limit in ("value", "namespace")
+    }
+
+
+@pytest.mark.parametrize(
+    ("attributes", "match"),
+    [
+        ({"agent.id": "agent-example"}, "undeclared attribute"),
+        ({"exception": "ValueError"}, "undeclared attribute"),
+        ({"url": "https://example.com/private"}, "undeclared attribute"),
+        ({"status_text": "payload too large"}, "undeclared attribute"),
+        ({"outcome": "failure"}, "outside its declared domain"),
+        ({"limit": "thread"}, "outside its declared domain"),
+    ],
+)
+def test_history_persistence_failure_rejects_unbounded_labels(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+    attributes: dict[str, str],
+    match: str,
+) -> None:
+    del metrics
+    expected = {
+        "service.name": "curie-api",
+        "source": "state-api",
+        "outcome": "capacity",
+        "limit": "value",
+    }
+    expected.update(attributes)
+    with pytest.raises(ValueError, match=match):
+        record_metric("curie.history.persistence.failure", attributes=expected)
+
+
 def test_deadline_halted_is_a_declared_terminal_turn_outcome(
     metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:
