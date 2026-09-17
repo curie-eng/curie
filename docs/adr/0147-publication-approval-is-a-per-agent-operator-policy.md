@@ -2,7 +2,7 @@
 
 Date: 2026-09-10
 
-Status: Draft
+Status: Accepted
 
 Proposed as part of the dark-factory decision set, discussed in
 [discussion #2551](https://github.com/curie-eng/curie/discussions/2551).
