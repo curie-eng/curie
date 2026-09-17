@@ -24,6 +24,11 @@ grafana.ini:
   analytics:
     reporting_enabled: false
     check_for_updates: false
+  plugins:
+    # Grafana 13.2.0 unloads Loki during automatic plugin updates, briefly
+    # causing queries to return 404. Disable that startup work:
+    # https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/#preinstall_auto_update
+    preinstall_auto_update: false
   users:
     allow_sign_up: false
   auth.anonymous:

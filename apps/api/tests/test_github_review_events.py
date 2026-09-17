@@ -1866,9 +1866,22 @@ def test_concurrent_distinct_delivery_headers_for_one_feedback_enqueue_once(revi
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(deliver, range(4)))
-    assert sorted(results) == [(200, "feedback_duplicate")] * 3 + [(200, "feedback_queued")]
-    assert valkey.xlen(stream) == 1
-    assert len(review_rows("SELECT event_id FROM curie.github_review_feedback")) == 1
+    duplicate = (200, "feedback_duplicate")
+    assert results.count(duplicate) == 3
+    creator = [result for result in results if result != duplicate]
+    # A duplicate may hold the outbox row lock until after the creator refreshes it.
+    assert creator in [[(200, "feedback_queued")], [(200, "feedback_waiting")]]
+    entries = valkey.xrange(stream)
+    assert len(entries) == 1
+    assert review_rows(
+        "SELECT event_id,status,stream_id,enqueue_attempts "
+        "FROM curie.github_review_feedback"
+    ) == [{
+        "event_id": truth.feedback.event_id,
+        "status": "queued",
+        "stream_id": entries[0][0],
+        "enqueue_attempts": 1,
+    }]
 
 
 def test_legacy_name_only_lineage_cannot_override_verified_github_owner(

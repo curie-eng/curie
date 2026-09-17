@@ -9,6 +9,7 @@ means a LogQL result and a Tempo span actually crossed the connector boundary.
 from __future__ import annotations
 
 import base64
+import configparser
 import json
 import os
 import re
@@ -288,6 +289,18 @@ def _write_runtime_configs(root: Path) -> tuple[dict[str, str], TempoEnvelope]:
     (root / "tempo.yaml").write_text(tempo_config)
 
     grafana_values = _load_yaml(OBSERVABILITY / "grafana-values.yaml")
+    grafana_ini = configparser.ConfigParser(interpolation=None)
+    grafana_ini.read_dict(
+        {
+            section: {
+                key: str(value).lower() if isinstance(value, bool) else str(value)
+                for key, value in settings.items()
+            }
+            for section, settings in grafana_values["grafana.ini"].items()
+        }
+    )
+    with (root / "grafana.ini").open("w") as grafana_ini_file:
+        grafana_ini.write(grafana_ini_file)
     provisioning = {
         "apiVersion": 1,
         "datasources": grafana_values["datasources"]["datasources.yaml"]["datasources"],
@@ -628,6 +641,7 @@ def _populate_runtime_stack(stack: RuntimeStack, root: Path, images: dict[str, s
             "GF_SERVER_HTTP_PORT": "80",
         },
         volumes=(
+            (root / "grafana.ini", "/etc/grafana/grafana.ini"),
             (
                 root / "grafana-datasources.yaml",
                 "/etc/grafana/provisioning/datasources/runtime.yaml",
