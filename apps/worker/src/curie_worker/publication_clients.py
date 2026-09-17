@@ -205,6 +205,8 @@ class PublicationLineageClient:
         *,
         expected_version: int,
         expected_head_sha: str | None,
+        expected_publication_version: int,
+        lease_owner: str,
         pr_number: int,
         pr_url: str,
         head_sha: str,
@@ -216,6 +218,8 @@ class PublicationLineageClient:
                 json={
                     "expected_version": expected_version,
                     "expected_head_sha": expected_head_sha,
+                    "expected_publication_version": expected_publication_version,
+                    "lease_owner": lease_owner,
                     "state": "open",
                     "pr_number": pr_number,
                     "pr_url": pr_url,

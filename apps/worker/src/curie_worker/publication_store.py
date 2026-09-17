@@ -421,6 +421,7 @@ class PostgresPublicationStore:
                 adapter=row["reply_adapter"],
             ),
             version=version,
+            lease_owner=self._lease_owner,
         )
 
     async def is_terminal(self, publication_id: uuid.UUID) -> bool:

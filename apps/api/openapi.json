@@ -3639,6 +3639,11 @@
             ],
             "title": "Expected Head Sha"
           },
+          "expected_publication_version": {
+            "minimum": 1.0,
+            "title": "Expected Publication Version",
+            "type": "integer"
+          },
           "expected_version": {
             "minimum": 1.0,
             "title": "Expected Version",
@@ -3646,6 +3651,12 @@
           },
           "head_sha": {
             "title": "Head Sha",
+            "type": "string"
+          },
+          "lease_owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Lease Owner",
             "type": "string"
           },
           "pr_number": {
@@ -3673,6 +3684,8 @@
         "required": [
           "expected_version",
           "expected_head_sha",
+          "expected_publication_version",
+          "lease_owner",
           "pr_number",
           "pr_url",
           "head_sha"

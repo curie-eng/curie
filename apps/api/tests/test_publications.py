@@ -316,6 +316,28 @@ def _get_lineage(
     )
 
 
+def _claim_publication_lease(publication_id: str, owner: str) -> int:
+    """Stand in for the worker's claim_next lease on one publication."""
+
+    async def run() -> int:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                result = await conn.execute(
+                    text(
+                        "UPDATE curie.publications SET lease_owner = :owner, "
+                        "lease_expires_at = now() + interval '1 minute', "
+                        "version = version + 1 WHERE id = :id RETURNING version"
+                    ),
+                    {"id": uuid.UUID(publication_id), "owner": owner},
+                )
+                return int(result.scalar_one())
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
 def _advance_lineage(
     client: TestClient,
     publication_id: str,
@@ -326,12 +348,18 @@ def _advance_lineage(
     state: str = "open",
     pr_number: int = PR_NUMBER,
     pr_url: str = PR_URL,
+    lease: tuple[int, str] | None = None,
 ) -> Any:
+    if lease is None:
+        owner = "api-test-worker"
+        lease = (_claim_publication_lease(publication_id, owner), owner)
     return client.patch(
         f"/v1/internal/publications/{publication_id}/lineage",
         json={
             "expected_version": expected_version,
             "expected_head_sha": expected_head_sha,
+            "expected_publication_version": lease[0],
+            "lease_owner": lease[1],
             "state": state,
             "pr_number": pr_number,
             "pr_url": pr_url,
@@ -3729,6 +3757,67 @@ def test_publication_revision_refuses_a_checkout_not_at_the_lineage_head(
     assert current["version"] == 2
 
 
+def test_lineage_advance_refuses_a_worker_whose_publication_lease_was_reclaimed(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"],
+            conversation_id="thread-lineage-lease",
+            dedupe_key="lineage-lease-stale",
+        ),
+    )
+    assert _resolve(client, auth_headers, publication["approval_id"]).status_code == 200
+    stale = (_claim_publication_lease(publication["id"], "worker-a"), "worker-a")
+    current = (_claim_publication_lease(publication["id"], "worker-b"), "worker-b")
+    snapshot = (
+        "SELECT p.status, p.version, p.lease_owner, p.patch_bytes IS NULL AS cleared, "
+        "l.pr_number, l.head_sha, l.version AS lineage_version "
+        "FROM curie.publications p JOIN curie.thread_publication_lineages l "
+        "ON l.id = p.lineage_id WHERE p.id = :id"
+    )
+    before = _rows(snapshot, {"id": uuid.UUID(publication["id"])})
+
+    for lease in (stale, (current[0], "worker-a"), (stale[0], "worker-b")):
+        refused = _advance_lineage(
+            client,
+            publication["id"],
+            expected_version=1,
+            expected_head_sha=None,
+            head_sha=FIRST_REVISION_SHA,
+            lease=lease,
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "publication.lease_lost"
+        assert _rows(snapshot, {"id": uuid.UUID(publication["id"])}) == before
+
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+        lease=current,
+    )
+    assert advanced.status_code == 200, advanced.text
+    assert _rows(snapshot, {"id": uuid.UUID(publication["id"])}) == [
+        {
+            "status": "succeeded",
+            "version": current[0] + 1,
+            "lease_owner": None,
+            "cleared": True,
+            "pr_number": PR_NUMBER,
+            "head_sha": FIRST_REVISION_SHA,
+            "lineage_version": 2,
+        }
+    ]
+
+
 def test_lineage_advance_cas_refuses_stale_version_and_expected_head(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
@@ -3844,6 +3933,9 @@ def test_concurrent_lineage_advances_have_one_exact_cas_winner(
     )
     assert _resolve(client, auth_headers, second["approval_id"]).status_code == 200
 
+    # Both racers present the same held lease, so only the lineage CAS decides.
+    lease = (_claim_publication_lease(second["id"], "api-test-worker"), "api-test-worker")
+
     def attempt(head_sha: str) -> Any:
         return _advance_lineage(
             client,
@@ -3851,6 +3943,7 @@ def test_concurrent_lineage_advances_have_one_exact_cas_winner(
             expected_version=2,
             expected_head_sha=FIRST_REVISION_SHA,
             head_sha=head_sha,
+            lease=lease,
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:

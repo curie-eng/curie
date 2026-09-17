@@ -1392,13 +1392,17 @@ async def advance_publication_lineage(
             "publication.lineage_stale",
             "publication revision is not the current thread lineage revision",
         )
-    if data.pr_url != f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}":
+    # GitHub repository owner and name are case-insensitive; the worker and the
+    # identity verifier already compare them with casefold.
+    expected_url = f"https://github.com/{lineage.repo_full_name}/pull/{data.pr_number}"
+    if data.pr_url.casefold() != expected_url.casefold():
         raise PublicationLineageConflict(
             "publication.lineage_stale",
             "pull request identity does not match the publication repository",
         )
     if lineage.pr_number is not None and (
-        lineage.pr_number != data.pr_number or lineage.pr_url != data.pr_url
+        lineage.pr_number != data.pr_number
+        or (lineage.pr_url or "").casefold() != data.pr_url.casefold()
     ):
         raise PublicationLineageConflict(
             "publication.lineage_stale",
@@ -1408,6 +1412,14 @@ async def advance_publication_lineage(
         raise PublicationLineageConflict(
             "publication.lineage_stale",
             "pull request lineage version or expected head is stale",
+        )
+    if (
+        publication.version != data.expected_publication_version
+        or publication.lease_owner != data.lease_owner
+    ):
+        raise PublicationLineageConflict(
+            "publication.lease_lost",
+            "publication lease is no longer held by this worker",
         )
     if publication.status not in ("approved", "launching", "running"):
         raise PublicationLineageConflict(
@@ -1510,7 +1522,8 @@ async def advance_publication_lineage(
         .where(
             Publication.id == publication.id,
             Publication.status == publication.status,
-            Publication.version == publication.version,
+            Publication.version == data.expected_publication_version,
+            Publication.lease_owner == data.lease_owner,
         )
         .values(**publication_values)
         .returning(Publication.id)

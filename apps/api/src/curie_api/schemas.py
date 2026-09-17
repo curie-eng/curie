@@ -1579,6 +1579,10 @@ class PublicationLineageAdvance(BaseModel):
 
     expected_version: int = Field(ge=1)
     expected_head_sha: str | None
+    # The worker's claimed publication version and lease owner fence a stale
+    # worker out after another worker reclaims the publication.
+    expected_publication_version: int = Field(ge=1)
+    lease_owner: str = Field(min_length=1, max_length=255)
     state: Literal["open", "merged", "closed"] = "open"
     pr_number: int = Field(gt=0)
     pr_url: str = Field(min_length=1, max_length=2048)

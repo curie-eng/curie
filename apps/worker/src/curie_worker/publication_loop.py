@@ -97,6 +97,7 @@ class PublicationWork:
     target: ReplyTarget
     route: TargetRoute
     version: int
+    lease_owner: str
 
 
 class PublicationStore(Protocol):
@@ -179,6 +180,8 @@ class PublicationLineageAuthority(Protocol):
         *,
         expected_version: int,
         expected_head_sha: str | None,
+        expected_publication_version: int,
+        lease_owner: str,
         pr_number: int,
         pr_url: str,
         head_sha: str,
@@ -645,23 +648,9 @@ class PublicationReconciler:
                 raise PublicationReconcileError(
                     "publication success omitted pull request identity"
                 )
-            # ADR 0143: the API verifies GitHub identity and advances the
-            # lineage with the publication outcome in one compare-and-set.
-            try:
-                await _resolve(
-                    self._lineage.advance(
-                        work.publication_id,
-                        expected_version=work.lineage_version,
-                        expected_head_sha=work.expected_remote_head,
-                        pr_number=pr_number,
-                        pr_url=pr_url,
-                        head_sha=new_head,
-                    )
-                )
-            except PublicationLineageRefused:
-                # A replay after a lost response finds its own settled outcome.
-                if not await _resolve(self._store.is_terminal(work.publication_id)):
-                    raise
+            await self._advance_lineage(
+                work, pr_url=pr_url, pr_number=pr_number, new_head=new_head
+            )
         await self._persist_result(
             work,
             outcome=outcome,
@@ -670,6 +659,35 @@ class PublicationReconciler:
         )
         await self.deliver_pending_cleanup()
         await self.deliver_pending_result(work.publication_id)
+
+    async def _advance_lineage(
+        self,
+        work: PublicationWork,
+        *,
+        pr_url: str,
+        pr_number: int,
+        new_head: str,
+    ) -> None:
+        # ADR 0143: the API verifies GitHub identity and advances the lineage
+        # with the publication outcome in one compare-and-set, fenced by this
+        # worker's claimed publication version and lease.
+        try:
+            await _resolve(
+                self._lineage.advance(
+                    work.publication_id,
+                    expected_version=work.lineage_version,
+                    expected_head_sha=work.expected_remote_head,
+                    expected_publication_version=work.version,
+                    lease_owner=work.lease_owner,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    head_sha=new_head,
+                )
+            )
+        except PublicationLineageRefused:
+            # A replay after a lost response finds its own settled outcome.
+            if not await _resolve(self._store.is_terminal(work.publication_id)):
+                raise
 
     async def _mark_lineage_terminal(
         self,
@@ -1031,13 +1049,22 @@ class PublicationReconciler:
             # exact marked commit with the expected parent. Persisting the
             # lineage CAS may expose cleanup or reply-outbox failures; those
             # must escape as outbox work, never be charged as another attempt
-            # at the already completed publication mutation.
+            # at the already completed publication mutation. The API's lineage
+            # advance is not yet committed, so its refusal or outage is bounded.
+            try:
+                await self._advance_lineage(
+                    work,
+                    pr_url=pull.url,
+                    pr_number=pull.number,
+                    new_head=pull.head_sha,
+                )
+            except Exception as exc:
+                await self._bounded_setup_failure(work, exc)
+                return
             await self._terminalize(
                 work,
                 outcome="published",
                 pr_url=pull.url,
-                pr_number=pull.number,
-                new_head=pull.head_sha,
                 names=names,
             )
             return

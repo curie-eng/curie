@@ -532,7 +532,7 @@ class _TestClientTransport(httpx.AsyncBaseTransport):
 
 
 def publish_through_worker(
-    client: TestClient, *, pr_number: int, head_sha: str = HEAD
+    client: TestClient, *, pr_number: int, head_sha: str = HEAD, pr_repo: str = REPO
 ) -> dict:
     """Drive the production worker success path for the one approved publication.
 
@@ -552,7 +552,7 @@ def publish_through_worker(
         _Replies,
     )
 
-    pr_url = f"https://github.com/{REPO}/pull/{pr_number}"
+    pr_url = f"https://github.com/{pr_repo}/pull/{pr_number}"
 
     async def run() -> dict:
         import curie_worker.publication_loop as module
@@ -887,6 +887,20 @@ def test_worker_publication_success_stamps_verified_identity_on_the_lineage(
         "status": "succeeded",
         "lease_owner": None,
     }]
+
+
+def test_worker_publication_accepts_github_canonical_repository_casing(
+    approved_review_producer,
+) -> None:
+    client, truth, valkey, stream = approved_review_producer
+    # GitHub may return the canonical owner/name spelling for a repository the
+    # operator configured in lowercase; repository names are case-insensitive.
+    publish_through_worker(client, pr_number=17, pr_repo="Acme-Corp/Acme-Bot")
+    assert review_rows(
+        "SELECT l.pr_number, l.github_repository_id, p.status "
+        "FROM curie.thread_publication_lineages l "
+        "JOIN curie.publications p ON p.lineage_id = l.id"
+    ) == [{"pr_number": 17, "github_repository_id": 21, "status": "succeeded"}]
 
 
 def test_worker_publication_with_mismatched_github_identity_is_refused(

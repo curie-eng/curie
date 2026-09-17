@@ -228,8 +228,11 @@ class _Store:
 class _Lineage:
     def __init__(self) -> None:
         self.advances: list[dict[str, Any]] = []
+        self.error: Exception | None = None
 
     def advance(self, publication_id: uuid.UUID, **advance: Any) -> None:
+        if self.error is not None:
+            raise self.error
         self.advances.append({"publication_id": publication_id, **advance})
 
 
@@ -572,6 +575,7 @@ def _work(module: Any, *, decision: str = "approved", kind: str = "slack") -> An
             adapter=None if kind == "slack" else "agentmail-sandbox",
         ),
         version=1,
+        lease_owner="publication-loop-test",
     )
 
 
@@ -608,6 +612,7 @@ def _lineage_work(
         target=_target(),
         route=TargetRoute(endpoint=None, adapter=None),
         version=1,
+        lease_owner="publication-loop-test",
     )
 
 
@@ -1276,6 +1281,36 @@ async def test_stored_terminal_pull_never_adopts_a_foreign_replacement_head(
     assert store.completed == {}
     assert loop._lineage.advances == []
     assert replies.events == []
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    ["refused", "unavailable"],
+)
+async def test_existing_pr_recovery_charges_lineage_advance_failures_to_bounded_retry(
+    publication: Any,
+    refusal: str,
+) -> None:
+    loop, store, _, cluster, github, replies = _loop(publication)
+    github.head_sha = REVISION_HEAD
+    github.allow_exact_revision(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
+    loop._lineage.error = (
+        publication.PublicationLineageRefused("publication lineage advance was refused")
+        if refusal == "refused"
+        else PublicationReconcileError("publication lineage advance returned HTTP 503")
+    )
+    store.retry_terminal_after = 2
+    work = _lineage_work(publication)
+
+    await loop.reconcile(work)
+    assert len(store.retries) == 1
+    assert store.completed == {}
+
+    await loop.reconcile(work)
+    assert len(store.retries) == 2
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert loop._lineage.advances == []
+    assert cluster.applied == []
 
 
 async def test_stored_terminal_pull_accepts_an_exact_verified_revision_head(
