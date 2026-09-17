@@ -1107,6 +1107,9 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
     async def go() -> None:
         async with make_harness() as h:
             hold = asyncio.Event()  # never set: the response hangs after a prefix
+            # This case specifically covers a runner that omitted the epoch.
+            # The shared fake otherwise matches the real runner and emits one.
+            h.runner.timeout_status = None
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="x")]
             handle = await asyncio.to_thread(h.substrate.claim, "tStreamTimeout")
@@ -1124,6 +1127,8 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
                 exc = excinfo.value
                 assert isinstance(exc, RunnerStreamTimeout)
                 assert isinstance(exc, TimeoutError)  # existing handlers still catch it
+                assert exc.timeout_result == "unconfirmed"
+                assert h.runner.timeout_calls == 0
                 assert str(exc).strip(), "a stream timeout must not stringify to nothing"
                 assert "Timeout" in str(exc)  # the normalized underlying class
                 # The delivery had only 0.2s left, so that effective request
@@ -1145,6 +1150,83 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
             finally:
                 hold.set()
                 await client.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(200, "accepted"), (409, "conflict"), (404, "unconfirmed")],
+)
+def test_timeout_callback_preserves_the_runner_confirmation(
+    status: int,
+    expected: str,
+) -> None:
+    async def go() -> None:
+        async def timeout(_request: web.Request) -> web.Response:
+            return web.json_response({"ok": status == 200}, status=status)
+
+        app = web.Application()
+        app.add_routes([web.post("/v1/timeout", timeout)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0)
+        try:
+            result = await client._notify_timeout(
+                f"http://127.0.0.1:{server.port}", "e" * 32, None
+            )
+            assert result == expected
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_timeout_callback_transport_failure_is_unconfirmed() -> None:
+    async def go() -> None:
+        app = web.Application()
+        server = TestServer(app)
+        await server.start_server()
+        base_url = f"http://127.0.0.1:{server.port}"
+        await server.close()
+        client = RunnerClient(total_timeout_s=5.0)
+        try:
+            assert await client._notify_timeout(base_url, "e" * 32, None) == "unconfirmed"
+        finally:
+            await client.close()
+
+    asyncio.run(go())
+
+
+def test_timeout_callback_control_timeout_is_unconfirmed() -> None:
+    async def go() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def timeout(_request: web.Request) -> web.Response:
+            entered.set()
+            await release.wait()
+            return web.json_response({"ok": True})
+
+        app = web.Application()
+        app.add_routes([web.post("/v1/timeout", timeout)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0, interrupt_timeout_s=0.05)
+        try:
+            notifying = asyncio.create_task(
+                client._notify_timeout(
+                    f"http://127.0.0.1:{server.port}", "e" * 32, None
+                )
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            assert not notifying.done()
+            assert await notifying == "unconfirmed"
+        finally:
+            release.set()
+            await client.close()
+            await server.close()
 
     asyncio.run(go())
 
@@ -1541,12 +1623,16 @@ def test_production_http_timeout_handler_holds_next_query_until_ack(
                 remaining_s=0.05,
             )
             with caplog.at_level(logging.WARNING, logger="curie_worker.runner_client"):
-                with pytest.raises(RunnerStreamTimeout):
+                with pytest.raises(RunnerStreamTimeout) as excinfo:
                     async with first:
                         async for _frame in first:
                             pass
 
             await asyncio.wait_for(session.interrupt_entered.wait(), timeout=1.0)
+            # The runner owns the timeout before awaiting the blocked SDK
+            # interrupt, but the worker cannot confirm that ownership without
+            # receiving the HTTP 200 response.
+            assert excinfo.value.timeout_result == "unconfirmed"
             second_task = asyncio.create_task(consume_second())
             await asyncio.wait_for(second_stream_opened.wait(), timeout=1.0)
             assert not session.interrupt_cancelled.is_set()

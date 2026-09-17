@@ -388,8 +388,10 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
+    "history-persistence-error",
 })
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
+WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset({"runner-timeout-unconfirmed"})
 
 _ESCALATION_DETAIL_MAX = 300
 
@@ -398,6 +400,12 @@ def map_error_classification(raw: str | None) -> str:
     if raw is not None and raw in PLATFORM_ERROR_CLASSIFICATIONS:
         return raw
     return UNCLASSIFIED_ERROR_CLASSIFICATION
+
+
+def _display_error_classification(raw: str | None) -> str:
+    if raw is not None and raw in WORKER_LOCAL_DISPLAY_CLASSIFICATIONS:
+        return raw
+    return map_error_classification(raw)
 
 
 def _workspace_inference_notice(repo: str | None) -> str | None:
@@ -1807,7 +1815,7 @@ class Kernel:
                     return
 
                 if outcome.saw_side_effect:
-                    token = map_error_classification(outcome.classification)
+                    token = _display_error_classification(outcome.classification)
                     await self._escalate(
                         qevent,
                         route,
@@ -1831,7 +1839,7 @@ class Kernel:
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
                 if not retryable or attempt >= self._config.max_attempts:
-                    token = map_error_classification(outcome.classification)
+                    token = _display_error_classification(outcome.classification)
                     await self._escalate(
                         qevent,
                         route,
@@ -5152,9 +5160,16 @@ class Kernel:
                 qevent.event_id,
                 _exception_reason(exc),
             )
-            classification = acc.classification or (
-                "runner-timeout" if isinstance(exc, RunnerStreamTimeout) else "runner-error"
-            )
+            if acc.classification is not None:
+                classification = acc.classification
+            elif isinstance(exc, RunnerStreamTimeout):
+                classification = (
+                    "runner-timeout"
+                    if exc.timeout_result == "accepted"
+                    else "runner-timeout-unconfirmed"
+                )
+            else:
+                classification = "runner-error"
             return TurnOutcome(
                 terminal_ok=False,
                 saw_side_effect=acc.saw_side_effect,

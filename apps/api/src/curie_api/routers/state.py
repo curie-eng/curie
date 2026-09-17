@@ -19,6 +19,7 @@ import json
 import uuid
 from typing import Annotated, Any
 
+from curie_telemetry import record_metric
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy import Text, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -228,6 +229,16 @@ async def _enforce_caps(
     settings = get_settings()
     value_bytes = _json_size(value)
     if value_bytes > settings.state_max_value_bytes:
+        if namespace == "transcript":
+            record_metric(
+                "curie.history.persistence.failure",
+                attributes={
+                    "service.name": "curie-api",
+                    "source": "state-api",
+                    "outcome": "capacity",
+                    "limit": "value",
+                },
+            )
         raise HTTPException(
             413,
             f"value is {value_bytes} bytes, over the "
@@ -271,6 +282,16 @@ async def _enforce_caps(
         others = await session.scalars(select(WorkflowStateEntry.value).where(*sibling_filter))
         namespace_bytes = value_bytes + sum(_json_size(v) for v in others)
         if namespace_bytes > settings.state_max_namespace_bytes:
+            if namespace == "transcript":
+                record_metric(
+                    "curie.history.persistence.failure",
+                    attributes={
+                        "service.name": "curie-api",
+                        "source": "state-api",
+                        "outcome": "capacity",
+                        "limit": "namespace",
+                    },
+                )
             raise HTTPException(
                 413,
                 f"namespace {namespace!r} would be {namespace_bytes} bytes, over the "
