@@ -820,7 +820,7 @@ def test_entry_is_acked_after_report_even_when_report_fails(make_eval_harness, b
             None,
             "high",
             "high",
-            id="stored settings",
+            id="stored_settings",
         ),
         pytest.param(
             "worker_model",
@@ -830,7 +830,7 @@ def test_entry_is_acked_after_report_even_when_report_fails(make_eval_harness, b
             "adaptive",
             None,
             "adaptive",
-            id="null stored settings",
+            id="null_stored_settings",
         ),
         pytest.param(
             None,
@@ -840,7 +840,7 @@ def test_entry_is_acked_after_report_even_when_report_fails(make_eval_harness, b
             None,
             None,
             None,
-            id="fully unset",
+            id="fully_unset",
         ),
         pytest.param(
             "worker_model",
@@ -850,7 +850,7 @@ def test_entry_is_acked_after_report_even_when_report_fails(make_eval_harness, b
             "adaptive",
             "disabled",
             "disabled",
-            id="sweep model wins",
+            id="sweep_model_wins",
         ),
     ],
 )
