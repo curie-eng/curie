@@ -2695,15 +2695,42 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
 
-  # Temporarily disabled on every train. The serial eleven scenario matrix took
-  # more than two hours on ordinary next PRs, including documentation only
-  # release metadata. Issue #2733 owns a scalable replacement.
-  e2e-cluster-upgrade-matrix:
-    name: E2E cluster upgrade matrix
+  # The upgrade matrix runs on every PR as independent shards (issue #2733).
+  # The script owns the shard list and its --self-test proves every scenario
+  # is assigned to exactly one shard, so CI never hardcodes shard ids.
+  e2e-cluster-upgrade-matrix-shards:
+    name: E2E cluster upgrade matrix shards
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    needs: [rust-build]
-    if: ${{ false }}
+    timeout-minutes: 10
+    outputs:
+      shards: ${{ steps.list.outputs.shards }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Check upgrade matrix shard coverage
+        run: bash cli/scripts/cluster-upgrade-matrix.sh --self-test
+      - name: List upgrade matrix shards
+        id: list
+        run: |
+          set -euo pipefail
+          shards="$(bash cli/scripts/cluster-upgrade-matrix.sh --list-shards --json \
+            | python3 -c 'import json, sys; print(json.dumps([s["id"] for s in json.load(sys.stdin)["shards"]]))')"
+          if [[ -z "$shards" || "$shards" == "[]" ]]; then
+            echo "cluster-upgrade-matrix.sh listed no shards" >&2
+            exit 1
+          fi
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+
+  e2e-cluster-upgrade-matrix:
+    name: E2E cluster upgrade matrix (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [rust-build, e2e-cluster-upgrade-matrix-shards]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.e2e-cluster-upgrade-matrix-shards.outputs.shards) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -2724,61 +2751,29 @@ jobs:
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
-      - name: Build the candidate api image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      # One parallel bake of all five candidate images (#2733); the serial
+      # builds cost ~3m15s per shard. Tags, Dockerfiles and gha cache scopes
+      # match the previous per-image build steps.
+      - name: Write the candidate image bake definition
+        run: |
+          cat > matrix-bake.json <<'EOF'
+          {"group": {"default": {"targets": ["api", "dispatcher", "worker", "ui", "runner"]}},
+          "target": {
+            "api": {"context": ".", "dockerfile": "apps/api/Dockerfile", "tags": ["curie-api:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-api"], "cache-to": ["type=gha,mode=max,scope=ladder-api"]},
+            "dispatcher": {"context": ".", "dockerfile": "apps/dispatcher/Dockerfile", "tags": ["curie-dispatcher:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-dispatcher"], "cache-to": ["type=gha,mode=max,scope=ladder-dispatcher"]},
+            "worker": {"context": ".", "dockerfile": "apps/worker/Dockerfile", "tags": ["curie-worker:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-worker"], "cache-to": ["type=gha,mode=max,scope=ladder-worker"]},
+            "ui": {"context": ".", "dockerfile": "apps/ui/Dockerfile", "tags": ["curie-ui:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-ui"], "cache-to": ["type=gha,mode=max,scope=ladder-ui"]},
+            "runner": {"context": ".", "dockerfile": "runner/Dockerfile", "tags": ["curie-runner:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-runner"], "cache-to": ["type=gha,mode=max,scope=ladder-runner"]}
+          }}
+          EOF
+      - name: Build the candidate images locally in parallel
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
         with:
-          context: .
-          file: apps/api/Dockerfile
           builder: ${{ steps.matrixcache.outputs.name }}
-          tags: curie-api:matrix-candidate
+          source: .
+          files: matrix-bake.json
           push: false
           load: true
-          cache-from: type=gha,scope=ladder-api
-          cache-to: type=gha,mode=max,scope=ladder-api
-      - name: Build the candidate dispatcher image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: apps/dispatcher/Dockerfile
-          builder: ${{ steps.matrixcache.outputs.name }}
-          tags: curie-dispatcher:matrix-candidate
-          push: false
-          load: true
-          cache-from: type=gha,scope=ladder-dispatcher
-          cache-to: type=gha,mode=max,scope=ladder-dispatcher
-      - name: Build the candidate worker image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: apps/worker/Dockerfile
-          builder: ${{ steps.matrixcache.outputs.name }}
-          tags: curie-worker:matrix-candidate
-          push: false
-          load: true
-          cache-from: type=gha,scope=ladder-worker
-          cache-to: type=gha,mode=max,scope=ladder-worker
-      - name: Build the candidate ui image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: apps/ui/Dockerfile
-          builder: ${{ steps.matrixcache.outputs.name }}
-          tags: curie-ui:matrix-candidate
-          push: false
-          load: true
-          cache-from: type=gha,scope=ladder-ui
-          cache-to: type=gha,mode=max,scope=ladder-ui
-      - name: Build the candidate runner image locally
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: runner/Dockerfile
-          builder: ${{ steps.matrixcache.outputs.name }}
-          tags: curie-runner:matrix-candidate
-          push: false
-          load: true
-          cache-from: type=gha,scope=ladder-runner
-          cache-to: type=gha,mode=max,scope=ladder-runner
       - name: Write the kind cluster config
         run: |
           cat > kind-upgrade-matrix-config.yaml <<'EOF'
@@ -2829,28 +2824,20 @@ jobs:
           kubectl apply -f "$calico_manifest"
           kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
           kubectl wait --for=condition=Ready node --all --timeout=300s
-      - name: Load candidate images into the kind cluster
-        run: |
-          set -euo pipefail
-          for image in \
-            curie-api:matrix-candidate \
-            curie-dispatcher:matrix-candidate \
-            curie-worker:matrix-candidate \
-            curie-ui:matrix-candidate \
-            curie-runner:matrix-candidate; do
-            kind load docker-image "$image" --name curie-upgrade-matrix
-          done
+      # No workflow-level kind load: the script retags matrix-candidate to
+      # 0.9.0/0.9.1 from local docker and kind-loads exclusive tags itself.
       - name: Run the cluster upgrade matrix
         env:
           CURIE_BIN: cli/target/release/curie
           CURIE_E2E_CANDIDATE_TAG: matrix-candidate
           CURIE_E2E_KIND_CLUSTER: curie-upgrade-matrix
+          SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
           if [[ -n "${KUBECONFIG:-}" ]]; then
             export CURIE_E2E_KUBECONFIG="$KUBECONFIG"
           fi
-          bash cli/scripts/cluster-upgrade-matrix.sh --scenario all --json
+          bash cli/scripts/cluster-upgrade-matrix.sh --shard "$SHARD" --json
       - name: Dump cluster upgrade matrix diagnostics on failure
         if: failure()
         run: |
@@ -2864,6 +2851,13 @@ jobs:
           tail -c 1000 .projects/2590-evidence/compatible-rollback.err 2>/dev/null || true
           tail -c 2000 .projects/2590-evidence/rollback-088.json 2>/dev/null || true
           tail -c 1000 .projects/2590-evidence/rollback-088.err 2>/dev/null || true
+      - name: Upload upgrade matrix evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: upgrade-matrix-evidence-${{ matrix.shard }}
+          path: .projects/2590-evidence
+          if-no-files-found: warn
       - name: Tear down the owned upgrade matrix cluster
         if: always()
         run: |
@@ -2873,7 +2867,7 @@ jobs:
   e2e-required:
     name: E2E required
     runs-on: ubuntu-latest
-    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix]
+    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -2892,6 +2886,7 @@ jobs:
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
           RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
           RELEASED_UPGRADE_NEGATIVE_RESULT: ${{ needs.e2e-released-upgrade-negative.result }}
+          UPGRADE_MATRIX_SHARDS_RESULT: ${{ needs.e2e-cluster-upgrade-matrix-shards.result }}
           UPGRADE_MATRIX_RESULT: ${{ needs.e2e-cluster-upgrade-matrix.result }}
         run: |
           set -euo pipefail
@@ -2909,6 +2904,7 @@ jobs:
           }
 
           if [[ "$CHANGES_RESULT" != "success" ||
+                "$UPGRADE_MATRIX_SHARDS_RESULT" != "success" ||
                 ( "$SKILL_SELECTED" != "true" && "$SKILL_SELECTED" != "false" ) ||
                 ( "$LOCAL_SELECTED" != "true" && "$LOCAL_SELECTED" != "false" ) ||
                 ( "$LOCAL_RELEASE_SELECTED" != "true" && "$LOCAL_RELEASE_SELECTED" != "false" ) ||
@@ -2934,7 +2930,9 @@ jobs:
           if [[ "$RELEASED_UPGRADE_SELECTED" == "true" ]]; then
             released_upgrade_expected="success"
           fi
-          upgrade_matrix_expected="skipped"
+          # Required on every PR, not change-selected. A matrix job reports
+          # success only when every shard succeeded.
+          upgrade_matrix_expected="success"
 
           if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
