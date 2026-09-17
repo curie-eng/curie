@@ -209,9 +209,9 @@ for name in scenarios:
     hits = [e for s in shards for e in s["scenarios"] if e["name"] == name]
     if name in phased:
         got = [p for e in hits for p in (e["phases"] or [])]
-        want = required[name]
+        required_phases = required[name]
         for p in phases:
-            n, need = got.count(p), (1 if p in want else 0)
+            n, need = got.count(p), (1 if p in required_phases else 0)
             if n != need:
                 errors.append(f"{name} phase {p} runs {n} times, want {need}")
     elif len(hits) != 1:

@@ -365,7 +365,10 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         .collect();
     assert_eq!(
         ids,
-        ["s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11", "s12", "s13"],
+        [
+            "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11", "s12",
+            "s13"
+        ],
         "canonical shard ids\n{manifest}"
     );
 
@@ -374,7 +377,11 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
     for shard in shards {
         let id = shard["id"].as_str().unwrap();
         let setup = shard["setup"].as_bool().expect("shard setup flag");
-        assert_eq!(setup, !matches!(id, "s01" | "s11"), "setup flag wrong for {id}");
+        assert_eq!(
+            setup,
+            !matches!(id, "s01" | "s11"),
+            "setup flag wrong for {id}"
+        );
         for item in shard["scenarios"].as_array().expect("scenarios array") {
             let name = item["name"].as_str().expect("scenario name").to_owned();
             if PHASED.contains(&name.as_str()) {
@@ -387,7 +394,10 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
                     .or_default()
                     .extend(list.iter().map(|p| p.as_str().expect("phase").to_owned()));
             } else {
-                assert!(item["phases"].is_null(), "{name} in {id} must have phases null");
+                assert!(
+                    item["phases"].is_null(),
+                    "{name} in {id} must have phases null"
+                );
                 unsplit.push(name);
             }
         }
@@ -396,11 +406,24 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
     let mut matrix_phases = bash_array_from_script("MATRIX_PHASES");
     assert_eq!(
         matrix_phases,
-        ["plan", "validate", "drain", "checkpoint", "migrate", "apply", "converge", "canary", "commit"]
+        [
+            "plan",
+            "validate",
+            "drain",
+            "checkpoint",
+            "migrate",
+            "apply",
+            "converge",
+            "canary",
+            "commit"
+        ]
     );
     matrix_phases.sort();
     let mut interrupt_phases = bash_array_from_script("INTERRUPT_PHASES");
-    assert_eq!(interrupt_phases, ["checkpoint", "migrate", "apply", "commit"]);
+    assert_eq!(
+        interrupt_phases,
+        ["checkpoint", "migrate", "apply", "commit"]
+    );
     interrupt_phases.sort();
     for (name, want, label) in [
         ("fail-every-phase", &matrix_phases, "MATRIX_PHASES"),
@@ -417,7 +440,10 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         .collect();
     expected.sort();
     unsplit.sort();
-    assert_eq!(unsplit, expected, "non-phased scenarios must each appear once");
+    assert_eq!(
+        unsplit, expected,
+        "non-phased scenarios must each appear once"
+    );
 }
 
 #[test]
@@ -433,7 +459,10 @@ fn self_test_checks_shard_coverage_and_timing() {
         "shard coverage refused a duplicated phase",
         "per-scenario timing recorded",
     ] {
-        assert!(text.contains(needle), "self-test must print `{needle}`\n{text}");
+        assert!(
+            text.contains(needle),
+            "self-test must print `{needle}`\n{text}"
+        );
     }
     let source = fs::read_to_string(script()).expect("read script");
     assert!(
@@ -457,30 +486,51 @@ s12 setup converge-negative
 s13 setup previous-serves";
 
 fn assert_override_refused(manifest: &str, what: &str) {
-    assert_ne!(manifest, GOOD_SHARDS, "fixture for {what} must differ from the good manifest");
+    assert_ne!(
+        manifest, GOOD_SHARDS,
+        "fixture for {what} must differ from the good manifest"
+    );
     let output = run_script(&["--self-test"], &[("CURIE_E2E_SHARDS_OVERRIDE", manifest)]);
     let text = output_text(&output);
-    assert!(!output.status.success(), "{what} must fail self-test\n{text}");
+    assert!(
+        !output.status.success(),
+        "{what} must fail self-test\n{text}"
+    );
     assert!(text.contains("shard coverage failed"), "{what}\n{text}");
 }
 
 #[test]
 fn good_override_passes_self_test() {
-    let output = run_script(&["--self-test"], &[("CURIE_E2E_SHARDS_OVERRIDE", GOOD_SHARDS)]);
+    let output = run_script(
+        &["--self-test"],
+        &[("CURIE_E2E_SHARDS_OVERRIDE", GOOD_SHARDS)],
+    );
     let text = output_text(&output);
-    assert!(output.status.success(), "canonical override must pass\n{text}");
-    assert!(text.contains("shard manifest covers every scenario exactly once"), "{text}");
+    assert!(
+        output.status.success(),
+        "canonical override must pass\n{text}"
+    );
+    assert!(
+        text.contains("shard manifest covers every scenario exactly once"),
+        "{text}"
+    );
 }
 
 #[test]
 fn self_test_fails_when_override_drops_a_scenario() {
-    assert_override_refused(&GOOD_SHARDS.replace(" migration-crash", ""), "dropped scenario");
+    assert_override_refused(
+        &GOOD_SHARDS.replace(" migration-crash", ""),
+        "dropped scenario",
+    );
 }
 
 #[test]
 fn self_test_fails_when_override_duplicates_a_scenario() {
     assert_override_refused(
-        &GOOD_SHARDS.replace("s11 nosetup rollback-published-089", "s11 nosetup rollback-published-089 fresh-n"),
+        &GOOD_SHARDS.replace(
+            "s11 nosetup rollback-published-089",
+            "s11 nosetup rollback-published-089 fresh-n",
+        ),
         "duplicated scenario",
     );
 }
@@ -488,7 +538,10 @@ fn self_test_fails_when_override_duplicates_a_scenario() {
 #[test]
 fn self_test_fails_when_override_drops_a_phase() {
     assert_override_refused(
-        &GOOD_SHARDS.replace("interrupt-resume:checkpoint+migrate", "interrupt-resume:checkpoint"),
+        &GOOD_SHARDS.replace(
+            "interrupt-resume:checkpoint+migrate",
+            "interrupt-resume:checkpoint",
+        ),
         "dropped phase",
     );
 }
@@ -496,7 +549,10 @@ fn self_test_fails_when_override_drops_a_phase() {
 #[test]
 fn self_test_fails_when_override_duplicates_a_phase() {
     assert_override_refused(
-        &GOOD_SHARDS.replace("fail-every-phase:converge", "fail-every-phase:converge+plan"),
+        &GOOD_SHARDS.replace(
+            "fail-every-phase:converge",
+            "fail-every-phase:converge+plan",
+        ),
         "duplicated phase",
     );
 }
@@ -504,7 +560,10 @@ fn self_test_fails_when_override_duplicates_a_phase() {
 #[test]
 fn self_test_fails_when_override_runs_phased_scenario_unsplit() {
     assert_override_refused(
-        &GOOD_SHARDS.replace("s08 setup interrupt-resume:apply+commit", "s08 setup interrupt-resume:apply+commit\ns14 setup interrupt-resume"),
+        &GOOD_SHARDS.replace(
+            "s08 setup interrupt-resume:apply+commit",
+            "s08 setup interrupt-resume:apply+commit\ns14 setup interrupt-resume",
+        ),
         "unsplit phased scenario",
     );
 }
@@ -512,7 +571,10 @@ fn self_test_fails_when_override_runs_phased_scenario_unsplit() {
 #[test]
 fn self_test_fails_when_interrupt_resume_runs_a_phase_outside_interrupt_phases() {
     assert_override_refused(
-        &GOOD_SHARDS.replace("interrupt-resume:apply+commit", "interrupt-resume:apply+commit+plan"),
+        &GOOD_SHARDS.replace(
+            "interrupt-resume:apply+commit",
+            "interrupt-resume:apply+commit+plan",
+        ),
         "interrupt-resume phase outside INTERRUPT_PHASES",
     );
 }
@@ -529,6 +591,31 @@ fn unknown_shard_is_refused() {
 fn shard_and_scenario_together_are_refused() {
     let output = run_script(&["--shard", "s01", "--scenario", "fresh-n"], &[]);
     let text = output_text(&output);
-    assert!(!output.status.success(), "--shard with --scenario must fail\n{text}");
+    assert!(
+        !output.status.success(),
+        "--shard with --scenario must fail\n{text}"
+    );
     assert!(text.contains("--shard and --scenario"), "{text}");
+}
+
+#[test]
+fn cluster_upgrade_matrix_every_listed_shard_id_resolves() {
+    // CI runs `--shard <id>` for each id `--list-shards` prints; a lookup that
+    // refuses a listed id fails every shard before any cluster work (#2733).
+    let listed = run_script(&["--list-shards"], &[]);
+    assert!(listed.status.success());
+    let manifest = String::from_utf8_lossy(&listed.stdout).to_string();
+    for line in manifest.lines().filter(|l| !l.trim().is_empty()) {
+        let id = line.split_whitespace().next().unwrap();
+        let output = run_script(&["--shard", id, "--self-test"], &[]);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "listed shard {id} must resolve\n{text}"
+        );
+    }
 }
