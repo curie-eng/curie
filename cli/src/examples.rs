@@ -2369,6 +2369,87 @@ fn parse_memory_quantity(quantity: &str) -> Result<u128> {
 mod tests {
     use super::*;
 
+    fn sre_route(channel: &str, users: Option<&[&str]>) -> crate::api::ApprovalRouteBindingResponse {
+        serde_json::from_value(match users {
+            Some(users) => serde_json::json!({
+                "resolution": {"kind": "slack", "address": channel},
+                "approvers": {"users": users},
+            }),
+            None => serde_json::json!({
+                "resolution": {"kind": "slack", "address": channel},
+            }),
+        })
+        .unwrap()
+    }
+
+    fn approvers(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn sre_approvals_route_map_binds_users_when_approvers_given() {
+        let map = sre_approvals_route_map(None, "C0SREOPS", &approvers(&["U0AAA", "U0BBB"]));
+        assert_eq!(
+            serde_json::to_value(&map).unwrap(),
+            serde_json::json!({"sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0SREOPS"},
+                "approvers": {"users": ["U0AAA", "U0BBB"]},
+            }})
+        );
+    }
+
+    #[test]
+    fn sre_approvals_route_map_omits_approvers_for_the_channel_member_default() {
+        let map = sre_approvals_route_map(None, "C0SREOPS", &[]);
+        assert_eq!(
+            serde_json::to_value(&map).unwrap(),
+            serde_json::json!({"sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0SREOPS"},
+            }})
+        );
+    }
+
+    #[test]
+    fn sre_approvals_route_map_preserves_other_bound_routes() {
+        let mut existing = std::collections::BTreeMap::new();
+        existing.insert("deploys".to_string(), sre_route("C0DEPLOY", Some(&["U0ZZZ"])));
+        let map = sre_approvals_route_map(Some(&existing), "C0SREOPS", &approvers(&["U0AAA"]));
+        let value = serde_json::to_value(&map).unwrap();
+        assert_eq!(
+            value["deploys"],
+            serde_json::json!({
+                "resolution": {"kind": "slack", "address": "C0DEPLOY"},
+                "approvers": {"users": ["U0ZZZ"]},
+            })
+        );
+        assert_eq!(value["sre-approvals"]["approvers"], serde_json::json!({"users": ["U0AAA"]}));
+        assert_eq!(value.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sre_approvals_route_map_keeps_an_existing_binding_and_replaces_only_approvers() {
+        let mut existing = std::collections::BTreeMap::new();
+        existing.insert("sre-approvals".to_string(), sre_route("C0KEPT", Some(&["U0OLD"])));
+
+        let replaced = sre_approvals_route_map(Some(&existing), "C0NEW", &approvers(&["U0NEW"]));
+        assert_eq!(
+            serde_json::to_value(&replaced).unwrap(),
+            serde_json::json!({"sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0KEPT"},
+                "approvers": {"users": ["U0NEW"]},
+            }})
+        );
+
+        let untouched = sre_approvals_route_map(Some(&existing), "C0NEW", &[]);
+        assert_eq!(
+            serde_json::to_value(&untouched).unwrap(),
+            serde_json::json!({"sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0KEPT"},
+                "approvers": {"users": ["U0OLD"]},
+            }})
+        );
+    }
+
     #[test]
     fn memory_quantities_cover_the_kubernetes_shapes_used_by_nodes_and_pods() {
         assert_eq!(parse_memory_quantity("1Gi").unwrap(), 1024 * 1024 * 1024);

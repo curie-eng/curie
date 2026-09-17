@@ -831,7 +831,13 @@ fn clap_routes_the_one_command_and_exposes_no_operator_configuration_or_credenti
             "the install surface must expose targeting flag {required}: {text}"
         );
     }
+    assert!(
+        text.contains("--approvers"),
+        "the install surface must expose --approvers as its single approval input: {text}"
+    );
     for forbidden in [
+        "--route-approvers",
+        "--routes-from",
         "--values",
         "--file",
         "--api-key",
@@ -2737,4 +2743,131 @@ fn default_install_applies_one_identity_with_a_fixed_demo_namespace_ceiling() {
         !access.contains("sre-bot-writer") && !access.contains("sre-bot-scaler"),
         "removed bespoke identities must not survive in rendered RBAC: {access}"
     );
+}
+
+fn approvers_dry_run_plan(fixture: &Fixture, extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["--dry-run", "--json"];
+    args.extend_from_slice(extra);
+    let output = fixture.run(&args);
+    let text = shown(&output);
+    assert!(output.status.success(), "dry run must succeed: {text}");
+    let document: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("dry run stdout must be one JSON object: {error}; {text}"));
+    assert!(
+        fixture.api.recorded().is_empty(),
+        "dry run must not mutate the platform API"
+    );
+    document["plan"]
+        .as_array()
+        .expect("dry run object must carry its ordered plan")
+        .iter()
+        .map(|line| line.as_str().expect("plan entries are strings").to_string())
+        .collect()
+}
+
+fn route_binding_line(lines: &[String]) -> (usize, String) {
+    lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.contains("sre-approvals") && line.to_ascii_lowercase().contains("bind"))
+        .map(|(index, line)| (index, line.clone()))
+        .unwrap_or_else(|| panic!("dry run plan must bind route sre-approvals: {lines:?}"))
+}
+
+#[test]
+fn dry_run_plans_the_sre_approvals_binding_with_comma_separated_approvers_before_deploy() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let lines = approvers_dry_run_plan(
+        &fixture,
+        &["--slack-channel", "C0SREOPS", "--approvers", "U0AAA,U0BBB"],
+    );
+    let (bind, line) = route_binding_line(&lines);
+    for user in ["U0AAA", "U0BBB"] {
+        assert!(line.contains(user), "binding line must name approver {user}: {line}");
+    }
+    let deploy = lines
+        .iter()
+        .position(|line| line.contains("deploy") && line.contains("sre-bot"))
+        .unwrap_or_else(|| panic!("plan must contain SRE bot bundle deployment: {lines:?}"));
+    assert!(
+        bind < deploy,
+        "the route must be bound before the deploy that refuses unbound routes: {lines:?}"
+    );
+    let plan = lines.join("\n");
+    assert!(
+        !plan.contains("--route-approvers sre-approvals=users:"),
+        "an install that binds approvers must not warn that they are missing: {lines:?}"
+    );
+}
+
+#[test]
+fn repeated_approvers_flags_accumulate_into_one_binding() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let lines = approvers_dry_run_plan(
+        &fixture,
+        &["--approvers", "U0AAA", "--approvers", "U0BBB,U0CCC"],
+    );
+    let (_, line) = route_binding_line(&lines);
+    for user in ["U0AAA", "U0BBB", "U0CCC"] {
+        assert!(line.contains(user), "binding line must name approver {user}: {line}");
+    }
+}
+
+#[test]
+fn dry_run_without_approvers_binds_the_channel_member_default_and_names_the_operator_gap() {
+    let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+    let lines = approvers_dry_run_plan(&fixture, &["--slack-channel", "C0SREOPS"]);
+    let (_, line) = route_binding_line(&lines);
+    let lower = line.to_ascii_lowercase();
+    assert!(
+        lower.contains("channel member") || lower.contains("channel-member"),
+        "binding line must disclose the channel-member approver default: {line}"
+    );
+    let plan = lines.join("\n");
+    let lower_plan = plan.to_ascii_lowercase();
+    assert!(
+        lower_plan.contains("operator principal"),
+        "the plan must say operator principals cannot resolve these gates: {lines:?}"
+    );
+    assert!(
+        plan.contains("--approvers") && plan.contains("--route-approvers sre-approvals=users:"),
+        "the plan must name both ways to bind approvers: {lines:?}"
+    );
+}
+
+#[test]
+fn blank_approver_ids_are_refused_before_any_cluster_mutation() {
+    for bad in ["", "   ", "U0AAA,", "U0AAA, ,U0BBB"] {
+        let fixture = Fixture::new(nodes(vec![node("node-a", "4Gi", true)]), pods(vec![]));
+        let output = fixture.run(&["--approvers", bad]);
+        let text = shown(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "blank approver id {bad:?} must be a usage error: {text}"
+        );
+        assert!(
+            text.contains("--approvers"),
+            "the refusal must name the offending flag: {text}"
+        );
+        assert!(
+            !text.contains("unexpected argument"),
+            "the refusal must come from approver validation, not an unknown flag: {text}"
+        );
+        assert!(fixture.api.recorded().is_empty(), "no API call for {bad:?}");
+        assert!(
+            !fixture
+                .helm_calls()
+                .iter()
+                .any(|call| call.starts_with("upgrade") || call.starts_with("install")),
+            "no Helm mutation for {bad:?}"
+        );
+        assert!(
+            !fixture
+                .kubectl_calls()
+                .iter()
+                .any(|call| call.contains("apply") || call.contains("create")),
+            "no kubectl mutation for {bad:?}"
+        );
+    }
 }
