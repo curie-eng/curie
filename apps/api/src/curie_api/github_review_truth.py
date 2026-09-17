@@ -177,7 +177,16 @@ async def verify_feedback_truth(
     observed = parse_feedback(feedback.event, canonical, str(feedback.delivery_id))
     # Repository spelling may differ in a signed payload; it is case-insensitive
     # identity. The canonical URL retained for the model comes from our lineage.
-    expected = replace(feedback, repo_full_name=observed.repo_full_name, url=observed.url)
+    # author_association is a descriptive claim GitHub recomputes per read (a
+    # live webhook said MEMBER, the App's re-read said CONTRIBUTOR, #2794).
+    # Both values already passed the parse-time allowlist; authority comes
+    # only from the permission read below, so drift is not a change.
+    expected = replace(
+        feedback,
+        repo_full_name=observed.repo_full_name,
+        url=observed.url,
+        author_association=observed.author_association,
+    )
     if observed != expected:
         raise FeedbackIgnored("feedback_changed")
     # A webhook association is provenance, never current write authority. Read

@@ -416,6 +416,50 @@ def test_signed_claims_cannot_override_current_github_authority(
     assert not any("private-sentinel" in path for path in truth.calls)
 
 
+# Issue #2794: GitHub bumps a pull_request_review_comment's updated_at when
+# its pending review is submitted (observed: created 15:24:44, updated
+# 15:24:52, identical body). Only a body change on re-read is an edit.
+PENDING_REVIEW_SUBMIT = {
+    "created_at": "2026-09-05T01:00:00Z",
+    "updated_at": "2026-09-05T01:00:08Z",
+}
+
+
+def test_inline_review_comment_submitted_from_a_pending_review_is_admitted(
+    review_app_key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = feedback_payload("pull_request_review_comment")
+    payload["comment"].update(PENDING_REVIEW_SUBMIT)
+    parse_feedback("pull_request_review_comment", payload, DELIVERY)
+    truth = GitHubTruth("pull_request_review_comment", review_app_key)
+    truth.payload["comment"].update(PENDING_REVIEW_SUBMIT)
+    truth.feedback = parse_feedback("pull_request_review_comment", truth.payload, DELIVERY)
+    truth.comment.update(PENDING_REVIEW_SUBMIT)
+    assert asyncio.run(verify_truth(truth, monkeypatch)) == HEAD
+
+
+def test_inline_review_comment_with_a_changed_body_on_reread_is_refused(
+    review_app_key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    truth = GitHubTruth("pull_request_review_comment", review_app_key)
+    truth.comment.update(PENDING_REVIEW_SUBMIT, body="Edited after delivery.")
+    with pytest.raises(FeedbackIgnored, match="feedback_changed"):
+        asyncio.run(verify_truth(truth, monkeypatch))
+
+
+def test_edited_issue_comment_is_still_refused(
+    review_app_key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = feedback_payload("issue_comment")
+    payload["comment"].update(PENDING_REVIEW_SUBMIT)
+    with pytest.raises(FeedbackIgnored, match="edited_feedback"):
+        parse_feedback("issue_comment", payload, DELIVERY)
+    truth = GitHubTruth("issue_comment", review_app_key)
+    truth.comment.update(PENDING_REVIEW_SUBMIT)
+    with pytest.raises(FeedbackIgnored, match="edited_feedback"):
+        asyncio.run(verify_truth(truth, monkeypatch))
+
+
 def test_a_user_pat_is_not_product_app_installation_proof(
     review_app_key: str,
     monkeypatch: pytest.MonkeyPatch,

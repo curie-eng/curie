@@ -196,7 +196,11 @@ def parse_feedback(event: str, payload: Any, delivery_id: str) -> UnverifiedFeed
     else:
         created = _instant(feedback.get("created_at"), "invalid_feedback_time")
         updated = _instant(feedback.get("updated_at"), "invalid_feedback_time")
-        if updated != created:
+        # An inline comment written into a pending review gets updated_at
+        # bumped when that review is submitted, with no edit (#2794: created
+        # 15:24:44, updated 15:24:52, same body). For that family the truth
+        # verifier's body equality on a fresh read is the edit check.
+        if event == "issue_comment" and updated != created:
             raise FeedbackIgnored("edited_feedback")
     if event == "pull_request_review_comment":
         path = feedback.get("path")
