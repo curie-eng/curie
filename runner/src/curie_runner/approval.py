@@ -51,6 +51,7 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 from plugin_format import (
+    PLATFORM_PUBLISH_TOOL_NAME,
     TOOL_POLICY_ENFORCEMENT,
     ApprovalPolicy,
     PluginManifest,
@@ -226,8 +227,8 @@ APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
 # untrusted input and must not be able to remove, execute, or grant its own
 # publication action.  The worker recognizes this exact runner-stamped
 # permission-gate provenance before it captures a patch.
-_PUBLISH_TOOL = "publish_changes"
-PUBLISH_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_PUBLISH_TOOL}"
+PUBLISH_TOOL_NAME = PLATFORM_PUBLISH_TOOL_NAME
+_PUBLISH_TOOL = PUBLISH_TOOL_NAME.removeprefix(f"mcp__{APPROVAL_SERVER_NAME}__")
 
 _PUBLISH_DESCRIPTION = (
     "When a managed repository is mounted, work only in /workspace and preserve"

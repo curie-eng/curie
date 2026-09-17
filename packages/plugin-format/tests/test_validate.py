@@ -2208,7 +2208,9 @@ def test_platform_publish_gate_passes(tmp_path: Path, declare_server: bool) -> N
     assert result.valid, result.errors
 
 
-@pytest.mark.parametrize("gate", ["mcp__curie__other_tool", "mcp__curie__", "mcp__curie__publish_changes_x"])
+@pytest.mark.parametrize(
+    "gate", ["mcp__curie__other_tool", "mcp__curie__", "mcp__curie__publish_changes_x"]
+)
 def test_other_platform_namespace_gates_are_refused(tmp_path: Path, gate: str) -> None:
     bundle = _bundle(
         tmp_path,

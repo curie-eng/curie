@@ -3084,7 +3084,6 @@ def test_route_normalization_vector_matches_the_runtime_loader(tmp_path) -> None
 def test_publish_tool_name_is_the_shared_plugin_format_constant() -> None:
     # #2776: the validator and the runner arm the publication gate by one name.
     import plugin_format
-
     from curie_runner import approval
 
     assert approval.PUBLISH_TOOL_NAME is plugin_format.PLATFORM_PUBLISH_TOOL_NAME
