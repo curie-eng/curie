@@ -2350,7 +2350,7 @@ case "$*" in
         # same session-scoped project identity the real skill tier records.
         echo "CURIE_SESSION_ID=local-stub-hermetic"
         ;;
-    *"name=curie-api"*)
+    *"name=curie-api"*|*"com.docker.compose.service=curie-api"*)
         if [ "${STUB_EXISTING_LOCAL_STACK:-0}" = "1" ]; then
             echo "stub-curie-api"
         fi

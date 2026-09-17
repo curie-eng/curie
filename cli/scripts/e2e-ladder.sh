@@ -190,8 +190,8 @@ fi
 STUB_PORT="${CURIE_LOCAL_STUB_PORT:-8155}"
 
 local_compose_cli_args() {
-  local verb="$1"
-  local args=("$verb" --project "$COMPOSE_PROJECT")
+  local args=("$@")
+  args+=(--project "$COMPOSE_PROJECT")
   local f
   for f in "${COMPOSE_FILES[@]}"; do
     args+=(-f "$f")
