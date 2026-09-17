@@ -175,11 +175,29 @@ CHANGED_RUNNER_NAME="curie-ladder-changed-$$"
 # The runner the hermetic negative boots, in the runs where no connector bundle
 # is named at all. Same rule again: never the default name.
 HERMETIC_RUNNER_NAME="curie-ladder-hermetic-$$"
-# Hardcoded, and deliberately NOT an env knob: the stub port is the constant
-# DEFAULT_LOCAL_STUB_PORT in cli/src/message.rs, pinned to the compose worker's
-# SLACK_API_BASE_URL. An override would only move this script's precheck, so it
-# could green-light an occupied 8155 and then hang on the message timeout.
-STUB_PORT=8155
+# Isolation contract (#2780). Default remains this checkout's compose.dev.yaml
+# and project curie. When COMPOSE_PROJECT_NAME and COMPOSE_FILE are set, the
+# local rung uses that project and ordered files. File[0] must still be this
+# checkout's compose.dev.yaml because the rung always passes --build.
+COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-curie}"
+if [[ -n "${COMPOSE_FILE:-}" ]]; then
+  IFS=: read -r -a COMPOSE_FILES <<< "$COMPOSE_FILE"
+else
+  COMPOSE_FILES=("$REPO_ROOT/compose.dev.yaml")
+fi
+# Default matches message::DEFAULT_LOCAL_STUB_PORT. Isolation sets
+# CURIE_LOCAL_STUB_PORT to the worker's rebound SLACK_API_BASE_URL port.
+STUB_PORT="${CURIE_LOCAL_STUB_PORT:-8155}"
+
+local_compose_cli_args() {
+  local verb="$1"
+  local args=("$verb" --project "$COMPOSE_PROJECT")
+  local f
+  for f in "${COMPOSE_FILES[@]}"; do
+    args+=(-f "$f")
+  done
+  printf '%s\n' "${args[@]}"
+}
 PROMPT="What is the weather in Denver right now?"
 # The live approval-gate case's turn (#2094). Deliberately explicit and
 # imperative, and deliberately NOT a weather question: the bundle's skill only
@@ -380,9 +398,13 @@ cleanup() {
         # Tolerated failure, on top of `set +e`: the stack may never have
         # finished coming up, and a failed `local down` must not skip the
         # sandbox sweep below or change the exit code captured above.
-        "$BIN" local down -f "$REPO_ROOT/compose.dev.yaml" || echo "warning: \`local down\` failed during teardown; sweeping anyway." >&2
+        local down_args=()
+        while IFS= read -r line; do
+          down_args+=("$line")
+        done < <(local_compose_cli_args local down)
+        "$BIN" "${down_args[@]}" || echo "warning: \`local down\` failed during teardown; sweeping anyway." >&2
         local orphans
-        orphans="$(docker ps -aq --filter "label=$SANDBOX_LABEL" 2>/dev/null)"
+        orphans="$(docker ps -aq --filter "label=$SANDBOX_LABEL" --filter "network=${CURIE_DOCKER_NETWORK:-curie_runner}" 2>/dev/null)"
         if [[ -n "$orphans" ]]; then
             echo "sweeping orphaned sandbox containers"
             # shellcheck disable=SC2086
@@ -678,7 +700,7 @@ product_stream_json() {
         local)
             local valkey
             valkey="$(docker ps \
-                --filter 'label=com.docker.compose.project=curie' \
+                --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
                 --filter 'label=com.docker.compose.service=valkey' \
                 --format '{{.Names}}')"
             [[ -n "$valkey" && "$valkey" != *$'\n'* ]] || {
@@ -1858,11 +1880,11 @@ probe_local_fake_model() {
         if [[ -n "$line" ]]; then
             workers+=("$line")
         fi
-    done < <(docker ps --filter 'label=com.docker.compose.project=curie' --filter 'label=com.docker.compose.service=curie-worker' --format '{{.Names}}')
+    done < <(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --filter 'label=com.docker.compose.service=curie-worker' --format '{{.Names}}')
     # Exactly one, never "inspect the first": two matches mean the scoping
     # assumption broke and the probe's answer would be meaningless.
     if (( ${#workers[@]} != 1 )); then
-        echo "local mode probe: expected exactly one running container matching label=com.docker.compose.project=curie plus label=com.docker.compose.service=curie-worker, found ${#workers[@]} (${workers[*]:-none})." >&2
+        echo "local mode probe: expected exactly one running container matching label=com.docker.compose.project=$COMPOSE_PROJECT plus label=com.docker.compose.service=curie-worker, found ${#workers[@]} (${workers[*]:-none})." >&2
         return 1
     fi
     # Captured into a variable and status-checked, never read through a process
@@ -2438,7 +2460,7 @@ local_worker_container() {
     local line workers=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && workers+=("$line")
-    done < <(docker ps --filter 'label=com.docker.compose.project=curie' --filter 'label=com.docker.compose.service=curie-worker' --format '{{.Names}}')
+    done < <(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --filter 'label=com.docker.compose.service=curie-worker' --format '{{.Names}}')
     if (( ${#workers[@]} != 1 )); then
         echo "connector scope probe: expected exactly one running curie-worker in the compose project 'curie', found ${#workers[@]} (${workers[*]:-none})." >&2
         return 1
@@ -3150,7 +3172,7 @@ start_local_otel_sink() {
     local network=curie_runner
     if ! docker network inspect "$network" >/dev/null 2>&1; then
         docker network create \
-            --label com.docker.compose.project=curie \
+            --label "com.docker.compose.project=$COMPOSE_PROJECT" \
             --label com.docker.compose.network=curie_runner \
             "$network" >/dev/null
         LOCAL_OTEL_NETWORK_OWNED=1
@@ -3875,7 +3897,7 @@ route_local_observability_to_product_collector() {
     docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
         up -d --force-recreate --no-deps curie-api curie-worker >/dev/null
     dispatcher="$(docker ps \
-        --filter 'label=com.docker.compose.project=curie' \
+        --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
         --filter 'label=com.docker.compose.service=curie-dispatcher' \
         --format '{{.Names}}')"
     if [[ -n "$dispatcher" ]]; then
@@ -3885,7 +3907,7 @@ route_local_observability_to_product_collector() {
     sleep 3
 
     local api worker
-    api="$(docker ps --filter 'label=com.docker.compose.project=curie' \
+    api="$(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
         --filter 'label=com.docker.compose.service=curie-api' --format '{{.Names}}')"
     worker="$(local_worker_container)"
     assert_product_collector_endpoint curie-api "$api" \
@@ -3893,7 +3915,7 @@ route_local_observability_to_product_collector() {
     assert_product_collector_endpoint curie-worker "$worker" \
         "http://127.0.0.1:24318" "http/protobuf"
     if [[ -n "$dispatcher" ]]; then
-        dispatcher="$(docker ps --filter 'label=com.docker.compose.project=curie' \
+        dispatcher="$(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
             --filter 'label=com.docker.compose.service=curie-dispatcher' --format '{{.Names}}')"
         assert_product_collector_endpoint curie-dispatcher "$dispatcher" \
             "http://otel-collector:4318" "http/protobuf"
@@ -4190,7 +4212,7 @@ rung_local() {
 
     assert_stub_port_free
 
-    if [[ -n "$(docker ps -q --filter 'name=curie-api' 2>/dev/null)" ]]; then
+    if [[ -n "$(docker ps -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --filter "label=com.docker.compose.service=curie-api" 2>/dev/null)" ]]; then
         # Reuse it and do NOT tear it down: the thread that brought a stack up
         # owns tearing it down, in both directions.
         echo "a compose stack is already running; reusing it and leaving teardown to whoever started it"
@@ -4204,7 +4226,11 @@ rung_local() {
         # local up is deliberately pinned to this checkout and builds the
         # candidate services; a release-channel binary otherwise resolves its
         # cached release compose and silently tests published images.
-        local up_args=(local up -f "$REPO_ROOT/compose.dev.yaml" --build)
+        local up_args=()
+        while IFS= read -r line; do
+          up_args+=("$line")
+        done < <(local_compose_cli_args local up)
+        up_args+=(--build)
         echo "=== curie ${up_args[*]} ==="
         # The observability query proof below reads traces and metrics through
         # the Curie API. Those routes require Langfuse/ClickHouse, so every
@@ -4393,7 +4419,11 @@ PY
     if (( LOCAL_STACK_OWNED )); then
         echo
         echo "=== curie local down ==="
-        "$BIN" local down -f "$REPO_ROOT/compose.dev.yaml"
+        local down_args=()
+        while IFS= read -r line; do
+          down_args+=("$line")
+        done < <(local_compose_cli_args local down)
+        "$BIN" "${down_args[@]}"
         LOCAL_STACK_OWNED=0
         stop_local_otel_sink
 
@@ -4409,7 +4439,7 @@ PY
         # The compose project name is pinned to `curie` by the CLI
         # (cli/src/local.rs COMPOSE_PROJECT_NAME), so this selects exactly the
         # services `local up` started and nothing else.
-        survivors="$(docker ps --filter 'label=com.docker.compose.project=curie' --format '{{.Names}}')"
+        survivors="$(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --format '{{.Names}}')"
         if [[ -n "$survivors" ]]; then
             echo "local down left compose services running:" >&2
             printf '%s\n' "$survivors" >&2
@@ -4418,7 +4448,7 @@ PY
         # Sandbox containers are named per thread, so a `name=curie-runner`
         # filter matches nothing and the assertion would pass no matter what
         # survived.
-        survivors="$(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')"
+        survivors="$(docker ps --filter "label=$SANDBOX_LABEL" --filter "network=${CURIE_DOCKER_NETWORK:-curie_runner}" --format '{{.Names}}')"
         if [[ -n "$survivors" ]]; then
             echo "sibling sandbox containers survived teardown:" >&2
             printf '%s\n' "$survivors" >&2
@@ -4493,7 +4523,7 @@ rung_local_release() {
 
     assert_stub_port_free
 
-    if [[ -n "$(docker ps -q --filter 'name=curie-api' 2>/dev/null)" ]]; then
+    if [[ -n "$(docker ps -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --filter "label=com.docker.compose.service=curie-api" 2>/dev/null)" ]]; then
         # Reuse it and do NOT tear it down, matching rung_local's rule: the
         # thread that brought a stack up owns tearing it down.
         echo "a compose stack is already running; reusing it and leaving teardown to whoever started it"
@@ -4608,13 +4638,13 @@ rung_local_release() {
         echo
         echo "=== assert nothing curie-related survived ==="
         local survivors
-        survivors="$(docker ps --filter 'label=com.docker.compose.project=curie' --format '{{.Names}}')"
+        survivors="$(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --format '{{.Names}}')"
         if [[ -n "$survivors" ]]; then
             echo "local down left compose services running:" >&2
             printf '%s\n' "$survivors" >&2
             return 1
         fi
-        survivors="$(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')"
+        survivors="$(docker ps --filter "label=$SANDBOX_LABEL" --filter "network=${CURIE_DOCKER_NETWORK:-curie_runner}" --format '{{.Names}}')"
         if [[ -n "$survivors" ]]; then
             echo "sibling sandbox containers survived teardown:" >&2
             printf '%s\n' "$survivors" >&2

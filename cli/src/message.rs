@@ -1326,7 +1326,11 @@ async fn observe_message_claims(
 ) -> crate::worker_claims::ClaimsState {
     match verb {
         TurnVerb::Local => {
-            crate::worker_claims::observe_local(crate::local::DEFAULT_COMPOSE_FILE).await
+            crate::worker_claims::observe_local(
+                crate::local::COMPOSE_PROJECT,
+                crate::local::DEFAULT_COMPOSE_FILE,
+            )
+            .await
         }
         TurnVerb::Cluster => {
             crate::worker_claims::observe_cluster(&opts.namespace, &opts.release)
@@ -1449,7 +1453,7 @@ fn compose_config_files(label: &str) -> Result<Vec<String>> {
 /// recreates a service needs the same derivation -- this one just narrows it to
 /// the single image the one-shot producer runs.
 async fn one_shot_dispatcher_image() -> Option<String> {
-    crate::local::running_stack_image("curie-dispatcher").await
+    crate::local::running_stack_image("curie-dispatcher", crate::local::COMPOSE_PROJECT).await
 }
 
 fn worker_compose_config_command(container: &str) -> OpsCommand {
@@ -4012,13 +4016,15 @@ fn worker_label_selector() -> String {
     format!("label=com.docker.compose.service={COMPOSE_WORKER_SERVICE}")
 }
 
-fn worker_ps_command() -> OpsCommand {
+fn worker_ps_command(project: &str) -> OpsCommand {
     OpsCommand::new(
         "docker",
         vec![
             plain("ps"),
             plain("--filter"),
             plain(worker_label_selector()),
+            plain("--filter"),
+            plain(format!("label=com.docker.compose.project={project}")),
             plain("--format"),
             plain("{{.Names}}"),
         ],
@@ -4057,7 +4063,11 @@ fn select_worker_container(stdout: &str) -> Result<String> {
 }
 
 async fn local_worker_container() -> Result<String> {
-    let cmd = worker_ps_command();
+    let project = std::env::var("COMPOSE_PROJECT_NAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| crate::local::COMPOSE_PROJECT.to_string());
+    let cmd = worker_ps_command(&project);
     let (ok, stdout, stderr) = run_capture(&cmd).await?;
     if !ok {
         bail!("listing the local worker container: {}", stderr.trim());
@@ -5842,10 +5852,14 @@ mod tests {
             worker_label_selector(),
             "label=com.docker.compose.service=curie-worker"
         );
-        let argv = worker_ps_command().display();
+        let argv = worker_ps_command(crate::local::COMPOSE_PROJECT).display();
         assert!(
             argv.contains("--filter label=com.docker.compose.service=curie-worker"),
             "docker ps argv lost the service filter: {argv}"
+        );
+        assert!(
+            argv.contains("--filter label=com.docker.compose.project=curie"),
+            "docker ps argv lost the project filter: {argv}"
         );
     }
 
@@ -6486,6 +6500,7 @@ mod tests {
 
     fn local_comms_opts(disconnect: bool) -> crate::comms::LocalCommsOpts {
         crate::comms::LocalCommsOpts {
+            project: crate::local::COMPOSE_PROJECT.to_string(),
             file: "compose.dev.yaml".to_string(),
             dry_run: false,
             app_token: "xapp-real-workspace".to_string(),

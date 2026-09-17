@@ -1102,10 +1102,9 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
          bundle cases with the suite-parity dry-run check in front of it"
     );
     assert!(
-        local_rung
-            .contains("local up_args=(local up -f \"$REPO_ROOT/compose.dev.yaml\" --build)\n        echo \"=== curie ${up_args[*]} ===\""),
+        local_rung.contains("local_compose_cli_args local up") && local_rung.contains("--build"),
         "the local rung must start the full profile required by its \
-         observability query proof; ladder contents:\n{text}"
+         observability query proof via local_compose_cli_args and --build; ladder contents:\n{text}"
     );
     assert!(
         !local_rung.contains("up_args+=(--minimal)"),
@@ -1132,12 +1131,13 @@ fn local_rung_honors_isolated_compose_project_and_ordered_files() {
         "reuse and teardown must filter by the selected compose project:\n{local_rung}"
     );
     assert!(
-        local_rung.contains("--project") || local_rung.contains("-p "),
-        "isolated local up must pass the selected project to the CLI:\n{local_rung}"
+        source.contains("local_compose_cli_args")
+            && (source.contains("--project") || source.contains("-p ")),
+        "isolated local up must pass the selected project to the CLI via local_compose_cli_args"
     );
     assert!(
-        local_rung.contains("compose.dev.yaml") && local_rung.contains("--build"),
-        "isolation must still pin this checkout's compose.dev.yaml with --build:\n{local_rung}"
+        source.contains("compose.dev.yaml") && local_rung.contains("--build"),
+        "isolation must still pin this checkout's compose.dev.yaml with --build"
     );
 }
 
@@ -2203,7 +2203,7 @@ print(json.dumps({
     "local up --minimal")
         echo "stub: compose stack up"
         ;;
-    "local up -f "*/compose.dev.yaml" --build")
+    "local up --project "*|"local up -f "*/compose.dev.yaml" --build")
         if [ "${STUB_REQUIRE_DEFAULT_BUILDER:-0}" = "1" ] \
             && [ "${BUILDX_BUILDER:-}" != "default" ]; then
             echo "local source build did not select the Docker daemon builder" >&2
@@ -2315,7 +2315,7 @@ print(json.dumps({
         fi
         exit "${STUB_EVAL_EXIT:-0}"
         ;;
-    "local down -f "*/compose.dev.yaml)
+    "local down --project "*|"local down -f "*/compose.dev.yaml)
         echo "stub: compose stack down"
         ;;
     *)
@@ -2693,19 +2693,21 @@ fn invocation_count(invocations: &str, expected: &str) -> usize {
 /// are both load-bearing parts of this argv.
 fn is_current_source_local_up(invocation: &str) -> bool {
     let args = invocation.split_whitespace().collect::<Vec<_>>();
-    args.len() == 5
-        && args[..3] == ["local", "up", "-f"]
-        && args[3].ends_with("/compose.dev.yaml")
-        && args[4] == "--build"
+    args.windows(2)
+        .any(|window| window[0] == "-f" && window[1].ends_with("/compose.dev.yaml"))
+        && args.contains(&"--build")
+        && args.first() == Some(&"local")
+        && args.get(1) == Some(&"up")
 }
 
 /// Teardown must target the same current-source compose file that the rung
 /// brought up; an unqualified `local down` could select a release compose.
 fn is_current_source_local_down(invocation: &str) -> bool {
     let args = invocation.split_whitespace().collect::<Vec<_>>();
-    args.len() == 4
-        && args[..3] == ["local", "down", "-f"]
-        && args[3].ends_with("/compose.dev.yaml")
+    args.windows(2)
+        .any(|window| window[0] == "-f" && window[1].ends_with("/compose.dev.yaml"))
+        && args.first() == Some(&"local")
+        && args.get(1) == Some(&"down")
 }
 
 fn current_source_local_down_count(invocations: &str) -> usize {

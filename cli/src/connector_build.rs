@@ -926,7 +926,12 @@ pub(crate) fn plain_command(program: &str, args: Vec<String>) -> crate::ops::Ops
 /// it in the lock. Ephemeral by construction: nothing pulls it, and a rebuild
 /// reuses it, which is exactly why the lock records the id instead.
 fn local_build_tag(bundle_name: &str, connector: &str) -> String {
-    format!("curie-connector-{bundle_name}-{connector}:build")
+    match std::env::var("COMPOSE_PROJECT_NAME") {
+        Ok(project) if !project.is_empty() && project != crate::local::COMPOSE_PROJECT => {
+            format!("curie-connector-{project}-{bundle_name}-{connector}:build")
+        }
+        _ => format!("curie-connector-{bundle_name}-{connector}:build"),
+    }
 }
 
 /// How many hex characters of the source digest become the pushed tag. Long

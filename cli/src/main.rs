@@ -1516,9 +1516,12 @@ enum LocalAction {
     /// even with a credential; set `CURIE_FAKE_MODEL=0` (or provide a
     /// credential) to go live.
     Up {
-        /// Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override.
-        #[arg(short = 'f', long)]
-        file: Option<String>,
+        /// Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints.
+        #[arg(long, env = "COMPOSE_PROJECT_NAME")]
+        project: Option<String>,
+        /// Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds.
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        files: Vec<String>,
         /// Print the docker compose command and exit without executing.
         #[arg(long)]
         dry_run: bool,
@@ -1589,9 +1592,12 @@ enum LocalAction {
     Rebuild {
         /// The compose service to rebuild, e.g. `curie-worker`.
         service: String,
-        /// Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override.
-        #[arg(short = 'f', long)]
-        file: Option<String>,
+        /// Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints.
+        #[arg(long, env = "COMPOSE_PROJECT_NAME")]
+        project: Option<String>,
+        /// Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds.
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        files: Vec<String>,
         /// Print the docker compose command and exit without executing.
         #[arg(long)]
         dry_run: bool,
@@ -1624,9 +1630,12 @@ enum LocalAction {
     },
     /// Stop the dev stack (docker compose down), keeping volumes.
     Down {
-        /// Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override.
-        #[arg(short = 'f', long)]
-        file: Option<String>,
+        /// Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints.
+        #[arg(long, env = "COMPOSE_PROJECT_NAME")]
+        project: Option<String>,
+        /// Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds.
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        files: Vec<String>,
         /// Also destroy volumes (adds -v). Prompts for confirmation unless --yes.
         #[arg(long)]
         wipe: bool,
@@ -1639,9 +1648,12 @@ enum LocalAction {
     },
     /// Show the dev stack's service status (docker compose ps).
     Status {
-        /// Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override.
-        #[arg(short = 'f', long)]
-        file: Option<String>,
+        /// Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints.
+        #[arg(long, env = "COMPOSE_PROJECT_NAME")]
+        project: Option<String>,
+        /// Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds.
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        files: Vec<String>,
         /// Print the docker compose command and exit without executing.
         #[arg(long)]
         dry_run: bool,
@@ -1677,9 +1689,12 @@ enum LocalAction {
             default_value = ""
         )]
         bot_token: String,
-        /// Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override.
-        #[arg(short = 'f', long)]
-        file: Option<String>,
+        /// Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints.
+        #[arg(long, env = "COMPOSE_PROJECT_NAME")]
+        project: Option<String>,
+        /// Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds.
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        files: Vec<String>,
         /// Print the docker compose command(s) that would run and exit without executing.
         #[arg(long)]
         dry_run: bool,
@@ -2948,15 +2963,60 @@ enum ClusterAction {
 ///
 /// `local up` does not call this: it inlines the same two steps so the
 /// `--build` channel guard can run between them (#1926).
-async fn resolve_compose_file(file: Option<String>, dry_run: bool) -> Result<String> {
+async fn bind_local_opts(
+    project: Option<String>,
+    files: Vec<String>,
+    dry_run: bool,
+    build: bool,
+) -> Result<LocalOpts> {
+    let isolated = project
+        .as_deref()
+        .is_some_and(|value| value != local::COMPOSE_PROJECT)
+        || files.len() > 1
+        || std::env::var("COMPOSE_FILE")
+            .ok()
+            .is_some_and(|value| !value.is_empty());
+    if isolated {
+        let resources = local::resolve_local_resources(project, files, String::new(), build)?;
+        if build {
+            let resolved = artifacts::resolve_compose(
+                resources.compose_files.first().map(String::as_str),
+                artifacts::Channel::current(),
+                artifacts::version(),
+                artifacts::cache_root,
+                std::path::Path::new(local::DEFAULT_COMPOSE_FILE).exists(),
+            )?;
+            let _ = local::ensure_build_reaches_the_stack(&resolved)?;
+        }
+        let mut opts = LocalOpts::for_file(
+            resources
+                .compose_files
+                .first()
+                .cloned()
+                .unwrap_or_else(|| local::DEFAULT_COMPOSE_FILE.to_string()),
+        );
+        opts.resources = resources;
+        opts.dry_run = dry_run;
+        opts.build = build.then_some(local::BuildReach::Substitutes);
+        return Ok(opts);
+    }
     let resolved = artifacts::resolve_compose(
-        file.as_deref(),
+        files.first().map(String::as_str),
         artifacts::Channel::current(),
         artifacts::version(),
         artifacts::cache_root,
         std::path::Path::new(local::DEFAULT_COMPOSE_FILE).exists(),
     )?;
-    materialize_artifact(resolved, dry_run, "compose").await
+    let reach = if build {
+        Some(local::ensure_build_reaches_the_stack(&resolved)?)
+    } else {
+        None
+    };
+    let file = materialize_artifact(resolved, dry_run, "compose").await?;
+    let mut opts = LocalOpts::for_file(file);
+    opts.dry_run = dry_run;
+    opts.build = reach;
+    Ok(opts)
 }
 
 /// The sandbox connector-secret bind map for a cluster deploy (#2503).
@@ -3570,7 +3630,8 @@ async fn run(command: Option<Command>) -> Result<()> {
         },
         Some(Command::Local { action }) => match action {
             LocalAction::Up {
-                file,
+                project,
+                files,
                 dry_run,
                 minimal,
                 model,
@@ -3580,47 +3641,19 @@ async fn run(command: Option<Command>) -> Result<()> {
                 env_file,
                 build,
             } => {
-                // The `--build` channel guard runs between the resolve and
-                // the materialize (#1926), so a refused run never downloads the
-                // release compose, never prints the compose-source note, and
-                // never emits a dry-run plan. That ordering is why these three
-                // steps are inlined here instead of going through
-                // `resolve_compose_file`.
-                let resolved = artifacts::resolve_compose(
-                    file.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                    artifacts::cache_root,
-                    std::path::Path::new(local::DEFAULT_COMPOSE_FILE).exists(),
-                )?;
-                let build = if build {
-                    Some(local::ensure_build_reaches_the_stack(&resolved)?)
-                } else {
-                    None
-                };
-                let file = materialize_artifact(resolved, dry_run, "compose").await?;
-                emit(
-                    local::up(
-                        LocalOpts {
-                            file,
-                            dry_run,
-                            minimal,
-                            local_model,
-                            pull_model,
-                            slack,
-                            model_mode: local::model_mode_from_env(),
-                            env_file,
-                            build,
-                            stack_image_env: Vec::new(),
-                        },
-                        model,
-                    )
-                    .await?,
-                )
+                let mut opts = bind_local_opts(project, files, dry_run, build).await?;
+                opts.minimal = minimal;
+                opts.local_model = local_model;
+                opts.pull_model = pull_model;
+                opts.slack = slack;
+                opts.model_mode = local::model_mode_from_env();
+                opts.env_file = env_file;
+                emit(local::up(opts, model).await?)
             }
             LocalAction::Rebuild {
                 service,
-                file,
+                project,
+                files,
                 dry_run,
                 minimal,
                 model,
@@ -3628,26 +3661,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                 slack,
                 env_file,
             } => {
-                let file = resolve_compose_file(file, dry_run).await?;
+                let mut opts = bind_local_opts(project, files, dry_run, false).await?;
+                opts.minimal = minimal;
+                opts.local_model = local_model;
+                opts.slack = slack;
+                opts.model_mode = local::model_mode_from_env();
+                opts.env_file = env_file;
                 emit(
                     local::rebuild(local::LocalRebuildOpts {
-                        common: LocalOpts {
-                            file,
-                            dry_run,
-                            minimal,
-                            local_model,
-                            pull_model: false,
-                            slack,
-                            model_mode: local::model_mode_from_env(),
-                            env_file,
-                            // `local rebuild` recreates ONE service against the
-                            // stack already running; it never re-tags images.
-                            // The tag it recreates ONTO still has to match that
-                            // stack, which is `resolve_stack_image_env` below,
-                            // not this flag (#1925).
-                            build: None,
-                            stack_image_env: Vec::new(),
-                        },
+                        common: opts,
                         service,
                         model,
                     })
@@ -3655,49 +3677,29 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
             }
             LocalAction::Down {
-                file,
+                project,
+                files,
                 wipe,
                 yes,
                 dry_run,
             } => {
-                let file = resolve_compose_file(file, dry_run).await?;
+                let opts = bind_local_opts(project, files, dry_run, false).await?;
                 emit(
                     local::down(LocalDownOpts {
-                        common: LocalOpts {
-                            file,
-                            dry_run,
-                            minimal: false,
-                            local_model: None,
-                            pull_model: false,
-                            slack: false,
-                            model_mode: local::ModelMode::DefaultFake,
-                            env_file: None,
-                            build: None,
-                            stack_image_env: Vec::new(),
-                        },
+                        common: opts,
                         wipe,
                         yes,
                     })
                     .await?,
                 )
             }
-            LocalAction::Status { file, dry_run } => {
-                let file = resolve_compose_file(file, dry_run).await?;
-                emit(
-                    local::status(LocalOpts {
-                        file,
-                        dry_run,
-                        minimal: false,
-                        local_model: None,
-                        pull_model: false,
-                        slack: false,
-                        model_mode: local::ModelMode::DefaultFake,
-                        env_file: None,
-                        build: None,
-                        stack_image_env: Vec::new(),
-                    })
-                    .await?,
-                )
+            LocalAction::Status {
+                project,
+                files,
+                dry_run,
+            } => {
+                let opts = bind_local_opts(project, files, dry_run, false).await?;
+                emit(local::status(opts).await?)
             }
             LocalAction::Comms {
                 slack,
@@ -3706,11 +3708,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                 model,
                 app_token,
                 bot_token,
-                file,
+                project,
+                files,
                 dry_run,
             } => {
                 comms::require_provider(slack)?;
-                let resolved_file = resolve_compose_file(file, dry_run).await?;
+                let mut model_opts = bind_local_opts(project, files, dry_run, false).await?;
+                model_opts.minimal = minimal;
+                model_opts.slack = true;
+                model_opts.model_mode = local::model_mode_from_env();
                 // #749: fall back to Slack tokens persisted via `curie secrets
                 // set` when neither a flag nor an env var supplied one, so
                 // `--slack` needs no per-session re-export. Precedence: flag/env
@@ -3719,18 +3725,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                     comms::resolve_local_slack_token("SLACK_APP_TOKEN", &app_token, disconnect)?;
                 let bot_token =
                     comms::resolve_local_slack_token("SLACK_BOT_TOKEN", &bot_token, disconnect)?;
-                let mut model_opts = LocalOpts {
-                    file: resolved_file.clone(),
-                    dry_run,
-                    minimal,
-                    local_model: None,
-                    pull_model: false,
-                    slack: true,
-                    model_mode: local::model_mode_from_env(),
-                    env_file: None,
-                    build: None,
-                    stack_image_env: Vec::new(),
-                };
                 let model_credentials =
                     local::apply_credential_plan(&mut model_opts, crate::ui::ui())?;
                 // #1925: `comms connect` recreates the worker and dispatcher --
@@ -3740,7 +3734,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 local::resolve_stack_image_env(&mut model_opts).await;
                 emit(
                     comms::local_comms(LocalCommsOpts {
-                        file: resolved_file,
+                        project: model_opts.project().to_string(),
+                        file: model_opts.file().to_string(),
                         dry_run,
                         app_token,
                         bot_token,
@@ -6717,22 +6712,22 @@ mod tests {
             let cli = Cli::try_parse_from(argv).expect("local verb accepts -f");
             match cli.command {
                 Some(Command::Local {
-                    action: LocalAction::Up { file, .. },
+                    action: LocalAction::Up { files, .. },
                 }) => {
                     assert_eq!(verb, "up");
-                    assert_eq!(file.as_deref(), Some("custom.yaml"));
+                    assert_eq!(files, vec!["custom.yaml"]);
                 }
                 Some(Command::Local {
-                    action: LocalAction::Down { file, .. },
+                    action: LocalAction::Down { files, .. },
                 }) => {
                     assert_eq!(verb, "down");
-                    assert_eq!(file.as_deref(), Some("custom.yaml"));
+                    assert_eq!(files, vec!["custom.yaml"]);
                 }
                 Some(Command::Local {
-                    action: LocalAction::Status { file, .. },
+                    action: LocalAction::Status { files, .. },
                 }) => {
                     assert_eq!(verb, "status");
-                    assert_eq!(file.as_deref(), Some("custom.yaml"));
+                    assert_eq!(files, vec!["custom.yaml"]);
                 }
                 _ => panic!("expected the local subcommand"),
             }

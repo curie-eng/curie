@@ -776,9 +776,18 @@ export const commandManifest = {
           "about": "Bring the dev stack up (`core` with `--minimal`, else `full`) and print URLs. Add `--slack` for the optional dispatcher",
           "args": [
             {
+              "env": "COMPOSE_PROJECT_NAME",
               "global": false,
-              "help": "Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override",
-              "id": "file",
+              "help": "Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints",
+              "id": "project",
+              "long": "project",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds",
+              "id": "files",
               "long": "file",
               "positional": false,
               "required": false,
@@ -888,9 +897,18 @@ export const commandManifest = {
               "required": true
             },
             {
+              "env": "COMPOSE_PROJECT_NAME",
               "global": false,
-              "help": "Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override",
-              "id": "file",
+              "help": "Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints",
+              "id": "project",
+              "long": "project",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds",
+              "id": "files",
               "long": "file",
               "positional": false,
               "required": false,
@@ -969,9 +987,18 @@ export const commandManifest = {
           "about": "Stop the dev stack (docker compose down), keeping volumes",
           "args": [
             {
+              "env": "COMPOSE_PROJECT_NAME",
               "global": false,
-              "help": "Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override",
-              "id": "file",
+              "help": "Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints",
+              "id": "project",
+              "long": "project",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds",
+              "id": "files",
               "long": "file",
               "positional": false,
               "required": false,
@@ -1021,9 +1048,18 @@ export const commandManifest = {
           "about": "Show the dev stack's service status (docker compose ps)",
           "args": [
             {
+              "env": "COMPOSE_PROJECT_NAME",
               "global": false,
-              "help": "Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override",
-              "id": "file",
+              "help": "Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints",
+              "id": "project",
+              "long": "project",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds",
+              "id": "files",
               "long": "file",
               "positional": false,
               "required": false,
@@ -1118,9 +1154,18 @@ export const commandManifest = {
               "required": false
             },
             {
+              "env": "COMPOSE_PROJECT_NAME",
               "global": false,
-              "help": "Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override",
-              "id": "file",
+              "help": "Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints",
+              "id": "project",
+              "long": "project",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds",
+              "id": "files",
               "long": "file",
               "positional": false,
               "required": false,
