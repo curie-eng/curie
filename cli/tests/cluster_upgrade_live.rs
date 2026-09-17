@@ -3283,3 +3283,127 @@ fn genuine_scalar_types_are_not_coerced_to_strings() {
         "a genuine null must not become a string: {raw}"
     );
 }
+
+fn retained_dotted_maps_and_scalars() -> String {
+    serde_json::json!({
+        "config": {"schemaVersion": "0.8.4"},
+        "security": {
+            "otelCollectorNetworkPolicy": {
+                "metricsIngress": [{
+                    "namespaceSelector": {
+                        "matchLabels": {
+                            "kubernetes.io/metadata.name": "observability"
+                        }
+                    },
+                    "podSelector": {
+                        "matchLabels": {
+                            "app.kubernetes.io/name": "prometheus"
+                        }
+                    }
+                }]
+            }
+        },
+        "independentLabels": {
+            "app.kubernetes.io/name": "retained",
+            "example.com/tier": "metrics"
+        },
+        "ordinary": {
+            "mode": "off",
+            "affirmative": "yes",
+            "short": "n",
+            "numeric": "00123",
+            "enabled": true,
+            "replicas": 3
+        }
+    })
+    .to_string()
+}
+
+fn assert_retained_dotted_maps_and_scalars(values: &Value) {
+    let expected = serde_json::json!({
+        "metricsIngress": [{
+            "namespaceSelector": {
+                "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                }
+            },
+            "podSelector": {
+                "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                }
+            }
+        }],
+        "independentLabels": {
+            "app.kubernetes.io/name": "retained",
+            "example.com/tier": "metrics"
+        },
+        "ordinary": {
+            "mode": "off",
+            "affirmative": "yes",
+            "short": "n",
+            "numeric": "00123",
+            "enabled": true,
+            "replicas": 3
+        }
+    });
+    assert_eq!(
+        values.pointer("/security/otelCollectorNetworkPolicy/metricsIngress"),
+        expected.pointer("/metricsIngress"),
+        "nested array label maps changed: {values}"
+    );
+    assert_eq!(
+        values.pointer("/independentLabels"),
+        expected.pointer("/independentLabels"),
+        "independent dotted label map changed: {values}"
+    );
+    assert_eq!(
+        values.pointer("/ordinary"),
+        expected.pointer("/ordinary"),
+        "ordinary scalar types changed: {values}"
+    );
+}
+
+#[test]
+fn retained_dotted_maps_and_scalars_stay_exact_in_normal_upgrade_json() {
+    let fixture = Fixture::new(Some(&retained_dotted_maps_and_scalars()));
+    let output = fixture.local("healthy");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "normal upgrade did not reach Helm: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let raw = fixture.values(1);
+    let values: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|error| panic!("normal retained overlay is not JSON ({error}): {raw}"));
+    assert_retained_dotted_maps_and_scalars(&values);
+}
+
+#[test]
+fn retained_dotted_maps_and_scalars_stay_exact_in_forward_only_upgrade_json() {
+    let fixture = Fixture::new(Some(&retained_dotted_maps_and_scalars()));
+    let output = fixture.run_with(
+        "schema-contract",
+        "0.9.0",
+        "charts/curie",
+        &["--forward-only"],
+    );
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "forward only upgrade did not reach Helm: {:?} / {}",
+        fixture.argv(),
+        stderr(&output)
+    );
+    let raw = fixture.values(1);
+    let values: Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
+        panic!("forward only retained overlay is not JSON ({error}): {raw}")
+    });
+    assert_retained_dotted_maps_and_scalars(&values);
+    assert_eq!(
+        values.pointer("/api/migrate/forwardOnly"),
+        Some(&Value::Bool(true)),
+        "forward only control must stay a boolean: {values}"
+    );
+}
