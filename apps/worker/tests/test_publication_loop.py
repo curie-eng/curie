@@ -923,7 +923,7 @@ async def test_cluster_message_card_without_reply_ref_dead_letters_without_hot_r
         publication, relay, _cluster_message_card_work(None)
     )
     try:
-        with pytest.raises(ValueError, match="canonical lowercase UUIDv4"):
+        with pytest.raises(ValueError, match="reply_ref is required"):
             await loop.deliver_pending_card()
         assert await loop.deliver_pending_card() is False
     finally:

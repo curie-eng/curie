@@ -431,9 +431,7 @@ class _ClusterMessageReplyAdapter:
 
     def _endpoint_for(self, reply_ref: str | None) -> tuple[str, str]:
         if reply_ref is None:
-            raise InvalidReplyTargetError(
-                "cluster message reply_ref must be a canonical lowercase UUIDv4"
-            )
+            raise InvalidReplyTargetError("cluster message reply_ref is required")
         try:
             parsed_ref = UUID(reply_ref)
         except (AttributeError, ValueError) as exc:
