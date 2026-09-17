@@ -582,7 +582,8 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
     assert bake["with"]["builder"] == "${{ steps.matrixcache.outputs.name }}"
     assert bake["with"]["load"] is True
     assert bake["with"]["push"] is False
-    assert bake["with"]["files"] == "${{ runner.temp }}/matrix-bake.json"
+    assert bake["with"]["files"] == "matrix-bake.json"
+    assert bake["with"]["source"] == "."
     writer = named_steps["Write the candidate image bake definition"]["run"]
     body = writer.split("<<'EOF'\n", 1)[1].rsplit("\nEOF", 1)[0]
     definition = json.loads(body)

@@ -2756,7 +2756,7 @@ jobs:
       # match the previous per-image build steps.
       - name: Write the candidate image bake definition
         run: |
-          cat > "$RUNNER_TEMP/matrix-bake.json" <<'EOF'
+          cat > matrix-bake.json <<'EOF'
           {"group": {"default": {"targets": ["api", "dispatcher", "worker", "ui", "runner"]}},
           "target": {
             "api": {"context": ".", "dockerfile": "apps/api/Dockerfile", "tags": ["curie-api:matrix-candidate"], "cache-from": ["type=gha,scope=ladder-api"], "cache-to": ["type=gha,mode=max,scope=ladder-api"]},
@@ -2770,7 +2770,8 @@ jobs:
         uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
         with:
           builder: ${{ steps.matrixcache.outputs.name }}
-          files: ${{ runner.temp }}/matrix-bake.json
+          source: .
+          files: matrix-bake.json
           push: false
           load: true
       - name: Write the kind cluster config
