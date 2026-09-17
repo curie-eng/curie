@@ -115,6 +115,18 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin rollback-088 reloading 0.8.8 images\n{text}"
     );
     assert!(
+        text.contains("restore_n loads exclusive 0.9.0 images before rollback"),
+        "self-test must pin restore_n reloading exclusive 0.9.0 before helm rollback\n{text}"
+    );
+    assert!(
+        text.contains("exclusive_kind_tag skips a reload when the node already holds the tag"),
+        "self-test must pin the exclusive_kind_tag early return\n{text}"
+    );
+    assert!(
+        text.contains("load_tag_images invalidates the exclusive kind tag"),
+        "self-test must pin load_tag_images invalidating EXCLUSIVE_KIND_TAG\n{text}"
+    );
+    assert!(
         text.contains("schema heads published=0039"),
         "self-test must pin the published 0.8.8 alembic head\n{text}"
     );
@@ -353,7 +365,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         .collect();
     assert_eq!(
         ids,
-        ["s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11"],
+        ["s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11", "s12", "s13"],
         "canonical shard ids\n{manifest}"
     );
 
@@ -362,7 +374,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
     for shard in shards {
         let id = shard["id"].as_str().unwrap();
         let setup = shard["setup"].as_bool().expect("shard setup flag");
-        assert_eq!(setup, !matches!(id, "s01" | "s10"), "setup flag wrong for {id}");
+        assert_eq!(setup, !matches!(id, "s01" | "s11"), "setup flag wrong for {id}");
         for item in shard["scenarios"].as_array().expect("scenarios array") {
             let name = item["name"].as_str().expect("scenario name").to_owned();
             if PHASED.contains(&name.as_str()) {
@@ -387,10 +399,16 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         ["plan", "validate", "drain", "checkpoint", "migrate", "apply", "converge", "canary", "commit"]
     );
     matrix_phases.sort();
-    for name in PHASED {
+    let mut interrupt_phases = bash_array_from_script("INTERRUPT_PHASES");
+    assert_eq!(interrupt_phases, ["checkpoint", "migrate", "apply", "commit"]);
+    interrupt_phases.sort();
+    for (name, want, label) in [
+        ("fail-every-phase", &matrix_phases, "MATRIX_PHASES"),
+        ("interrupt-resume", &interrupt_phases, "INTERRUPT_PHASES"),
+    ] {
         let mut got = phases.get(name).cloned().unwrap_or_default();
         got.sort();
-        assert_eq!(got, matrix_phases, "{name} phases must cover MATRIX_PHASES once each");
+        assert_eq!(&got, want, "{name} phases must cover {label} once each");
     }
 
     let mut expected: Vec<String> = bash_array_from_script("SCENARIOS_ALL")
@@ -425,16 +443,18 @@ fn self_test_checks_shard_coverage_and_timing() {
 }
 
 const GOOD_SHARDS: &str = "s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version
-s02 setup fail-every-phase:plan+validate+drain+checkpoint+migrate+apply+converge
-s03 setup fail-every-phase:canary+commit
-s04 setup interrupt-resume:plan+validate
-s05 setup interrupt-resume:drain+checkpoint
-s06 setup interrupt-resume:migrate+apply
-s07 setup interrupt-resume:converge+canary
-s08 setup interrupt-resume:commit
-s09 setup n-to-n1 compatible-rollback rollback-published-088
-s10 nosetup rollback-published-089 migration-crash
-s11 setup converge-negative previous-serves";
+s02 setup fail-every-phase:plan+validate+drain
+s03 setup fail-every-phase:checkpoint+migrate+apply
+s04 setup fail-every-phase:converge
+s05 setup fail-every-phase:canary
+s06 setup fail-every-phase:commit
+s07 setup interrupt-resume:checkpoint+migrate
+s08 setup interrupt-resume:apply+commit
+s09 setup n-to-n1 compatible-rollback
+s10 setup rollback-published-088
+s11 nosetup rollback-published-089 migration-crash
+s12 setup converge-negative
+s13 setup previous-serves";
 
 fn assert_override_refused(manifest: &str, what: &str) {
     assert_ne!(manifest, GOOD_SHARDS, "fixture for {what} must differ from the good manifest");
@@ -460,7 +480,7 @@ fn self_test_fails_when_override_drops_a_scenario() {
 #[test]
 fn self_test_fails_when_override_duplicates_a_scenario() {
     assert_override_refused(
-        &GOOD_SHARDS.replace("s10 nosetup rollback-published-089", "s10 nosetup rollback-published-089 fresh-n"),
+        &GOOD_SHARDS.replace("s11 nosetup rollback-published-089", "s11 nosetup rollback-published-089 fresh-n"),
         "duplicated scenario",
     );
 }
@@ -468,7 +488,7 @@ fn self_test_fails_when_override_duplicates_a_scenario() {
 #[test]
 fn self_test_fails_when_override_drops_a_phase() {
     assert_override_refused(
-        &GOOD_SHARDS.replace("interrupt-resume:converge+canary", "interrupt-resume:converge"),
+        &GOOD_SHARDS.replace("interrupt-resume:checkpoint+migrate", "interrupt-resume:checkpoint"),
         "dropped phase",
     );
 }
@@ -476,7 +496,7 @@ fn self_test_fails_when_override_drops_a_phase() {
 #[test]
 fn self_test_fails_when_override_duplicates_a_phase() {
     assert_override_refused(
-        &GOOD_SHARDS.replace("fail-every-phase:canary+commit", "fail-every-phase:canary+commit+plan"),
+        &GOOD_SHARDS.replace("fail-every-phase:converge", "fail-every-phase:converge+plan"),
         "duplicated phase",
     );
 }
@@ -484,8 +504,16 @@ fn self_test_fails_when_override_duplicates_a_phase() {
 #[test]
 fn self_test_fails_when_override_runs_phased_scenario_unsplit() {
     assert_override_refused(
-        &GOOD_SHARDS.replace("s08 setup interrupt-resume:commit", "s08 setup interrupt-resume:commit\ns12 setup interrupt-resume"),
+        &GOOD_SHARDS.replace("s08 setup interrupt-resume:apply+commit", "s08 setup interrupt-resume:apply+commit\ns14 setup interrupt-resume"),
         "unsplit phased scenario",
+    );
+}
+
+#[test]
+fn self_test_fails_when_interrupt_resume_runs_a_phase_outside_interrupt_phases() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("interrupt-resume:apply+commit", "interrupt-resume:apply+commit+plan"),
+        "interrupt-resume phase outside INTERRUPT_PHASES",
     );
 }
 

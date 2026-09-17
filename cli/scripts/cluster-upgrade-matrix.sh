@@ -82,6 +82,13 @@ SCENARIOS_ALL=(
 )
 
 MATRIX_PHASES=(plan validate drain checkpoint migrate apply converge canary commit)
+# interrupt-resume runs a subset (issue #2733): plan/validate/drain interrupt
+# before any mutation and converge/canary follow apply, so checkpoint, migrate,
+# apply, commit are the distinct resume states. fail-every-phase keeps all nine.
+INTERRUPT_PHASES=(checkpoint migrate apply commit)
+# Tag the kind node currently holds exclusively; "" when unknown. Any path
+# that loads or untags app images on the node must clear it.
+EXCLUSIVE_KIND_TAG=""
 
 # Canonical shard manifest: `<id> <setup|nosetup> <scenario>[:<phase>+<phase>]...`.
 # Scenario order inside a shard preserves the serial state chain. `setup`
@@ -89,16 +96,18 @@ MATRIX_PHASES=(plan validate drain checkpoint migrate apply converge canary comm
 # upgrade to 0.9.0). --list-shards, --shard and the self-test coverage gate all
 # read SHARDS, so CI cannot run a manifest the gate did not check.
 SHARDS_CANONICAL="s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version
-s02 setup fail-every-phase:plan+validate+drain+checkpoint+migrate+apply+converge
-s03 setup fail-every-phase:canary+commit
-s04 setup interrupt-resume:plan+validate
-s05 setup interrupt-resume:drain+checkpoint
-s06 setup interrupt-resume:migrate+apply
-s07 setup interrupt-resume:converge+canary
-s08 setup interrupt-resume:commit
-s09 setup n-to-n1 compatible-rollback rollback-published-088
-s10 nosetup rollback-published-089 migration-crash
-s11 setup converge-negative previous-serves"
+s02 setup fail-every-phase:plan+validate+drain
+s03 setup fail-every-phase:checkpoint+migrate+apply
+s04 setup fail-every-phase:converge
+s05 setup fail-every-phase:canary
+s06 setup fail-every-phase:commit
+s07 setup interrupt-resume:checkpoint+migrate
+s08 setup interrupt-resume:apply+commit
+s09 setup n-to-n1 compatible-rollback
+s10 setup rollback-published-088
+s11 nosetup rollback-published-089 migration-crash
+s12 setup converge-negative
+s13 setup previous-serves"
 SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
 
 log() { printf '%s\n' "$*" >&2; }
@@ -150,7 +159,8 @@ is_sha256() {
 
 # shard_manifest <check|json|lookup> <manifest> [shard-id]
 # check: exit 0 when every scenario runs exactly once and each phased scenario
-# covers MATRIX_PHASES exactly once across shards; else print
+# covers its phase set exactly once across shards (fail-every-phase:
+# MATRIX_PHASES, interrupt-resume: INTERRUPT_PHASES); else print
 # "shard coverage failed: ..." and exit 2. json: check, then emit the manifest.
 # lookup: check, then print setup|nosetup and one item per line; exit 3 when
 # the id is unknown.
@@ -161,6 +171,7 @@ mode, manifest = sys.argv[1], sys.argv[2]
 want = sys.argv[3] if len(sys.argv) > 3 else ""
 scenarios = sys.argv[4].split()
 phases = sys.argv[5].split()
+required = {"fail-every-phase": phases, "interrupt-resume": sys.argv[6].split()}
 phased = ("fail-every-phase", "interrupt-resume")
 errors, shards, ids = [], [], set()
 for ln, line in enumerate(manifest.splitlines(), 1):
@@ -198,10 +209,11 @@ for name in scenarios:
     hits = [e for s in shards for e in s["scenarios"] if e["name"] == name]
     if name in phased:
         got = [p for e in hits for p in (e["phases"] or [])]
+        want = required[name]
         for p in phases:
-            n = got.count(p)
-            if n != 1:
-                errors.append(f"{name} phase {p} runs {n} times, want 1")
+            n, need = got.count(p), (1 if p in want else 0)
+            if n != need:
+                errors.append(f"{name} phase {p} runs {n} times, want {need}")
     elif len(hits) != 1:
         errors.append(f"scenario {name} runs {len(hits)} times, want 1")
 if errors:
@@ -218,7 +230,7 @@ elif mode == "lookup":
                 print(e["name"] + (":" + "+".join(e["phases"]) if e["phases"] else ""))
             raise SystemExit(0)
     raise SystemExit(3)
-' "$1" "$2" "${3:-}" "${SCENARIOS_ALL[*]}" "${MATRIX_PHASES[*]}"
+' "$1" "$2" "${3:-}" "${SCENARIOS_ALL[*]}" "${MATRIX_PHASES[*]}" "${INTERRUPT_PHASES[*]}"
 }
 
 verify_sha256() {
@@ -372,6 +384,39 @@ run_self_test() {
         log "self-test: restore_n must helm rollback to 0.9.0 instead of a full upgrade wait"
         failed=1
     fi
+    if awk '/^restore_n\(\)/,/^}/' "$script_path" | awk '
+        /exclusive_kind_tag "0.9.0"/ { if (!rollback) before=1 }
+        /helm_ns rollback/ { rollback=1 }
+        END { exit (before && rollback) ? 0 : 1 }
+    '; then
+        log "restore_n loads exclusive 0.9.0 images before rollback"
+    else
+        log "self-test: restore_n must exclusive_kind_tag 0.9.0 before helm rollback (pullPolicy Never)"
+        failed=1
+    fi
+    if awk '/^exclusive_kind_tag\(\)/,/^}/' "$script_path" | awk '
+        index($0, "\"$EXCLUSIVE_KIND_TAG\" == \"$keep\"") { early=NR }
+        /kind load docker-image/ { if (!load) load=NR }
+        index($0, "EXCLUSIVE_KIND_TAG=\"$keep\"") { set=NR }
+        /untag_kind_siblings/ { last_untag=NR }
+        END { exit (early && load && early < load && set > last_untag) ? 0 : 1 }
+    '; then
+        log "exclusive_kind_tag skips a reload when the node already holds the tag"
+    else
+        log "self-test: exclusive_kind_tag must return early on EXCLUSIVE_KIND_TAG and set it after the final untag"
+        failed=1
+    fi
+    local fn inval_ok=1
+    for fn in load_tag_images untag_kind_siblings ensure_kind retag_candidate_versions; do
+        if ! awk "/^${fn}\\(\\)/,/^}/" "$script_path" | grep -q 'EXCLUSIVE_KIND_TAG=""'; then
+            log "self-test: $fn must invalidate EXCLUSIVE_KIND_TAG"
+            inval_ok=0
+            failed=1
+        fi
+    done
+    if (( inval_ok )); then
+        log "load_tag_images invalidates the exclusive kind tag"
+    fi
     if awk '/^exclusive_kind_tag\(\)/,/^}/' "$script_path" | awk '
         /untag_kind_siblings/ { untag++ }
         /kind load docker-image/ { load=1 }
@@ -410,9 +455,9 @@ run_self_test() {
     for label in "dropped scenario" "duplicated scenario" "dropped phase" "duplicated phase"; do
         case "$label" in
             "dropped scenario") mutated="${SHARDS_CANONICAL/ migration-crash/}" ;;
-            "duplicated scenario") mutated="${SHARDS_CANONICAL/s10 nosetup rollback-published-089/s10 nosetup rollback-published-089 fresh-n}" ;;
-            "dropped phase") mutated="${SHARDS_CANONICAL/interrupt-resume:converge+canary/interrupt-resume:converge}" ;;
-            "duplicated phase") mutated="${SHARDS_CANONICAL/fail-every-phase:canary+commit/fail-every-phase:canary+commit+plan}" ;;
+            "duplicated scenario") mutated="${SHARDS_CANONICAL/s11 nosetup rollback-published-089/s11 nosetup rollback-published-089 fresh-n}" ;;
+            "dropped phase") mutated="${SHARDS_CANONICAL/interrupt-resume:checkpoint+migrate/interrupt-resume:checkpoint}" ;;
+            "duplicated phase") mutated="${SHARDS_CANONICAL/fail-every-phase:converge/fail-every-phase:converge+plan}" ;;
         esac
         if [[ "$mutated" == "$SHARDS_CANONICAL" ]]; then
             log "self-test: $label negative control did not mutate the manifest"
@@ -607,6 +652,7 @@ kubeconfig_is_named_kind() {
 }
 
 ensure_kind() {
+    EXCLUSIVE_KIND_TAG=""
     mkdir -p "$(dirname "$KUBECONFIG_FILE")" "$EVIDENCE_DIR"
     if kind get clusters 2>/dev/null | grep -Fxq "$KIND_CLUSTER"; then
         if (( FORCE )); then
@@ -635,6 +681,7 @@ IMAGES=(curie-api curie-worker curie-dispatcher curie-ui curie-runner)
 
 retag_candidate_versions() {
     local src_tag="$1" version="$2" required="${3:-optional}" img src dest short
+    EXCLUSIVE_KIND_TAG=""
     for img in "${IMAGES[@]}"; do
         src="$(image_for "$img" "$src_tag")"
         if docker image inspect "$src" >/dev/null 2>&1; then
@@ -658,6 +705,7 @@ retag_candidate_versions() {
 
 load_tag_images() {
     local tag="$1" img ref
+    EXCLUSIVE_KIND_TAG=""
     for img in "${IMAGES[@]}"; do
         ref="$(image_for "$img" "$tag")"
         if docker image inspect "$ref" >/dev/null 2>&1; then
@@ -693,6 +741,7 @@ kind_node() {
 
 untag_kind_siblings() {
     local keep="$1" node img tag ref
+    EXCLUSIVE_KIND_TAG=""
     node="$(kind_node)"
     [[ -n "$node" ]] || return 0
     for img in "${IMAGES[@]}"; do
@@ -712,6 +761,10 @@ untag_kind_siblings() {
 
 exclusive_kind_tag() {
     local keep="$1" node img ref
+    if [[ -n "$keep" && "$EXCLUSIVE_KIND_TAG" == "$keep" ]]; then
+        log "kind node already holds exclusive app tag $keep"
+        return 0
+    fi
     node="$(kind_node)"
     [[ -n "$node" ]] || return 0
     # Untag siblings before load. 0.9.0 and 0.9.1 are the same digest in CI;
@@ -730,6 +783,7 @@ exclusive_kind_tag() {
         kind load docker-image "$ref" --name "$KIND_CLUSTER"
     done
     untag_kind_siblings "$keep"
+    EXCLUSIVE_KIND_TAG="$keep"
     log "kind node $node holds exclusive app tag $keep"
 }
 
@@ -1190,6 +1244,9 @@ restore_n() {
             # harness restore; it is not the product mutator under test.
             rev="$(helm_revision_for_version 0.9.0)"
             if [[ -n "$rev" ]]; then
+                # pullPolicy Never: the node may hold exclusive 0.9.1, so load
+                # 0.9.0 first or the rollback waits out its whole timeout.
+                exclusive_kind_tag "0.9.0"
                 log "rolling back to helm revision $rev (0.9.0)"
                 helm_ns rollback "$RELEASE" "$rev" --wait --timeout 180s || \
                     cluster_upgrade "0.9.0" "$CHART_090" || true
@@ -1212,7 +1269,7 @@ run_interrupt_resume() {
     if [[ -n "${CURIE_E2E_INTERRUPT_PHASES:-}" ]]; then
         read -r -a phases <<< "$CURIE_E2E_INTERRUPT_PHASES"
     else
-        phases=("${MATRIX_PHASES[@]}")
+        phases=("${INTERRUPT_PHASES[@]}")
     fi
     for phase in "${phases[@]}"; do
         # A leftover in_progress record for 0.9.1 skips already-completed
