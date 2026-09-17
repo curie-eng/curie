@@ -26,7 +26,7 @@ use curie_aci_protocol::QueuedTurn;
 use redis::aio::MultiplexedConnection;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::api::{Agent, ApiClient};
+use crate::api::{Agent, ApiClient, ClusterMessageReplyEvent};
 use crate::chat::{
     await_reply, await_resume, capped, continue_hint_line, continue_hint_long_line,
     parse_approval_id, resolve_targets, Outcome, SlackStub,
@@ -594,6 +594,89 @@ async fn dispatcher_connected_strict(
 
 const CLUSTER_MESSAGE_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Worker `publication_loop._report` prefixes. A publication result is a
+/// `reply.update` with one of these texts and no `turn.completed`: resolving a
+/// publication does not enqueue a model resume, so the cluster-message waiter
+/// that only watches completion would hang until `--timeout-secs` (#2757).
+fn is_publication_result_text(text: &str) -> bool {
+    text.starts_with("Published the approved changes: ")
+        || text.starts_with("Changes were not published: ")
+        || text.starts_with("Publication failed safely after approval: ")
+}
+
+/// Classify one relay page into a resume wait outcome. Pure so the #2757 hang
+/// (publication result delivered, waiter still looping) is unit-testable
+/// without a cluster.
+///
+/// Session approval expiry and rejection still enqueue a model resume, so this
+/// classifier must not treat a durable approval row as terminal. Only a
+/// publication result text or a real completion/terminal page stops the wait.
+fn cluster_relay_page_outcome(
+    events: &[ClusterMessageReplyEvent],
+    terminal_page: bool,
+    latest: &mut Option<String>,
+    observer: &mut impl FnMut(&str),
+) -> Result<Option<Outcome>> {
+    let mut awaiting_approval = false;
+    let mut completed = false;
+    let mut publication_result = false;
+    for event in events {
+        match event.kind.as_str() {
+            "turn.status" => {
+                if let Some(status) = event.status.as_deref() {
+                    observer(status);
+                }
+            }
+            "reply.update" => {
+                if let Some(text) = event.text.as_ref() {
+                    if latest.as_deref() != Some(text.as_str()) {
+                        observer(text);
+                        *latest = Some(text.clone());
+                    }
+                    if is_publication_result_text(text) {
+                        publication_result = true;
+                    }
+                }
+            }
+            "reply.post" => {}
+            "turn.completed" => match event.outcome.as_deref() {
+                Some("awaiting-approval") => awaiting_approval = true,
+                Some("delivered" | "dropped" | "escalated") => {
+                    awaiting_approval = false;
+                    completed = true;
+                }
+                Some(outcome) => {
+                    bail!("cluster-message relay returned unknown outcome {outcome:?}")
+                }
+                None => bail!("cluster-message completion omitted its outcome"),
+            },
+            _ => {}
+        }
+    }
+    if publication_result {
+        return Ok(Some(
+            latest
+                .clone()
+                .map_or(Outcome::CompletedNoEdit, Outcome::Replied),
+        ));
+    }
+    if completed || terminal_page {
+        return Ok(Some(
+            latest
+                .clone()
+                .map_or(Outcome::CompletedNoEdit, Outcome::Replied),
+        ));
+    }
+    if awaiting_approval {
+        let approval_id = latest.as_deref().and_then(parse_approval_id);
+        return Ok(Some(Outcome::AwaitingApproval {
+            reply: latest.clone(),
+            approval_id,
+        }));
+    }
+    Ok(None)
+}
+
 /// One disconnected cluster turn plus the opaque API bucket the worker will
 /// write. The normal Slack binding coordinates stay intact so agent resolution
 /// does not diverge; only reply delivery selects the reserved built-in adapter.
@@ -629,6 +712,12 @@ struct ClusterRelayObservation {
 /// poll. No stream/PENDING read is used as completion: the worker's relay event
 /// is the reply-delivery outcome, while XACK remains worker-owned and continues
 /// even if this CLI exits.
+///
+/// A publication result is a `reply.update` with no `turn.completed` (resolving
+/// a publication does not enqueue a model resume). The waiter treats that text
+/// as terminal so `curie cluster message` is told instead of reprinting the
+/// waiting note until `--timeout-secs` (#2757). Session expiry still waits for
+/// the resume turn.
 async fn await_cluster_relay(
     api: &ApiClient,
     reply_ref: &uuid::Uuid,
@@ -666,52 +755,12 @@ async fn await_cluster_relay(
                     page.next_cursor
                 );
             }
-            let mut awaiting_approval = false;
-            let mut completed = false;
-            for event in page.events {
-                match event.kind.as_str() {
-                    "turn.status" => {
-                        if let Some(status) = event.status.as_deref() {
-                            observer(status);
-                        }
-                    }
-                    "reply.update" => {
-                        if let Some(text) = event.text {
-                            if latest.as_deref() != Some(text.as_str()) {
-                                observer(&text);
-                                latest = Some(text);
-                            }
-                        }
-                    }
-                    "reply.post" => {}
-                    "turn.completed" => match event.outcome.as_deref() {
-                        Some("awaiting-approval") => awaiting_approval = true,
-                        Some("delivered" | "dropped" | "escalated") => {
-                            awaiting_approval = false;
-                            completed = true;
-                        }
-                        Some(outcome) => {
-                            bail!("cluster-message relay returned unknown outcome {outcome:?}")
-                        }
-                        None => bail!("cluster-message completion omitted its outcome"),
-                    },
-                    _ => {}
-                }
-            }
+            let outcome =
+                cluster_relay_page_outcome(&page.events, page.terminal, &mut latest, observer)?;
             cursor = page.next_cursor;
-            if completed || page.terminal {
+            if let Some(outcome) = outcome {
                 return Ok(ClusterRelayObservation {
-                    outcome: latest.map_or(Outcome::CompletedNoEdit, Outcome::Replied),
-                    next_cursor: cursor,
-                });
-            }
-            if awaiting_approval {
-                let approval_id = latest.as_deref().and_then(parse_approval_id);
-                return Ok(ClusterRelayObservation {
-                    outcome: Outcome::AwaitingApproval {
-                        reply: latest,
-                        approval_id,
-                    },
+                    outcome,
                     next_cursor: cursor,
                 });
             }
@@ -7709,5 +7758,103 @@ mod tests {
         ]))
         .expect("global --json between target and verb must not hide the trap");
         assert!(format!("{err:#}").contains("cluster message"), "{err:#}");
+    }
+
+    fn relay_event(
+        kind: &str,
+        text: Option<&str>,
+        outcome: Option<&str>,
+    ) -> ClusterMessageReplyEvent {
+        ClusterMessageReplyEvent {
+            kind: kind.to_string(),
+            text: text.map(str::to_string),
+            status: None,
+            outcome: outcome.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn cluster_relay_page_treats_publication_result_update_as_terminal() {
+        let mut latest = None;
+        let mut observed = Vec::new();
+        let outcome = cluster_relay_page_outcome(
+            &[relay_event(
+                "reply.update",
+                Some("Publication failed safely after approval: card delivery failed"),
+                None,
+            )],
+            false,
+            &mut latest,
+            &mut |text| observed.push(text.to_string()),
+        )
+        .expect("publication result classification")
+        .expect("must stop waiting");
+        match outcome {
+            Outcome::Replied(reply) => {
+                assert!(reply.contains("Publication failed safely after approval"));
+            }
+            other => panic!("expected Replied, got {other:?}"),
+        }
+        assert_eq!(observed.len(), 1);
+    }
+
+    #[test]
+    fn cluster_relay_page_treats_published_result_update_as_terminal() {
+        let mut latest = None;
+        let outcome = cluster_relay_page_outcome(
+            &[relay_event(
+                "reply.update",
+                Some(
+                    "Published the approved changes: https://github.com/acme-corp/acme-bot/pull/1",
+                ),
+                None,
+            )],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("published result classification")
+        .expect("must stop waiting after the PR lands");
+        match outcome {
+            Outcome::Replied(reply) => assert!(reply.contains("pull/1")),
+            other => panic!("expected Replied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cluster_relay_page_keeps_waiting_on_card_post_without_result() {
+        let mut latest = None;
+        let outcome = cluster_relay_page_outcome(
+            &[relay_event("reply.post", None, None)],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("card post classification");
+        assert!(
+            outcome.is_none(),
+            "an approval card without a publication result must keep polling"
+        );
+    }
+
+    #[test]
+    fn cluster_relay_page_still_parks_on_awaiting_approval_completion() {
+        let mut latest = Some("approve 3f2504e0-4f89-41d3-9a0c-0305e82c3301".to_string());
+        let outcome = cluster_relay_page_outcome(
+            &[relay_event(
+                "turn.completed",
+                None,
+                Some("awaiting-approval"),
+            )],
+            false,
+            &mut latest,
+            &mut |_| {},
+        )
+        .expect("awaiting-approval classification")
+        .expect("must still park");
+        match outcome {
+            Outcome::AwaitingApproval { .. } => {}
+            other => panic!("expected AwaitingApproval, got {other:?}"),
+        }
     }
 }
