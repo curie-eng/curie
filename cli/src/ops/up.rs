@@ -2177,8 +2177,7 @@ fn overlay_leaf(
 fn escape_helm_set_key_segment(key: &str) -> String {
     // Retained object keys may contain literal dots. Escape backslashes first
     // so their Helm escaping cannot consume the escape added for a later dot.
-    key.replace('\\', "\\\\")
-        .replace('.', "\\.")
+    key.replace('\\', "\\\\").replace('.', "\\.")
 }
 
 fn overlay_json(
