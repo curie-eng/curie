@@ -20,6 +20,7 @@ from kubernetes import config as k8s_config
 
 from ..attachments import ATTACHMENTS_REF_ENV
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
+from .quota import quota_has_live_headroom, quota_rejection_is_valid
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
@@ -155,16 +156,11 @@ def _quota_rejection(status: dict[str, Any]) -> QuotaRejection | None:
         hard = _resource_map(hard_raw)
         if requested is None or used is None or hard is None:
             continue
-        common = sorted(requested.keys() & used.keys() & hard.keys())
-        if not common:
-            continue
-        resource = common[0]
         return QuotaRejection(
             quota_name=quota_name,
-            resource=resource,
-            requested=requested[resource],
-            used=used[resource],
-            hard=hard[resource],
+            requested=requested,
+            used=used,
+            hard=hard,
         )
     return None
 
@@ -235,7 +231,14 @@ class KubernetesSandboxClient:
             k8s_config.load_incluster_config()
         except k8s_config.ConfigException:
             k8s_config.load_kube_config(config_file=kubeconfig)
-        self._api = k8s_client.CustomObjectsApi()
+        configuration = k8s_client.Configuration.get_default_copy()
+        # The installed client otherwise inherits urllib3's three retry
+        # default. That would multiply every explicit request timeout by four
+        # and make the pressure deletion envelope false.
+        configuration.retries = 0
+        api_client = k8s_client.ApiClient(configuration=configuration)
+        self._api = k8s_client.CustomObjectsApi(api_client)
+        self._core_api = k8s_client.CoreV1Api(api_client)
         self._namespace = namespace
 
     # -- SandboxClaim (extensions group) ------------------------------------
@@ -331,14 +334,27 @@ class KubernetesSandboxClient:
             EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body
         )
 
-    def get_claim(self, name: str) -> ClaimView | None:
-        obj = self._get(EXT_GROUP, EXT_VERSION, "sandboxclaims", name)
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        obj = self._get(
+            EXT_GROUP,
+            EXT_VERSION,
+            "sandboxclaims",
+            name,
+            request_timeout_seconds=request_timeout_seconds,
+        )
         return _claim_view(obj) if obj is not None else None
 
-    def delete_claim(self, name: str) -> None:
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
         try:
             self._api.delete_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", name
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxclaims",
+                name,
+                _request_timeout=request_timeout_seconds,
             )
         except k8s_client.ApiException as exc:
             if exc.status != 404:
@@ -356,9 +372,49 @@ class KubernetesSandboxClient:
 
     # -- Sandbox (core group) ------------------------------------------------
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
-        obj = self._get(CORE_GROUP, CORE_VERSION, "sandboxes", name)
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        obj = self._get(
+            CORE_GROUP,
+            CORE_VERSION,
+            "sandboxes",
+            name,
+            request_timeout_seconds=request_timeout_seconds,
+        )
         return _sandbox_view(obj) if obj is not None else None
+
+    def quota_has_headroom(
+        self,
+        rejection: QuotaRejection,
+        *,
+        request_timeout_seconds: float,
+    ) -> bool:
+        if not quota_rejection_is_valid(rejection):
+            return False
+        try:
+            quota = self._core_api.read_namespaced_resource_quota(
+                rejection.quota_name,
+                self._namespace,
+                _request_timeout=request_timeout_seconds,
+            )
+        except Exception:  # noqa: BLE001 - unreadable quota state fails closed
+            return False
+
+        metadata = getattr(quota, "metadata", None)
+        spec = getattr(quota, "spec", None)
+        status = getattr(quota, "status", None)
+        if (
+            getattr(metadata, "name", None) != rejection.quota_name
+            or getattr(metadata, "namespace", None) != self._namespace
+        ):
+            return False
+        return quota_has_live_headroom(
+            rejection,
+            spec_hard=getattr(spec, "hard", None),
+            status_hard=getattr(status, "hard", None),
+            status_used=getattr(status, "used", None),
+        )
 
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:
         self._api.patch_namespaced_custom_object(
@@ -372,10 +428,23 @@ class KubernetesSandboxClient:
 
     # -- helpers --------------------------------------------------------------
 
-    def _get(self, group: str, version: str, plural: str, name: str) -> dict[str, Any] | None:
+    def _get(
+        self,
+        group: str,
+        version: str,
+        plural: str,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+    ) -> dict[str, Any] | None:
         try:
             obj = self._api.get_namespaced_custom_object(
-                group, version, self._namespace, plural, name
+                group,
+                version,
+                self._namespace,
+                plural,
+                name,
+                _request_timeout=request_timeout_seconds,
             )
         except k8s_client.ApiException as exc:
             if exc.status == 404:

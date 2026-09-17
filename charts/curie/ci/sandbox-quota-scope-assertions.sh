@@ -20,7 +20,7 @@
 # an independent constant. These assertions pin that the two sides agree under
 # every way an operator can set them.
 #
-# Six assertions:
+# Seven assertions:
 #   (a) Default render: the quota's scope equals priorityClasses.sandbox.name.
 #   (b) The invariant that actually matters: the quota's scope equals the
 #       priorityClassName on the SandboxTemplate's pod spec. This is the one that
@@ -35,6 +35,7 @@
 #       exactly the silent shape this file exists to prevent.
 #   (f) The quota is absent entirely when resourceQuota.enabled is false, so the
 #       gate did not become unconditional.
+#   (g) The worker has only namespaced get permission for ResourceQuota reads.
 set -euo pipefail
 
 CHART="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,6 +44,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 QUOTA_TPL="templates/tenant-resourcequota.yaml"
 SANDBOX_TPL="templates/agent-sandbox.yaml"
+WORKER_TPL="templates/worker.yaml"
 
 scope_of() {
   # Print the single PriorityClass value the rendered quota scopes on.
@@ -137,6 +139,44 @@ if grep -q "kind: ResourceQuota" "$TMP/disabled.yaml" 2>/dev/null; then
   echo "FAIL: quota rendered despite resourceQuota.enabled=false" >&2; exit 1
 fi
 echo "  ok: absent"
+
+echo "=== (g) worker quota access is namespaced and read only ==="
+helm template rel "$CHART" --show-only "$WORKER_TPL" > "$TMP/worker.yaml"
+python3 - "$TMP/worker.yaml" <<'PY'
+import sys
+
+import yaml
+
+documents = [document for document in yaml.safe_load_all(open(sys.argv[1])) if document]
+if any(document.get("kind") == "ClusterRole" for document in documents):
+    raise SystemExit("worker render must not create a ClusterRole")
+roles = [
+    document
+    for document in documents
+    if document.get("kind") == "Role"
+    and document.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+    == "worker"
+]
+if len(roles) != 1:
+    raise SystemExit(f"expected one namespaced worker Role, found {len(roles)}")
+quota_rules = [
+    rule
+    for rule in roles[0].get("rules", [])
+    if "resourcequotas" in rule.get("resources", [])
+]
+if len(quota_rules) != 1:
+    raise SystemExit(f"expected one worker ResourceQuota rule, found {len(quota_rules)}")
+rule = quota_rules[0]
+if rule.get("apiGroups") != [""]:
+    raise SystemExit(f"ResourceQuota must use the core API group: {rule}")
+if rule.get("resources") != ["resourcequotas"]:
+    raise SystemExit(f"ResourceQuota rule must grant only resourcequotas: {rule}")
+if rule.get("verbs") != ["get"]:
+    raise SystemExit(f"ResourceQuota rule must grant only get: {rule}")
+if "resourceNames" in rule:
+    raise SystemExit(f"ResourceQuota rule must not fix one quota name: {rule}")
+PY
+echo "  ok: one namespaced get rule"
 
 echo
 echo "All sandbox quota scope assertions passed."

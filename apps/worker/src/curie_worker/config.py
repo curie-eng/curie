@@ -1153,7 +1153,7 @@ class WorkerConfig(BaseSettings):
     def valkey_client_kwargs(self) -> dict[str, Any]:
         """The connection parts every Valkey client in the worker is built from.
 
-        One place -- the three clients in ``run.build`` and the upgrade-drain
+        One place -- the four clients in ``run.build`` and the upgrade-drain
         hook's own client -- so they cannot drift on the transport: ``ssl``
         reaching some of them and not the rest is a lane that goes silently
         cleartext against a TLS-only BYO store (#2315), and for the drain hook

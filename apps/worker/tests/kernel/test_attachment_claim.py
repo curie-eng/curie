@@ -1008,11 +1008,15 @@ def test_cancellation_waits_for_a_successful_handoff_before_cleanup(
             bind_gate = threading.Event()
             real_get_claim = h.fake_k8s.get_claim
 
-            def pause_candidate_bind(claim_name: str) -> Any:
+            def pause_candidate_bind(
+                claim_name: str, *, request_timeout_seconds: float
+            ) -> Any:
                 if claim_name != old.claim_name and not bind_gate.is_set():
                     bind_entered.set()
                     assert bind_gate.wait(timeout=5.0), "candidate bind gate timed out"
-                return real_get_claim(claim_name)
+                return real_get_claim(
+                    claim_name, request_timeout_seconds=request_timeout_seconds
+                )
 
             monkeypatch.setattr(h.fake_k8s, "get_claim", pause_candidate_bind)
             qevent = _qevent(
@@ -1081,11 +1085,15 @@ def test_cancellation_discards_after_a_definitively_failed_handoff(
             bind_gate = threading.Event()
             real_get_claim = h.fake_k8s.get_claim
 
-            def pause_candidate_bind(claim_name: str) -> Any:
+            def pause_candidate_bind(
+                claim_name: str, *, request_timeout_seconds: float
+            ) -> Any:
                 if claim_name != old.claim_name and not bind_gate.is_set():
                     bind_entered.set()
                     assert bind_gate.wait(timeout=5.0), "candidate bind gate timed out"
-                return real_get_claim(claim_name)
+                return real_get_claim(
+                    claim_name, request_timeout_seconds=request_timeout_seconds
+                )
 
             monkeypatch.setattr(h.fake_k8s, "get_claim", pause_candidate_bind)
             qevent = _qevent(
@@ -1807,10 +1815,12 @@ def _hide_sandboxes(h: Any, monkeypatch: Any) -> set[str]:
     hidden: set[str] = set()
     real_get_sandbox = h.fake_k8s.get_sandbox
 
-    def get_sandbox(name: str) -> Any:
+    def get_sandbox(name: str, *, request_timeout_seconds: float) -> Any:
         if name in hidden:
             return None
-        return real_get_sandbox(name)
+        return real_get_sandbox(
+            name, request_timeout_seconds=request_timeout_seconds
+        )
 
     monkeypatch.setattr(h.fake_k8s, "get_sandbox", get_sandbox)
     return hidden

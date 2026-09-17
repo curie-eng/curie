@@ -100,7 +100,7 @@ _THREAD_ATTRIBUTES = {
 }
 _SANDBOX_ATTRIBUTES = {
     "service.name": ["curie-worker"],
-    "operation": ["claim", "resume", "release", "suspend", "cleanup"],
+    "operation": ["claim", "resume", "release", "suspend", "cleanup", "reclaim"],
     "outcome": [
         "claimed",
         "reused",
@@ -110,6 +110,15 @@ _SANDBOX_ATTRIBUTES = {
         "failed",
         "orphan-cleaned",
         "observed",
+        "expiry-unsupported",
+        "race-lost",
+        "reclaimed",
+        "reclaimed-retry-refused",
+        "refused-invalid-quota",
+        "refused-no-budget",
+        "refused-no-safe-route",
+        "scan-incomplete",
+        "timeout",
     ],
 }
 _SANDBOX_INVENTORY_ATTRIBUTES = {

@@ -21,6 +21,7 @@ Out-of-cluster reachability uses ``kubectl port-forward`` to the sandbox pod
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -40,6 +41,10 @@ from curie_worker.sandbox import (
     SandboxSubstrate,
     SubstrateConfig,
 )
+from redis.asyncio import Redis as AsyncRedis
+from redis.asyncio.retry import Retry as AsyncRetry
+from redis.backoff import NoBackoff
+from redis.maint_notifications import MaintNotificationsConfig
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("CURIE_SANDBOX_E2E") != "1",
@@ -113,6 +118,16 @@ def substrate() -> Iterator[SandboxSubstrate]:
         port=int(os.environ.get("TEST_VALKEY_PORT", "26379")),
         password=os.environ.get("TEST_VALKEY_PW", "valkeypass") or None,
     )
+    pressure_client = AsyncRedis(
+        host=os.environ.get("TEST_VALKEY_HOST", "localhost"),
+        port=int(os.environ.get("TEST_VALKEY_PORT", "26379")),
+        password=os.environ.get("TEST_VALKEY_PW", "valkeypass") or None,
+        socket_timeout=1.0,
+        socket_connect_timeout=1.0,
+        retry=AsyncRetry(NoBackoff(), 0),
+        driver_info=None,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
     client.ping()
     prefix = "e2e:curie:sandbox"
     config = SubstrateConfig(
@@ -123,12 +138,15 @@ def substrate() -> Iterator[SandboxSubstrate]:
         key_prefix=prefix,
     )
     yield SandboxSubstrate(
-        KubernetesSandboxClient(NAMESPACE), AffinityStore(client, key_prefix=prefix), config
+        KubernetesSandboxClient(NAMESPACE),
+        AffinityStore(client, pressure_client=pressure_client, key_prefix=prefix),
+        config,
     )
     keys = list(client.scan_iter(match=f"{prefix}:*"))
     if keys:
         client.delete(*keys)
     client.close()
+    asyncio.run(pressure_client.aclose())
 
 
 def _await_pool_ready(timeout: float = 180.0) -> None:
