@@ -28,6 +28,7 @@ const REGISTRY_INDEX_WITHOUT_REQUIRED_FIELDS: &str =
     r#"{"mediaType":"application/vnd.oci.image.index.v1+json"}"#;
 const AGENT_ID: &str = "00000000-0000-0000-0000-000000000001";
 const VERSION_ID: &str = "00000000-0000-0000-0000-000000000002";
+const PLATFORM_PUBLISH_GATE: &str = "mcp__curie__publish_changes";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -199,7 +200,7 @@ case " $* " in
         printf '%s\n' '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"grafana"},"data":{"admin-user":"bWlncmF0ZWQtYWRtaW4=","admin-password":"cHc="}}'
         exit 0
         ;;
-    *" wait "*" secret/sre-bot-kubernetes-token "*)
+    *" wait "*" secret/sre-bot-kubernetes-token "*|*" wait "*" secret/sre-bot-upgrader-token "*)
         case "$CURIE_TEST_READER_TOKEN_MODE" in
             success|read-failure) exit 0 ;;
             timeout)
@@ -208,7 +209,7 @@ case " $* " in
                 ;;
         esac
         ;;
-    *" get secret sre-bot-kubernetes-token "*)
+    *" get secret sre-bot-kubernetes-token "*|*" get secret sre-bot-upgrader-token "*)
         case "$CURIE_TEST_READER_TOKEN_MODE" in
             success)
                 printf '%s\n' '{"apiVersion":"v1","kind":"Secret","data":{"ca.crt":"Zml4dHVyZS1jYQ==","token":"enp6enp6enp6enp6"}}'
@@ -1505,6 +1506,73 @@ fn successful_install_uploads_the_pinned_upstream_kubernetes_connector_and_tool_
         "the removed writer image must never be resolved: {registry:?}"
     );
 }
+
+#[test]
+fn publication_gate_survives_both_embedded_installer_modes_with_operator_approvers() {
+    for platform_upgrade in [false, true] {
+        let fixture = full_install_fixture();
+        let mut args = vec!["--approvers", "U0EXAMPLE1"];
+        if platform_upgrade {
+            args.push("--platform-upgrade");
+        }
+        let output = fixture.run(&args);
+        let text = shown(&output);
+        assert!(
+            output.status.success(),
+            "install with platform_upgrade={platform_upgrade} must complete: {text}"
+        );
+
+        let plugin: Value = serde_json::from_slice(&uploaded_bundle_file(
+            &fixture,
+            ".claude-plugin/plugin.json",
+        ))
+        .expect("uploaded plugin manifest must remain valid JSON");
+        let gates = plugin["approvalPolicy"]["gates"]
+            .as_array()
+            .expect("uploaded approvalPolicy.gates must be present");
+        let publication_gates: Vec<&Value> = gates
+            .iter()
+            .filter(|gate| gate["gate"] == PLATFORM_PUBLISH_GATE)
+            .collect();
+        assert_eq!(
+            publication_gates.len(),
+            1,
+            "the uploaded bundle must preserve one exact publication gate: {gates:?}"
+        );
+        assert_eq!(
+            publication_gates[0],
+            &json!({
+                "gate": PLATFORM_PUBLISH_GATE,
+                "route": "sre-approvals",
+            }),
+            "the uploaded bundle must preserve one exact publication route in both installer modes: {gates:?}"
+        );
+        assert_eq!(
+            gates
+                .iter()
+                .any(|gate| gate["gate"] == "mcp__self-upgrade__upgrade_self"),
+            platform_upgrade,
+            "the two iterations must exercise different self upgrade modes: {gates:?}"
+        );
+
+        let route_write = fixture
+            .api
+            .recorded()
+            .into_iter()
+            .find(|request| {
+                request.method == "PATCH" && request.path == format!("/agents/{AGENT_ID}")
+            })
+            .expect("install must bind sre-approvals before uploading the bundle");
+        let route_body: Value = serde_json::from_slice(&route_write.body)
+            .expect("approval route request must remain valid JSON");
+        assert_eq!(
+            route_body["approval_routes"]["sre-approvals"]["approvers"]["users"],
+            json!(["U0EXAMPLE1"]),
+            "the publication route must be resolvable by the explicit operator user"
+        );
+    }
+}
+
 #[test]
 fn install_records_the_current_commit_sha_on_the_created_version() {
     let fixture = Fixture::with_modes(

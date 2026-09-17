@@ -39,11 +39,11 @@ curie example sre-bot install --observability --slack-channel C0EXAMPLE1 \
 ```
 
 The installer binds the `sre-approvals` route that gates the six Kubernetes
-mutations before it deploys. You need to add approvers with `--approvers`
-(comma separated Slack user IDs, repeatable) to resolve those approvals from the
-CLI with an operator principal. Without it the install still succeeds, but only
-members of the bound Slack channel can approve, and the installer says so. Bind
-them later with
+mutations and platform publication before it deploys. Terminal resolution
+requires an explicit users list. Add it with `--approvers` using comma separated
+Slack user IDs. Without it the Slack install still succeeds, but only members
+of the bound Slack channel can approve from Slack, and the installer says so.
+Bind users later with
 `curie cluster approvals sre-bot --route-resolution sre-approvals=<CHANNEL> --route-approvers sre-approvals=users:<ids>`.
 If any bound route carries a notification target, the installer refuses to
 rewrite the route map (the API does not return the notification transport);
@@ -77,23 +77,19 @@ route, then deploy again:
 
 ```bash
 curie cluster deploy --plugin-dir examples/sre-bot   # first run: creates the agent, refuses locally
-curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1 \
+  --route-approvers sre-approvals=users:U0EXAMPLE1
 curie cluster approvals sre-bot --list-routes
 curie cluster deploy --plugin-dir examples/sre-bot
 ```
 
-On an existing agent that already binds the route, the first deploy succeeds
-and the bind step is unnecessary.
-
-You need to add approvers to resolve these approvals from the CLI with an
-operator principal: the route must bind an explicit user list, and without one
-only members of the bound Slack channel can approve. A route write replaces the
-whole map, so repeat the resolution in the same invocation:
-
-```bash
-curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1 \
-  --route-approvers sre-approvals=users:U0EXAMPLE1
-```
+On an existing agent that already binds the route, the first deploy succeeds and
+the bind step is unnecessary. Terminal resolution additionally requires an
+explicit users list. A platform API key only mints the operator principal.
+`CURIE_APPROVAL_PRINCIPAL_TOKEN` carries the subject used by `--resolve`, and
+that subject must appear in the route's users list. Rejection or resolution by
+an unbound operator must not publish changes. A route write replaces the whole
+map, so repeat the resolution and users in the same invocation.
 
 With `--observability`, the example also installs the metrics pipeline and
 reliability alerts. Follow [METRICS-ROLLOUT.md](docs/METRICS-ROLLOUT.md) for the

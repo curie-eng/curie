@@ -42,6 +42,7 @@ const GRAFANA_ADMIN_SECRET: &str = "grafana-admin";
 const GRAFANA_RELEASE: &str = "grafana";
 const READER_IDENTITY: &str = "sre-bot-kubernetes";
 const READER_TOKEN_SECRET: &str = "sre-bot-kubernetes-token";
+const PLATFORM_PUBLISH_GATE: &str = "mcp__curie__publish_changes";
 const UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_self";
 const UPGRADE_TOOL: &str = "self-upgrade/upgrade_self";
 // The platform-upgrade verb. Stripped like the others on a read-only install:
@@ -50,9 +51,9 @@ const UPGRADE_TOOL: &str = "self-upgrade/upgrade_self";
 const PLATFORM_UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_platform";
 const PLATFORM_UPGRADE_TOOL: &str = "self-upgrade/upgrade_platform";
 const LATEST_RELEASE_TOOL: &str = "self-upgrade/latest_release";
-// The six Kubernetes mutation verbs. These are always present in the shipped
-// bundle (unlike self-upgrade), so their gates are never stripped by this
-// transform -- only the self-upgrade gates come and go with upgrade_enabled.
+// Platform publication and the six Kubernetes mutation verbs are always
+// present in the shipped bundle. Only the self upgrade gates come and go with
+// upgrade_enabled.
 const KUBERNETES_MUTATION_TOOLS: &[&str] = &[
     "pods_delete",
     "pods_exec",
@@ -2214,9 +2215,10 @@ fn is_self_upgrade_policy_entry(entry: &serde_json::Value) -> bool {
 fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u8>> {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(source).context("parsing embedded SRE bot plugin.json")?;
-    // Pinned, not merely present. approvalPolicy governs both the optional
-    // self-upgrade connector and the always-present Kubernetes mutations.
+    // Pinned, not merely present. approvalPolicy governs platform publication,
+    // the optional self upgrade connector, and the Kubernetes mutations.
     let mut expected_gates = vec![
+        serde_json::json!({"gate": PLATFORM_PUBLISH_GATE, "route": "sre-approvals"}),
         serde_json::json!({"gate": UPGRADE_GATE, "route": "sre-approvals"}),
         serde_json::json!({"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}),
     ];
@@ -2254,11 +2256,12 @@ fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u
     }
     // Keep exactly the gates and tool-policy entries whose connectors survived.
     // Either kind of reference to a stripped connector fails bundle validation;
-    // a kept connector without both layers would bypass the intended gate. The
-    // Kubernetes connector is never stripped, so its six mutation gates are
-    // always kept regardless of upgrade_enabled -- otherwise those mutations
-    // would carry route=None and no operator principal could resolve them.
-    let mut kept: Vec<serde_json::Value> = Vec::new();
+    // a kept connector without both layers would bypass the intended gate.
+    // Platform publication and the Kubernetes connector are never stripped.
+    // Their gates stay present regardless of upgrade_enabled so their calls
+    // always carry a route that an operator principal can resolve.
+    let mut kept =
+        vec![serde_json::json!({"gate": PLATFORM_PUBLISH_GATE, "route": "sre-approvals"})];
     if upgrade_enabled {
         kept.push(serde_json::json!({"gate": UPGRADE_GATE, "route": "sre-approvals"}));
         kept.push(serde_json::json!({"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}));
@@ -2269,8 +2272,8 @@ fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u
             "route": "sre-approvals"
         }));
     }
-    // approvalPolicy is never removed: the Kubernetes gates above are always
-    // present, so the policy always has at least six gates.
+    // approvalPolicy is never removed because publication and the Kubernetes
+    // gates above are always present.
     manifest.insert(
         "approvalPolicy".to_string(),
         serde_json::json!({"gates": kept}),
@@ -2723,7 +2726,11 @@ mod tests {
         let manifest =
             runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
-        assert_eq!(routed_gates(&parsed), kubernetes_gate_set());
+        assert_eq!(routed_gates(&parsed), always_retained_gate_set());
+        assert_eq!(
+            parsed["approvalPolicy"]["gates"].as_array().unwrap().len(),
+            7
+        );
         let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
         assert!(!allow.iter().any(is_self_upgrade_policy_entry));
     }
@@ -2773,14 +2780,15 @@ mod tests {
             .collect();
         assert!(gates.contains(&UPGRADE_GATE));
         assert!(gates.contains(&PLATFORM_UPGRADE_GATE));
-        let mut expected = kubernetes_gate_set();
+        assert!(gates.contains(&PLATFORM_PUBLISH_GATE));
+        let mut expected = always_retained_gate_set();
         expected.insert((UPGRADE_GATE.to_string(), "sre-approvals".to_string()));
         expected.insert((
             PLATFORM_UPGRADE_GATE.to_string(),
             "sre-approvals".to_string(),
         ));
         assert_eq!(routed_gates(&parsed), expected);
-        assert_eq!(gates.len(), 8);
+        assert_eq!(gates.len(), 9);
         let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
         assert!(allow
             .iter()
@@ -3047,7 +3055,11 @@ mod tests {
         let manifest =
             runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
-        assert_eq!(routed_gates(&parsed), kubernetes_gate_set());
+        assert_eq!(routed_gates(&parsed), always_retained_gate_set());
+        assert_eq!(
+            parsed["approvalPolicy"]["gates"].as_array().unwrap().len(),
+            7
+        );
         let source: serde_json::Value =
             serde_json::from_slice(bundle_file(".claude-plugin/plugin.json")).unwrap();
         assert_eq!(
@@ -3092,6 +3104,15 @@ mod tests {
             .collect()
     }
 
+    fn always_retained_gate_set() -> std::collections::BTreeSet<(String, String)> {
+        let mut gates = kubernetes_gate_set();
+        gates.insert((
+            PLATFORM_PUBLISH_GATE.to_string(),
+            "sre-approvals".to_string(),
+        ));
+        gates
+    }
+
     fn routed_gates(manifest: &serde_json::Value) -> std::collections::BTreeSet<(String, String)> {
         manifest["approvalPolicy"]["gates"]
             .as_array()
@@ -3107,26 +3128,27 @@ mod tests {
     }
 
     #[test]
-    fn kubernetes_mutation_gates_survive_the_transform_with_upgrade_off_and_on() {
+    fn always_retained_gates_survive_the_transform_with_upgrade_off_and_on() {
         // #2722: a Kubernetes mutation without a routed gate raises a route-less
-        // approval no operator principal can resolve, so the installer must keep
-        // all six whether or not the self-upgrade connector is kept.
+        // approval no operator principal can resolve. Publication uses the same
+        // route, so the installer must keep all seven gates in both modes.
         let source = bundle_file(".claude-plugin/plugin.json");
 
         let off = runtime_plugin_manifest(source, false).unwrap();
         let off: serde_json::Value = serde_json::from_slice(&off).unwrap();
-        assert_eq!(routed_gates(&off), kubernetes_gate_set());
+        assert_eq!(routed_gates(&off), always_retained_gate_set());
+        assert_eq!(off["approvalPolicy"]["gates"].as_array().unwrap().len(), 7);
 
         let on = runtime_plugin_manifest(source, true).unwrap();
         let on: serde_json::Value = serde_json::from_slice(&on).unwrap();
-        let mut expected = kubernetes_gate_set();
+        let mut expected = always_retained_gate_set();
         expected.insert((UPGRADE_GATE.to_string(), "sre-approvals".to_string()));
         expected.insert((
             PLATFORM_UPGRADE_GATE.to_string(),
             "sre-approvals".to_string(),
         ));
         assert_eq!(routed_gates(&on), expected);
-        assert_eq!(on["approvalPolicy"]["gates"].as_array().unwrap().len(), 8);
+        assert_eq!(on["approvalPolicy"]["gates"].as_array().unwrap().len(), 9);
     }
 
     #[test]
@@ -3139,78 +3161,91 @@ mod tests {
     }
 
     #[test]
-    fn runtime_plugin_transform_requires_the_exact_upgrade_gate_policy() {
-        let exact_upgrade = serde_json::json!({
-            "gate": UPGRADE_GATE,
-            "route": "sre-approvals"
-        });
-        let exact_platform = serde_json::json!({
-            "gate": PLATFORM_UPGRADE_GATE,
-            "route": "sre-approvals"
-        });
+    fn runtime_plugin_transform_requires_the_exact_gate_policy() {
+        let exact: serde_json::Value =
+            serde_json::from_slice(bundle_file(".claude-plugin/plugin.json")).unwrap();
+        let mutate_gate = |name: &str, replacement: Option<serde_json::Value>| {
+            let mut manifest = exact.clone();
+            let gates = manifest["approvalPolicy"]["gates"].as_array_mut().unwrap();
+            let index = gates
+                .iter()
+                .position(|gate| gate["gate"] == name)
+                .unwrap_or_else(|| panic!("fixture must declare {name}"));
+            match replacement {
+                Some(replacement) => gates[index] = replacement,
+                None => {
+                    gates.remove(index);
+                }
+            }
+            manifest
+        };
+        let mut missing_policy = exact.clone();
+        missing_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("approvalPolicy");
+        let mut additional_gate = exact.clone();
+        additional_gate["approvalPolicy"]["gates"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "gate": "mcp__other__write",
+                "route": "sre-approvals"
+            }));
         let cases = [
-            (
-                "missing approval policy",
-                serde_json::json!({"name": "sre-bot", "description": "source"}),
-            ),
+            ("missing approval policy", missing_policy),
             (
                 "renamed gate",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [
-                        {
-                            "gate": "mcp__self-upgrade__upgrade_agent",
-                            "route": "sre-approvals"
-                        },
-                        exact_platform.clone()
-                    ]}
-                }),
+                mutate_gate(
+                    UPGRADE_GATE,
+                    Some(serde_json::json!({
+                        "gate": "mcp__self-upgrade__upgrade_agent",
+                        "route": "sre-approvals"
+                    })),
+                ),
+            ),
+            ("additional gate", additional_gate),
+            (
+                "kubernetes mutation gate missing",
+                mutate_gate("mcp__kubernetes__pods_delete", None),
             ),
             (
-                "additional gate",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [
-                        exact_upgrade.clone(),
-                        exact_platform.clone(),
-                        {"gate": "mcp__other__write", "route": "sre-approvals"}
-                    ]}
-                }),
-            ),
-            (
-                "kubernetes mutation gates missing",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [
-                        exact_upgrade.clone(),
-                        exact_platform.clone()
-                    ]}
-                }),
-            ),
-            (
-                "platform gate dropped",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [exact_upgrade.clone()]}
-                }),
+                "platform upgrade gate dropped",
+                mutate_gate(PLATFORM_UPGRADE_GATE, None),
             ),
             (
                 "different route",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [
-                        {
-                            "gate": UPGRADE_GATE,
-                            "route": "other-approvals"
-                        },
-                        exact_platform.clone()
-                    ]}
-                }),
+                mutate_gate(
+                    UPGRADE_GATE,
+                    Some(serde_json::json!({
+                        "gate": UPGRADE_GATE,
+                        "route": "other-approvals"
+                    })),
+                ),
+            ),
+            (
+                "publication gate dropped",
+                mutate_gate(PLATFORM_PUBLISH_GATE, None),
+            ),
+            (
+                "publication gate renamed",
+                mutate_gate(
+                    PLATFORM_PUBLISH_GATE,
+                    Some(serde_json::json!({
+                        "gate": "mcp__curie__publish_changes_typo",
+                        "route": "sre-approvals"
+                    })),
+                ),
+            ),
+            (
+                "publication route changed",
+                mutate_gate(
+                    PLATFORM_PUBLISH_GATE,
+                    Some(serde_json::json!({
+                        "gate": PLATFORM_PUBLISH_GATE,
+                        "route": "other-approvals"
+                    })),
+                ),
             ),
         ];
 
