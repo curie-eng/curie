@@ -1942,6 +1942,16 @@ jobs:
             "curie-postgres-readiness:${GITHUB_SHA}"; do
             kind load docker-image "$img" --name curie-e2e
           done
+      - name: Install uv for publication proof
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Prove publication Job adoption and failure reporting
+        env:
+          CURIE_PUBLICATION_KUBE_CONTEXT: kind-curie-e2e
+          CURIE_PUBLICATION_KIND_CLUSTER: curie-e2e
+          CURIE_PUBLICATION_RUNNER_IMAGE: curie-runner:latest
+        run: bash charts/curie/ci/runtime/publication-job-assertions.sh
       - name: Langfuse web waits for delayed Postgres without restarting
         env:
           READINESS_NAMESPACE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
