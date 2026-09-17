@@ -220,6 +220,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         level=settings.log_level.upper(),
     )
     app.state.telemetry = telemetry
+    for limit in ("value", "namespace"):
+        record_metric(
+            "curie.history.persistence.failure",
+            0,
+            attributes={
+                "service.name": "curie-api",
+                "source": "state-api",
+                "outcome": "capacity",
+                "limit": limit,
+            },
+        )
     try:
         yield
     finally:

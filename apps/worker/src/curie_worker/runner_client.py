@@ -24,7 +24,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import aiohttp
 from aci_protocol import Event, Final, Interrupt, OutboundEvent, parse_ndjson_line
@@ -54,6 +54,7 @@ _TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
 _TURN_EPOCH_MIN_LENGTH = 32
 _TURN_EPOCH_MAX_LENGTH = 256
 _T = TypeVar("_T")
+TimeoutResult = Literal["accepted", "conflict", "unconfirmed"]
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,10 @@ class RunnerStreamTimeout(TimeoutError):
     normalized underlying exception class and the budget that expired.
     """
 
+    def __init__(self, message: str, timeout_result: TimeoutResult) -> None:
+        super().__init__(message)
+        self.timeout_result = timeout_result
+
 
 @dataclass(frozen=True)
 class RunnerWorkspaceSnapshot:
@@ -128,7 +133,7 @@ class TurnStream:
         response: aiohttp.ClientResponse,
         budget_s: float,
         deadline: float,
-        timeout_callback: Callable[[], Awaitable[None]] | None = None,
+        timeout_callback: Callable[[], Awaitable[TimeoutResult]] | None = None,
     ) -> None:
         self._response = response
         self._saw_final = False
@@ -173,19 +178,19 @@ class TurnStream:
     ) -> RunnerStreamTimeout:
         terminal = self._stream_timeout_error
         if terminal is None:
-            terminal = RunnerStreamTimeout(self._timeout_reason(cause))
+            terminal = RunnerStreamTimeout(self._timeout_reason(cause), "unconfirmed")
             self._stream_timeout_error = terminal
             self._record_stream_timeout(cause)
-            await self._notify_timeout()
+            terminal.timeout_result = await self._notify_timeout()
         return terminal
 
-    async def _notify_timeout(self) -> None:
+    async def _notify_timeout(self) -> TimeoutResult:
         callback = self._timeout_callback
         self._timeout_callback = None
         if callback is None:
-            return
+            return "unconfirmed"
         try:
-            await callback()
+            return await callback()
         except Exception as exc:  # noqa: BLE001 - preserve the causal body timeout
             # The epoch, bearer, and response body are deliberately absent. A
             # failed notification leaves abandonment as the runner's truthful
@@ -194,6 +199,7 @@ class TurnStream:
                 "runner timeout terminal notification failed (%s)",
                 type(exc).__name__,
             )
+            return "unconfirmed"
 
     def _timeout_reason(self, cause: BaseException) -> str:
         return (
@@ -434,14 +440,14 @@ class RunnerClient:
                 resp.release()
                 raise RunnerError(f"/v1/event -> {resp.status}: {body}")
             turn_epoch = resp.headers.get(_TURN_EPOCH_HEADER)
-            timeout_callback: Callable[[], Awaitable[None]] | None = None
+            timeout_callback: Callable[[], Awaitable[TimeoutResult]] | None = None
             if _valid_turn_epoch(turn_epoch):
                 # ``turn_epoch`` is narrowed by the validation above. Keep the
                 # callback response-bound so a retry can never inherit a stale
                 # epoch from an earlier /v1/event.
-                async def notify_timeout() -> None:
+                async def notify_timeout() -> TimeoutResult:
                     assert turn_epoch is not None
-                    await self._notify_timeout(base_url, turn_epoch, token)
+                    return await self._notify_timeout(base_url, turn_epoch, token)
 
                 timeout_callback = notify_timeout
             return (
@@ -456,10 +462,12 @@ class RunnerClient:
         base_url: str,
         turn_epoch: str,
         token: str | None,
-    ) -> None:
+    ) -> TimeoutResult:
         """Best-effort causal timeout notification for one accepted turn."""
 
-        async def request(headers: dict[str, str] | None) -> tuple[None, str]:
+        async def request(
+            headers: dict[str, str] | None,
+        ) -> tuple[TimeoutResult, str]:
             control_headers = dict(headers or {})
             control_headers[_TURN_EPOCH_HEADER] = turn_epoch
             async with self._session.post(
@@ -471,9 +479,18 @@ class RunnerClient:
                     # Do not read or echo an arbitrary response body on this
                     # sensitive best-effort path.
                     raise RunnerError(f"/v1/timeout -> {resp.status}")
-                return None, "conflict" if resp.status == 409 else "success"
+                if resp.status == 409:
+                    return "conflict", "conflict"
+                return "accepted", "success"
 
-        await self._rpc("timeout", token, request)
+        try:
+            return await self._rpc("timeout", token, request)
+        except Exception as exc:  # noqa: BLE001 - this control call is best effort
+            logger.warning(
+                "runner timeout terminal notification failed (%s)",
+                type(exc).__name__,
+            )
+            return "unconfirmed"
 
     async def steer(
         self,
