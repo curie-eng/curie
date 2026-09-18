@@ -566,3 +566,16 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --run-id "$GITHUB_RUN_ID" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      # A filing crash used to die inside a step nobody reads (#2819). Put
+      # the reason on the run summary so the red check is self-explaining.
+      - name: Surface a filing failure on the run summary
+        if: failure()
+        run: |
+          {
+            echo "## nightly-ladder issue filing did not complete"
+            echo
+            echo "Filing for this red run failed part-way or never started, so"
+            echo "some or all failure signatures have no issue. Check what was"
+            echo "already created before refiling."
+            echo "See the \`File or comment one issue per failure signature\` step."
+          } >> "$GITHUB_STEP_SUMMARY"
