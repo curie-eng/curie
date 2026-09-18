@@ -1,11 +1,11 @@
 {
   "schemaVersion": "1.4",
-  "asOf": "2026-09-17",
+  "asOf": "2026-09-18",
   "repository": {
     "name": "curie-eng/curie",
     "branch": "main",
-    "commit": "8692fd5d8b2c53bd6ced91f8746c7b69b653ad1a",
-    "shortCommit": "8692fd5d",
+    "commit": "cc5019504be48fca0ecae824d8b7d91a33c1715d",
+    "shortCommit": "cc501950",
     "release": "v0.9.1"
   },
   "title": "Curie architecture atlas",
