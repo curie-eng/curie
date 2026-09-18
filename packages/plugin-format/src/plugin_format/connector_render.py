@@ -577,22 +577,26 @@ def _derived_headers(spec: ConnectorSpec) -> dict[str, Any]:
     Derived, not authored, for the same reason the URL above is: under ADR-0086
     the author writes no URL and no header, so there is nothing to get wrong.
     The value is the ``${NAME}`` placeholder -- no secret VALUE is ever read or
-    rendered here. The name is ``spec.bearer_secret`` when set, otherwise the
-    single declared secret (the github-mcp-server shape). A hosted connector
-    with several secrets and no ``bearer_secret`` is refused at validation
-    rather than silently using ``secrets[0]`` (#2559). Remaining secrets keep
-    their pod-side ``secretKeyRef`` delivery.
+    rendered here. The name is ``spec.bearer_secret`` when set, otherwise a
+    single plain string secret (the github-mcp-server shape). A ``SecretRef``
+    does not imply client authentication. An explicit ``bearer_secret`` still
+    requests a header for that name.
+    A hosted connector with several secrets and no ``bearer_secret`` is refused
+    at validation rather than silently using ``secrets[0]`` (#2559). Remaining
+    secrets keep their pod-side ``secretKeyRef`` delivery.
 
     With the header present, a wrong token surfaces from the tool call as
-    GitHub's ``401 Bad credentials``; a MISSING value is refused at deploy
-    (``connectors.yaml declares secret(s) with no value available``). A
-    ``SecretRef`` value never reaches the sandbox under ADR-0090, so the
-    placeholder expands empty and the runner's capability probe still only
-    logs the failure -- a known gap, tracked as a follow-up issue.
+    GitHub's ``401 Bad credentials``. A ``SecretRef`` value never reaches the
+    sandbox under ADR-0090, which is why an implicit reference emits no header.
+    An explicitly selected reference still emits the requested placeholder so
+    the runner can diagnose its missing sandbox value honestly.
     """
 
-    name = spec.bearer_secret_name()
-    if not name:
+    if spec.bearer_secret:
+        name = spec.bearer_secret
+    elif len(spec.secrets) == 1 and isinstance(spec.secrets[0], str):
+        name = spec.secrets[0]
+    else:
         return {}
     return {"headers": {"Authorization": f"Bearer ${{{name}}}"}}
 
@@ -625,7 +629,7 @@ def mcp_entry(
     For a hosted connector the URL is derived from the Service that Curie just
     created; hand-writing it is how a bundle ends up with an address that does
     not resolve in the tier it is deployed to. Its ``Authorization`` header is
-    derived from ``bearer_secret`` (or the single declared secret) for the same
+    derived from ``bearer_secret`` (or one plain string secret) for the same
     reason, so the author writes no header either -- see ``_derived_headers``.
     """
 

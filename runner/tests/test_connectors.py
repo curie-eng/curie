@@ -795,6 +795,16 @@ GITHUB = (
     "    secrets: [GITHUB_PERSONAL_ACCESS_TOKEN]\n"
 )
 
+GITHUB_POD_CREDENTIAL = (
+    "connectors:\n"
+    "  github:\n"
+    "    image: ghcr.io/github/github-mcp-server:v0.20.1\n"
+    "    secrets:\n"
+    "      - name: GITHUB_PERSONAL_ACCESS_TOKEN\n"
+    "        from_secret: gh-pat\n"
+    "        key: token\n"
+)
+
 _BEARER = {"Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"}
 
 
@@ -803,6 +813,22 @@ def test_the_mounted_hosted_server_carries_the_declared_credential(tmp_path: Pat
     # the URL, is derived. `${VAR}` is expanded by the MCP client from the
     # sandbox environment, so nothing resolved is written to disk here.
     servers = derive_mcp_servers(_bundle(tmp_path, GITHUB), **SCOPE)
+    assert servers["github"]["headers"] == _BEARER
+
+
+def test_a_pod_only_credential_is_not_mounted_in_the_sandbox_catalog(tmp_path: Path) -> None:
+    servers = derive_mcp_servers(_bundle(tmp_path, GITHUB_POD_CREDENTIAL), **SCOPE)
+    github = servers["github"]
+    assert github["url"] == (
+        "http://curie-acme-dev-mcp-github.curie.svc.cluster.local:8000/mcp"
+    )
+    assert "headers" not in github
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in json.dumps(github)
+
+
+def test_an_explicit_pod_credential_bearer_is_mounted_in_the_catalog(tmp_path: Path) -> None:
+    declared = GITHUB_POD_CREDENTIAL + "    bearer_secret: GITHUB_PERSONAL_ACCESS_TOKEN\n"
+    servers = derive_mcp_servers(_bundle(tmp_path, declared), **SCOPE)
     assert servers["github"]["headers"] == _BEARER
 
 
@@ -836,8 +862,8 @@ def test_materialize_expands_the_bearer_and_drops_it_from_env() -> None:
 
 
 def test_materialize_leaves_a_missing_bearer_as_the_placeholder() -> None:
-    # A SecretRef / unset value still expands empty today (#2519). Dropping a
-    # name that was never in env would hide that gap; leave the placeholder.
+    # An explicitly selected SecretRef or another unset value still expands
+    # empty today (#2519). Leave a name that was never in env as a placeholder.
     from curie_runner.connectors import materialize_hosted_bearer_headers
 
     servers = {
