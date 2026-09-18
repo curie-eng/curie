@@ -635,8 +635,32 @@ def test_0045_request_identity_active_uniqueness_and_cascade(
                 "terminal_cause": "other",
             },
         ),
+        (
+            "cancellation_requested",
+            {
+                "started_at": STAMP,
+                "execution_deadline": STAMP + timedelta(seconds=1800),
+                "terminal_cause": None,
+            },
+        ),
         ("completed", {"terminal_cause": "completed"}),
+        (
+            "completed",
+            {
+                "started_at": STAMP,
+                "execution_deadline": STAMP + timedelta(seconds=1800),
+                "terminal_at": STAMP + timedelta(seconds=1200),
+                "terminal_cause": None,
+            },
+        ),
         ("failed", {"terminal_at": STAMP}),
+        (
+            "cancelled",
+            {
+                "terminal_at": STAMP + timedelta(hours=2),
+                "terminal_cause": None,
+            },
+        ),
         (
             "cancelled",
             {
@@ -653,6 +677,23 @@ def test_0045_request_identity_active_uniqueness_and_cascade(
                 "execution_deadline": STAMP + timedelta(seconds=1800),
                 "terminal_at": STAMP + timedelta(seconds=1801),
                 "terminal_cause": "execution_deadline",
+            },
+        ),
+        (
+            "expired",
+            {
+                "terminal_at": STAMP + timedelta(hours=2),
+                "terminal_cause": None,
+            },
+        ),
+        (
+            "expired",
+            {
+                "started_at": STAMP,
+                "execution_deadline": STAMP + timedelta(seconds=1800),
+                "terminal_at": STAMP + timedelta(seconds=1801),
+                "terminal_cause": None,
+                "termination_observation": "fixture observed runtime termination",
             },
         ),
     ],

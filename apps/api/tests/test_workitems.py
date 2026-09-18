@@ -937,6 +937,176 @@ def test_elapsed_execution_is_observed_before_reuse_and_can_be_cancelled_explici
     with_session(body)
 
 
+def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) -> None:
+    async def run() -> None:
+        setup_engine = create_async_engine(get_settings().database_url)
+        lock_engine = create_async_engine(get_settings().database_url)
+        service_engine = create_async_engine(get_settings().database_url)
+        observer_engine = create_async_engine(get_settings().database_url)
+        service_task: asyncio.Task[workitems.WorkItemResult] | None = None
+
+        try:
+            async with AsyncSession(setup_engine) as setup:
+                agent_id = await _agent(setup, "deadline-crossing-agent")
+                lineage_id = await _lineage(setup, agent_id, pr=125)
+                item_id, request_id = uuid.uuid4(), uuid.uuid4()
+                execution_deadline = await _now(setup) + timedelta(seconds=5)
+                started_at = execution_deadline - timedelta(seconds=1800)
+                await setup.execute(
+                    text(
+                        "INSERT INTO curie.work_items "
+                        "(id, github_repository_id, github_issue_number, "
+                        "github_installation_id, agent_id, repo_full_name, "
+                        "conversation_id, version, next_sequence) VALUES "
+                        "(:id, 101, 2577, 202, :agent, :repo, :conversation, 2, 2)"
+                    ),
+                    {
+                        "id": item_id,
+                        "agent": agent_id,
+                        "repo": REPO,
+                        "conversation": CONVERSATION,
+                    },
+                )
+                await setup.execute(
+                    text(
+                        "INSERT INTO curie.execution_requests "
+                        "(id, work_item_id, sequence, status, wait_deadline, "
+                        "started_at, execution_deadline, version) VALUES "
+                        "(:id, :item, 1, 'running', :wait, :started, :deadline, 2)"
+                    ),
+                    {
+                        "id": request_id,
+                        "item": item_id,
+                        "wait": started_at + timedelta(seconds=1),
+                        "started": started_at,
+                        "deadline": execution_deadline,
+                    },
+                )
+                await setup.commit()
+
+            async with (
+                AsyncSession(lock_engine) as holder,
+                AsyncSession(service_engine) as service,
+                AsyncSession(observer_engine) as observer,
+            ):
+                holder_pid = await holder.scalar(text("SELECT pg_backend_pid()"))
+                service_pid = await service.scalar(text("SELECT pg_backend_pid()"))
+                assert isinstance(holder_pid, int)
+                assert isinstance(service_pid, int)
+                await holder.execute(
+                    text(
+                        "LOCK TABLE curie.thread_publication_lineages "
+                        "IN ACCESS EXCLUSIVE MODE"
+                    )
+                )
+
+                service_task = asyncio.create_task(
+                    workitems.link_publication_lineage(
+                        service,
+                        work_item_id=item_id,
+                        request_id=request_id,
+                        publication_lineage_id=lineage_id,
+                        expected_work_item_version=2,
+                        expected_request_version=2,
+                    )
+                )
+                holder_released = False
+
+                try:
+
+                    async def observe_lineage_lock_wait() -> None:
+                        while True:
+                            row = (
+                                await observer.execute(
+                                    text(
+                                        "SELECT a.wait_event_type, a.query, "
+                                        "EXISTS (SELECT 1 FROM pg_locks l "
+                                        "WHERE l.pid = a.pid AND NOT l.granted) "
+                                        "AS waiting_lock, CAST(:holder AS integer) = "
+                                        "ANY(pg_blocking_pids(a.pid)) "
+                                        "AS blocked_by_holder FROM pg_stat_activity a "
+                                        "WHERE a.pid = :service"
+                                    ),
+                                    {"holder": holder_pid, "service": service_pid},
+                                )
+                            ).mappings().one()
+                            if (
+                                row.wait_event_type == "Lock"
+                                and row.waiting_lock
+                                and row.blocked_by_holder
+                            ):
+                                assert "thread_publication_lineages" in row.query.lower()
+                                return
+                            if service_task.done():
+                                raise AssertionError(
+                                    "lineage link completed before reaching the lock gate"
+                                )
+                            await asyncio.sleep(0.01)
+
+                    await asyncio.wait_for(observe_lineage_lock_wait(), timeout=5)
+
+                    async def wait_for_database_deadline() -> datetime:
+                        while True:
+                            database_now = await _now(observer)
+                            if database_now >= execution_deadline:
+                                return database_now
+                            await asyncio.sleep(0.01)
+
+                    crossed_at = await asyncio.wait_for(
+                        wait_for_database_deadline(), timeout=20
+                    )
+                    assert crossed_at >= execution_deadline
+                    await holder.rollback()
+                    holder_released = True
+
+                    result = await asyncio.wait_for(service_task, timeout=10)
+                    conflict = _conflict(result, "execution_deadline_elapsed")
+                    assert (conflict.work_item_version, conflict.request_version) == (
+                        2,
+                        2,
+                    )
+
+                    persisted = (
+                        await observer.execute(
+                            text(
+                                "SELECT w.publication_lineage_id, "
+                                "w.version AS work_version, r.status, "
+                                "r.version AS request_version, r.started_at, "
+                                "r.execution_deadline FROM curie.work_items w "
+                                "JOIN curie.execution_requests r "
+                                "ON r.work_item_id = w.id WHERE w.id = :id"
+                            ),
+                            {"id": item_id},
+                        )
+                    ).mappings().one()
+                    assert persisted.publication_lineage_id is None
+                    assert (
+                        persisted.work_version,
+                        persisted.status,
+                        persisted.request_version,
+                    ) == (2, "running", 2)
+                    assert persisted.started_at == started_at
+                    assert persisted.execution_deadline == execution_deadline
+                finally:
+                    if not holder_released:
+                        await holder.rollback()
+                    if not service_task.done():
+                        service_task.cancel()
+                        await asyncio.gather(service_task, return_exceptions=True)
+        finally:
+            if service_task is not None and not service_task.done():
+                service_task.cancel()
+                await asyncio.gather(service_task, return_exceptions=True)
+            await asyncio.gather(
+                setup_engine.dispose(),
+                lock_engine.dispose(),
+                service_engine.dispose(),
+                observer_engine.dispose(),
+            )
+
+    asyncio.run(run())
+
+
 def test_start_and_cancellation_race_has_only_serial_outcomes(clean_db: None) -> None:
     async def setup(session: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]:
         waiting = await _request(

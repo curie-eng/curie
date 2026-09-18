@@ -180,4 +180,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0152 | [Registry destinations are operator-declared, not a platform preset](0152-no-cidr-trusted-registries-preset.md) | Draft |
 | 0153 | [A channel-port turn carries its attachments, and the worker fetches them from the adapter that produced them](0153-a-channel-port-turn-carries-its-attachments.md) | Accepted |
 | 0154 | [The tracker owns dependencies and Curie admits ready work](0154-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
+| 0155 | [WorkItems own durable execution identity](0155-work-items-own-durable-execution-identity.md) | Accepted |
 <!-- END GENERATED: adr-index -->

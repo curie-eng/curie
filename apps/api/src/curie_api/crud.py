@@ -32,6 +32,7 @@ from .models import (
     PublicationReviewReservation,
     ThreadPublicationLineage,
     ThreadWorkspace,
+    WorkItem,
 )
 from .publication_authority import VerifiedPublicationIdentity
 from .schemas import (
@@ -301,6 +302,7 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
     # match the FK ondelete=CASCADE already declared on every child table. Bundle
     # objects in RustFS are intentionally left in place (out of scope).
     await session.execute(delete(AgentChannel).where(AgentChannel.agent_id == agent_id))
+    await session.execute(delete(WorkItem).where(WorkItem.agent_id == agent_id))
     await session.execute(delete(Deployment).where(Deployment.agent_id == agent_id))
     await session.execute(delete(AgentVersion).where(AgentVersion.agent_id == agent_id))
     await session.execute(delete(Agent).where(Agent.id == agent_id))
