@@ -12,15 +12,18 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyAck, ReplyTarget
 from curie_worker.approval_cards import ApprovalCardRef
+from curie_worker.config import WorkerConfig
 from curie_worker.publication_loop import PublicationReconcileError
 from curie_worker.publication_store import (
     PostgresPublicationStore,
     PublicationStoreError,
 )
-from curie_worker.reply_sink import TargetRoute
+from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute, build_reply_sink
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -72,6 +75,7 @@ class _Store:
         self.retry_terminal_after = 99
         self.card_pending: Any | None = None
         self.card_delivery_retries: list[tuple[uuid.UUID, str]] = []
+        self.card_delivery_permanent: list[bool] = []
         self.card_delivered: set[uuid.UUID] = set()
         self.card_retry_terminal_after = 99
         self.cleanup_pending: set[uuid.UUID] = set()
@@ -88,9 +92,12 @@ class _Store:
         self.card_delivered.add(publication_id)
         self.card_pending = None
 
-    def retry_card_delivery(self, publication_id: uuid.UUID, *, error: str) -> None:
+    def retry_card_delivery(
+        self, publication_id: uuid.UUID, *, error: str, permanent: bool
+    ) -> None:
         self.card_delivery_retries.append((publication_id, error))
-        if len(self.card_delivery_retries) >= self.card_retry_terminal_after:
+        self.card_delivery_permanent.append(permanent)
+        if permanent or len(self.card_delivery_retries) >= self.card_retry_terminal_after:
             self.completed[publication_id] = ("failed", None)
             self.pending[publication_id] = {
                 "outcome": "failed",
@@ -464,6 +471,13 @@ class _Cards:
         self.restored: list[tuple[str, ApprovalCardRef]] = []
         self.remember_fail_once = False
         self.restore_failures_remaining = 0
+        self.notice_refs: dict[str, str] = {}
+        self.notice_read_fails = False
+
+    async def read_notice_ref(self, approval_id: str) -> str | None:
+        if self.notice_read_fails:
+            raise RuntimeError("notice ref store unavailable")
+        return self.notice_refs.get(approval_id)
 
     async def pop(self, approval_id: str) -> ApprovalCardRef | None:
         self.popped.append(approval_id)
@@ -832,6 +846,153 @@ async def test_missing_transcript_wiring_is_logged_loudly(
         _loop(publication, transcript=None)
 
     assert "publication transcript recording is not configured" in caplog.text
+
+
+CLUSTER_MESSAGE_REPLY_REF = "123e4567-e89b-42d3-a456-426614174000"
+CLUSTER_MESSAGE_WORKER_TOKEN = "worker-only-cluster-message-token"
+
+
+class _ClusterMessageRelay:
+    """The API's internal cluster-message reply route, answered like the real one."""
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+        self.status = 200
+        self.app = web.Application()
+        self.app.add_routes(
+            [web.post("/v1/internal/cluster-message-replies/{reply_ref}", self._append)]
+        )
+
+    async def _append(self, request: web.Request) -> web.Response:
+        reply_ref = request.match_info["reply_ref"]
+        self.posts.append((reply_ref, await request.json()))
+        if self.status != 200:
+            return web.Response(status=self.status)
+        return web.json_response({"ref": reply_ref})
+
+
+def _cluster_message_card_work(reply_ref: str | None) -> Any:
+    work = _card_work()
+    work.target = ReplyTarget(
+        kind="slack",
+        address="C0EXAMPLE1",
+        conversation_id="1700000000.000100",
+        reply_ref=reply_ref,
+    )
+    work.route = TargetRoute(endpoint=None, adapter=CLUSTER_MESSAGE_ADAPTER)
+    return work
+
+
+async def _cluster_message_card_loop(
+    publication: Any, relay: _ClusterMessageRelay, work: Any
+) -> tuple[Any, _Store, _Cards, Any, TestServer]:
+    server = TestServer(relay.app)
+    await server.start_server()
+    cards = _Cards()
+    loop, store, _, _, _, _ = _loop(publication, cards)
+    sink = build_reply_sink(
+        WorkerConfig(
+            api_base_url=f"http://127.0.0.1:{server.port}",
+            internal_worker_token=CLUSTER_MESSAGE_WORKER_TOKEN,
+        )
+    )
+    loop._replies = sink
+    store.card_pending = work
+    return loop, store, cards, sink, server
+
+
+async def test_cluster_message_publication_card_posts_to_the_session_reply_bucket(
+    publication: Any,
+) -> None:
+    """#2720 success: the card reaches the relay bucket and its ref is remembered."""
+    relay = _ClusterMessageRelay()
+    loop, store, cards, sink, server = await _cluster_message_card_loop(
+        publication, relay, _cluster_message_card_work(CLUSTER_MESSAGE_REPLY_REF)
+    )
+    try:
+        assert await loop.deliver_pending_card() is True
+    finally:
+        await sink.aclose()
+        await server.close()
+
+    assert [ref for ref, _ in relay.posts] == [CLUSTER_MESSAGE_REPLY_REF]
+    body = relay.posts[0][1]
+    assert body["event"] == "reply.post"
+    assert body["message"]["interaction"]["id"] == str(APPROVAL_ID)
+    assert cards.ref is not None and cards.ref.ts == CLUSTER_MESSAGE_REPLY_REF
+    assert store.card_delivered == {PUBLICATION_ID}
+    assert store.card_delivery_retries == []
+
+
+async def test_cluster_message_card_without_reply_ref_dead_letters_without_hot_retry(
+    publication: Any,
+) -> None:
+    """#2720 card failure: the relay refusal is permanent and terminal on attempt one."""
+    relay = _ClusterMessageRelay()
+    loop, store, cards, sink, server = await _cluster_message_card_loop(
+        publication, relay, _cluster_message_card_work(None)
+    )
+    try:
+        with pytest.raises(ValueError, match="reply_ref is required"):
+            await loop.deliver_pending_card()
+        assert await loop.deliver_pending_card() is False
+    finally:
+        await sink.aclose()
+        await server.close()
+
+    assert relay.posts == []
+    assert store.card_delivery_permanent == [True]
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert cards.ref is None
+    assert store.card_delivered == set()
+
+
+async def test_publication_card_transport_value_error_is_not_permanent(
+    publication: Any,
+) -> None:
+    """#2720: only an unaddressable target is permanent.
+
+    A transport can surface a ValueError after the request left, such as the
+    UnicodeDecodeError a malformed provider body raises; that stays a bounded
+    retry instead of failing the publication on one bad response.
+    """
+    loop, store, _, _, _, replies = _loop(publication, _Cards())
+    store.card_pending = _card_work()
+
+    async def malformed(*_args: Any, **_kwargs: Any) -> Any:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    replies.emit = malformed  # type: ignore[method-assign]
+
+    with pytest.raises(UnicodeDecodeError):
+        await loop.deliver_pending_card()
+
+    assert store.card_delivery_permanent == [False]
+    assert store.completed == {}
+
+
+async def test_cluster_message_card_relay_outage_is_a_bounded_retry(
+    publication: Any,
+) -> None:
+    """#2720 bounded retry: a transient relay failure counts toward the cap."""
+    relay = _ClusterMessageRelay()
+    relay.status = 503
+    loop, store, _, sink, server = await _cluster_message_card_loop(
+        publication, relay, _cluster_message_card_work(CLUSTER_MESSAGE_REPLY_REF)
+    )
+    store.card_retry_terminal_after = 2
+    try:
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="answered 503"):
+                await loop.deliver_pending_card()
+        assert await loop.deliver_pending_card() is False
+    finally:
+        await sink.aclose()
+        await server.close()
+
+    assert len(relay.posts) == 2
+    assert store.card_delivery_permanent == [False, False]
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
 
 
 async def test_publication_card_crash_after_post_adopts_same_ref_on_retry(
@@ -1672,6 +1833,41 @@ async def test_non_slack_publication_result_uses_the_stored_adapter_route_withou
     assert PR_URL in event.text
     assert store.completed[PUBLICATION_ID] == ("published", PR_URL)
     assert not hasattr(loop, "runner") and not hasattr(loop, "model")
+
+
+@pytest.mark.parametrize(
+    ("remembered", "read_fails", "expected_ref"),
+    [
+        ("1700000000.000077", False, "1700000000.000077"),
+        (None, False, None),
+        ("1700000000.000077", True, None),
+    ],
+)
+async def test_publication_result_edits_the_remembered_pending_notice(
+    publication: Any,
+    remembered: str | None,
+    read_fails: bool,
+    expected_ref: str | None,
+) -> None:
+    # #2721: a ref-less row's pending notice ref lives only in the card store.
+    cards = _Cards()
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    if remembered is not None:
+        cards.notice_refs[str(APPROVAL_ID)] = remembered
+    cards.notice_read_fails = read_fails
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+        "resolved_by": RESOLVER,
+        "resolution_note": None,
+    }
+
+    await loop.deliver_pending_result(PUBLICATION_ID)
+
+    event, _ = replies.events[0]
+    assert PR_URL in event.text
+    assert event.target.reply_ref == expected_ref
 
 
 @pytest.mark.parametrize(

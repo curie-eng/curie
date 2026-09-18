@@ -42,6 +42,7 @@ const GRAFANA_ADMIN_SECRET: &str = "grafana-admin";
 const GRAFANA_RELEASE: &str = "grafana";
 const READER_IDENTITY: &str = "sre-bot-kubernetes";
 const READER_TOKEN_SECRET: &str = "sre-bot-kubernetes-token";
+const PLATFORM_PUBLISH_GATE: &str = "mcp__curie__publish_changes";
 const UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_self";
 const UPGRADE_TOOL: &str = "self-upgrade/upgrade_self";
 // The platform-upgrade verb. Stripped like the others on a read-only install:
@@ -50,6 +51,17 @@ const UPGRADE_TOOL: &str = "self-upgrade/upgrade_self";
 const PLATFORM_UPGRADE_GATE: &str = "mcp__self-upgrade__upgrade_platform";
 const PLATFORM_UPGRADE_TOOL: &str = "self-upgrade/upgrade_platform";
 const LATEST_RELEASE_TOOL: &str = "self-upgrade/latest_release";
+// Platform publication and the six Kubernetes mutation verbs are always
+// present in the shipped bundle. Only the self upgrade gates come and go with
+// upgrade_enabled.
+const KUBERNETES_MUTATION_TOOLS: &[&str] = &[
+    "pods_delete",
+    "pods_exec",
+    "pods_run",
+    "resources_create_or_update",
+    "resources_delete",
+    "resources_scale",
+];
 // The platform-upgrade objects this installer renders. Names are fixed rather
 // than configurable: the connector is told the CronJob's name through its own
 // env, and two places free to disagree is how a tool ends up refusing every call
@@ -226,6 +238,10 @@ pub struct SreBotInstallOpts {
     pub observability_namespace: String,
     /// Repeatable `owner/repo` or `owner/*` entries for `api.githubRepoAllowlist`.
     pub workspace_repo: Vec<String>,
+    /// Slack user IDs bound as the explicit approvers of the `sre-approvals`
+    /// route. Each raw `--approvers` value may be comma separated; empty means
+    /// the channel-member default, which operator principals cannot resolve.
+    pub approvers: Vec<String>,
 }
 
 struct InstallIdentity {
@@ -493,6 +509,7 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
         crate::api::validate_allowlist_entry(entry)
             .map_err(|err| crate::exit::usage(err.to_string()))?;
     }
+    let approvers = parse_approvers(&opts.approvers)?;
 
     let identity = InstallIdentity::from_opts(&opts);
 
@@ -530,6 +547,26 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
             "build the Kubernetes connector kubeconfig in memory from the ServiceAccount token"
                 .to_string(),
         );
+        let resolution = opts
+            .slack_channel
+            .clone()
+            .unwrap_or_else(|| "<the agent's bound Slack channel>".to_string());
+        lines.push(match approvers.is_empty() {
+            false => format!(
+                "bind approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT} (creating the \
+                 agent if absent): resolution {resolution}, approvers users {} (the only users, \
+                 operator principals minted for them included, who may resolve its gates)",
+                approvers.join(",")
+            ),
+            true => format!(
+                "bind approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT} (creating the \
+                 agent if absent): resolution {resolution}, approvers left to the channel member \
+                 default unless already bound"
+            ),
+        });
+        if approvers.is_empty() {
+            lines.push(operator_gap_notice());
+        }
         let mut deploy = format!(
             "curie cluster deploy --plugin-dir embedded:examples/sre-bot --namespace {} --release {}",
             identity.namespace, identity.release
@@ -606,6 +643,8 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
 
     let bundle_dir = workspace.bundle_dir();
     let connection = resolve_embedded_cluster_connection(&identity).await?;
+    // Before the deploy: it refuses a bundle whose declared routes are unbound.
+    bind_sre_approvals_route(&connection, opts.slack_channel.as_deref(), &approvers).await?;
     let deployed =
         deploy_embedded_sre_bot(&bundle_dir, &connection, opts.slack_channel.as_deref()).await?;
     // ALWAYS after the deploy, never before. `install_sre_bot` orders privileged
@@ -1391,6 +1430,189 @@ async fn resolve_embedded_cluster_connection(
     })
 }
 
+/// The approval route every shipped Kubernetes mutation gate names.
+const SRE_APPROVALS_ROUTE: &str = "sre-approvals";
+/// The agent the embedded bundle deploys as (its plugin name).
+const SRE_BOT_AGENT: &str = "sre-bot";
+
+/// Split, trim, and validate the raw `--approvers` values. A blank id is a usage
+/// error raised before any cluster work, never silently skipped: dropping it
+/// would bind a narrower approver set than the operator typed.
+fn parse_approvers(raw: &[String]) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for value in raw {
+        for id in value.split(',') {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(crate::exit::usage(format!(
+                    "--approvers {value:?} contains a blank user ID; pass comma separated Slack \
+                     user IDs such as --approvers U0123ABCD,U0456DEFG"
+                )));
+            }
+            if !ids.iter().any(|seen: &String| seen == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn operator_gap_notice() -> String {
+    format!(
+        "route {SRE_APPROVALS_ROUTE} binds no explicit approver user list: operator principals \
+         cannot resolve the six Kubernetes mutations and platform publication on it until users are bound; approval stays \
+         with the route's Slack channel members or approver group. Re-run with --approvers \
+         <USER_IDS>, or run `curie cluster approvals {SRE_BOT_AGENT} --route-resolution \
+         {SRE_APPROVALS_ROUTE}=<CHANNEL> --route-approvers {SRE_APPROVALS_ROUTE}=users:<ids>` (a \
+         full replacement of the route map; use --routes-from to keep other routes)"
+    )
+}
+
+/// Whether an operator principal is locked out of `binding`: only a non-empty
+/// explicit `users` list is operator-eligible, so a missing route, a
+/// channel-member default, or a group-only binding all leave the gap.
+fn route_lacks_operator_approvers(binding: Option<&crate::api::ApprovalRouteBindingWrite>) -> bool {
+    binding
+        .and_then(|binding| binding.approvers.as_ref())
+        .and_then(|approvers| approvers.users.as_ref())
+        .is_none_or(|users| users.is_empty())
+}
+
+fn route_binding_as_write(
+    binding: &crate::api::ApprovalRouteBindingResponse,
+) -> crate::api::ApprovalRouteBindingWrite {
+    crate::api::ApprovalRouteBindingWrite {
+        resolution: crate::api::ApprovalResolutionTargetWrite {
+            kind: binding.resolution.kind.clone(),
+            address: binding.resolution.address.clone(),
+        },
+        // The response omits the notification's transport (endpoint, adapter),
+        // so it cannot be written back faithfully. Callers refuse any bound
+        // notification first (`refuse_unwritable_notifications`).
+        notification: None,
+        approvers: binding.approvers.clone(),
+    }
+}
+
+/// The full-replacement route map the installer writes: every other bound route
+/// kept as is, `sre-approvals` kept if already bound (only its approvers
+/// replaced, and only when some are given), else bound to `channel`.
+///
+/// Notifications do not survive this map; call
+/// [`refuse_unwritable_notifications`] on `existing` before writing it.
+fn sre_approvals_route_map(
+    existing: Option<&BTreeMap<String, crate::api::ApprovalRouteBindingResponse>>,
+    channel: &str,
+    approvers: &[String],
+) -> BTreeMap<String, crate::api::ApprovalRouteBindingWrite> {
+    let mut map: BTreeMap<String, crate::api::ApprovalRouteBindingWrite> = existing
+        .map(|routes| {
+            routes
+                .iter()
+                .map(|(name, binding)| (name.clone(), route_binding_as_write(binding)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let binding = map
+        .entry(SRE_APPROVALS_ROUTE.to_string())
+        .or_insert_with(|| crate::api::ApprovalRouteBindingWrite {
+            resolution: crate::api::ApprovalResolutionTargetWrite {
+                kind: "slack".to_string(),
+                address: channel.to_string(),
+            },
+            notification: None,
+            approvers: None,
+        });
+    if !approvers.is_empty() {
+        binding.approvers = Some(crate::api::ApprovalApprovers {
+            group: None,
+            users: Some(approvers.to_vec()),
+        });
+    }
+    map
+}
+
+/// Refuse to rewrite a route map that carries a notification target. The API
+/// response redacts its endpoint and adapter, and a route write replaces the
+/// whole map, so writing it back would silently drop or corrupt that ping.
+fn refuse_unwritable_notifications(
+    existing: Option<&BTreeMap<String, crate::api::ApprovalRouteBindingResponse>>,
+) -> Result<()> {
+    let with_notification: Vec<&str> = existing
+        .into_iter()
+        .flatten()
+        .filter(|(_, binding)| binding.notification.is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if with_notification.is_empty() {
+        return Ok(());
+    }
+    Err(crate::exit::CliError::usage(format!(
+        "refusing to bind route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT}: route(s) {} \
+         carry a notification target whose transport the API does not return, and a route \
+         write replaces the whole map, so this installer cannot keep it. Nothing was deployed.",
+        with_notification.join(", ")
+    ))
+    .with_fix(format!(
+        "write the full route map yourself, including {SRE_APPROVALS_ROUTE} and every \
+         notification, with `curie cluster approvals {SRE_BOT_AGENT} --routes-from <file>`, then \
+         re-run this installer"
+    ))
+    .into())
+}
+
+/// Ensure the `sre-bot` agent exists and its `sre-approvals` route is bound,
+/// writing only when the computed map differs from what is bound.
+async fn bind_sre_approvals_route(
+    connection: &EmbeddedClusterConnection,
+    slack_channel: Option<&str>,
+    approvers: &[String],
+) -> Result<()> {
+    let ui = crate::ui::ui();
+    let client = crate::api::ApiClient::new(&connection.api_url, &connection.api_key)?;
+    // The same resolution the deploy performs next: an absent agent is created
+    // on --slack-channel or the platform default channel, so this adds nothing
+    // the deploy would not.
+    let (agent, _, _) = client
+        .resolve_agent(SRE_BOT_AGENT, slack_channel, None)
+        .await?;
+    let existing = agent.approval_routes.as_ref();
+    let channel = match slack_channel {
+        Some(channel) => channel.to_string(),
+        None => agent
+            .channels
+            .iter()
+            .find(|binding| binding.kind == "slack")
+            .map(|binding| binding.address.clone())
+            .ok_or_else(|| {
+                crate::exit::usage(format!(
+                    "agent {SRE_BOT_AGENT} has no Slack channel binding to resolve route \
+                     {SRE_APPROVALS_ROUTE} on; pass --slack-channel <CHANNEL>"
+                ))
+            })?,
+    };
+    let desired = sre_approvals_route_map(existing, &channel, approvers);
+    let current: BTreeMap<String, crate::api::ApprovalRouteBindingWrite> = existing
+        .map(|routes| {
+            routes
+                .iter()
+                .map(|(name, binding)| (name.clone(), route_binding_as_write(binding)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if desired != current {
+        refuse_unwritable_notifications(existing)?;
+        client.set_approval_routes(&agent.id, &desired).await?;
+        ui.note(&format!(
+            "bound approval route {SRE_APPROVALS_ROUTE} on agent {SRE_BOT_AGENT}"
+        ));
+    }
+    if route_lacks_operator_approvers(desired.get(SRE_APPROVALS_ROUTE)) {
+        ui.warn(&operator_gap_notice());
+    }
+    Ok(())
+}
+
 async fn deploy_embedded_sre_bot(
     bundle_dir: &Path,
     connection: &EmbeddedClusterConnection,
@@ -1993,14 +2215,20 @@ fn is_self_upgrade_policy_entry(entry: &serde_json::Value) -> bool {
 fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u8>> {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(source).context("parsing embedded SRE bot plugin.json")?;
-    // Pinned, not merely present. The Kubernetes tool policy remains intact;
-    // approvalPolicy only governs the optional self-upgrade connector.
-    let expected_policy = serde_json::json!({
-        "gates": [
-            {"gate": UPGRADE_GATE, "route": "sre-approvals"},
-            {"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}
-        ]
-    });
+    // Pinned, not merely present. approvalPolicy governs platform publication,
+    // the optional self upgrade connector, and the Kubernetes mutations.
+    let mut expected_gates = vec![
+        serde_json::json!({"gate": PLATFORM_PUBLISH_GATE, "route": "sre-approvals"}),
+        serde_json::json!({"gate": UPGRADE_GATE, "route": "sre-approvals"}),
+        serde_json::json!({"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}),
+    ];
+    for tool in KUBERNETES_MUTATION_TOOLS {
+        expected_gates.push(serde_json::json!({
+            "gate": format!("mcp__kubernetes__{tool}"),
+            "route": "sre-approvals"
+        }));
+    }
+    let expected_policy = serde_json::json!({ "gates": expected_gates });
     if manifest.get("approvalPolicy") != Some(&expected_policy) {
         bail!("embedded SRE bot must declare the exact gated write verbs");
     }
@@ -2029,24 +2257,27 @@ fn runtime_plugin_manifest(source: &[u8], upgrade_enabled: bool) -> Result<Vec<u
     // Keep exactly the gates and tool-policy entries whose connectors survived.
     // Either kind of reference to a stripped connector fails bundle validation;
     // a kept connector without both layers would bypass the intended gate.
-    let mut kept: Vec<serde_json::Value> = Vec::new();
+    // Platform publication and the Kubernetes connector are never stripped.
+    // Their gates stay present regardless of upgrade_enabled so their calls
+    // always carry a route that an operator principal can resolve.
+    let mut kept =
+        vec![serde_json::json!({"gate": PLATFORM_PUBLISH_GATE, "route": "sre-approvals"})];
     if upgrade_enabled {
         kept.push(serde_json::json!({"gate": UPGRADE_GATE, "route": "sre-approvals"}));
         kept.push(serde_json::json!({"gate": PLATFORM_UPGRADE_GATE, "route": "sre-approvals"}));
     }
-    if !kept.is_empty() {
-        // Keep exactly the gate for the connector that stayed. A gate naming a
-        // connector this install removed fails bundle validation for everyone,
-        // and a connector kept without its gate is the ungated write this whole
-        // path exists to avoid -- so the two are decided together, here, from one
-        // condition.
-        manifest.insert(
-            "approvalPolicy".to_string(),
-            serde_json::json!({"gates": kept}),
-        );
-    } else {
-        manifest.remove("approvalPolicy");
+    for tool in KUBERNETES_MUTATION_TOOLS {
+        kept.push(serde_json::json!({
+            "gate": format!("mcp__kubernetes__{tool}"),
+            "route": "sre-approvals"
+        }));
     }
+    // approvalPolicy is never removed because publication and the Kubernetes
+    // gates above are always present.
+    manifest.insert(
+        "approvalPolicy".to_string(),
+        serde_json::json!({"gates": kept}),
+    );
     serde_json::to_vec_pretty(&manifest).context("serializing the SRE bot plugin manifest")
 }
 
@@ -2351,6 +2582,122 @@ fn parse_memory_quantity(quantity: &str) -> Result<u128> {
 mod tests {
     use super::*;
 
+    fn sre_route(
+        channel: &str,
+        users: Option<&[&str]>,
+    ) -> crate::api::ApprovalRouteBindingResponse {
+        serde_json::from_value(match users {
+            Some(users) => serde_json::json!({
+                "resolution": {"kind": "slack", "address": channel},
+                "approvers": {"users": users},
+            }),
+            None => serde_json::json!({
+                "resolution": {"kind": "slack", "address": channel},
+            }),
+        })
+        .unwrap()
+    }
+
+    fn approvers(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn operator_gap_is_flagged_for_a_group_only_or_empty_users_route() {
+        let group_only: crate::api::ApprovalRouteBindingResponse =
+            serde_json::from_value(serde_json::json!({
+                "resolution": {"kind": "slack", "address": "C0SREOPS"},
+                "approvers": {"group": "S0ONCALL"},
+            }))
+            .unwrap();
+        let mut existing = std::collections::BTreeMap::new();
+        existing.insert("sre-approvals".to_string(), group_only);
+        let map = sre_approvals_route_map(Some(&existing), "C0SREOPS", &[]);
+        assert!(route_lacks_operator_approvers(map.get("sre-approvals")));
+
+        let empty_users = sre_route("C0SREOPS", Some(&[]));
+        existing.insert("sre-approvals".to_string(), empty_users);
+        let map = sre_approvals_route_map(Some(&existing), "C0SREOPS", &[]);
+        assert!(route_lacks_operator_approvers(map.get("sre-approvals")));
+
+        assert!(route_lacks_operator_approvers(None));
+        let map = sre_approvals_route_map(None, "C0SREOPS", &approvers(&["U0AAA"]));
+        assert!(!route_lacks_operator_approvers(map.get("sre-approvals")));
+    }
+
+    #[test]
+    fn sre_approvals_route_map_binds_users_when_approvers_given() {
+        let map = sre_approvals_route_map(None, "C0SREOPS", &approvers(&["U0AAA", "U0BBB"]));
+        assert_eq!(
+            serde_json::to_value(&map).unwrap(),
+            serde_json::json!({"sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0SREOPS"},
+                "approvers": {"users": ["U0AAA", "U0BBB"]},
+            }})
+        );
+    }
+
+    #[test]
+    fn sre_approvals_route_map_omits_approvers_for_the_channel_member_default() {
+        let map = sre_approvals_route_map(None, "C0SREOPS", &[]);
+        assert_eq!(
+            serde_json::to_value(&map).unwrap(),
+            serde_json::json!({"sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0SREOPS"},
+            }})
+        );
+    }
+
+    #[test]
+    fn sre_approvals_route_map_preserves_other_bound_routes() {
+        let mut existing = std::collections::BTreeMap::new();
+        existing.insert(
+            "deploys".to_string(),
+            sre_route("C0DEPLOY", Some(&["U0ZZZ"])),
+        );
+        let map = sre_approvals_route_map(Some(&existing), "C0SREOPS", &approvers(&["U0AAA"]));
+        let value = serde_json::to_value(&map).unwrap();
+        assert_eq!(
+            value["deploys"],
+            serde_json::json!({
+                "resolution": {"kind": "slack", "address": "C0DEPLOY"},
+                "approvers": {"users": ["U0ZZZ"]},
+            })
+        );
+        assert_eq!(
+            value["sre-approvals"]["approvers"],
+            serde_json::json!({"users": ["U0AAA"]})
+        );
+        assert_eq!(value.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sre_approvals_route_map_keeps_an_existing_binding_and_replaces_only_approvers() {
+        let mut existing = std::collections::BTreeMap::new();
+        existing.insert(
+            "sre-approvals".to_string(),
+            sre_route("C0KEPT", Some(&["U0OLD"])),
+        );
+
+        let replaced = sre_approvals_route_map(Some(&existing), "C0NEW", &approvers(&["U0NEW"]));
+        assert_eq!(
+            serde_json::to_value(&replaced).unwrap(),
+            serde_json::json!({"sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0KEPT"},
+                "approvers": {"users": ["U0NEW"]},
+            }})
+        );
+
+        let untouched = sre_approvals_route_map(Some(&existing), "C0NEW", &[]);
+        assert_eq!(
+            serde_json::to_value(&untouched).unwrap(),
+            serde_json::json!({"sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0KEPT"},
+                "approvers": {"users": ["U0OLD"]},
+            }})
+        );
+    }
+
     #[test]
     fn memory_quantities_cover_the_kubernetes_shapes_used_by_nodes_and_pods() {
         assert_eq!(parse_memory_quantity("1Gi").unwrap(), 1024 * 1024 * 1024);
@@ -2379,7 +2726,11 @@ mod tests {
         let manifest =
             runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
-        assert!(parsed.get("approvalPolicy").is_none());
+        assert_eq!(routed_gates(&parsed), always_retained_gate_set());
+        assert_eq!(
+            parsed["approvalPolicy"]["gates"].as_array().unwrap().len(),
+            7
+        );
         let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
         assert!(!allow.iter().any(is_self_upgrade_policy_entry));
     }
@@ -2427,7 +2778,17 @@ mod tests {
             .iter()
             .map(|gate| gate["gate"].as_str().unwrap())
             .collect();
-        assert_eq!(gates, vec![UPGRADE_GATE, PLATFORM_UPGRADE_GATE]);
+        assert!(gates.contains(&UPGRADE_GATE));
+        assert!(gates.contains(&PLATFORM_UPGRADE_GATE));
+        assert!(gates.contains(&PLATFORM_PUBLISH_GATE));
+        let mut expected = always_retained_gate_set();
+        expected.insert((UPGRADE_GATE.to_string(), "sre-approvals".to_string()));
+        expected.insert((
+            PLATFORM_UPGRADE_GATE.to_string(),
+            "sre-approvals".to_string(),
+        ));
+        assert_eq!(routed_gates(&parsed), expected);
+        assert_eq!(gates.len(), 9);
         let allow = parsed["toolPolicy"]["allow"].as_array().unwrap();
         assert!(allow
             .iter()
@@ -2694,7 +3055,11 @@ mod tests {
         let manifest =
             runtime_plugin_manifest(bundle_file(".claude-plugin/plugin.json"), false).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
-        assert!(parsed.get("approvalPolicy").is_none());
+        assert_eq!(routed_gates(&parsed), always_retained_gate_set());
+        assert_eq!(
+            parsed["approvalPolicy"]["gates"].as_array().unwrap().len(),
+            7
+        );
         let source: serde_json::Value =
             serde_json::from_slice(bundle_file(".claude-plugin/plugin.json")).unwrap();
         assert_eq!(
@@ -2718,6 +3083,74 @@ mod tests {
             .any(|tool| tool.as_str() == Some("grafana/query_loki_logs")));
     }
 
+    const KUBERNETES_MUTATIONS: [&str; 6] = [
+        "pods_delete",
+        "pods_exec",
+        "pods_run",
+        "resources_create_or_update",
+        "resources_delete",
+        "resources_scale",
+    ];
+
+    fn kubernetes_gate_set() -> std::collections::BTreeSet<(String, String)> {
+        KUBERNETES_MUTATIONS
+            .iter()
+            .map(|tool| {
+                (
+                    format!("mcp__kubernetes__{tool}"),
+                    "sre-approvals".to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn always_retained_gate_set() -> std::collections::BTreeSet<(String, String)> {
+        let mut gates = kubernetes_gate_set();
+        gates.insert((
+            PLATFORM_PUBLISH_GATE.to_string(),
+            "sre-approvals".to_string(),
+        ));
+        gates
+    }
+
+    fn routed_gates(manifest: &serde_json::Value) -> std::collections::BTreeSet<(String, String)> {
+        manifest["approvalPolicy"]["gates"]
+            .as_array()
+            .expect("approvalPolicy.gates must be present")
+            .iter()
+            .map(|gate| {
+                (
+                    gate["gate"].as_str().unwrap().to_string(),
+                    gate["route"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn always_retained_gates_survive_the_transform_with_upgrade_off_and_on() {
+        // #2722: a Kubernetes mutation without a routed gate raises a route-less
+        // approval no operator principal can resolve. Publication uses the same
+        // route, so the installer must keep all seven gates in both modes.
+        let source = bundle_file(".claude-plugin/plugin.json");
+
+        let off = runtime_plugin_manifest(source, false).unwrap();
+        let off: serde_json::Value = serde_json::from_slice(&off).unwrap();
+        assert_eq!(routed_gates(&off), always_retained_gate_set());
+        assert_eq!(off["approvalPolicy"]["gates"].as_array().unwrap().len(), 7);
+
+        let on = runtime_plugin_manifest(source, true).unwrap();
+        let on: serde_json::Value = serde_json::from_slice(&on).unwrap();
+        let mut expected = always_retained_gate_set();
+        expected.insert((UPGRADE_GATE.to_string(), "sre-approvals".to_string()));
+        expected.insert((
+            PLATFORM_UPGRADE_GATE.to_string(),
+            "sre-approvals".to_string(),
+        ));
+        assert_eq!(routed_gates(&on), expected);
+        assert_eq!(on["approvalPolicy"]["gates"].as_array().unwrap().len(), 9);
+    }
+
     #[test]
     fn runtime_connector_transform_refuses_an_unknown_connector() {
         let source = b"connectors:\n  kubernetes: {}\n  grafana: {}\n  tempo:\n    build:\n      context: connectors/tempo\n  self-upgrade: {}\n  mystery: {}\n";
@@ -2728,67 +3161,91 @@ mod tests {
     }
 
     #[test]
-    fn runtime_plugin_transform_requires_the_exact_upgrade_gate_policy() {
-        let exact_upgrade = serde_json::json!({
-            "gate": UPGRADE_GATE,
-            "route": "sre-approvals"
-        });
-        let exact_platform = serde_json::json!({
-            "gate": PLATFORM_UPGRADE_GATE,
-            "route": "sre-approvals"
-        });
+    fn runtime_plugin_transform_requires_the_exact_gate_policy() {
+        let exact: serde_json::Value =
+            serde_json::from_slice(bundle_file(".claude-plugin/plugin.json")).unwrap();
+        let mutate_gate = |name: &str, replacement: Option<serde_json::Value>| {
+            let mut manifest = exact.clone();
+            let gates = manifest["approvalPolicy"]["gates"].as_array_mut().unwrap();
+            let index = gates
+                .iter()
+                .position(|gate| gate["gate"] == name)
+                .unwrap_or_else(|| panic!("fixture must declare {name}"));
+            match replacement {
+                Some(replacement) => gates[index] = replacement,
+                None => {
+                    gates.remove(index);
+                }
+            }
+            manifest
+        };
+        let mut missing_policy = exact.clone();
+        missing_policy
+            .as_object_mut()
+            .unwrap()
+            .remove("approvalPolicy");
+        let mut additional_gate = exact.clone();
+        additional_gate["approvalPolicy"]["gates"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "gate": "mcp__other__write",
+                "route": "sre-approvals"
+            }));
         let cases = [
-            (
-                "missing approval policy",
-                serde_json::json!({"name": "sre-bot", "description": "source"}),
-            ),
+            ("missing approval policy", missing_policy),
             (
                 "renamed gate",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [
-                        {
-                            "gate": "mcp__self-upgrade__upgrade_agent",
-                            "route": "sre-approvals"
-                        },
-                        exact_platform.clone()
-                    ]}
-                }),
+                mutate_gate(
+                    UPGRADE_GATE,
+                    Some(serde_json::json!({
+                        "gate": "mcp__self-upgrade__upgrade_agent",
+                        "route": "sre-approvals"
+                    })),
+                ),
+            ),
+            ("additional gate", additional_gate),
+            (
+                "kubernetes mutation gate missing",
+                mutate_gate("mcp__kubernetes__pods_delete", None),
             ),
             (
-                "additional gate",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [
-                        exact_upgrade.clone(),
-                        exact_platform.clone(),
-                        {"gate": "mcp__other__write", "route": "sre-approvals"}
-                    ]}
-                }),
-            ),
-            (
-                "platform gate dropped",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [exact_upgrade.clone()]}
-                }),
+                "platform upgrade gate dropped",
+                mutate_gate(PLATFORM_UPGRADE_GATE, None),
             ),
             (
                 "different route",
-                serde_json::json!({
-                    "name": "sre-bot",
-                    "description": "source",
-                    "approvalPolicy": {"gates": [
-                        {
-                            "gate": UPGRADE_GATE,
-                            "route": "other-approvals"
-                        },
-                        exact_platform.clone()
-                    ]}
-                }),
+                mutate_gate(
+                    UPGRADE_GATE,
+                    Some(serde_json::json!({
+                        "gate": UPGRADE_GATE,
+                        "route": "other-approvals"
+                    })),
+                ),
+            ),
+            (
+                "publication gate dropped",
+                mutate_gate(PLATFORM_PUBLISH_GATE, None),
+            ),
+            (
+                "publication gate renamed",
+                mutate_gate(
+                    PLATFORM_PUBLISH_GATE,
+                    Some(serde_json::json!({
+                        "gate": "mcp__curie__publish_changes_typo",
+                        "route": "sre-approvals"
+                    })),
+                ),
+            ),
+            (
+                "publication route changed",
+                mutate_gate(
+                    PLATFORM_PUBLISH_GATE,
+                    Some(serde_json::json!({
+                        "gate": PLATFORM_PUBLISH_GATE,
+                        "route": "other-approvals"
+                    })),
+                ),
             ),
         ];
 

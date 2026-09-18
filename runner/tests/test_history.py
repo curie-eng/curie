@@ -451,6 +451,70 @@ def test_state_store_append_then_load_round_trip() -> None:
     anyio.run(go)
 
 
+@pytest.mark.parametrize(
+    ("status", "error_type_name"),
+    (
+        (413, "HistoryCapacityError"),
+        (503, "HistoryAppendError"),
+    ),
+)
+def test_state_store_append_errors_carry_only_the_http_status(
+    status: int,
+    error_type_name: str,
+) -> None:
+    from curie_runner import history as history_module
+
+    error_type = getattr(history_module, error_type_name)
+    sensitive_body = (
+        "https://state.example.com/agents/A/state/transcript/private-key "
+        "private transcript text token-PLACEHOLDER"
+    )
+    app = web.Application()
+
+    async def reject_append(_request: web.Request) -> web.Response:
+        return web.Response(status=status, text=sensitive_body)
+
+    app.router.add_post("/agents/A/state/transcript/t1/append", reject_append)
+
+    async def go() -> None:
+        async with TestServer(app) as server:
+            store = StateApiTranscriptStore(
+                str(server.make_url("/agents/A/state/transcript/t1")), token=None
+            )
+            with pytest.raises(error_type) as caught:
+                await store.append(TurnRecord(user="question", assistant="answer"))
+            assert caught.value.args == (status,)
+            assert caught.value.status == status
+            assert sensitive_body not in str(caught.value)
+
+    anyio.run(go)
+
+
+def test_state_store_load_error_carries_no_response_body() -> None:
+    sensitive_body = (
+        "https://state.example.com/agents/A/state/transcript/private-key "
+        "private transcript text token-PLACEHOLDER"
+    )
+    app = web.Application()
+
+    async def reject_load(_request: web.Request) -> web.Response:
+        return web.Response(status=503, text=sensitive_body)
+
+    app.router.add_get("/agents/A/state/transcript/t1", reject_load)
+
+    async def go() -> None:
+        async with TestServer(app) as server:
+            store = StateApiTranscriptStore(
+                str(server.make_url("/agents/A/state/transcript/t1")), token=None
+            )
+            with pytest.raises(HistoryError) as caught:
+                await store.load()
+            assert caught.value.args == (503,)
+            assert sensitive_body not in str(caught.value)
+
+    anyio.run(go)
+
+
 def test_oversized_first_turn_is_bounded_before_append_and_cold_replays_in_order() -> None:
     """The live-sized first record must fit before the state API sees it (#2271)."""
 

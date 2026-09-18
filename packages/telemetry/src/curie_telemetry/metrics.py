@@ -69,6 +69,12 @@ _HISTORY_CACHE_ATTRIBUTES = {
     "source": ["runner"],
     "cache_hit": ["true", "false"],
 }
+_HISTORY_PERSISTENCE_FAILURE_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "source": ["state-api"],
+    "outcome": ["capacity"],
+    "limit": ["value", "namespace"],
+}
 _QUEUE_ATTRIBUTES = {
     "service.name": ["curie-api", "curie-dispatcher", "curie-worker"],
     "source": ["api", "dispatcher", "worker", "local", "eval"],
@@ -100,7 +106,7 @@ _THREAD_ATTRIBUTES = {
 }
 _SANDBOX_ATTRIBUTES = {
     "service.name": ["curie-worker"],
-    "operation": ["claim", "resume", "release", "suspend", "cleanup"],
+    "operation": ["claim", "resume", "release", "suspend", "cleanup", "reclaim"],
     "outcome": [
         "claimed",
         "reused",
@@ -110,6 +116,15 @@ _SANDBOX_ATTRIBUTES = {
         "failed",
         "orphan-cleaned",
         "observed",
+        "expiry-unsupported",
+        "race-lost",
+        "reclaimed",
+        "reclaimed-retry-refused",
+        "refused-invalid-quota",
+        "refused-no-budget",
+        "refused-no-safe-route",
+        "scan-incomplete",
+        "timeout",
     ],
 }
 _SANDBOX_INVENTORY_ATTRIBUTES = {
@@ -304,6 +319,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Provider cache read input tokens on the first turn after structured replay.",
         False,
         _HISTORY_CACHE_ATTRIBUTES,
+    ),
+    "curie.history.persistence.failure": _definition(
+        "counter",
+        "{failure}",
+        "Transcript persistence failures caused by state capacity limits.",
+        True,
+        _HISTORY_PERSISTENCE_FAILURE_ATTRIBUTES,
     ),
     "curie.queue.enqueue": _definition(
         "counter", "{message}", "Messages enqueued.", True, _QUEUE_ATTRIBUTES

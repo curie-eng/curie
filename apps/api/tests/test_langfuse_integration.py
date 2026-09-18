@@ -5,6 +5,7 @@ read path (proxy -> Langfuse observations API -> reconstructed tree). Skips when
 the dev stack is not reachable so the unit suite stays runnable standalone.
 """
 
+import os
 import time
 from typing import Any
 
@@ -18,14 +19,21 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.trace import SpanKind
 
-COLLECTOR_ENDPOINT = "http://localhost:24318/v1/traces"
+COLLECTOR_ENDPOINT = os.environ.get(
+    "TEST_OTEL_COLLECTOR_ENDPOINT", "http://localhost:24318/v1/traces"
+)
+COLLECTOR_PROBE = COLLECTOR_ENDPOINT.removesuffix("/v1/traces")
+LANGFUSE_HOST = (
+    os.environ.get("TEST_LANGFUSE_HOST")
+    or os.environ.get("LANGFUSE_HOST")
+    or get_settings().langfuse_host
+)
 
 
 def _stack_up() -> bool:
-    host = get_settings().langfuse_host
     try:
-        httpx.get(f"{host}/api/public/health", timeout=2.0).raise_for_status()
-        httpx.get("http://localhost:24318", timeout=2.0)
+        httpx.get(f"{LANGFUSE_HOST}/api/public/health", timeout=2.0).raise_for_status()
+        httpx.get(COLLECTOR_PROBE, timeout=2.0)
     except Exception:
         return False
     return True

@@ -39,6 +39,7 @@ from aci_protocol import (
 from claude_agent_sdk import AssistantMessage, ResultMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .adapter import (
     McpServerReconnector,
@@ -47,12 +48,13 @@ from .adapter import (
     StreamedToolUseBoundary,
     model_message_to_conversation,
 )
-from .approval import PUBLISH_TOOL_NAME, ApprovalGate
+from .approval import ApprovalGate
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import (
     ApprovalContext,
     ConversationMessage,
     HarnessReplayState,
+    HistoryCapacityError,
     NullTranscriptStore,
     TranscriptStore,
     TurnRecord,
@@ -82,6 +84,8 @@ SessionFactory = Callable[[], ModelSession]
 # 60 s control-request timeout and must not be cancelled. On expiry the prior
 # failures stand and the turn runs with them.
 _CONNECTOR_RECOVERY_BUDGET_SECONDS = 20.0
+_HISTORY_PERSISTENCE_BUDGET_SECONDS = 15.0
+_HISTORY_REPLAY_EXPORT_BUDGET_SECONDS = 5.0
 # Re-dials the connectors named by the current failures and returns the ones
 # still failing (#2634). Bound by ``build_runner`` over the materialized servers.
 ConnectorReprobe = Callable[
@@ -313,6 +317,7 @@ class SessionRunner:
         # finish-race window (final produced, lock not yet freed) is rejected
         # instead of writing into an already-terminal stream.
         self._turn_open = False
+        self._persistence_owned = False
         # Safe-boundary fence for replacing a runner. A fresh runner has no
         # completed turn to lose. Once a turn begins, only a successful durable
         # transcript append re-authorizes replacement, unless an earlier turn
@@ -371,12 +376,11 @@ class SessionRunner:
     async def _record_turn(self, event: Event, state: TurnState) -> None:
         """Append one completed turn to the durable conversation transcript (#20).
 
-        A successful DONE terminal final or an AWAITING_APPROVAL suspension sets
-        ``state.final_text``. Failed, budget-halted, auth-halted, and idle turns
-        leave it None and are not persisted, so the transcript holds delivered
-        exchanges and resumable approval context, not error stubs. Best-effort:
-        a transient store failure is logged and never propagated -- recording
-        history must not fail a turn the user already received an answer to.
+        A DONE terminal candidate or an AWAITING_APPROVAL suspension sets
+        ``state.final_text`` before this runs. Failed, budget, authentication,
+        and idle turns leave it None and are not persisted. A capacity refusal
+        propagates to the prepublication terminal decision. Other failures keep
+        the candidate terminal under the best effort history policy.
         """
 
         if state.final_text is None:
@@ -390,19 +394,19 @@ class SessionRunner:
             and state.approval_gate_kind == "permission"
         ):
             messages = close_suspended_tool_calls(messages)
-        harness_replay: HarnessReplayState | None = None
-        exporter = getattr(self._session, "export_replay_state", None)
-        if callable(exporter):
-            try:
-                harness_replay = await exporter()
-            except Exception as exc:  # noqa: BLE001 - portable replay remains valid
-                logger.warning(
-                    "harness replay export failed session=%s error_class=%s: %s",
-                    self._session_id,
-                    type(exc).__name__,
-                    exc,
-                )
         try:
+            harness_replay: HarnessReplayState | None = None
+            exporter = getattr(self._session, "export_replay_state", None)
+            if callable(exporter):
+                try:
+                    with anyio.fail_after(_HISTORY_REPLAY_EXPORT_BUDGET_SECONDS):
+                        harness_replay = await exporter()
+                except Exception as exc:  # noqa: BLE001 - portable replay remains valid
+                    logger.warning(
+                        "harness replay export failed session=%s error_class=%s",
+                        self._session_id,
+                        type(exc).__name__,
+                    )
             record = bound_turn_record(
                 TurnRecord(
                     user=event.text,
@@ -433,16 +437,83 @@ class SessionRunner:
                 )
             )
             await self._history.append(record)
-            self._history_durable = not self._history_loss_observed
-        except Exception as exc:  # noqa: BLE001 - best-effort; never fail a completed turn
+        except HistoryCapacityError as exc:
             self._history_loss_observed = True
             self._history_durable = False
             logger.warning(
-                "history append failed session=%s error_class=%s: %s",
+                "history append failed session=%s error_class=%s status=%d",
                 self._session_id,
                 type(exc).__name__,
-                exc,
+                exc.status,
             )
+            raise
+        except BaseException as exc:
+            self._history_loss_observed = True
+            self._history_durable = False
+            if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(
+                exc, Exception
+            ):
+                raise
+            status = getattr(exc, "status", None)
+            if isinstance(status, int):
+                logger.warning(
+                    "history append failed session=%s error_class=%s status=%d",
+                    self._session_id,
+                    type(exc).__name__,
+                    status,
+                )
+            else:
+                logger.warning(
+                    "history append failed session=%s error_class=%s",
+                    self._session_id,
+                    type(exc).__name__,
+                )
+        else:
+            self._history_durable = not self._history_loss_observed
+
+    async def _persist_terminal(
+        self,
+        event: Event,
+        state: TurnState,
+        final: Final,
+        *,
+        final_text: str,
+    ) -> tuple[Final, bool]:
+        """Own a persistable terminal and decide its final before publication."""
+
+        self._status = final.status
+        self._persistence_owned = True
+        self._turn_open = False
+        self._turn_ready = False
+        state.final_text = final_text
+        capacity_failure = False
+        try:
+            try:
+                with anyio.fail_after(_HISTORY_PERSISTENCE_BUDGET_SECONDS):
+                    await self._record_turn(event, state)
+            except HistoryCapacityError:
+                state.final_text = None
+                state.approval_summary = None
+                state.approval_route = None
+                state.approval_gate_kind = None
+                state.approval_granted_tool = None
+                state.approval_display = None
+                state.approval_halt_requested = False
+                self._status = SessionStatus.CLASSIFIED_FAILURE
+                final = Final(
+                    text="run failed: conversation history could not be persisted",
+                    status=SessionStatus.CLASSIFIED_FAILURE,
+                )
+                capacity_failure = True
+            except TimeoutError:
+                logger.warning(
+                    "history persistence timed out session=%s budget_seconds=%s",
+                    self._session_id,
+                    _HISTORY_PERSISTENCE_BUDGET_SECONDS,
+                )
+        finally:
+            self._persistence_owned = False
+        return final, capacity_failure
 
     async def consolidate_memory(self) -> ConsolidationResult:
         """Compact accumulated memory, merging duplicates and unioning provenance.
@@ -508,6 +579,7 @@ class SessionRunner:
             self._timeout_interrupt_delivered = False
             self._turn_epoch = None
             self._turn_open = False
+            self._persistence_owned = False
             self._active_state = None
             self._turn_ready = False
             self._status = SessionStatus.IDLE_AWAITING_INPUT
@@ -532,6 +604,8 @@ class SessionRunner:
     async def interrupt(self, _reason: str = "") -> None:
         """Request a hard stop; the live turn's final is reclassified to idle."""
 
+        if self._persistence_owned:
+            return
         self._interrupt_requested = True
         if self._turn_open and not self._turn_ready:
             # Accepted turn still in connector recovery: no query has been
@@ -622,6 +696,7 @@ class SessionRunner:
             self._timeout_interrupt_settled = None
             self._timeout_interrupt_delivered = False
             self._turn_epoch = turn_epoch
+            self._persistence_owned = False
             self._turn_open = True
             self._history_durable = False
             # Not ready until turn-start connector recovery completes (#2634):
@@ -726,9 +801,6 @@ class SessionRunner:
                             self._status.value,
                             int((time.monotonic() - start) * 1000),
                         )
-                        # Persist the completed turn to the durable transcript so a
-                        # restarted sandbox can rehydrate this thread (#20).
-                        await self._record_turn(event, state)
                         metric_outcome = self._metric_outcome(tracker)
                     except Exception as exc:  # noqa: BLE001 - the ACI stream must
                         # always terminate in a final; a raised SDK/transport error
@@ -858,6 +930,7 @@ class SessionRunner:
                 try:
                     emit_completed_metrics()
                 finally:
+                    self._persistence_owned = False
                     self._turn_open = False
                     self._turn_ready = False
                     self._turn_epoch = None
@@ -1038,9 +1111,21 @@ class SessionRunner:
                     # suspended at its yield. Re-apply its precedence immediately
                     # before publishing the terminal final.
                     final = self._reclassify(final)
-                    self._status = final.status
-                    self._turn_open = False
-                    self._turn_ready = False
+                    capacity_failure = False
+                    if final.status in {
+                        SessionStatus.DONE,
+                        SessionStatus.AWAITING_APPROVAL,
+                    }:
+                        final, capacity_failure = await self._persist_terminal(
+                            event,
+                            state,
+                            final,
+                            final_text=final.text,
+                        )
+                    else:
+                        self._status = final.status
+                        self._turn_open = False
+                        self._turn_ready = False
                     gen.finish_turn(
                         timeout_requested=self._timeout_requested,
                         interrupt_requested=self._interrupt_requested,
@@ -1051,14 +1136,16 @@ class SessionRunner:
                         completed_without_result=final.status
                         is SessionStatus.AWAITING_APPROVAL,
                     )
-                    # Persist clean replies and resumable approval suspensions;
-                    # classified failures remain delivery outcomes, not history.
-                    if final.status in {
-                        SessionStatus.DONE,
-                        SessionStatus.AWAITING_APPROVAL,
-                    }:
-                        state.final_text = final.text
-                    yield to_ndjson_line(self._with_connector_notice(final))
+                    if capacity_failure:
+                        yield to_ndjson_line(
+                            ErrorEvent(
+                                message="conversation history capacity exceeded",
+                                classification="history-persistence-error",
+                            )
+                        )
+                        yield to_ndjson_line(final)
+                    else:
+                        yield to_ndjson_line(self._with_connector_notice(final))
                     return
                 yield to_ndjson_line(outbound)
 
@@ -1095,9 +1182,18 @@ class SessionRunner:
         for line in self._false_completion_lines(state, final):
             yield line
         final = self._reclassify(final)
-        self._status = final.status
-        self._turn_open = False
-        self._turn_ready = False
+        capacity_failure = False
+        if final.status is SessionStatus.AWAITING_APPROVAL:
+            final, capacity_failure = await self._persist_terminal(
+                event,
+                state,
+                final,
+                final_text=final.text or state.assistant_text,
+            )
+        else:
+            self._status = final.status
+            self._turn_open = False
+            self._turn_ready = False
         gen.finish_turn(
             timeout_requested=self._timeout_requested,
             interrupt_requested=self._interrupt_requested,
@@ -1105,12 +1201,16 @@ class SessionRunner:
             approval_paused=final.status is SessionStatus.AWAITING_APPROVAL,
             completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
         )
-        # A missing provider ResultMessage is still incomplete for a nominal
-        # DONE turn. The one resumable exception is a runner-owned approval
-        # halt: its structured tool call and gate context must cross runners.
-        if final.status is SessionStatus.AWAITING_APPROVAL:
-            state.final_text = final.text or state.assistant_text
-        yield to_ndjson_line(self._with_connector_notice(final))
+        if capacity_failure:
+            yield to_ndjson_line(
+                ErrorEvent(
+                    message="conversation history capacity exceeded",
+                    classification="history-persistence-error",
+                )
+            )
+            yield to_ndjson_line(final)
+        else:
+            yield to_ndjson_line(self._with_connector_notice(final))
 
     def _observe_publication_calls(self, state: TurnState) -> None:
         """Record every publication call the runner sees on the stream (#2294).
@@ -1150,7 +1250,7 @@ class SessionRunner:
         while state.publication_calls_observed < len(state.publication_calls):
             payload = state.publication_calls[state.publication_calls_observed]
             state.publication_calls_observed += 1
-            if gate is None or PUBLISH_TOOL_NAME not in gate.required:
+            if gate is None or PLATFORM_PUBLISH_TOOL_NAME not in gate.required:
                 # The model named the publication tool where the platform has no
                 # gated checkout to publish from. Recording it anyway would ask a
                 # human to authorize an action that cannot exist, so fail closed.
@@ -1220,7 +1320,7 @@ class SessionRunner:
             not state.publication_calls
             or gate is None
             or gate.pending_summary is None
-            or gate.pending_granted_tool != PUBLISH_TOOL_NAME
+            or gate.pending_granted_tool != PLATFORM_PUBLISH_TOOL_NAME
             or gate.pending_halt
             or self._interrupt_requested
             or self._timeout_requested
@@ -1254,7 +1354,7 @@ class SessionRunner:
         if (
             not state.publication_calls
             or final.status is not SessionStatus.AWAITING_APPROVAL
-            or final.approval_granted_tool == PUBLISH_TOOL_NAME
+            or final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
         ):
             return
         if state.publication_unrecorded is not None:
@@ -1466,7 +1566,7 @@ class SessionRunner:
 
         permission_is_actionable_tool = (
             gate.pending_summary is not None
-            and gate.pending_granted_tool != PUBLISH_TOOL_NAME
+            and gate.pending_granted_tool != PLATFORM_PUBLISH_TOOL_NAME
         )
         if permission_is_actionable_tool:
             # A gated tool call is the card. Copy it even when translate.py

@@ -38,8 +38,9 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
-from .approval import APPROVAL_TOOL_NAME, PUBLISH_TOOL_NAME, guard_reserved_summary
+from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
 from .history import ConversationMessage
 from .otel import _GenerationSpan
 from .side_effects import SideEffectClassifier
@@ -67,6 +68,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
+    "history-persistence-error",
 })
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 
@@ -226,7 +228,7 @@ def _translate_assistant(
                 # The SDK block says only that a tool interval should be
                 # inferred. It is not proof this runner executed the tool.
                 gen.tool_use(block.id, block.name)
-            if block.name == PUBLISH_TOOL_NAME:
+            if block.name == PLATFORM_PUBLISH_TOOL_NAME:
                 # Wire-level capture only (#2294). The session decides what to
                 # do with it; recording it here would put gate state in a
                 # deliberately pure module.

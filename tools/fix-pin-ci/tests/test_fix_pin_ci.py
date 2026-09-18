@@ -24,15 +24,27 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CHECKER = REPO_ROOT / "tools" / "fix-pin-ci" / "check.py"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+REQUIRED_WORKFLOWS = (
+    CI_WORKFLOW,
+    REPO_ROOT / ".github" / "workflows" / "codeql.yaml",
+    REPO_ROOT / ".github" / "workflows" / "dependency-audit.yaml",
+    REPO_ROOT / ".github" / "workflows" / "gitleaks.yaml",
+    REPO_ROOT / ".github" / "workflows" / "pr-body.yaml",
+)
 PR_TEMPLATE = REPO_ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md"
 BUG_REPORT = REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 VERIFY_FIX_PIN = REPO_ROOT / "cli" / "scripts" / "verify-fix-pin.sh"
 
 VALID_SELECTOR = "apps/api/tests/test_fix_pin_ci_gate.py::test_exact_declaration"
+LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
+LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
 CHART_SELECTOR = "charts/curie/ci/render-assertions.sh"
 PR_CONDITION = re.compile(r"github\.event_name\s*==\s*['\"]pull_request['\"]")
+REPOSITORY = "curie-eng/curie"
+STACK_BRANCH = "task/local-deployment-fix-pin"
+BASE_SHA = "a" * 40
 
 
 def _write_event(
@@ -42,13 +54,30 @@ def _write_event(
     action: str = "opened",
     include_body: bool = True,
     base_ref: str = "next",
+    base_sha: object = BASE_SHA,
+    include_base_sha: bool = True,
+    repository: object = REPOSITORY,
+    base_repository: object = REPOSITORY,
 ) -> Path:
-    pull_request: dict[str, object] = {"base": {"ref": base_ref}}
+    base: dict[str, object] = {
+        "ref": base_ref,
+        "repo": {"full_name": base_repository},
+    }
+    if include_base_sha:
+        base["sha"] = base_sha
+    pull_request: dict[str, object] = {"base": base}
     if include_body:
         pull_request["body"] = body
     event_path = tmp_path / "event.json"
     event_path.write_text(
-        json.dumps({"action": action, "pull_request": pull_request}), encoding="utf-8"
+        json.dumps(
+            {
+                "action": action,
+                "repository": {"full_name": repository},
+                "pull_request": pull_request,
+            }
+        ),
+        encoding="utf-8",
     )
     return event_path
 
@@ -121,16 +150,33 @@ def _gh_issue_payload(
 
 def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
     """Install a fake ``gh`` in its own directory so PATH shadows nothing else."""
-    return _write_fake_binary(
-        tmp_path,
-        "gh",
-        call_log_environment="FIX_PIN_GH_CALL_LOG",
-        output_environment="FIX_PIN_GH_LABELS",
-        exit_environment="FIX_PIN_GH_EXIT",
-        subdirectory="gh-bin",
-        default_output="[]",
-        print_end="\n",
+    directory = tmp_path / "gh-bin"
+    directory.mkdir(exist_ok=True)
+    call_log = tmp_path / "gh-argv.json"
+    fake_binary = directory / "gh"
+    fake_binary.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json",
+                "import os",
+                "from pathlib import Path",
+                "import sys",
+                "arguments = sys.argv[1:]",
+                "with Path(os.environ['FIX_PIN_GH_CALL_LOG']).open('a') as stream:",
+                "    stream.write(json.dumps(arguments) + '\\n')",
+                "if any(argument.endswith('/pulls') for argument in arguments):",
+                "    print(os.environ.get('FIX_PIN_GH_PULLS', '[]'))",
+                "    raise SystemExit(int(os.environ.get('FIX_PIN_GH_PULLS_EXIT', '0')))",
+                "print(os.environ.get('FIX_PIN_GH_LABELS', '[]'))",
+                "raise SystemExit(int(os.environ.get('FIX_PIN_GH_EXIT', '0')))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
     )
+    fake_binary.chmod(0o755)
+    return directory, call_log
 
 
 def _run_checker(
@@ -146,11 +192,25 @@ def _run_checker(
     gh_body: str = "",
     gh_milestone: str | None = "v0.9.0",
     gh_exit: int = 0,
+    gh_pulls: str = "[]",
+    gh_pulls_exit: int = 0,
     gh_on_path: bool = True,
     base_ref: str = "next",
+    base_sha: object = BASE_SHA,
+    include_base_sha: bool = True,
+    repository: object = REPOSITORY,
+    base_repository: object = REPOSITORY,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     event_path = _write_event(
-        tmp_path, body, action=action, include_body=include_body, base_ref=base_ref
+        tmp_path,
+        body,
+        action=action,
+        include_body=include_body,
+        base_ref=base_ref,
+        base_sha=base_sha,
+        include_base_sha=include_base_sha,
+        repository=repository,
+        base_repository=base_repository,
     )
     curie, call_log = _write_fake_curie(tmp_path)
     binaries, gh_call_log = _write_fake_gh(tmp_path)
@@ -162,7 +222,9 @@ def _run_checker(
         "FIX_PIN_GH_CALL_LOG": str(gh_call_log),
         "FIX_PIN_GH_LABELS": _gh_issue_payload(gh_labels, gh_body, gh_milestone),
         "FIX_PIN_GH_EXIT": str(gh_exit),
-        "GITHUB_REPOSITORY": "curie-eng/curie",
+        "FIX_PIN_GH_PULLS": gh_pulls,
+        "FIX_PIN_GH_PULLS_EXIT": str(gh_pulls_exit),
+        "GITHUB_REPOSITORY": REPOSITORY,
         # An empty PATH is how "gh is not installed" is expressed; the checker
         # reaches curie by absolute path, so nothing else needs PATH here.
         "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}" if gh_on_path else "",
@@ -190,6 +252,62 @@ def _run_checker(
 
 def _gh_call_log(tmp_path: Path) -> Path:
     return tmp_path / "gh-argv.json"
+
+
+def _gh_calls(tmp_path: Path) -> list[list[str]]:
+    if not _gh_call_log(tmp_path).exists():
+        return []
+    return [
+        json.loads(line)
+        for line in _gh_call_log(tmp_path).read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def _pull_lookup_calls(tmp_path: Path) -> list[list[str]]:
+    return [
+        call
+        for call in _gh_calls(tmp_path)
+        if any(argument.endswith("/pulls") for argument in call)
+    ]
+
+
+def _prerequisite(
+    *,
+    state: object = "open",
+    head_ref: object = STACK_BRANCH,
+    head_sha: object = BASE_SHA,
+    head_repository: object = REPOSITORY,
+    base_ref: object = "main",
+    base_repository: object = REPOSITORY,
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "head": {
+            "ref": head_ref,
+            "sha": head_sha,
+            "repo": {"full_name": head_repository},
+        },
+        "base": {
+            "ref": base_ref,
+            "repo": {"full_name": base_repository},
+        },
+    }
+
+
+def _assert_exact_pull_lookup(tmp_path: Path) -> None:
+    # GitHub documents read permission plus the head and state filters here:
+    # https://docs.github.com/en/rest/pulls/pulls#list-pull-requests
+    calls = _pull_lookup_calls(tmp_path)
+    assert len(calls) == 1, f"expected one direct prerequisite lookup, got {calls!r}"
+    call = calls[0]
+    assert call[:2] == ["api", f"repos/{REPOSITORY}/pulls"]
+    method_index = call.index("--method")
+    assert call[method_index + 1] == "GET"
+    fields: list[str] = []
+    for index, argument in enumerate(call[:-1]):
+        if argument in {"-f", "--raw-field"}:
+            fields.append(call[index + 1])
+    assert fields == [f"head=curie-eng:{STACK_BRANCH}", "state=open"]
 
 
 def _github_output(tmp_path: Path) -> Path:
@@ -302,6 +420,21 @@ def test_supported_nested_python_selectors_call_the_verifier(
     ]
 
 
+@pytest.mark.parametrize("selector", [LOCAL_SELECTOR, LOCAL_LIVE_SELECTOR])
+def test_local_python_selector_calls_the_verifier_at_the_ci_boundary(
+    tmp_path: Path, selector: str
+) -> None:
+    completed, call_log = _run_checker(tmp_path, f"Fix pin: {selector}\n")
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(call_log.read_text(encoding="utf-8")) == [
+        "dev",
+        "verify-fix-pin",
+        "HEAD",
+        selector,
+    ]
+
+
 def test_ordinary_fix_pin_prose_skips_without_calling_the_verifier(tmp_path: Path) -> None:
     completed, call_log = _run_checker(
         tmp_path, "This closes the fix pin-related enforcement gap"
@@ -353,6 +486,11 @@ def test_invalid_or_duplicate_declarations_fail_closed_without_calling_curie(
         "cli/tests/verify_fix_pin.rs::--no-run",
         "tools/fix-pin-ci/tests/test_fix_pin_ci.py::test_not_supported",
         "apps/api/tests/test_fix_pin_ci_gate.py",
+        "cli/tests/test_pin.py::test_pin",
+        "cli/tests/local/nested/test_pin.py::test_pin",
+        "cli/tests/local/../test_pin.py::test_pin",
+        "cli/tests/local/pin.py::test_pin",
+        "cli/tests/local/test_pin.py::helper",
     ],
 )
 def test_unsupported_selectors_fail_closed_without_calling_curie(
@@ -547,16 +685,35 @@ def test_committed_pull_request_template_skips_without_calling_curie(tmp_path: P
     assert not call_log.exists(), "the template instruction must not activate the verifier"
 
 
-def _load_ci() -> dict[str, Any]:
-    document = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
-    assert isinstance(document, dict), "ci.yaml must be a YAML mapping"
+def _load_workflow(path: Path) -> dict[str, Any]:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(document, dict), f"{path.name} must be a YAML mapping"
     return document
+
+
+def _load_ci() -> dict[str, Any]:
+    return _load_workflow(CI_WORKFLOW)
 
 
 def _workflow_trigger(document: dict[str, Any]) -> dict[str, Any]:
     trigger = document.get("on", document.get(True))
     assert isinstance(trigger, dict), "ci.yaml must declare an on mapping"
     return trigger
+
+
+def test_required_workflows_reach_one_task_branch_without_widening_pushes() -> None:
+    for path in REQUIRED_WORKFLOWS:
+        trigger = _workflow_trigger(_load_workflow(path))
+        pull_request = trigger.get("pull_request")
+        assert isinstance(pull_request, dict), f"{path.name} must run for pull requests"
+        assert pull_request.get("branches") == ["main", "next", "task/**"], path.name
+
+        push = trigger.get("push")
+        if path.name == "pr-body.yaml":
+            assert push is None, "the PR body guard must remain pull request only"
+        else:
+            assert isinstance(push, dict), f"{path.name} must retain its push trigger"
+            assert push.get("branches") == ["main", "next"], path.name
 
 
 def _python_job(document: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -665,11 +822,15 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     )
     pytest_command = shlex.split(_string(steps[pytest_index], "run").strip())
     assert pytest_command[:4] == ["uv", "run", "pytest", "-q"]
-    assert all(
-        argument.startswith("--durations") for argument in pytest_command[4:]
-    ), (
-        "the Python suite must run unfiltered: only reporting flags may be added "
-        f"to `uv run pytest -q`, got {pytest_command!r}"
+    # xdist distribution flags change where tests run, not which tests run, so
+    # they are allowed alongside reporting flags. Anything else could filter.
+    extra = pytest_command[4:]
+    distribution = ["-n", "4", "--dist", "loadgroup"]
+    if extra[: len(distribution)] == distribution:
+        extra = extra[len(distribution) :]
+    assert all(argument.startswith("--durations") for argument in extra), (
+        "the Python suite must run unfiltered: only reporting and xdist "
+        f"distribution flags may be added to `uv run pytest -q`, got {pytest_command!r}"
     )
     assert stack_index < migration_index < pytest_index
 
@@ -707,10 +868,11 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
 
     permissions = job.get("permissions")
     assert isinstance(permissions, dict), "the fix pin job must declare job level permissions"
-    assert permissions.get("contents") == "read"
-    assert permissions.get("issues") == "read", (
-        "the gate reads the labels of the closed issues a pull request names"
-    )
+    assert permissions == {
+        "contents": "read",
+        "issues": "read",
+        "pull-requests": "read",
+    }
 
     checkout = steps[
         _single_step_index(
@@ -960,6 +1122,7 @@ def test_pull_request_template_documents_the_required_declaration() -> None:
         "apps/*/tests/*.py::test",
         "packages/*/tests/*.py::test",
         "runner/tests/*.py::test",
+        "cli/tests/local/test_*.py::test",
         "cli/tests/name.rs::test",
         "charts/curie/ci/name.sh",
     ):
@@ -1000,12 +1163,15 @@ def test_closing_a_bug_issue_without_a_declaration_fails_and_names_the_issue(
     assert "Fix pin" in completed.stderr, shown
     assert "SKIPPED: no Fix pin declaration" not in completed.stdout, shown
     assert not call_log.exists(), "a missing declaration must not reach curie"
-    assert json.loads(_gh_call_log(tmp_path).read_text(encoding="utf-8")) == [
+    expected = [
         "api",
         "repos/curie-eng/curie/issues/12",
         "--jq",
         "{labels:[.labels[].name],body:.body,milestone:.milestone.title}",
     ]
+    calls = _gh_calls(tmp_path)
+    assert calls
+    assert all(call == expected for call in calls)
 
 
 def test_closing_a_bug_issue_with_an_explicit_not_applicable_reason_passes(
@@ -1243,6 +1409,49 @@ def test_unit_pin_for_a_found_local_issue_fails_without_a_waiver(tmp_path: Path)
     assert not call_log.exists(), "a unit pin must not pass for a local-found issue"
 
 
+@pytest.mark.parametrize("gh_labels", [FOUND_UNIT_LABELS, FOUND_LOCAL_LABELS])
+def test_local_pin_satisfies_unit_and_local_discovery_surfaces(
+    tmp_path: Path, gh_labels: str
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
+        gh_labels=gh_labels,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert call_log.exists(), "an at surface local pin must be verified"
+
+
+@pytest.mark.parametrize("gh_labels", [FOUND_CLUSTER_LABELS, FOUND_LIVE_LABELS])
+def test_local_pin_refuses_cluster_and_live_discovery_surfaces_without_a_waiver(
+    tmp_path: Path, gh_labels: str
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
+        gh_labels=gh_labels,
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "local" in completed.stderr, shown
+    assert not call_log.exists(), "a below surface local pin must not reach curie"
+
+
+def test_local_test_live_filename_is_still_a_local_pin(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_LIVE_SELECTOR}\n",
+        gh_labels=FOUND_CLUSTER_LABELS,
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert "is a local pin" in completed.stderr, shown
+    assert not call_log.exists(), "a local path named test_live remains below cluster"
+
+
 def test_helm_render_pin_for_a_found_cluster_issue_passes_without_a_waiver(
     tmp_path: Path,
 ) -> None:
@@ -1399,6 +1608,7 @@ def test_matching_milestone_train_passes(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.startswith("SKIPPED: Fix pin declared not applicable")
     assert _gh_call_log(tmp_path).exists(), "a closed issue must be looked up even when excused"
+    assert not _pull_lookup_calls(tmp_path), "a direct next pull request needs no stack lookup"
     assert not call_log.exists(), "an excused declaration must not run curie"
 
 
@@ -1414,7 +1624,201 @@ def test_matching_patch_milestone_on_main_passes(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.startswith("SKIPPED: Fix pin declared not applicable")
     assert _gh_call_log(tmp_path).exists(), "a closed issue must be looked up even when excused"
+    assert not _pull_lookup_calls(tmp_path), "a direct main pull request needs no stack lookup"
     assert not call_log.exists(), "an excused declaration must not run curie"
+
+
+def test_one_exact_same_repository_prerequisite_resolves_the_effective_train(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref=STACK_BRANCH,
+        gh_pulls=json.dumps([_prerequisite()]),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(call_log.read_text(encoding="utf-8")) == [
+        "dev",
+        "verify-fix-pin",
+        "HEAD",
+        LOCAL_SELECTOR,
+    ]
+    _assert_exact_pull_lookup(tmp_path)
+
+
+def _invalid_prerequisite_payload(case: str) -> str:
+    prerequisite = _prerequisite()
+    if case == "none":
+        return "[]"
+    if case == "ambiguous":
+        return json.dumps([prerequisite, _prerequisite()])
+    if case == "closed":
+        prerequisite["state"] = "closed"
+    elif case == "head fork":
+        prerequisite["head"]["repo"]["full_name"] = "acme-corp/acme-bot"
+    elif case == "base fork":
+        prerequisite["base"]["repo"]["full_name"] = "acme-corp/acme-bot"
+    elif case == "head ref":
+        prerequisite["head"]["ref"] = "task/other"
+    elif case == "stale sha":
+        prerequisite["head"]["sha"] = "b" * 40
+    elif case == "missing sha":
+        del prerequisite["head"]["sha"]
+    elif case == "malformed sha":
+        prerequisite["head"]["sha"] = "not a commit sha"
+    elif case == "deeper chain":
+        prerequisite["base"]["ref"] = "task/earlier"
+    elif case == "malformed result":
+        return json.dumps([{"state": "open"}])
+    elif case == "not an array":
+        return json.dumps({"state": "open"})
+    elif case == "invalid json":
+        return "{"
+    else:
+        raise AssertionError(f"unknown prerequisite case: {case}")
+    return json.dumps([prerequisite])
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "none",
+        "ambiguous",
+        "closed",
+        "head fork",
+        "base fork",
+        "head ref",
+        "stale sha",
+        "missing sha",
+        "malformed sha",
+        "deeper chain",
+        "malformed result",
+        "not an array",
+        "invalid json",
+    ],
+)
+def test_invalid_direct_prerequisite_refuses_before_curie(
+    tmp_path: Path, case: str
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref=STACK_BRANCH,
+        gh_pulls=_invalid_prerequisite_payload(case),
+    )
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert not call_log.exists(), f"{case} must refuse before curie"
+    _assert_exact_pull_lookup(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("base_sha", "include_base_sha"),
+    [(None, True), ("not a commit sha", True), (BASE_SHA, False)],
+)
+def test_missing_or_malformed_event_base_sha_refuses_before_lookup_and_curie(
+    tmp_path: Path, base_sha: object, include_base_sha: bool
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref=STACK_BRANCH,
+        base_sha=base_sha,
+        include_base_sha=include_base_sha,
+        gh_pulls=json.dumps([_prerequisite()]),
+    )
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert not call_log.exists(), "an invalid event base sha must refuse before curie"
+    assert not _pull_lookup_calls(tmp_path), "an invalid event base sha must refuse before API"
+
+
+def test_dependent_base_repository_must_match_the_event_repository(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref=STACK_BRANCH,
+        base_repository="other/curie",
+        gh_pulls=json.dumps([_prerequisite()]),
+    )
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert not call_log.exists(), "a cross repository dependent must refuse before curie"
+    assert not _pull_lookup_calls(tmp_path), "a cross repository dependent must refuse before API"
+
+
+def test_non_task_base_ref_is_not_treated_as_a_prerequisite_branch(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref="feature/not-a-task-branch",
+        gh_pulls=json.dumps([_prerequisite(head_ref="feature/not-a-task-branch")]),
+    )
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert not call_log.exists(), "an unsupported base branch must refuse before curie"
+    assert not _pull_lookup_calls(tmp_path), "only task branches may resolve a prerequisite"
+
+
+def test_prerequisite_api_failure_refuses_before_curie(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref=STACK_BRANCH,
+        gh_pulls_exit=1,
+    )
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert not call_log.exists(), "an unreadable prerequisite API must refuse before curie"
+    _assert_exact_pull_lookup(tmp_path)
+
+
+def test_stacked_pull_request_without_gh_refuses_before_curie(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone=PATCH_MILESTONE,
+        base_ref=STACK_BRANCH,
+        gh_on_path=False,
+    )
+
+    assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
+    assert not call_log.exists(), "missing gh must refuse before curie"
+
+
+def test_prerequisite_train_still_must_match_the_closed_issue_milestone(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",
+        gh_labels=BUG_LABELS,
+        gh_milestone=FEATURE_MILESTONE,
+        base_ref=STACK_BRANCH,
+        gh_pulls=json.dumps([_prerequisite(base_ref="main")]),
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode != 0, shown
+    assert FEATURE_MILESTONE in completed.stderr, shown
+    assert "main" in completed.stderr and "next" in completed.stderr, shown
+    assert not call_log.exists(), "the milestone train remains authoritative"
+    _assert_exact_pull_lookup(tmp_path)
 
 
 def test_mismatched_milestone_train_fails(tmp_path: Path) -> None:

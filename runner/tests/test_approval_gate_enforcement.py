@@ -75,7 +75,6 @@ from curie_runner.approval import (
     APPROVAL_SERVER_NAME,
     APPROVAL_SUMMARY_PREFIX,
     APPROVAL_TOOL_NAME,
-    PUBLISH_TOOL_NAME,
     ApprovalGate,
     ApprovalPolicyError,
     build_approval_gate,
@@ -88,6 +87,7 @@ from curie_runner.otel import RunTracer
 from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier
 from curie_runner.translate import TurnState, translate_message
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _CAPABILITY_SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
@@ -1244,7 +1244,7 @@ def _publish_block(
         content=[
             ToolUseBlock(
                 id=call_id,
-                name=PUBLISH_TOOL_NAME,
+                name=PLATFORM_PUBLISH_TOOL_NAME,
                 input={"title": title, "body": body},
             )
         ],
@@ -1283,7 +1283,7 @@ def _managed_publish_gate() -> ApprovalGate:
 
     gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
     assert gate is not None
-    assert PUBLISH_TOOL_NAME in gate.required
+    assert PLATFORM_PUBLISH_TOOL_NAME in gate.required
     return gate
 
 
@@ -1323,11 +1323,11 @@ def test_publish_call_neither_gate_layer_saw_still_pauses_awaiting_approval(
     assert final.status != SessionStatus.DONE
     assert final.approval_summary
     assert final.approval_summary.startswith(APPROVAL_SUMMARY_PREFIX)
-    assert PUBLISH_TOOL_NAME in final.approval_summary
+    assert PLATFORM_PUBLISH_TOOL_NAME in final.approval_summary
     # The trusted provenance pair the worker branches on before it captures a
     # patch. A fallback record that stamped anything else would be inert.
     assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     assert final.approval_route is None
     assert gate.publication_title == "Ship changes"
     assert gate.publication_body == "The proposed change."
@@ -1372,7 +1372,7 @@ def test_hook_recorded_publish_is_not_recorded_twice_by_the_stream(
     final = events[-1]
     assert final.status == SessionStatus.AWAITING_APPROVAL
     assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     # Exactly one record, and it is the gate layer's own -- the observer added
     # nothing on top of it.
     assert gate.publication_title == "Hook recorded"
@@ -1464,7 +1464,7 @@ def test_publish_call_on_a_gate_that_does_not_carry_publish_fails_closed() -> No
 
     gate = build_approval_gate(operator_tools=["Bash"], policy_routes={})
     assert gate is not None
-    assert PUBLISH_TOOL_NAME not in gate.required
+    assert PLATFORM_PUBLISH_TOOL_NAME not in gate.required
     runner, _session = _runner_over(_publish_then_clean_done(), gate=gate)
 
     events = parse_ndjson("".join(_run_lines(runner)))
@@ -1551,7 +1551,7 @@ def test_malformed_publish_followed_by_a_valid_one_pauses_on_the_valid_record() 
     assert final.status == SessionStatus.AWAITING_APPROVAL
     assert final.status != SessionStatus.CLASSIFIED_FAILURE
     assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     # Exactly one record, and it is the VALID proposal -- not the malformed one,
     # which never wrote anything.
     assert gate.publication_title == "Ship changes"
@@ -1604,7 +1604,7 @@ def test_hook_recorded_publish_survives_a_later_malformed_stream_observation() -
     assert final.status == SessionStatus.AWAITING_APPROVAL
     assert final.status != SessionStatus.CLASSIFIED_FAILURE
     assert final.approval_gate_kind == "permission"
-    assert final.approval_granted_tool == PUBLISH_TOOL_NAME
+    assert final.approval_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     # The hook's own record, untouched by the second observation.
     assert gate.publication_title == "Ship changes"
     assert gate.publication_body == "the proposal"
@@ -1629,7 +1629,7 @@ def test_another_gated_tools_approval_is_kept_when_a_publish_call_cannot_take_th
         operator_tools=["Bash"], policy_routes={}, managed_workspace=True
     )
     assert gate is not None
-    assert gate.required == frozenset({"Bash", PUBLISH_TOOL_NAME})
+    assert gate.required == frozenset({"Bash", PLATFORM_PUBLISH_TOOL_NAME})
     script = [
         AssistantMessage(
             content=[ToolUseBlock(id="b1", name="Bash", input={"command": "git status"})],

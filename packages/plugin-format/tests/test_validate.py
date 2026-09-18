@@ -2179,3 +2179,44 @@ def test_production_callers_never_pass_a_profile(relative: str) -> None:
     source = (repo_root / relative).read_text(encoding="utf-8")
     assert "validate_bundle(" in source, f"{relative} no longer calls validate_bundle"
     assert "profile=" not in source, f"{relative} must call validate_bundle with no profile"
+
+
+# --- the platform publication gate (#2776) ---------------------------------------
+#
+# The platform-mounted publication tool's live name is mcp__curie__publish_changes.
+# It is neither a bundle server nor a connector, so only that EXACT name is
+# accepted; the rest of the mcp__curie__ namespace is still refused.
+
+
+def test_platform_publish_gate_name_is_the_live_tool_name() -> None:
+    from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
+
+    assert PLATFORM_PUBLISH_TOOL_NAME == "mcp__curie__publish_changes"
+
+
+@pytest.mark.parametrize("declare_server", [True, False])
+def test_platform_publish_gate_passes(tmp_path: Path, declare_server: bool) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "mcp__curie__publish_changes", "route": "publish"}]}}',
+    )
+    if declare_server:
+        _write_mcp(bundle, '{"mcpServers": {"crm": {"command": "crm-server"}}}')
+
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+@pytest.mark.parametrize(
+    "gate", ["mcp__curie__other_tool", "mcp__curie__", "mcp__curie__publish_changes_x"]
+)
+def test_other_platform_namespace_gates_are_refused(tmp_path: Path, gate: str) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        f'{{"gate": "{gate}", "route": "publish"}}]}}}}',
+    )
+    _write_mcp(bundle, '{"mcpServers": {"crm": {"command": "crm-server"}}}')
+
+    assert len(_gate_errors(bundle)) == 1

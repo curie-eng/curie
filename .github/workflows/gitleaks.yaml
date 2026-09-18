@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, next]
   pull_request:
-    branches: [main, next]
+    branches: [main, next, "task/**"]
   schedule:
     # Weekly full-history sweep so a secret introduced (or surfaced by a future
     # history rewrite) is caught even without a push.

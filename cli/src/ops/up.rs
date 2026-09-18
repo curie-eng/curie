@@ -2174,6 +2174,12 @@ fn overlay_leaf(
     }
 }
 
+fn escape_helm_set_key_segment(key: &str) -> String {
+    // Retained object keys may contain literal dots. Escape backslashes first
+    // so their Helm escaping cannot consume the escape added for a later dot.
+    key.replace('\\', "\\\\").replace('.', "\\.")
+}
+
 fn overlay_json(
     opts: &mut UpOpts,
     value: &serde_json::Value,
@@ -2183,8 +2189,9 @@ fn overlay_json(
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map {
+                let key = escape_helm_set_key_segment(key);
                 let path = if prefix.is_empty() {
-                    key.clone()
+                    key
                 } else {
                     format!("{prefix}.{key}")
                 };

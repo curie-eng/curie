@@ -112,6 +112,28 @@
       },
       "cardinality_bound": 2
     },
+    "curie.history.persistence.failure": {
+      "type": "counter",
+      "unit": "{failure}",
+      "description": "Transcript persistence failures caused by state capacity limits.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "source": [
+          "state-api"
+        ],
+        "outcome": [
+          "capacity"
+        ],
+        "limit": [
+          "value",
+          "namespace"
+        ]
+      },
+      "cardinality_bound": 2
+    },
     "curie.queue.enqueue": {
       "type": "counter",
       "unit": "{message}",
@@ -511,7 +533,8 @@
           "resume",
           "release",
           "suspend",
-          "cleanup"
+          "cleanup",
+          "reclaim"
         ],
         "outcome": [
           "claimed",
@@ -521,10 +544,19 @@
           "suspended",
           "failed",
           "orphan-cleaned",
-          "observed"
+          "observed",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "timeout"
         ]
       },
-      "cardinality_bound": 40
+      "cardinality_bound": 102
     },
     "curie.sandbox.claim.duration": {
       "type": "histogram",
@@ -540,7 +572,8 @@
           "resume",
           "release",
           "suspend",
-          "cleanup"
+          "cleanup",
+          "reclaim"
         ],
         "outcome": [
           "claimed",
@@ -550,10 +583,19 @@
           "suspended",
           "failed",
           "orphan-cleaned",
-          "observed"
+          "observed",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "timeout"
         ]
       },
-      "cardinality_bound": 40
+      "cardinality_bound": 102
     },
     "curie.sandbox.resume.duration": {
       "type": "histogram",
@@ -569,7 +611,8 @@
           "resume",
           "release",
           "suspend",
-          "cleanup"
+          "cleanup",
+          "reclaim"
         ],
         "outcome": [
           "claimed",
@@ -579,10 +622,19 @@
           "suspended",
           "failed",
           "orphan-cleaned",
-          "observed"
+          "observed",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "timeout"
         ]
       },
-      "cardinality_bound": 40
+      "cardinality_bound": 102
     },
     "curie.sandbox.release.duration": {
       "type": "histogram",
@@ -598,7 +650,8 @@
           "resume",
           "release",
           "suspend",
-          "cleanup"
+          "cleanup",
+          "reclaim"
         ],
         "outcome": [
           "claimed",
@@ -608,10 +661,19 @@
           "suspended",
           "failed",
           "orphan-cleaned",
-          "observed"
+          "observed",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "timeout"
         ]
       },
-      "cardinality_bound": 40
+      "cardinality_bound": 102
     },
     "curie.sandbox.active": {
       "type": "gauge",
@@ -663,7 +725,8 @@
           "resume",
           "release",
           "suspend",
-          "cleanup"
+          "cleanup",
+          "reclaim"
         ],
         "outcome": [
           "claimed",
@@ -673,10 +736,19 @@
           "suspended",
           "failed",
           "orphan-cleaned",
-          "observed"
+          "observed",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "timeout"
         ]
       },
-      "cardinality_bound": 40
+      "cardinality_bound": 102
     },
     "curie.runner.rpc.request.duration": {
       "type": "histogram",

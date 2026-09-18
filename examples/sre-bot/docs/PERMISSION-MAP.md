@@ -65,6 +65,14 @@ ceiling. Kubernetes RBAC cannot restrict a patch to a friendly field, and there
 is no generic rollback for those changes. Approval controls the agent, not the
 credential: if the credential leaks, only RBAC remains.
 
+## Platform publication
+
+Tool: `mcp__curie__publish_changes` through the `sre-approvals` route.
+
+This platform mounted tool operates only on the managed allowlisted workspace
+selected for the turn. After approval, it opens a pull request. It never grants
+`git push` authority to the sandbox and has no Kubernetes connector or RBAC row.
+
 ## `upgrade_self()`
 
 Tool: `mcp__self-upgrade__upgrade_self()` with zero arguments.

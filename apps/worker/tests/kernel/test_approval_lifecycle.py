@@ -2104,18 +2104,15 @@ def test_a_slack_turns_record_carries_slack_and_no_adapter(make_harness) -> None
     asyncio.run(go())
 
 
-def test_null_placeholder_turn_reaches_an_approval_and_persists_its_own_ref(
+def test_null_placeholder_turn_persists_its_approval_before_any_delivery(
     make_harness,
 ) -> None:
     """A placeholder-less turn can pause for approval like any other (ADR-0079).
 
-    The reverse of what this test asserted before the placeholder-less path
-    landed: the kernel used to refuse the turn outright, so a channel that
-    preposts nothing could not reach an approval gate at all.
-
-    The record must carry the ref the turn DELIVERED on, not the null the wire
-    carried. Those differ here, and persisting the null would send the approval's
-    outcome to a second message beside the request it answers.
+    #2721: the durable row is created with whatever ref the turn already holds
+    (None here) BEFORE any delivery. A delivery that precedes persistence strands
+    the approval whenever the transport is down, so the reply ref is no longer
+    minted ahead of the record.
     """
 
     async def go() -> None:
@@ -2135,17 +2132,166 @@ def test_null_placeholder_turn_reaches_an_approval_and_persists_its_own_ref(
             assert h.runner.opened == ["please discount"]
             assert approvals.create_calls == 1
             req = approvals.requests[0]
-            # The routing pair and egress selector still come off the wire...
             assert req.reply_kind == "email"
             assert req.reply_adapter == "agentmail"
-            # ...but the reply ref is the one this turn minted by delivering.
-            assert req.reply_placeholder is not None
-            assert req.reply_placeholder == h.sink.text_posts[0][1]
+            # Whatever ref the turn held at persistence: a booting post may
+            # already have minted one, or none exists yet.
+            minted = h.sink.text_posts[0][1] if h.sink.text_posts else None
+            assert req.reply_placeholder in (None, minted)
 
     asyncio.run(go())
 
 
-def test_no_edit_placeholderless_approval_uses_one_minted_ref(make_harness) -> None:
+def _gate_only_script(summary: str) -> list:
+    # No TextDelta before the Final: pre-gate streamed prose is the turn's own
+    # delivery during the model turn, before the kernel can know a gate fired,
+    # and is out of scope for #2721.
+    return [Final(text="Requesting sign-off", status=AWAITING, approval_summary=summary)]
+
+
+def _record_create_calls_at_emit(h, approvals: RecordingApprovals) -> list[int]:  # noqa: ANN001
+    seen: list[int] = []
+    original_emit = h.sink.emit
+
+    async def recording_emit(
+        reply_event: ReplyEvent,
+        *,
+        route: TargetRoute,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        # The booting caption precedes the model turn, so no approval can
+        # exist yet; every delivery after it is the pausing turn's own.
+        if getattr(reply_event, "text", None) != h.config.booting_text:
+            seen.append(approvals.create_calls)
+        return await original_emit(
+            reply_event,
+            route=route,
+            best_effort_unreachable=best_effort_unreachable,
+        )
+
+    h.sink.emit = recording_emit
+    return seen
+
+
+def test_placeholderless_approval_row_precedes_every_delivery_attempt(
+    make_harness,
+) -> None:
+    """#2721 AC1: on a placeholderless Slack turn, no delivery is attempted
+    before the durable approval row exists."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _gate_only_script("Give ACME a 20% discount")
+            seen = _record_create_calls_at_emit(h, approvals)
+
+            await h.kernel.process_event(
+                _qevent("please discount", thread="th_row_first", placeholder=None)
+            )
+
+            assert approvals.create_calls == 1
+            assert seen, "the pausing turn delivered nothing"
+            assert seen == [1] * len(seen), seen
+
+    asyncio.run(go())
+
+
+def _install_dead_transport(h) -> list[str]:  # noqa: ANN001
+    attempts: list[str] = []
+
+    async def not_authed(
+        reply_event: ReplyEvent,
+        *,
+        route: TargetRoute,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        attempts.append(reply_event.event)
+        raise RuntimeError("not_authed")
+
+    h.sink.emit = not_authed
+    return attempts
+
+
+def test_approval_without_a_slack_surface_still_suspends_and_completes(
+    make_harness,
+) -> None:
+    """#2721 AC2: every delivery failing (no Slack) must not strand the approval.
+
+    The event completes awaiting approval exactly once: one row, the sandbox
+    suspended, the done marker set, and no exception back to the consumer.
+    """
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _gate_only_script("Give ACME a 20% discount")
+            _install_dead_transport(h)
+            event = _qevent("please discount", thread="th_no_slack", placeholder=None)
+
+            await h.kernel.process_event(event)
+
+            assert approvals.create_calls == 1
+            modes = [s.operating_mode for s in h.fake_k8s.sandboxes.values()]
+            assert modes == ["Suspended"]
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_approval_without_a_slack_surface_is_exactly_once_and_resumes_once(
+    make_harness,
+) -> None:
+    """#2721 AC3: redelivery of the pausing event creates no second row and opens
+    no second model turn; the resolution resumes exactly once, even redelivered."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _gate_only_script("Give ACME a 20% discount")
+            working_emit = h.sink.emit
+            _install_dead_transport(h)
+            thread = "th_no_slack_once"
+            event = _qevent("please discount", thread=thread, placeholder=None)
+
+            await h.kernel.process_event(event)
+            await h.kernel.process_event(event)
+
+            assert approvals.create_calls == 1
+            assert h.runner.opened == ["please discount"]
+
+            h.sink.emit = working_emit
+            h.runner.default_script = [Final(text="Discount applied.", status=DONE)]
+            resolution = _qevent(
+                "[approval resolved] approved by U9",
+                thread=thread,
+                event_id="approval-appr-1-resolved",
+                placeholder=None,
+            )
+
+            await h.kernel.process_event(resolution)
+            assert h.runner.opened == [
+                "please discount",
+                "[approval resolved] approved by U9",
+            ]
+
+            await h.kernel.process_event(resolution)
+            assert h.runner.opened == [
+                "please discount",
+                "[approval resolved] approved by U9",
+            ]
+            assert approvals.create_calls == 1
+
+    asyncio.run(go())
+
+
+def test_no_edit_placeholderless_approval_resumes_onto_the_minted_message(
+    make_harness,
+) -> None:
+    """#1640 under the #2721 contract: the row is persisted before the notice
+    mints a ref, so it carries None, and the API replays a None placeholder on
+    the resolution turn. The resumed answer must still edit the single message
+    the pending notice minted, never post a second one."""
+
     async def go() -> None:
         approvals = RecordingApprovals()
         async with make_harness(
@@ -2168,7 +2314,7 @@ def test_no_edit_placeholderless_approval_uses_one_minted_ref(make_harness) -> N
             assert request.reply_kind == "slack"
             assert request.reply_endpoint is None
             assert request.reply_adapter is None
-            assert request.reply_placeholder == minted
+            assert request.reply_placeholder in (None, minted)
             assert h.sink.updates
             assert {ref for _, ref, _ in h.sink.updates} == {minted}
             assert "Awaiting approval (appr-1)" in h.sink.updates[-1][2]
@@ -2181,7 +2327,8 @@ def test_no_edit_placeholderless_approval_uses_one_minted_ref(make_harness) -> N
                 "[approval resolved] approved by U9",
                 thread=thread,
                 event_id="approval-appr-1-resolved",
-                placeholder=request.reply_placeholder,
+                # The API replays the row's ref; under #2721 that may be None.
+                placeholder=None,
             )
 
             await h.kernel.process_event(resolution)
@@ -2194,9 +2341,12 @@ def test_no_edit_placeholderless_approval_uses_one_minted_ref(make_harness) -> N
     asyncio.run(go())
 
 
-def test_no_edit_placeholderless_approval_refuses_a_missing_minted_ref(
+def test_no_edit_placeholderless_approval_tolerates_a_notice_without_a_ref(
     make_harness,
 ) -> None:
+    """#2721: a notice acknowledged with no ref no longer fails the turn. The
+    row already exists, so the turn completes awaiting approval."""
+
     async def go() -> None:
         approvals = RecordingApprovals()
         async with make_harness(
@@ -2212,17 +2362,14 @@ def test_no_edit_placeholderless_approval_refuses_a_missing_minted_ref(
             original_emit = h.sink.emit
             missing_ref_deliveries = 0
 
-            async def omit_precreation_ref(
+            async def omit_minted_ref(
                 reply_event: ReplyEvent,
                 *,
                 route: TargetRoute,
                 best_effort_unreachable: bool = False,
             ) -> ReplyAck:
                 nonlocal missing_ref_deliveries
-                if (
-                    reply_event.target.reply_ref is None
-                    and getattr(reply_event, "text", None) == "Requesting sign-off"
-                ):
+                if reply_event.target.reply_ref is None:
                     missing_ref_deliveries += 1
                     return ReplyAck(ref=None)
                 return await original_emit(
@@ -2231,16 +2378,15 @@ def test_no_edit_placeholderless_approval_refuses_a_missing_minted_ref(
                     best_effort_unreachable=best_effort_unreachable,
                 )
 
-            h.sink.emit = omit_precreation_ref
+            h.sink.emit = omit_minted_ref
 
-            with pytest.raises(RuntimeError, match="reply ref"):
-                await h.kernel.process_event(event)
+            await h.kernel.process_event(event)
 
-            assert missing_ref_deliveries == 1
-            assert approvals.create_calls == 0
+            assert missing_ref_deliveries >= 1
+            assert approvals.create_calls == 1
             modes = [s.operating_mode for s in h.fake_k8s.sandboxes.values()]
-            assert modes == ["Running"]
-            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert modes == ["Suspended"]
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
 
     asyncio.run(go())
 
@@ -2621,6 +2767,7 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
                 TargetRoute(),
                 lambda: None,
                 remaining_s=17.25,
+                pressure_retried=False,
                 workspace_inference=_WorkspaceInferenceCarry(),
             )
 
@@ -4266,4 +4413,3 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
             assert "unexpected approval route" not in h.sink.last_text
 
     asyncio.run(go())
-

@@ -30,7 +30,7 @@ from .publication_k8s import (
     deterministic_publication_branch,
     publication_resource_names,
 )
-from .reply_sink import ReplySink, TargetRoute
+from .reply_sink import InvalidReplyTargetError, ReplySink, TargetRoute
 
 _PR_MARKER = re.compile(r"^CURIE_PR_URL=(https://github\.com/[^\s]+/pull/\d+)$", re.MULTILINE)
 _PR_NUMBER_MARKER = re.compile(r"^CURIE_PR_NUMBER=([1-9][0-9]*)$", re.MULTILINE)
@@ -108,7 +108,7 @@ class PublicationStore(Protocol):
     ) -> None | Awaitable[None]: ...
 
     def retry_card_delivery(
-        self, publication_id: uuid.UUID, *, error: str
+        self, publication_id: uuid.UUID, *, error: str, permanent: bool
     ) -> None | Awaitable[None]: ...
 
     def claim_pending_cleanup(self) -> Any: ...
@@ -346,7 +346,9 @@ class PublicationReconciler:
         if self._card_store is None:
             error = "durable approval-card reference storage is unavailable"
             await _resolve(
-                self._store.retry_card_delivery(work.publication_id, error=error)
+                self._store.retry_card_delivery(
+                    work.publication_id, error=error, permanent=False
+                )
             )
             raise PublicationReconcileError(error)
         try:
@@ -395,7 +397,13 @@ class PublicationReconciler:
         except Exception as exc:
             error = str(exc)[:2000] or type(exc).__name__
             await _resolve(
-                self._store.retry_card_delivery(work.publication_id, error=error)
+                self._store.retry_card_delivery(
+                    work.publication_id,
+                    error=error,
+                    # An unaddressable reply target is refused before any
+                    # transport attempt and fails identically on every retry.
+                    permanent=isinstance(exc, InvalidReplyTargetError),
+                )
             )
             raise
         await _resolve(self._store.mark_card_delivered(work.publication_id))
@@ -498,6 +506,26 @@ class PublicationReconciler:
             best_effort_unreachable=False,
         )
 
+    async def _result_target(self, result: Any, approval_id: str) -> ReplyTarget:
+        # #2721: the approval row is persisted before delivery, so a ref-less
+        # target's pending notice ref lives only in the card store. Edit that
+        # notice instead of posting a second message; lookup is best-effort.
+        target: ReplyTarget = result.target
+        if target.reply_ref is not None or self._card_store is None:
+            return target
+        try:
+            notice_ref = await self._card_store.read_notice_ref(approval_id)
+        except Exception:
+            logger.warning(
+                "publication notice ref lookup failed publication_id=%s",
+                result.publication_id,
+                exc_info=True,
+            )
+            return target
+        if notice_ref is None:
+            return target
+        return target.model_copy(update={"reply_ref": notice_ref})
+
     async def deliver_pending_result(
         self,
         publication_id: uuid.UUID | None = None,
@@ -580,7 +608,9 @@ class PublicationReconciler:
                 transcript_retry_error = PublicationReconcileError(
                     "publication transcript recording is not configured"
                 )
-            await self._report(result.target, result.route, text)
+            await self._report(
+                await self._result_target(result, approval_id), result.route, text
+            )
             if card_ref is not None:
                 await self._settle_card(result, card_ref)
         except Exception as exc:

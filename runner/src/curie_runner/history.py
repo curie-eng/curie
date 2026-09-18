@@ -57,6 +57,18 @@ class HistoryError(RuntimeError):
     """A history reference could not be resolved or dereferenced."""
 
 
+class HistoryAppendError(HistoryError):
+    """The state API refused a transcript append."""
+
+    def __init__(self, status: int) -> None:
+        self.status = status
+        super().__init__(status)
+
+
+class HistoryCapacityError(HistoryAppendError):
+    """The state API refused a transcript append because a byte cap was reached."""
+
+
 class StructuredReplayUnsupported(HistoryError):
     """The selected harness cannot consume a recovered structured prefix."""
 
@@ -671,8 +683,7 @@ class StateApiTranscriptStore:
                     # No transcript written yet -- a fresh thread, not an error.
                     return []
                 if resp.status != 200:
-                    body = await resp.text()
-                    raise HistoryError(f"history load failed: {resp.status} {body[:200]}")
+                    raise HistoryError(resp.status)
                 payload = await resp.json()
         value = payload.get("value")
         if not isinstance(value, list):
@@ -698,8 +709,9 @@ class StateApiTranscriptStore:
                 f"{self._key_url}/append", data=body, headers=headers
             ) as resp:
                 if resp.status not in (200, 201):
-                    text = await resp.text()
-                    raise HistoryError(f"history append failed: {resp.status} {text[:200]}")
+                    if resp.status == 413:
+                        raise HistoryCapacityError(resp.status)
+                    raise HistoryAppendError(resp.status)
 
 
 def resolve_history(history_ref: str | None, env: Mapping[str, str]) -> TranscriptStore:

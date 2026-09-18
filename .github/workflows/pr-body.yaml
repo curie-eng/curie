@@ -2,7 +2,7 @@ name: PR body guard
 
 on:
   pull_request:
-    branches: [main, next]
+    branches: [main, next, "task/**"]
     # A PR body can be edited without a new commit. Re-run the body guards on
     # that event so a formerly valid closing keyword cannot become inert, and so
     # an AI attribution footer cannot be pasted in, after the rest of CI has

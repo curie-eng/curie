@@ -1453,8 +1453,12 @@ class WorkspaceClaimCoordinator:
         lineage_head: str | None = None,
         lineage_base_sha: str | None = None,
         publication_visible_outcome_revision: int = 0,
+        fresh_only: bool = False,
     ) -> WorkspaceClaimResult:
         """Prepare once, then cold-claim or resume a suspended route.
+
+        ``fresh_only`` forwards to the substrate claim so an attachment turn
+        never adopts a live runner that did not boot with its env (#2739).
 
         ``revalidate_before_handoff`` is the late-replacement linearization
         guard. It runs after the archive is verified and durably staged,
@@ -1543,6 +1547,7 @@ class WorkspaceClaimCoordinator:
                         publication_visible_outcome_revision=(
                             publication_visible_outcome_revision
                         ),
+                        fresh_only=fresh_only,
                     )
                 except Exception as exc:
                     # The substrate signal is injected to keep this worker-local

@@ -170,6 +170,23 @@ class RouteRecord:
 
 
 @dataclass(frozen=True)
+class PressureCandidate:
+    """One persisted live route eligible for bounded pressure inspection."""
+
+    thread_key: str
+    record: RouteRecord
+    expires_at_ms: int
+
+
+@dataclass(frozen=True)
+class PressureScanResult:
+    """A complete pressure inventory, or a fail closed scan outcome."""
+
+    candidates: tuple[PressureCandidate, ...]
+    outcome: Literal["complete", "scan-incomplete", "expiry-unsupported"]
+
+
+@dataclass(frozen=True)
 class SubstrateConfig:
     """Tunables for the substrate; defaults match the dev chart profile."""
 
@@ -239,10 +256,9 @@ class QuotaRejection:
     """Observed ResourceQuota evidence from a rejected sandbox claim."""
 
     quota_name: str
-    resource: str
-    requested: str
-    used: str
-    hard: str
+    requested: Mapping[str, str]
+    used: Mapping[str, str]
+    hard: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -314,13 +330,24 @@ class SandboxClient(Protocol):
 
         ...
 
-    def get_claim(self, name: str) -> ClaimView | None: ...
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None: ...
 
-    def delete_claim(self, name: str) -> None: ...
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None: ...
 
     def list_claims(self, *, label_selector: str) -> list[ClaimView]: ...
 
-    def get_sandbox(self, name: str) -> SandboxView | None: ...
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None: ...
+
+    def quota_has_headroom(
+        self,
+        rejection: QuotaRejection,
+        *,
+        request_timeout_seconds: float,
+    ) -> bool: ...
 
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None: ...
 
@@ -340,13 +367,22 @@ class CapacityExhaustedError(SandboxError):
         self.rejection = rejection
         super().__init__(
             f"ResourceQuota {rejection.quota_name} rejected "
-            f"{rejection.resource}={rejection.requested}; current usage is "
-            f"{rejection.used}/{rejection.hard}"
+            f"requested={rejection.requested}; used={rejection.used}; "
+            f"hard={rejection.hard}"
         )
 
 
 class NoRouteError(SandboxError):
     """An operation needed an existing thread route and none was found."""
+
+
+class RouteChangedError(SandboxError):
+    """A fresh-only claim found (or raced) a live route it did not create.
+
+    Attachment turns stage files into the runner created for them (#2739);
+    adopting a runner another worker bound in the meantime would deliver the
+    turn without its files, so the caller refuses instead.
+    """
 
 
 class SuspendedThreadError(SandboxError):

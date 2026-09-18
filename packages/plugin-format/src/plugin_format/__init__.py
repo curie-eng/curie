@@ -7,6 +7,7 @@ escalates to the orchestrator.
 """
 
 from .approval_policy import (
+    PLATFORM_PUBLISH_TOOL_NAME,
     connector_server_names,
     connector_tool_prefix,
     declared_mcp_server_names,
@@ -67,6 +68,7 @@ __version__ = "0.0.0"
 
 __all__ = [
     "__version__",
+    "PLATFORM_PUBLISH_TOOL_NAME",
     "RESERVED_BOOT_ENV",
     "is_reserved_boot_env_name",
     "MANIFEST_LOCATIONS",

@@ -35,8 +35,19 @@ Fix pin: <supported selector>
      apps/*/tests/*.py::test
      packages/*/tests/*.py::test
      runner/tests/*.py::test
+     cli/tests/local/test_*.py::test
      cli/tests/name.rs::test
      charts/curie/ci/name.sh
+
+     A local Python selector must start the actual isolated local services it
+     owns. The verifier runs it twice in separate pytest processes. Each
+     baseline and reversed invocation must begin from fresh state, register
+     cleanup before startup, and verify cleanup. Unavailable Docker, ports,
+     binaries, or services must produce errors, never skips or green results.
+     Put prerequisite checks, service startup, and cleanup verification in
+     pytest fixture setup or teardown so environmental failures are errors,
+     which the verifier refuses. Only product behavior assertions belong in
+     the test body.
 
      The declaration must be present before opening the pull request. If it is
      added or corrected later, the body edit automatically revalidates the
@@ -50,9 +61,10 @@ Fix pin: <supported selector>
 Fix pin: n/a - <reason>
 
      The pin's tier is derived from the selector's location, not from prose:
-     unit tests, charts/curie/ci/* (cluster helm-render), or test_live.py
-     (live). If the closed issue carries found:unit, found:local,
-     found:cluster, or found:live and the pin is below that surface, add:
+     unit tests, cli/tests/local/test_*.py (local), charts/curie/ci/* (cluster
+     helm-render), or other test_live.py selectors (live). If the closed issue
+     carries found:unit, found:local, found:cluster, or found:live and the pin
+     is below that surface, add:
 Fix pin waiver: <reason>
 
      A unit pin for a found:live issue fails without that waiver.

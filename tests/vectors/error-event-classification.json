@@ -12,7 +12,8 @@
     "model-credential-rejected",
     "approval-not-acted",
     "false-completion",
-    "publication-unrecorded"
+    "publication-unrecorded",
+    "history-persistence-error"
   ],
   "vectors": [
     {
@@ -99,6 +100,11 @@
       "name": "platform_publication_unrecorded",
       "input": "publication-unrecorded",
       "expected": "publication-unrecorded"
+    },
+    {
+      "name": "platform_history_persistence_error",
+      "input": "history-persistence-error",
+      "expected": "history-persistence-error"
     }
   ]
 }

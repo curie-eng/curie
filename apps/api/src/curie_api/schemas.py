@@ -1899,6 +1899,7 @@ class ObservationNode(BaseModel):
     startTime: str | None = None  # noqa: N815 (Langfuse wire field name)
     model: str | None = None
     usageDetails: dict[str, Any] | None = None  # noqa: N815
+    toolName: str | None = None  # noqa: N815 (which tool an execute_tool span ran)
     children: list["ObservationNode"] = []
 
 

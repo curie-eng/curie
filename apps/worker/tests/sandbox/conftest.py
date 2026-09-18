@@ -9,9 +9,10 @@ client is exercised by the env-gated k8scratch e2e in ``test_e2e_k8scratch.py``.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +20,9 @@ from pathlib import Path
 import pytest
 import redis
 from curie_test_support.valkey import (
+    VALKEY_HOST,
+    VALKEY_PORT,
+    VALKEY_PW,
     connect_or_skip,
 )
 from curie_worker.sandbox import (
@@ -29,6 +33,10 @@ from curie_worker.sandbox import (
     SubstrateConfig,
 )
 from curie_worker.sandbox.docker import DockerSandboxClient
+from redis.asyncio import Redis as AsyncRedis
+from redis.asyncio.retry import Retry as AsyncRetry
+from redis.backoff import NoBackoff
+from redis.maint_notifications import MaintNotificationsConfig
 
 
 def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:
@@ -56,9 +64,17 @@ class _RecordingDocker(DockerSandboxClient):
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self.calls: list[list[str]] = []
+        self.timeouts: list[float] = []
         self.outputs: dict[str, str] = {}
 
-    def _docker(self, args: list[str], *, check: bool = True) -> str:
+    def _docker(
+        self,
+        args: list[str],
+        *,
+        request_timeout_seconds: float,
+        check: bool = True,
+    ) -> str:
+        self.timeouts.append(request_timeout_seconds)
         self.calls.append(args)
         return self.outputs.get(args[0], "")
 
@@ -86,8 +102,36 @@ def key_prefix(redis_client: redis.Redis) -> Iterator[str]:
 
 
 @pytest.fixture
-def affinity(redis_client: redis.Redis, key_prefix: str) -> AffinityStore:
-    return AffinityStore(redis_client, key_prefix=key_prefix)
+def pressure_redis_factory() -> Callable[[], AsyncRedis]:
+    def make_client() -> AsyncRedis:
+        return AsyncRedis(
+            host=VALKEY_HOST,
+            port=VALKEY_PORT,
+            password=VALKEY_PW or None,
+            decode_responses=False,
+            socket_timeout=1.0,
+            socket_connect_timeout=1.0,
+            retry=AsyncRetry(NoBackoff(), 0),
+            driver_info=None,
+            maint_notifications_config=MaintNotificationsConfig(enabled=False),
+        )
+
+    return make_client
+
+
+@pytest.fixture
+def affinity(
+    redis_client: redis.Redis,
+    pressure_redis_factory: Callable[[], AsyncRedis],
+    key_prefix: str,
+) -> Iterator[AffinityStore]:
+    pressure_client = pressure_redis_factory()
+    yield AffinityStore(
+        redis_client,
+        pressure_client=pressure_client,
+        key_prefix=key_prefix,
+    )
+    asyncio.run(pressure_client.aclose())
 
 
 @pytest.fixture
@@ -144,6 +188,8 @@ class FakeSandboxClient:
     sandboxes: dict[str, FakeSandbox] = field(default_factory=dict)
     bind_ready: bool = True
     quota_rejection: QuotaRejection | None = None
+    quota_headroom_results: list[bool | BaseException] = field(default_factory=list)
+    quota_headroom_calls: list[tuple[QuotaRejection, float]] = field(default_factory=list)
     ready_reason: str | None = None
     ready_message: str | None = None
     created: list[str] = field(default_factory=list)
@@ -176,7 +222,10 @@ class FakeSandboxClient:
         )
         self.created.append(name)
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
             return None
@@ -192,7 +241,8 @@ class FakeSandboxClient:
             ready_message=claim.ready_message,
         )
 
-    def delete_claim(self, name: str) -> None:
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        assert request_timeout_seconds > 0
         claim = self.claims.pop(name, None)
         if claim is not None:
             self.sandboxes.pop(claim.sandbox_name, None)
@@ -203,12 +253,15 @@ class FakeSandboxClient:
         views = []
         for claim in self.claims.values():
             if claim.labels.get(key) == value:
-                view = self.get_claim(claim.name)
+                view = self.get_claim(claim.name, request_timeout_seconds=1.0)
                 assert view is not None
                 views.append(view)
         return views
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        assert request_timeout_seconds > 0
         sandbox = self.sandboxes.get(name)
         if sandbox is None:
             return None
@@ -218,6 +271,21 @@ class FakeSandboxClient:
             service_fqdn=sandbox.service_fqdn,
             operating_mode=sandbox.operating_mode,
         )
+
+    def quota_has_headroom(
+        self,
+        rejection: QuotaRejection,
+        *,
+        request_timeout_seconds: float,
+    ) -> bool:
+        assert 0 < request_timeout_seconds <= 1.0
+        self.quota_headroom_calls.append((rejection, request_timeout_seconds))
+        if not self.quota_headroom_results:
+            return False
+        result = self.quota_headroom_results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode

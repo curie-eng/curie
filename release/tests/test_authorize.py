@@ -1547,6 +1547,11 @@ class TestHelmCiWorkflowTriggers:
         # the rendered env value through the real ThreadedBotAdmission
         # parser, so a PR that only relaxes that parser must still run this
         # workflow.
+        # The two cli/ paths are the same obligation once more (#2741): the
+        # retained-values scalar gate builds and runs the real CLI against the
+        # recorded upgrade boundary, so its subject and its stub driver both
+        # live outside charts/, and a PR restoring the YAML 1.2 emitter must
+        # still match this filter.
         assert triggers["pull_request"]["paths"] == [
             "charts/curie/**",
             "examples/sre-bot/observability/**",
@@ -1560,6 +1565,8 @@ class TestHelmCiWorkflowTriggers:
             "uv.lock",
             "pyproject.toml",
             "compose.dev.yaml",
+            "cli/src/ops/upgrade.rs",
+            "cli/tests/data/upgrade-driver.py",
         ]
 
 

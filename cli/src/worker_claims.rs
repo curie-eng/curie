@@ -15,7 +15,6 @@ use tokio::time::Instant;
 use crate::ops::{plain, run_capture, OpsCommand};
 
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
-const COMPOSE_PROJECT: &str = "curie";
 const COMPOSE_WORKER_SERVICE: &str = "curie-worker";
 
 const STATUS_ARGS: [&str; 6] = [
@@ -243,17 +242,17 @@ fn cluster_exec_command(namespace: &str, pod: &str) -> OpsCommand {
     OpsCommand::new("kubectl", args)
 }
 
-fn local_exec_command(compose_file: &str) -> OpsCommand {
-    let mut args = vec![
-        plain("compose"),
-        plain("-p"),
-        plain(COMPOSE_PROJECT),
-        plain("-f"),
-        plain(compose_file),
-        plain("exec"),
-        plain("-T"),
-        plain(COMPOSE_WORKER_SERVICE),
-    ];
+fn local_exec_command(project: &str, compose_files: &[String]) -> OpsCommand {
+    let mut args = vec![plain("compose"), plain("-p"), plain(project)];
+    let files = if compose_files.is_empty() {
+        vec![crate::local::DEFAULT_COMPOSE_FILE.to_string()]
+    } else {
+        compose_files.to_vec()
+    };
+    for file in files {
+        args.extend([plain("-f"), plain(file)]);
+    }
+    args.extend([plain("exec"), plain("-T"), plain(COMPOSE_WORKER_SERVICE)]);
     args.extend(STATUS_ARGS.into_iter().map(plain));
     OpsCommand::new("docker", args)
 }
@@ -290,9 +289,11 @@ pub(crate) async fn observe_cluster(namespace: &str, release: &str) -> ClusterOb
 
 /// Execute status in the fixed local Compose project and worker service. The
 /// entire child lifetime is covered by one deadline.
-pub(crate) async fn observe_local(compose_file: &str) -> ClaimsState {
+pub(crate) async fn observe_local(project: &str, compose_files: &[String]) -> ClaimsState {
     let observation = async {
-        let (executed, stdout, _) = run_capture(&local_exec_command(compose_file)).await.ok()?;
+        let (executed, stdout, _) = run_capture(&local_exec_command(project, compose_files))
+            .await
+            .ok()?;
         executed.then(|| parse_status(&stdout))
     };
 

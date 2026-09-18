@@ -3382,6 +3382,17 @@
             ],
             "title": "Starttime"
           },
+          "toolName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Toolname"
+          },
           "type": {
             "title": "Type",
             "type": "string"

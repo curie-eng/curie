@@ -644,6 +644,10 @@ enum Command {
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
+        /// Kubernetes context for every helm and kubectl call. Defaults to the
+        /// kubeconfig current-context, which is resolved once and pinned.
+        #[arg(long, global = true, value_name = "NAME")]
+        context: Option<String>,
     },
     /// Install a complete first party example workflow.
     Example {
@@ -937,6 +941,13 @@ enum SreBotAction {
         /// Bind the installed bot to this Slack channel.
         #[arg(long, value_name = "CHANNEL")]
         slack_channel: Option<String>,
+        /// Slack user IDs allowed to resolve the bot's Kubernetes mutation
+        /// gates (route sre-approvals). Comma separated and repeatable.
+        /// Required for operator principals (`curie cluster approvals
+        /// --resolve`) to approve; without it only members of the bound Slack
+        /// channel can approve.
+        #[arg(long, value_name = "USER_IDS")]
+        approvers: Vec<String>,
         /// Install the upgrade path: the self-upgrade connector, the platform
         /// upgrade Job, and the two identities behind them.
         ///
@@ -1505,9 +1516,12 @@ enum LocalAction {
     /// even with a credential; set `CURIE_FAKE_MODEL=0` (or provide a
     /// credential) to go live.
     Up {
-        /// Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override.
-        #[arg(short = 'f', long)]
-        file: Option<String>,
+        /// Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints.
+        #[arg(long, env = "COMPOSE_PROJECT_NAME")]
+        project: Option<String>,
+        /// Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds.
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        files: Vec<String>,
         /// Print the docker compose command and exit without executing.
         #[arg(long)]
         dry_run: bool,
@@ -1578,9 +1592,12 @@ enum LocalAction {
     Rebuild {
         /// The compose service to rebuild, e.g. `curie-worker`.
         service: String,
-        /// Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override.
-        #[arg(short = 'f', long)]
-        file: Option<String>,
+        /// Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints.
+        #[arg(long, env = "COMPOSE_PROJECT_NAME")]
+        project: Option<String>,
+        /// Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds.
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        files: Vec<String>,
         /// Print the docker compose command and exit without executing.
         #[arg(long)]
         dry_run: bool,
@@ -1613,9 +1630,12 @@ enum LocalAction {
     },
     /// Stop the dev stack (docker compose down), keeping volumes.
     Down {
-        /// Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override.
-        #[arg(short = 'f', long)]
-        file: Option<String>,
+        /// Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints.
+        #[arg(long, env = "COMPOSE_PROJECT_NAME")]
+        project: Option<String>,
+        /// Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds.
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        files: Vec<String>,
         /// Also destroy volumes (adds -v). Prompts for confirmation unless --yes.
         #[arg(long)]
         wipe: bool,
@@ -1628,9 +1648,12 @@ enum LocalAction {
     },
     /// Show the dev stack's service status (docker compose ps).
     Status {
-        /// Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override.
-        #[arg(short = 'f', long)]
-        file: Option<String>,
+        /// Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints.
+        #[arg(long, env = "COMPOSE_PROJECT_NAME")]
+        project: Option<String>,
+        /// Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds.
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        files: Vec<String>,
         /// Print the docker compose command and exit without executing.
         #[arg(long)]
         dry_run: bool,
@@ -1666,9 +1689,12 @@ enum LocalAction {
             default_value = ""
         )]
         bot_token: String,
-        /// Compose file. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds. Pass to override.
-        #[arg(short = 'f', long)]
-        file: Option<String>,
+        /// Compose project. Default: `curie`. Isolation requires this with ordered `-f` files and matching host endpoints.
+        #[arg(long, env = "COMPOSE_PROJECT_NAME")]
+        project: Option<String>,
+        /// Ordered compose files. Repeat `-f` for a base then override. Default: version-pinned `compose.release.yaml` from the remote on release builds; local `compose.dev.yaml` on dev builds.
+        #[arg(short = 'f', long = "file", action = clap::ArgAction::Append)]
+        files: Vec<String>,
         /// Print the docker compose command(s) that would run and exit without executing.
         #[arg(long)]
         dry_run: bool,
@@ -2937,15 +2963,60 @@ enum ClusterAction {
 ///
 /// `local up` does not call this: it inlines the same two steps so the
 /// `--build` channel guard can run between them (#1926).
-async fn resolve_compose_file(file: Option<String>, dry_run: bool) -> Result<String> {
+async fn bind_local_opts(
+    project: Option<String>,
+    files: Vec<String>,
+    dry_run: bool,
+    build: bool,
+) -> Result<LocalOpts> {
+    let isolated = project
+        .as_deref()
+        .is_some_and(|value| value != local::COMPOSE_PROJECT)
+        || files.len() > 1
+        || std::env::var("COMPOSE_FILE")
+            .ok()
+            .is_some_and(|value| !value.is_empty());
+    if isolated {
+        let resources = local::resolve_local_resources(project, files, String::new(), build)?;
+        if build {
+            let resolved = artifacts::resolve_compose(
+                resources.compose_files.first().map(String::as_str),
+                artifacts::Channel::current(),
+                artifacts::version(),
+                artifacts::cache_root,
+                std::path::Path::new(local::DEFAULT_COMPOSE_FILE).exists(),
+            )?;
+            let _ = local::ensure_build_reaches_the_stack(&resolved)?;
+        }
+        let mut opts = LocalOpts::for_file(
+            resources
+                .compose_files
+                .first()
+                .cloned()
+                .unwrap_or_else(|| local::DEFAULT_COMPOSE_FILE.to_string()),
+        );
+        opts.resources = resources;
+        opts.dry_run = dry_run;
+        opts.build = build.then_some(local::BuildReach::Substitutes);
+        return Ok(opts);
+    }
     let resolved = artifacts::resolve_compose(
-        file.as_deref(),
+        files.first().map(String::as_str),
         artifacts::Channel::current(),
         artifacts::version(),
         artifacts::cache_root,
         std::path::Path::new(local::DEFAULT_COMPOSE_FILE).exists(),
     )?;
-    materialize_artifact(resolved, dry_run, "compose").await
+    let reach = if build {
+        Some(local::ensure_build_reaches_the_stack(&resolved)?)
+    } else {
+        None
+    };
+    let file = materialize_artifact(resolved, dry_run, "compose").await?;
+    let mut opts = LocalOpts::for_file(file);
+    opts.dry_run = dry_run;
+    opts.build = reach;
+    Ok(opts)
 }
 
 /// The sandbox connector-secret bind map for a cluster deploy (#2503).
@@ -3177,6 +3248,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             release,
                             observability_namespace,
                             workspace_repo,
+                            approvers,
                         },
                 },
         }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
@@ -3188,6 +3260,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             release,
             observability_namespace,
             workspace_repo,
+            approvers,
         })
         .await?
         {
@@ -3557,7 +3630,8 @@ async fn run(command: Option<Command>) -> Result<()> {
         },
         Some(Command::Local { action }) => match action {
             LocalAction::Up {
-                file,
+                project,
+                files,
                 dry_run,
                 minimal,
                 model,
@@ -3567,47 +3641,19 @@ async fn run(command: Option<Command>) -> Result<()> {
                 env_file,
                 build,
             } => {
-                // The `--build` channel guard runs between the resolve and
-                // the materialize (#1926), so a refused run never downloads the
-                // release compose, never prints the compose-source note, and
-                // never emits a dry-run plan. That ordering is why these three
-                // steps are inlined here instead of going through
-                // `resolve_compose_file`.
-                let resolved = artifacts::resolve_compose(
-                    file.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                    artifacts::cache_root,
-                    std::path::Path::new(local::DEFAULT_COMPOSE_FILE).exists(),
-                )?;
-                let build = if build {
-                    Some(local::ensure_build_reaches_the_stack(&resolved)?)
-                } else {
-                    None
-                };
-                let file = materialize_artifact(resolved, dry_run, "compose").await?;
-                emit(
-                    local::up(
-                        LocalOpts {
-                            file,
-                            dry_run,
-                            minimal,
-                            local_model,
-                            pull_model,
-                            slack,
-                            model_mode: local::model_mode_from_env(),
-                            env_file,
-                            build,
-                            stack_image_env: Vec::new(),
-                        },
-                        model,
-                    )
-                    .await?,
-                )
+                let mut opts = bind_local_opts(project, files, dry_run, build).await?;
+                opts.minimal = minimal;
+                opts.local_model = local_model;
+                opts.pull_model = pull_model;
+                opts.slack = slack;
+                opts.model_mode = local::model_mode_from_env();
+                opts.env_file = env_file;
+                emit(local::up(opts, model).await?)
             }
             LocalAction::Rebuild {
                 service,
-                file,
+                project,
+                files,
                 dry_run,
                 minimal,
                 model,
@@ -3615,26 +3661,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                 slack,
                 env_file,
             } => {
-                let file = resolve_compose_file(file, dry_run).await?;
+                let mut opts = bind_local_opts(project, files, dry_run, false).await?;
+                opts.minimal = minimal;
+                opts.local_model = local_model;
+                opts.slack = slack;
+                opts.model_mode = local::model_mode_from_env();
+                opts.env_file = env_file;
                 emit(
                     local::rebuild(local::LocalRebuildOpts {
-                        common: LocalOpts {
-                            file,
-                            dry_run,
-                            minimal,
-                            local_model,
-                            pull_model: false,
-                            slack,
-                            model_mode: local::model_mode_from_env(),
-                            env_file,
-                            // `local rebuild` recreates ONE service against the
-                            // stack already running; it never re-tags images.
-                            // The tag it recreates ONTO still has to match that
-                            // stack, which is `resolve_stack_image_env` below,
-                            // not this flag (#1925).
-                            build: None,
-                            stack_image_env: Vec::new(),
-                        },
+                        common: opts,
                         service,
                         model,
                     })
@@ -3642,49 +3677,29 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
             }
             LocalAction::Down {
-                file,
+                project,
+                files,
                 wipe,
                 yes,
                 dry_run,
             } => {
-                let file = resolve_compose_file(file, dry_run).await?;
+                let opts = bind_local_opts(project, files, dry_run, false).await?;
                 emit(
                     local::down(LocalDownOpts {
-                        common: LocalOpts {
-                            file,
-                            dry_run,
-                            minimal: false,
-                            local_model: None,
-                            pull_model: false,
-                            slack: false,
-                            model_mode: local::ModelMode::DefaultFake,
-                            env_file: None,
-                            build: None,
-                            stack_image_env: Vec::new(),
-                        },
+                        common: opts,
                         wipe,
                         yes,
                     })
                     .await?,
                 )
             }
-            LocalAction::Status { file, dry_run } => {
-                let file = resolve_compose_file(file, dry_run).await?;
-                emit(
-                    local::status(LocalOpts {
-                        file,
-                        dry_run,
-                        minimal: false,
-                        local_model: None,
-                        pull_model: false,
-                        slack: false,
-                        model_mode: local::ModelMode::DefaultFake,
-                        env_file: None,
-                        build: None,
-                        stack_image_env: Vec::new(),
-                    })
-                    .await?,
-                )
+            LocalAction::Status {
+                project,
+                files,
+                dry_run,
+            } => {
+                let opts = bind_local_opts(project, files, dry_run, false).await?;
+                emit(local::status(opts).await?)
             }
             LocalAction::Comms {
                 slack,
@@ -3693,11 +3708,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                 model,
                 app_token,
                 bot_token,
-                file,
+                project,
+                files,
                 dry_run,
             } => {
                 comms::require_provider(slack)?;
-                let resolved_file = resolve_compose_file(file, dry_run).await?;
+                let mut model_opts = bind_local_opts(project, files, dry_run, false).await?;
+                model_opts.minimal = minimal;
+                model_opts.slack = true;
+                model_opts.model_mode = local::model_mode_from_env();
                 // #749: fall back to Slack tokens persisted via `curie secrets
                 // set` when neither a flag nor an env var supplied one, so
                 // `--slack` needs no per-session re-export. Precedence: flag/env
@@ -3706,18 +3725,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                     comms::resolve_local_slack_token("SLACK_APP_TOKEN", &app_token, disconnect)?;
                 let bot_token =
                     comms::resolve_local_slack_token("SLACK_BOT_TOKEN", &bot_token, disconnect)?;
-                let mut model_opts = LocalOpts {
-                    file: resolved_file.clone(),
-                    dry_run,
-                    minimal,
-                    local_model: None,
-                    pull_model: false,
-                    slack: true,
-                    model_mode: local::model_mode_from_env(),
-                    env_file: None,
-                    build: None,
-                    stack_image_env: Vec::new(),
-                };
                 let model_credentials =
                     local::apply_credential_plan(&mut model_opts, crate::ui::ui())?;
                 // #1925: `comms connect` recreates the worker and dispatcher --
@@ -3727,7 +3734,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                 local::resolve_stack_image_env(&mut model_opts).await;
                 emit(
                     comms::local_comms(LocalCommsOpts {
-                        file: resolved_file,
+                        project: model_opts.project().to_string(),
+                        files: model_opts.files().to_vec(),
+                        stub_port: model_opts.resources.stub_port,
                         dry_run,
                         app_token,
                         bot_token,
@@ -4057,7 +4066,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await?,
             ),
         },
-        Some(Command::Cluster { action }) => match action {
+        Some(Command::Cluster { action, context }) => {
+            if let Some(target) = curie::kube_context::pin_for_cluster_command(context.as_deref())?
+            {
+                ui::ui().note(&format!(
+                    "Kubernetes context: {} (cluster {})",
+                    target.context, target.cluster
+                ));
+            }
+            match action {
             ClusterAction::Up {
                 namespace,
                 release,
@@ -5236,7 +5253,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
-        },
+        }
+        }
         Some(Command::ListAgents) => commands::list_agents().await,
         Some(Command::DeployLocal {
             folder,
@@ -5622,6 +5640,7 @@ mod tests {
         match from_env.command {
             Some(Command::Cluster {
                 action: ClusterAction::Up { github_token, .. },
+                ..
             }) => assert_eq!(
                 github_token.as_deref(),
                 Some("ghp-SENTINEL-1124-leak-canary")
@@ -5631,6 +5650,7 @@ mod tests {
         match without.command {
             Some(Command::Cluster {
                 action: ClusterAction::Up { github_token, .. },
+                ..
             }) => assert_eq!(
                 github_token, None,
                 "an unset variable must be absence, not an empty credential"
@@ -5653,6 +5673,7 @@ mod tests {
                         dry_run,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(to, "0.9.0");
                 assert_eq!(namespace, "curie");
@@ -5875,6 +5896,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Eval { model, .. },
+                ..
             }) => assert_eq!(model, vec!["opus"]),
             _ => panic!("expected cluster eval sweep"),
         }
@@ -5951,6 +5973,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Eval { case_id, .. },
+                ..
             }) => assert_eq!(case_id, vec!["greets-the-user", "escalates"]),
             _ => panic!("expected cluster eval with a selector"),
         }
@@ -5960,6 +5983,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Eval { case_id, .. },
+                ..
             }) => assert!(case_id.is_empty()),
             _ => panic!("expected cluster eval"),
         }
@@ -6407,6 +6431,7 @@ mod tests {
                         valkey_password,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(api_key, None, "an omitted --api-key must not default");
                 assert_eq!(
@@ -6439,6 +6464,7 @@ mod tests {
                         valkey_password,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(api_key, Some("K".to_string()));
                 assert_eq!(valkey_password, Some("P".to_string()));
@@ -6462,6 +6488,7 @@ mod tests {
                         valkey_password,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(api_key, None, "an omitted --api-key must not default");
                 assert_eq!(
@@ -6493,6 +6520,7 @@ mod tests {
                         valkey_password,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(api_key, Some("K".to_string()));
                 assert_eq!(valkey_password, Some("P".to_string()));
@@ -6518,6 +6546,7 @@ mod tests {
                         api_local_port,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(listen_port, 0, "an omitted --listen-port must request 0");
                 assert_eq!(
@@ -6545,6 +6574,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { api_local_port, .. },
+                ..
             }) => assert_eq!(
                 api_local_port, 0,
                 "an omitted --api-local-port must request a kernel-assigned port"
@@ -6563,6 +6593,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { api_local_port, .. },
+                ..
             }) => assert_eq!(api_local_port, 18123),
             _ => panic!("expected cluster deploy command"),
         }
@@ -6591,6 +6622,7 @@ mod tests {
                         api_local_port,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(listen_port, 18155);
                 assert_eq!(valkey_local_port, 18156);
@@ -6613,6 +6645,7 @@ mod tests {
                         release,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(api_url, None);
                 assert_eq!(namespace, "curie");
@@ -6635,6 +6668,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { api_url, .. },
+                ..
             }) => assert_eq!(api_url.as_deref(), Some("http://h:30080/api")),
             _ => panic!("expected cluster deploy command"),
         }
@@ -6658,6 +6692,7 @@ mod tests {
                     ClusterAction::Deploy {
                         namespace, release, ..
                     },
+                ..
             }) => {
                 assert_eq!(namespace, "ns1");
                 assert_eq!(release, "rel1");
@@ -6678,22 +6713,22 @@ mod tests {
             let cli = Cli::try_parse_from(argv).expect("local verb accepts -f");
             match cli.command {
                 Some(Command::Local {
-                    action: LocalAction::Up { file, .. },
+                    action: LocalAction::Up { files, .. },
                 }) => {
                     assert_eq!(verb, "up");
-                    assert_eq!(file.as_deref(), Some("custom.yaml"));
+                    assert_eq!(files, vec!["custom.yaml"]);
                 }
                 Some(Command::Local {
-                    action: LocalAction::Down { file, .. },
+                    action: LocalAction::Down { files, .. },
                 }) => {
                     assert_eq!(verb, "down");
-                    assert_eq!(file.as_deref(), Some("custom.yaml"));
+                    assert_eq!(files, vec!["custom.yaml"]);
                 }
                 Some(Command::Local {
-                    action: LocalAction::Status { file, .. },
+                    action: LocalAction::Status { files, .. },
                 }) => {
                     assert_eq!(verb, "status");
-                    assert_eq!(file.as_deref(), Some("custom.yaml"));
+                    assert_eq!(files, vec!["custom.yaml"]);
                 }
                 _ => panic!("expected the local subcommand"),
             }
@@ -6792,6 +6827,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Versions { target },
+                ..
             }) => {
                 assert_eq!(target.agent, "demo");
                 assert_eq!(target.conn.namespace, "prod");
@@ -6812,6 +6848,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Kill { agent, yes, .. },
+                ..
             }) => {
                 assert_eq!(agent, "deal-desk");
                 assert!(yes);
@@ -6833,6 +6870,7 @@ mod tests {
                         dry_run,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(agent, "a");
                 assert!(!yes);
@@ -6849,6 +6887,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Resume { agent, dry_run, .. },
+                ..
             }) => {
                 assert_eq!(agent, "a");
                 assert!(dry_run);
@@ -6864,6 +6903,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Budget { agent, limit, .. },
+                ..
             }) => {
                 assert_eq!(agent, "a");
                 assert_eq!(limit, 12.5);
@@ -6893,6 +6933,7 @@ mod tests {
                         yes,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(agent, "deal-desk");
                 assert_eq!(thread_key, "1234.5678");
@@ -6923,6 +6964,7 @@ mod tests {
                         dry_run,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(agent, "a");
                 assert_eq!(thread_key, "t1");
@@ -7007,6 +7049,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Memory { target, add },
+                ..
             }) => {
                 assert_eq!(target.agent, "translation-bot");
                 assert_eq!(add.as_deref(), Some("ask before translating to French"));
@@ -7128,6 +7171,7 @@ mod tests {
                         open,
                         ..
                     },
+                ..
             }) => {
                 assert_eq!(namespace, "curie");
                 assert_eq!(release, "curie");
@@ -7148,7 +7192,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Cluster {
-                action: ClusterAction::Observability { .. }
+                action: ClusterAction::Observability { .. },
+                ..
             })
         ));
     }
@@ -7161,6 +7206,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Observability { dry_run, open, .. },
+                ..
             }) => {
                 assert!(dry_run, "--dry-run must parse to true");
                 assert!(open, "--open must parse to true");
@@ -7216,6 +7262,7 @@ mod tests {
         match cli.command {
             Some(Command::Cluster {
                 action: ClusterAction::Delete { agent, yes, .. },
+                ..
             }) => {
                 assert_eq!(agent, "a");
                 assert!(yes);
@@ -7310,6 +7357,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { secret, .. },
+                ..
             }) => assert_eq!(secret, vec!["GITHUB_PERSONAL_ACCESS_TOKEN"]),
             _ => panic!("expected cluster deploy"),
         }
@@ -7320,6 +7368,7 @@ mod tests {
         {
             Some(Command::Cluster {
                 action: ClusterAction::Deploy { secret, .. },
+                ..
             }) => assert!(secret.is_empty()),
             _ => panic!("expected cluster deploy"),
         }
@@ -7358,6 +7407,7 @@ mod tests {
                         app_token,
                         ..
                     },
+                ..
             }) => {
                 assert!(slack);
                 assert!(disconnect);

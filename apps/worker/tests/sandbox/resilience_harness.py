@@ -3,9 +3,11 @@
 Two layers live here:
 
 - **Pure helpers** (``thread_hash``, ``unique_marker``, ``final_frame``,
-  ``collected_text``, ``detect_cross_talk``) have no cluster or subprocess
-  dependency and are unit-tested offline in ``test_resilience_harness_unit.py``.
+  ``collected_text``, ``detect_cross_talk``, ``pod_identity_gone``,
+  ``pod_ready``) have no cluster or subprocess dependency and are unit-tested offline in
+  ``test_resilience_harness_unit.py``.
 - **Cluster helpers** (``kubectl``, ``pod_of_sandbox``, ``pod_uid``,
+  ``read_pod``, ``wait_pod_identity_gone``, ``wait_pod_ready``,
   ``port_forward``, ``get_json``, ``post_event``, ``final_frame`` consumers,
   ``live_sandboxclaims``) mirror ``apps/worker/tests/sandbox/test_e2e_k8scratch.py``
   and only run when a real cluster is configured.
@@ -22,8 +24,9 @@ import json
 import os
 import socket
 import subprocess
+import time
 import urllib.request
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
 
@@ -33,6 +36,12 @@ class ResilienceConfig:
 
     The namespace, pool, and Valkey defaults match the sandbox e2e template so
     the two suites can share a standing cluster and dev stack.
+
+    ``history_base`` (``CURIE_SANDBOX_E2E_HISTORY_BASE``) is the cluster-reachable
+    state-API transcript-key prefix the resume phase injects. The runner rejects
+    any ``CURIE_HISTORY_REF`` that is not an ``http(s)://`` state-API URL
+    (``runner/src/curie_runner/history.py``, ``resolve_history``), so a resumed
+    pod cannot boot without one; the resume phase says so rather than guessing.
     """
 
     namespace: str
@@ -44,6 +53,7 @@ class ResilienceConfig:
     batch: int
     runs: int
     live_creds: bool
+    history_base: str
 
     @classmethod
     def from_env(cls) -> ResilienceConfig:
@@ -61,6 +71,7 @@ class ResilienceConfig:
             batch=int(os.environ.get("CURIE_SANDBOX_E2E_BATCH", "3")),
             runs=int(os.environ.get("CURIE_SANDBOX_E2E_RUNS", "1")),
             live_creds=live,
+            history_base=os.environ.get("CURIE_SANDBOX_E2E_HISTORY_BASE", ""),
         )
 
 
@@ -110,6 +121,45 @@ def collected_text(frames: Sequence[dict[str, object]]) -> str:
         if isinstance(value, str) and value:
             parts.append(value)
     return " ".join(parts)
+
+
+def pod_ready(pod: dict[str, object] | None) -> bool:
+    """True when the pod reports ``Ready=True``.
+
+    ``None`` (no such pod) and a pod with no Ready condition are both not-ready.
+    """
+
+    if pod is None:
+        return False
+    status = pod.get("status")
+    if not isinstance(status, dict):
+        return False
+    conditions = status.get("conditions")
+    if not isinstance(conditions, list):
+        return False
+    for condition in conditions:
+        if isinstance(condition, dict) and condition.get("type") == "Ready":
+            return condition.get("status") == "True"
+    return False
+
+
+def pod_identity_gone(pod: dict[str, object] | None, original_uid: str) -> bool:
+    """True when the pod identity named by ``original_uid`` is no longer present.
+
+    Two distinct cluster states both mean the original identity is gone:
+
+    - the pod name resolves to nothing (``pod is None``), the ordinary case; and
+    - the name resolves to a *different* ``metadata.uid``, which is what the
+      sandbox controller produces when it recreates a deleted pod under the same
+      name. A name-only check mistakes that replacement for a failed deletion.
+
+    An unchanged UID means the original pod is still there and the caller must
+    keep waiting.
+    """
+
+    if pod is None:
+        return True
+    return pod_uid(pod) != original_uid
 
 
 def detect_cross_talk(marker: str, other_markers: Sequence[str], text: str) -> bool:
@@ -194,16 +244,24 @@ def get_json(base: str, path: str) -> dict[str, object]:
 
 
 def post_event(
-    base: str, text: str, *, user: str = "U-soak", ts: str = "1.0"
+    base: str, text: str, *, token: str, user: str = "U-soak", ts: str = "1.0"
 ) -> list[dict[str, object]]:
-    """POST an ACI ``message`` event and return the parsed NDJSON frames."""
+    """POST an ACI ``message`` event and return the parsed NDJSON frames.
+
+    ``token`` is the claim's per-claim runner token. The runner enforces a
+    bearer on its POST routes exactly when the claim minted one and is a
+    pass-through when it did not (``runner/src/curie_runner/server.py``,
+    ``create_app``), so an empty token means "this claim carries no bearer",
+    not "skip authentication".
+    """
 
     body = json.dumps(
         {"kind": "event", "type": "message", "text": text, "user": user, "ts": ts}
     ).encode()
-    request = urllib.request.Request(
-        f"{base}/v1/event", data=body, headers={"Content-Type": "application/json"}
-    )
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(f"{base}/v1/event", data=body, headers=headers)
     with urllib.request.urlopen(request, timeout=90) as resp:
         return [json.loads(line) for line in resp.read().splitlines() if line.strip()]
 
@@ -228,3 +286,114 @@ def live_sandboxclaims(
     )
     items = json.loads(raw).get("items", [])
     return [dict(item) for item in items]
+
+
+class PodReadError(RuntimeError):
+    """A pod read failed for a reason that is not "the pod does not exist".
+
+    Authorization failures, transport failures, and malformed API responses all
+    raise this rather than being read as a deletion.
+    """
+
+
+def read_pod(cfg: ResilienceConfig, name: str) -> dict[str, object] | None:
+    """The pod object for ``name``, or ``None`` when the API says it does not exist.
+
+    ``--ignore-not-found`` makes the API itself answer the question: a missing
+    pod is an empty body with exit 0, and every other failure (RBAC, an
+    unreachable API server, a credential-helper that will not run, a timeout)
+    is a non-zero exit that raises :class:`PodReadError`. Matching ``kubectl``
+    stderr text would be wrong here -- an auth message such as ``exec:
+    executable kubelogin not found`` contains "not found" and would certify a
+    deletion nobody observed.
+
+    A body that parses but carries no usable ``metadata.uid`` is also a failed
+    read, not a pod: identity is the whole question this answers.
+    """
+
+    try:
+        raw = kubectl(cfg, "get", "pod", name, "--ignore-not-found", "-o", "json")
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        raise PodReadError(f"pod read for {name} failed: {stderr}") from exc
+    except subprocess.SubprocessError as exc:
+        raise PodReadError(f"pod read for {name} failed: {exc}") from exc
+    if not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        raise PodReadError(f"pod read for {name} returned malformed JSON") from exc
+    if not isinstance(parsed, dict):
+        raise PodReadError(f"pod read for {name} returned an unexpected body")
+    metadata = parsed.get("metadata")
+    uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    if not isinstance(uid, str) or not uid:
+        raise PodReadError(f"pod read for {name} returned no metadata.uid")
+    return dict(parsed)
+
+
+def wait_pod_identity_gone(
+    cfg: ResilienceConfig,
+    sandbox_name: str,
+    original_uid: str,
+    *,
+    timeout: float = 90.0,
+    poll_interval: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, object] | None:
+    """Block until the pod identity ``original_uid`` disappears; return what replaced it.
+
+    Returns ``None`` if the name went away entirely, or the replacement pod
+    object if the controller recreated it under the same name. Raises
+    ``AssertionError`` if ``original_uid`` is still present at ``timeout``, and
+    propagates :class:`PodReadError` for any read that did not answer the
+    question.
+
+    ``sleep`` and ``clock`` are injected so the offline unit tests can exercise
+    every branch, including the timeout, without a cluster or real waiting.
+    """
+
+    deadline = clock() + timeout
+    while True:
+        pod = read_pod(cfg, sandbox_name)
+        if pod_identity_gone(pod, original_uid):
+            return pod
+        if clock() >= deadline:
+            raise AssertionError(
+                f"pod {sandbox_name} still carries uid {original_uid} after {timeout}s"
+            )
+        sleep(poll_interval)
+
+
+def wait_pod_ready(
+    cfg: ResilienceConfig,
+    sandbox_name: str,
+    *,
+    timeout: float = 120.0,
+    poll_interval: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, object]:
+    """Block until ``sandbox_name`` reports ``Ready=True`` and return that pod.
+
+    A claim satisfied by a pod the controller has just rebuilt can be handed back
+    before that pod serves, so the recovery assertions state readiness rather
+    than racing a port-forward against container start. Failing to become ready
+    inside ``timeout`` is a failure, never a pass: this waits for the assertion,
+    it does not relax it. A read that cannot answer still raises
+    :class:`PodReadError`.
+    """
+
+    deadline = clock() + timeout
+    while True:
+        pod = read_pod(cfg, sandbox_name)
+        if pod_ready(pod):
+            assert pod is not None
+            return pod
+        if clock() >= deadline:
+            raise AssertionError(
+                f"pod {sandbox_name} was not Ready within {timeout}s"
+            )
+        sleep(poll_interval)

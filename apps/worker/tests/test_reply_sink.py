@@ -42,6 +42,7 @@ from curie_worker.reply_sink import (
     CLUSTER_MESSAGE_ADAPTER,
     MAX_ACK_BODY_BYTES,
     HttpReplyAdapter,
+    InvalidReplyTargetError,
     MissingAdapterCredentialError,
     OversizedAdapterResponseError,
     RedirectedAdapterEndpointError,
@@ -180,7 +181,9 @@ def _update(kind: str, text: str = "the answer") -> ReplyUpdate:
     )
 
 
-def _cluster_message_update(reply_ref: str = CLUSTER_MESSAGE_REPLY_REF) -> ReplyUpdate:
+def _cluster_message_update(
+    reply_ref: str | None = CLUSTER_MESSAGE_REPLY_REF,
+) -> ReplyUpdate:
     return ReplyUpdate(
         version=REPLY_WIRE_VERSION,
         event="reply.update",
@@ -801,6 +804,49 @@ def test_cluster_message_rejects_noncanonical_uuid4_before_any_request(
                     ),
                 )
             assert requests == [], "validation must run before any HTTP request"
+        finally:
+            if sink is not None:
+                await sink.aclose()
+
+    asyncio.run(go())
+
+
+def test_cluster_message_absent_reply_ref_names_absence_not_malformed_uuid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2757: None is missing, not a bad UUIDv4, and must not hit the wire."""
+
+    async def go() -> None:
+        requests: list[tuple[object, object]] = []
+
+        def refuse_request(
+            _session: aiohttp.ClientSession,
+            url: object,
+            *_args: object,
+            **kwargs: object,
+        ) -> object:
+            requests.append((url, kwargs.get("headers")))
+            raise AssertionError("absent reply_ref attempted outbound HTTP")
+
+        monkeypatch.setattr(aiohttp.ClientSession, "post", refuse_request)
+        sink = None
+        try:
+            sink = build_reply_sink(
+                _config(
+                    api_base_url="http://api.example.test:8000",
+                    internal_worker_token=INTERNAL_WORKER_TOKEN,
+                )
+            )
+            with pytest.raises(InvalidReplyTargetError, match="reply_ref is required") as raised:
+                await sink.emit(
+                    _cluster_message_update(None),
+                    route=TargetRoute(
+                        endpoint="http://evil.example/hostile-wire-endpoint",
+                        adapter=CLUSTER_MESSAGE_ADAPTER,
+                    ),
+                )
+            assert "canonical lowercase UUIDv4" not in str(raised.value)
+            assert requests == [], "absence must be refused before any HTTP request"
         finally:
             if sink is not None:
                 await sink.aclose()

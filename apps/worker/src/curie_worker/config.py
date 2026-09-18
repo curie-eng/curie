@@ -1153,7 +1153,7 @@ class WorkerConfig(BaseSettings):
     def valkey_client_kwargs(self) -> dict[str, Any]:
         """The connection parts every Valkey client in the worker is built from.
 
-        One place -- the three clients in ``run.build`` and the upgrade-drain
+        One place -- the four clients in ``run.build`` and the upgrade-drain
         hook's own client -- so they cannot drift on the transport: ``ssl``
         reaching some of them and not the rest is a lane that goes silently
         cleartext against a TLS-only BYO store (#2315), and for the drain hook
@@ -1248,6 +1248,12 @@ class WorkerConfig(BaseSettings):
         # Where a posted approval card lives so its own resolution or expiry can
         # settle it without sharing identity with another approval on the thread.
         return f"{self.key_prefix}:approval-card:{approval_id}"
+
+    def approval_notice_ref_key(self, approval_id: str) -> str:
+        # The reply ref a placeholderless pending notice minted AFTER its approval
+        # row was persisted without one (#2721). A distinct segment from the card
+        # key so the card store's legacy migration scan never sees these entries.
+        return f"{self.key_prefix}:approval-notice-ref:{approval_id}"
 
     def dead_letter_stream_name(self) -> str:
         """The graveyard stream: the explicit override, else derived ``<stream>:dead``.

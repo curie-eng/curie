@@ -1055,14 +1055,13 @@ pub struct ReapReport {
     pub error: Option<String>,
 }
 
-async fn labeled_container_ids(label: &str) -> Result<Vec<String>> {
-    let list_args: Vec<String> = vec![
-        "ps".into(),
-        "-a".into(),
-        "--filter".into(),
-        format!("label={label}"),
-        "-q".into(),
-    ];
+async fn labeled_container_ids_filtered(filters: &[(&str, &str)]) -> Result<Vec<String>> {
+    let mut list_args: Vec<String> = vec!["ps".into(), "-a".into()];
+    for (key, value) in filters {
+        list_args.push("--filter".into());
+        list_args.push(format!("{key}={value}"));
+    }
+    list_args.push("-q".into());
     let out = docker(&list_args).await?;
     Ok(out
         .lines()
@@ -1112,13 +1111,17 @@ fn reap_report(
 /// (e.g. `local down`) cannot report a clean teardown while runner containers
 /// keep holding ports and credentials (#613).
 pub async fn reap_labeled(label: &str) -> ReapReport {
-    let candidates = match labeled_container_ids(label).await {
+    reap_filtered(&[("label", label)]).await
+}
+
+pub async fn reap_filtered(filters: &[(&str, &str)]) -> ReapReport {
+    let candidates = match labeled_container_ids_filtered(filters).await {
         Ok(ids) => ids,
         Err(e) => {
             return ReapReport {
                 removed: 0,
                 still_present: Vec::new(),
-                error: Some(format!("could not list containers labeled {label}: {e}")),
+                error: Some(format!("could not list containers {filters:?}: {e}")),
             }
         }
     };
@@ -1147,14 +1150,14 @@ pub async fn reap_labeled(label: &str) -> ReapReport {
     };
 
     // Re-list for the ground truth of what is still running.
-    match labeled_container_ids(label).await {
+    match labeled_container_ids_filtered(filters).await {
         Ok(still_present) => reap_report(&rm_stdout, rm_error, still_present),
         Err(e) => ReapReport {
             removed: count_removed(&rm_stdout),
             still_present: Vec::new(),
             error: Some(match rm_error {
                 Some(r) => format!("{r}; also could not confirm teardown: {e}"),
-                None => format!("could not confirm teardown of containers labeled {label}: {e}"),
+                None => format!("could not confirm teardown of containers {filters:?}: {e}"),
             }),
         },
     }

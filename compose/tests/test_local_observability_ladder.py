@@ -212,8 +212,9 @@ def test_local_ladder_owns_a_real_queryable_otlp_sink() -> None:
     # The sink has to exist before `local up`, because service startup telemetry
     # and the ingress root are part of the proof. The query belongs after the
     # real turn finalized, not beside static compose/config assertions.
-    local_up = 'local up -f "$REPO_ROOT/compose.dev.yaml" --build'
+    local_up = "local_compose_cli_args local up"
     assert local_up in rung, "the local rung must build the current compose source"
+    assert "--build" in rung, "the local rung must still pass --build"
     assert rung.index("start_local_otel_sink") < rung.index(local_up)
     assert rung.index("assert_local_otel_healthy_turn") > rung.index(
         'assert_finalized_reply "local"'
@@ -449,12 +450,15 @@ def test_inject_local_runner_failure_blanks_live_credentials_and_reaps(
     """Execute the real inject/restore helpers against a stub docker."""
 
     source = LADDER_PATH.read_text()
-    script = _shell_function(source, "container_env_value")
+    script = _shell_function(source, "ladder_compose")
+    script += _shell_function(source, "container_env_value")
     script += _shell_function(source, "reap_local_runner_sandboxes")
     script += _shell_function(source, "inject_local_runner_failure")
     script += _shell_function(source, "restore_local_runner_health")
     script += """
 REPO_ROOT="$1"
+COMPOSE_PROJECT=curie
+COMPOSE_FILES=("$REPO_ROOT/compose.dev.yaml")
 SANDBOX_LABEL="curietech.ai/managed-by=curie-sandbox-substrate"
 LOCAL_OTEL_ENDPOINT="http://otel.example:4318"
 LIVE=1
@@ -659,6 +663,10 @@ def test_product_oracle_discovers_only_the_seed_trace_from_bounded_transport(
         "operation",
         "observation_count",
         "observation_type",
+        # Langfuse renames a tool observation to the tool, so the tool identity is
+        # the only evidence that a specific tool ran. A built-in or connector tool
+        # name is not caller data.
+        "tool_name",
         "approval_decision",
     ):
         assert allowed in sanitizer, f"sanitized evidence omits safe field {allowed!r}"
@@ -719,6 +727,7 @@ def test_product_evidence_sanitizer_and_failure_paths_never_dump_private_json(
         "operation",
         "observation_count",
         "observation_type",
+        "tool_name",
         "approval_decision",
     }
     combined_output = result.stdout + result.stderr
@@ -887,7 +896,7 @@ def test_approval_seed_background_message_is_owned_by_global_cleanup() -> None:
     assert "APPROVAL_SEED_MESSAGE_PID=$!" in approval
     assert "stop_approval_seed_message terminate || true" in trap
     assert trap.index("stop_approval_seed_message terminate || true") < trap.index(
-        '"$BIN" local down'
+        "local_compose_cli_args local down"
     ), "the background Slack stub must stop before its stack is torn down"
     assert approval.count("stop_approval_seed_message terminate || true") == 2
     assert "stop_approval_seed_message || code=$?" in approval
@@ -944,9 +953,10 @@ def test_product_collector_restore_restarts_and_verifies_every_seed_emitter() ->
         "export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318" in restore
     )
     assert (
-        "export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318"
+        'export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT="$PRODUCT_COLLECTOR_WORKER_ENDPOINT"'
         in restore
     )
+    assert "http://127.0.0.1:24318" in source
     assert "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in restore
     assert "unset OTEL_EXPORTER_OTLP_ENDPOINT" not in restore
     for protocol in ("http/protobuf", "otel-collector:4318"):
@@ -1123,6 +1133,7 @@ REPO_ROOT="$2"
 FAILURE="$3"
 BIN=true
 LAST_ORDINARY_TRACE_ID=cccccccccccccccccccccccccccccccc
+ladder_compose() { docker compose "$@"; }
 sleep() { :; }
 docker() {
     if [[ "$1" == logs ]]; then

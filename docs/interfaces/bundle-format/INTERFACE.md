@@ -159,6 +159,11 @@ tool is `mcp__plugin_<bundle>_<server>__<tool>`; a connector is mounted directly
 `mcp__<connector>__<tool>` with no infix). A consumer that reads the manifest alone rejects every
 connector gate as `approval_policy.gate_not_namespaced`
 (`packages/plugin-format/src/plugin_format/validate.py::_validate_approval_policy`).
+One gate name comes from neither set: the platform publication tool, accepted by its exact live
+name `mcp__curie__publish_changes` (`plugin_format.PLATFORM_PUBLISH_TOOL_NAME`, #2776) so a
+bundle can bind publication approval to a route. The rest of the `mcp__curie__` namespace is still
+refused. A consumer built before the first release carrying #2776 refuses this gate as
+`approval_policy.gate_not_namespaced`.
 
 A second consumer must accept all of these shapes, the Claude-Code-shaped ones and the Curie-only
 overlay both.

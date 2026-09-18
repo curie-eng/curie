@@ -794,9 +794,10 @@ def test_deleting_the_claim_removes_the_materialized_directory(
     root, _mode = _attachment_mount(client.calls[0])
     assert root.exists()
 
-    client.delete_claim("claim-attachments")
+    client.delete_claim("claim-attachments", request_timeout_seconds=1.0)
 
     assert not root.exists(), "the attachment dir outlived the claim it belonged to"
+    assert 0 < client.timeouts[-1] <= 1.0
     _left_nothing(staged)
 
 
@@ -811,7 +812,14 @@ def test_a_failed_container_boot_removes_the_materialized_directory(
     """
 
     class _FailingDocker(_RecordingDocker):
-        def _docker(self, args: list[str], *, check: bool = True) -> str:
+        def _docker(
+            self,
+            args: list[str],
+            *,
+            request_timeout_seconds: float,
+            check: bool = True,
+        ) -> str:
+            assert request_timeout_seconds > 0
             self.calls.append(args)
             if args[0] == "run":
                 raise DockerError("docker run failed")

@@ -7,6 +7,8 @@
 #
 # Usage:
 #   curie dev cluster-upgrade-matrix [--scenario all|...] [--force] [--keep] [--json]
+#   bash cli/scripts/cluster-upgrade-matrix.sh --list-shards [--json]
+#   bash cli/scripts/cluster-upgrade-matrix.sh --shard s01 [--force] [--keep] [--json]
 #   bash cli/scripts/cluster-upgrade-matrix.sh --self-test
 set -euo pipefail
 
@@ -16,6 +18,15 @@ FORCE=0
 KEEP=0
 JSON=0
 SCENARIO="all"
+SCENARIO_SET=0
+SHARD=""
+SHARD_SETUP=0
+SHARD_ITEMS=()
+LIST_SHARDS=0
+CURRENT_LABEL=""
+CURRENT_NAME=""
+CURRENT_PHASES=""
+CURRENT_STARTED=""
 BIN="${CURIE_BIN:-}"
 NAMESPACE="${CURIE_E2E_NAMESPACE:-acme-2590}"
 RELEASE="${CURIE_E2E_RELEASE:-t2590}"
@@ -35,6 +46,7 @@ STARTED_AT=""
 CHART_090=""
 CHART_091=""
 REV_088=""
+REV_089=""
 SENTINEL_ID="acme-2590"
 FAIL_AT_HOOK=""
 INTERRUPT_AFTER_HOOK=""
@@ -42,11 +54,16 @@ INTERRUPT_AFTER_HOOK=""
 CHART_088_SHA="88664c2f991bed7a3e4bc0513ae73bfcbac08077d99a69e7087138aa6f8f3af2"
 CLI_088_SHA="dc0e1ab1b928522f1ca1c03e05d823e08218800c2d2a33d0d88af623972f6685"
 REL_088="https://github.com/curie-eng/curie/releases/download/v0.8.8"
+CHART_089_SHA="ee57017fe3009c35a4390b0c0555c44249ba98bba1d4f53f12aa3944b2bd5e5e"
+CLI_089_SHA="b8f3a00bcbf0920ae61e55039aa6a9d48e4d302db88a8c97e8148905569c0e9a"
+REL_089="https://github.com/curie-eng/curie/releases/download/v0.8.9"
 # Published v0.8.8 ships alembic 0039. The candidate head is the checkout's
 # schema_compat.json, so a rebase onto a newer next does not hard-code 0043.
 PUBLISHED_HEAD="0039"
 TARGET_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["schema_head"])' \
     "$REPO_ROOT/apps/api/src/curie_api/schema_compat.json")"
+SUPPORTED_ROLLBACK_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["windows"]["0.9.0"]["schema_head"])' \
+    "$REPO_ROOT/cli/src/application_schema_windows.json")"
 
 SCENARIOS_ALL=(
     soak-refusal
@@ -58,10 +75,41 @@ SCENARIOS_ALL=(
     n-to-n1
     compatible-rollback
     rollback-published-088
+    rollback-published-089
     migration-crash
     converge-negative
     previous-serves
 )
+
+MATRIX_PHASES=(plan validate drain checkpoint migrate apply converge canary commit)
+# interrupt-resume runs a subset (issue #2733): plan/validate/drain interrupt
+# before any mutation and converge/canary follow apply, so checkpoint, migrate,
+# apply, commit are the distinct resume states. fail-every-phase keeps all nine.
+INTERRUPT_PHASES=(checkpoint migrate apply commit)
+# Tag the kind node currently holds exclusively; "" when unknown. Any path
+# that loads or untags app images on the node must clear it.
+EXCLUSIVE_KIND_TAG=""
+
+# Canonical shard manifest: `<id> <setup|nosetup> <scenario>[:<phase>+<phase>]...`.
+# Scenario order inside a shard preserves the serial state chain. `setup`
+# shards start from setup_nonempty_n (published 0.8.8 + sentinel, forward-only
+# upgrade to 0.9.0). --list-shards, --shard and the self-test coverage gate all
+# read SHARDS, so CI cannot run a manifest the gate did not check.
+SHARDS_CANONICAL="s01 nosetup soak-refusal fresh-n n1-to-n-nonempty same-version
+s02 setup fail-every-phase:plan+validate+drain
+s03 setup fail-every-phase:checkpoint+migrate+apply
+s04 setup fail-every-phase:converge
+s05 setup fail-every-phase:canary
+s06 setup fail-every-phase:commit
+s07 setup interrupt-resume:checkpoint+migrate
+s08 setup interrupt-resume:apply+commit
+s09 setup n-to-n1 compatible-rollback
+s10 setup rollback-published-088
+s11 nosetup rollback-published-089
+s12 nosetup migration-crash
+s13 setup converge-negative
+s14 setup previous-serves"
+SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
 
 log() { printf '%s\n' "$*" >&2; }
 
@@ -72,7 +120,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|compatible-rollback|rollback-published-088|migration-crash|converge-negative|previous-serves] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|compatible-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -110,6 +158,82 @@ is_sha256() {
     [[ "$h" =~ ^[0-9a-f]{64}$ ]]
 }
 
+# shard_manifest <check|json|lookup> <manifest> [shard-id]
+# check: exit 0 when every scenario runs exactly once and each phased scenario
+# covers its phase set exactly once across shards (fail-every-phase:
+# MATRIX_PHASES, interrupt-resume: INTERRUPT_PHASES); else print
+# "shard coverage failed: ..." and exit 2. json: check, then emit the manifest.
+# lookup: check, then print setup|nosetup and one item per line; exit 3 when
+# the id is unknown.
+shard_manifest() {
+    python3 -c '
+import json, sys
+mode, manifest = sys.argv[1], sys.argv[2]
+want = sys.argv[3] if len(sys.argv) > 3 else ""
+scenarios = sys.argv[4].split()
+phases = sys.argv[5].split()
+required = {"fail-every-phase": phases, "interrupt-resume": sys.argv[6].split()}
+phased = ("fail-every-phase", "interrupt-resume")
+errors, shards, ids = [], [], set()
+for ln, line in enumerate(manifest.splitlines(), 1):
+    toks = line.split()
+    if not toks:
+        continue
+    if len(toks) < 3:
+        errors.append(f"line {ln}: need <id> <setup|nosetup> <scenario>...")
+        continue
+    sid, setup, items = toks[0], toks[1], toks[2:]
+    if setup not in ("setup", "nosetup"):
+        errors.append(f"{sid}: setup flag must be setup or nosetup, got {setup}")
+    if sid in ids:
+        errors.append(f"duplicate shard id {sid}")
+    ids.add(sid)
+    entries = []
+    for item in items:
+        name, sep, ph = item.partition(":")
+        plist = None
+        if name not in scenarios:
+            errors.append(f"{sid}: unknown scenario {name}")
+        if name in phased:
+            if not ph:
+                errors.append(f"{sid}: phased scenario {name} must be split by phase")
+            else:
+                plist = ph.split("+")
+                for p in plist:
+                    if p not in phases:
+                        errors.append(f"{sid}: unknown phase {p} for {name}")
+        elif sep:
+            errors.append(f"{sid}: scenario {name} is not phased")
+        entries.append({"name": name, "phases": plist})
+    shards.append({"id": sid, "setup": setup == "setup", "scenarios": entries})
+for name in scenarios:
+    hits = [e for s in shards for e in s["scenarios"] if e["name"] == name]
+    if name in phased:
+        got = [p for e in hits for p in (e["phases"] or [])]
+        required_phases = required[name]
+        for p in phases:
+            n, need = got.count(p), (1 if p in required_phases else 0)
+            if n != need:
+                errors.append(f"{name} phase {p} runs {n} times, want {need}")
+    elif len(hits) != 1:
+        errors.append(f"scenario {name} runs {len(hits)} times, want 1")
+if errors:
+    for e in errors:
+        print(f"shard coverage failed: {e}", file=sys.stderr)
+    raise SystemExit(2)
+if mode == "json":
+    print(json.dumps({"shards": shards}))
+elif mode == "lookup":
+    for s in shards:
+        if s["id"] == want:
+            print("setup" if s["setup"] else "nosetup")
+            for e in s["scenarios"]:
+                print(e["name"] + (":" + "+".join(e["phases"]) if e["phases"] else ""))
+            raise SystemExit(0)
+    raise SystemExit(3)
+' "$1" "$2" "${3:-}" "${SCENARIOS_ALL[*]}" "${MATRIX_PHASES[*]}" "${INTERRUPT_PHASES[*]}"
+}
+
 verify_sha256() {
     local want="$1" file="$2"
     echo "$want  $file" | sha256sum -c -
@@ -118,7 +242,9 @@ verify_sha256() {
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --scenario) SCENARIO="${2:-}"; shift 2 ;;
+            --scenario) SCENARIO="${2:-}"; SCENARIO_SET=1; shift 2 ;;
+            --shard) SHARD="${2:-}"; [[ -n "$SHARD" ]] || die "--shard needs an id"; shift 2 ;;
+            --list-shards) LIST_SHARDS=1; shift ;;
             --force) FORCE=1; shift ;;
             --keep) KEEP=1; shift ;;
             --json) JSON=1; shift ;;
@@ -129,6 +255,25 @@ parse_args() {
     done
     if ! valid_scenario "$SCENARIO"; then
         die "unknown scenario '$SCENARIO'"
+    fi
+    if [[ -n "$SHARD" ]]; then
+        (( SCENARIO_SET == 0 )) || die "--shard and --scenario are mutually exclusive"
+        (( LIST_SHARDS == 0 )) || die "--shard and --list-shards are mutually exclusive"
+        local out rc=0 line
+        out="$(shard_manifest lookup "$SHARDS" "$SHARD")" || rc=$?
+        (( rc != 3 )) || die "unknown shard '$SHARD'"
+        (( rc == 0 )) || die "shard manifest failed coverage; refusing --shard $SHARD"
+        SHARD_ITEMS=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            if [[ "$line" == setup ]]; then
+                SHARD_SETUP=1
+            elif [[ "$line" == nosetup ]]; then
+                SHARD_SETUP=0
+            else
+                SHARD_ITEMS+=("$line")
+            fi
+        done <<<"$out"
     fi
 }
 
@@ -161,10 +306,17 @@ run_self_test() {
         log "self-test: published checksum pins are malformed"
         failed=1
     fi
-    if [[ "$PUBLISHED_HEAD" =~ ^[0-9]{4}$ && "$TARGET_HEAD" =~ ^[0-9]{4}$ ]]; then
-        log "schema heads published=$PUBLISHED_HEAD candidate=$TARGET_HEAD"
+    if is_sha256 "$CHART_089_SHA" && is_sha256 "$CLI_089_SHA"; then
+        log "published v0.8.9 chart checksum pinned"
+        log "published v0.8.9 cli checksum pinned"
     else
-        log "self-test: schema heads are malformed published='$PUBLISHED_HEAD' target='$TARGET_HEAD'"
+        log "self-test: published v0.8.9 checksum pins are malformed"
+        failed=1
+    fi
+    if [[ "$PUBLISHED_HEAD" =~ ^[0-9]{4}$ && "$TARGET_HEAD" =~ ^[0-9]{4}$ && "$SUPPORTED_ROLLBACK_HEAD" =~ ^[0-9]{4}$ ]]; then
+        log "schema heads published=$PUBLISHED_HEAD candidate=$TARGET_HEAD supported-rollback=$SUPPORTED_ROLLBACK_HEAD"
+    else
+        log "self-test: schema heads are malformed published='$PUBLISHED_HEAD' target='$TARGET_HEAD' supported-rollback='$SUPPORTED_ROLLBACK_HEAD'"
         failed=1
     fi
     tmp="$(mktemp)"
@@ -233,6 +385,39 @@ run_self_test() {
         log "self-test: restore_n must helm rollback to 0.9.0 instead of a full upgrade wait"
         failed=1
     fi
+    if awk '/^restore_n\(\)/,/^}/' "$script_path" | awk '
+        /exclusive_kind_tag "0.9.0"/ { if (!rollback) before=1 }
+        /helm_ns rollback/ { rollback=1 }
+        END { exit (before && rollback) ? 0 : 1 }
+    '; then
+        log "restore_n loads exclusive 0.9.0 images before rollback"
+    else
+        log "self-test: restore_n must exclusive_kind_tag 0.9.0 before helm rollback (pullPolicy Never)"
+        failed=1
+    fi
+    if awk '/^exclusive_kind_tag\(\)/,/^}/' "$script_path" | awk '
+        index($0, "\"$EXCLUSIVE_KIND_TAG\" == \"$keep\"") { early=NR }
+        /kind load docker-image/ { if (!load) load=NR }
+        index($0, "EXCLUSIVE_KIND_TAG=\"$keep\"") { set=NR }
+        /untag_kind_siblings/ { last_untag=NR }
+        END { exit (early && load && early < load && set > last_untag) ? 0 : 1 }
+    '; then
+        log "exclusive_kind_tag skips a reload when the node already holds the tag"
+    else
+        log "self-test: exclusive_kind_tag must return early on EXCLUSIVE_KIND_TAG and set it after the final untag"
+        failed=1
+    fi
+    local fn inval_ok=1
+    for fn in load_tag_images untag_kind_siblings ensure_kind retag_candidate_versions; do
+        if ! awk "/^${fn}\\(\\)/,/^}/" "$script_path" | grep -q 'EXCLUSIVE_KIND_TAG=""'; then
+            log "self-test: $fn must invalidate EXCLUSIVE_KIND_TAG"
+            inval_ok=0
+            failed=1
+        fi
+    done
+    if (( inval_ok )); then
+        log "load_tag_images invalidates the exclusive kind tag"
+    fi
     if awk '/^exclusive_kind_tag\(\)/,/^}/' "$script_path" | awk '
         /untag_kind_siblings/ { untag++ }
         /kind load docker-image/ { load=1 }
@@ -255,6 +440,70 @@ run_self_test() {
         log "self-test: rollback-published-088 must load 0.8.8 images before helm rollback"
         failed=1
     fi
+    if awk '/^run_rollback_published_089\(\)/,/^}/' "$script_path" | grep -q 'run_compatible_rollback'; then
+        log "published 0.8.9 refusal keeps the compatible rollback proof in one scenario"
+    else
+        log "self-test: rollback-published-089 must run the compatible rollback proof"
+        failed=1
+    fi
+    if awk '/^run_migration_crash\(\)/,/^}/' "$script_path" | awk '
+        /interrupt_schema_migrate$/ { interrupt=NR }
+        /SECONDS \+ 120/ { if (interrupt) bound=NR }
+        /terminate_tree "\$pid"/ { if (bound) kill=NR }
+        /recover_killed_upgrade_ownership/ { if (kill) owner=NR }
+        /recover_helm_lock/ { if (owner) lock=NR }
+        /migration-crash-retry/ { if (lock) retry=NR }
+        END { exit retry ? 0 : 1 }
+    '; then
+        log "migration-crash bounds the interrupted upgrade wait"
+    else
+        log "self-test: migration-crash must wait at most 120s for the interrupted upgrade, then terminate it and recover ownership and the helm lock before retrying"
+        failed=1
+    fi
+    if shard_manifest check "$SHARDS"; then
+        log "shard manifest covers every scenario exactly once"
+    else
+        log "self-test: shard coverage failed for the active manifest"
+        failed=1
+    fi
+    local mutated label
+    for label in "dropped scenario" "duplicated scenario" "dropped phase" "duplicated phase"; do
+        case "$label" in
+            "dropped scenario") mutated="${SHARDS_CANONICAL/ migration-crash/}" ;;
+            "duplicated scenario") mutated="${SHARDS_CANONICAL/s12 nosetup migration-crash/s12 nosetup migration-crash fresh-n}" ;;
+            "dropped phase") mutated="${SHARDS_CANONICAL/interrupt-resume:checkpoint+migrate/interrupt-resume:checkpoint}" ;;
+            "duplicated phase") mutated="${SHARDS_CANONICAL/fail-every-phase:converge/fail-every-phase:converge+plan}" ;;
+        esac
+        if [[ "$mutated" == "$SHARDS_CANONICAL" ]]; then
+            log "self-test: $label negative control did not mutate the manifest"
+            failed=1
+        elif shard_manifest check "$mutated" 2>/dev/null; then
+            log "self-test: shard coverage accepted a $label"
+            failed=1
+        else
+            log "shard coverage refused a $label"
+        fi
+    done
+    local saved_evidence="$EVIDENCE_DIR" saved_summary="${GITHUB_STEP_SUMMARY-}" timing_dir
+    timing_dir="$(mktemp -d)"
+    EVIDENCE_DIR="$timing_dir"
+    GITHUB_STEP_SUMMARY=""
+    run_scenario_timed self-test-probe all true
+    if python3 -c '
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+ok = len(rows) == 1 and rows[0]["scenario"] == "self-test-probe" and rows[0]["phases"] == "all" \
+    and rows[0]["outcome"] == "passed" and isinstance(rows[0]["elapsed_seconds"], int) and "shard" in rows[0]
+raise SystemExit(0 if ok else 1)
+' "$timing_dir/scenarios.jsonl" 2>/dev/null && [[ -z "$CURRENT_LABEL" ]]; then
+        log "per-scenario timing recorded"
+    else
+        log "self-test: per-scenario timing row missing or malformed"
+        failed=1
+    fi
+    rm -rf "$timing_dir"
+    EVIDENCE_DIR="$saved_evidence"
+    GITHUB_STEP_SUMMARY="$saved_summary"
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
@@ -293,8 +542,49 @@ fullname() {
     printf '%s-curie' "$RELEASE"
 }
 
+# record_timing_row <label> <scenario> <phases> <outcome> <elapsed>
+record_timing_row() {
+    local label="$1" name="$2" phases="$3" outcome="$4" elapsed="$5"
+    log "$label phases=$phases outcome=$outcome elapsed_seconds=$elapsed"
+    mkdir -p "$EVIDENCE_DIR" 2>/dev/null || true
+    python3 -c '
+import json, sys
+print(json.dumps({"scenario": sys.argv[1], "phases": sys.argv[2], "outcome": sys.argv[3],
+                  "elapsed_seconds": int(sys.argv[4]), "shard": sys.argv[5] or None}))
+' "$name" "$phases" "$outcome" "$elapsed" "$SHARD" >>"$EVIDENCE_DIR/scenarios.jsonl" 2>/dev/null || true
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        printf '| %s | %s | %s | %s | %s |\n' "${SHARD:-serial}" "$name" "$phases" "$outcome" "$elapsed" \
+            >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+    fi
+}
+
+# run_timed <label> <scenario> <phases|all> <fn...>
+# No if/|| around the call: set -e must stay live inside the scenario. A
+# failure exits the script and cleanup() records the failed row from
+# CURRENT_LABEL.
+run_timed() {
+    CURRENT_LABEL="$1"
+    CURRENT_NAME="$2"
+    CURRENT_PHASES="$3"
+    shift 3
+    CURRENT_STARTED=$SECONDS
+    "$@"
+    record_timing_row "$CURRENT_LABEL" "$CURRENT_NAME" "$CURRENT_PHASES" passed $((SECONDS - CURRENT_STARTED))
+    CURRENT_LABEL=""
+}
+
+run_scenario_timed() {
+    local name="$1" phases="$2"
+    shift 2
+    run_timed "scenario=$name" "$name" "$phases" "$@"
+}
+
 cleanup() {
     local status=$?
+    if [[ -n "$CURRENT_LABEL" ]]; then
+        record_timing_row "$CURRENT_LABEL" "$CURRENT_NAME" "$CURRENT_PHASES" failed $((SECONDS - CURRENT_STARTED))
+        CURRENT_LABEL=""
+    fi
     if (( KEEP )); then
         log "keeping owned resources (kind=$KIND_CLUSTER ns=$NAMESPACE release=$RELEASE)"
         return 0
@@ -337,9 +627,20 @@ fetch_published() {
     download_pin "$REL_088/curie-x86_64-unknown-linux-gnu" "$ASSET_DIR/curie-0.8.8" "$CLI_088_SHA"
     chmod +x "$ASSET_DIR/curie-0.8.8"
     PUBLISHED_BIN="$ASSET_DIR/curie-0.8.8"
+    download_pin "$REL_089/curie-0.8.9.tgz" "$ASSET_DIR/curie-0.8.9.tgz" "$CHART_089_SHA"
+    download_pin "$REL_089/curie-x86_64-unknown-linux-gnu" "$ASSET_DIR/curie-0.8.9" "$CLI_089_SHA"
+    chmod +x "$ASSET_DIR/curie-0.8.9"
     [[ "$(helm show chart "$ASSET_DIR/curie-0.8.8.tgz" | awk '$1 == "version:" {print $2}')" == 0.8.8 ]] \
         || die "published chart tgz is not version 0.8.8"
-    log "published v0.8.8 chart and CLI verified"
+    [[ "$(helm show chart "$ASSET_DIR/curie-0.8.9.tgz" | awk '$1 == "version:" {print $2}')" == 0.8.9 ]] \
+        || die "published chart tgz is not version 0.8.9"
+    if tar -tzf "$ASSET_DIR/curie-0.8.8.tgz" | grep -Eq 'templates/schema-compat.yaml|files/schema-compat.json'; then
+        die "published v0.8.8 chart unexpectedly carries schema compatibility metadata"
+    fi
+    if tar -tzf "$ASSET_DIR/curie-0.8.9.tgz" | grep -Eq 'templates/schema-compat.yaml|files/schema-compat.json'; then
+        die "published v0.8.9 chart unexpectedly carries schema compatibility metadata"
+    fi
+    log "published v0.8.8 and v0.8.9 charts and CLIs verified without schema compatibility metadata"
 }
 
 package_n_charts() {
@@ -366,6 +667,7 @@ kubeconfig_is_named_kind() {
 }
 
 ensure_kind() {
+    EXCLUSIVE_KIND_TAG=""
     mkdir -p "$(dirname "$KUBECONFIG_FILE")" "$EVIDENCE_DIR"
     if kind get clusters 2>/dev/null | grep -Fxq "$KIND_CLUSTER"; then
         if (( FORCE )); then
@@ -393,7 +695,8 @@ image_for() {
 IMAGES=(curie-api curie-worker curie-dispatcher curie-ui curie-runner)
 
 retag_candidate_versions() {
-    local src_tag="$1" version="$2" img src dest short
+    local src_tag="$1" version="$2" required="${3:-optional}" img src dest short
+    EXCLUSIVE_KIND_TAG=""
     for img in "${IMAGES[@]}"; do
         src="$(image_for "$img" "$src_tag")"
         if docker image inspect "$src" >/dev/null 2>&1; then
@@ -401,6 +704,9 @@ retag_candidate_versions() {
         elif docker image inspect "${img}:${src_tag}" >/dev/null 2>&1; then
             src="${img}:${src_tag}"
         else
+            if [[ "$required" == required ]]; then
+                die "required source image $img:$src_tag is not local"
+            fi
             log "candidate image $img:$src_tag is not local; skipping retag"
             continue
         fi
@@ -414,6 +720,7 @@ retag_candidate_versions() {
 
 load_tag_images() {
     local tag="$1" img ref
+    EXCLUSIVE_KIND_TAG=""
     for img in "${IMAGES[@]}"; do
         ref="$(image_for "$img" "$tag")"
         if docker image inspect "$ref" >/dev/null 2>&1; then
@@ -435,9 +742,9 @@ load_tag_images() {
 prepare_candidate_images() {
     local src="${CANDIDATE_TAG:-upgrade-candidate}"
     retag_candidate_versions "$src" "0.9.0"
-    retag_candidate_versions "$src" "0.9.1"
     load_tag_images "0.8.8"
     load_tag_images "0.9.0"
+    retag_candidate_versions "0.9.0" "0.9.1" required
     # Do not load 0.9.0 and 0.9.1 together: they are the same digest in CI,
     # and converge refuses a tagged alias with more than one name.
     exclusive_kind_tag "0.9.0"
@@ -449,6 +756,7 @@ kind_node() {
 
 untag_kind_siblings() {
     local keep="$1" node img tag ref
+    EXCLUSIVE_KIND_TAG=""
     node="$(kind_node)"
     [[ -n "$node" ]] || return 0
     for img in "${IMAGES[@]}"; do
@@ -468,6 +776,10 @@ untag_kind_siblings() {
 
 exclusive_kind_tag() {
     local keep="$1" node img ref
+    if [[ -n "$keep" && "$EXCLUSIVE_KIND_TAG" == "$keep" ]]; then
+        log "kind node already holds exclusive app tag $keep"
+        return 0
+    fi
     node="$(kind_node)"
     [[ -n "$node" ]] || return 0
     # Untag siblings before load. 0.9.0 and 0.9.1 are the same digest in CI;
@@ -486,6 +798,7 @@ exclusive_kind_tag() {
         kind load docker-image "$ref" --name "$KIND_CLUSTER"
     done
     untag_kind_siblings "$keep"
+    EXCLUSIVE_KIND_TAG="$keep"
     log "kind node $node holds exclusive app tag $keep"
 }
 
@@ -657,6 +970,32 @@ helm_install_088() {
     log "published 0.8.8 helm revision $REV_088"
 }
 
+helm_install_089() {
+    refuse_soak "$NAMESPACE" "$RELEASE"
+    local img ref
+    for img in "${IMAGES[@]}"; do
+        ref="$(image_for "$img" "0.8.9")"
+        log "refreshing published image $ref"
+        docker pull "$ref"
+    done
+    load_tag_images "0.8.9"
+    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
+    local sets=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && sets+=(--set "$line")
+    done < <(image_sets "IfNotPresent")
+    log "helm install published 0.8.9 ns=$NAMESPACE release=$RELEASE"
+    helm_ns install "$RELEASE" "$ASSET_DIR/curie-0.8.9.tgz" \
+        --create-namespace \
+        --wait --timeout 15m \
+        "${sets[@]}"
+    OWNED_HELM=1
+    wait_rollout
+    REV_089="$(helm_revision)"
+    log "published 0.8.9 helm revision $REV_089"
+}
+
 cluster_up_n() {
     local chart="$1"
     refuse_soak "$NAMESPACE" "$RELEASE"
@@ -802,7 +1141,13 @@ run_same_version() {
 
 run_fail_every_phase() {
     local phase status=0
-    for phase in plan validate drain checkpoint migrate apply converge canary commit; do
+    local phases
+    if [[ -n "${CURIE_E2E_FAIL_PHASES:-}" ]]; then
+        read -r -a phases <<< "$CURIE_E2E_FAIL_PHASES"
+    else
+        phases=("${MATRIX_PHASES[@]}")
+    fi
+    for phase in "${phases[@]}"; do
         # Later phases (canary/commit) still run converge. Start each row
         # from healthy 0.9.0 so a leftover 0.9.1 apply cannot fail converge
         # before FAIL_AT is reached.
@@ -914,6 +1259,9 @@ restore_n() {
             # harness restore; it is not the product mutator under test.
             rev="$(helm_revision_for_version 0.9.0)"
             if [[ -n "$rev" ]]; then
+                # pullPolicy Never: the node may hold exclusive 0.9.1, so load
+                # 0.9.0 first or the rollback waits out its whole timeout.
+                exclusive_kind_tag "0.9.0"
                 log "rolling back to helm revision $rev (0.9.0)"
                 helm_ns rollback "$RELEASE" "$rev" --wait --timeout 180s || \
                     cluster_upgrade "0.9.0" "$CHART_090" || true
@@ -936,7 +1284,7 @@ run_interrupt_resume() {
     if [[ -n "${CURIE_E2E_INTERRUPT_PHASES:-}" ]]; then
         read -r -a phases <<< "$CURIE_E2E_INTERRUPT_PHASES"
     else
-        phases=(plan validate drain checkpoint migrate apply converge canary commit)
+        phases=("${INTERRUPT_PHASES[@]}")
     fi
     for phase in "${phases[@]}"; do
         # A leftover in_progress record for 0.9.1 skips already-completed
@@ -1006,6 +1354,8 @@ run_compatible_rollback() {
     kubectl_ns get deploy "$(fullname)-api" -o jsonpath='{.status.readyReplicas}{"\n"}' | grep -vq '^0$' \
         || die "api not Ready after compatible rollback"
     api_health >/dev/null || die "api health failed after compatible rollback"
+    assert_sentinel
+    assert_alembic "$SUPPORTED_ROLLBACK_HEAD"
     log "compatible rollback previous version 0.9.0 serves"
 }
 
@@ -1072,6 +1422,71 @@ run_rollback_published_088() {
     fi
 }
 
+run_rollback_published_089() {
+    uninstall_owned
+    helm_install_089
+    insert_sentinel
+    assert_sentinel
+    assert_alembic "$PUBLISHED_HEAD"
+
+    local boot=0
+    cluster_upgrade "0.9.0" "$CHART_090" --forward-only || boot=$?
+    record_upgrade_json "rollback-089-bootstrap"
+    [[ "$boot" -eq 0 ]] || die "rollback-089 bootstrap 0.8.9 to 0.9.0 exited $boot"
+    wait_rollout
+    [[ "$(helm_version)" == "0.9.0" ]] || die "rollback-089 bootstrap did not reach 0.9.0"
+    assert_sentinel
+    assert_alembic "$TARGET_HEAD"
+
+    helm_ns get manifest "$RELEASE" --revision "$REV_089" \
+        >"$EVIDENCE_DIR/rollback-089-retained-manifest.yaml"
+    if grep -Eq 'app.kubernetes.io/component:[[:space:]]*schema-compat' \
+        "$EVIDENCE_DIR/rollback-089-retained-manifest.yaml"; then
+        die "published 0.8.9 retained manifest unexpectedly has app.kubernetes.io/component=schema-compat"
+    fi
+    log "published 0.8.9 retained manifest has no app.kubernetes.io/component=schema-compat object"
+
+    load_tag_images "0.8.9"
+    local status=0
+    set +e
+    "$BIN" --json cluster rollback --yes --revision "$REV_089" \
+        --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-089.json" 2>"$EVIDENCE_DIR/rollback-089.err"
+    status=$?
+    set -e
+    (( status != 0 )) || die "published 0.8.9 rollback unexpectedly succeeded"
+
+    local err
+    err="$(cat "$EVIDENCE_DIR/rollback-089.json" "$EVIDENCE_DIR/rollback-089.err" 2>/dev/null || true)"
+    echo "$err" | grep -F "0.8.9" >/dev/null \
+        || die "rollback-089 refusal did not name 0.8.9: $err"
+    echo "$err" | grep -F "$PUBLISHED_HEAD" >/dev/null \
+        || die "rollback-089 refusal did not name published head $PUBLISHED_HEAD: $err"
+    echo "$err" | grep -F "$SUPPORTED_ROLLBACK_HEAD" >/dev/null \
+        || die "rollback-089 refusal did not name supported head $SUPPORTED_ROLLBACK_HEAD: $err"
+    echo "$err" | grep -F "outside its declared schema range" >/dev/null \
+        || die "rollback-089 refusal did not name the declared schema range: $err"
+    if echo "$err" | grep -F "could not establish" >/dev/null; then
+        die "rollback-089 failed identity classification instead of applying the published range: $err"
+    fi
+    [[ "$(helm_version)" == "0.9.0" ]] \
+        || die "refused rollback changed helm from 0.9.0 to $(helm_version)"
+    assert_sentinel
+    assert_alembic "$TARGET_HEAD"
+    kubectl_ns get deploy "$(fullname)-api" -o jsonpath='{.status.readyReplicas}{"\n"}' | grep -vq '^0$' \
+        || die "api has no readyReplicas after refused published 0.8.9 rollback"
+    api_health >/dev/null || die "api health failed after refused published 0.8.9 rollback"
+    log "published 0.8.9 refused at schema head $PUBLISHED_HEAD; 0.9.0 and sentinel remain healthy"
+
+    local advance=0
+    cluster_upgrade "0.9.1" "$CHART_091" || advance=$?
+    record_upgrade_json "rollback-089-compatible-setup"
+    [[ "$advance" -eq 0 ]] || die "rollback-089 compatible setup exited $advance"
+    wait_rollout
+    [[ "$(helm_version)" == "0.9.1" ]] || die "rollback-089 compatible setup did not reach 0.9.1"
+    run_compatible_rollback
+}
+
 schema_migrate_busy() {
     kubectl_ns get jobs,pods -l "app.kubernetes.io/component=schema-migrate" \
         -o name 2>/dev/null | grep -q .
@@ -1110,7 +1525,29 @@ run_migration_crash() {
         kubectl_ns get jobs,pods -o wide >"$EVIDENCE_DIR/migration-crash-timeout.txt" 2>&1 || true
         die "schema-migrate Job was not observed running; refusing a no-op retry as crash proof"
     fi
-    wait "$pid" || status=$?
+    # helm blocks ~900s on the deleted hook Job. Give the interrupted upgrade
+    # 120s to fail on its own, then kill it and recover what the kill leaves.
+    local exit_deadline=$((SECONDS + 120))
+    while (( SECONDS < exit_deadline )) && kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        terminate_tree "$pid"
+        local kill_deadline=$((SECONDS + 30))
+        while (( SECONDS < kill_deadline )) && kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" || status=$?
+        log "first migration-crash upgrade terminated after 120s (exit $status); recovering ownership and helm lock"
+        recover_killed_upgrade_ownership
+        recover_helm_lock
+    else
+        wait "$pid" || status=$?
+        log "first migration-crash upgrade exited on its own with $status"
+    fi
     log "first migration-crash upgrade exited $status; retrying"
     set +e
     cluster_upgrade "0.9.0" "$CHART_090" --forward-only
@@ -1257,12 +1694,22 @@ run_previous_serves() {
 }
 
 write_evidence() {
-    local elapsed=$((SECONDS - STARTED_AT))
+    local elapsed=$((SECONDS - STARTED_AT)) shard_json scenarios_json
+    shard_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1] or None))' "$SHARD")"
+    scenarios_json="$(python3 -c '
+import json, sys
+try:
+    rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+except FileNotFoundError:
+    rows = []
+print(json.dumps(rows))
+' "$EVIDENCE_DIR/scenarios.jsonl")"
     cat >"$EVIDENCE_DIR/summary.json" <<EOF
 {
   "issue": 2590,
   "commit": "$CANDIDATE",
   "published": "0.8.8",
+  "strict_published_rollback": "0.8.9",
   "published_head": "$PUBLISHED_HEAD",
   "target_head": "$TARGET_HEAD",
   "n": "0.9.0",
@@ -1272,12 +1719,93 @@ write_evidence() {
   "kind_cluster": "$KIND_CLUSTER",
   "namespace": "$NAMESPACE",
   "release": "$RELEASE",
+  "shard": $shard_json,
+  "scenarios": $scenarios_json,
   "elapsed_seconds": $elapsed
 }
 EOF
     if (( JSON )); then
         cat "$EVIDENCE_DIR/summary.json"
     fi
+}
+
+run_soak_refusal() {
+    log "soak-refusal covered by parse-time refuse_soak"
+}
+
+scenario_fn() {
+    case "$1" in
+        soak-refusal) echo run_soak_refusal ;;
+        fresh-n) echo run_fresh_n ;;
+        n1-to-n-nonempty) echo run_n1_to_n ;;
+        same-version) echo run_same_version ;;
+        fail-every-phase) echo run_fail_every_phase ;;
+        interrupt-resume) echo run_interrupt_resume ;;
+        n-to-n1) echo run_n_to_n1 ;;
+        compatible-rollback) echo run_compatible_rollback ;;
+        rollback-published-088) echo run_rollback_published_088 ;;
+        rollback-published-089) echo run_rollback_published_089 ;;
+        migration-crash) echo run_migration_crash ;;
+        converge-negative) echo run_converge_negative ;;
+        previous-serves) echo run_previous_serves ;;
+        *) die "no runner for scenario '$1'" ;;
+    esac
+}
+
+# Harness setup for `setup` shards: the nonempty 0.9.0 state the serial chain
+# reaches after n1-to-n-nonempty. Not a scenario; timed as setup=nonempty-n.
+setup_nonempty_n() {
+    uninstall_owned
+    helm_install_088
+    insert_sentinel
+    assert_sentinel
+    assert_alembic "$PUBLISHED_HEAD"
+    local status=0 ver
+    cluster_upgrade "0.9.0" "$CHART_090" --forward-only || status=$?
+    record_upgrade_json "setup-nonempty-n"
+    [[ "$status" -eq 0 ]] || die "setup nonempty-n cluster upgrade exited $status"
+    assert_upgrade_status "succeeded"
+    wait_rollout
+    ver="$(helm_version)"
+    [[ "$ver" == "0.9.0" ]] || die "setup nonempty-n helm version is '$ver' not 0.9.0"
+    assert_sentinel
+    assert_review_feedback_table
+    assert_alembic "$TARGET_HEAD"
+    log "setup nonempty-n reached 0.9.0 at $TARGET_HEAD with the sentinel"
+}
+
+run_shard() {
+    local item name phases
+    log "shard $SHARD setup=$SHARD_SETUP items=${SHARD_ITEMS[*]}"
+    if (( SHARD_SETUP )); then
+        run_timed "setup=nonempty-n" "setup=nonempty-n" all setup_nonempty_n
+    fi
+    for item in "${SHARD_ITEMS[@]}"; do
+        name="${item%%:*}"
+        phases="all"
+        [[ "$item" == *:* ]] && phases="${item#*:}"
+        case "$name" in
+            fail-every-phase) CURIE_E2E_FAIL_PHASES="${phases//+/ }" ;;
+            interrupt-resume) CURIE_E2E_INTERRUPT_PHASES="${phases//+/ }" ;;
+        esac
+        run_scenario_timed "$name" "$phases" "$(scenario_fn "$name")"
+        CURIE_E2E_FAIL_PHASES=""
+        CURIE_E2E_INTERRUPT_PHASES=""
+    done
+}
+
+run_serial() {
+    local name phases
+    for name in "${SCENARIOS_ALL[@]}"; do
+        [[ "$name" == soak-refusal ]] && continue
+        scenario_wanted "$name" || continue
+        phases="all"
+        case "$name" in
+            fail-every-phase) [[ -z "${CURIE_E2E_FAIL_PHASES:-}" ]] || phases="${CURIE_E2E_FAIL_PHASES// /+}" ;;
+            interrupt-resume) [[ -z "${CURIE_E2E_INTERRUPT_PHASES:-}" ]] || phases="${CURIE_E2E_INTERRUPT_PHASES// /+}" ;;
+        esac
+        run_scenario_timed "$name" "$phases" "$(scenario_fn "$name")"
+    done
 }
 
 run_matrix() {
@@ -1287,54 +1815,41 @@ run_matrix() {
     STARTED_AT=$SECONDS
     WORKDIR="$(mktemp -d /tmp/curie-cluster-upgrade-matrix.XXXXXX)"
     mkdir -p "$EVIDENCE_DIR"
+    : >"$EVIDENCE_DIR/scenarios.jsonl"
     trap cleanup EXIT
-    if [[ "$SCENARIO" == "soak-refusal" ]]; then
-        log "soak-refusal covered by parse-time refuse_soak"
+    if [[ -z "$SHARD" && "$SCENARIO" == "soak-refusal" ]]; then
+        run_scenario_timed soak-refusal all run_soak_refusal
         write_evidence
         return 0
     fi
+    if [[ -z "$SHARD" && "$SCENARIO" == "all" ]]; then
+        run_scenario_timed soak-refusal all run_soak_refusal
+    fi
+    local prelude_started=$SECONDS
     fetch_published
     package_n_charts
     ensure_kind
     prepare_candidate_images
-    if scenario_wanted "fresh-n"; then
-        run_fresh_n
-    fi
-    if scenario_wanted "n1-to-n-nonempty"; then
-        run_n1_to_n
-    fi
-    if scenario_wanted "same-version"; then
-        run_same_version
-    fi
-    if scenario_wanted "fail-every-phase"; then
-        run_fail_every_phase
-    fi
-    if scenario_wanted "interrupt-resume"; then
-        run_interrupt_resume
-    fi
-    if scenario_wanted "n-to-n1"; then
-        run_n_to_n1
-    fi
-    if scenario_wanted "compatible-rollback"; then
-        run_compatible_rollback
-    fi
-    if scenario_wanted "rollback-published-088"; then
-        run_rollback_published_088
-    fi
-    if scenario_wanted "migration-crash"; then
-        run_migration_crash
-    fi
-    if scenario_wanted "converge-negative"; then
-        run_converge_negative
-    fi
-    if scenario_wanted "previous-serves"; then
-        run_previous_serves
+    log "prelude elapsed_seconds=$((SECONDS - prelude_started))"
+    if [[ -n "$SHARD" ]]; then
+        run_shard
+    else
+        run_serial
     fi
     write_evidence
-    log "cluster-upgrade-matrix finished on candidate $CANDIDATE"
+    log "cluster-upgrade-matrix finished on candidate $CANDIDATE${SHARD:+ shard $SHARD}"
 }
 
 parse_args "$@"
+if (( LIST_SHARDS )); then
+    if (( JSON )); then
+        shard_manifest json "$SHARDS"
+    else
+        shard_manifest check "$SHARDS"
+        printf '%s\n' "$SHARDS"
+    fi
+    exit 0
+fi
 if (( SELF_TEST )); then
     run_self_test
     exit 0
