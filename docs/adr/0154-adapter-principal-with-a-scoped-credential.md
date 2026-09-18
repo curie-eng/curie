@@ -2,7 +2,7 @@
 
 Date: 2026-09-17
 
-Status: Draft
+Status: Accepted
 
 ## Context
 
