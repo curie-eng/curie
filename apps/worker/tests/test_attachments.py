@@ -206,18 +206,79 @@ def test_discarding_an_older_prepared_set_preserves_a_newer_set_and_its_ledger(
     files = FakeSlackFiles({"F1": [b"older_bytes"], "F2": [b"newer_bytes"]})
     coordinator, objects = _coordinator(attachments, files)
     older = _resolve(coordinator, [_ref("F1", "older.csv")], generation="older")
+    older_owners = set(_owner_keys(attachments, objects))
     newer = _resolve(coordinator, [_ref("F2", "newer.csv")], generation="newer")
-    (ledger_key,) = tuple(objects.list_keys(attachments.ATTACHMENT_LEDGER_PREFIX))
-    newer_ledger = objects.objects[ledger_key]
+    owners = set(_owner_keys(attachments, objects))
+    assert len(owners) == 2, "each resolve owns its own immutable record"
+    (newer_key,) = owners - older_owners
+    newer_owner = objects.objects[newer_key]
 
     coordinator.discard_prepared(thread_key=THREAD_KEY, prepared=older)
 
     assert all(key not in objects.objects for key in older.object_keys)
     assert all(objects.objects[key] == b"newer_bytes" for key in newer.object_keys)
-    assert objects.objects[ledger_key] == newer_ledger
+    assert set(_owner_keys(attachments, objects)) == {newer_key}
+    assert objects.objects[newer_key] == newer_owner
     current = coordinator.current(THREAD_KEY)
     assert current is not None
     assert current.object_keys == newer.object_keys
+
+
+def _owner_keys(module: Any, objects: RetainingObjectStore) -> list[str]:
+    """Every retention owner record, through the store's real listing."""
+
+    return list(objects.list_keys(module.ATTACHMENT_LEDGER_PREFIX))
+
+
+@pytest.mark.parametrize("discarded", ["first", "second"])
+def test_discarding_either_overlapping_set_preserves_the_other_and_its_keys(
+    attachments: Any, discarded: str
+) -> None:
+    """Exact discard, both orders, with ownership genuinely shared (#2737, AC4).
+
+    A fixed ``generation`` is what makes this the real case rather than two
+    unrelated sets: both resolves park under the same agent/generation prefix, so
+    the second set's only key is a key the first set also names. Discarding
+    either one may remove only what NO remaining owner still names -- the other
+    set's owner record survives untouched, and so does every object key it
+    names, including the shared one. A discard that deletes its own object keys
+    unconditionally destroys bytes a live turn is about to install.
+
+    Driven straight at the coordinator because the kernel mints a fresh
+    generation per resolve and so can never produce the overlap.
+    """
+
+    files = FakeSlackFiles({"F1": [b"one_bytes"], "F2": [b"two_bytes"]})
+    coordinator, objects = _coordinator(attachments, files)
+    first = _resolve(
+        coordinator, [_ref("F1", "one.csv"), _ref("F2", "two.csv")], generation="shared"
+    )
+    first_owners = set(_owner_keys(attachments, objects))
+    second = _resolve(coordinator, [_ref("F1", "one-again.csv")], generation="shared")
+    owners = set(_owner_keys(attachments, objects))
+
+    assert len(owners) == 2, "two resolves must leave two distinct owner records"
+    (first_key,) = first_owners
+    (second_key,) = owners - first_owners
+    shared_key = second.object_keys[0]
+    assert shared_key in first.object_keys, "the fixed generation must overlap the key"
+
+    if discarded == "first":
+        coordinator.discard_prepared(thread_key=THREAD_KEY, prepared=first)
+        survivor, surviving_set = second_key, second
+        # Only the discarded set ever named its second key, so that one goes.
+        assert first.object_keys[1] not in objects.objects
+    else:
+        coordinator.discard_prepared(thread_key=THREAD_KEY, prepared=second)
+        survivor, surviving_set = first_key, first
+        assert all(key in objects.objects for key in first.object_keys)
+
+    assert set(_owner_keys(attachments, objects)) == {survivor}
+    assert all(key in objects.objects for key in surviving_set.object_keys)
+    assert shared_key in objects.objects, "a key the surviving owner names must stay"
+    current = coordinator.current(THREAD_KEY)
+    assert current is not None
+    assert current.object_keys == surviving_set.object_keys
 
 
 def test_the_minted_reference_is_a_short_lived_signed_one_object_capability(
