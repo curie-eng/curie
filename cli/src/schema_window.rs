@@ -330,23 +330,44 @@ mod tests {
     }
 
     #[test]
+    fn released_v090_and_v091_remain_at_0044_and_v091_refuses_0045() {
+        let v090 = window_for("0.9.0").expect("0.9.0 is catalogued");
+        let v091 = window_for("0.9.1").expect("0.9.1 is catalogued");
+        assert_eq!(v090.schema_head, "0044");
+        assert_eq!(v091.schema_head, "0044");
+
+        let err = check_target_schema(
+            "0.9.1",
+            &v091,
+            "0045",
+            &["0.9.1".to_string(), "0.10.0".to_string()],
+        )
+        .expect_err("published 0.9.1 must refuse live revision 0045");
+        assert!(err.message.contains("0.9.1"));
+        assert!(err.message.contains("0045"));
+        assert!(err.message.contains("0044"));
+    }
+
+    #[test]
     fn packaged_n_and_n1_share_this_tree_head_so_rollback_is_compatible() {
-        let n = window_for("0.9.0").expect("0.9.0 is catalogued for the next-train matrix");
-        let n1 = window_for("0.9.1").expect("0.9.1 is catalogued for the next-train matrix");
+        let n = window_for("0.10.0").expect("0.10.0 is catalogued for the next train matrix");
+        let n1 = window_for("0.10.1").expect("0.10.1 is catalogued for the next train matrix");
+        assert_eq!(n.schema_min, "0044");
+        assert_eq!(n.schema_head, "0045");
         assert_eq!(n.schema_min, n1.schema_min);
         assert_eq!(n.schema_head, n1.schema_head);
         check_target_schema(
-            "0.9.0",
+            "0.10.0",
             &n,
-            &n.schema_head,
-            &["0.9.0".to_string(), "0.9.1".to_string()],
+            "0045",
+            &["0.10.0".to_string(), "0.10.1".to_string()],
         )
         .expect("N+1 to N is the same schema window");
         let err = check_target_schema(
             "0.8.7",
             &window_for("0.8.7").expect("0.8.7 window"),
             &n.schema_head,
-            &["0.8.7".to_string(), "0.9.0".to_string()],
+            &["0.8.7".to_string(), "0.10.0".to_string()],
         )
         .expect_err("0.8.7 cannot start on this tree's head");
         assert!(

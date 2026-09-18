@@ -87,36 +87,36 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin cluster upgrade as the mutator\n{text}"
     );
     assert!(
-        text.contains("restore_n resumes leftover in_progress 0.9.0"),
-        "self-test must pin restore_n resuming leftover in_progress 0.9.0\n{text}"
+        text.contains("restore_n resumes leftover in_progress 0.10.0"),
+        "self-test must pin restore_n resuming leftover in_progress 0.10.0\n{text}"
     );
     assert!(
-        text.contains("restore_n clears leftover in_progress after restoring 0.9.0"),
-        "self-test must pin restore_n clearing the checkpoint after the 0.9.0 restore\n{text}"
+        text.contains("restore_n clears leftover in_progress after restoring 0.10.0"),
+        "self-test must pin restore_n clearing the checkpoint after the 0.10.0 restore\n{text}"
     );
     assert!(
-        text.contains("n-to-n1 restores 0.9.0 through restore_n"),
+        text.contains("n-to-n1 restores 0.10.0 through restore_n"),
         "self-test must pin n-to-n1 using restore_n\n{text}"
     );
     assert!(
-        text.contains("restore_n rolls back to 0.9.0 when a revision exists"),
-        "self-test must pin restore_n rolling back to 0.9.0\n{text}"
+        text.contains("restore_n rolls back to 0.10.0 when a revision exists"),
+        "self-test must pin restore_n rolling back to 0.10.0\n{text}"
     );
     assert!(
         text.contains("exclusive_kind_tag untags siblings before and after load"),
         "self-test must pin exclusive_kind_tag untag-before-load\n{text}"
     );
     assert!(
-        text.contains("compatible rollback reloads exclusive 0.9.0 images"),
-        "self-test must pin compatible rollback reloading 0.9.0 images\n{text}"
+        text.contains("compatible rollback reloads exclusive 0.10.0 images"),
+        "self-test must pin compatible rollback reloading 0.10.0 images\n{text}"
     );
     assert!(
         text.contains("published 0.8.8 rollback reloads 0.8.8 images"),
         "self-test must pin rollback-088 reloading 0.8.8 images\n{text}"
     );
     assert!(
-        text.contains("restore_n loads exclusive 0.9.0 images before rollback"),
-        "self-test must pin restore_n reloading exclusive 0.9.0 before helm rollback\n{text}"
+        text.contains("restore_n loads exclusive 0.10.0 images before rollback"),
+        "self-test must pin restore_n reloading exclusive 0.10.0 before helm rollback\n{text}"
     );
     assert!(
         text.contains("exclusive_kind_tag skips a reload when the node already holds the tag"),
@@ -182,21 +182,21 @@ fn candidate_image_setup_derives_every_n1_tag_from_local_n_before_exclusive_load
         .map(|(_, rest)| rest.split_once("\n}\n").map_or(rest, |(body, _)| body))
         .expect("prepare_candidate_images function");
     let load_n = prepare
-        .find("load_tag_images \"0.9.0\"")
-        .expect("candidate setup must ensure every local 0.9.0 image");
+        .find("load_tag_images \"0.10.0\"")
+        .expect("candidate setup must ensure every local 0.10.0 image");
     let derive_n1 = prepare
-        .find("retag_candidate_versions \"0.9.0\" \"0.9.1\" required")
-        .expect("candidate setup must derive 0.9.1 from the ensured local 0.9.0 images");
+        .find("retag_candidate_versions \"0.10.0\" \"0.10.1\" required")
+        .expect("candidate setup must derive 0.10.1 from the ensured local 0.10.0 images");
     let exclusive_n = prepare
-        .find("exclusive_kind_tag \"0.9.0\"")
-        .expect("candidate setup must make 0.9.0 exclusive in kind");
+        .find("exclusive_kind_tag \"0.10.0\"")
+        .expect("candidate setup must make 0.10.0 exclusive in kind");
     assert!(
         load_n < derive_n1 && derive_n1 < exclusive_n,
-        "0.9.1 tags must be derived after local 0.9.0 is ensured and before sibling tags are removed"
+        "0.10.1 tags must be derived after local 0.10.0 is ensured and before sibling tags are removed"
     );
     assert!(
-        !prepare.contains("retag_candidate_versions \"$src\" \"0.9.1\""),
-        "0.9.1 must not depend on an optional upgrade-candidate source"
+        !prepare.contains("retag_candidate_versions \"$src\" \"0.10.1\""),
+        "0.10.1 must not depend on an optional upgrade candidate source"
     );
 
     let retag = source
@@ -221,7 +221,11 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
     .expect("parse application schema catalog");
     assert_eq!(
         catalog["windows"]["0.9.0"]["schema_head"], "0044",
-        "the supported 0.9.0 rollback head must remain pinned"
+        "the released 0.9.0 head must remain pinned"
+    );
+    assert_eq!(
+        catalog["windows"]["0.10.0"]["schema_head"], "0045",
+        "the candidate 0.10.0 rollback head must match this tree"
     );
     assert!(
         source.contains("rollback-published-089"),
@@ -276,7 +280,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
         .expect("run_rollback_published_089 function");
     let published_install = scenario
         .split_once("helm_install_089")
-        .and_then(|(_, rest)| rest.split_once("cluster_upgrade \"0.9.0\""))
+        .and_then(|(_, rest)| rest.split_once("cluster_upgrade \"0.10.0\""))
         .map(|(body, _)| body)
         .expect("published 0.8.9 install assertions");
     assert!(
@@ -298,11 +302,11 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
             && scenario.contains("outside its declared schema range")
             && scenario.contains("if echo \"$err\" | grep -F \"could not establish\"")
             && scenario.contains("failed identity classification"),
-        "scenario must require a nonzero range refusal naming 0.8.9, published head 0039, and supported head 0044 while rejecting identity failures"
+        "scenario must require a nonzero range refusal naming 0.8.9, published head 0039, and candidate head 0045 while rejecting identity failures"
     );
     assert!(
-        scenario.contains("helm_version") && scenario.contains("0.9.0"),
-        "refusal must leave the deployed 0.9.0 revision unchanged"
+        scenario.contains("helm_version") && scenario.contains("0.10.0"),
+        "refusal must leave the deployed 0.10.0 revision unchanged"
     );
     assert!(
         scenario.matches("assert_sentinel").count() >= 2
@@ -323,7 +327,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_supported_rollback() {
     assert!(
         compatible.contains("assert_sentinel")
             && compatible.contains("assert_alembic \"$SUPPORTED_ROLLBACK_HEAD\""),
-        "supported 0.9.1 to 0.9.0 rollback must retain the sentinel and catalogued Alembic head"
+        "supported 0.10.1 to 0.10.0 rollback must retain the sentinel and catalogued Alembic head"
     );
 }
 
