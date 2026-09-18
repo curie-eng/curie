@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 CONTRACT = "0041"
-REVIEW_SCHEMA_MIN = "0044"
+REVIEW_SCHEMA_MIN = "0045"
 PREV = "0040"
 
 
@@ -239,7 +239,7 @@ def test_n_minus_one_can_serve_an_unknown_newer_expand() -> None:
     assert can_serve(None, window, known) is False
 
 
-@pytest.mark.parametrize("future_expand", ("0042", "0043", "0044"))
+@pytest.mark.parametrize("future_expand", ("0042", "0043", "0044", "0045"))
 def test_0041_image_accepts_review_schema_expands_it_does_not_know(
     future_expand: str,
 ) -> None:
