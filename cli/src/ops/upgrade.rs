@@ -1191,6 +1191,26 @@ fn api_workload_missing(stderr: &str) -> bool {
     lower.contains("not found") && (lower.contains("deploy") || lower.contains("pod"))
 }
 
+/// Serialize the values document Helm will read.
+///
+/// #2741: Helm parses a `-f` values file with Go's YAML, which resolves the
+/// YAML 1.1 boolean set -- `off`, `on`, `yes`, `no`, `y`, `n` -- from a bare
+/// scalar. `serde_norway` emits YAML 1.2, where those words are ordinary
+/// strings that need no quoting, so a retained string `"off"` went out as
+/// `mode: off` and came back into Helm as the boolean `false`. That silently
+/// turned `security.gvisor.mode: "off"` into a gVisor requirement the cluster
+/// could not satisfy.
+///
+/// JSON is the fix rather than a quoting rule, because it removes the
+/// disagreement instead of enumerating it: every JSON string is quoted by
+/// construction, so no scalar word can be re-resolved, while real booleans,
+/// numbers and nulls stay themselves. JSON is also a subset of YAML, and Helm
+/// parses `-f` by content, not by file extension, so the document it reads is
+/// unchanged in every other respect.
+fn helm_values_document(values: &serde_json::Value) -> Result<String> {
+    serde_json::to_string_pretty(values).context("could not serialize the migrated overlay")
+}
+
 fn merge_forward_only(overlay: Option<&str>) -> Result<String> {
     let mut doc: serde_json::Value = match overlay {
         Some(text) if !text.trim().is_empty() => {
@@ -1219,7 +1239,7 @@ fn merge_forward_only(overlay: Option<&str>) -> Result<String> {
         .as_object_mut()
         .context("api.migrate is not a mapping")?;
     migrate_map.insert("forwardOnly".into(), serde_json::Value::Bool(true));
-    serde_norway::to_string(&doc).context("could not serialize the migrated overlay")
+    helm_values_document(&doc)
 }
 
 impl LiveHost {
@@ -1816,11 +1836,7 @@ impl LiveHost {
             .into_iter()
             .next()
             .unwrap_or_default();
-        Ok(Some((
-            serde_norway::to_string(&outcome.values)
-                .context("could not serialize the migrated overlay")?,
-            schema_plan,
-        )))
+        Ok(Some((helm_values_document(&outcome.values)?, schema_plan)))
     }
 
     /// The chart version the release reports. `scripts/check-version-consistency.sh`

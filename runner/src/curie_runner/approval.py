@@ -51,6 +51,7 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 from plugin_format import (
+    PLATFORM_PUBLISH_TOOL_NAME,
     TOOL_POLICY_ENFORCEMENT,
     ApprovalPolicy,
     PluginManifest,
@@ -226,8 +227,7 @@ APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
 # untrusted input and must not be able to remove, execute, or grant its own
 # publication action.  The worker recognizes this exact runner-stamped
 # permission-gate provenance before it captures a patch.
-_PUBLISH_TOOL = "publish_changes"
-PUBLISH_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_PUBLISH_TOOL}"
+_PUBLISH_TOOL = PLATFORM_PUBLISH_TOOL_NAME.removeprefix(f"mcp__{APPROVAL_SERVER_NAME}__")
 
 _PUBLISH_DESCRIPTION = (
     "When a managed repository is mounted, work only in /workspace and preserve"
@@ -338,7 +338,7 @@ def has_permission_pager(gate: ApprovalGate | None) -> bool:
 
     if gate is None:
         return False
-    if gate.required - {PUBLISH_TOOL_NAME}:
+    if gate.required - {PLATFORM_PUBLISH_TOOL_NAME}:
         return True
     policy = gate.tool_policy
     return policy is not None and bool(policy.approvalRequired)
@@ -727,7 +727,7 @@ class ApprovalGate:
 
         if self.pending_summary is not None:
             return False
-        if tool_name == PUBLISH_TOOL_NAME:
+        if tool_name == PLATFORM_PUBLISH_TOOL_NAME:
             title = tool_input.get("title")
             body = tool_input.get("body", "")
             if not isinstance(title, str) or not title.strip() or len(title) > 240:
@@ -781,7 +781,7 @@ class ApprovalGate:
         session turns that into a fail-closed classified failure.
         """
 
-        return self._record_pending(PUBLISH_TOOL_NAME, tool_input)
+        return self._record_pending(PLATFORM_PUBLISH_TOOL_NAME, tool_input)
 
 
 class _GateDecision(NamedTuple):
@@ -846,7 +846,7 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
     # These exact tools belong to the platform-owned approval server, not to
     # the bundle or one of its connectors.  Leave them to their existing
     # permission/in-process gates; every other MCP name remains fail-closed.
-    if tool_name == APPROVAL_TOOL_NAME or tool_name == PUBLISH_TOOL_NAME:
+    if tool_name == APPROVAL_TOOL_NAME or tool_name == PLATFORM_PUBLISH_TOOL_NAME:
         return None
     canonical = canonical_tool_name(
         tool_name,
@@ -914,7 +914,7 @@ def _decide_gate(gate: ApprovalGate, tool_name: str, tool_input: dict[str, Any])
         return _GateDecision(blocked=False, ungated=True)
     # Publication is completed outside the sandbox after approval, so an
     # injected or stale grant must never let the in-sandbox tool execute.
-    if tool_name != PUBLISH_TOOL_NAME and gate.consume_grant(tool_name):
+    if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name):
         return _GateDecision(blocked=False, ungated=False)
     gate.block(tool_name, tool_input)
     return _GateDecision(blocked=True, ungated=False)
@@ -1452,8 +1452,8 @@ def build_approval_gate(
         # extra approval card, under-arming is a silent fail-open.
         normalized.extend(effective)
 
-    operator = frozenset(name for name in normalized if name != PUBLISH_TOOL_NAME)
-    # PUBLISH_TOOL_NAME stays out of the operator-tools set so the platform
+    operator = frozenset(name for name in normalized if name != PLATFORM_PUBLISH_TOOL_NAME)
+    # PLATFORM_PUBLISH_TOOL_NAME stays out of the operator-tools set so the platform
     # adds the gate via managed_workspace, not as an operator list entry. A
     # bundle may attach an audience route through policy_routes. The requester
     # thread owns the card; publication still cannot consume a grant.
@@ -1470,10 +1470,10 @@ def build_approval_gate(
     # still owns the card. Publication cannot consume a grant.
     gated_tools = operator | frozenset(policy_routes)
     if managed_workspace:
-        gated_tools |= frozenset({PUBLISH_TOOL_NAME})
+        gated_tools |= frozenset({PLATFORM_PUBLISH_TOOL_NAME})
     if not gated_tools and tool_policy is None:
         return None
-    safe_grant_tool = None if grant_tool == PUBLISH_TOOL_NAME else grant_tool
+    safe_grant_tool = None if grant_tool == PLATFORM_PUBLISH_TOOL_NAME else grant_tool
     return ApprovalGate(
         required=gated_tools,
         route_by_tool=policy_routes,

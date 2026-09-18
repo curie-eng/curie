@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assert every declared approval gate names a tool that actually exists.
+"""Assert every connector approval gate names a tool that actually exists.
 
 Why this has to exist
 ---------------------
@@ -15,7 +15,9 @@ the deploy validator skips the check when it cannot determine the bundle's MCP
 server names, which is the case for a connectors.yaml bundle (curie#1495).
 
 So the guard belongs here, where the live tool list is knowable: start the
-connectors, ask each one for its tools, and compare.
+connectors, ask each one for its tools, and compare. Platform publication is
+mounted outside connectors, so its one exact built in name is accepted without
+a connector catalog row.
 
 The naming rule this encodes
 ----------------------------
@@ -39,8 +41,9 @@ Usage
 
 Two directions, and the second matters more
 -------------------------------------------
-1. Every declared gate names a tool that exists. Catches a typo, and catches the
-   plugin-prefixed form curie's own error message recommends.
+1. Every declared connector gate names a tool that exists. Catches a typo, and
+   catches the plugin-prefixed form curie's own error message recommends. The
+   platform publication gate is checked by exact name instead.
 2. Every tool that is NOT `readOnlyHint` has a gate. Catches the failure the
    one-tool-per-write-connector rule exists to avoid: someone adds a second
    write tool and forgets to declare its gate. Nothing else reports that -- the
@@ -70,6 +73,7 @@ import urllib.request
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+PLATFORM_PUBLISH_TOOL_NAME = "mcp__curie__publish_changes"
 
 
 def with_url_port(host: str, url: str) -> str:
@@ -306,7 +310,11 @@ def main() -> int:
         if not any(fnmatch.fnmatchcase(canonical, pattern) for canonical in live_canonical)
     ]
     gates = sorted(set(legacy_gates) | policy_gates)
-    bad = [g for g in legacy_gates if g not in live]
+    bad = [
+        g
+        for g in legacy_gates
+        if g != PLATFORM_PUBLISH_TOOL_NAME and g not in live
+    ]
     for g in bad:
         near = difflib.get_close_matches(g, live, n=1, cutoff=0.5)
         hint = f" -- closest live tool: {near[0]}" if near else ""
@@ -353,9 +361,15 @@ def main() -> int:
         )
         return 1
 
+    connector_gate_count = len(gates) - int(PLATFORM_PUBLISH_TOOL_NAME in gates)
+    publication_status = (
+        "the exact platform publication gate is accepted outside connector catalogs; "
+        if PLATFORM_PUBLISH_TOOL_NAME in gates
+        else ""
+    )
     print(
-        f"all {len(gates)} gate(s) match a live tool; "
-        f"all {len(write_tools)} write tool(s) are gated"
+        f"all {connector_gate_count} connector gate(s) match a live tool; "
+        f"{publication_status}all {len(write_tools)} write tool(s) are gated"
     )
     return 0
 

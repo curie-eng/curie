@@ -27,6 +27,7 @@ _PLATFORM = (
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
+    "history-persistence-error",
 )
 
 

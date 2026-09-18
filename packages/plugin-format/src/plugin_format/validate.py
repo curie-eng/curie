@@ -16,6 +16,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from . import connector_lock
 from .approval_policy import (
+    PLATFORM_PUBLISH_TOOL_NAME,
     connector_server_names,
     connector_tool_prefix,
     declared_mcp_server_names,
@@ -944,6 +945,11 @@ def _validate_approval_policy(
             if summary_err is not None:
                 c.error("approval_policy.summary_invalid", summary_err, loc)
         if expected_prefixes is None or not stripped_gate.startswith("mcp__"):
+            continue
+        # The platform publication tool is mounted by the runner, not declared
+        # by the bundle; accept its exact live name only, so a misspelled
+        # platform tool is still refused (#2776).
+        if stripped_gate == PLATFORM_PUBLISH_TOOL_NAME:
             continue
 
         # A live tool name needs a non-empty tool suffix after the matched

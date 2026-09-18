@@ -23,7 +23,6 @@ from curie_runner.adapter import build_options
 from curie_runner.approval import (
     APPROVAL_SUMMARY_PREFIX,
     APPROVAL_TOOL_NAME,
-    PUBLISH_TOOL_NAME,
     ApprovalGate,
     ApprovalPolicyError,
     ApprovalPolicyResolution,
@@ -47,7 +46,7 @@ from curie_runner.session import SessionRunner, _apply_approval_override
 from curie_runner.side_effects import SideEffectClassifier
 from curie_runner.translate import TurnState, translate_message
 from mcp import types as mcp_types
-from plugin_format import validate_bundle
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME, validate_bundle
 
 
 def _event(text: str = "hello") -> Event:
@@ -367,7 +366,7 @@ def test_publish_tool_is_always_listed_but_unmounted_invocation_refuses() -> Non
             operator_tools=None, policy_routes={}, managed_workspace=True
         )
         assert mounted_gate is not None
-        assert mounted_gate.required == frozenset({PUBLISH_TOOL_NAME})
+        assert mounted_gate.required == frozenset({PLATFORM_PUBLISH_TOOL_NAME})
 
         # Defence in depth is also unconditional. Calling the discoverable
         # tool without a mounted checkout must fail usefully, never fabricate a
@@ -1073,34 +1072,34 @@ def test_publish_gate_is_an_additive_exact_platform_member() -> None:
         managed_workspace=True,
     )
     assert gate is not None
-    assert gate.required == frozenset({"Read", "Bash", PUBLISH_TOOL_NAME})
+    assert gate.required == frozenset({"Read", "Bash", PLATFORM_PUBLISH_TOOL_NAME})
     assert gate.route_by_tool == {"Bash": "managers"}
-    assert gate.route_by_tool.get(PUBLISH_TOOL_NAME) is None
+    assert gate.route_by_tool.get(PLATFORM_PUBLISH_TOOL_NAME) is None
 
 
 def test_bundle_may_attach_a_route_to_platform_publish() -> None:
     gate = build_approval_gate(
         operator_tools=None,
-        policy_routes={PUBLISH_TOOL_NAME: "bundle-selected-audience"},
+        policy_routes={PLATFORM_PUBLISH_TOOL_NAME: "bundle-selected-audience"},
         managed_workspace=True,
     )
 
     assert gate is not None
-    assert gate.required == frozenset({PUBLISH_TOOL_NAME})
-    assert PUBLISH_TOOL_NAME in gate.route_by_tool
-    assert gate.route_by_tool[PUBLISH_TOOL_NAME] == "bundle-selected-audience"
+    assert gate.required == frozenset({PLATFORM_PUBLISH_TOOL_NAME})
+    assert PLATFORM_PUBLISH_TOOL_NAME in gate.route_by_tool
+    assert gate.route_by_tool[PLATFORM_PUBLISH_TOOL_NAME] == "bundle-selected-audience"
 
 
 def test_publish_permission_block_carries_policy_route() -> None:
     async def go() -> None:
         gate = build_approval_gate(
             operator_tools=None,
-            policy_routes={PUBLISH_TOOL_NAME: "bundle-selected-audience"},
+            policy_routes={PLATFORM_PUBLISH_TOOL_NAME: "bundle-selected-audience"},
             managed_workspace=True,
         )
         assert gate is not None
         result = await build_can_use_tool(gate)(
-            PUBLISH_TOOL_NAME,
+            PLATFORM_PUBLISH_TOOL_NAME,
             {"title": "  Update documentation  ", "body": "Exact body\n" * 100},
             ToolPermissionContext(),
         )
@@ -1117,13 +1116,13 @@ def test_publish_gate_denial_has_exact_trusted_provenance_and_no_route() -> None
         )
         assert gate is not None
         result = await build_can_use_tool(gate)(
-            PUBLISH_TOOL_NAME,
+            PLATFORM_PUBLISH_TOOL_NAME,
             {"title": "  Update documentation  ", "body": "Exact body\n" * 100},
             ToolPermissionContext(),
         )
         assert isinstance(result, PermissionResultDeny)
         assert gate.pending_gate_kind == "permission"
-        assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+        assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
         assert gate.pending_route is None
         assert gate.publication_title == "Update documentation"
         assert gate.publication_body == "Exact body\n" * 100
@@ -1138,7 +1137,7 @@ def test_invalid_publish_proposal_creates_no_pending_approval() -> None:
         )
         assert gate is not None
         result = await build_can_use_tool(gate)(
-            PUBLISH_TOOL_NAME, {"title": "   ", "body": "ignored"}, ToolPermissionContext()
+            PLATFORM_PUBLISH_TOOL_NAME, {"title": "   ", "body": "ignored"}, ToolPermissionContext()
         )
 
         assert isinstance(result, PermissionResultDeny)
@@ -1155,16 +1154,16 @@ def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
         gate = build_approval_gate(
             operator_tools=None,
             policy_routes={},
-            grant_tool=PUBLISH_TOOL_NAME,
+            grant_tool=PLATFORM_PUBLISH_TOOL_NAME,
             managed_workspace=True,
         )
         assert gate is not None
         result = await build_can_use_tool(gate)(
-            PUBLISH_TOOL_NAME, {"title": "Ship changes"}, ToolPermissionContext()
+            PLATFORM_PUBLISH_TOOL_NAME, {"title": "Ship changes"}, ToolPermissionContext()
         )
         assert isinstance(result, PermissionResultDeny)
         assert gate.grant_tool is None
-        assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+        assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
 
         # Bypass the permission callback and call the in-process tool directly:
         # it must still refuse, because publication belongs to the platform Job.
@@ -1174,7 +1173,7 @@ def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
         direct = await entry.handler(
             None,
             mcp_types.CallToolRequestParams(
-                name=PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
+                name=PLATFORM_PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
                 arguments={"title": "Ship changes"},
             ),
         )
@@ -1195,7 +1194,7 @@ def _managed_publish_gate() -> ApprovalGate:
 
     gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
     assert gate is not None
-    assert PUBLISH_TOOL_NAME in gate.required
+    assert PLATFORM_PUBLISH_TOOL_NAME in gate.required
     return gate
 
 
@@ -1212,9 +1211,9 @@ def test_observe_publication_records_the_pending_approval_without_a_halt() -> No
     assert recorded is True
     assert gate.pending_summary is not None
     assert gate.pending_summary.startswith(APPROVAL_SUMMARY_PREFIX)
-    assert PUBLISH_TOOL_NAME in gate.pending_summary
+    assert PLATFORM_PUBLISH_TOOL_NAME in gate.pending_summary
     assert gate.pending_gate_kind == "permission"
-    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+    assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     # Platform-owned gate: the request thread owns the card, so no bundle route.
     assert gate.pending_route is None
     assert gate.publication_title == "Ship changes"
@@ -1264,7 +1263,7 @@ def test_observe_publication_never_overwrites_a_hook_recorded_block() -> None:
     # normal path) the stream observer would overwrite the hook's record and drop
     # its halt-backed provenance, turning the working path into a second one.
     gate = _managed_publish_gate()
-    gate.block(PUBLISH_TOOL_NAME, {"title": "Hook recorded", "body": "hook body"})
+    gate.block(PLATFORM_PUBLISH_TOOL_NAME, {"title": "Hook recorded", "body": "hook body"})
     hook_summary = gate.pending_summary
 
     assert gate.observe_publication({"title": "Stream observed", "body": "stream body"}) is False
@@ -1273,7 +1272,7 @@ def test_observe_publication_never_overwrites_a_hook_recorded_block() -> None:
     assert gate.publication_title == "Hook recorded"
     assert gate.publication_body == "hook body"
     assert gate.pending_gate_kind == "permission"
-    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+    assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
     # The hook's own halt marker survives untouched: the observer only ever adds
     # a record, it never edits what another layer already decided.
     assert gate.pending_halt is True
@@ -1288,7 +1287,7 @@ def test_observe_publication_never_mints_a_grant() -> None:
     gate = build_approval_gate(
         operator_tools=None,
         policy_routes={},
-        grant_tool=PUBLISH_TOOL_NAME,
+        grant_tool=PLATFORM_PUBLISH_TOOL_NAME,
         managed_workspace=True,
     )
     assert gate is not None
@@ -1298,11 +1297,11 @@ def test_observe_publication_never_mints_a_grant() -> None:
     assert gate.observe_publication({"title": "Ship changes", "body": "body"}) is True
 
     assert gate.grant_tool is None
-    assert gate.consume_grant(PUBLISH_TOOL_NAME) is False
+    assert gate.consume_grant(PLATFORM_PUBLISH_TOOL_NAME) is False
     # And the record it wrote is still the one-per-turn record: a second call
     # blocks again rather than being waved through.
     assert gate.observe_publication({"title": "Ship changes", "body": "body"}) is False
-    assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+    assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
 
 
 def test_build_approval_gate_carries_the_grant_tool() -> None:
@@ -3079,3 +3078,4 @@ def test_route_normalization_vector_matches_the_runtime_loader(tmp_path) -> None
             f"frozen vector says {case['expected']!r} -- normalization drift between "
             "the deploy-time reader and the loader is the #453/#544 fail-open shape"
         )
+

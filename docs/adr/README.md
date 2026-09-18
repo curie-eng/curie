@@ -177,4 +177,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0147 | [Publication approval is a per-agent operator policy, not a platform constant](0147-publication-approval-is-a-per-agent-operator-policy.md) | Accepted |
 | 0151 | [A permission-gate card shows a bundle-authored sentence; the machine summary stays the audit record](0151-bundle-authored-human-approval-summary.md) | Draft |
 | 0152 | [Registry destinations are operator-declared, not a platform preset](0152-no-cidr-trusted-registries-preset.md) | Draft |
+| 0153 | [A channel-port turn carries its attachments, and the worker fetches them from the adapter that produced them](0153-a-channel-port-turn-carries-its-attachments.md) | Accepted |
 <!-- END GENERATED: adr-index -->

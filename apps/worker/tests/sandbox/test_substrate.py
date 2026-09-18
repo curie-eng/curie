@@ -20,6 +20,7 @@ from curie_worker.sandbox import (
     QuotaRejection,
     RouteRecord,
     RouteState,
+    SandboxError,
     SandboxHandle,
     SandboxSubstrate,
     SandboxView,
@@ -295,12 +296,12 @@ def test_handoff_route_survives_old_claim_delete_failure_and_reaper_finishes_cle
     real_delete = fake_k8s.delete_claim
     failed_once = False
 
-    def fail_old_once(name: str) -> None:
+    def fail_old_once(name: str, *, request_timeout_seconds: float) -> None:
         nonlocal failed_once
         if name == old.claim_name and not failed_once:
             failed_once = True
             raise RuntimeError("injected post-CAS cleanup failure")
-        real_delete(name)
+        real_delete(name, request_timeout_seconds=request_timeout_seconds)
 
     monkeypatch.setattr(fake_k8s, "delete_claim", fail_old_once)
     replacement = substrate.handoff(
@@ -339,25 +340,28 @@ def test_quota_rejection_fails_promptly_and_cleans_up_claim(
 
     rejection = QuotaRejection(
         quota_name="curie-sandbox-quota",
-        resource="limits.cpu",
-        requested="1",
-        used="8",
-        hard="8",
+        requested={"limits.cpu": "1"},
+        used={"limits.cpu": "8"},
+        hard={"limits.cpu": "8"},
     )
     fake_k8s.quota_rejection = rejection
     original_get_claim = fake_k8s.get_claim
     poll_count = 0
 
-    def get_claim_with_updated_rejection(name: str) -> ClaimView | None:
+    def get_claim_with_updated_rejection(
+        name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
         nonlocal poll_count
-        view = original_get_claim(name)
+        view = original_get_claim(
+            name, request_timeout_seconds=request_timeout_seconds
+        )
         if view is None:
             return None
         poll_count += 1
         if poll_count == 1:
             return replace(
                 view,
-                quota_rejection=replace(rejection, used="7"),
+                quota_rejection=replace(rejection, used={"limits.cpu": "7"}),
             )
         return view
 
@@ -372,10 +376,9 @@ def test_quota_rejection_fails_promptly_and_cleans_up_claim(
     assert elapsed < 20 * config.poll_interval_seconds
     assert excinfo.value.rejection == rejection
     assert excinfo.value.rejection.quota_name == "curie-sandbox-quota"
-    assert excinfo.value.rejection.resource == "limits.cpu"
-    assert excinfo.value.rejection.requested == "1"
-    assert excinfo.value.rejection.used == "8"
-    assert excinfo.value.rejection.hard == "8"
+    assert excinfo.value.rejection.requested == {"limits.cpu": "1"}
+    assert excinfo.value.rejection.used == {"limits.cpu": "8"}
+    assert excinfo.value.rejection.hard == {"limits.cpu": "8"}
     assert poll_count >= 2
     assert fake_k8s.deleted == fake_k8s.created
     assert affinity.get("T1") is None
@@ -386,17 +389,20 @@ def test_transient_quota_rejection_can_clear_before_claim_binds(
 ) -> None:
     rejection = QuotaRejection(
         quota_name="curie-sandbox-quota",
-        resource="limits.cpu",
-        requested="1",
-        used="8",
-        hard="8",
+        requested={"limits.cpu": "1"},
+        used={"limits.cpu": "8"},
+        hard={"limits.cpu": "8"},
     )
     original_get_claim = fake_k8s.get_claim
     poll_count = 0
 
-    def get_claim_after_transient_rejection(name: str) -> ClaimView | None:
+    def get_claim_after_transient_rejection(
+        name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
         nonlocal poll_count
-        view = original_get_claim(name)
+        view = original_get_claim(
+            name, request_timeout_seconds=request_timeout_seconds
+        )
         if view is None:
             return None
         poll_count += 1
@@ -426,10 +432,9 @@ def test_later_non_quota_condition_replaces_earlier_quota_evidence(
 ) -> None:
     rejection = QuotaRejection(
         quota_name="curie-sandbox-quota",
-        resource="limits.cpu",
-        requested="1",
-        used="8",
-        hard="8",
+        requested={"limits.cpu": "1"},
+        used={"limits.cpu": "8"},
+        hard={"limits.cpu": "8"},
     )
     fake_k8s.bind_ready = False
     fake_k8s.ready_reason = "ReconcilerError"
@@ -437,9 +442,13 @@ def test_later_non_quota_condition_replaces_earlier_quota_evidence(
     original_get_claim = fake_k8s.get_claim
     poll_count = 0
 
-    def get_claim_after_quota_rejection(name: str) -> ClaimView | None:
+    def get_claim_after_quota_rejection(
+        name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
         nonlocal poll_count
-        view = original_get_claim(name)
+        view = original_get_claim(
+            name, request_timeout_seconds=request_timeout_seconds
+        )
         if view is None:
             return None
         poll_count += 1
@@ -542,6 +551,82 @@ def test_suspend_resume_rehydrates_from_history(
     assert substrate.lookup("T1") == resumed
 
 
+def test_handoff_without_workspace_preserves_identity_generation_and_env(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
+) -> None:
+    first = substrate.claim("T1", env={RUNNER_TOKEN_ENV: "token-first"})
+    history_ref = "redis://state/transcript/T1"
+    affinity.replace(
+        "T1",
+        RouteRecord(handle=replace(first, history_ref=history_ref)),
+        ttl_seconds=60,
+    )
+    caller_env = {
+        "CURIE_BUNDLE_REF": "bundles/acme-agent-v7.tgz",
+        "CURIE_ATTACHMENTS_REF": "state/attachments/T1/set-2",
+        RUNNER_TOKEN_ENV: "token-second",
+    }
+
+    expected = replace(first, history_ref=history_ref)
+    replacement = substrate.handoff(
+        "T1",
+        expected=expected,
+        env=caller_env,
+        workspace_repo=None,
+    )
+
+    assert replacement.claim_name != first.claim_name
+    assert replacement.sandbox_name != first.sandbox_name
+    assert first.claim_name in fake_k8s.deleted
+    assert first.claim_name not in fake_k8s.claims
+    assert replacement.claim_name in fake_k8s.claims
+
+    replacement_env = fake_k8s.claims[replacement.claim_name].env
+    assert replacement_env["CURIE_BUNDLE_REF"] == caller_env["CURIE_BUNDLE_REF"]
+    assert replacement_env["CURIE_ATTACHMENTS_REF"] == caller_env["CURIE_ATTACHMENTS_REF"]
+    assert replacement_env[SESSION_ENV] == first.session_id
+    assert replacement_env[HISTORY_ENV] == history_ref
+    assert replacement_env[RUNNER_TOKEN_ENV] == "token-second"
+    assert replacement_env[RUNNER_TOKEN_ENV] != first.token
+    assert replacement.token == replacement_env[RUNNER_TOKEN_ENV]
+    assert caller_env[RUNNER_TOKEN_ENV] == "token-second"
+
+    assert replacement.session_id == first.session_id
+    assert replacement.history_ref == history_ref
+    assert replacement.workspace_repo is None
+    assert replacement.generation == expected.generation + 1
+    route = affinity.get("T1")
+    assert route is not None
+    assert route.state is RouteState.LIVE
+    assert route.handle == replacement
+    assert affinity.route_inventory()[RouteState.LIVE] == {replacement.claim_name}
+    assert substrate.lookup("T1") == replacement
+
+
+def test_handoff_bind_failure_preserves_old_route(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    first = substrate.claim("T1", env={RUNNER_TOKEN_ENV: "token-first"})
+    fake_k8s.bind_ready = False
+
+    with pytest.raises(ClaimTimeoutError):
+        substrate.handoff(
+            "T1",
+            expected=first,
+            env={
+                "CURIE_ATTACHMENTS_REF": "set-2",
+                RUNNER_TOKEN_ENV: "token-second",
+            },
+            workspace_repo=None,
+        )
+
+    assert affinity.get("T1") == RouteRecord(handle=first)
+    assert first.claim_name in fake_k8s.claims
+    assert first.claim_name not in fake_k8s.deleted
+    assert substrate.lookup("T1") == first
+
+
 def test_suspend_and_resume_require_route(substrate: SandboxSubstrate) -> None:
     with pytest.raises(NoRouteError):
         substrate.suspend("nope", history_ref=None)
@@ -574,7 +659,8 @@ class _DelayedDeleteClient(FakeSandboxClient):
     claim_gets: dict[str, int] = field(default_factory=dict)
     sandbox_gets: dict[str, int] = field(default_factory=dict)
 
-    def delete_claim(self, name: str) -> None:
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None or name in self.claim_gets:
             return
@@ -582,22 +668,159 @@ class _DelayedDeleteClient(FakeSandboxClient):
         self.sandbox_gets[claim.sandbox_name] = 0
         self.deleted.append(name)
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
         if name in self.claim_gets:
             self.claim_gets[name] += 1
             if self.claim_gets[name] >= self.claim_gone_after_gets:
                 # Drop the CR only. The sandbox/pod can outlive it.
                 self.claims.pop(name, None)
                 return None
-        return super().get_claim(name)
+        return super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        assert request_timeout_seconds > 0
         if name in self.sandbox_gets:
             self.sandbox_gets[name] += 1
             if self.sandbox_gets[name] >= self.sandbox_gone_after_gets:
                 self.sandboxes.pop(name, None)
                 return None
-        return super().get_sandbox(name)
+        return super().get_sandbox(name, request_timeout_seconds=request_timeout_seconds)
+
+
+@dataclass
+class _ReleaseReadTimeoutThenGoneClient(FakeSandboxClient):
+    claim_reads: int = 0
+    delete_started: bool = False
+
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        assert request_timeout_seconds > 0
+        self.delete_started = True
+        self.deleted.append(name)
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
+        if not self.delete_started:
+            return super().get_claim(
+                name,
+                request_timeout_seconds=request_timeout_seconds,
+            )
+        assert request_timeout_seconds <= 1.0
+        self.claim_reads += 1
+        if self.claim_reads == 1:
+            raise TimeoutError("first claim disappearance read timed out")
+        claim = self.claims.pop(name, None)
+        if claim is not None:
+            self.sandboxes.pop(claim.sandbox_name, None)
+        return None
+
+
+@dataclass
+class _PersistentReleaseReadErrorClient(FakeSandboxClient):
+    delete_started: bool = False
+    claim_reads: int = 0
+    sandbox_reads: int = 0
+
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        assert request_timeout_seconds > 0
+        self.delete_started = True
+        self.deleted.append(name)
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
+        if not self.delete_started:
+            return super().get_claim(
+                name,
+                request_timeout_seconds=request_timeout_seconds,
+            )
+        self.claim_reads += 1
+        raise SandboxError("claim disappearance read failed")
+
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        assert request_timeout_seconds > 0
+        if not self.delete_started:
+            return super().get_sandbox(
+                name,
+                request_timeout_seconds=request_timeout_seconds,
+            )
+        self.sandbox_reads += 1
+        raise SandboxError("sandbox disappearance read failed")
+
+
+@dataclass
+class _ReleaseDeleteFailureClient(FakeSandboxClient):
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        del name
+        assert request_timeout_seconds > 0
+        raise SandboxError("delete failed")
+
+
+def test_release_wait_gone_recovers_when_first_claim_read_times_out(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    fake_k8s = _ReleaseReadTimeoutThenGoneClient()
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+        release_gone_timeout_seconds=2.0,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-release-read-timeout")
+
+    assert substrate.release("T-release-read-timeout", wait_gone=True)
+    assert fake_k8s.claim_reads == 2
+    assert handle.claim_name not in fake_k8s.claims
+    assert handle.sandbox_name not in fake_k8s.sandboxes
+
+
+def test_release_wait_gone_returns_after_persistent_read_errors(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    fake_k8s = _PersistentReleaseReadErrorClient()
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+        release_gone_timeout_seconds=0.05,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-release-persistent-read-error")
+
+    started = time.monotonic()
+    assert substrate.release("T-release-persistent-read-error", wait_gone=True)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2
+    assert fake_k8s.claim_reads > 0
+    assert fake_k8s.sandbox_reads > 0
+    assert handle.claim_name in fake_k8s.claims
+    assert handle.sandbox_name in fake_k8s.sandboxes
+
+
+def test_release_still_propagates_delete_failure(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    fake_k8s = _ReleaseDeleteFailureClient()
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    handle = substrate.claim("T-release-delete-failure")
+
+    with pytest.raises(SandboxError, match="delete failed"):
+        substrate.release("T-release-delete-failure", wait_gone=True)
+
+    assert affinity.get("T-release-delete-failure") == RouteRecord(handle=handle)
+    assert handle.claim_name in fake_k8s.claims
+    assert handle.sandbox_name in fake_k8s.sandboxes
 
 
 def test_release_without_wait_gone_returns_while_claim_still_counts(
@@ -638,8 +861,8 @@ def test_release_wait_gone_blocks_until_claim_and_sandbox_are_absent(
     assert substrate.release("T-eval-1", wait_gone=True)
     assert handle.claim_name not in fake_k8s.claims
     assert handle.sandbox_name not in fake_k8s.sandboxes
-    assert fake_k8s.get_claim(handle.claim_name) is None
-    assert fake_k8s.get_sandbox(handle.sandbox_name) is None
+    assert fake_k8s.get_claim(handle.claim_name, request_timeout_seconds=1.0) is None
+    assert fake_k8s.get_sandbox(handle.sandbox_name, request_timeout_seconds=1.0) is None
 
 
 def test_release_wait_gone_does_not_return_when_only_the_claim_has_vanished(
@@ -664,6 +887,193 @@ def test_release_wait_gone_does_not_return_when_only_the_claim_has_vanished(
     assert substrate.release("T-eval-1", wait_gone=True)
     assert handle.claim_name not in fake_k8s.claims
     assert handle.sandbox_name in fake_k8s.sandboxes
+
+
+def test_delete_detached_requires_claim_and_sandbox_disappearance(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    fake_k8s = _DelayedDeleteClient(
+        claim_gone_after_gets=2,
+        sandbox_gone_after_gets=4,
+    )
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-pressure")
+    record = affinity.get("T-pressure")
+    assert record is not None
+    assert affinity.delete_if_claim("T-pressure", handle.claim_name)
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"pods": "1"},
+        used={"pods": "2"},
+        hard={"pods": "2"},
+    )
+    fake_k8s.quota_headroom_results = [False, True]
+
+    assert substrate.delete_detached(
+        record,
+        rejection,
+        deadline=time.monotonic() + 2.0,
+    )
+
+    assert handle.claim_name not in fake_k8s.claims
+    assert handle.sandbox_name not in fake_k8s.sandboxes
+    assert fake_k8s.claim_gets[handle.claim_name] >= 2
+    assert fake_k8s.sandbox_gets[handle.sandbox_name] >= 4
+    assert [call[0] for call in fake_k8s.quota_headroom_calls] == [
+        rejection,
+        rejection,
+    ]
+
+
+@dataclass
+class _DeadlineReadClient(FakeSandboxClient):
+    claim_reads: int = 0
+    sandbox_reads: int = 0
+    observed_timeouts: list[float] = field(default_factory=list)
+
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        self.observed_timeouts.append(request_timeout_seconds)
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        del name
+        self.claim_reads += 1
+        self.observed_timeouts.append(request_timeout_seconds)
+        time.sleep(0.02)
+        return None
+
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        del name
+        self.sandbox_reads += 1
+        self.observed_timeouts.append(request_timeout_seconds)
+        return None
+
+
+def _detached_record(thread_key: str, claim_name: str) -> RouteRecord:
+    return RouteRecord(
+        handle=SandboxHandle(
+            thread_key=thread_key,
+            claim_name=claim_name,
+            sandbox_name=f"sbx-{claim_name}",
+            namespace="test-ns",
+            service_fqdn=f"sbx-{claim_name}.test-ns.svc.cluster.local",
+            port=8080,
+            session_id=f"session-{thread_key}",
+        )
+    )
+
+
+def test_delete_detached_rechecks_deadline_before_each_transport_read(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    fake_k8s = _DeadlineReadClient()
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    record = _detached_record("T-deadline", "claim-deadline")
+
+    assert not substrate.delete_detached(
+        record,
+        QuotaRejection(
+            quota_name="curie-sandbox-quota",
+            requested={"pods": "1"},
+            used={"pods": "2"},
+            hard={"pods": "2"},
+        ),
+        deadline=time.monotonic() + 0.01,
+    )
+
+    assert fake_k8s.claim_reads == 1
+    assert fake_k8s.sandbox_reads == 0
+    assert fake_k8s.observed_timeouts
+    assert all(0 < timeout <= 0.01 for timeout in fake_k8s.observed_timeouts)
+
+
+@dataclass
+class _DeleteTimeoutClient(FakeSandboxClient):
+    read_calls: int = 0
+
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        del name
+        assert 0 < request_timeout_seconds <= 5.0
+        raise TimeoutError("delete timed out")
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        del name, request_timeout_seconds
+        self.read_calls += 1
+        return None
+
+
+def test_delete_timeout_never_authorizes_capacity_retry(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    fake_k8s = _DeleteTimeoutClient()
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    record = _detached_record("T-delete-timeout", "claim-timeout")
+
+    assert not substrate.delete_detached(
+        record,
+        QuotaRejection(
+            quota_name="curie-sandbox-quota",
+            requested={"pods": "1"},
+            used={"pods": "2"},
+            hard={"pods": "2"},
+        ),
+        deadline=time.monotonic() + 10.0,
+    )
+    assert fake_k8s.read_calls == 0
+
+
+@pytest.mark.parametrize(
+    "quota_result",
+    [False, TimeoutError("quota read timed out")],
+    ids=["full", "unreadable"],
+)
+def test_delete_detached_never_succeeds_without_proved_quota_headroom(
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    quota_result: bool | BaseException,
+) -> None:
+    fake_k8s = FakeSandboxClient()
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-quota-full")
+    record = affinity.get("T-quota-full")
+    assert record is not None
+    assert affinity.delete_if_claim("T-quota-full", handle.claim_name)
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"limits.cpu": "1", "limits.memory": "512Mi"},
+        used={"limits.cpu": "2", "limits.memory": "1Gi"},
+        hard={"limits.cpu": "2", "limits.memory": "1Gi"},
+    )
+    fake_k8s.quota_headroom_results = [quota_result] * 100
+
+    assert not substrate.delete_detached(
+        record,
+        rejection,
+        deadline=time.monotonic() + 0.02,
+    )
+
+    assert handle.claim_name not in fake_k8s.claims
+    assert handle.sandbox_name not in fake_k8s.sandboxes
+    assert len(fake_k8s.quota_headroom_calls) >= 2
+    assert all(
+        observed == rejection and 0 < timeout <= 1.0
+        for observed, timeout in fake_k8s.quota_headroom_calls
+    )
 
 
 def test_reap_orphans_deletes_unrouted_claims(
@@ -708,18 +1118,22 @@ class _ReapDuringBindClient(FakeSandboxClient):
     reaped: bool = False
     reap_results: list[list[str]] = field(default_factory=list)
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
         if self.substrate is not None and not self.reaped:
             # Flagged before reaping: reap_orphans() calls list_claims(), which
             # re-enters get_claim on this same fake.
             self.reaped = True
             self.reap_results.append(self.substrate.reap_orphans())
-            view = super().get_claim(name)  # the claim has not bound yet
+            view = super().get_claim(  # the claim has not bound yet
+                name, request_timeout_seconds=request_timeout_seconds
+            )
             claim = self.claims.get(name)
             if claim is not None:
                 claim.ready = True  # the controller binds right after the tick
             return view
-        return super().get_claim(name)
+        return super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
 
 
 def test_reap_orphans_spares_an_in_flight_claim(
@@ -759,8 +1173,12 @@ class _ReapAfterBindClient(FakeSandboxClient):
     reap_results: list[list[str]] = field(default_factory=list)
     ready_at_reap: list[bool] = field(default_factory=list)
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
-        view = super().get_sandbox(name)
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        view = super().get_sandbox(
+            name, request_timeout_seconds=request_timeout_seconds
+        )
         if view is None or self.substrate is None or self.reaped:
             return view
         self.reaped = True
@@ -978,7 +1396,10 @@ class _SlowBindNoFqdnClient(FakeSandboxClient):
             self._bind_deadline = time.monotonic() + self.bind_after_seconds
         super().create_claim(name, **kwargs)  # type: ignore[arg-type]
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
             return None
@@ -993,8 +1414,12 @@ class _SlowBindNoFqdnClient(FakeSandboxClient):
             ready_message=None,
         )
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
-        view = super().get_sandbox(name)
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        view = super().get_sandbox(
+            name, request_timeout_seconds=request_timeout_seconds
+        )
         if view is None:
             return None
         return SandboxView(
@@ -1075,9 +1500,13 @@ def test_non_quota_reconciler_error_stays_on_slow_bind_path(
     original_get_claim = fake_k8s.get_claim
     poll_count = 0
 
-    def get_claim_with_updated_condition(name: str) -> ClaimView | None:
+    def get_claim_with_updated_condition(
+        name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
         nonlocal poll_count
-        current = original_get_claim(name)
+        current = original_get_claim(
+            name, request_timeout_seconds=request_timeout_seconds
+        )
         if current is None:
             return None
         poll_count += 1
@@ -1232,7 +1661,10 @@ class _VirtualBindClient(FakeSandboxClient):
         self.bind_after_seconds = bind_after_seconds
         self.poll_times: list[float] = []
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
             return None
@@ -1259,8 +1691,12 @@ class _VirtualFqdnClient(FakeSandboxClient):
         self.fqdn_after_seconds = fqdn_after_seconds
         self.sandbox_polls: list[float] = []
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
-        view = super().get_sandbox(name)
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        view = super().get_sandbox(
+            name, request_timeout_seconds=request_timeout_seconds
+        )
         if view is None:
             return None
         self.sandbox_polls.append(self.clock.now)
@@ -1384,7 +1820,10 @@ class _VirtualBindThenFqdnClient(FakeSandboxClient):
         self.poll_times: list[float] = []
         self.sandbox_polls: list[float] = []
 
-    def get_claim(self, name: str) -> ClaimView | None:
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
             return None
@@ -1400,8 +1839,12 @@ class _VirtualBindThenFqdnClient(FakeSandboxClient):
             ready_message=None,
         )
 
-    def get_sandbox(self, name: str) -> SandboxView | None:
-        view = super().get_sandbox(name)
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        view = super().get_sandbox(
+            name, request_timeout_seconds=request_timeout_seconds
+        )
         if view is None:
             return None
         self.sandbox_polls.append(self.clock.now)
@@ -1434,3 +1877,208 @@ def test_service_fqdn_polling_restarts_fast_after_a_cold_bind(
 
     assert fake_k8s.sandbox_polls == pytest.approx([10.0, 10.05])
     assert handle.service_fqdn.endswith(".svc.cluster.local")
+
+
+# --- #2739: fresh-only claims across runner restart transitions -------------
+
+
+def _route_changed_error() -> type[Exception]:
+    """Imported lazily so the rest of this module still collects before #2739."""
+
+    from curie_worker.sandbox import RouteChangedError, SandboxError
+
+    assert issubclass(RouteChangedError, SandboxError)
+    return RouteChangedError
+
+
+def test_default_claim_reuses_a_route_that_went_nonlive_then_live_again(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient
+) -> None:
+    """Control for #2739: the ordinary claim reuses and ignores ``env``.
+
+    This is the bug shape a file turn must not inherit: a lookup that saw no
+    live route followed by a claim that silently adopts the old runner.
+    """
+
+    old = substrate.claim("T2739")
+    fake_k8s.sandboxes[old.sandbox_name].operating_mode = "Restarting"
+    assert substrate.lookup("T2739") is None
+    fake_k8s.sandboxes[old.sandbox_name].operating_mode = "Running"
+
+    again = substrate.claim("T2739", env={"CURIE_ATTACHMENTS_REF": "ref"})
+
+    assert again == old
+    assert len(fake_k8s.created) == 1
+
+
+def test_fresh_only_claim_refuses_a_route_that_became_live_after_lookup(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
+) -> None:
+    """#2739: a Running record under fresh_only is a changed route, not reuse."""
+
+    route_changed = _route_changed_error()
+    old = substrate.claim("T2739")
+    fake_k8s.sandboxes[old.sandbox_name].operating_mode = "Restarting"
+    assert substrate.lookup("T2739") is None
+    fake_k8s.sandboxes[old.sandbox_name].operating_mode = "Running"
+
+    with pytest.raises(route_changed):
+        substrate.claim(
+            "T2739",
+            env={"CURIE_ATTACHMENTS_REF": "ref"},
+            fresh_only=True,  # type: ignore[call-arg]
+        )
+
+    assert len(fake_k8s.created) == 1
+    assert affinity.get("T2739") == RouteRecord(handle=old)
+    assert old.claim_name not in fake_k8s.deleted
+
+
+def test_fresh_only_claim_with_no_route_claims_fresh_with_env(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient
+) -> None:
+    """#2739 AC3: a brand new thread still gets the attachment env on its claim."""
+
+    handle = substrate.claim(
+        "T2739-new",
+        env={"CURIE_ATTACHMENTS_REF": "ref"},
+        fresh_only=True,  # type: ignore[call-arg]
+    )
+
+    assert fake_k8s.created == [handle.claim_name]
+    assert fake_k8s.claims[handle.claim_name].env["CURIE_ATTACHMENTS_REF"] == "ref"
+    assert substrate.lookup("T2739-new") == handle
+
+
+def test_fresh_only_claim_evicts_a_gone_sandbox_and_claims_fresh_with_env(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient
+) -> None:
+    """#2739: a dead retained runner is not a changed route; it is replaced."""
+
+    old = substrate.claim("T2739-gone")
+    fake_k8s.sandboxes.pop(old.sandbox_name)
+
+    handle = substrate.claim(
+        "T2739-gone",
+        env={"CURIE_ATTACHMENTS_REF": "ref"},
+        fresh_only=True,  # type: ignore[call-arg]
+    )
+
+    assert handle.claim_name != old.claim_name
+    assert old.claim_name in fake_k8s.deleted
+    assert fake_k8s.claims[handle.claim_name].env["CURIE_ATTACHMENTS_REF"] == "ref"
+    assert substrate.lookup("T2739-gone") == handle
+
+
+def test_fresh_only_claim_that_loses_the_route_race_deletes_its_own_claim(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2739: losing put_if_absent to a live winner never adopts the winner."""
+
+    route_changed = _route_changed_error()
+    real_put = affinity.put_if_absent
+    planted: list[bool] = []
+
+    def plant_winner_first(thread_key: str, record: RouteRecord, ttl_seconds: int) -> bool:
+        if not planted:
+            planted.append(True)
+            # The nested default claim records the live winner through the
+            # real put (the flag above lets it through), then ours loses.
+            substrate.claim(thread_key)
+        return real_put(thread_key, record, ttl_seconds)
+
+    monkeypatch.setattr(affinity, "put_if_absent", plant_winner_first)
+
+    with pytest.raises(route_changed):
+        substrate.claim(
+            "T2739-race",
+            env={"CURIE_ATTACHMENTS_REF": "ref"},
+            fresh_only=True,  # type: ignore[call-arg]
+        )
+
+    winner = affinity.get("T2739-race")
+    assert winner is not None
+    assert len(fake_k8s.created) == 2
+    (loser_claim,) = [name for name in fake_k8s.created if name != winner.handle.claim_name]
+    assert loser_claim in fake_k8s.deleted
+    assert loser_claim not in fake_k8s.claims
+    assert winner.handle.claim_name in fake_k8s.claims
+    assert winner.handle.claim_name not in fake_k8s.deleted
+    assert substrate.lookup("T2739-race") == winner.handle
+
+
+def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    """#2739 AC4 on the Docker client: ``restarting`` reads as gone to lookup,
+    and the same container back to ``running`` must not be adopted by a
+    fresh-only claim."""
+
+    from curie_worker.sandbox.docker import DockerSandboxClient
+
+    from .conftest import _FakeBundleStore
+
+    route_changed = _route_changed_error()
+
+    class _RestartingDocker(DockerSandboxClient):
+        def __init__(self) -> None:
+            super().__init__(image="curie-runner", bundle_store=_FakeBundleStore())
+            self.status = "running"
+            self.created: list[str] = []
+
+        def _docker(
+            self,
+            args: list[str],
+            *,
+            request_timeout_seconds: float,
+            check: bool = True,
+        ) -> str:
+            assert request_timeout_seconds > 0
+            raise AssertionError(f"unexpected docker call {args}")
+
+        def _inspect(
+            self, name: str, *, deadline: float
+        ) -> tuple[str, dict[str, str], datetime | None]:
+            assert deadline > time.monotonic()
+            return self.status, {}, None
+
+        def _dial_endpoint(
+            self, name: str, *, deadline: float
+        ) -> tuple[str, int] | None:
+            assert deadline > time.monotonic()
+            return ("127.0.0.1", 18080)
+
+        def create_claim(self, name: str, **_kwargs: object) -> None:
+            self.created.append(name)
+            raise AssertionError("a fresh-only claim created a container on a live route")
+
+    docker = _RestartingDocker()
+    substrate = SandboxSubstrate(docker, affinity, config)
+    old = SandboxHandle(
+        thread_key="T2739-docker",
+        claim_name="curie-thread-docker-abc123",
+        sandbox_name="curie-thread-docker-abc123",
+        namespace=config.namespace,
+        service_fqdn="127.0.0.1",
+        port=18080,
+        session_id="thread-docker",
+    )
+    assert affinity.put_if_absent("T2739-docker", RouteRecord(handle=old), 60)
+
+    docker.status = "restarting"
+    assert substrate.lookup("T2739-docker") is None
+    docker.status = "running"
+    assert substrate.lookup("T2739-docker") == old
+
+    with pytest.raises(route_changed):
+        substrate.claim(
+            "T2739-docker",
+            env={"CURIE_ATTACHMENTS_REF": "ref"},
+            fresh_only=True,  # type: ignore[call-arg]
+        )
+
+    assert docker.created == []
+    assert affinity.get("T2739-docker") == RouteRecord(handle=old)

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 StartConnector = Callable[[list[dict[str, object]]], str]
 
@@ -194,6 +195,27 @@ def test_gate_naming_a_published_write_tool_passes(
     assert r.returncode == 0, r.stdout + r.stderr
 
 
+def test_only_the_exact_platform_publication_gate_may_omit_a_connector_catalog(
+    tmp_path: Path, connector: StartConnector
+) -> None:
+    url = connector([READ_TOOL])
+    b = bundle(tmp_path, [PLATFORM_PUBLISH_TOOL_NAME])
+
+    exact = run(b, f"tempo={url}")
+    assert exact.returncode == 0, exact.stdout + exact.stderr
+
+    manifest_path = b / ".claude-plugin" / "plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    misspelled = f"{PLATFORM_PUBLISH_TOOL_NAME}_typo"
+    manifest["approvalPolicy"]["gates"][0]["gate"] = misspelled
+    manifest_path.write_text(json.dumps(manifest))
+
+    rejected = run(b, f"tempo={url}")
+    assert rejected.returncode == 1, rejected.stdout
+    assert "GATE ARMS NOTHING" in rejected.stderr
+    assert misspelled in rejected.stderr
+
+
 def test_tool_policy_approval_pattern_gates_a_published_write_tool(
     tmp_path: Path, connector: StartConnector
 ) -> None:
@@ -299,7 +321,7 @@ def test_a_host_without_a_port_still_matches_an_allowed_hosts_entry(
     b = bundle(tmp_path, ["mcp__k8s-write__restart_deployment"])
     r = run(b, f"k8s-write={url}", hosts=("k8s-write=sre.svc.cluster.local",))
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "all 1 gate(s) match a live tool" in r.stdout
+    assert "all 1 connector gate(s) match a live tool" in r.stdout
 
 
 def test_a_rejected_host_says_so_instead_of_reading_as_unreachable(
@@ -368,4 +390,4 @@ def test_a_307_to_the_trailing_slash_is_followed(
     r = run(b, f"k8s-write={url}")
 
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "all 1 gate(s) match a live tool" in r.stdout
+    assert "all 1 connector gate(s) match a live tool" in r.stdout

@@ -1486,6 +1486,22 @@ pub fn helm_history_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
+/// Read the manifest Helm retained for one selected revision.
+fn helm_retained_manifest_cmd(o: &CommonOpts, revision: u32) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("get"),
+            plain("manifest"),
+            plain(&o.release),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("--revision"),
+            plain(revision.to_string()),
+        ],
+    )
+}
+
 /// Read the live Alembic revision from the running API pod before Helm mutates.
 pub fn live_schema_revision_cmd(o: &CommonOpts) -> OpsCommand {
     let deploy = chart_fullname(&o.release).resource("api");
@@ -1648,6 +1664,33 @@ fn skipped_note(skipped: &[u32], from: u32) -> Option<String> {
 const LIVE_SCHEMA_PROBE_OVERRIDE_FIX: &str =
     "pass --live-schema-revision <rev> with the live Alembic revision so the schema-window check can run without the API pod";
 
+fn retained_manifest_guidance(
+    common: &CommonOpts,
+    revision: u32,
+    published_head: &str,
+    remediation: Option<&str>,
+) -> String {
+    let inspect = helm_retained_manifest_cmd(common, revision);
+    let raw_rollback = helm_rollback_cmd(common, revision);
+    let remediation = remediation
+        .map(|text| format!(" {text}."))
+        .unwrap_or_default();
+    format!(
+        "inspect `{}`; an absent ConfigMap labeled app.kubernetes.io/component=schema-compat identifies the published artifact with schema head {published_head}.{remediation} Only after accepting the schema risk, the operator owns using `{}` directly outside Curie's guarded rollback",
+        inspect.display(),
+        raw_rollback.display()
+    )
+}
+
+fn retained_manifest_fix(common: &CommonOpts, revision: u32, published_head: &str) -> String {
+    retained_manifest_guidance(
+        common,
+        revision,
+        published_head,
+        Some("repair Helm access or the retained metadata and retry"),
+    )
+}
+
 async fn probe_live_schema_revision(common: &CommonOpts, ui: &crate::ui::Ui) -> Result<String> {
     require_on_path("kubectl")?;
     let probe = live_schema_revision_cmd(common);
@@ -1749,11 +1792,88 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
             .with_fix("inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued")
             .into());
         };
-        if let Err(refusal) =
-            crate::schema_window::check_target_schema(&target_app, &live, &history_apps)
-        {
+        let Some(catalog_window) = crate::schema_window::window_for(&target_app) else {
+            let refusal = crate::schema_window::missing_target_window_refusal(
+                &target_app,
+                &live,
+                &history_apps,
+            );
             return Err(crate::exit::CliError::failure(refusal.message)
                 .with_fix(refusal.fix)
+                .into());
+        };
+        let (resolved_window, published_identity_fix) = if catalog_window
+            .artifact_identity_ambiguous
+        {
+            let manifest_cmd = helm_retained_manifest_cmd(&opts.common, choice.to_revision);
+            ui.plumbing(&format!("+ {}", manifest_cmd.display()));
+            let (ok, manifest_out, manifest_err) = run_capture(&manifest_cmd).await?;
+            let fix = retained_manifest_fix(
+                &opts.common,
+                choice.to_revision,
+                &catalog_window.schema_head,
+            );
+            if !ok {
+                let detail = crate::schema_window::redact_probe_text(
+                    manifest_err
+                        .trim()
+                        .lines()
+                        .next()
+                        .unwrap_or("helm get manifest exited nonzero with no message"),
+                );
+                return Err(crate::exit::CliError::failure(format!(
+                    "refusing rollback to application {target_app}: could not establish the selected artifact identity from its retained manifest: {detail}"
+                ))
+                .with_fix(fix)
+                .into());
+            }
+            match crate::schema_compat::classify_retained_manifest(&manifest_out, &target_app) {
+                Ok(crate::schema_compat::RetainedManifestIdentity::Published) => {
+                    let guidance = retained_manifest_guidance(
+                        &opts.common,
+                        choice.to_revision,
+                        &catalog_window.schema_head,
+                        None,
+                    );
+                    (catalog_window, Some(guidance))
+                }
+                Ok(crate::schema_compat::RetainedManifestIdentity::Candidate(metadata)) => {
+                    let candidate = crate::schema_window::candidate_window(
+                        &metadata.schema_min,
+                        &metadata.schema_head,
+                    )
+                    .map_err(|error| {
+                        crate::exit::CliError::failure(format!(
+                            "refusing rollback to application {target_app}: {}",
+                            crate::schema_window::redact_probe_text(&error)
+                        ))
+                        .with_fix(fix.clone())
+                    })?;
+                    (candidate, None)
+                }
+                Err(error) => {
+                    return Err(crate::exit::CliError::failure(format!(
+                        "refusing rollback to application {target_app}: could not establish the selected artifact identity: {}",
+                        crate::schema_window::redact_probe_text(&error)
+                    ))
+                    .with_fix(fix)
+                    .into());
+                }
+            }
+        } else {
+            (catalog_window, None)
+        };
+        if let Err(refusal) = crate::schema_window::check_target_schema(
+            &target_app,
+            &resolved_window,
+            &live,
+            &history_apps,
+        ) {
+            let fix = published_identity_fix
+                .map(|identity| format!("{}. {identity}", refusal.fix))
+                .unwrap_or(refusal.fix);
+            return Err(crate::exit::CliError::failure(refusal.message)
+                .with_fix(fix)
                 .into());
         }
         if opts.live_schema_revision.is_some() {
@@ -3697,26 +3817,66 @@ async fn discover_release_fullname(namespace: &str, release: &str) -> ComponentD
     preferred_probe_outcome(api, worker)
 }
 
-/// The per-process memo behind [`release_fullname`]. One
+/// The per-process memo behind [`release_fullname_discovery`]. One
 /// [`tokio::sync::OnceCell`] per `(namespace, release)`, handed out under a std
-/// mutex that is never held across an await.
-type ReleaseFullnameCache = std::sync::Mutex<
+/// mutex that is never held across an await. It stores the raw discovery
+/// outcome so callers can choose whether falling back to the chart name is
+/// safe for their operation.
+type ReleaseFullnameDiscoveryCache = std::sync::Mutex<
+    std::collections::HashMap<
+        (String, String),
+        std::sync::Arc<tokio::sync::OnceCell<ComponentDiscovery>>,
+    >,
+>;
+
+static RELEASE_FULLNAME_DISCOVERY_CACHE: std::sync::LazyLock<ReleaseFullnameDiscoveryCache> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The fallback adapter memo behind [`release_fullname`]. It preserves the
+/// existing once per process fallback warning behavior while taking every raw
+/// outcome from [`release_fullname_discovery`].
+type ReleaseFullnameFallbackCache = std::sync::Mutex<
     std::collections::HashMap<
         (String, String),
         std::sync::Arc<tokio::sync::OnceCell<ReleaseFullname>>,
     >,
 >;
 
-static RELEASE_FULLNAME_CACHE: std::sync::LazyLock<ReleaseFullnameCache> =
+static RELEASE_FULLNAME_FALLBACK_CACHE: std::sync::LazyLock<ReleaseFullnameFallbackCache> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Return the cached raw release fullname discovery outcome.
+///
+/// This is the only path that probes component names. Callers that can safely
+/// use the chart-computed fallback should use [`release_fullname`] instead.
+pub(crate) async fn release_fullname_discovery(
+    namespace: &str,
+    release: &str,
+) -> ComponentDiscovery {
+    // The std mutex is held only long enough to hand back this key's cell --
+    // never across the await below, which is what would deadlock the runtime.
+    let cell = {
+        let mut cache = RELEASE_FULLNAME_DISCOVERY_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .entry((namespace.to_string(), release.to_string()))
+            .or_default()
+            .clone()
+    };
+    cell.get_or_init(|| discover_release_fullname(namespace, release))
+        .await
+        .clone()
+}
 
 /// The release's fullname: discovered from the cluster, falling back to the
 /// chart's no-override rule.
 ///
-/// THE live entry point. Every path that can reach a cluster resolves here, and
-/// [`chart_fullname`] is what it degrades to. Discovery finding nothing is
-/// normal rather than an error -- `doctor` and a not-yet-installed release must
-/// still work -- so this never fails.
+/// The fallback enabled live entry point. Callers that can safely use the
+/// chart computed name resolve here, while mutating callers that need a
+/// confirmed resource target use [`release_fullname_discovery`] directly.
+/// Discovery finding nothing is normal rather than an error -- `doctor` and a
+/// not-yet-installed release must still work -- so this never fails.
 ///
 /// It is not, however, silent about WHY it degraded. A failed probe (RBAC
 /// denial, no kubectl, unreachable API server) and an ambiguous match both warn
@@ -3725,8 +3885,9 @@ static RELEASE_FULLNAME_CACHE: std::sync::LazyLock<ReleaseFullnameCache> =
 /// the warning `cluster status` reports "not found" for a Service that exists
 /// and a self-plumbed deploy fails against a name helm never rendered. Control
 /// flow is deliberately unchanged -- the fallback still happens, loudly.
-/// Failing mutating verbs closed on a failed probe is the stronger fix and is
-/// left as a follow-up policy decision.
+/// A mutating caller that needs a confirmed resource target must inspect
+/// [`release_fullname_discovery`] directly and fail closed on every outcome
+/// other than [`ComponentDiscovery::Found`].
 ///
 /// Resolve LAZILY, on the branch that actually needs a cluster-derived name.
 /// Resolving at a verb's entry point fires kubectl on the explicit-`--api-url`
@@ -3745,20 +3906,20 @@ static RELEASE_FULLNAME_CACHE: std::sync::LazyLock<ReleaseFullnameCache> =
 ///
 /// Two consequences, both deliberate:
 ///
-/// - The fallback warning is emitted ONCE per process instead of once per
-///   call. It says the rendered name could not be discovered, which is a fact
-///   about the run, not about the call site; repeating it per caller was noise.
-/// - Every outcome is cached, the [`chart_fullname`] fallback included. That is
-///   safe because no verb resolves a fullname both BEFORE and AFTER mutating
-///   the cluster within one process: `cluster up` and `cluster down` never call
-///   this (they name chart resources through the chart's own templates), so
-///   there is no window in which a cached miss could outlive the install that
-///   would have turned it into a hit.
+/// - Every raw discovery outcome is cached, so callers share one probe result
+///   without making a fallback choice on another caller's behalf. This adapter
+///   separately caches its mapped fullname, preserving one fallback warning per
+///   namespace and release.
+/// - No verb resolves a fullname both BEFORE and AFTER mutating the cluster
+///   within one process: `cluster up` and `cluster down` never call this (they
+///   name chart resources through the chart's own templates), so there is no
+///   window in which a cached miss could outlive the install that would have
+///   turned it into a hit.
 pub async fn release_fullname(namespace: &str, release: &str) -> ReleaseFullname {
     // The std mutex is held only long enough to hand back this key's cell --
     // never across the await below, which is what would deadlock the runtime.
     let cell = {
-        let mut cache = RELEASE_FULLNAME_CACHE
+        let mut cache = RELEASE_FULLNAME_FALLBACK_CACHE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache
@@ -3767,7 +3928,7 @@ pub async fn release_fullname(namespace: &str, release: &str) -> ReleaseFullname
             .clone()
     };
     cell.get_or_init(|| async {
-        match discover_release_fullname(namespace, release).await {
+        match release_fullname_discovery(namespace, release).await {
             ComponentDiscovery::Found(fullname) => fullname,
             outcome => {
                 let fallback = chart_fullname(release);

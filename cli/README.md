@@ -364,7 +364,7 @@ the optional Slack dispatcher.
 
 | Command | What it does |
 |---|---|
-| `curie local up` | Bring the compose stack up (`docker compose --profile full up -d --wait` by default, `docker compose --profile core up -d --wait` with `--minimal`) and print URLs.<br>• `--slack` appends `--profile slack`.<br>• `--build` builds the stack's images from the source checkout as `:dev` and runs those instead of the published ones; it needs a compose file that substitutes the image tags, so a release-channel `curie` must pass `-f compose.dev.yaml` or it refuses before building anything (#1926).<br>• `--local-model [<id>]` adds the `local-model` profile and routes runners at the compose Ollama (default `qwen3:4b`). Same pre-provisioning rule as `skill up`: the ~8.9 GB image and the model must already be cached or `up` refuses before starting anything; `--pull-model` accepts the download for that run (ADR 0093, #1183).<br>• `--env-file <PATH>` reads the model credential from a bundle `.env` as a last resort (precedence: shell env > file; only `CURIE_CREDENTIALS`/`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`, and the value never reaches argv or logs), so the stack boots live with no `set -a; source .env` step (#749). |
+| `curie local up` | Bring the compose stack up (`docker compose --profile full up -d --wait` by default, `docker compose --profile core up -d --wait` with `--minimal`) and print URLs.<br>• `--project` / `COMPOSE_PROJECT_NAME` and repeated `-f` / `COMPOSE_FILE` select an isolated stack; a custom project requires ordered files (candidate compose.dev.yaml then override) and matching host endpoints, otherwise usage exit 2 (#2780).<br>• `--slack` appends `--profile slack`.<br>• `--build` builds the stack's images from the source checkout as `:dev` and runs those instead of the published ones; it needs a compose file that substitutes the image tags, so a release-channel `curie` must pass `-f compose.dev.yaml` or it refuses before building anything (#1926).<br>• `--local-model [<id>]` adds the `local-model` profile and routes runners at the compose Ollama (default `qwen3:4b`). Same pre-provisioning rule as `skill up`: the ~8.9 GB image and the model must already be cached or `up` refuses before starting anything; `--pull-model` accepts the download for that run (ADR 0093, #1183).<br>• `--env-file <PATH>` reads the model credential from a bundle `.env` as a last resort (precedence: shell env > file; only `CURIE_CREDENTIALS`/`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`, and the value never reaches argv or logs), so the stack boots live with no `set -a; source .env` step (#749). |
 | `curie local down` | Stop the compose stack (`docker compose down`), keeping volumes. |
 | `curie local status` | Show the compose stack's service status (`docker compose ps`). |
 | `curie local observability` | Print the local platform's observability surfaces: Curie Console, Langfuse UI (traces / cost / evals), and the Curie API base. URLs are printed only; pass `--open` to also open the browsable ones (Console, Langfuse) in a browser. `--json` never opens a browser. |
@@ -740,8 +740,9 @@ these forms:
 
 1. `apps/.../tests/test_x.py::test_y`, `packages/.../tests/test_x.py::test_y`,
    or `runner/tests/test_x.py::test_y` for a Python test.
-2. `cli/tests/name.rs::test_name` for a Rust integration test.
-3. `charts/curie/ci/name.sh` for a chart check script.
+2. `cli/tests/local/test_x.py::test_y` for a local Python test.
+3. `cli/tests/name.rs::test_name` for a Rust integration test.
+4. `charts/curie/ci/name.sh` for a chart check script.
 
 The command runs the selector at the current `HEAD`, reverses only the change's
 non test files in a disposable worktree, then runs the selector again. It prints
@@ -753,10 +754,20 @@ Chart checks must return nonzero. It prints `UNPINNED` and exits nonzero when th
 selector remains green.
 
 It refuses invalid commit or pull request references, root commits, changes
-without classified test files or product files, selectors outside the five
+without classified test files or product files, selectors outside the supported
 forms or not changed by the reference, a red baseline, and reverse patch
 conflicts. It also refuses unrelated collection, import, compile, setup, and
 teardown failures. Inline tests in product files are not inferred.
+
+A local Python selector starts the actual isolated local services the test
+owns. The verifier invokes it twice in separate pytest processes, once for the
+baseline and once for the reversed change. Each invocation must start from
+fresh state, register cleanup before startup, and verify cleanup before it
+finishes. Unavailable Docker, required ports, required binaries, or required
+services must produce errors, never skips or green results. Put prerequisite
+checks, service startup, and cleanup verification in pytest fixture setup or
+teardown so environmental failures are errors, which the verifier refuses.
+Only product behavior assertions belong in the test body.
 
 ### Building the runner image from source
 

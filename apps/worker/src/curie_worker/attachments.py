@@ -443,13 +443,19 @@ def _slack_transport(
 class SlackFileClient:
     """Download one Slack file's bytes with the bot token, and only here.
 
-    ``url_private`` is NOT public: the download must carry
-    ``Authorization: Bearer <token>``, and Slack answers an unauthenticated
-    request with an HTML sign-in page rather than the bytes
-    (https://docs.slack.dev/reference/objects/file-object).  The token
-    authenticates exactly these two requests and reaches nothing downstream --
-    what the sandbox receives is a presigned one-object URL from the private
-    object store.
+    The download reads ``url_private_download`` rather than ``url_private``:
+    Slack answers a PDF's ``url_private`` with a 302 to ``slack-files.com``,
+    and the transport below deliberately refuses to follow it (see
+    ``_NoRedirect``), so the bearer token never reaches a host Slack chose.
+    ``url_private_download`` is Slack's documented direct-download endpoint on
+    the same file object and does not redirect
+    (https://docs.slack.dev/reference/objects/file-object). It is NOT public,
+    though: the download must carry ``Authorization: Bearer <token>``, or
+    Slack answers with an HTML sign-in page rather than the bytes.
+
+    The token authenticates exactly these two requests and reaches nothing
+    downstream -- what the sandbox receives is a presigned one-object URL from
+    the private object store.
     """
 
     def __init__(
@@ -470,10 +476,10 @@ class SlackFileClient:
         self._read_chunk_bytes = read_chunk_bytes
 
     def fetch(self, file_id: str) -> Iterator[bytes]:
-        url_private = self._url_private(file_id)
+        download_url = self._download_url(file_id)
         response = self._transport(
             method="GET",
-            url=url_private,
+            url=download_url,
             headers=self._headers(),
             chunk_bytes=self._read_chunk_bytes,
         )
@@ -492,7 +498,7 @@ class SlackFileClient:
             )
         return response.chunks
 
-    def _url_private(self, file_id: str) -> str:
+    def _download_url(self, file_id: str) -> str:
         response = self._transport(
             method="GET",
             url=f"{self._api_url}/files.info?file={file_id}",
@@ -506,12 +512,24 @@ class SlackFileClient:
             payload = json.loads(body)
             if not payload.get("ok"):
                 raise SlackFileError(f"slack files.info failed: {payload.get('error')}")
-            url_private = str(payload["file"]["url_private"])
+            file_obj = payload["file"]
+            if not isinstance(file_obj, Mapping):
+                raise TypeError("file object is not a mapping")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise SlackFileError("slack files.info returned an unusable envelope") from exc
-        if not url_private.startswith("https://"):
-            raise SlackFileError("slack files.info returned a non-HTTPS url_private")
-        return url_private
+        # The envelope parsed fine and was ok, but the field this module reads
+        # instead of url_private (see the class docstring) may still be
+        # absent. Named explicitly rather than folded into the except above,
+        # since a missing field is not the same failure as a malformed
+        # envelope and an operator needs to be able to tell them apart.
+        if "url_private_download" not in file_obj:
+            raise SlackFileError(
+                "slack files.info's file object has no url_private_download field"
+            )
+        download_url = str(file_obj["url_private_download"])
+        if not download_url.startswith("https://"):
+            raise SlackFileError("slack files.info returned a non-HTTPS url_private_download")
+        return download_url
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token}"}
@@ -689,6 +707,28 @@ class AttachmentCoordinator:
                 self.objects.delete(key)
             except Exception:  # noqa: BLE001 -- the refusal above is the real news
                 continue
+
+    def discard_prepared(self, *, thread_key: str, prepared: PreparedAttachments) -> None:
+        """Discard an abandoned preclaim set without disturbing a newer resolve.
+
+        The caller knows the exact bytes it prepared but not whether another
+        worker resolved a later turn for the same thread while the route was
+        being decided.  Its own objects are always safe to remove; the sibling
+        ledger is removed only when it is still the exact record for this set.
+        """
+
+        with self._lock:
+            self._discard(prepared.object_keys)
+            current = self._load(thread_key)
+            expected = _AttachmentSet(
+                thread_key=thread_key,
+                refs=prepared.refs,
+                object_keys=prepared.object_keys,
+                expires_at_epoch=prepared.retention_expires_at_epoch,
+            )
+            if current != expected:
+                return
+            self.objects.delete(self._ledger_key(thread_key))
 
     @staticmethod
     def _object_key(*, agent_id: str, generation: str, index: int) -> str:

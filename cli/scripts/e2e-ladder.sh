@@ -175,11 +175,42 @@ CHANGED_RUNNER_NAME="curie-ladder-changed-$$"
 # The runner the hermetic negative boots, in the runs where no connector bundle
 # is named at all. Same rule again: never the default name.
 HERMETIC_RUNNER_NAME="curie-ladder-hermetic-$$"
-# Hardcoded, and deliberately NOT an env knob: the stub port is the constant
-# DEFAULT_LOCAL_STUB_PORT in cli/src/message.rs, pinned to the compose worker's
-# SLACK_API_BASE_URL. An override would only move this script's precheck, so it
-# could green-light an occupied 8155 and then hang on the message timeout.
-STUB_PORT=8155
+# Isolation contract (#2780). Default remains this checkout's compose.dev.yaml
+# and project curie. When COMPOSE_PROJECT_NAME and COMPOSE_FILE are set, the
+# local rung uses that project and ordered files. File[0] must still be this
+# checkout's compose.dev.yaml because the rung always passes --build.
+COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-curie}"
+if [[ -n "${COMPOSE_FILE:-}" ]]; then
+  IFS=: read -r -a COMPOSE_FILES <<< "$COMPOSE_FILE"
+else
+  COMPOSE_FILES=("$REPO_ROOT/compose.dev.yaml")
+fi
+# Default matches message::DEFAULT_LOCAL_STUB_PORT. Isolation sets
+# CURIE_LOCAL_STUB_PORT to the worker's rebound SLACK_API_BASE_URL port.
+STUB_PORT="${CURIE_LOCAL_STUB_PORT:-8155}"
+# Host-network worker OTLP and Collector self-metrics. Isolation remaps the
+# published collector ports; the default matches compose.dev.yaml.
+PRODUCT_COLLECTOR_WORKER_ENDPOINT="${CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT:-http://127.0.0.1:24318}"
+PRODUCT_COLLECTOR_METRICS_URL="${CURIE_LOCAL_OTEL_METRICS_URL:-http://127.0.0.1:28888/metrics}"
+
+local_compose_cli_args() {
+  local args=("$@")
+  args+=(--project "$COMPOSE_PROJECT")
+  local f
+  for f in "${COMPOSE_FILES[@]}"; do
+    args+=(-f "$f")
+  done
+  printf '%s\n' "${args[@]}"
+}
+
+ladder_compose() {
+  local args=(docker compose -p "$COMPOSE_PROJECT")
+  local f
+  for f in "${COMPOSE_FILES[@]}"; do
+    args+=(-f "$f")
+  done
+  "${args[@]}" "$@"
+}
 PROMPT="What is the weather in Denver right now?"
 # The live approval-gate case's turn (#2094). Deliberately explicit and
 # imperative, and deliberately NOT a weather question: the bundle's skill only
@@ -220,9 +251,11 @@ MCP_RECEIPT_IMAGE=""
 LAST_ORDINARY_TRACE_ID=""
 LAST_MCP_TRACE_ID=""
 LAST_APPROVAL_TRACE_ID=""
+LAST_CODING_TRACE_ID=""
 LAST_ORDINARY_MEMBERSHIP=""
 LAST_MCP_MEMBERSHIP=""
 LAST_APPROVAL_MEMBERSHIP=""
+LAST_CODING_MEMBERSHIP=""
 LAST_QUERY_MEMBERSHIP=""
 LAST_QUERY_OBSERVATION_COUNT="0"
 LAST_EXTERNAL_ACCEPTED_DELTA="0"
@@ -340,6 +373,8 @@ WORKDIR="$(mktemp -d)"
 LOCAL_PRODUCT_EVIDENCE="$WORKDIR/product-observability-local.json"
 CLUSTER_PRODUCT_EVIDENCE="$WORKDIR/product-observability-cluster.json"
 APPROVAL_SEED_MESSAGE_PID=""
+APPROVAL_SEED_AGENT_ID=""
+APPROVAL_SEED_CHANNEL=""
 
 stop_approval_seed_message() {
     local mode="${1:-wait}" pid code=0
@@ -362,6 +397,10 @@ cleanup() {
     # before stack teardown so an interrupted seed cannot retain the stub port
     # after this run exits.
     stop_approval_seed_message terminate || true
+    if ! cleanup_approval_seed_fixture; then
+        echo "error: could not remove owned approval seed agent" >&2
+        [[ "$code" -ne 0 ]] || code=1
+    fi
     # The compose worker spawns runner containers as SIBLINGS on the host daemon
     # via the mounted docker socket, so a rung that died before `local down` can
     # strand them. This raw sweep is a BACKSTOP, not duplication: `local down`
@@ -378,9 +417,13 @@ cleanup() {
         # Tolerated failure, on top of `set +e`: the stack may never have
         # finished coming up, and a failed `local down` must not skip the
         # sandbox sweep below or change the exit code captured above.
-        "$BIN" local down -f "$REPO_ROOT/compose.dev.yaml" || echo "warning: \`local down\` failed during teardown; sweeping anyway." >&2
+        local down_args=()
+        while IFS= read -r line; do
+          down_args+=("$line")
+        done < <(local_compose_cli_args local down)
+        "$BIN" "${down_args[@]}" || echo "warning: \`local down\` failed during teardown; sweeping anyway." >&2
         local orphans
-        orphans="$(docker ps -aq --filter "label=$SANDBOX_LABEL" 2>/dev/null)"
+        orphans="$(docker ps -aq --filter "label=$SANDBOX_LABEL" --filter "network=${CURIE_DOCKER_NETWORK:-curie_runner}" 2>/dev/null)"
         if [[ -n "$orphans" ]]; then
             echo "sweeping orphaned sandbox containers"
             # shellcheck disable=SC2086
@@ -676,7 +719,7 @@ product_stream_json() {
         local)
             local valkey
             valkey="$(docker ps \
-                --filter 'label=com.docker.compose.project=curie' \
+                --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
                 --filter 'label=com.docker.compose.service=valkey' \
                 --format '{{.Names}}')"
             [[ -n "$valkey" && "$valkey" != *$'\n'* ]] || {
@@ -856,7 +899,7 @@ PY
 # Slack queue entry; no caller-supplied id and no harness XADD are accepted.
 cluster_external_ingress_seed() {
     local kind="$1" expected_operations="$2" expected_decision="${3:-}"
-    local receipt="$CLUSTER_EXTERNAL_INGRESS_RECEIPT" fields marker stream_start stream_end trace_id
+    local receipt="$CLUSTER_EXTERNAL_INGRESS_RECEIPT" fields marker stream_start stream_end trace_id expected_tool=""
     [[ -n "$PRODUCT_OBSERVABILITY_RUN_ID" ]] || {
         echo "cluster product evidence blocked: CURIE_E2E_PRODUCT_RUN_ID is required to join one supported run" >&2
         return 1
@@ -870,7 +913,7 @@ cluster_external_ingress_seed() {
         return 1
     }
     fields="$(python3 - "$receipt" "$PRODUCT_OBSERVABILITY_RUN_ID" "$kind" <<'PY'
-import json, pathlib, re, sys
+import hashlib, json, pathlib, re, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
 run_id, kind = sys.argv[2:4]
 if not isinstance(value, dict) or value.get("run_id") != run_id:
@@ -895,6 +938,12 @@ if kind == "mcp" and seed.get("mcp_call_count_delta") != 1:
     raise SystemExit("external MCP seed omitted its independent one-call receipt")
 if kind == "approval" and seed.get("approval_transition_observed") is not True:
     raise SystemExit("external approval seed omitted its independent transition receipt")
+if kind == "coding":
+    # The external Slack driver observes this digest in the finalized reply
+    # after asking Bash to run hashlib.sha256(marker.encode()).hexdigest().
+    expected_receipt = hashlib.sha256(marker.encode()).hexdigest()
+    if seed.get("coding_execution_receipt") != expected_receipt:
+        raise SystemExit("external coding seed omitted its independent execution receipt")
 accepted = seed.get("otelcol_receiver_accepted_spans_delta")
 sent = seed.get("otelcol_exporter_sent_spans_delta")
 if not all(isinstance(item, (int, float)) and not isinstance(item, bool) and item > 0 for item in (accepted, sent)):
@@ -904,7 +953,10 @@ PY
 )" || return 1
     read -r marker stream_start stream_end LAST_EXTERNAL_ACCEPTED_DELTA LAST_EXTERNAL_SENT_DELTA <<< "$fields"
     trace_id="$(discover_cluster_external_trace_id "$marker" "$stream_start" "$stream_end")" || return 1
-    query_exact_seed_trace cluster "$trace_id" "$expected_operations" "$expected_decision" observe
+    if [[ "$kind" == "coding" ]]; then
+        expected_tool="Bash"
+    fi
+    query_exact_seed_trace cluster "$trace_id" "$expected_operations" "$expected_decision" observe "$expected_tool"
 }
 
 discover_cluster_external_trace_id() {
@@ -973,6 +1025,7 @@ safe_operations = {
     }
 operations = []
 types = set()
+tool_names = set()
 observation_count = [0]
 
 def walk(node):
@@ -984,10 +1037,23 @@ def walk(node):
     observation_count[0] += 1
     name = public_node.get("name")
     kind = public_node.get("type")
+    normalized_kind = kind.upper() if isinstance(kind, str) else ""
+    # Langfuse 3.225.5 maps any span carrying gen_ai.tool.name to type TOOL and
+    # RENAMES the observation to the tool, so a real tool call never arrives
+    # under the name execute_tool. Name-keyed membership alone is therefore
+    # blind to every tool call; the type and the hoisted toolName are the only
+    # surviving evidence that the execute_tool operation happened.
+    tool_name = public_node.get("toolName")
+    if not isinstance(tool_name, str) or not tool_name:
+        tool_name = name if normalized_kind == "TOOL" and isinstance(name, str) else None
     if name in safe_operations:
         operations.append(name)
-    if isinstance(kind, str) and kind.upper() in {"SPAN", "GENERATION", "EVENT"}:
-        types.add(kind.upper())
+    elif normalized_kind == "TOOL" or tool_name:
+        operations.append("execute_tool")
+    if tool_name:
+        tool_names.add(tool_name)
+    if normalized_kind in {"SPAN", "GENERATION", "EVENT", "TOOL"}:
+        types.add(normalized_kind)
     children = public_node.get("children")
     if not isinstance(children, list):
         raise SystemExit("exact trace node omitted its child array")
@@ -1013,11 +1079,14 @@ sanitized = {
     "operation": sorted(set(operations)),
     "observation_count": observation_count[0],
     "observation_type": sorted(types),
+    # WHICH tool ran, not merely that some tool observation existed: a required
+    # Bash call must not be satisfied by an unrelated surviving tool span.
+    "tool_name": sorted(tool_names),
     "approval_decision": decision,
     }
 allowed_evidence_fields = {
     "trace_id", "service", "operation", "observation_count",
-    "observation_type", "approval_decision",
+    "observation_type", "tool_name", "approval_decision",
     }
 if set(sanitized) != allowed_evidence_fields:
     raise SystemExit("sanitized evidence field set drifted")
@@ -1028,7 +1097,7 @@ PY
 # Query one exact ID only. Raw CLI output remains in a mode-0600 file and only
 # sanitize_exact_trace_read reaches stdout.
 query_exact_seed_trace() {
-    local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}"
+    local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}" expected_tool="${6:-}"
     local attempt code=0 private_read safe_read membership observation_count saw_valid=0
     local last_query_state="query-error"
     LAST_QUERY_MEMBERSHIP=""
@@ -1129,7 +1198,7 @@ PY
             else
                 saw_valid=1
                 last_query_state="incomplete-membership"
-                read -r membership observation_count < <(python3 - "$safe_read" "$expected_csv" "$expected_decision" <<'PY'
+                read -r membership observation_count < <(python3 - "$safe_read" "$expected_csv" "$expected_decision" "$expected_tool" <<'PY'
 import json, pathlib, sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text())
 expected = [item for item in sys.argv[2].split(",") if item]
@@ -1139,7 +1208,10 @@ missing = [
     if not any(candidate in operations for candidate in item.split("|"))
 ]
 decision_matches = not sys.argv[3] or value["approval_decision"] == sys.argv[3]
-membership = value["observation_count"] > 0 and not missing and decision_matches
+# Fail closed on identity: checked against the sanitized tool_name projection,
+# never a raw private read, so a surviving unrelated tool cannot stand in.
+tool_matches = not sys.argv[4] or sys.argv[4] in value["tool_name"]
+membership = value["observation_count"] > 0 and not missing and decision_matches and tool_matches
 print("true" if membership else "false", value["observation_count"])
 PY
                 )
@@ -1173,7 +1245,7 @@ PY
 import json, sys
 print(json.dumps({
     "trace_id": sys.argv[1], "service": [], "operation": [],
-    "observation_count": 0, "observation_type": [],
+    "observation_count": 0, "observation_type": [], "tool_name": [],
     "approval_decision": None,
 }, sort_keys=True, separators=(",", ":")))
 PY
@@ -1262,6 +1334,179 @@ seed_mcp_read_turn() {
     printf '%s' "$trace_id"
 }
 
+seed_coding_tool_turn() {
+    local tier="$1" agent_id="${2:-}" query_state="${3:-present}" marker="curie-seed-coding-$$-$RANDOM"
+    local stream_start stream_end out reply trace_id
+    local expected_receipt
+    # A fixed arithmetic product is model-computable, and a DENIED tool call
+    # still emits its span, so that receipt witnessed neither execution nor
+    # success. The sha256 of this run's own random marker is not derivable
+    # without actually running the tool.
+    expected_receipt="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$marker")" || return 1
+    if [[ "$LIVE" != "1" || -z "$agent_id" || -z "$marker" ]]; then
+        echo "seed-invalid: built-in coding seed needs live mode, a deployed agent, and a marker before telemetry" >&2
+        return 1
+    fi
+    if [[ "$tier" == "cluster" ]]; then
+        echo "seed-invalid: cluster coding correlation must come from the external Slack ingress receipt" >&2
+        return 1
+    fi
+    stream_start="$(capture_stream_cursor "$tier")" || return 1
+    out="$("$BIN" --json local message --channel C0LOCALDEV \
+        "Use the built-in Bash tool exactly once to run: python3 -c \"import hashlib;print(hashlib.sha256(b'$marker').hexdigest())\". Then reply with the exact digest it printed. $marker" || true)"
+    assert_finalized_reply "$tier built-in coding correlation" "$out"
+    # Independent of telemetry: a built-in tool has no hosted container to log a
+    # receipt, so the sha256 digest in the finalized reply is the proof that the
+    # tool really ran and succeeded.
+    reply="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    d = {}
+print(d.get("reply", "") if isinstance(d, dict) else "")
+' || true)"
+    if [[ "$reply" != *"$expected_receipt"* ]]; then
+        echo "seed-invalid: built-in coding seed reply is missing the deterministic tool receipt" >&2
+        return 1
+    fi
+    echo "built-in coding receipt present in reply"
+    stream_end="$(capture_stream_cursor "$tier")" || return 1
+    trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
+    query_exact_seed_trace "$tier" "$trace_id" "execute_tool" "" "$query_state" "Bash"
+    LAST_CODING_TRACE_ID="$trace_id"
+    LAST_CODING_MEMBERSHIP="$LAST_QUERY_MEMBERSHIP"
+    printf '%s' "$trace_id"
+}
+
+configure_deterministic_approval_seed_route() {
+    local tier="$1" agent_id="$2" channel="$3" routes_file status
+    routes_file="$(mktemp "$WORKDIR/approval-routes.XXXXXX")" || return 1
+    if ! python3 - "$agent_id" "${CURIE_API_URL:-http://localhost:28000}" "$routes_file" "$channel" <<'PYROUTES'
+import json, os, sys, urllib.error, urllib.request
+from pathlib import Path
+
+agent_id, api_base, routes_path, channel = sys.argv[1:5]
+request = urllib.request.Request(
+    api_base.rstrip("/") + "/agents",
+    headers={"Accept": "application/json", "X-API-Key": os.environ.get("CURIE_API_KEY") or "curie-dev-key"},
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        agents = json.load(response)
+except urllib.error.HTTPError as exc:
+    raise SystemExit("GET /agents failed with HTTP %s: %s" % (exc.code, exc.read().decode(errors="replace")))
+except urllib.error.URLError as exc:
+    raise SystemExit("GET /agents failed: %s" % exc.reason)
+if not isinstance(agents, list) or any(not isinstance(agent, dict) for agent in agents):
+    raise SystemExit("GET /agents returned an unexpected response")
+matches = [agent for agent in agents if agent.get("id") == agent_id or agent.get("name") == agent_id]
+if len(matches) != 1:
+    raise SystemExit("expected exactly one deployed agent matching %s" % agent_id)
+existing = matches[0].get("approval_routes") or dict()
+if not isinstance(existing, dict):
+    raise SystemExit("agent %s returned malformed approval_routes" % agent_id)
+with_notification = sorted(
+    name for name, binding in existing.items()
+    if name != "e2e" and isinstance(binding, dict) and binding.get("notification") is not None
+)
+if with_notification:
+    raise SystemExit(
+        "refusing to configure deterministic approval route: existing route(s) %s carry "
+        "notification targets whose hidden transport the API response does not expose; "
+        "a full route map write cannot preserve them" % ", ".join(with_notification)
+    )
+merged = dict(existing)
+merged["e2e"] = dict(
+    resolution=dict(kind="slack", address=channel),
+    approvers=dict(users=["U0EXAMPLE1"]),
+)
+Path(routes_path).write_text(json.dumps(merged, separators=(",", ":")) + "\n")
+PYROUTES
+    then
+        rm -f "$routes_file"
+        return 1
+    fi
+    if "$BIN" --json "$tier" approvals "$agent_id" --routes-from "$routes_file"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$routes_file"
+    return "$status"
+}
+
+cleanup_approval_seed_fixture() {
+    [[ -n "${APPROVAL_SEED_AGENT_ID:-}" ]] || return 0
+    "$BIN" --json local kill "$APPROVAL_SEED_AGENT_ID" --yes || return 1
+    "$BIN" --json local delete "$APPROVAL_SEED_AGENT_ID" --yes || return 1
+    APPROVAL_SEED_AGENT_ID=""
+    APPROVAL_SEED_CHANNEL=""
+}
+
+prepare_approval_seed_fixture() {
+    local tier="$1" fixture_dir="$WORKDIR/approval-seed-bundle"
+    local fixture_name="approval-seed-$$-$RANDOM"
+    if [[ -n "${APPROVAL_SEED_AGENT_ID:-}" ]]; then
+        echo "seed-invalid: an approval seed fixture is already registered" >&2
+        return 1
+    fi
+    APPROVAL_SEED_CHANNEL="C0E2EAPPROVAL"
+    if ! python3 - "$fixture_dir" "$fixture_name" <<'PYBUNDLE'
+import json, sys
+from pathlib import Path
+
+bundle, name = Path(sys.argv[1]), sys.argv[2]
+(bundle / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+(bundle / "skills" / "approval-seed").mkdir(parents=True, exist_ok=True)
+manifest = dict(
+    name=name,
+    version="0.1.0",
+    description="Deterministic approval resume verification fixture.",
+    systemPrompt="Complete the requested approval verification.",
+    approvalPolicy=dict(gates=[dict(gate="Read", route="e2e", grantableViaPolicy=True)]),
+)
+(bundle / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest) + "\n")
+(bundle / "skills" / "approval-seed" / "SKILL.md").write_text(
+    "---\nname: approval-seed\ndescription: Verify approval suspend and resume.\n"
+    "allowed-tools: Bash\n---\n\nComplete the requested approval verification.\n"
+)
+(bundle / ".mcp.json").write_text('{"mcpServers":{}}\n')
+PYBUNDLE
+    then
+        return 1
+    fi
+    # Register the owned API identity before route configuration or deployment
+    # can fail, so the EXIT cleanup can always remove the transient agent.
+    if ! APPROVAL_SEED_AGENT_ID="$(python3 - "$fixture_name" "$APPROVAL_SEED_CHANNEL" <<'PYAGENT'
+import json, os, sys, urllib.error, urllib.request
+
+name, channel = sys.argv[1:3]
+request = urllib.request.Request(
+    (os.environ.get("CURIE_API_URL") or "http://localhost:28000").rstrip("/") + "/agents",
+    data=json.dumps(dict(name=name, channel=dict(kind="slack", address=channel))).encode(),
+    headers={"Content-Type": "application/json", "X-API-Key": os.environ.get("CURIE_API_KEY") or "curie-dev-key"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        agent = json.load(response)
+except urllib.error.HTTPError as exc:
+    raise SystemExit("POST /agents failed with HTTP %s: %s" % (exc.code, exc.read().decode(errors="replace")))
+except urllib.error.URLError as exc:
+    raise SystemExit("POST /agents failed: %s" % exc.reason)
+agent_id = agent.get("id")
+if not isinstance(agent_id, str) or not agent_id:
+    raise SystemExit("POST /agents omitted the owned fixture id")
+print(agent_id)
+PYAGENT
+    )"; then
+        return 1
+    fi
+    configure_deterministic_approval_seed_route "$tier" "$APPROVAL_SEED_AGENT_ID" "$APPROVAL_SEED_CHANNEL" || return 1
+    "$BIN" --json local deploy --plugin-dir "$fixture_dir"
+}
+
 seed_approval_resume_turn() {
     local tier="$1" agent_id="${2:-}" query_state="${3:-present}" marker="curie-seed-approval-$$-$RANDOM"
     local stream_start stream_end message_file message_stderr_file token_file pending_file approval_id token out trace_id
@@ -1275,6 +1520,11 @@ seed_approval_resume_turn() {
         return 1
     fi
     umask 077
+    if ! prepare_approval_seed_fixture "$tier"; then
+        echo "seed-invalid: could not prepare dedicated approval fixture" >&2
+        return 1
+    fi
+    agent_id="$APPROVAL_SEED_AGENT_ID"
     if ! message_file="$(mktemp "$WORKDIR/approval-message.XXXXXX")"; then
         echo "seed-invalid: could not create private approval message artifact" >&2
         return 1
@@ -1295,13 +1545,6 @@ seed_approval_resume_turn() {
         return 1
     fi
     local scope=()
-    if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
-        --route-resolution e2e=C0EXAMPLE1 --route-approvers e2e=users:U0EXAMPLE1 \
-        >/dev/null; then
-        rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
-        echo "seed-invalid: could not configure deterministic approval route" >&2
-        return 1
-    fi
     if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
         --mint-operator-principal U0EXAMPLE1 > "$token_file"; then
         rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
@@ -1325,7 +1568,7 @@ PY
         rm -f "$message_file" "$message_stderr_file" "$pending_file"
         return 1
     }
-    "$BIN" --json local message --channel C0LOCALDEV --timeout-secs 120 \
+    "$BIN" --json local message --channel "$APPROVAL_SEED_CHANNEL" --timeout-secs 120 \
         "[fake:request-approval:e2e] approve correlation $marker" > "$message_file" 2> "$message_stderr_file" &
     APPROVAL_SEED_MESSAGE_PID=$!
     approval_id=""
@@ -1782,11 +2025,11 @@ probe_local_fake_model() {
         if [[ -n "$line" ]]; then
             workers+=("$line")
         fi
-    done < <(docker ps --filter 'label=com.docker.compose.project=curie' --filter 'label=com.docker.compose.service=curie-worker' --format '{{.Names}}')
+    done < <(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --filter 'label=com.docker.compose.service=curie-worker' --format '{{.Names}}')
     # Exactly one, never "inspect the first": two matches mean the scoping
     # assumption broke and the probe's answer would be meaningless.
     if (( ${#workers[@]} != 1 )); then
-        echo "local mode probe: expected exactly one running container matching label=com.docker.compose.project=curie plus label=com.docker.compose.service=curie-worker, found ${#workers[@]} (${workers[*]:-none})." >&2
+        echo "local mode probe: expected exactly one running container matching label=com.docker.compose.project=$COMPOSE_PROJECT plus label=com.docker.compose.service=curie-worker, found ${#workers[@]} (${workers[*]:-none})." >&2
         return 1
     fi
     # Captured into a variable and status-checked, never read through a process
@@ -2233,6 +2476,128 @@ PY
     echo "connector fixture applied to $dir (connectors.yaml)"
 }
 
+# Bind every approval route that survived prepare_connector_bundle before the
+# local deploy precheck judges the manifest. An absent agent is created through
+# the same API the deploy uses. For an existing agent, the public approvals verb
+# performs the full map update so its validation and API preflight stay in the
+# path; only missing routes are added to the map it receives.
+bind_local_connector_approval_routes() {
+    local dir="$1"
+    local plugin="$dir/.claude-plugin/plugin.json"
+    local api_base="${CURIE_API_URL:-http://localhost:28000}"
+    local routes_file agent_name approval_status
+    routes_file="$(mktemp)"
+    if ! agent_name="$(python3 - "$plugin" "$api_base" "$routes_file" <<'PY'
+import json, os, sys, urllib.error, urllib.request
+from pathlib import Path
+
+plugin_path, api_base, routes_path = sys.argv[1:4]
+api_key = os.environ.get("CURIE_API_KEY") or "curie-dev-key"
+manifest = json.loads(Path(plugin_path).read_text())
+agent_name = manifest["name"]
+gates = manifest.get("approvalPolicy", dict()).get("gates", [])
+routes = sorted({gate["route"] for gate in gates})
+if not routes:
+    raise SystemExit(0)
+
+
+def request(method, path, payload=None):
+    data = None if payload is None else json.dumps(payload).encode()
+    headers = dict(Accept="application/json", **{"X-API-Key": api_key})
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        api_base.rstrip("/") + path,
+        data=data,
+        method=method,
+        headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise SystemExit("%s %s failed with HTTP %s: %s" % (method, path, exc.code, detail))
+    except urllib.error.URLError as exc:
+        raise SystemExit("%s %s failed: %s" % (method, path, exc.reason))
+    return json.loads(raw) if raw else None
+
+
+agents = request("GET", "/agents")
+if not isinstance(agents, list):
+    raise SystemExit("GET /agents returned an unexpected response")
+agent = next((item for item in agents if item.get("name") == agent_name), None)
+new_binding = dict(resolution=dict(kind="slack", address="C0LOCALDEV"))
+if agent is None:
+    request(
+        "POST",
+        "/agents",
+        dict(
+            name=agent_name,
+            channel=dict(kind="slack", address="C0LOCALDEV"),
+            approval_routes=dict((route, new_binding) for route in routes),
+        ),
+    )
+    raise SystemExit(0)
+
+existing = agent.get("approval_routes") or dict()
+if not isinstance(existing, dict):
+    raise SystemExit("agent %s returned malformed approval_routes" % agent_name)
+missing = [route for route in routes if route not in existing]
+if not missing:
+    raise SystemExit(0)
+with_notification = sorted(
+    name
+    for name, binding in existing.items()
+    if isinstance(binding, dict) and binding.get("notification") is not None
+)
+if with_notification:
+    raise SystemExit(
+        "refusing to add approval route(s) %s on agent %s: existing route(s) %s "
+        "carry notification targets whose hidden transport the API response does not expose, "
+        "so a full route map write cannot preserve them. Re-run this connector ladder on a "
+        "fresh isolated stack instead of dropping notification policy."
+        % (", ".join(missing), agent_name, ", ".join(with_notification))
+    )
+merged = dict(existing)
+for route in missing:
+    merged[route] = new_binding
+Path(routes_path).write_text(json.dumps(merged, separators=(",", ":")) + "\n")
+print(agent_name)
+PY
+    )"; then
+        rm -f "$routes_file"
+        return 1
+    fi
+    if [[ -s "$routes_file" ]]; then
+        if "$BIN" --json local approvals "$agent_name" --routes-from "$routes_file"; then
+            approval_status=0
+        else
+            approval_status=$?
+        fi
+        rm -f "$routes_file"
+        return "$approval_status"
+    fi
+    rm -f "$routes_file"
+}
+
+# Command substitution is confined to the CLI invocation inside this helper.
+# Bash's dynamic scope assigns the captured payload to the caller's local
+# deploy_json, while the direct helper call preserves the CLI's status and lets
+# the enclosing EXIT trap observe it after the diagnostic is printed.
+capture_local_deploy() {
+    local dir="$1"
+    local captured deploy_status
+    if captured="$("$BIN" --json local deploy --plugin-dir "$dir")"; then
+        deploy_status=0
+    else
+        deploy_status=$?
+    fi
+    deploy_json="$captured"
+    printf '%s\n' "$deploy_json"
+    return "$deploy_status"
+}
+
 # Add the independently countable, read-only MCP receipt server to a scratch
 # bundle. It goes through the ordinary connector build/lock path; no in-sandbox
 # file can be evidence because the sandbox is destroyed with the turn.
@@ -2362,7 +2727,7 @@ local_worker_container() {
     local line workers=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && workers+=("$line")
-    done < <(docker ps --filter 'label=com.docker.compose.project=curie' --filter 'label=com.docker.compose.service=curie-worker' --format '{{.Names}}')
+    done < <(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --filter 'label=com.docker.compose.service=curie-worker' --format '{{.Names}}')
     if (( ${#workers[@]} != 1 )); then
         echo "connector scope probe: expected exactly one running curie-worker in the compose project 'curie', found ${#workers[@]} (${workers[*]:-none})." >&2
         return 1
@@ -3074,7 +3439,7 @@ start_local_otel_sink() {
     local network=curie_runner
     if ! docker network inspect "$network" >/dev/null 2>&1; then
         docker network create \
-            --label com.docker.compose.project=curie \
+            --label "com.docker.compose.project=$COMPOSE_PROJECT" \
             --label com.docker.compose.network=curie_runner \
             "$network" >/dev/null
         LOCAL_OTEL_NETWORK_OWNED=1
@@ -3664,9 +4029,10 @@ pin_local_source_images() {
     if (( ! LOCAL_STACK_OWNED )); then
         return 0
     fi
-    export CURIE_BASE_TAG=dev
-    export CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:dev
-    export CURIE_DISPATCHER_IMAGE=ghcr.io/curie-eng/curie-dispatcher:dev
+    local tag="${CURIE_LOCAL_IMAGE_TAG:-dev}"
+    export CURIE_BASE_TAG="$tag"
+    export CURIE_RUNNER_IMAGE="ghcr.io/curie-eng/curie-runner:$tag"
+    export CURIE_DISPATCHER_IMAGE="ghcr.io/curie-eng/curie-dispatcher:$tag"
 }
 
 # Affinity reuses a live sandbox across worker recreation. Reap so the next
@@ -3704,7 +4070,7 @@ inject_local_runner_failure() {
     export CURIE_CREDENTIALS=""
     export ANTHROPIC_API_KEY=""
     export CLAUDE_CODE_OAUTH_TOKEN=""
-    docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+    ladder_compose --profile core --profile full \
         up -d --force-recreate --no-deps curie-worker >/dev/null
     reap_local_runner_sandboxes
     sleep 3
@@ -3732,7 +4098,7 @@ restore_local_runner_health() {
     else
         unset CLAUDE_CODE_OAUTH_TOKEN
     fi
-    docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+    ladder_compose --profile core --profile full \
         up -d --force-recreate --no-deps curie-worker >/dev/null
     reap_local_runner_sandboxes
     LOCAL_OTEL_FAILURE_MODE=0
@@ -3777,7 +4143,7 @@ route_local_observability_to_product_collector() {
     fi
 
     export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
-    export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318
+    export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT="$PRODUCT_COLLECTOR_WORKER_ENDPOINT"
     export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
     local stale runner dispatcher=""
     # An already-running curie-runner inherited the disposable endpoint. Reap
@@ -3796,28 +4162,28 @@ route_local_observability_to_product_collector() {
             fi
         done < <(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')
     fi
-    docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+    ladder_compose --profile core --profile full \
         up -d --force-recreate --no-deps curie-api curie-worker >/dev/null
     dispatcher="$(docker ps \
-        --filter 'label=com.docker.compose.project=curie' \
+        --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
         --filter 'label=com.docker.compose.service=curie-dispatcher' \
         --format '{{.Names}}')"
     if [[ -n "$dispatcher" ]]; then
-        docker compose --profile slack -f "$REPO_ROOT/compose.dev.yaml" \
+        ladder_compose --profile slack \
             up -d --force-recreate --no-deps curie-dispatcher >/dev/null
     fi
     sleep 3
 
     local api worker
-    api="$(docker ps --filter 'label=com.docker.compose.project=curie' \
+    api="$(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
         --filter 'label=com.docker.compose.service=curie-api' --format '{{.Names}}')"
     worker="$(local_worker_container)"
     assert_product_collector_endpoint curie-api "$api" \
         "http://otel-collector:4318" "http/protobuf"
     assert_product_collector_endpoint curie-worker "$worker" \
-        "http://127.0.0.1:24318" "http/protobuf"
+        "$PRODUCT_COLLECTOR_WORKER_ENDPOINT" "http/protobuf"
     if [[ -n "$dispatcher" ]]; then
-        dispatcher="$(docker ps --filter 'label=com.docker.compose.project=curie' \
+        dispatcher="$(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
             --filter 'label=com.docker.compose.service=curie-dispatcher' --format '{{.Names}}')"
         assert_product_collector_endpoint curie-dispatcher "$dispatcher" \
             "http://otel-collector:4318" "http/protobuf"
@@ -3834,7 +4200,7 @@ route_local_observability_to_product_collector() {
 
 product_collector_metric_value() {
     local metric="$1"
-    curl -fsS http://127.0.0.1:28888/metrics | python3 -c '
+    curl -fsS "$PRODUCT_COLLECTOR_METRICS_URL" | python3 -c '
 import re, sys
 name = sys.argv[1]
 total = 0.0
@@ -3848,7 +4214,7 @@ print(total)
 wait_product_collector_ready() {
     local attempt
     for attempt in $(seq 1 60); do
-        if curl -fsS http://127.0.0.1:28888/metrics >/dev/null 2>&1; then
+        if curl -fsS "$PRODUCT_COLLECTOR_METRICS_URL" >/dev/null 2>&1; then
             # The Collector's startup contract logs "Everything is ready";
             # the live self-metrics endpoint is the stronger Ready probe.
             return 0
@@ -3860,7 +4226,7 @@ wait_product_collector_ready() {
 }
 
 restart_local_product_collector() {
-    docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+    ladder_compose --profile full \
         up -d --force-recreate --no-deps otel-collector >/dev/null || return 1
     wait_product_collector_ready
 }
@@ -3892,7 +4258,7 @@ case_local_langfuse_invalid_auth() {
         original_set=1
         original="$LANGFUSE_OTLP_AUTH_HEADER"
     fi
-    langfuse_web="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q langfuse-web)" || return 1
+    langfuse_web="$(ladder_compose --profile full ps -q langfuse-web)" || return 1
     [[ -n "$langfuse_web" ]] || {
         echo "pinned langfuse-web is not running for the real exporter negative" >&2
         return 1
@@ -3917,7 +4283,7 @@ case_local_langfuse_invalid_auth() {
             echo "Collector failed the Ready check after invalid-auth restart" >&2
             exit 1
         }
-        collector="$(docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" ps -q otel-collector)" || exit 1
+        collector="$(ladder_compose --profile full ps -q otel-collector)" || exit 1
         [[ -n "$collector" ]] || exit 1
         accepted_baseline="$(product_collector_metric_value otelcol_receiver_accepted_spans)" || exit 1
         failed_baseline="$(product_collector_metric_value otelcol_exporter_send_failed_spans)" || exit 1
@@ -4114,7 +4480,7 @@ rung_local() {
 
     assert_stub_port_free
 
-    if [[ -n "$(docker ps -q --filter 'name=curie-api' 2>/dev/null)" ]]; then
+    if [[ -n "$(docker ps -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --filter "label=com.docker.compose.service=curie-api" 2>/dev/null)" ]]; then
         # Reuse it and do NOT tear it down: the thread that brought a stack up
         # owns tearing it down, in both directions.
         echo "a compose stack is already running; reusing it and leaving teardown to whoever started it"
@@ -4128,7 +4494,11 @@ rung_local() {
         # local up is deliberately pinned to this checkout and builds the
         # candidate services; a release-channel binary otherwise resolves its
         # cached release compose and silently tests published images.
-        local up_args=(local up -f "$REPO_ROOT/compose.dev.yaml" --build)
+        local up_args=()
+        while IFS= read -r line; do
+          up_args+=("$line")
+        done < <(local_compose_cli_args local up)
+        up_args+=(--build)
         echo "=== curie ${up_args[*]} ==="
         # The observability query proof below reads traces and metrics through
         # the Curie API. Those routes require Langfuse/ClickHouse, so every
@@ -4149,8 +4519,10 @@ rung_local() {
     echo
     echo "=== curie --json local deploy ==="
     # No --api-url: the default IS the cold-start path a real user hits, and
-    # exercising the default is the point. First create binds C0LOCALDEV, so the
-    # message below can resolve the sole deployed agent with no --channel.
+    # exercising the default is the point. In connector mode the route binding
+    # helper performs the first create and binds C0LOCALDEV; otherwise deploy
+    # performs that create and binding. The message below can therefore resolve
+    # the sole deployed agent with no --channel.
     #
     # --json for the receipt: `local status --json` carries no digest
     # (cli/schema/local-status.schema.json is only `services`), so the deploy
@@ -4158,8 +4530,10 @@ rung_local() {
     # rung uploaded -- is the ONLY surface that reports this tier's artifact
     # identity. Read from stdout only; the human text is on stderr.
     local deploy_json digest agent_id agent_name deployment_id
-    deploy_json="$("$BIN" --json local deploy --plugin-dir "$WORKDIR/bundle")"
-    printf '%s\n' "$deploy_json"
+    if connector_mode; then
+        bind_local_connector_approval_routes "$WORKDIR/bundle"
+    fi
+    capture_local_deploy "$WORKDIR/bundle"
     digest="$(deploy_field "local" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "local" "$deploy_json" agent.id)"
     agent_name="$(deploy_field "local" "$deploy_json" agent.name)"
@@ -4194,13 +4568,12 @@ rung_local() {
         # project the CLI pins (cli/src/local.rs COMPOSE_PROJECT).
         local worker
         worker="$(local_worker_container)"
-        assert_declared_connectors_hosted "local" curie \
+        assert_declared_connectors_hosted "local" "$COMPOSE_PROJECT" \
             "$(container_env_value "$worker" CURIE_RELEASE)" "$agent_name"
     else
-        # `curie` is the compose project the CLI pins (cli/src/local.rs
-        # COMPOSE_PROJECT), and the project this tier stamps on a connector
-        # container is that same name.
-        assert_no_connector_containers "local" curie
+        # The project this tier stamps on a connector container is the selected
+        # compose project, default curie.
+        assert_no_connector_containers "local" "$COMPOSE_PROJECT"
     fi
 
     echo
@@ -4268,12 +4641,18 @@ rung_local() {
         echo "=== exact approval wait/resolve/resume product-observability seed ==="
         seed_approval_resume_turn local "$agent_id" "$product_query_state"
         [[ "$LAST_APPROVAL_MEMBERSHIP" == "true" ]] || product_membership="false"
+        cleanup_approval_seed_fixture || return 1
     fi
     if [[ "$LIVE" == "1" ]]; then
         echo
         echo "=== exact hosted MCP read product-observability seed ==="
         seed_mcp_read_turn local "$agent_id" "$agent_name" "$product_query_state"
         [[ "$LAST_MCP_MEMBERSHIP" == "true" ]] || product_membership="false"
+
+        echo
+        echo "=== exact built-in coding tool product-observability seed ==="
+        seed_coding_tool_turn local "$agent_id" "$product_query_state"
+        [[ "$LAST_CODING_MEMBERSHIP" == "true" ]] || product_membership="false"
     fi
 
     product_accepted_after="$(product_collector_metric_value otelcol_receiver_accepted_spans)"
@@ -4312,7 +4691,11 @@ PY
     if (( LOCAL_STACK_OWNED )); then
         echo
         echo "=== curie local down ==="
-        "$BIN" local down -f "$REPO_ROOT/compose.dev.yaml"
+        local down_args=()
+        while IFS= read -r line; do
+          down_args+=("$line")
+        done < <(local_compose_cli_args local down)
+        "$BIN" "${down_args[@]}"
         LOCAL_STACK_OWNED=0
         stop_local_otel_sink
 
@@ -4328,7 +4711,7 @@ PY
         # The compose project name is pinned to `curie` by the CLI
         # (cli/src/local.rs COMPOSE_PROJECT_NAME), so this selects exactly the
         # services `local up` started and nothing else.
-        survivors="$(docker ps --filter 'label=com.docker.compose.project=curie' --format '{{.Names}}')"
+        survivors="$(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --format '{{.Names}}')"
         if [[ -n "$survivors" ]]; then
             echo "local down left compose services running:" >&2
             printf '%s\n' "$survivors" >&2
@@ -4337,7 +4720,7 @@ PY
         # Sandbox containers are named per thread, so a `name=curie-runner`
         # filter matches nothing and the assertion would pass no matter what
         # survived.
-        survivors="$(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')"
+        survivors="$(docker ps --filter "label=$SANDBOX_LABEL" --filter "network=${CURIE_DOCKER_NETWORK:-curie_runner}" --format '{{.Names}}')"
         if [[ -n "$survivors" ]]; then
             echo "sibling sandbox containers survived teardown:" >&2
             printf '%s\n' "$survivors" >&2
@@ -4412,7 +4795,7 @@ rung_local_release() {
 
     assert_stub_port_free
 
-    if [[ -n "$(docker ps -q --filter 'name=curie-api' 2>/dev/null)" ]]; then
+    if [[ -n "$(docker ps -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --filter "label=com.docker.compose.service=curie-api" 2>/dev/null)" ]]; then
         # Reuse it and do NOT tear it down, matching rung_local's rule: the
         # thread that brought a stack up owns tearing it down.
         echo "a compose stack is already running; reusing it and leaving teardown to whoever started it"
@@ -4431,10 +4814,18 @@ rung_local_release() {
         # stack this run is about to reuse. Wiping first makes this rung an
         # actual cold start rather than one that might silently inherit state
         # and mask the exact compose-env-wiring drift (#545) it exists to catch.
-        "$BIN" local down --wipe --yes -f "$release_compose" >/dev/null 2>&1 || true
+        local down_args=(local down --wipe --yes --project "$COMPOSE_PROJECT" -f "$release_compose")
+        local extra_i
+        for ((extra_i = 1; extra_i < ${#COMPOSE_FILES[@]}; extra_i++)); do
+            down_args+=(-f "${COMPOSE_FILES[$extra_i]}")
+        done
+        "$BIN" "${down_args[@]}" >/dev/null 2>&1 || true
 
         echo
-        local up_args=(local up -f "$release_compose")
+        local up_args=(local up --project "$COMPOSE_PROJECT" -f "$release_compose")
+        for ((extra_i = 1; extra_i < ${#COMPOSE_FILES[@]}; extra_i++)); do
+            up_args+=(-f "${COMPOSE_FILES[$extra_i]}")
+        done
         if [[ "$compose_profile" == "core" ]]; then
             up_args+=(--minimal)
         fi
@@ -4452,8 +4843,10 @@ rung_local_release() {
     # (their regular-file mtimes are normalized where they are created), so a
     # separate copy no longer means a separate identity.
     local deploy_json digest agent_id agent_name deployment_id
-    deploy_json="$("$BIN" --json local deploy --plugin-dir "$WORKDIR/bundle-release")"
-    printf '%s\n' "$deploy_json"
+    if connector_mode; then
+        bind_local_connector_approval_routes "$WORKDIR/bundle-release"
+    fi
+    capture_local_deploy "$WORKDIR/bundle-release"
     digest="$(deploy_field "local-release" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "local-release" "$deploy_json" agent.id)"
     agent_name="$(deploy_field "local-release" "$deploy_json" agent.name)"
@@ -4488,12 +4881,11 @@ rung_local_release() {
         # shares the pinned project name and the same delivery overlay.
         local worker
         worker="$(local_worker_container)"
-        assert_declared_connectors_hosted "local-release" curie \
+        assert_declared_connectors_hosted "local-release" "$COMPOSE_PROJECT" \
             "$(container_env_value "$worker" CURIE_RELEASE)" "$agent_name"
     else
-        # Same compose project as rung 2: the release compose file the CLI
-        # generates carries the same pinned project name.
-        assert_no_connector_containers "local-release" curie
+        # Same compose project as rung 2: the selected project, default curie.
+        assert_no_connector_containers "local-release" "$COMPOSE_PROJECT"
     fi
 
     echo
@@ -4527,13 +4919,13 @@ rung_local_release() {
         echo
         echo "=== assert nothing curie-related survived ==="
         local survivors
-        survivors="$(docker ps --filter 'label=com.docker.compose.project=curie' --format '{{.Names}}')"
+        survivors="$(docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --format '{{.Names}}')"
         if [[ -n "$survivors" ]]; then
             echo "local down left compose services running:" >&2
             printf '%s\n' "$survivors" >&2
             return 1
         fi
-        survivors="$(docker ps --filter "label=$SANDBOX_LABEL" --format '{{.Names}}')"
+        survivors="$(docker ps --filter "label=$SANDBOX_LABEL" --filter "network=${CURIE_DOCKER_NETWORK:-curie_runner}" --format '{{.Names}}')"
         if [[ -n "$survivors" ]]; then
             echo "sibling sandbox containers survived teardown:" >&2
             printf '%s\n' "$survivors" >&2
@@ -4695,6 +5087,7 @@ PY
 
 run_cluster_product_observability() {
     local agent_id="$1" agent_name="$2" membership accepted_delta sent_delta
+    local second_accepted_delta second_sent_delta third_accepted_delta=0 third_sent_delta=0
     preflight_cluster_product_observability
     seed_cluster_missing_carrier_control
     cluster_external_ingress_seed ordinary \
@@ -4707,17 +5100,26 @@ run_cluster_product_observability() {
             "curie.turn.ingress,curie.queue.enqueue,curie.approval.suspend,curie.approval.resolve,curie.approval.resume,curie.reply.post|curie.reply.update" \
             approved
         [[ "$LAST_QUERY_MEMBERSHIP" == "true" ]] || membership="false"
+        second_accepted_delta="$LAST_EXTERNAL_ACCEPTED_DELTA"
+        second_sent_delta="$LAST_EXTERNAL_SENT_DELTA"
     else
         cluster_external_ingress_seed mcp \
             "curie.turn.ingress,curie.queue.enqueue,execute_tool,curie.reply.post|curie.reply.update"
         [[ "$LAST_QUERY_MEMBERSHIP" == "true" ]] || membership="false"
+        second_accepted_delta="$LAST_EXTERNAL_ACCEPTED_DELTA"
+        second_sent_delta="$LAST_EXTERNAL_SENT_DELTA"
+        cluster_external_ingress_seed coding \
+            "curie.turn.ingress,curie.queue.enqueue,execute_tool,curie.reply.post|curie.reply.update"
+        [[ "$LAST_QUERY_MEMBERSHIP" == "true" ]] || membership="false"
+        third_accepted_delta="$LAST_EXTERNAL_ACCEPTED_DELTA"
+        third_sent_delta="$LAST_EXTERNAL_SENT_DELTA"
     fi
     read -r accepted_delta sent_delta < <(python3 - \
-        "$accepted_delta" "$LAST_EXTERNAL_ACCEPTED_DELTA" \
-        "$sent_delta" "$LAST_EXTERNAL_SENT_DELTA" <<'PY'
+        "$accepted_delta" "$second_accepted_delta" "$third_accepted_delta" \
+        "$sent_delta" "$second_sent_delta" "$third_sent_delta" <<'PY'
 import sys
-accepted_first, accepted_second, sent_first, sent_second = map(float, sys.argv[1:5])
-print(accepted_first + accepted_second, sent_first + sent_second)
+accepted_first, accepted_second, accepted_third, sent_first, sent_second, sent_third = map(float, sys.argv[1:7])
+print(accepted_first + accepted_second + accepted_third, sent_first + sent_second + sent_third)
 PY
     )
     # Each external seed performs the exact candidate read equivalent to
@@ -4885,6 +5287,47 @@ validate_cluster_helm_release() {
 
 # Rung 3: the deployed release. Requires one to already exist; it is never
 # installed or torn down here, because the cluster is shared.
+assert_retention_claim() {
+    local logfile="$1" thread_key="$2" launch_epoch="$3"
+    python3 - "$logfile" "$thread_key" "$launch_epoch" <<'PYCLAIM'
+import datetime, json, re, sys
+from pathlib import Path
+
+logfile, thread_key, launch_epoch = sys.argv[1:4]
+launched = float(launch_epoch)
+pattern = re.compile(r"claim latency for " + re.escape(thread_key) + r": ([0-9]+) ms")
+claims = []
+for line in Path(logfile).read_text().splitlines():
+    try:
+        raw_timestamp, raw_record = line.split(" ", 1)
+        record = json.loads(raw_record)
+    except ValueError:
+        continue
+    if not isinstance(record, dict) or record.get("logger") != "curie_worker.kernel":
+        continue
+    message = record.get("message")
+    match = pattern.fullmatch(message) if isinstance(message, str) else None
+    if match is None:
+        continue
+    try:
+        timestamp = datetime.datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            raise ValueError("missing timestamp timezone")
+        claims.append((timestamp.timestamp(), int(match.group(1))))
+    except (ValueError, IndexError) as exc:
+        raise SystemExit("cluster: invalid claim timestamp for %s: %s" % (thread_key, exc))
+if len(claims) != 1:
+    raise SystemExit("cluster: expected one exact worker claim for %s, found %s" % (thread_key, len(claims)))
+claimed, duration_ms = claims[0]
+if not launched <= claimed <= launched + 45 or duration_ms >= 45000:
+    raise SystemExit(
+        "cluster: worker claim for %s missed the 45 second capacity bound "
+        "(completed %.3fs after launch, claim duration %sms)" % (thread_key, claimed - launched, duration_ms)
+    )
+print("cluster: timely worker claim proved for %s (%sms)" % (thread_key, duration_ms))
+PYCLAIM
+}
+
 rung_cluster() {
     if [[ "$PRODUCT_OBSERVABILITY" != "1" ]]; then
         CURIE_NAMESPACE="${CURIE_NAMESPACE-curie}"
@@ -5090,32 +5533,54 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
             echo "cluster: retention eval suite $eval_i reported a failing case. Not failing the rung: this rung's grade is report only (#1603)." >&2
         fi
     done
-    local retention_args=(--json cluster message)
+    local retention_thread retention_context retention_surfaces retention_channel
+    retention_context="$(kubectl config current-context)" || return 1
+    retention_surfaces="$("$BIN" --json cluster --context "$retention_context" surfaces "$agent_id" "${ns_rel[@]}")" || return 1
+    retention_channel="$(python3 -c '
+import json, sys
+surfaces = json.loads(sys.argv[1]).get("surfaces")
+if not isinstance(surfaces, list) or len(surfaces) != 1:
+    raise SystemExit("cluster: retention turn requires exactly one bound surface")
+surface = surfaces[0]
+if not isinstance(surface, dict) or surface.get("kind") != "slack":
+    raise SystemExit("cluster: retention turn requires a Slack surface")
+address = surface.get("address")
+if not isinstance(address, str) or not address or address != address.strip():
+    raise SystemExit("cluster: retention surface has no valid address")
+print(address)
+' "$retention_surfaces")" || return 1
+    retention_thread="$(python3 -c 'import time; now = time.time_ns(); print(f"{now // 1_000_000_000}.{(now // 1_000) % 1_000_000:06d}")')"
+    local retention_args=(--json cluster --context "$retention_context" message)
     retention_args+=("${ns_rel[@]}")
-    retention_args+=("$PROMPT")
+    retention_args+=("$PROMPT" --channel "$retention_channel")
+    retention_args+=(--thread "$retention_thread" --timeout-secs 300)
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
         retention_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
     fi
     echo "=== curie cluster message after repeated eval ==="
-    local retention_out retention_rc
+    local retention_out retention_log retention_launch_epoch retention_since
+    retention_log="$(mktemp "$WORKDIR/retention-worker.XXXXXX")" || return 1
+    retention_launch_epoch="$(python3 -c 'import time; print(time.time())')"
+    retention_since="$(python3 -c 'import datetime,sys; print(datetime.datetime.fromtimestamp(float(sys.argv[1]), datetime.timezone.utc).isoformat().replace("+00:00", "Z"))' "$retention_launch_epoch")"
     set +e
-    retention_out="$(timeout 45 "$BIN" "${retention_args[@]}")"
-    retention_rc=$?
+    retention_out="$("$BIN" "${retention_args[@]}")"
     set -e
     printf '%s\n' "$retention_out"
-    # GNU timeout can return 124 at the same boundary where the CLI has already
-    # emitted its complete finalized JSON but has not quite exited. The reply is
-    # the outcome this check exists to prove, so validate the captured outcome
-    # before diagnosing the process status. A timeout with absent, partial, or
-    # non-finalized JSON still fails here and retains the #1534 diagnosis.
-    if ! assert_finalized_reply "cluster" "$retention_out"; then
-        if [[ "$retention_rc" -eq 124 ]]; then
-            echo "cluster: message after repeated eval timed out at 45s without a finalized reply; eval-owned sandboxes likely still hold the quota (#1534)." >&2
-        fi
+    # Prove capacity from this turn's successful worker claim, independently
+    # of the time its live model needs to produce the finalized reply.
+    if ! kubectl --context "$retention_context" -n "$CURIE_NAMESPACE" logs \
+        -l "app.kubernetes.io/instance=$CURIE_RELEASE,app.kubernetes.io/component=worker" \
+        --timestamps --prefix=false --tail=-1 --since-time="$retention_since" > "$retention_log"; then
+        rm -f "$retention_log"
         return 1
     fi
-    if [[ "$retention_rc" -eq 124 ]]; then
-        echo "cluster: finalized reply was captured at the 45s timeout boundary; accepting the proved outcome."
+    if ! assert_retention_claim "$retention_log" "slack:$retention_channel:$retention_thread" "$retention_launch_epoch"; then
+        rm -f "$retention_log"
+        return 1
+    fi
+    rm -f "$retention_log"
+    if ! assert_finalized_reply "cluster" "$retention_out"; then
+        return 1
     fi
 
     assert_bundle_identity "cluster" "$digest"

@@ -5,12 +5,14 @@
 use anyhow::{bail, Result};
 
 use crate::local::{fake_model_env_override, otel_endpoint_env_override, ModelMode};
-use crate::ops::{plain, require_on_path, run_step, secret_set, CommonOpts, OpsCommand};
+use crate::ops::{plain, require_on_path, run_step, secret_set, CmdArg, CommonOpts, OpsCommand};
 
-/// The worker's Slack stub sink URL (compose default); restored on disconnect.
-const LOCAL_SLACK_STUB_URL: &str = "http://localhost:8155/api/";
 /// The worker's stub bot token (compose default); restored on disconnect.
 const LOCAL_SLACK_STUB_BOT_TOKEN: &str = "xoxb-dev";
+
+fn local_slack_stub_url(port: u16) -> String {
+    format!("http://localhost:{port}/api/")
+}
 
 /// Shared connect-time copy: exactly one Curie release may own a Slack app.
 pub const SLACK_ONE_APP_PER_RELEASE_NOTE: &str =
@@ -37,7 +39,9 @@ pub struct CommsOpts {
 }
 
 pub struct LocalCommsOpts {
-    pub file: String,
+    pub project: String,
+    pub files: Vec<String>,
+    pub stub_port: u16,
     pub dry_run: bool,
     pub app_token: String,
     pub bot_token: String,
@@ -112,6 +116,19 @@ pub fn disconnect_commands(opts: &CommsOpts) -> Vec<OpsCommand> {
     )]
 }
 
+fn comms_compose_args(o: &LocalCommsOpts, profiles: &[&str], tail: &[&str]) -> Vec<CmdArg> {
+    let mut args = vec![plain("compose")];
+    for profile in profiles {
+        args.extend([plain("--profile"), plain(*profile)]);
+    }
+    args.extend([plain("-p"), plain(&o.project)]);
+    for file in &o.files {
+        args.extend([plain("-f"), plain(file)]);
+    }
+    args.extend(tail.iter().copied().map(plain));
+    args
+}
+
 pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
     let mut env = vec![("SLACK_API_BASE_URL".into(), String::new())];
     env.extend(fake_model_env_override(o.model_mode));
@@ -119,23 +136,15 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
         env.push(("CURIE_MODEL".into(), model.clone()));
     }
     env.extend(otel_endpoint_env_override(o.minimal));
+    env.push(("COMPOSE_PROJECT_NAME".into(), o.project.clone()));
     env.extend(o.stack_image_env.iter().cloned());
     vec![OpsCommand::new(
         "docker",
-        vec![
-            plain("compose"),
-            plain("--profile"),
-            plain("core"),
-            plain("--profile"),
-            plain("slack"),
-            plain("-f"),
-            plain(&o.file),
-            plain("up"),
-            plain("-d"),
-            plain("--wait"),
-            plain("curie-worker"),
-            plain("curie-dispatcher"),
-        ],
+        comms_compose_args(
+            o,
+            &["core", "slack"],
+            &["up", "-d", "--wait", "curie-worker", "curie-dispatcher"],
+        ),
     )
     .with_env(env)
     .with_secret_env({
@@ -149,8 +158,9 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
 }
 
 pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
+    let stub_url = local_slack_stub_url(o.stub_port);
     let mut worker_env = vec![
-        ("SLACK_API_BASE_URL".into(), LOCAL_SLACK_STUB_URL.into()),
+        ("SLACK_API_BASE_URL".into(), stub_url),
         ("SLACK_BOT_TOKEN".into(), LOCAL_SLACK_STUB_BOT_TOKEN.into()),
     ];
     worker_env.extend(fake_model_env_override(o.model_mode));
@@ -158,35 +168,16 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
         worker_env.push(("CURIE_MODEL".into(), model.clone()));
     }
     worker_env.extend(otel_endpoint_env_override(o.minimal));
+    worker_env.push(("COMPOSE_PROJECT_NAME".into(), o.project.clone()));
     worker_env.extend(o.stack_image_env.iter().cloned());
     vec![
         OpsCommand::new(
             "docker",
-            vec![
-                plain("compose"),
-                plain("--profile"),
-                plain("core"),
-                plain("--profile"),
-                plain("slack"),
-                plain("-f"),
-                plain(&o.file),
-                plain("stop"),
-                plain("curie-dispatcher"),
-            ],
+            comms_compose_args(o, &["core", "slack"], &["stop", "curie-dispatcher"]),
         ),
         OpsCommand::new(
             "docker",
-            vec![
-                plain("compose"),
-                plain("--profile"),
-                plain("core"),
-                plain("-f"),
-                plain(&o.file),
-                plain("up"),
-                plain("-d"),
-                plain("--wait"),
-                plain("curie-worker"),
-            ],
+            comms_compose_args(o, &["core"], &["up", "-d", "--wait", "curie-worker"]),
         )
         .with_env(worker_env)
         .with_secret_env(o.model_credentials.clone()),
@@ -764,7 +755,9 @@ mod tests {
 
     fn local_comms_opts_with(disconnect: bool, mode: ModelMode, minimal: bool) -> LocalCommsOpts {
         LocalCommsOpts {
-            file: "compose.dev.yaml".into(),
+            project: crate::local::COMPOSE_PROJECT.into(),
+            files: vec!["compose.dev.yaml".into()],
+            stub_port: crate::message::DEFAULT_LOCAL_STUB_PORT,
             dry_run: false,
             app_token: if disconnect {
                 String::new()
@@ -788,7 +781,9 @@ mod tests {
     #[test]
     fn local_connect_command_wires_dispatcher_and_unwires_stub() {
         let cmds = local_connect_commands(&LocalCommsOpts {
-            file: "compose.dev.yaml".into(),
+            project: crate::local::COMPOSE_PROJECT.into(),
+            files: vec!["compose.dev.yaml".into()],
+            stub_port: crate::message::DEFAULT_LOCAL_STUB_PORT,
             dry_run: false,
             app_token: "xapp-1-secretsecret".into(),
             bot_token: "xoxb-1-secretsecret".into(),
@@ -803,9 +798,9 @@ mod tests {
         let line = cmds[0].display();
         assert_eq!(
             line,
-            "SLACK_API_BASE_URL= 'SLACK_APP_TOKEN=xapp-1-s***' \
+            "COMPOSE_PROJECT_NAME=curie SLACK_API_BASE_URL= 'SLACK_APP_TOKEN=xapp-1-s***' \
              'SLACK_BOT_TOKEN=xoxb-1-s***' \
-             docker compose --profile core --profile slack -f compose.dev.yaml up -d --wait \
+             docker compose --profile core --profile slack -p curie -f compose.dev.yaml up -d --wait \
              curie-worker curie-dispatcher"
         );
         assert!(!line.contains("secretsecret"), "secret leaked: {line}");
@@ -817,14 +812,14 @@ mod tests {
         assert_eq!(cmds.len(), 2);
         assert_eq!(
             cmds[0].display(),
-            "docker compose --profile core --profile slack -f compose.dev.yaml stop curie-dispatcher"
+            "docker compose --profile core --profile slack -p curie -f compose.dev.yaml stop curie-dispatcher"
         );
         let second = cmds[1].display();
         assert_eq!(
             second,
-            "SLACK_API_BASE_URL=http://localhost:8155/api/ \
+            "COMPOSE_PROJECT_NAME=curie SLACK_API_BASE_URL=http://localhost:8155/api/ \
              SLACK_BOT_TOKEN=xoxb-dev \
-             docker compose --profile core -f compose.dev.yaml up -d --wait curie-worker"
+             docker compose --profile core -p curie -f compose.dev.yaml up -d --wait curie-worker"
         );
         assert!(
             !second.contains("curie-dispatcher"),
@@ -904,7 +899,7 @@ mod tests {
             .contains(&("CURIE_FAKE_MODEL".to_string(), "0".to_string())));
         assert!(worker_cmd.env.contains(&(
             "SLACK_API_BASE_URL".to_string(),
-            LOCAL_SLACK_STUB_URL.to_string(),
+            local_slack_stub_url(crate::message::DEFAULT_LOCAL_STUB_PORT),
         )));
         assert!(worker_cmd.env.contains(&(
             "SLACK_BOT_TOKEN".to_string(),
@@ -939,19 +934,9 @@ mod tests {
             ModelMode::FakePinnedDespiteCredential,
             ModelMode::DefaultFake,
         ] {
-            let up_env = crate::local::up_command(&crate::local::LocalOpts {
-                file: "compose.dev.yaml".into(),
-                dry_run: false,
-                minimal: false,
-                local_model: None,
-                pull_model: false,
-                slack: false,
-                model_mode: mode,
-                env_file: None,
-                build: None,
-                stack_image_env: Vec::new(),
-            })
-            .env;
+            let mut up_opts = crate::local::LocalOpts::for_file("compose.dev.yaml");
+            up_opts.model_mode = mode;
+            let up_env = crate::local::up_command(&up_opts).env;
             let connect_env = local_connect_commands(&local_comms_opts(false, mode))[0]
                 .env
                 .clone();
@@ -977,19 +962,9 @@ mod tests {
             ModelMode::FakePinnedDespiteCredential,
             ModelMode::DefaultFake,
         ] {
-            let up_env = crate::local::up_command(&crate::local::LocalOpts {
-                file: "compose.dev.yaml".into(),
-                dry_run: false,
-                minimal: false,
-                local_model: None,
-                pull_model: false,
-                slack: false,
-                model_mode: mode,
-                env_file: None,
-                build: None,
-                stack_image_env: Vec::new(),
-            })
-            .env;
+            let mut up_opts = crate::local::LocalOpts::for_file("compose.dev.yaml");
+            up_opts.model_mode = mode;
+            let up_env = crate::local::up_command(&up_opts).env;
             let disconnect_env = local_disconnect_commands(&local_comms_opts(true, mode))[1]
                 .env
                 .clone();
@@ -1013,19 +988,9 @@ mod tests {
     #[test]
     fn up_and_local_connect_agree_on_otel_endpoint_override_for_every_minimal() {
         for minimal in [false, true] {
-            let up_env = crate::local::up_command(&crate::local::LocalOpts {
-                file: "compose.dev.yaml".into(),
-                dry_run: false,
-                minimal,
-                local_model: None,
-                pull_model: false,
-                slack: false,
-                model_mode: ModelMode::DefaultFake,
-                env_file: None,
-                build: None,
-                stack_image_env: Vec::new(),
-            })
-            .env;
+            let mut up_opts = crate::local::LocalOpts::for_file("compose.dev.yaml");
+            up_opts.minimal = minimal;
+            let up_env = crate::local::up_command(&up_opts).env;
             let connect_env = local_connect_commands(&local_comms_opts_with(
                 false,
                 ModelMode::DefaultFake,
@@ -1053,19 +1018,9 @@ mod tests {
     #[test]
     fn up_and_local_disconnect_agree_on_otel_endpoint_override_for_every_minimal() {
         for minimal in [false, true] {
-            let up_env = crate::local::up_command(&crate::local::LocalOpts {
-                file: "compose.dev.yaml".into(),
-                dry_run: false,
-                minimal,
-                local_model: None,
-                pull_model: false,
-                slack: false,
-                model_mode: ModelMode::DefaultFake,
-                env_file: None,
-                build: None,
-                stack_image_env: Vec::new(),
-            })
-            .env;
+            let mut up_opts = crate::local::LocalOpts::for_file("compose.dev.yaml");
+            up_opts.minimal = minimal;
+            let up_env = crate::local::up_command(&up_opts).env;
             let disconnect_env = local_disconnect_commands(&local_comms_opts_with(
                 true,
                 ModelMode::DefaultFake,

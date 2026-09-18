@@ -51,6 +51,13 @@ _SANDBOX_ATTR = SpanAttributeKey.CURIE_SANDBOX_ID.value
 # Stone 3, #889) when a turn resumes a resolved approval.
 _APPROVAL_DECISION_ATTR = SpanAttributeKey.APPROVAL_DECISION.value
 
+# The OTel span attribute the runner stamps on each execute_tool span
+# (runner/otel.py). Surfaced on the node because a trace consumer has to be able
+# to tell WHICH tool ran, not merely that some tool ran: an assertion that an
+# execute_tool observation exists still passes when the span for the one tool
+# under test is the one that went missing.
+_TOOL_NAME_ATTR = SpanAttributeKey.TOOL_NAME.value
+
 
 def _probe_attr(bag: Any, key: str, *, bare_key: str | None = None) -> str | None:
     """Return a non-empty string attribute from one attribute bag, or None.
@@ -146,6 +153,7 @@ def build_tree(observations: list[dict[str, Any]]) -> list[ObservationNode]:
             startTime=obs.get("startTime"),
             model=obs.get("model"),
             usageDetails=obs.get("usageDetails"),
+            toolName=_probe_attr(obs, _TOOL_NAME_ATTR),
             children=[node_for(k) for k in kids],
         )
 

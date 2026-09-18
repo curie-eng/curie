@@ -32,11 +32,39 @@
   "approvalPolicy": {
     "gates": [
       {
+        "gate": "mcp__curie__publish_changes",
+        "route": "sre-approvals"
+      },
+      {
         "gate": "mcp__self-upgrade__upgrade_self",
         "route": "sre-approvals"
       },
       {
         "gate": "mcp__self-upgrade__upgrade_platform",
+        "route": "sre-approvals"
+      },
+      {
+        "gate": "mcp__kubernetes__pods_delete",
+        "route": "sre-approvals"
+      },
+      {
+        "gate": "mcp__kubernetes__pods_exec",
+        "route": "sre-approvals"
+      },
+      {
+        "gate": "mcp__kubernetes__pods_run",
+        "route": "sre-approvals"
+      },
+      {
+        "gate": "mcp__kubernetes__resources_create_or_update",
+        "route": "sre-approvals"
+      },
+      {
+        "gate": "mcp__kubernetes__resources_delete",
+        "route": "sre-approvals"
+      },
+      {
+        "gate": "mcp__kubernetes__resources_scale",
         "route": "sre-approvals"
       }
     ]

@@ -925,8 +925,16 @@ pub(crate) fn plain_command(program: &str, args: Vec<String>) -> crate::ops::Ops
 /// The tag a local-daemon build produces, before the daemon's image id replaces
 /// it in the lock. Ephemeral by construction: nothing pulls it, and a rebuild
 /// reuses it, which is exactly why the lock records the id instead.
-fn local_build_tag(bundle_name: &str, connector: &str) -> String {
-    format!("curie-connector-{bundle_name}-{connector}:build")
+fn local_build_tag(bundle_name: &str, connector: &str) -> Result<String> {
+    let resources = crate::local::current_resources()?;
+    if resources.isolated() {
+        Ok(format!(
+            "curie-connector-{}-{bundle_name}-{connector}:build",
+            resources.project
+        ))
+    } else {
+        Ok(format!("curie-connector-{bundle_name}-{connector}:build"))
+    }
 }
 
 /// How many hex characters of the source digest become the pushed tag. Long
@@ -1011,7 +1019,7 @@ pub fn build_plan(
         ),
         None => (
             Delivery::LocalDaemon,
-            local_build_tag(bundle_name, connector),
+            local_build_tag(bundle_name, connector)?,
             None,
         ),
     };
@@ -1531,6 +1539,7 @@ pub fn compose_overlay(
     project: &str,
     plugin_dir: &Path,
 ) -> Result<serde_json::Value> {
+    let network = crate::local::current_resources()?.docker_network;
     let mut services = serde_json::Map::new();
     for (connector, spec) in &decl.connectors {
         if !is_hosted(spec) {
@@ -1598,10 +1607,7 @@ pub fn compose_overlay(
             service.insert("volumes".into(), serde_json::Value::Array(volumes));
         }
         let mut attachment = serde_json::Map::new();
-        attachment.insert(
-            RUNNER_NETWORK.to_string(),
-            serde_json::json!({ "aliases": [alias] }),
-        );
+        attachment.insert(network.clone(), serde_json::json!({ "aliases": [alias] }));
         service.insert("networks".into(), serde_json::Value::Object(attachment));
         let mut labels = serde_json::Map::new();
         labels.insert(
@@ -1636,8 +1642,8 @@ pub fn compose_overlay(
 
     let mut networks = serde_json::Map::new();
     networks.insert(
-        RUNNER_NETWORK.to_string(),
-        serde_json::json!({ "external": true, "name": RUNNER_NETWORK }),
+        network.clone(),
+        serde_json::json!({ "external": true, "name": network }),
     );
     Ok(serde_json::json!({
         "services": services,

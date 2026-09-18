@@ -10,7 +10,7 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -23,6 +23,9 @@ from curie_api.routers.state import (
     _namespace_lock_key,
 )
 from curie_api.sandbox_token import mint
+from curie_telemetry import build_resource, configure_meter_provider
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from sqlalchemy import make_url
 from sqlalchemy.exc import IntegrityError
 
@@ -31,15 +34,61 @@ _FAR_FUTURE = 4102444800  # 2100-01-01, valid at test time
 _PAST = 1000000000  # 2001, expired at test time
 
 
-def _agent(client: Any, headers: dict[str, str]) -> str:
+def _agent(
+    client: Any,
+    headers: dict[str, str],
+    *,
+    address: str = "C000000S01",
+    name: str = "state-agent",
+) -> str:
     resp = client.post(
         "/agents",
-        json={"name": "state-agent", "channel": {"kind": "slack", "address": "C000000S01"}},
+        json={"name": name, "channel": {"kind": "slack", "address": address}},
         headers=headers,
     )
     assert resp.status_code == 201, resp.text
     agent_id: str = resp.json()["id"]
     return agent_id
+
+
+@pytest.fixture
+def history_failure_metrics(
+    client: Any,
+) -> Iterator[tuple[MeterProvider, InMemoryMetricReader]]:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        metric_readers=[reader],
+        resource=build_resource(
+            "curie-api",
+            service_version="0.0.0-test",
+            service_instance_id="acme-api-capacity-test",
+            deployment_environment="test",
+        ),
+    )
+    original = client.app.state.telemetry.meter_provider
+    configure_meter_provider(provider)
+    try:
+        yield provider, reader
+    finally:
+        configure_meter_provider(original)
+        provider.shutdown()
+
+
+def _history_failure_points(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> list[tuple[int, dict[str, str]]]:
+    provider, reader = metrics
+    assert provider.force_flush(timeout_millis=5000)
+    data = reader.get_metrics_data()
+    assert data is not None
+    return [
+        (int(point.value), dict(point.attributes))
+        for resource_metrics in data.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+        if metric.name == "curie.history.persistence.failure"
+        for point in metric.data.data_points
+    ]
 
 
 def test_state_router_accepts_a_scoped_token_for_the_path_agent(
@@ -412,6 +461,134 @@ def test_namespace_over_the_per_namespace_cap_is_rejected(
         # Second key pushes the namespace total (~116 bytes) over the 100 cap.
         b = client.put(f"{base}/b", json={"value": {"s": "x" * 50}}, headers=auth_headers)
         assert b.status_code == 413, b.text
+    finally:
+        get_settings.cache_clear()
+
+
+def test_transcript_value_cap_records_once_without_mutating_the_log(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/transcript/thread-value/append"
+    seed = {"kind": "message", "text": "seed"}
+    settings = get_settings()
+    settings.state_max_value_bytes = _json_size([seed])
+    try:
+        initial = client.post(url, json={"item": seed}, headers=auth_headers)
+        assert initial.status_code == 200, initial.text
+
+        refused = client.post(
+            url,
+            json={"item": {"kind": "message", "text": "x" * 200}},
+            headers=auth_headers,
+        )
+        assert refused.status_code == 413, refused.text
+
+        stored = client.get(url.removesuffix("/append"), headers=auth_headers)
+        assert stored.status_code == 200, stored.text
+        assert stored.json()["value"] == [seed]
+        assert stored.json()["version"] == initial.json()["version"]
+        assert _history_failure_points(history_failure_metrics) == [
+            (
+                1,
+                {
+                    "service.name": "curie-api",
+                    "source": "state-api",
+                    "outcome": "capacity",
+                    "limit": "value",
+                },
+            )
+        ]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_transcript_namespace_cap_records_once_and_preserves_every_key(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    aid = _agent(client, auth_headers)
+    target_item = {"kind": "message", "text": "target"}
+    sibling_item = {"kind": "message", "text": "sibling"}
+    target = f"/agents/{aid}/state/transcript/thread-target"
+    sibling = f"/agents/{aid}/state/transcript/thread-sibling"
+    settings = get_settings()
+    settings.state_max_value_bytes = 10_000
+    settings.state_max_namespace_bytes = _json_size([target_item]) + _json_size(
+        [sibling_item]
+    )
+    try:
+        target_seed = client.post(
+            f"{target}/append", json={"item": target_item}, headers=auth_headers
+        )
+        sibling_seed = client.post(
+            f"{sibling}/append", json={"item": sibling_item}, headers=auth_headers
+        )
+        assert target_seed.status_code == 200, target_seed.text
+        assert sibling_seed.status_code == 200, sibling_seed.text
+
+        refused = client.post(
+            f"{target}/append",
+            json={"item": {"kind": "message", "text": "next"}},
+            headers=auth_headers,
+        )
+        assert refused.status_code == 413, refused.text
+
+        for url, seeded in ((target, target_seed), (sibling, sibling_seed)):
+            stored = client.get(url, headers=auth_headers)
+            assert stored.status_code == 200, stored.text
+            assert stored.json()["value"] == seeded.json()["value"]
+            assert stored.json()["version"] == seeded.json()["version"]
+
+        other = _agent(
+            client,
+            auth_headers,
+            address="C000000S02",
+            name="state-agent-other",
+        )
+        healthy = client.post(
+            f"/agents/{other}/state/transcript/thread-other/append",
+            json={"item": {"kind": "message", "text": "healthy"}},
+            headers=auth_headers,
+        )
+        assert healthy.status_code == 200, healthy.text
+        assert _history_failure_points(history_failure_metrics) == [
+            (
+                1,
+                {
+                    "service.name": "curie-api",
+                    "source": "state-api",
+                    "outcome": "capacity",
+                    "limit": "namespace",
+                },
+            )
+        ]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_non_transcript_capacity_refusal_records_no_history_failure(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    history_failure_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    aid = _agent(client, auth_headers)
+    settings = get_settings()
+    settings.state_max_value_bytes = 10
+    try:
+        refused = client.post(
+            f"/agents/{aid}/state/audit/log/append",
+            json={"item": {"text": "x" * 100}},
+            headers=auth_headers,
+        )
+        assert refused.status_code == 413, refused.text
+        assert _history_failure_points(history_failure_metrics) == []
     finally:
         get_settings.cache_clear()
 

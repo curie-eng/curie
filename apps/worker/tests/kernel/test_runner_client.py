@@ -452,14 +452,15 @@ def test_post_final_stall_has_a_short_cleanup_bound_and_releases_response() -> N
         runner = _PostFinalRunner(stall=True)
         server = TestServer(runner.app)
         await server.start_server()
-        client = RunnerClient(total_timeout_s=30.0)
+        client = RunnerClient(total_timeout_s=0.5)
         turn = await client.start_turn(f"http://127.0.0.1:{server.port}", _event())
         release_calls = _spy_release(turn)
         loop = asyncio.get_running_loop()
         started = loop.time()
         try:
             await asyncio.wait_for(_break_after_final(turn), timeout=2.0)
-            assert loop.time() - started < 2.0
+            elapsed = loop.time() - started
+            assert elapsed < 2.0
             assert release_calls["n"] >= 1
         finally:
             runner.unblock.set()
@@ -811,6 +812,217 @@ def test_a_remaining_budget_does_not_break_a_responsive_turn() -> None:
     asyncio.run(go())
 
 
+# aiohttp 3.14.3 ClientResponse._response_eof releases the connection and stops
+# its HTTP timer in client_reqrep.py. Buffering both frames before the consumer
+# stalls proves that only the TurnStream context can keep the turn bounded.
+class _BufferedEofRunner:
+    """Send a complete response before frame handling can finish."""
+
+    def __init__(self, *, header_delay_s: float = 0.0) -> None:
+        self.header_delay_s = header_delay_s
+        self.eof_sent = asyncio.Event()
+        self.timeout_calls = 0
+        self.app = web.Application()
+        self.app.add_routes(
+            [
+                web.post("/v1/event", self._event),
+                web.post("/v1/timeout", self._timeout),
+            ]
+        )
+
+    async def _event(self, request: web.Request) -> web.StreamResponse:
+        await asyncio.sleep(self.header_delay_s)
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "application/x-ndjson",
+                _TURN_EPOCH_HEADER: "e" * 32,
+            },
+        )
+        await response.prepare(request)
+        frames = [
+            SideEffectFlag(tool="deploy", call_id="buffered-call"),
+            Final(text="done", status=DONE),
+        ]
+        for frame in frames:
+            await response.write((frame.model_dump_json() + "\n").encode())
+        await response.write_eof()
+        self.eof_sent.set()
+        return response
+
+    async def _timeout(self, _request: web.Request) -> web.Response:
+        self.timeout_calls += 1
+        return web.json_response({"ok": True})
+
+
+async def _consume_with_stalled_side_effect(
+    turn: Any,
+    runner: _BufferedEofRunner,
+    entered: asyncio.Event,
+    release: asyncio.Event,
+) -> list[Any]:
+    frames: list[Any] = []
+    async with turn:
+        async for frame in turn:
+            frames.append(frame)
+            if isinstance(frame, SideEffectFlag):
+                await runner.eof_sent.wait()
+                entered.set()
+                await release.wait()
+    return frames
+
+
+def test_turn_deadline_covers_buffered_frame_handling_after_http_eof(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The original effective deadline covers headers and frame effects."""
+
+    async def go() -> None:
+        runner = _BufferedEofRunner(header_delay_s=0.5)
+        server = TestServer(runner.app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=1.5)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        metrics: list[tuple[str, dict[str, str]]] = []
+        real_record_metric = runner_client_module.record_metric
+
+        def capture_metric(
+            name: str,
+            value: float = 1,
+            *,
+            attributes: dict[str, str],
+        ) -> None:
+            real_record_metric(name, value, attributes=attributes)
+            metrics.append((name, dict(attributes)))
+
+        monkeypatch.setattr(runner_client_module, "record_metric", capture_metric)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            with caplog.at_level(logging.INFO, logger="curie_worker.runner_client"):
+                turn = await client.start_turn(
+                    f"http://127.0.0.1:{server.port}",
+                    _event(),
+                    remaining_s=1.0,
+                )
+                headers_elapsed = loop.time() - started
+                with pytest.raises(RunnerStreamTimeout) as excinfo:
+                    await asyncio.wait_for(
+                        _consume_with_stalled_side_effect(
+                            turn, runner, entered, release
+                        ),
+                        timeout=2.0,
+                    )
+            elapsed = loop.time() - started
+
+            assert runner.eof_sent.is_set()
+            assert entered.is_set()
+            assert headers_elapsed >= 0.4
+            assert elapsed < 1.4, "the header delay was not charged to the deadline"
+            assert "1.0s" in str(excinfo.value)
+            assert runner.timeout_calls == 1
+
+            bound_logs = [
+                record.getMessage()
+                for record in caplog.records
+                if "runner request timeout bound" in record.getMessage()
+            ]
+            assert len(bound_logs) == 1
+            assert "1.500" in bound_logs[0]
+            assert bound_logs[0].count("1.000") == 2
+            timeout_results = [
+                attributes
+                for name, attributes in metrics
+                if name == "curie.runner.rpc.result"
+                and attributes.get("operation") == "event"
+                and attributes.get("outcome") == "timeout"
+            ]
+            assert timeout_results == [
+                {
+                    "service.name": "curie-worker",
+                    "operation": "event",
+                    "role": "client",
+                    "outcome": "timeout",
+                }
+            ]
+        finally:
+            release.set()
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_external_cancellation_during_buffered_frame_handling_stays_cancelled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def go() -> None:
+        runner = _BufferedEofRunner()
+        server = TestServer(runner.app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        task: asyncio.Task[list[Any]] | None = None
+        try:
+            turn = await client.start_turn(
+                f"http://127.0.0.1:{server.port}", _event(), remaining_s=5.0
+            )
+            task = asyncio.create_task(
+                _consume_with_stalled_side_effect(turn, runner, entered, release)
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert runner.timeout_calls == 0
+            assert not any(
+                "runner turn stream exceeded" in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            release.set()
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_handler_timeout_before_turn_deadline_stays_plain_timeout() -> None:
+    async def go() -> None:
+        runner = _BufferedEofRunner()
+        server = TestServer(runner.app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0)
+        marker = TimeoutError("action handler timeout")
+        try:
+            turn = await client.start_turn(
+                f"http://127.0.0.1:{server.port}", _event(), remaining_s=5.0
+            )
+            with pytest.raises(TimeoutError) as excinfo:
+                async with turn:
+                    async for frame in turn:
+                        if isinstance(frame, SideEffectFlag):
+                            await runner.eof_sent.wait()
+                            raise marker
+
+            assert excinfo.value is marker
+            assert not isinstance(excinfo.value, RunnerStreamTimeout)
+            assert runner.timeout_calls == 0
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
 def test_interrupt_takes_no_remaining_budget_while_the_other_rpcs_do() -> None:
     """A structural guard against a future "simplification" that folds interrupt
     into the budget path. ``/v1/interrupt`` is the fail-closed path a lost lease
@@ -895,6 +1107,9 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
     async def go() -> None:
         async with make_harness() as h:
             hold = asyncio.Event()  # never set: the response hangs after a prefix
+            # This case specifically covers a runner that omitted the epoch.
+            # The shared fake otherwise matches the real runner and emits one.
+            h.runner.timeout_status = None
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="x")]
             handle = await asyncio.to_thread(h.substrate.claim, "tStreamTimeout")
@@ -912,6 +1127,8 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
                 exc = excinfo.value
                 assert isinstance(exc, RunnerStreamTimeout)
                 assert isinstance(exc, TimeoutError)  # existing handlers still catch it
+                assert exc.timeout_result == "unconfirmed"
+                assert h.runner.timeout_calls == 0
                 assert str(exc).strip(), "a stream timeout must not stringify to nothing"
                 assert "Timeout" in str(exc)  # the normalized underlying class
                 # The delivery had only 0.2s left, so that effective request
@@ -933,6 +1150,83 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
             finally:
                 hold.set()
                 await client.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(200, "accepted"), (409, "conflict"), (404, "unconfirmed")],
+)
+def test_timeout_callback_preserves_the_runner_confirmation(
+    status: int,
+    expected: str,
+) -> None:
+    async def go() -> None:
+        async def timeout(_request: web.Request) -> web.Response:
+            return web.json_response({"ok": status == 200}, status=status)
+
+        app = web.Application()
+        app.add_routes([web.post("/v1/timeout", timeout)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0)
+        try:
+            result = await client._notify_timeout(
+                f"http://127.0.0.1:{server.port}", "e" * 32, None
+            )
+            assert result == expected
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_timeout_callback_transport_failure_is_unconfirmed() -> None:
+    async def go() -> None:
+        app = web.Application()
+        server = TestServer(app)
+        await server.start_server()
+        base_url = f"http://127.0.0.1:{server.port}"
+        await server.close()
+        client = RunnerClient(total_timeout_s=5.0)
+        try:
+            assert await client._notify_timeout(base_url, "e" * 32, None) == "unconfirmed"
+        finally:
+            await client.close()
+
+    asyncio.run(go())
+
+
+def test_timeout_callback_control_timeout_is_unconfirmed() -> None:
+    async def go() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def timeout(_request: web.Request) -> web.Response:
+            entered.set()
+            await release.wait()
+            return web.json_response({"ok": True})
+
+        app = web.Application()
+        app.add_routes([web.post("/v1/timeout", timeout)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0, interrupt_timeout_s=0.05)
+        try:
+            notifying = asyncio.create_task(
+                client._notify_timeout(
+                    f"http://127.0.0.1:{server.port}", "e" * 32, None
+                )
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            assert not notifying.done()
+            assert await notifying == "unconfirmed"
+        finally:
+            release.set()
+            await client.close()
+            await server.close()
 
     asyncio.run(go())
 
@@ -1329,12 +1623,16 @@ def test_production_http_timeout_handler_holds_next_query_until_ack(
                 remaining_s=0.05,
             )
             with caplog.at_level(logging.WARNING, logger="curie_worker.runner_client"):
-                with pytest.raises(RunnerStreamTimeout):
+                with pytest.raises(RunnerStreamTimeout) as excinfo:
                     async with first:
                         async for _frame in first:
                             pass
 
             await asyncio.wait_for(session.interrupt_entered.wait(), timeout=1.0)
+            # The runner owns the timeout before awaiting the blocked SDK
+            # interrupt, but the worker cannot confirm that ownership without
+            # receiving the HTTP 200 response.
+            assert excinfo.value.timeout_result == "unconfirmed"
             second_task = asyncio.create_task(consume_second())
             await asyncio.wait_for(second_stream_opened.wait(), timeout=1.0)
             assert not session.interrupt_cancelled.is_set()

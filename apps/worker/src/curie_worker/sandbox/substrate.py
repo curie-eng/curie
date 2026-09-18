@@ -43,6 +43,9 @@ from .types import (
     CapacityExhaustedError,
     ClaimTimeoutError,
     NoRouteError,
+    PressureScanResult,
+    QuotaRejection,
+    RouteChangedError,
     RouteRecord,
     RouteState,
     SandboxClient,
@@ -93,6 +96,8 @@ logger = logging.getLogger(__name__)
 # sandbox, and the next claim() takes the existing _evict_stale path, which
 # drops the stale route and rebinds. Slow turn, not corruption.
 REAP_GRACE_MARGIN_SECONDS = 30.0
+_CONTROL_REQUEST_TIMEOUT_S = 5.0
+_GONE_READ_TIMEOUT_S = 1.0
 
 
 def _poll_sleeps(config: SubstrateConfig) -> Iterator[float]:
@@ -163,6 +168,7 @@ class SandboxSubstrate:
         workspace_repo: str | None = None,
         workspace_materialized_head: str | None = None,
         publication_visible_outcome_revision: int = 0,
+        fresh_only: bool = False,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -170,6 +176,12 @@ class SandboxSubstrate:
         history ref); the fast path passes none so the claim binds a pre-warmed
         generic sandbox. ``agent_name`` selects the per-agent warm pool when
         connector secrets are marked on ``env`` (#1488).
+
+        ``fresh_only`` is for callers whose ``env`` must reach the runner that
+        serves the turn (attachment staging, #2739): a live running route, or
+        a concurrent winner of the route race, raises ``RouteChangedError``
+        instead of being reused. Suspended routes still raise
+        ``SuspendedThreadError``.
         """
 
         started = time.monotonic()
@@ -186,8 +198,13 @@ class SandboxSubstrate:
                 if record is not None:
                     if record.state is RouteState.SUSPENDED:
                         raise SuspendedThreadError(thread_key)
-                    sandbox = self._k8s.get_sandbox(record.handle.sandbox_name)
+                    sandbox = self._k8s.get_sandbox(
+                        record.handle.sandbox_name,
+                        request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                    )
                     if sandbox is not None and sandbox.operating_mode == "Running":
+                        if fresh_only:
+                            raise RouteChangedError(thread_key)
                         self._affinity.touch(thread_key, self._config.route_ttl_seconds)
                         handle = record.handle
                         outcome = "reused"
@@ -205,6 +222,7 @@ class SandboxSubstrate:
                         publication_visible_outcome_revision=(
                             publication_visible_outcome_revision
                         ),
+                        fresh_only=fresh_only,
                     )
                     outcome = "claimed"
             except Exception as exc:
@@ -237,10 +255,78 @@ class SandboxSubstrate:
         record = self._affinity.get(thread_key)
         if record is None or record.state is not RouteState.LIVE:
             return None
-        sandbox = self._k8s.get_sandbox(record.handle.sandbox_name)
+        sandbox = self._k8s.get_sandbox(
+            record.handle.sandbox_name,
+            request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+        )
         if sandbox is None or sandbox.operating_mode != "Running":
             return None
         return record.handle
+
+    @property
+    def claim_timeout_seconds(self) -> float:
+        """The fresh claim budget the pressure path must reserve for its retry."""
+
+        return self._config.claim_timeout_seconds
+
+    @property
+    def namespace(self) -> str:
+        """The only namespace whose routes this substrate may reclaim."""
+
+        return self._config.namespace
+
+    async def pressure_candidates(
+        self, *, max_pages: int, max_records: int, deadline: float
+    ) -> PressureScanResult:
+        """Return a complete, namespace local pressure inventory."""
+
+        result = await self._affinity.pressure_candidates(
+            max_pages=max_pages,
+            max_records=max_records,
+            deadline=deadline,
+        )
+        if result.outcome != "complete":
+            return result
+        return PressureScanResult(
+            tuple(
+                candidate
+                for candidate in result.candidates
+                if candidate.record.handle.namespace == self._config.namespace
+            ),
+            "complete",
+        )
+
+    async def pressure_get(self, thread_key: str) -> RouteRecord | None:
+        """Reread one candidate on the bounded pressure connection."""
+
+        return await self._affinity.pressure_get(thread_key)
+
+    async def detach_if_unchanged(
+        self,
+        thread_key: str,
+        *,
+        expected_claim: str,
+        expected_generation: int,
+        expected_expires_at_ms: int,
+        lock_key: str,
+        lock_token: str,
+    ) -> bool:
+        """Detach one exact route while its distributed victim lock is owned."""
+
+        return await self._affinity.detach_if_unchanged(
+            thread_key,
+            expected_claim=expected_claim,
+            expected_generation=expected_generation,
+            expected_expires_at_ms=expected_expires_at_ms,
+            lock_key=lock_key,
+            lock_token=lock_token,
+        )
+
+    def workspace_repository(self, thread_key: str) -> str | None:
+        """The persisted workspace repository for any route state on a thread."""
+
+        record = self._affinity.get(thread_key)
+        return None if record is None else record.handle.workspace_repo
 
     def adopt(self, thread_key: str) -> SandboxHandle | None:
         """Adopt an existing ready live route without ever creating one.
@@ -257,7 +343,10 @@ class SandboxSubstrate:
         if record is None or record.state is not RouteState.LIVE:
             return None
 
-        claim = self._k8s.get_claim(record.handle.claim_name)
+        claim = self._k8s.get_claim(
+            record.handle.claim_name,
+            request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+        )
         if (
             claim is None
             or not claim.ready
@@ -266,7 +355,10 @@ class SandboxSubstrate:
             self._evict_stale(thread_key, record)
             return None
 
-        sandbox = self._k8s.get_sandbox(record.handle.sandbox_name)
+        sandbox = self._k8s.get_sandbox(
+            record.handle.sandbox_name,
+            request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+        )
         if (
             sandbox is None
             or not sandbox.ready
@@ -285,13 +377,13 @@ class SandboxSubstrate:
         *,
         expected: SandboxHandle,
         env: dict[str, str],
-        workspace_repo: str,
+        workspace_repo: str | None,
         workspace_materialized_head: str | None = None,
         publication_visible_outcome_revision: int = 0,
         agent_name: str | None = None,
         validate_candidate: Callable[[SandboxHandle], None] | None = None,
     ) -> SandboxHandle:
-        """Cold-create a workspace runner, then CAS it over one generic route.
+        """Cold create a runner, then CAS it over one retained route.
 
         The old route remains authoritative while the candidate binds. Losing
         the claim+generation fence deletes only the unexposed candidate. After
@@ -323,7 +415,10 @@ class SandboxSubstrate:
             # The candidate is ready but still unrouted. Refusal retires only
             # that unexposed claim; the old route remains authoritative until
             # the generation CAS below succeeds.
-            self._k8s.delete_claim(candidate.claim_name)
+            self._k8s.delete_claim(
+                candidate.claim_name,
+                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            )
             raise
         record = RouteRecord(handle=candidate, state=RouteState.LIVE)
         if not self._affinity.replace_if_generation(
@@ -333,12 +428,18 @@ class SandboxSubstrate:
             record=record,
             ttl_seconds=self._config.route_ttl_seconds,
         ):
-            self._k8s.delete_claim(candidate.claim_name)
-            raise NoRouteError(f"late workspace handoff lost its route fence for {thread_key}")
+            self._k8s.delete_claim(
+                candidate.claim_name,
+                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            )
+            raise NoRouteError(f"late handoff lost its route fence for {thread_key}")
         try:
-            self._k8s.delete_claim(expected.claim_name)
+            self._k8s.delete_claim(
+                expected.claim_name,
+                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            )
         except Exception:  # noqa: BLE001 - route already swapped; reaper owns cleanup
-            logger.exception("late workspace handoff left old claim for orphan reaping")
+            logger.exception("late handoff left old claim for orphan reaping")
         return candidate
 
     # -- suspend / resume -------------------------------------------------------
@@ -431,7 +532,10 @@ class SandboxSubstrate:
                 if old.history_ref is not None:
                     boot.setdefault(HISTORY_ENV, old.history_ref)
 
-                self._k8s.delete_claim(old.claim_name)
+                self._k8s.delete_claim(
+                    old.claim_name,
+                    request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                )
                 self._affinity.delete_if_claim(thread_key, old.claim_name)
                 handle = self._claim_fresh(
                     thread_key,
@@ -504,7 +608,10 @@ class SandboxSubstrate:
                 if record is not None:
                     claim_name = record.handle.claim_name
                     sandbox_name = record.handle.sandbox_name
-                    self._k8s.delete_claim(claim_name)
+                    self._k8s.delete_claim(
+                        claim_name,
+                        request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                    )
                     self._affinity.delete_if_claim(thread_key, claim_name)
                     released = True
                     if wait_gone:
@@ -548,8 +655,35 @@ class SandboxSubstrate:
         deadline = time.monotonic() + self._config.release_gone_timeout_seconds
         sleeps = _poll_sleeps(self._config)
         while time.monotonic() < deadline:
-            claim_gone = self._k8s.get_claim(claim_name) is None
-            sandbox_gone = self._k8s.get_sandbox(sandbox_name) is None
+            claim_gone = False
+            try:
+                claim_gone = self._k8s.get_claim(
+                    claim_name,
+                    request_timeout_seconds=min(
+                        _GONE_READ_TIMEOUT_S,
+                        max(0.001, deadline - time.monotonic()),
+                    ),
+                ) is None
+            except Exception as exc:  # noqa: BLE001 - the gone wait is soft
+                logger.warning(
+                    "release gone wait could not read claim: %s",
+                    type(exc).__name__,
+                )
+
+            sandbox_gone = False
+            try:
+                sandbox_gone = self._k8s.get_sandbox(
+                    sandbox_name,
+                    request_timeout_seconds=min(
+                        _GONE_READ_TIMEOUT_S,
+                        max(0.001, deadline - time.monotonic()),
+                    ),
+                ) is None
+            except Exception as exc:  # noqa: BLE001 - the gone wait is soft
+                logger.warning(
+                    "release gone wait could not read sandbox: %s",
+                    type(exc).__name__,
+                )
             if claim_gone and sandbox_gone:
                 return
             time.sleep(max(0.0, min(next(sleeps), deadline - time.monotonic())))
@@ -560,6 +694,71 @@ class SandboxSubstrate:
             sandbox_name,
             self._config.release_gone_timeout_seconds,
         )
+
+    def delete_detached(
+        self,
+        record: RouteRecord,
+        rejection: QuotaRejection,
+        *,
+        deadline: float,
+    ) -> bool:
+        """Delete one detached claim and prove exact quota headroom."""
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            self._k8s.delete_claim(
+                record.handle.claim_name,
+                request_timeout_seconds=min(
+                    _CONTROL_REQUEST_TIMEOUT_S, remaining
+                ),
+            )
+            sleeps = _poll_sleeps(self._config)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                claim_gone = self._k8s.get_claim(
+                    record.handle.claim_name,
+                    request_timeout_seconds=min(_GONE_READ_TIMEOUT_S, remaining),
+                ) is None
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                sandbox_gone = self._k8s.get_sandbox(
+                    record.handle.sandbox_name,
+                    request_timeout_seconds=min(_GONE_READ_TIMEOUT_S, remaining),
+                ) is None
+                if claim_gone and sandbox_gone:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    try:
+                        if self._k8s.quota_has_headroom(
+                            rejection,
+                            request_timeout_seconds=min(
+                                _GONE_READ_TIMEOUT_S, remaining
+                            ),
+                        ):
+                            return True
+                    except Exception as exc:  # noqa: BLE001 - quota state is unknown
+                        logger.warning(
+                            "idle route reclamation could not prove quota headroom: %s",
+                            type(exc).__name__,
+                        )
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(next(sleeps), remaining))
+        except Exception as exc:  # noqa: BLE001 - pressure cleanup fails closed
+            logger.warning(
+                "idle route reclamation could not prove sandbox deletion: %s",
+                type(exc).__name__,
+            )
+            return False
 
     def reap_orphans(self) -> list[str]:
         """Measure orphan cleanup at the substrate seam for every backend."""
@@ -676,7 +875,10 @@ class SandboxSubstrate:
                 # The comparison is >=, so a claim exactly at the grace is
                 # spared. Ties go to the creator; do not simplify this to >.
                 continue
-            self._k8s.delete_claim(claim.name)
+            self._k8s.delete_claim(
+                claim.name,
+                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            )
             deleted.append(claim.name)
         observed = {claim.name for claim in claims} - set(deleted)
         return deleted, observed
@@ -697,6 +899,7 @@ class SandboxSubstrate:
         publication_visible_outcome_revision: int = 0,
         generation: int = 0,
         publish: bool = True,
+        fresh_only: bool = False,
     ) -> SandboxHandle:
         config = self._config
         nonce = uuid.uuid4().hex[:6]
@@ -717,7 +920,9 @@ class SandboxSubstrate:
             sandbox_name = self._await_bound(name, deadline)
             bound = self._await_service_fqdn(sandbox_name, deadline)
         except Exception:
-            self._k8s.delete_claim(name)
+            self._k8s.delete_claim(
+                name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S
+            )
             raise
 
         handle = SandboxHandle(
@@ -754,21 +959,36 @@ class SandboxSubstrate:
             if winner is None:
                 continue
             if winner.state is RouteState.SUSPENDED:
-                self._k8s.delete_claim(name)
+                self._k8s.delete_claim(
+                    name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S
+                )
                 raise SuspendedThreadError(thread_key)
-            sandbox = self._k8s.get_sandbox(winner.handle.sandbox_name)
+            sandbox = self._k8s.get_sandbox(
+                winner.handle.sandbox_name,
+                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            )
             if sandbox is not None and sandbox.operating_mode == "Running":
-                self._k8s.delete_claim(name)
+                self._k8s.delete_claim(
+                    name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S
+                )
+                if fresh_only:
+                    # The winner never saw this claim's env (#2739).
+                    raise RouteChangedError(thread_key)
                 return winner.handle
             self._evict_stale(thread_key, winner)
-        self._k8s.delete_claim(name)
+        self._k8s.delete_claim(
+            name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S
+        )
         raise NoRouteError(f"could not record a route for {thread_key} after repeated races")
 
     def _evict_stale(self, thread_key: str, record: RouteRecord) -> None:
         """Retire a route whose sandbox is gone: delete its claim (idempotent)
         and drop the route, guarded so a fresher route is never deleted."""
 
-        self._k8s.delete_claim(record.handle.claim_name)
+        self._k8s.delete_claim(
+            record.handle.claim_name,
+            request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+        )
         self._affinity.delete_if_claim(thread_key, record.handle.claim_name)
 
     def _await_bound(self, claim_name: str, deadline: float) -> str:
@@ -777,7 +997,13 @@ class SandboxSubstrate:
         consecutive_quota = 0
         sleeps = _poll_sleeps(self._config)
         while time.monotonic() < deadline:
-            claim = self._k8s.get_claim(claim_name)
+            claim = self._k8s.get_claim(
+                claim_name,
+                request_timeout_seconds=min(
+                    _CONTROL_REQUEST_TIMEOUT_S,
+                    max(0.001, deadline - time.monotonic()),
+                ),
+            )
             if claim is not None:
                 last_quota_rejection = claim.quota_rejection
                 if claim.quota_rejection is not None:
@@ -812,7 +1038,13 @@ class SandboxSubstrate:
     def _await_service_fqdn(self, sandbox_name: str, deadline: float) -> SandboxView:
         sleeps = _poll_sleeps(self._config)
         while time.monotonic() < deadline:
-            sandbox = self._k8s.get_sandbox(sandbox_name)
+            sandbox = self._k8s.get_sandbox(
+                sandbox_name,
+                request_timeout_seconds=min(
+                    _CONTROL_REQUEST_TIMEOUT_S,
+                    max(0.001, deadline - time.monotonic()),
+                ),
+            )
             if sandbox is not None and sandbox.service_fqdn:
                 return sandbox
             time.sleep(max(0.0, min(next(sleeps), deadline - time.monotonic())))

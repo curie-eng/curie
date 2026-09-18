@@ -67,7 +67,13 @@ Pydantic models mirroring the Claude Code shapes:
   (`mcp__plugin_<bundle>_<server>__<tool>`, non-empty tool suffix) — the runner
   matches gates by exact string equality, so a mis-namespaced `mcp__` gate
   previously validated green but silently never armed (#453). Built-in gates
-  (no `mcp__` prefix, e.g. `Bash`) are unaffected. The error message names the
+  (no `mcp__` prefix, e.g. `Bash`) are unaffected. One platform gate is also
+  accepted: the exact name `mcp__curie__publish_changes`
+  (`plugin_format.PLATFORM_PUBLISH_TOOL_NAME`), the runner-mounted publication
+  tool, so a bundle can bind its publication approval to a route (#2776). Only
+  that exact name is accepted; any other `mcp__curie__` gate is still refused.
+  Deploy tooling older than the first release carrying #2776 refuses it with
+  `approval_policy.gate_not_namespaced`. The error message names the
   expected form; to arm a live tool name the bundle does not declare, use the
   per-agent `CURIE_APPROVAL_REQUIRED_TOOLS` env knob instead. Runtime approval
   routing is a separate not-yet-built seam, so this is validation only today.

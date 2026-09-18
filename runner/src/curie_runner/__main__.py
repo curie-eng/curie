@@ -682,13 +682,25 @@ async def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, Conversa
         if summary is not None:
             await store.append(summary)
     except Exception as exc:  # noqa: BLE001 - translate loader failures consistently
-        logger.error(
-            "history load failed session=%s error_class=%s: %s",
-            config.session.session_id,
-            type(exc).__name__,
-            exc,
+        status = (
+            exc.args[0]
+            if len(exc.args) == 1 and isinstance(exc.args[0], int)
+            else None
         )
-        raise HistoryError("configured structured history could not be loaded") from exc
+        if status is None:
+            logger.error(
+                "history load failed session=%s error_class=%s",
+                config.session.session_id,
+                type(exc).__name__,
+            )
+        else:
+            logger.error(
+                "history load failed session=%s error_class=%s status=%d",
+                config.session.session_id,
+                type(exc).__name__,
+                status,
+            )
+        raise HistoryError("configured structured history could not be loaded") from None
     logger.info(
         "history loaded session=%s records=%d messages=%d compacted=%s",
         config.session.session_id,

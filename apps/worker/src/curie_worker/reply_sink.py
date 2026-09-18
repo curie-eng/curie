@@ -79,6 +79,10 @@ class MissingAdapterCredentialError(RuntimeError):
     """Platform egress had no credential (or no target) and sent nothing."""
 
 
+class InvalidReplyTargetError(ValueError):
+    """The reply target cannot be addressed, so no retry can ever deliver it."""
+
+
 class RejectedAdapterResponseError(RuntimeError):
     """The adapter answered with an error status.
 
@@ -427,18 +431,16 @@ class _ClusterMessageReplyAdapter:
 
     def _endpoint_for(self, reply_ref: str | None) -> tuple[str, str]:
         if reply_ref is None:
-            raise ValueError(
-                "cluster message reply_ref must be a canonical lowercase UUIDv4"
-            )
+            raise InvalidReplyTargetError("cluster message reply_ref is required")
         try:
             parsed_ref = UUID(reply_ref)
         except (AttributeError, ValueError) as exc:
-            raise ValueError(
+            raise InvalidReplyTargetError(
                 "cluster message reply_ref must be a canonical lowercase UUIDv4"
             ) from exc
         canonical_ref = str(parsed_ref)
         if parsed_ref.version != 4 or canonical_ref != reply_ref:
-            raise ValueError(
+            raise InvalidReplyTargetError(
                 "cluster message reply_ref must be a canonical lowercase UUIDv4"
             )
         if not self._internal_worker_token:

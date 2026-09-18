@@ -39,6 +39,15 @@ on:
       # (#2190) both read compose.dev.yaml to check third-party image tags,
       # so a compose-only edit that unpins one must run this workflow too.
       - "compose.dev.yaml"
+      # Third obligation, and the one this gate exists for (#2741): the
+      # retained-values scalar gate below BUILDS AND EXECUTES the real CLI
+      # against the recorded upgrade boundary, so its subject is Rust and its
+      # driver is a Python stub -- neither of them under charts/. Without these
+      # entries, a PR that reverts the JSON re-serializer and puts the YAML 1.2
+      # emitter back matches nothing in this filter, the helm job is skipped,
+      # and the gate that exists to catch exactly that revert never runs.
+      - "cli/src/ops/upgrade.rs"
+      - "cli/tests/data/upgrade-driver.py"
 
 permissions:
   contents: read
@@ -467,6 +476,20 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/upgrade-drain-assertions.sh
+
+      # Retained values must reach Helm with their scalar TYPES intact (#2741).
+      # The CLI re-serialized the values it reads back from a release, and its
+      # YAML 1.2 emitter left `off`, `on`, `yes` and `no` unquoted -- words that
+      # Helm's YAML 1.1 parser resolves as booleans. A release holding
+      # `security.gvisor.mode: "off"` upgraded into `false` and then demanded a
+      # RuntimeClass the cluster did not have. This step drives the real CLI,
+      # captures the document it hands Helm, and reads it back with real Helm,
+      # so the round trip is asserted through the consumer that actually broke.
+      # It builds the CLI, which is why it is the one step here that needs cargo.
+      - name: helm render assertions (retained values scalar preservation)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/upgrade-retained-scalar-assertions.sh
 
       # Schema migrations run in one hook Job (#2300). Prove the Job is the
       # migrator, the API init only waits, and forward-only is opt-in.

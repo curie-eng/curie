@@ -17,8 +17,9 @@ use base64::Engine;
 use crate::api::ApiClient;
 use crate::mail_channel::{self, TokenState};
 use crate::ops::{
-    chart_fullname, fetch_release_computed_values, plain, release_fullname, require_on_path,
-    resolve_existing_secret_ref, run_step, secret_patch_file, CommonOpts, OpsCommand,
+    chart_fullname, failure_reason, fetch_release_computed_values, plain,
+    release_fullname_discovery, require_on_path, resolve_existing_secret_ref, run_capture,
+    run_step, secret_patch_file, CommonOpts, ComponentDiscovery, OpsCommand,
 };
 
 /// API ceiling on `ChannelTokenRequest.ttl_s` (one week).
@@ -207,7 +208,8 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
         )
         .into());
     };
-    let (secret_name, secret_key) = live_token_secret(&opts.common, Some(&values)).await;
+    let (secret_name, secret_key) = live_token_secret(&opts.common, Some(&values)).await?;
+    preflight_token_secret(&cl, &opts.common, &secret_name).await?;
     let mint_step = cl.step(&format!("minting channel token for {kind}:{address}"));
     let token = match client.mint_channel_token(&kind, &address, ttl_s).await {
         Ok(token) => {
@@ -229,10 +231,8 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
         .map_err(|err| revoked_without_install(err, &opts, &kind, &address, &secret_name))?;
     let expires_at = format_exp(exp);
     let patch = serde_json::json!({ "stringData": { &secret_key: token } });
-    // The write needs the token, so it cannot precede the mint. Some of what it
-    // can fail on could still be probed beforehand -- whether the Secret exists,
-    // whether we may patch it -- which is #2561; what is left here is the part
-    // that cannot be probed away.
+    // The write needs the token, so it cannot precede the mint. The resolved
+    // Secret was already read before minting, but the write can still fail.
     run_step(
         &cl,
         &format!("writing {secret_name}/{secret_key}"),
@@ -276,7 +276,6 @@ pub async fn channel_token(opts: ChannelTokenOpts) -> Result<ChannelTokenOutput>
 /// holding a token this very command revoked. Name that state, because the
 /// underlying `kubectl` error describes a Secret and says nothing about a
 /// channel that has just stopped accepting mail.
-///
 fn revoked_without_install(
     err: anyhow::Error,
     opts: &ChannelTokenOpts,
@@ -490,17 +489,112 @@ pub(crate) fn resolve_token_secret(
 async fn live_token_secret(
     common: &CommonOpts,
     values: Option<&serde_json::Value>,
-) -> (String, String) {
+) -> Result<(String, String)> {
     if let Some(pair) = resolve_existing_secret_ref(
         values,
         EXISTING_SECRET,
         EXISTING_SECRET_KEY,
         DEFAULT_DATA_KEY,
     ) {
-        return pair;
+        return Ok(pair);
     }
-    let fullname = release_fullname(&common.namespace, &common.release).await;
-    (fullname.resource("secrets"), DEFAULT_DATA_KEY.to_string())
+    match release_fullname_discovery(&common.namespace, &common.release).await {
+        ComponentDiscovery::Found(fullname) => {
+            Ok((fullname.resource("secrets"), DEFAULT_DATA_KEY.to_string()))
+        }
+        ComponentDiscovery::NotPresent => Err(unconfirmed_chart_secret(
+            common,
+            "neither its labelled api Service nor worker Deployment was found",
+            "confirm the release is installed and that its api or worker component is enabled",
+        )),
+        ComponentDiscovery::ProbeFailed { component, detail } => Err(unconfirmed_chart_secret(
+            common,
+            &format!("the kubectl probe for its {component} component failed: {detail}"),
+            "restore kubectl access and RBAC to get/list services and deployments",
+        )),
+        ComponentDiscovery::Ambiguous { component, names } => Err(unconfirmed_chart_secret(
+            common,
+            &format!(
+                "the labelled {component} component is ambiguous among {}",
+                names.join(", ")
+            ),
+            "remove or relabel the conflicting resources so exactly one component identifies the release",
+        )),
+    }
+}
+
+fn unconfirmed_chart_secret(common: &CommonOpts, reason: &str, recovery: &str) -> anyhow::Error {
+    crate::exit::CliError::failure(format!(
+        "the chart managed channel token Secret is an unconfirmed Secret target for release {} in namespace {}: {reason}; no token was minted",
+        common.release, common.namespace
+    ))
+    .with_fix(format!(
+        "{recovery} for release {} in namespace {}, then retry; no token was minted",
+        common.release, common.namespace
+    ))
+    .into()
+}
+
+/// Verify that the exact Secret resolved from the release still exists and is
+/// readable before the API rotates the channel token.
+async fn preflight_token_secret(
+    cl: &crate::ui::Checklist,
+    common: &CommonOpts,
+    secret_name: &str,
+) -> Result<()> {
+    let command = secret_get_command(common, secret_name);
+    let ui = crate::ui::ui();
+    ui.plumbing(&format!("+ {}", command.display()));
+    let step = cl.step(&format!("checking channel token Secret {secret_name}"));
+    match run_capture(&command).await {
+        Ok((true, _, _)) => {
+            step.done("readable");
+            Ok(())
+        }
+        Ok((false, _, stderr)) => {
+            step.fail("failed");
+            Err(secret_preflight_failed(
+                common,
+                secret_name,
+                failure_reason(&stderr),
+            ))
+        }
+        Err(error) => {
+            step.fail("failed");
+            Err(secret_preflight_failed(
+                common,
+                secret_name,
+                &error.to_string(),
+            ))
+        }
+    }
+}
+
+fn secret_preflight_failed(common: &CommonOpts, secret_name: &str, reason: &str) -> anyhow::Error {
+    crate::exit::CliError::failure(format!(
+        "could not read channel token Secret {secret_name} for release {} in namespace {}: {reason}; no token was minted",
+        common.release, common.namespace
+    ))
+    .with_fix(format!(
+        "confirm Secret {secret_name} exists and grant get and patch access in namespace {} for release {}, then retry; no token was minted",
+        common.namespace, common.release
+    ))
+    .into()
+}
+
+fn secret_get_command(common: &CommonOpts, secret_name: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(&common.namespace),
+            plain("get"),
+            plain("secret"),
+            plain(secret_name),
+            plain("-o"),
+            plain("name"),
+        ],
+    )
 }
 
 /// Parse `--ttl`: a positive integer number of seconds, optionally with a

@@ -34,8 +34,20 @@ Kubernetes identity, builds its kubeconfig in memory, deploys the bundle, and
 stores the credential outside bundle content:
 
 ```bash
-curie example sre-bot install --observability
+curie example sre-bot install --observability --slack-channel C0EXAMPLE1 \
+  --approvers U0EXAMPLE1,U0EXAMPLE2
 ```
+
+The installer binds the `sre-approvals` route that gates the six Kubernetes
+mutations and platform publication before it deploys. Terminal resolution
+requires an explicit users list. Add it with `--approvers` using comma separated
+Slack user IDs. Without it the Slack install still succeeds, but only members
+of the bound Slack channel can approve from Slack, and the installer says so.
+Bind users later with
+`curie cluster approvals sre-bot --route-resolution sre-approvals=<CHANNEL> --route-approvers sre-approvals=users:<ids>`.
+If any bound route carries a notification target, the installer refuses to
+rewrite the route map (the API does not return the notification transport);
+write the full map with `curie cluster approvals sre-bot --routes-from <file>`.
 
 Runtime repository workspaces need `api.githubRepoAllowlist`. The chart default
 is empty and denies every selection, including after `curie cluster deploy
@@ -65,13 +77,19 @@ route, then deploy again:
 
 ```bash
 curie cluster deploy --plugin-dir examples/sre-bot   # first run: creates the agent, refuses locally
-curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1 \
+  --route-approvers sre-approvals=users:U0EXAMPLE1
 curie cluster approvals sre-bot --list-routes
 curie cluster deploy --plugin-dir examples/sre-bot
 ```
 
-On an existing agent that already binds the route, the first deploy succeeds
-and the bind step is unnecessary.
+On an existing agent that already binds the route, the first deploy succeeds and
+the bind step is unnecessary. Terminal resolution additionally requires an
+explicit users list. A platform API key only mints the operator principal.
+`CURIE_APPROVAL_PRINCIPAL_TOKEN` carries the subject used by `--resolve`, and
+that subject must appear in the route's users list. Rejection or resolution by
+an unbound operator must not publish changes. A route write replaces the whole
+map, so repeat the resolution and users in the same invocation.
 
 With `--observability`, the example also installs the metrics pipeline and
 reliability alerts. Follow [METRICS-ROLLOUT.md](docs/METRICS-ROLLOUT.md) for the

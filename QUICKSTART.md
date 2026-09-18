@@ -174,9 +174,14 @@ kubeconfig in memory, installs the observability stack, and deploys the bundle:
 ```bash
 export CURIE_CREDENTIALS=sk-ant-...
 curie cluster up --allow-egress-host anthropic --set security.gvisor.mode=off
-curie example sre-bot install --observability
+curie example sre-bot install --observability --approvers U0EXAMPLE1
 curie cluster message "Is any pod crashlooping right now?"
 ```
+
+The installer binds the `sre-approvals` route that gates the Kubernetes
+mutations. You need to add approvers with `--approvers` (Slack user IDs, comma
+separated) to resolve those approvals from the CLI with an operator principal;
+without it only members of the bound Slack channel can approve.
 
 Run the installer with `--dry-run` first to inspect its ordered mutation plan.
 The optional `--platform-upgrade` flag adds a separate, much wider
@@ -193,10 +198,15 @@ route it declares, and deploy again:
 
 ```bash
 curie cluster deploy --plugin-dir examples/sre-bot
-curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1
+curie cluster approvals sre-bot --route-resolution sre-approvals=C0EXAMPLE1 \
+  --route-approvers sre-approvals=users:U0EXAMPLE1
 curie cluster approvals sre-bot --list-routes
 curie cluster deploy --plugin-dir examples/sre-bot
 ```
+
+Drop `--route-approvers` only if Slack channel members should be the sole
+approvers; operator principals cannot resolve a route without an explicit user
+list.
 
 On a fresh install the first deploy creates the agent and refuses locally
 (exit 2) with the binding command, before uploading anything; the platform API

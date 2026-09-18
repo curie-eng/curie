@@ -194,8 +194,7 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   told apart from `runner-error` -- the sandbox or the transport dying -- so an
   operator can see which one happened.
   `workspace-error` is a managed-workspace preparation FAULT before the turn was
-  ever accepted (#2004): the clone, the archive, the upload, or a missing
-  workspace coordinator on a turn that names no repository. It is told apart
+  ever accepted (#2004): the clone, the archive, or the upload. It is told apart
   from `runner-error` for the same
   reason, and it always carries a `workspace start failed` WARNING naming the
   agent, the deployment, the repository the turn asked for and the stage that
@@ -203,10 +202,17 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   A deliberate repository-selection refusal is the other half of that split and
   is NOT this: it is a decision rather than a fault, so it stays terminal,
   answers the user, and logs at INFO instead. A turn that names a repository
-  while the worker-wide coordinator is off is such a refusal (#2659); and a
-  turn that attaches a workspace because its own message named the repository
-  ends its reply with one platform line naming that repository, placed after
-  the model's answer and before the receipt or the awaiting-approval notice.
+  while the coordinator is off for the worker is such a refusal (#2659). Generic
+  turns continue through the normal claim path while it is off. A retained live
+  or suspended route that already has a repository workspace and verified review
+  feedback are also terminal refusals, because both require repository authority.
+  The disabled lane does not consult repository selections or webhook operator
+  mappings held only by the server. A turn with no repository message, verified
+  review, or retained route that carries a repository stays generic and runs
+  without a workspace.
+  A turn that attaches a workspace because its own message named the repository
+  ends its reply with one platform line naming that repository, placed after the
+  model's answer and before the receipt or the awaiting-approval notice.
 - **Idempotency + crash recovery.** The Slack event id gates a `done` marker, so
   a redelivered or reclaimed entry that already finished is skipped.
   A renewable worker lease distinguishes process death from ordinary consumer
@@ -481,7 +487,10 @@ from curie_worker.sandbox import (
 
 substrate = SandboxSubstrate(
     KubernetesSandboxClient(namespace),          # or any SandboxClient impl
-    AffinityStore(redis_client),                 # the compose/chart Valkey
+    AffinityStore(
+        redis_client,
+        pressure_client=pressure_redis_client,
+    ),                                           # bounded async pressure lane
     SubstrateConfig(namespace=..., warm_pool="<release>-runner-pool"),
 )
 
@@ -495,6 +504,41 @@ substrate.reap_orphans()              # periodic tick: claims with no live route
 
 Contract notes the kernel must know:
 
+Quota pressure reclamation runs only after a real ResourceQuota refusal and
+only when the remaining delivery budget is at least 70 seconds plus
+`claim_timeout_seconds`. A lower budget returns the capacity response without
+scanning. Reclamation adds no periodic timer, scheduler, or warm pool.
+
+The rejection retains every exceeded resource and its requested, used, and
+hard quantity. Before scanning, the worker validates the complete map with
+Kubernetes quantity semantics, including CPU DecimalSI, memory BinarySI, pod
+counts, and combined rejections. Invalid or incomplete evidence returns the
+capacity response with `outcome=refused-invalid-quota` and performs no pressure
+Redis call or deletion.
+
+After one exact idle route is detached and deleted, the worker polls the exact
+named ResourceQuota in its configured namespace within the existing 20 second
+cleanup window. It retries only when live spec and status hard limits agree and
+every rejected resource has enough current headroom. The worker Role grants
+only namespaced `get` on core `resourcequotas`. A missing permission, malformed
+quantity, mismatched spec and status limits, or timeout fails closed. The
+rejected claim or another quota can consume the freed capacity before the full
+retry. That bounded race records `reclaimed-retry-refused`; it does not delete
+another victim or schedule work.
+
+The inventory scans at most eight pages with a SCAN `COUNT` hint of 8192,
+roughly 65,000 keys in the whole logical database. `COUNT` is approximate. A
+separate limit counts at most 256 matching route keys before filtering, so
+suspended routes count toward it, and at most four candidates are probed. A
+database outside either finite window fails closed. Alert on
+`curie.sandbox.lifecycle` with `operation=reclaim` and
+`outcome=scan-incomplete`. Redis or Valkey before 7.0 does not support
+`PEXPIRETIME`, so the pass returns `expiry-unsupported`.
+
+On a terminal pressure timeout, cancellation is delivered once and victim lock
+release can add one finite cold pressure Redis operation, at most four seconds.
+That tail consumes unused claim reserve and never authorizes requester retry.
+
 - **One live session per thread.** `claim()` is claim-or-adopt: a lost
   creation race deletes the loser's claim and returns the winner's handle. The
   route lives in Valkey (`curie:sandbox:route:<thread_key>`) with a TTL;
@@ -503,8 +547,9 @@ Contract notes the kernel must know:
   `agentSandbox.deploy=true` installs `<release>-runner` (SandboxTemplate) and
   `<release>-runner-pool` (SandboxWarmPool). Claims without per-claim env bind
   a pre-warmed sandbox (0.04-0.07 s measured on a scratch k3s cluster); claims **with**
-  env (the resume path) get a fresh sandbox instead (cold create, seconds not
-  sub-second) because env cannot be injected into an already-running pod.
+  env through resume or retained attachment replacement get a fresh sandbox
+  instead. This cold create takes seconds rather than less than one second
+  because env cannot be injected into a running pod.
 - **Suspend/resume is a cold rehydrate.** `suspend()` flips the Sandbox
   to `Suspended` (the pod is deleted) and records the caller-supplied history
   ref. `resume()` retires the old claim and creates a new one whose per-claim
@@ -541,3 +586,30 @@ Contract notes the kernel must know:
   plane); Valkey is never mocked. The env-gated e2e
   (`tests/sandbox/test_e2e_k8scratch.py`, `CURIE_SANDBOX_E2E=1`) drives the
   real cluster.
+
+### Retained thread attachments
+
+An attachment on an idle retained thread needs new claim environment, so the
+worker cold creates a candidate runner. Replacement requires an authenticated
+old runner that is inactive, has a safe completed or idle status, and reports
+durable history. The old route remains authoritative while the candidate binds.
+The worker then swaps the candidate over the exact old claim and generation in
+one affinity operation. This temporarily requires capacity for both the old and
+candidate runners. A capacity refusal, bind failure, or lost fence deletes only
+the candidate and preserves the old route.
+
+The replacement keeps the logical session identity and durable transcript
+reference, but it loses prompt cache warmth, process memory, and other container
+local state. Text without an attachment keeps the existing steering behavior.
+An active runner asks the sender to wait. An unauthenticated, unreadable,
+nondurable, malformed, or otherwise unsafe runner asks the sender to start a
+new thread. Neither refusal processes the message text.
+
+In v0.9.1 a retained thread with an open repository workspace says that its
+workspace is already open and asks the sender to start a new thread. A generic
+retained thread whose new file message selects a repository, or whose server
+state already holds a repository selection, gives a separate repository
+selection refusal and the same recovery. When repository workspaces are
+disabled, the existing workspaces disabled refusal takes precedence before the
+file is resolved. Fresh workspace claims and suspended workspace resumes still
+receive attachments. Retained workspace replacement is tracked in #2728.

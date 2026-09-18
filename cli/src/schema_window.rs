@@ -25,6 +25,8 @@ struct Catalog {
 pub struct Window {
     pub schema_min: String,
     pub schema_head: String,
+    #[serde(default)]
+    pub artifact_identity_ambiguous: bool,
 }
 
 fn catalog() -> &'static Catalog {
@@ -59,6 +61,32 @@ pub fn window_for(app_version: &str) -> Option<Window> {
 
 fn revision_index(revision: &str) -> Option<usize> {
     catalog().revisions.iter().position(|item| item == revision)
+}
+
+/// Build the serving window declared by retained candidate metadata.
+/// Both bounds must be known catalog revisions so an unrecognized value can
+/// never expand rollback eligibility.
+pub fn candidate_window(schema_min: &str, schema_head: &str) -> Result<Window, String> {
+    let Some(min_idx) = revision_index(schema_min) else {
+        return Err(format!(
+            "candidate schema minimum revision {schema_min} is not in the application schema catalog"
+        ));
+    };
+    let Some(head_idx) = revision_index(schema_head) else {
+        return Err(format!(
+            "candidate schema head revision {schema_head} is not in the application schema catalog"
+        ));
+    };
+    if min_idx > head_idx {
+        return Err(format!(
+            "candidate schema minimum revision {schema_min} is after its head revision {schema_head}"
+        ));
+    }
+    Ok(Window {
+        schema_min: schema_min.to_string(),
+        schema_head: schema_head.to_string(),
+        artifact_identity_ambiguous: false,
+    })
 }
 
 /// Live revision is inside the application's declared range on the linear
@@ -135,24 +163,17 @@ fn fail_forward_fix(forward: Option<String>, live: &str) -> String {
     }
 }
 
-/// Check that `target_app` can start against `live`. `history_apps` supplies
-/// fail-forward candidates (every application version in the Helm history).
+/// Check that `target_app` can start against `live` using its resolved artifact
+/// window. `history_apps` supplies fail forward candidates from Helm history.
 pub fn check_target_schema(
     target_app: &str,
+    window: &Window,
     live: &str,
     history_apps: &[String],
 ) -> Result<(), SchemaRefusal> {
     let target = normalize_app_version(target_app);
     let candidates: Vec<&str> = history_apps.iter().map(String::as_str).collect();
-    let Some(window) = window_for(&target) else {
-        return Err(SchemaRefusal {
-            message: format!(
-                "refusing rollback to application {target}: no declared schema range for that version"
-            ),
-            fix: fail_forward_fix(newest_fail_forward(candidates, live), live),
-        });
-    };
-    if live_in_window(live, &window) {
+    if live_in_window(live, window) {
         return Ok(());
     }
     Err(SchemaRefusal {
@@ -162,6 +183,22 @@ pub fn check_target_schema(
         ),
         fix: fail_forward_fix(newest_fail_forward(candidates, live), live),
     })
+}
+
+/// Refusal for an application version that has no static catalog entry.
+pub fn missing_target_window_refusal(
+    target_app: &str,
+    live: &str,
+    history_apps: &[String],
+) -> SchemaRefusal {
+    let target = normalize_app_version(target_app);
+    let candidates: Vec<&str> = history_apps.iter().map(String::as_str).collect();
+    SchemaRefusal {
+        message: format!(
+            "refusing rollback to application {target}: no declared schema range for that version"
+        ),
+        fix: fail_forward_fix(newest_fail_forward(candidates, live), live),
+    }
 }
 
 /// Last non-log token of `alembic current` stdout: `0039 (head)` -> `0039`.
@@ -225,7 +262,9 @@ mod tests {
     #[test]
     fn incident_refusal_names_fail_forward_v085() {
         let history = ["0.8.4".to_string(), "0.8.5".to_string()];
-        let err = check_target_schema("0.8.4", "0039", &history).expect_err("incompatible");
+        let window = window_for("0.8.4").expect("0.8.4 window");
+        let err =
+            check_target_schema("0.8.4", &window, "0039", &history).expect_err("incompatible");
         assert!(err.message.contains("0039") && err.message.contains("0.8.4"));
         assert!(err.message.contains("0038"));
         assert!(err.fix.contains("0.8.5"), "{}", err.fix);
@@ -234,13 +273,17 @@ mod tests {
 
     #[test]
     fn compatible_v085_to_v085_is_allowed() {
-        check_target_schema("0.8.5", "0039", &["0.8.5".to_string()]).expect("compatible");
+        let window = window_for("0.8.5").expect("0.8.5 window");
+        check_target_schema("0.8.5", &window, "0039", &["0.8.5".to_string()]).expect("compatible");
     }
 
     #[test]
     fn unknown_app_version_is_refused() {
-        let err = check_target_schema("0.7.3", "0039", &["0.7.3".to_string(), "0.8.5".to_string()])
-            .expect_err("unknown version is fail-closed");
+        let err = missing_target_window_refusal(
+            "0.7.3",
+            "0039",
+            &["0.7.3".to_string(), "0.8.5".to_string()],
+        );
         assert!(err.message.contains("0.7.3"));
         assert!(err.fix.contains("0.8.5"));
     }
@@ -294,12 +337,14 @@ mod tests {
         assert_eq!(n.schema_head, n1.schema_head);
         check_target_schema(
             "0.9.0",
+            &n,
             &n.schema_head,
             &["0.9.0".to_string(), "0.9.1".to_string()],
         )
         .expect("N+1 to N is the same schema window");
         let err = check_target_schema(
             "0.8.7",
+            &window_for("0.8.7").expect("0.8.7 window"),
             &n.schema_head,
             &["0.8.7".to_string(), "0.9.0".to_string()],
         )
@@ -327,6 +372,10 @@ mod tests {
             .expect("appVersion");
         let window = window_for(&app_version)
             .unwrap_or_else(|| panic!("catalog missing window for {app_version}"));
+        assert!(
+            !window.artifact_identity_ambiguous,
+            "Chart.yaml appVersion {app_version} must have one unambiguous artifact identity"
+        );
 
         let mut found = Vec::new();
         let mut down_of = Vec::new();

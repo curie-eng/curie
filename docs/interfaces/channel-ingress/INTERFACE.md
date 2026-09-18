@@ -289,7 +289,8 @@ incomplete adapter coverage and conformance.
 - **Still leaks — attachment resolution.** The only `AttachmentFilePort`
   implementation is `SlackFileClient`
   (`apps/worker/src/curie_worker/attachments.py::SlackFileClient`): Slack
-  `files.info` / `url_private` with the bot token, wired from
+  `files.info` / `url_private_download` with the bot token (`url_private` 302s
+  to `slack-files.com`, which the no-redirect transport refuses to follow), wired from
   `apps/worker/src/curie_worker/run.py::build` regardless of the turn's channel
   kind. The kernel (`apps/worker/src/curie_worker/kernel.py::Kernel._resolve_attachments`)
   never checks `reply_handle.kind`. A missing `files:read` scope degrades

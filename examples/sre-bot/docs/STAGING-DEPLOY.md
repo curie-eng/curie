@@ -80,8 +80,13 @@ and does not roll back. Rollback remains an operator action.
 ## Slack
 
 ```bash
-curie example sre-bot install --observability --slack-channel <channel-id>
+curie example sre-bot install --observability --slack-channel <channel-id> \
+  --approvers <user-id>[,<user-id>]
 ```
+
+`--approvers` binds explicit Slack user IDs on the `sre-approvals` route. You
+need it to resolve approvals from the CLI with an operator principal; without
+it only members of the bound Slack channel can approve.
 
 Bind by channel ID, never `#name`. `deploy.yaml` carries no active documentation
 placeholder binding. Both API and CLI refuse the `C0EXAMPLE<digits>` placeholder
@@ -95,9 +100,11 @@ shape before creating or changing an agent, version, or deployment.
   immutable registry locks for any connector it keeps.
 - The Kubernetes connector is already an immutable upstream image and must keep
   its core-only, stateless, single-cluster arguments.
-- `toolPolicy` and `approvalPolicy` references must name connectors that remain
-  in the runtime bundle. Removing `self-upgrade` also removes its two allow
-  entries and legacy gates; the installer performs this transformation.
+- `toolPolicy` references and connector approval gates must name connectors that
+  remain in the runtime bundle. The exact `mcp__curie__publish_changes` gate is
+  platform mounted, has no connector, and remains in both installer modes.
+  Removing `self-upgrade` removes its two allow entries and legacy gates; the
+  installer performs this transformation.
 - `K8S_KUBECONFIG` must be supplied outside the bundle. If self-upgrade remains,
   `SELF_UPGRADE_KUBECONFIG` is also required.
 

@@ -21,7 +21,12 @@ CURIE_SANDBOX_E2E_BATCH`` ready replicas. ``pool_ready`` blocks until the pool
 reports that capacity, so the concurrent claims and batch burst do not starve.
 ``CURIE_SANDBOX_E2E_NAMESPACE`` and ``CURIE_SANDBOX_E2E_POOL`` select the
 standing-cluster resources; the namespace/pool and Valkey defaults match the
-sandbox E2E template. With a live Claude credential, reply-content isolation
+sandbox E2E template. ``CURIE_SANDBOX_E2E_HISTORY_BASE`` is required by Phase D:
+the resumed pod boots its ``CURIE_HISTORY_REF``, and the runner accepts only an
+``http(s)://`` state-API transcript-key URL, so the phase needs a
+cluster-reachable prefix to hang each thread's marker off.
+
+With a live Claude credential, reply-content isolation
 assertions and the cache-token probe are also enabled. Without one, the
 fake-model runner still proves every structural property but does not echo
 markers, so content-level cross-talk assertions do not run.
@@ -34,7 +39,10 @@ Four phases share the module-scoped substrate and a set of held claims:
   leaves them undisturbed (same pod UIDs).
 - Phase C: a sandbox is killed mid-run (unclean pod delete); the thread
   re-claims a fresh sandbox and exactly one live claim survives (no orphan or
-  duplicate side effect at the substrate level).
+  duplicate side effect at the substrate level). Waiting for the kill to land is
+  UID-aware: the controller frequently recreates the pod under the same name, so
+  the scenario waits for the *original* ``metadata.uid`` to disappear rather than
+  for the name, and a failed read raises instead of counting as a deletion.
 - Phase D: one thread is suspended and resumed under sustained load on the
   others; the resumed pod carries the injected history ref and the loaded
   threads keep their pods.
@@ -95,12 +103,16 @@ Follow-ups outside this footprint:
   exactly once.
 - If an eval-fanout batch interpretation is wanted, add a phase that drives the
   ``curie:evals`` stream and its consumer group.
+- ``SandboxSubstrate.claim`` can hand back a handle whose pod the controller has
+  just rebuilt and which is not serving yet; it waits for the serviceFQDN, not
+  for readiness. The scenario waits for ``Ready`` itself (see Phase C). Whether
+  the substrate should do that for its callers is a product question, filed
+  separately rather than patched from a test.
 """
 
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
 import urllib.error
@@ -108,6 +120,7 @@ import urllib.request
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Protocol
 
 import pytest
 
@@ -133,6 +146,8 @@ from resilience_harness import (  # noqa: E402
     post_event,
     thread_hash,
     unique_marker,
+    wait_pod_identity_gone,
+    wait_pod_ready,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -148,37 +163,38 @@ pytestmark = pytest.mark.skipif(
 _RUNS = ResilienceConfig.from_env().runs
 
 
+class _Claimed(Protocol):
+    """The part of ``SandboxHandle`` a turn needs: where to dial and how to authenticate."""
+
+    sandbox_name: str
+    port: int
+    token: str
+
+
 def _drive_turn(
     cfg: ResilienceConfig,
-    sandbox_name: str,
-    port: int,
+    handle: _Claimed,
     text: str,
     *,
     user: str,
     ts: str,
 ) -> list[dict[str, object]]:
-    """Port-forward to a sandbox, assert health, post one ACI turn, return frames."""
+    """Port-forward to a claim's sandbox, assert health, post one ACI turn.
 
-    with port_forward(cfg, sandbox_name, port) as base:
+    The claim's own token authenticates the turn: a resumed claim mints a
+    per-claim runner bearer that a warm-pool binding does not, so driving every
+    turn through the handle keeps both paths honest.
+    """
+
+    with port_forward(cfg, handle.sandbox_name, handle.port) as base:
         assert get_json(base, "/healthz") == {"ok": True}
-        return post_event(base, text, user=user, ts=ts)
+        return post_event(base, text, token=handle.token, user=user, ts=ts)
 
 
 def _assert_final(frames: Sequence[dict[str, object]]) -> None:
     final = final_frame(frames)
     types = [f.get("type") for f in frames]
     assert final is not None, f"turn did not end in a final frame: {types}"
-
-
-def _wait_pod_gone(cfg: ResilienceConfig, sandbox_name: str, timeout: float = 90.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            pod_of_sandbox(cfg, sandbox_name)
-        except subprocess.CalledProcessError:
-            return
-        time.sleep(1)
-    raise AssertionError(f"pod {sandbox_name} was never deleted within {timeout}s")
 
 
 @pytest.mark.parametrize("run", range(_RUNS))
@@ -214,7 +230,7 @@ def test_e2e_resilience(
         def _turn(key: str) -> tuple[str, list[dict[str, object]]]:
             handle = claimed[key]
             text = f"Please remember this token exactly: {markers[key]}"
-            frames = _drive_turn(cfg, handle.sandbox_name, handle.port, text, user=key, ts="1.0")
+            frames = _drive_turn(cfg, handle, text, user=key, ts="1.0")
             return key, frames
 
         replies: dict[str, list[dict[str, object]]] = {}
@@ -249,9 +265,7 @@ def test_e2e_resilience(
         def _batch_turn(key: str) -> tuple[str, list[dict[str, object]]]:
             handle = substrate.claim(key)
             claimed[key] = handle
-            frames = _drive_turn(
-                cfg, handle.sandbox_name, handle.port, "batch turn under load", user=key, ts="1.0"
-            )
+            frames = _drive_turn(cfg, handle, "batch turn under load", user=key, ts="1.0")
             return key, frames
 
         with ThreadPoolExecutor(max_workers=max(cfg.batch, 1)) as pool:
@@ -279,16 +293,24 @@ def test_e2e_resilience(
         victim_sandbox = claimed[victim].sandbox_name
         old_uid = uids[victim]
         kubectl(cfg, "delete", "pod", victim_sandbox, "--wait=false")
-        _wait_pod_gone(cfg, victim_sandbox)
-        print(f"EVIDENCE phase_c_killed_pod uid={old_uid}")
+        kill_start = time.monotonic()
+        replacement = wait_pod_identity_gone(cfg, victim_sandbox, old_uid)
+        replacement_uid = pod_uid(replacement) if replacement is not None else None
+        print(
+            f"EVIDENCE phase_c_killed_pod uid={old_uid} "
+            f"replacement_uid={replacement_uid} "
+            f"gone_after_s={time.monotonic() - kill_start:.1f}"
+        )
 
         fresh = substrate.claim(victim)
         claimed[victim] = fresh
         new_uid = pod_uid(pod_of_sandbox(cfg, fresh.sandbox_name))
         assert new_uid != old_uid, "re-claim returned the killed pod UID"
-        frames = _drive_turn(
-            cfg, fresh.sandbox_name, fresh.port, "back after a kill", user=victim, ts="2.0"
-        )
+        # The replacement pod may be seconds old, so state the readiness the
+        # recovery turn depends on instead of racing a port-forward against it.
+        assert pod_uid(wait_pod_ready(cfg, fresh.sandbox_name)) == new_uid
+        print(f"EVIDENCE phase_c_replacement_ready uid={new_uid}")
+        frames = _drive_turn(cfg, fresh, "back after a kill", user=victim, ts="2.0")
         _assert_final(frames)
         uids[victim] = new_uid
 
@@ -308,13 +330,18 @@ def test_e2e_resilience(
         loaded = [k for k in a_keys if k != victim][: max(cfg.concurrency - 1, 1)]
         target = loaded[0]
         others = loaded[1:]
-        target_marker = markers[target]
+        # The resumed pod boots the ref, so it has to be a state-API transcript
+        # URL; the per-thread marker rides in its path to keep the injected value
+        # unique per thread.
+        assert cfg.history_base, (
+            "set CURIE_SANDBOX_E2E_HISTORY_BASE to a cluster-reachable state-API "
+            "transcript-key prefix; the runner rejects a non-http history ref at boot"
+        )
+        target_marker = f"{cfg.history_base.rstrip('/')}/{markers[target]}"
 
         def _sustained(key: str) -> str:
             handle = claimed[key]
-            frames = _drive_turn(
-                cfg, handle.sandbox_name, handle.port, "sustained follow-up", user=key, ts="3.0"
-            )
+            frames = _drive_turn(cfg, handle, "sustained follow-up", user=key, ts="3.0")
             _assert_final(frames)
             return key
 
@@ -322,7 +349,8 @@ def test_e2e_resilience(
         with ThreadPoolExecutor(max_workers=max(len(others), 1)) as pool:
             load = pool.map(_sustained, others) if others else iter(())
             substrate.suspend(target, history_ref=target_marker)
-            _wait_pod_gone(cfg, claimed[target].sandbox_name)
+            suspended_uid = uids[target]
+            wait_pod_identity_gone(cfg, claimed[target].sandbox_name, suspended_uid)
             resumed = substrate.resume(target)
             claimed[target] = resumed
             list(load)
@@ -337,9 +365,8 @@ def test_e2e_resilience(
             for e in c.get("env", [])
         }
         assert env.get(HISTORY_ENV) == target_marker, "resumed pod missing injected history ref"
-        frames = _drive_turn(
-            cfg, resumed.sandbox_name, resumed.port, "resumed and rehydrated", user=target, ts="4.0"
-        )
+        assert pod_uid(wait_pod_ready(cfg, resumed.sandbox_name)) == pod_uid(resumed_pod)
+        frames = _drive_turn(cfg, resumed, "resumed and rehydrated", user=target, ts="4.0")
         _assert_final(frames)
         for key in others:
             assert pod_uid(pod_of_sandbox(cfg, claimed[key].sandbox_name)) == uids[key], (
@@ -350,15 +377,9 @@ def test_e2e_resilience(
         # -- Cache-warmth proxy: same pod across consecutive turns ------------
         stable = loaded[-1] if len(loaded) > 1 else target
         first_uid = pod_uid(pod_of_sandbox(cfg, claimed[stable].sandbox_name))
-        frames = _drive_turn(
-            cfg, claimed[stable].sandbox_name, claimed[stable].port, "warmth turn one",
-            user=stable, ts="5.0",
-        )
+        frames = _drive_turn(cfg, claimed[stable], "warmth turn one", user=stable, ts="5.0")
         _assert_final(frames)
-        frames = _drive_turn(
-            cfg, claimed[stable].sandbox_name, claimed[stable].port, "warmth turn two",
-            user=stable, ts="6.0",
-        )
+        frames = _drive_turn(cfg, claimed[stable], "warmth turn two", user=stable, ts="6.0")
         _assert_final(frames)
         second_uid = pod_uid(pod_of_sandbox(cfg, claimed[stable].sandbox_name))
         assert second_uid == first_uid, "pod rebound between consecutive turns (cache lost)"

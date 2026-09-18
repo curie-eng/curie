@@ -24,6 +24,9 @@ import redis
 from aci_protocol.s3 import build_s3_client
 from curie_telemetry import bootstrap_service_telemetry, record_metric
 from redis.asyncio import Redis as AsyncRedis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
+from redis.maint_notifications import MaintNotificationsConfig
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from . import __version__
@@ -96,6 +99,7 @@ class Runtime:
     # disposal site alongside the other long-lived transports.
     sink: ReplySinkRouter
     async_redis: AsyncRedis
+    pressure_async_redis: AsyncRedis
     eval_redis: AsyncRedis
     eval_http: httpx.AsyncClient
     engine: AsyncEngine
@@ -327,10 +331,18 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         **config.valkey_client_kwargs(),
         socket_timeout=config.valkey_socket_timeout_s,
     )
+    pressure_async_redis: AsyncRedis = AsyncRedis(
+        **config.valkey_client_kwargs(),
+        socket_timeout=1.0,
+        socket_connect_timeout=1.0,
+        retry=Retry(NoBackoff(), 0),
+        driver_info=None,
+        maint_notifications_config=MaintNotificationsConfig(enabled=False),
+    )
     sub_config = _substrate_config(env)
     substrate = SandboxSubstrate(
         _sandbox_client(config, env, sub_config),
-        AffinityStore(sync_redis),
+        AffinityStore(sync_redis, pressure_client=pressure_async_redis),
         sub_config,
     )
     runner = RunnerClient(
@@ -442,6 +454,13 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
             ),
             dead_owner_proof_s=config.consumer_heartbeat_ttl_ms / 1000.0,
         ),
+        pressure_lock=ThreadLock(
+            pressure_async_redis,
+            ttl_ms=config.lock_ttl_ms,
+            acquire_timeout_s=0.1,
+            poll_interval_s=0.02,
+            owner=None,
+        ),
         markers=Markers(async_redis, config),
         config=config,
         binding=binding,
@@ -531,6 +550,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         runner=runner,
         sink=sink,
         async_redis=async_redis,
+        pressure_async_redis=pressure_async_redis,
         eval_redis=eval_redis,
         eval_http=eval_http,
         engine=engine,
@@ -884,6 +904,7 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
         await rt.sink.aclose()
         await rt.eval_http.aclose()
         await rt.async_redis.aclose()
+        await rt.pressure_async_redis.aclose()
         await rt.eval_redis.aclose()
         await rt.engine.dispose()
     logging.getLogger("curie_worker").info("worker stopped")
