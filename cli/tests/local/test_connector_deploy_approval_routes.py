@@ -504,6 +504,61 @@ run_deploy
     return _run(["bash", "-c", script], env=case.env, timeout=240)
 
 
+def _drive_approval_seed(case: LocalCase, agent_id: str) -> subprocess.CompletedProcess[str]:
+    source = LADDER.read_text()
+    functions = "\n".join(
+        part
+        for part in (
+            _function(source, "configure_deterministic_approval_seed_route", optional=True),
+            _function(source, "seed_approval_resume_turn"),
+        )
+        if part
+    )
+    resolved = case.root / "approval-seed-resolved"
+    wrapper = case.root / "approval-seed-curie"
+    wrapper.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ " $* " == *" local approvals "* && " $* " == *" --list "* ]]; then
+    printf '%s\\n' '{{"pending":[{{"id":"approval-seed","status":"pending","route":"e2e"}}]}}'
+    exit 0
+fi
+if [[ " $* " == *" local approvals "* && " $* " == *" --resolve "* ]]; then
+    : > "$STUB_APPROVAL_SEED_RESOLVED"
+    printf '%s\\n' '{{"status":"approved"}}'
+    exit 0
+fi
+if [[ " $* " == *" local message "* ]]; then
+    while [[ ! -f "$STUB_APPROVAL_SEED_RESOLVED" ]]; do
+        sleep 0.01
+    done
+    printf '%s\\n' '{{"finalized":true,"reply":"approval resumed"}}'
+    exit 0
+fi
+exec {shlex.quote(str(case.binary))} "$@"
+"""
+    )
+    wrapper.chmod(0o755)
+    script = f"""set -euo pipefail
+BIN={shlex.quote(str(wrapper))}
+WORKDIR={shlex.quote(str(case.root))}
+LIVE=0
+APPROVAL_SEED_MESSAGE_PID=''
+capture_stream_cursor() {{ printf 'stream-cursor'; }}
+assert_finalized_reply() {{ return 0; }}
+discover_trace_id_for_seed() {{ printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; }}
+query_exact_seed_trace() {{ LAST_QUERY_MEMBERSHIP=true; return 0; }}
+stop_approval_seed_message() {{ wait "$APPROVAL_SEED_MESSAGE_PID"; }}
+approval_resume_failure_summary() {{ return 0; }}
+{functions}
+seed_approval_resume_turn local {shlex.quote(agent_id)}
+"""
+    env = dict(case.env)
+    env["STUB_APPROVAL_SEED_RESOLVED"] = str(resolved)
+    return _run(["bash", "-c", script], env=env, timeout=240)
+
+
 def _json_objects(text: str) -> list[object]:
     decoder = json.JSONDecoder()
     values: list[object] = []
@@ -569,6 +624,45 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
     stock_agent = _api(local_case.api_url, "GET", f"/agents/{agent_id}")
     assert set(stock_agent["approval_routes"]) == {"sre-approvals"}
 
+    retained_sre = {
+        "resolution": {"kind": "slack", "address": "C0SREBOT"},
+        "approvers": {"users": ["U0EXAMPLE1"]},
+    }
+    retained_other = {
+        "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+        "approvers": {"group": "S0EXAMPLE1"},
+    }
+    before_approval_seed = _api(
+        local_case.api_url,
+        "PATCH",
+        f"/agents/{agent_id}",
+        {
+            "approval_routes": {
+                "sre-approvals": retained_sre,
+                EXISTING_ROUTE: retained_other,
+            }
+        },
+    )
+    approval_seed = _drive_approval_seed(local_case, agent_id)
+    assert approval_seed.returncode == 0, approval_seed.stdout + approval_seed.stderr
+    seeded_agent = _api(local_case.api_url, "GET", f"/agents/{agent_id}")
+    assert set(seeded_agent["approval_routes"]) == {
+        "e2e",
+        "sre-approvals",
+        EXISTING_ROUTE,
+    }
+    assert seeded_agent["approval_routes"]["sre-approvals"] == before_approval_seed[
+        "approval_routes"
+    ]["sre-approvals"]
+    assert seeded_agent["approval_routes"][EXISTING_ROUTE] == before_approval_seed[
+        "approval_routes"
+    ][EXISTING_ROUTE]
+    assert seeded_agent["approval_routes"]["e2e"] == {
+        "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+        "notification": None,
+        "approvers": {"group": None, "users": ["U0EXAMPLE1"]},
+    }
+
     existing = {"resolution": {"kind": "slack", "address": "C0EXAMPLE2"}}
     retained_with_notification = {
         "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
@@ -587,6 +681,18 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
         },
     )
     seeded_routes = seeded["approval_routes"]
+    notification_refused = _drive_approval_seed(local_case, agent_id)
+    assert notification_refused.returncode == 1, (
+        notification_refused.stdout + notification_refused.stderr
+    )
+    assert "carry notification targets" in notification_refused.stderr, (
+        notification_refused.stdout + notification_refused.stderr
+    )
+    assert (
+        _api(local_case.api_url, "GET", f"/agents/{agent_id}")["approval_routes"]
+        == seeded_routes
+    )
+
     _add_second_route(local_case.bundle)
     guarded = _drive_deploy(local_case, connector_mode=True)
     assert guarded.returncode == 1, guarded.stdout + guarded.stderr
