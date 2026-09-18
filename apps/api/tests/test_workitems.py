@@ -11,7 +11,8 @@ from typing import Any
 import pytest
 from curie_api import workitems
 from curie_api.config import get_settings
-from sqlalchemy import text
+from curie_api.models import ThreadPublicationLineage
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -125,6 +126,9 @@ async def _lineage(
     conversation: str = CONVERSATION,
     repo: str = REPO,
     pr: int = 123,
+    status: str = "open",
+    github_repository_id: int | None = None,
+    github_installation_id: int | None = None,
 ) -> uuid.UUID:
     version_id, deployment_id, lineage_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await session.execute(
@@ -148,9 +152,12 @@ async def _lineage(
             "INSERT INTO curie.thread_publication_lineages "
             "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
             "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
-            "latest_revision) VALUES "
+            "latest_revision, github_repository_id, github_installation_id, "
+            "github_pr_node_id, base_ref) VALUES "
             "(:id, :agent, :deployment, :conversation, :repo, :base_sha, "
-            ":branch, :pr, :url, :head_sha, 'open', 1, 1)"
+            ":branch, :pr, :url, :head_sha, :status, 1, 1, "
+            ":github_repository_id, :github_installation_id, :github_pr_node_id, "
+            ":base_ref)"
         ),
         {
             "id": lineage_id,
@@ -163,6 +170,13 @@ async def _lineage(
             "pr": pr,
             "url": f"https://github.com/{repo}/pull/{pr}",
             "head_sha": "1123456789abcdef0123456789abcdef01234567",
+            "status": status,
+            "github_repository_id": github_repository_id,
+            "github_installation_id": github_installation_id,
+            "github_pr_node_id": (
+                f"PR_kwDO{lineage_id.hex}" if github_repository_id is not None else None
+            ),
+            "base_ref": "main" if github_repository_id is not None else None,
         },
     )
     await session.commit()
@@ -269,6 +283,54 @@ def test_work_item_identity_replay_and_conflicting_provenance(clean_db: None) ->
     with_session(body)
 
 
+def test_concurrent_duplicate_work_item_intake_returns_one_replay(clean_db: None) -> None:
+    async def setup(session: AsyncSession) -> uuid.UUID:
+        return await _agent(session, "duplicate-intake-agent")
+
+    agent_id = with_session(setup)
+
+    async def race() -> list[workitems.WorkItemResult]:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def contender() -> workitems.WorkItemResult:
+            async with maker() as session:
+                return await workitems.create_or_get_work_item(
+                    session,
+                    github_repository_id=101,
+                    github_issue_number=2573,
+                    github_installation_id=202,
+                    agent_id=agent_id,
+                    repo_full_name=REPO,
+                    conversation_id=CONVERSATION,
+                )
+
+        try:
+            gathered = asyncio.gather(contender(), contender())
+            return list(await asyncio.wait_for(gathered, timeout=10))
+        finally:
+            await engine.dispose()
+
+    results = asyncio.run(race())
+    assert all(isinstance(result, workitems.WorkItemOutcome) for result in results)
+    outcomes = [
+        result for result in results if isinstance(result, workitems.WorkItemOutcome)
+    ]
+    assert sorted(outcome.replayed for outcome in outcomes) == [False, True]
+    assert len({outcome.work_item.id for outcome in outcomes}) == 1
+    assert all(outcome.work_item.version == 1 for outcome in outcomes)
+
+    async def verify(session: AsyncSession) -> None:
+        assert await session.scalar(
+            text(
+                "SELECT count(*) FROM curie.work_items "
+                "WHERE github_repository_id = 101 AND github_issue_number = 2573"
+            )
+        ) == 1
+
+    with_session(verify)
+
+
 def test_request_replay_fences_and_sequential_lifecycle(clean_db: None) -> None:
     async def body(session: AsyncSession) -> None:
         item = (await _item(session, await _agent(session))).work_item
@@ -322,6 +384,38 @@ def test_request_replay_fences_and_sequential_lifecycle(clean_db: None) -> None:
             "stale_version",
         )
         assert stale.work_item_version == 2
+
+        late_start = _conflict(
+            await workitems.start_execution(
+                session,
+                work_item_id=item.id,
+                request_id=request.id,
+                expected_work_item_version=first.work_item.version,
+                expected_request_version=request.version,
+            ),
+            "waiting_deadline_elapsed",
+        )
+        assert (late_start.work_item_version, late_start.request_version) == (2, 1)
+        unchanged_waiting = (
+            await session.execute(
+                text(
+                    "SELECT w.version AS work_version, r.status, "
+                    "r.version AS request_version, r.wait_deadline, r.started_at, "
+                    "r.execution_deadline FROM curie.work_items w "
+                    "JOIN curie.execution_requests r ON r.work_item_id = w.id "
+                    "WHERE w.id = :id AND r.id = :request_id"
+                ),
+                {"id": item.id, "request_id": request.id},
+            )
+        ).mappings().one()
+        assert (
+            unchanged_waiting.work_version,
+            unchanged_waiting.status,
+            unchanged_waiting.request_version,
+            unchanged_waiting.wait_deadline,
+            unchanged_waiting.started_at,
+            unchanged_waiting.execution_deadline,
+        ) == (2, "waiting", 1, deadline, None, None)
 
         expired = await workitems.expire_waiting(
             session,
@@ -403,6 +497,72 @@ def test_concurrent_request_creation_has_one_winner(clean_db: None) -> None:
     with_session(verify)
 
 
+def test_concurrent_request_id_reuse_across_work_items_is_an_identity_conflict(
+    clean_db: None,
+) -> None:
+    async def setup(
+        session: AsyncSession,
+    ) -> tuple[workitems.WorkItemSnapshot, workitems.WorkItemSnapshot, datetime]:
+        agent_id = await _agent(session, "request-identity-agent")
+        first = (await _item(session, agent_id)).work_item
+        second = (await _item(session, agent_id, issue=2574)).work_item
+        return first, second, await _now(session) + timedelta(hours=1)
+
+    first, second, deadline = with_session(setup)
+    request_id = uuid.uuid4()
+
+    async def race() -> list[workitems.WorkItemResult]:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def contender(item: workitems.WorkItemSnapshot) -> workitems.WorkItemResult:
+            async with maker() as session:
+                return await workitems.create_execution_request(
+                    session,
+                    work_item_id=item.id,
+                    request_id=request_id,
+                    wait_deadline=deadline,
+                    expected_work_item_version=item.version,
+                )
+
+        try:
+            gathered = asyncio.gather(contender(first), contender(second))
+            return list(await asyncio.wait_for(gathered, timeout=10))
+        finally:
+            await engine.dispose()
+
+    results = asyncio.run(race())
+    winners = [r for r in results if isinstance(r, workitems.WorkItemOutcome)]
+    losers = [r for r in results if isinstance(r, workitems.WorkItemConflict)]
+    assert len(winners) == len(losers) == 1
+    assert winners[0].request is not None
+    assert winners[0].request.id == request_id
+    assert losers[0].code == "identity_mismatch"
+    assert losers[0].request_id == request_id
+    assert losers[0].work_item_id is not None
+    assert losers[0].work_item_id != winners[0].work_item.id
+
+    async def verify(session: AsyncSession) -> None:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT id, version, next_sequence FROM curie.work_items "
+                    "WHERE id IN (:first, :second)"
+                ),
+                {"first": first.id, "second": second.id},
+            )
+        ).mappings().all()
+        state = {row.id: (row.version, row.next_sequence) for row in rows}
+        assert state[winners[0].work_item.id] == (2, 2)
+        assert state[losers[0].work_item_id] == (1, 1)
+        assert await session.scalar(
+            text("SELECT count(*) FROM curie.execution_requests WHERE id = :id"),
+            {"id": request_id},
+        ) == 1
+
+    with_session(verify)
+
+
 def test_start_terminal_transitions_and_deadlines_are_fenced(clean_db: None) -> None:
     async def body(session: AsyncSession) -> None:
         item = (await _item(session, await _agent(session))).work_item
@@ -428,6 +588,41 @@ def test_start_terminal_transitions_and_deadlines_are_fenced(clean_db: None) -> 
         assert request.execution_deadline - request.started_at == timedelta(seconds=1800)
         assert (request.id, request.wait_deadline) == immutable
         assert (running.work_item.version, request.version) == (2, 2)
+        early_deadline = _conflict(
+            await workitems.request_execution_deadline_cancellation(
+                session,
+                work_item_id=item.id,
+                request_id=request.id,
+                expected_work_item_version=running.work_item.version,
+                expected_request_version=request.version,
+            ),
+            "illegal_transition",
+        )
+        assert (early_deadline.work_item_version, early_deadline.request_version) == (
+            2,
+            2,
+        )
+        unchanged_running = (
+            await session.execute(
+                text(
+                    "SELECT w.version AS work_version, r.status, "
+                    "r.version AS request_version, r.started_at, "
+                    "r.execution_deadline, r.terminal_at, r.terminal_cause "
+                    "FROM curie.work_items w JOIN curie.execution_requests r "
+                    "ON r.work_item_id = w.id WHERE w.id = :id AND r.id = :request_id"
+                ),
+                {"id": item.id, "request_id": request.id},
+            )
+        ).mappings().one()
+        assert (
+            unchanged_running.work_version,
+            unchanged_running.status,
+            unchanged_running.request_version,
+            unchanged_running.started_at,
+            unchanged_running.execution_deadline,
+            unchanged_running.terminal_at,
+            unchanged_running.terminal_cause,
+        ) == (2, "running", 2, request.started_at, request.execution_deadline, None, None)
         _conflict(
             await workitems.fail_execution(
                 session,
@@ -553,12 +748,155 @@ def test_publication_linkage_validates_lineage_identity(
     with_session(body)
 
 
+@pytest.mark.parametrize(
+    ("repository_id", "installation_id", "matches"),
+    [(101, 202, True), (999, 202, False), (101, 999, False)],
+)
+def test_publication_linkage_validates_verified_github_identity(
+    clean_db: None,
+    repository_id: int,
+    installation_id: int,
+    matches: bool,
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        running = await _start(
+            session, await _request(session, (await _item(session, agent_id)).work_item)
+        )
+        assert running.request is not None
+        lineage_id = await _lineage(
+            session,
+            agent_id,
+            github_repository_id=repository_id,
+            github_installation_id=installation_id,
+        )
+        stored_identity = (
+            await session.execute(
+                text(
+                    "SELECT github_repository_id, github_installation_id "
+                    "FROM curie.thread_publication_lineages WHERE id = :id"
+                ),
+                {"id": lineage_id},
+            )
+        ).one()
+        assert tuple(stored_identity) == (repository_id, installation_id)
+
+        result = await workitems.link_publication_lineage(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=running.request.id,
+            publication_lineage_id=lineage_id,
+            expected_work_item_version=running.work_item.version,
+            expected_request_version=running.request.version,
+        )
+        if matches:
+            assert isinstance(result, workitems.WorkItemOutcome), result
+            assert result.work_item.publication_lineage_id == lineage_id
+            assert result.work_item.version == 3
+        else:
+            conflict = _conflict(result, "lineage_mismatch")
+            assert (conflict.work_item_version, conflict.request_version) == (2, 2)
+            persisted = await session.scalar(
+                text("SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"),
+                {"id": running.work_item.id},
+            )
+            assert persisted is None
+
+    with_session(body)
+
+
+def test_publication_linkage_refreshes_cached_verified_github_identity(
+    clean_db: None,
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        running = await _start(
+            session, await _request(session, (await _item(session, agent_id)).work_item)
+        )
+        assert running.request is not None
+        lineage_id = await _lineage(session, agent_id)
+        cached = await session.scalar(
+            select(ThreadPublicationLineage).where(
+                ThreadPublicationLineage.id == lineage_id
+            )
+        )
+        assert cached is not None
+        assert (cached.github_repository_id, cached.github_installation_id) == (
+            None,
+            None,
+        )
+
+        update_engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(update_engine) as updater:
+                await updater.execute(
+                    text(
+                        "UPDATE curie.thread_publication_lineages SET "
+                        "github_repository_id = 999, github_installation_id = 999, "
+                        "github_pr_node_id = :node_id, base_ref = 'main' WHERE id = :id"
+                    ),
+                    {"id": lineage_id, "node_id": f"PR_kwDO{lineage_id.hex}"},
+                )
+                await updater.commit()
+        finally:
+            await update_engine.dispose()
+
+        persisted_identity = (
+            await session.execute(
+                text(
+                    "SELECT github_repository_id, github_installation_id "
+                    "FROM curie.thread_publication_lineages WHERE id = :id"
+                ),
+                {"id": lineage_id},
+            )
+        ).one()
+        assert tuple(persisted_identity) == (999, 999)
+        assert (cached.github_repository_id, cached.github_installation_id) == (
+            None,
+            None,
+        )
+
+        conflict = _conflict(
+            await workitems.link_publication_lineage(
+                session,
+                work_item_id=running.work_item.id,
+                request_id=running.request.id,
+                publication_lineage_id=lineage_id,
+                expected_work_item_version=running.work_item.version,
+                expected_request_version=running.request.version,
+            ),
+            "lineage_mismatch",
+        )
+        assert (conflict.work_item_version, conflict.request_version) == (2, 2)
+        assert await session.scalar(
+            text("SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"),
+            {"id": running.work_item.id},
+        ) is None
+
+    with_session(body)
+
+
 def test_publication_link_is_unique_idempotent_and_restricts_deletion(
     clean_db: None,
 ) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent(session)
-        lineage_id = await _lineage(session, agent_id, repo="ACME-CORP/ACME-BOT")
+        lineage_id = await _lineage(
+            session,
+            agent_id,
+            repo="ACME-CORP/ACME-BOT",
+            status="merged",
+        )
+        historical_identity = (
+            await session.execute(
+                text(
+                    "SELECT status, github_repository_id, github_installation_id "
+                    "FROM curie.thread_publication_lineages WHERE id = :id"
+                ),
+                {"id": lineage_id},
+            )
+        ).one()
+        assert tuple(historical_identity) == ("merged", None, None)
         waiting = await _request(
             session, (await _item(session, agent_id)).work_item
         )
@@ -1212,23 +1550,69 @@ def test_terminal_and_link_races_cannot_win_after_sticky_cancellation(
     if isinstance(cancellation, workitems.WorkItemConflict):
         assert operation == "link" and cancellation.code == "stale_version"
         assert isinstance(mutation, workitems.WorkItemOutcome), mutation
+        assert mutation.request is not None
+        assert mutation.work_item.version == 3
+        assert mutation.request.status == "running"
+        assert mutation.request.version == 2
+        assert mutation.work_item.publication_lineage_id == lineage_id
+        assert cancellation.work_item_version == mutation.work_item.version
 
-        async def retry(session: AsyncSession) -> None:
+        async def retry(session: AsyncSession) -> workitems.WorkItemOutcome:
             result = await workitems.request_cancellation(
                 session, work_item_id=item_id, expected_work_item_version=3
             )
             assert isinstance(result, workitems.WorkItemOutcome), result
+            return result
 
-        with_session(retry)
+        retried = with_session(retry)
+        assert retried.request is not None
+        assert (
+            retried.work_item.version,
+            retried.request.status,
+            retried.request.version,
+            retried.work_item.publication_lineage_id,
+        ) == (4, "cancellation_requested", 3, lineage_id)
+        expected = (4, "cancellation_requested", 3, lineage_id)
     else:
         assert cancellation.work_item.cancelled_at is not None
-        if isinstance(mutation, workitems.WorkItemConflict):
-            assert mutation.code in {"work_item_cancelled", "stale_version"}
+        if cancellation.request is not None:
+            assert cancellation.request.status == "cancellation_requested"
+            assert isinstance(mutation, workitems.WorkItemConflict), mutation
+            assert mutation.code == "work_item_cancelled"
+            assert (
+                cancellation.work_item.version,
+                cancellation.request.version,
+                cancellation.work_item.publication_lineage_id,
+            ) == (3, 3, None)
+            expected = (3, "cancellation_requested", 3, None)
+        else:
+            assert operation in {"complete", "fail"}
+            assert isinstance(mutation, workitems.WorkItemOutcome), mutation
+            assert mutation.request is not None
+            terminal_status = "completed" if operation == "complete" else "failed"
+            assert mutation.request.status == terminal_status
+            assert mutation.request.version == 3
+            assert cancellation.work_item.version == 3
+            expected = (3, terminal_status, 3, None)
 
     async def verify(session: AsyncSession) -> None:
-        assert await session.scalar(
-            text("SELECT cancelled_at IS NOT NULL FROM curie.work_items WHERE id = :id"),
-            {"id": item_id},
-        ) is True
+        row = (
+            await session.execute(
+                text(
+                    "SELECT w.version AS work_version, w.cancelled_at, "
+                    "w.publication_lineage_id, r.status, r.version AS request_version "
+                    "FROM curie.work_items w JOIN curie.execution_requests r "
+                    "ON r.work_item_id = w.id WHERE w.id = :id AND r.id = :request_id"
+                ),
+                {"id": item_id, "request_id": request_id},
+            )
+        ).mappings().one()
+        assert row.cancelled_at is not None
+        assert (
+            row.work_version,
+            row.status,
+            row.request_version,
+            row.publication_lineage_id,
+        ) == expected
 
     with_session(verify)

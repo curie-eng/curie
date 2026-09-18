@@ -774,3 +774,37 @@ def test_0045_deadline_arithmetic_and_request_fields_are_write_once(
             f"UPDATE curie.execution_requests SET {assignment} WHERE id = :id",
             {"id": request_id, **params},
         )
+
+    for assignment, params in (
+        (
+            "started_at = :started_at, "
+            "execution_deadline = :execution_deadline",
+            {
+                "started_at": STAMP + timedelta(seconds=1),
+                "execution_deadline": STAMP + timedelta(seconds=1801),
+            },
+        ),
+        (
+            "status = 'waiting', started_at = NULL, "
+            "execution_deadline = NULL",
+            {},
+        ),
+    ):
+        with pytest.raises(DBAPIError) as excinfo:
+            _sql(
+                f"UPDATE curie.execution_requests SET {assignment} WHERE id = :id",
+                {"id": request_id, **params},
+            )
+        assert getattr(excinfo.value.orig, "sqlstate", None) == "23514"
+        assert "execution deadlines are write once" in str(excinfo.value.orig)
+        assert _sql(
+            "SELECT status, started_at, execution_deadline "
+            "FROM curie.execution_requests WHERE id = :id",
+            {"id": request_id},
+        ) == [
+            {
+                "status": "running",
+                "started_at": STAMP,
+                "execution_deadline": STAMP + timedelta(seconds=1800),
+            }
+        ]
