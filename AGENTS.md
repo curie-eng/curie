@@ -797,15 +797,6 @@ and the role is what selects your base.
 | General bug fix, security fix, or change shared by both lines | `main` |
 | Feature for the next feature release, or a bug unique to that unreleased work | `next` |
 
-The GitHub milestone-to-train mapping that CI enforces lives in
-[`tools/fix-pin-ci/milestone-trains.json`](tools/fix-pin-ci/milestone-trains.json).
-Each milestone is explicitly classified there: `patch` entries map to `main`
-and `feature` entries map to `next`. The version number's shape does not select
-the branch independently of that mapping. A pull request that closes an issue
-whose milestone belongs to the other train fails, and a pull request that closes
-a `bug` issue with no milestone fails. The check reuses the existing fix-pin gate
-rather than adding a second workflow.
-
 Create a short lived `task/<short-description>` branch from the selected base:
 
 ```bash
