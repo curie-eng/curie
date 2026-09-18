@@ -699,8 +699,16 @@ run_upgrade() {
     if [[ "$tag" == "0.8.7" && -z "$CANDIDATE_TAG" ]]; then
         log "candidate application images are published :0.8.7; CLI/chart are this checkout $CANDIDATE"
     fi
+    # The approval-recovery baseline (v0.8.6, head 0039) crosses contract
+    # revision 0041, which the migrate gate refuses without the documented
+    # forward-only procedure. Pass it explicitly for that scenario only.
+    local forward=()
+    if [[ "$SCENARIO" == "approval-recovery" ]]; then
+        forward+=(--set api.migrate.forwardOnly=true)
+        log "U4 approval-recovery upgrade passes api.migrate.forwardOnly=true (crosses contract 0041)"
+    fi
     # Omit credentialsExistingSecret so retention is observed, not re-applied.
-    cluster_up_with "$BIN" "$REPO_ROOT/charts/curie" "$tag" 0
+    cluster_up_with "$BIN" "$REPO_ROOT/charts/curie" "$tag" 0 "${forward[@]}"
     wait_rollout
     log "U4 candidate CLI upgrade complete (tag=$tag)"
 }
@@ -1012,24 +1020,31 @@ json.dump(found[0], sys.stdout)
 provoke_approval() {
     local label="$1" before after id deadline
     before="$(pending_ids | sort)"
+    local turn_pid
     (
-        "$BIN" --json cluster message \
+        exec "$BIN" --json cluster message \
             --namespace "$NAMESPACE" \
             --release "$RELEASE" \
             --channel "$CHANNEL" \
             "2753 $label: run the shell command \`echo $label\` using your Bash tool" \
             >"$EVIDENCE_DIR/approval-turn-$label.json" 2>&1
     ) &
+    turn_pid=$!
     deadline=$((SECONDS + 300))
     while (( SECONDS < deadline )); do
         after="$(pending_ids | sort)"
         id="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -n 1)"
         if [[ -n "$id" ]]; then
+            # The turn now blocks on the approval it raised. Stop the client so
+            # it cannot outlive the drill holding the drill lock; the pending
+            # row is server state and stays.
+            kill "$turn_pid" 2>/dev/null || true
             printf '%s' "$id"
             return 0
         fi
         sleep 3
     done
+    kill "$turn_pid" 2>/dev/null || true
     die "no pending approval appeared for '$label' within 300s; the gated tool was never called"
 }
 
@@ -1060,6 +1075,9 @@ body = {key: src[key] for key in carry if key in src}
 body["summary"] = "2753 drill: orphaned approval, card identity removed"
 body["dedupe_key"] = "2753-orphan-" + uuid.uuid4().hex
 body["route"] = sys.argv[1]
+# The v0.8.6 read omits reply_kind but its intake requires it. The retained
+# row came from the Slack-shaped channel binding of the agent, so that is its kind.
+body.setdefault("reply_kind", "slack")
 # The missing card: no placeholder to address a reply to. The field is
 # required and nullable, so this states the absence rather than omitting it.
 body["reply_placeholder"] = None
@@ -1093,6 +1111,9 @@ seed_approval_recovery() {
         --route-resolution "$RECOVERY_ROUTE=$CHANNEL" \
         --route-resolution "$RECOVERY_ORPHAN_ROUTE=$CHANNEL" \
         --route-approvers "$RECOVERY_ROUTE=users:$RECOVERY_APPROVER"
+    # The first deploy created the agent but was refused a deployment: the
+    # bundle declares routes the agent did not bind yet. Now it does.
+    deploy_agent
     RECOVERY_RETAINED_ID="$(provoke_approval retained)"
     api_get_in_cluster "/approvals/$RECOVERY_RETAINED_ID" | redact \
         >"$EVIDENCE_DIR/approval-retained-seeded.json"
@@ -1332,18 +1353,20 @@ start_fence_probes() {
     : >"$EVIDENCE_DIR/recovery-fence-probes.jsonl"
     # Neither watcher touches a fenced table (catalog views and alembic_version
     # only), so both keep reporting while the fence is held. Each line starts
-    # with `epoch_ms`.
+    # with `epoch_ms` read from the Postgres clock: the container `date` has no
+    # %N, and a seconds stamp silently breaks every ordering check below.
     kubectl_ns exec "sts/$(fullname)-postgres" -c postgres -- bash -c '
 while true; do
-    printf "%s %s\n" "$(date +%s%3N)" "$(PGPASSWORD=${POSTGRES_PASSWORD} psql -qtAX -h 127.0.0.1 \
+    PGPASSWORD=${POSTGRES_PASSWORD} psql -qtAX -h 127.0.0.1 \
         -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-        -c "select version_num from curie.alembic_version" 2>/dev/null | tr -d "[:space:]")"
+        -c "select (extract(epoch from clock_timestamp()) * 1000)::bigint || '"' '"' || coalesce((select version_num from curie.alembic_version), '"''"')" 2>/dev/null
     sleep 0.2
 done' >"$EVIDENCE_DIR/recovery-fence-revisions.txt" 2>/dev/null &
     FENCE_WATCH_PID=$!
     kubectl_ns exec "sts/$(fullname)-postgres" -c postgres -- bash -c '
 while true; do
-    ts="$(date +%s%3N)"
+    ts="$(PGPASSWORD=${POSTGRES_PASSWORD} psql -qtAX -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+        -c "select (extract(epoch from clock_timestamp()) * 1000)::bigint" 2>/dev/null)"
     PGPASSWORD=${POSTGRES_PASSWORD} psql -qtAX -F "|" -h 127.0.0.1 \
         -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$0" 2>/dev/null | sed "s/^/$ts|/"
     sleep 0.1
@@ -1518,6 +1541,8 @@ carry = (
 )
 body = {key: src[key] for key in carry if key in src}
 body["summary"] = "2753 drill: concurrent intake during the identity migration"
+# The v0.8.6 read omits reply_kind but its intake requires it (see the orphan seed).
+body.setdefault("reply_kind", "slack")
 json.dump(body, sys.stdout)
 '
 }
@@ -1813,7 +1838,8 @@ run_approval_recovery() {
     # observable step, because that is the operator act the refusal text names.
     log "R3 enabling api.approvalRecovery.enabled on the candidate release"
     cluster_up_with "$BIN" "$REPO_ROOT/charts/curie" "$(candidate_image_tag)" 0 \
-        --set api.approvalRecovery.enabled=true
+        --set api.approvalRecovery.enabled=true \
+        --set api.migrate.forwardOnly=true
     wait_rollout
 
     log "R3 minting an operator principal (token never printed)"
