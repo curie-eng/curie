@@ -741,10 +741,15 @@ class AttachmentCoordinator:
         are not, because a concurrent resolve on the same generation parks under
         the same keys and names them in a record of its own.
 
-        The ledger is therefore read AFTER the owner record is gone and BEFORE
-        any object is deleted. The old order deleted the bytes first and only
-        then asked who owned them, which is how a discard could destroy the
-        objects a live turn was about to install.
+        The ledger is therefore read BEFORE any object is deleted -- the old
+        order deleted the bytes first and only then asked who owned them, which
+        is how a discard could destroy the objects a live turn was about to
+        install -- and this resolve's own record is deleted LAST. That ordering
+        is what keeps the cleanup obligation durable: the caller logs a failed
+        discard and does not retry it, so a record dropped ahead of a failing
+        scan would leave bytes that no later expiry sweep could ever find. While
+        the record survives, the worst outcome is bytes that outlive the turn
+        and are swept on schedule instead of immediately.
         """
 
         if not prepared.object_keys:
@@ -753,18 +758,30 @@ class AttachmentCoordinator:
             # file-free turn at exactly zero store calls.
             return
 
+        owner_key = self._owner_key(thread_key, prepared._owner_token)
         with self._lock:
-            # Idempotent: the store treats a delete of an absent key as done,
-            # so a retried discard is not an error.
-            self.objects.delete(self._owner_key(thread_key, prepared._owner_token))
             protected: set[str] = set()
-            for _key, record in self._scan_owners():
-                if record.thread_key != thread_key:
+            for key, record in self._scan_owners():
+                # This resolve's own record is skipped rather than deleted up
+                # front: it must not protect the very bytes being discarded,
+                # and it must still be there if anything below fails.
+                if key == owner_key or record.thread_key != thread_key:
                     continue
                 protected.update(record.object_keys)
-            self._discard(
-                key for key in dict.fromkeys(prepared.object_keys) if key not in protected
-            )
+            removed = True
+            for key in dict.fromkeys(prepared.object_keys):
+                if key in protected:
+                    continue
+                try:
+                    self.objects.delete(key)
+                except Exception:  # noqa: BLE001 -- the record below is the recovery
+                    # Not fatal and not swallowed either: the bytes are still
+                    # there, so the record that names them has to stay too.
+                    removed = False
+            if removed:
+                # Idempotent: the store treats a delete of an absent key as
+                # done, so a retried discard is not an error.
+                self.objects.delete(owner_key)
 
     @staticmethod
     def _object_key(*, agent_id: str, generation: str, index: int) -> str:
