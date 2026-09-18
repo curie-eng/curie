@@ -1406,6 +1406,7 @@ def test_cluster_message_publication_card_consumer_is_delivered_or_bounded(
             credentials=None,
             cluster=None,
             github=None,
+            lineage=None,
             replies=sink,
             job_settings=None,  # type: ignore[arg-type]
             card_store=ApprovalCardStore(valkey, config),
