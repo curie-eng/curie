@@ -9114,6 +9114,22 @@
         "parameters": [
           {
             "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
             "name": "X-Curie-Adapter-Principal",
             "required": false,
             "schema": {
