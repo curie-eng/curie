@@ -69,6 +69,8 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
+cargo test --locked --manifest-path "$REPO/cli/Cargo.toml" --test cluster_up_inference retained_ >&2
+
 # --- the retained install ----------------------------------------------------
 # Three YAML 1.1 boolean words, in three unrelated places, all of them strings
 # in the installed release. JSON is YAML, and JSON has no bare scalars, so the
