@@ -273,22 +273,32 @@ async def mint_channel_token(
     binding is re-pointed or merely re-asserted (another bump).
     """
 
+    if adapter is not None:
+        # Decide served vs unknown on an UNLOCKED read first: an adapter must
+        # never take `FOR UPDATE` on a row it does not serve, and unknown vs
+        # unserved must read identically (same detail, same lack of a lock) so
+        # an adapter cannot probe which pairs are bound outside its own set.
+        unlocked_row = await session.scalar(
+            select(AgentChannel).where(
+                AgentChannel.kind == data.kind, AgentChannel.address == data.address
+            )
+        )
+        if unlocked_row is None or unlocked_row.id not in adapter.bindings:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "adapter principal does not serve this binding"
+            )
+
     # Locked, not the unlocked `_resolve_binding` the ingress uses: two concurrent
     # mints that both read N and both write N+1 would stamp the same generation
     # on two tokens, and neither rotation would revoke the other. `populate_existing`
-    # is the same load-bearing choice as `crud.lock_agent_bindings`.
+    # is the same load-bearing choice as `crud.lock_agent_bindings`. Only reached
+    # for a row the adapter (or the platform key) actually serves.
     row: AgentChannel | None = await session.scalar(
         select(AgentChannel)
         .where(AgentChannel.kind == data.kind, AgentChannel.address == data.address)
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if adapter is not None and (row is None or row.id not in adapter.bindings):
-        # Unknown and unserved read the same, so an adapter cannot probe which
-        # pairs are bound outside its own set.
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "adapter principal does not serve this binding"
-        )
     if row is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,

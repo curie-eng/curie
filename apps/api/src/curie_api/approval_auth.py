@@ -157,8 +157,9 @@ def _authenticate_adapter(token: str, actor: str | None) -> AuthenticatedApprova
     )
     if claims is None or actor is None or not actor.strip():
         raise _unauthorized()
+    stripped_actor = actor.strip()
     return AuthenticatedApprovalPrincipal(
-        subject=actor,
+        subject=stripped_actor,
         kind="adapter",
         actor_channel=None,
         adapter=claims.subject,
@@ -199,21 +200,24 @@ def platform_key_or_adapter(
 
 
 async def require_adapter_principal(
+    x_api_key: Annotated[str | None, Header()] = None,
     x_curie_adapter_principal: Annotated[
         str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)
     ] = None,
 ) -> adapter_principal.AdapterClaims:
     """The adapter credential alone, for self-rotation. The platform key is not
-    accepted: it issues adapter credentials, it does not renew one."""
+    accepted: it issues adapter credentials, it does not renew one. Presenting
+    both together is ambiguous and fails closed, matching the other adapter
+    and resolver dependencies."""
 
-    claims = (
-        adapter_principal.verify(
-            x_curie_adapter_principal,
-            get_settings().api_key,
-            scope=adapter_principal.SCOPE_APPROVALS_READ,
-        )
-        if x_curie_adapter_principal is not None
-        else None
+    if x_curie_adapter_principal is None:
+        raise _unauthorized("missing or invalid adapter principal")
+    if x_api_key is not None:
+        raise _unauthorized("ambiguous credentials")
+    claims = adapter_principal.verify(
+        x_curie_adapter_principal,
+        get_settings().api_key,
+        scope=adapter_principal.SCOPE_APPROVALS_READ,
     )
     if claims is None:
         raise _unauthorized("missing or invalid adapter principal")

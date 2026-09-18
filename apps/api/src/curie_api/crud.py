@@ -1886,8 +1886,13 @@ async def list_approvals(
         return []
     # Narrow in SQL to the served agents' routed rows, then apply the one
     # predicate the resolver also uses; the route map is JSONB, so the
-    # resolution match itself stays in Python.
-    stmt = stmt.where(Approval.agent_id.in_(targets), Approval.route.is_not(None))
+    # resolution match itself stays in Python. The SQL side still needs its
+    # own bound: `_approval_served` can only drop rows, never keep more than
+    # it's given, so a hard cap here (well above `limit`) keeps a busy agent's
+    # adapter listing from materializing every routed approval it has.
+    stmt = stmt.where(Approval.agent_id.in_(targets), Approval.route.is_not(None)).limit(
+        max(limit, 1000)
+    )
     served = [a for a in await session.scalars(stmt) if _approval_served(a, targets)]
     return served[:limit]
 

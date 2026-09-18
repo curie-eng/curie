@@ -12,6 +12,7 @@ Everything drives the real HTTP surface against real Postgres and Valkey.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import Iterator
@@ -19,7 +20,8 @@ from typing import Any
 
 import pytest
 import redis
-from curie_api import adapter_principal
+from curie_api import adapter_principal, approval_principal, channel_token, sandbox_token
+from curie_api.adapter_principal import _b64url, _signature
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from fastapi.testclient import TestClient
@@ -59,6 +61,22 @@ def _binding_id(agent_id: str) -> str:
                     {"aid": agent_id},
                 )
                 return str(result.scalar_one())
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
+def _channel_bindings(agent_id: str) -> list[dict[str, str]]:
+    async def run() -> list[dict[str, str]]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    sql_text("SELECT id, address FROM curie.agent_channels WHERE agent_id = :aid"),
+                    {"aid": agent_id},
+                )
+                return [{"id": str(row.id), "address": row.address} for row in result]
         finally:
             await engine.dispose()
 
@@ -509,3 +527,332 @@ def test_issuance_requires_platform_key_and_validates_body(
         "/approvals/principals/adapter", json={**body, "ttl_s": 604801}, headers=auth_headers
     )
     assert too_long.status_code == 422, too_long.text
+
+
+# --- 8. one agent, two routes: the served pair conjunct ------------------------
+
+
+def test_one_agent_two_routes_adapter_serves_only_its_own_binding(
+    adapter_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Grok finding 1: the served predicate is a (kind, address) match on the
+    SAME agent, not merely a shared agent id. One agent, two channel bindings,
+    two routes each resolving to a different binding; a token naming only
+    binding A must not see or resolve the approval routed through binding B."""
+
+    channel_a = f"C0ADPA{_uid().upper()}"
+    channel_b = f"C0ADPB{_uid().upper()}"
+    route_a, route_b = f"route-a-{_uid()}", f"route-b-{_uid()}"
+    created = adapter_client.post(
+        "/agents",
+        json={
+            "name": f"adapter-two-route-{_uid()}",
+            "channel": {"kind": "slack", "address": channel_a},
+            "approval_routes": {
+                route_a: {
+                    "resolution": {"kind": "slack", "address": channel_a},
+                    "approvers": {"users": [SENDER]},
+                },
+                route_b: {
+                    "resolution": {"kind": "slack", "address": channel_b},
+                    "approvers": {"users": [SENDER]},
+                },
+            },
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    agent_id = str(created.json()["id"])
+    added = adapter_client.post(
+        f"/agents/{agent_id}/channels",
+        json={"kind": "slack", "address": channel_b},
+        headers=auth_headers,
+    )
+    assert added.status_code == 201, added.text
+
+    rows = _channel_bindings(agent_id)
+    binding_by_address = {row["address"]: row["id"] for row in rows}
+    binding_a = binding_by_address[channel_a]
+
+    routed_a = {
+        "agent_id": agent_id,
+        "binding_id": binding_a,
+        "route": route_a,
+        "channel": channel_a,
+    }
+    routed_b = {
+        "agent_id": agent_id,
+        "binding_id": binding_by_address[channel_b],
+        "route": route_b,
+        "channel": channel_b,
+    }
+    approval_a = _approval(adapter_client, auth_headers, routed_a)
+    approval_b = _approval(adapter_client, auth_headers, routed_b)
+    token = _adapter_token([binding_a])
+
+    listed = adapter_client.get("/approvals", headers=_adp(token))
+    assert listed.status_code == 200, listed.text
+    assert {row["id"] for row in listed.json()} == {approval_a["id"]}
+
+    refused = adapter_client.post(
+        f"/approvals/{approval_b['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_adp(token, SENDER),
+    )
+    assert refused.status_code == 404, refused.text
+    assert refused.json()["detail"] == NOT_FOUND
+    assert _status(adapter_client, auth_headers, approval_b["id"]) == "pending"
+    assert _audit(adapter_client, auth_headers, approval_b["id"]) == []
+
+    allowed = adapter_client.post(
+        f"/approvals/{approval_a['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_adp(token, SENDER),
+    )
+    assert allowed.status_code == 200, allowed.text
+
+
+# --- 9. rotate with an ambiguous credential ------------------------------------
+
+
+def test_rotate_refuses_adapter_token_plus_platform_key(
+    adapter_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Grok finding 4: rotate is documented as the adapter credential ALONE;
+    presenting the platform key alongside a live adp token must fail closed,
+    the same as every other resolver-credential pair, not silently succeed."""
+
+    served = _routed_agent(adapter_client, auth_headers, approvers={"users": [SENDER]})
+    token = _adapter_token([served["binding_id"]])
+
+    both = adapter_client.post(
+        "/approvals/principals/adapter/rotate",
+        json={},
+        headers={**auth_headers, **_adp(token)},
+    )
+    assert both.status_code == 401, both.text
+
+
+# --- 10. actor header normalization --------------------------------------------
+
+
+def test_resolve_strips_whitespace_around_a_listed_actor(
+    adapter_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Grok finding 5: the actor header is compared to the explicit user list
+    after stripping, and the audit row records the stripped value, not the
+    raw header with its surrounding whitespace."""
+
+    served = _routed_agent(adapter_client, auth_headers, approvers={"users": [SENDER]})
+    approval = _approval(adapter_client, auth_headers, served)
+    token = _adapter_token([served["binding_id"]])
+
+    accepted = adapter_client.post(
+        f"/approvals/{approval['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_adp(token, f"  {SENDER}  "),
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["resolved_by"] == SENDER
+
+    audit = _audit(adapter_client, auth_headers, approval["id"])
+    assert audit[-1]["actor"] == SENDER
+
+
+# --- 11. hand-signed cross-prefix / malformed claim rejection ------------------
+
+
+def test_verify_refuses_other_prefixes_and_malformed_claims() -> None:
+    """Grok finding 7: cross-verify the four prefixes both directions, plus
+    extra-key and unsorted-bindings shapes that a loosened check might admit."""
+
+    key = "unit-signing-key"
+    binding = str(uuid.uuid4())
+    binding2 = str(uuid.uuid4())
+    now = int(time.time())
+
+    # A chn-shaped and an sbx-shaped token never verify as adapter.
+    chn_token = channel_token.mint(
+        key,
+        channel_id=binding,
+        generation=1,
+        scope=channel_token.CHANNEL_ENQUEUE_SCOPE,
+        exp=now + 60,
+    )
+    assert adapter_principal.verify(chn_token, key, scope="approvals:read", now=now) is None
+    sbx_token = sandbox_token.mint(key, agent="a", scope="state", exp=now + 60)
+    assert adapter_principal.verify(sbx_token, key, scope="approvals:read", now=now) is None
+
+    # An hmac-approval-principal ("apr") shaped token never verifies as adapter.
+    apr_payload = json.dumps(
+        {"sub": "op", "kind": "operator", "exp": now + 60}, separators=(",", ":"), sort_keys=True
+    ).encode()
+    apr_signing_input = f"apr.{_b64url(apr_payload)}"
+    apr_token = f"{apr_signing_input}.{_signature(key, apr_signing_input)}"
+    assert adapter_principal.verify(apr_token, key, scope="approvals:read", now=now) is None
+
+    # An adp token is never accepted where an approval-principal is expected.
+    adp_token = adapter_principal.mint(key, subject="a", bindings=[binding], exp=now + 60)
+    assert (
+        approval_principal.verify_claims(adp_token, key, scope=approval_principal.APPROVE_SCOPE)
+        is None
+    )
+
+    # Extra claim key.
+    with_extra = json.dumps(
+        {
+            "sub": "a",
+            "kind": "adapter",
+            "bindings": [binding],
+            "scopes": list(adapter_principal.SCOPES),
+            "exp": now + 60,
+            "extra": "nope",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    signing_input = f"adp.{_b64url(with_extra)}"
+    extra_token = f"{signing_input}.{_signature(key, signing_input)}"
+    assert adapter_principal.verify(extra_token, key, scope="approvals:read", now=now) is None
+
+    # Unsorted bindings list.
+    unsorted = sorted([binding, binding2], reverse=True)
+    assert unsorted[0] != sorted(unsorted)[0] or unsorted != sorted(unsorted)
+    with_unsorted = json.dumps(
+        {
+            "sub": "a",
+            "kind": "adapter",
+            "bindings": unsorted,
+            "scopes": list(adapter_principal.SCOPES),
+            "exp": now + 60,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    signing_input = f"adp.{_b64url(with_unsorted)}"
+    unsorted_token = f"{signing_input}.{_signature(key, signing_input)}"
+    assert adapter_principal.verify(unsorted_token, key, scope="approvals:read", now=now) is None
+
+
+def test_adapter_token_on_approval_principal_header_is_401(
+    adapter_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Grok finding 7: an adp token presented as `X-Curie-Approval-Principal`
+    (the wrong header) must never verify; it should be refused as an
+    unauthenticated/invalid principal, not silently treated as some kind."""
+
+    served = _routed_agent(adapter_client, auth_headers, approvers={"users": [SENDER]})
+    approval = _approval(adapter_client, auth_headers, served)
+    token = _adapter_token([served["binding_id"]])
+
+    response = adapter_client.post(
+        f"/approvals/{approval['id']}/resolve",
+        json={"decision": "approved"},
+        headers={"X-Curie-Approval-Principal": token},
+    )
+    assert response.status_code == 401, response.text
+    assert _status(adapter_client, auth_headers, approval["id"]) == "pending"
+
+
+# --- 12. HTTP-issued and rotated tokens drive the real behaviors --------------
+
+
+def test_http_issued_and_rotated_tokens_drive_mint_resolve_and_audit(
+    adapter_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Grok finding 6: chn-mint, resolve, and audit driven by the token that
+    came back from POST /approvals/principals/adapter and from rotate, not an
+    in-process `mint()` call."""
+
+    address = f"httpissued-{_uid()}@example.test"
+    _agent, binding = _email_agent(adapter_client, auth_headers, address)
+    issued = adapter_client.post(
+        "/approvals/principals/adapter",
+        json={"subject": ADAPTER_SUBJECT, "binding_ids": [binding]},
+        headers=auth_headers,
+    )
+    assert issued.status_code == 201, issued.text
+    issued_token = issued.json()["token"]
+
+    mint = adapter_client.post(
+        "/channels/token",
+        json={"kind": "email", "address": address, "ttl_s": 3600},
+        headers=_adp(issued_token),
+    )
+    assert mint.status_code == 200, mint.text
+    assert mint.json()["token"].startswith("chn.")
+
+    served = _routed_agent(adapter_client, auth_headers, approvers={"users": [SENDER]})
+    issued2 = adapter_client.post(
+        "/approvals/principals/adapter",
+        json={"subject": ADAPTER_SUBJECT, "binding_ids": [served["binding_id"]]},
+        headers=auth_headers,
+    )
+    assert issued2.status_code == 201, issued2.text
+    approval = _approval(adapter_client, auth_headers, served)
+
+    rotated = adapter_client.post(
+        "/approvals/principals/adapter/rotate",
+        json={"ttl_s": 3600},
+        headers=_adp(issued2.json()["token"]),
+    )
+    assert rotated.status_code == 201, rotated.text
+    rotated_token = rotated.json()["token"]
+
+    resolved = adapter_client.post(
+        f"/approvals/{approval['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_adp(rotated_token, SENDER),
+    )
+    assert resolved.status_code == 200, resolved.text
+
+    audit = _audit(adapter_client, auth_headers, approval["id"])
+    assert audit[-1]["principal_kind"] == "adapter"
+    assert audit[-1]["actor"] == SENDER
+    assert audit[-1]["principal_subject"] == ADAPTER_SUBJECT
+
+
+# --- 13. adapter + other resolver credential pairs -----------------------------
+
+
+def test_resolve_refuses_adapter_plus_operator_and_adapter_plus_console(
+    adapter_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Grok finding 9: adp plus an `apr` operator header, and adp plus a
+    console session cookie, must both fail closed as ambiguous, with no
+    state change -- not just the operator+cookie pair already covered."""
+
+    served = _routed_agent(adapter_client, auth_headers, approvers={"users": [SENDER]})
+    approval = _approval(adapter_client, auth_headers, served)
+    token = _adapter_token([served["binding_id"]])
+
+    operator_issue = adapter_client.post(
+        "/approvals/principals/operator",
+        json={"subject": SENDER},
+        headers=auth_headers,
+    )
+    assert operator_issue.status_code == 201, operator_issue.text
+    operator_token = operator_issue.json()["token"]
+
+    with_operator = adapter_client.post(
+        f"/approvals/{approval['id']}/resolve",
+        json={"decision": "approved"},
+        headers={
+            **_adp(token, SENDER),
+            "X-Curie-Approval-Principal": operator_token,
+        },
+    )
+    assert with_operator.status_code == 401, with_operator.text
+    assert "ambiguous" in with_operator.json()["detail"].lower()
+
+    with_cookie = adapter_client.post(
+        f"/approvals/{approval['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_adp(token, SENDER),
+        cookies={"curie_console_session": "whatever-session-token"},
+    )
+    assert with_cookie.status_code == 401, with_cookie.text
+    assert "ambiguous" in with_cookie.json()["detail"].lower()
+
+    assert _status(adapter_client, auth_headers, approval["id"]) == "pending"
+    assert _audit(adapter_client, auth_headers, approval["id"]) == []
