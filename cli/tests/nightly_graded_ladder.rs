@@ -1872,37 +1872,145 @@ fn live_cluster_rung_emits_the_graded_reply_for_passing_cases() {
 }
 
 #[test]
-fn cluster_rung_repeats_eval_then_messages_inside_claim_timeout() {
-    let text = ladder();
+fn cluster_rung_proves_the_post_eval_claim_without_cutting_the_reply_budget() {
+    let cluster = ladder_function("rung_cluster");
     assert!(
-        text.contains("#1534 repeated cluster eval then message still claims"),
+        cluster.contains("#1534 repeated cluster eval then message still claims"),
         "the cluster rung must run repeated eval suites then a message so \
          retained eval sandboxes cannot exhaust the default ResourceQuota; \
-         ladder contents:\n{text}"
+         rung contents:\n{cluster}"
     );
     assert!(
-        text.contains(r#"timeout 45 "$BIN" "${retention_args[@]}""#),
-        "the post-eval message must be bounded well inside the 90s claim \
-         timeout; a hang until ClaimTimeoutError is the #1534 failure; \
-         ladder contents:\n{text}"
+        cluster.contains(
+            r#"retention_thread="$(python3 -c 'import time; now = time.time_ns(); print(f"{now // 1_000_000_000}.{(now // 1_000) % 1_000_000:06d}")')""#,
+        ),
+        "the post-eval turn needs a unique timestamp-shaped explicit thread so \
+         its worker claim log cannot be borrowed from an earlier turn; rung \
+         contents:\n{cluster}"
     );
     assert!(
-        text.contains(r#"assert_finalized_reply "cluster" "$retention_out""#),
-        "the post-eval message must still finalize a reply, proving a normal \
-         turn can claim after repeated evals; ladder contents:\n{text}"
+        cluster.contains(r#"retention_args+=(--thread "$retention_thread" --timeout-secs 300)"#),
+        "the post-eval message must carry its unique thread and retain the CLI's \
+         normal 300 second reply budget; rung contents:\n{cluster}"
     );
-    let finalized_assertion = text
+    assert!(
+        !cluster.contains(r#"timeout 45 "$BIN" "${retention_args[@]}""#),
+        "a 45 second process timeout conflates claim capacity with model latency; \
+         rung contents:\n{cluster}"
+    );
+    let message_finished = cluster
+        .find(r#"retention_out="$("$BIN" "${retention_args[@]}")"#)
+        .expect("the post-eval message must finish under its normal reply budget");
+    let claim_proof = cluster
+        .find(r#"assert_retention_claim "$retention_log" "slack:$retention_channel:$retention_thread" "$retention_launch_epoch""#)
+        .expect("the completed message must be tied to its own bounded worker claim");
+    let finalized_assertion = cluster
         .find(r#"if ! assert_finalized_reply "cluster" "$retention_out"; then"#)
-        .expect("the bounded post-eval message must validate its captured reply");
-    let timeout_rejection = text
-        .find(r#"if [[ "$retention_rc" -eq 124 ]]; then"#)
-        .expect("the bounded post-eval message must still diagnose a real timeout");
+        .expect("the post-eval message must still validate its finalized reply");
     assert!(
-        finalized_assertion < timeout_rejection,
-        "a response that finalized at the timeout boundary must be accepted from \
-         its captured JSON before exit 124 is diagnosed; otherwise the ladder can \
-         reject the exact successful outcome it exists to prove; ladder contents:\n{text}"
+        message_finished < claim_proof && claim_proof < finalized_assertion,
+        "the posthoc claim proof must judge the completed turn before its reply is \
+         accepted; otherwise a slow model or an unrelated worker line can hide a \
+         failed claim; rung contents:\n{cluster}"
     );
+}
+
+#[test]
+fn cluster_context_precedes_message_in_the_real_cli_grammar() {
+    let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args([
+            "--json",
+            "cluster",
+            "--context",
+            "ctx",
+            "message",
+            "retention",
+            "--help",
+        ])
+        .output()
+        .expect("run cluster message help through the compiled CLI");
+    let help = transcript(&output);
+    assert!(
+        output.status.success(),
+        "a cluster scoped context must parse before message: {help}"
+    );
+    assert!(
+        help.contains("Drive the deployed Kubernetes release end to end"),
+        "the parsed command must reach cluster message help: {help}"
+    );
+}
+
+fn run_retention_claim_assertion(log: &str) -> Output {
+    let harness = tempfile::tempdir().expect("create retention claim harness directory");
+    let log_file = harness.path().join("worker.log");
+    fs::write(&log_file, log).expect("write timestamped worker log fixture");
+    let helper = ladder_function("assert_retention_claim");
+    let script = format!(
+        "set -euo pipefail\n{helper}\nassert_retention_claim {} {} 1735689600\n",
+        sh_single_quote(&log_file),
+        sh_single_quote(Path::new("slack:C0LOCALDEV:1735689600.000001")),
+    );
+    Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("run retention claim assertion")
+}
+
+#[test]
+fn retention_claim_assertion_accepts_only_the_exact_timely_worker_claim() {
+    let expected_thread = "slack:C0LOCALDEV:1735689600.000001";
+    let timely = run_retention_claim_assertion(
+        r#"2025-01-01T00:00:44Z {"logger":"curie_worker.kernel","message":"claim latency for slack:C0LOCALDEV:1735689600.000001: 44 ms","timestamp":"2025-01-01T00:00:44+00:00"}
+"#,
+    );
+    let timely_transcript = transcript(&timely);
+    assert!(
+        timely.status.success(),
+        "a claim inside the first 45 seconds must pass even when reply timing is \
+         outside this helper's proof: {timely_transcript}"
+    );
+
+    for (case, log) in [
+        (
+            "missing",
+            r#"2025-01-01T00:00:44Z {"logger":"curie_worker.kernel","message":"worker completed another operation","timestamp":"2025-01-01T00:00:44+00:00"}
+"#,
+        ),
+        (
+            "unrelated",
+            r#"2025-01-01T00:00:44Z {"logger":"curie_worker.kernel","message":"claim latency for slack:C0LOCALDEV:1735689600.000002: 1 ms","timestamp":"2025-01-01T00:00:44+00:00"}
+"#,
+        ),
+        (
+            "wrong logger",
+            r#"2025-01-01T00:00:44Z {"logger":"other","message":"claim latency for slack:C0LOCALDEV:1735689600.000001: 1 ms","timestamp":"2025-01-01T00:00:44+00:00"}
+"#,
+        ),
+        (
+            "late",
+            r#"2025-01-01T00:00:46Z {"logger":"curie_worker.kernel","message":"claim latency for slack:C0LOCALDEV:1735689600.000001: 1 ms","timestamp":"2025-01-01T00:00:46+00:00"}
+"#,
+        ),
+        (
+            "overlong",
+            r#"2025-01-01T00:00:44Z {"logger":"curie_worker.kernel","message":"claim latency for slack:C0LOCALDEV:1735689600.000001: 45000 ms","timestamp":"2025-01-01T00:00:44+00:00"}
+"#,
+        ),
+    ] {
+        let output = run_retention_claim_assertion(log);
+        let output_transcript = transcript(&output);
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "a {case} worker claim must not prove post-eval capacity: {output_transcript}"
+        );
+        assert!(
+            output_transcript.contains(expected_thread),
+            "the {case} rejection must name the exact missing or invalid claim \
+             key: {output_transcript}"
+        );
+    }
 }
 
 // --- Assertion group 6: the EXECUTING parity controls -----------------------
@@ -1992,6 +2100,9 @@ for arg in "$@"; do bundle_dir="$arg"; done
 name=""
 namespace=""
 release=""
+context=""
+channel=""
+thread_key=""
 observability_start=""
 observability_end=""
 prev=""
@@ -1999,6 +2110,9 @@ for arg in "$@"; do
     if [ "$prev" = "--name" ]; then name="$arg"; fi
     if [ "$prev" = "--namespace" ]; then namespace="$arg"; fi
     if [ "$prev" = "--release" ]; then release="$arg"; fi
+    if [ "$prev" = "--context" ]; then context="$arg"; fi
+    if [ "$prev" = "--channel" ]; then channel="$arg"; fi
+    if [ "$prev" = "--thread" ]; then thread_key="$arg"; fi
     if [ "$prev" = "--start" ]; then observability_start="$arg"; fi
     if [ "$prev" = "--end" ]; then observability_end="$arg"; fi
     prev="$arg"
@@ -2013,6 +2127,34 @@ require_expected_ns_rel() {
     if [ -z "$namespace" ] || [ -z "$release" ] \
         || [ "$namespace" != "$expect_ns" ] || [ "$release" != "$expect_rel" ]; then
         echo "unexpected curie invocation: $*" >&2
+        exit 97
+    fi
+}
+
+require_retention_context() {
+    expect_context="${STUB_EXPECT_CONTEXT:-stub-context}"
+    if [ "$context" != "$expect_context" ]; then
+        echo "unexpected retention context: $context" >&2
+        exit 97
+    fi
+}
+
+require_parent_retention_context() {
+    expect_context="${STUB_EXPECT_CONTEXT:-stub-context}"
+    case "$*" in
+        "--json cluster --context $expect_context message "*)
+            ;;
+        *)
+            echo "retention context must be scoped to cluster before message: $*" >&2
+            exit 97
+            ;;
+    esac
+}
+
+require_retention_channel() {
+    expect_channel="${STUB_EXPECT_CHANNEL:-C0LOCALDEV}"
+    if [ "$channel" != "$expect_channel" ]; then
+        echo "unexpected retention channel: $channel" >&2
         exit 97
     fi
 }
@@ -2251,12 +2393,28 @@ print(json.dumps({
         printf '%s' "$bundle_dir" > "$STUB_STATE/last_plugin_dir"
         emit_deploy "${STUB_CLUSTER_SHA256:-$(sha_of_bundle "$bundle_dir")}"
         ;;
+    "--json cluster --context ${STUB_EXPECT_CONTEXT:-stub-context} surfaces $STUB_AGENT_ID --namespace "*)
+        require_expected_ns_rel "$@"
+        require_retention_context
+        printf '{"agent":"%s","surfaces":[{"kind":"slack","address":"%s"}],"changed":false}\n' \
+            "$STUB_AGENT_ID" "${STUB_EXPECT_CHANNEL:-C0LOCALDEV}"
+        ;;
     "--json local message "*)
         printf '%s\n' '{"finalized":true,"reply":"stub local weather reply"}'
         ;;
-    "--json cluster message "*)
+    "--json cluster --context ${STUB_EXPECT_CONTEXT:-stub-context} message "*|"--json cluster message "*)
         require_expected_ns_rel "$@"
+        if [ -n "$thread_key" ]; then
+            require_parent_retention_context "$@"
+            require_retention_context
+            require_retention_channel
+            printf '%s' "$thread_key" > "$STUB_STATE/retention-thread"
+            printf '%s' "$channel" > "$STUB_STATE/retention-channel"
+        fi
         printf '%s\n' '{"finalized":true,"reply":"stub cluster weather reply"}'
+        if [ -n "$thread_key" ] && [ "${STUB_RETENTION_MESSAGE_EXIT:-0}" != "0" ]; then
+            exit "$STUB_RETENTION_MESSAGE_EXIT"
+        fi
         ;;
     "--json local observability runs --limit 100")
         printf '{"limit":100,"count":1,"runs":[{"id":"%s","name":"curie-run","timestamp":"2026-08-22T12:34:56Z"}]}\n' \
@@ -2437,6 +2595,51 @@ set -u
 if [ -n "${STUB_KUBECTL_INVOCATION_LOG:-}" ]; then
     printf '%s\n' "$*" >> "$STUB_KUBECTL_INVOCATION_LOG"
 fi
+case "$*" in
+    "config current-context")
+        printf '%s\n' 'stub-context'
+        exit 0
+        ;;
+    *" logs "*)
+        case "${STUB_RETENTION_CLAIM_MODE:-exact}" in
+            missing)
+                exit 0
+                ;;
+            exact|unrelated|late|overlong)
+                ;;
+            *)
+                printf 'unknown retention claim mode: %s\n' "${STUB_RETENTION_CLAIM_MODE}" >&2
+                exit 97
+                ;;
+        esac
+        if [ ! -s "$STUB_STATE/retention-thread" ] || [ ! -s "$STUB_STATE/retention-channel" ]; then
+            echo 'retention logs requested without an explicit cluster message channel and thread' >&2
+            exit 97
+        fi
+        thread_key="$(cat "$STUB_STATE/retention-thread")"
+        channel="$(cat "$STUB_STATE/retention-channel")"
+        if [ "${STUB_RETENTION_CLAIM_MODE:-exact}" = "unrelated" ]; then
+            thread_key='1735689600.000002'
+        fi
+        python3 - "$channel" "$thread_key" "${STUB_RETENTION_CLAIM_MODE:-exact}" <<'PYRETENTION'
+import datetime, json, sys
+
+channel, thread_key, mode = sys.argv[1:4]
+claimed = datetime.datetime.now(datetime.timezone.utc)
+if mode == "late":
+    claimed += datetime.timedelta(seconds=46)
+duration_ms = 45000 if mode == "overlong" else 1
+record = {
+    "logger": "curie_worker.kernel",
+    "message": "claim latency for slack:%s:%s: %s ms" % (channel, thread_key, duration_ms),
+    "timestamp": claimed.isoformat(),
+}
+prefix = claimed.isoformat(timespec="microseconds").replace("+00:00", "Z")
+print(prefix, json.dumps(record, separators=(",", ":")))
+PYRETENTION
+        exit 0
+        ;;
+esac
 expect_ns="${STUB_EXPECT_NAMESPACE:-curie}"
 expect_rel="${STUB_EXPECT_RELEASE:-curie}"
 case "$expect_rel" in
@@ -2625,7 +2828,9 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
         .env_remove("STUB_UNAVAILABLE_MARKER")
         .env_remove("STUB_LOCAL_DEPLOY_REFUSAL")
         .env_remove("STUB_UNKNOWN_TRACE_EXIT")
-        .env_remove("STUB_UNKNOWN_TRACE_NO_FIX");
+        .env_remove("STUB_UNKNOWN_TRACE_NO_FIX")
+        .env_remove("STUB_RETENTION_CLAIM_MODE")
+        .env_remove("STUB_RETENTION_MESSAGE_EXIT");
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -2677,6 +2882,172 @@ capture_local_deploy {}
         Some(2),
         "capture must return the deploy refusal status unchanged; \
          stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+fn run_approval_seed_route_harness(
+    harness: &Path,
+    api_url: &str,
+    route_map: &Path,
+    refuse_route_mutation: bool,
+) -> Output {
+    let helper = ladder_function("configure_deterministic_approval_seed_route");
+    let curie = harness.join("approval-seed-curie");
+    write_executable(
+        &curie,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+route_file=""
+previous=""
+for argument in "$@"; do
+    if [ "$previous" = "--routes-from" ]; then
+        route_file="$argument"
+        break
+    fi
+    previous="$argument"
+done
+if [ -n "$route_file" ]; then
+    cp "$route_file" "$STUB_ROUTE_MAP"
+    if [ "${STUB_REFUSE_ROUTE_MUTATION:-0}" = "1" ]; then
+        printf '%s\n' '{"error":"seed route mutation rejected","fix":"keep the existing route map"}'
+        exit 22
+    fi
+    printf '%s\n' '{"routes":"updated"}'
+    exit 0
+fi
+
+printf 'unexpected approval seed command: %s\n' "$*" >&2
+exit 97
+"#,
+    );
+
+    let script = [
+        "set -euo pipefail\n".to_owned(),
+        format!("BIN={}\n", sh_single_quote(&curie)),
+        format!("WORKDIR={}\n", sh_single_quote(harness)),
+        helper,
+        format!("configure_deterministic_approval_seed_route local {AGENT_ID} C0EXAMPLE1\n"),
+    ]
+    .concat();
+    Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("CURIE_API_URL", api_url)
+        .env("CURIE_API_KEY", "curie-dev-key")
+        .env("STUB_ROUTE_MAP", route_map)
+        .env(
+            "STUB_REFUSE_ROUTE_MUTATION",
+            if refuse_route_mutation { "1" } else { "0" },
+        )
+        .output()
+        .expect("run approval seed route harness")
+}
+
+#[test]
+fn approval_seed_keeps_every_representable_route_and_reprints_a_refused_route_write() {
+    let harness = tempfile::tempdir().expect("create approval seed route harness directory");
+    let retained_routes = serde_json::json!({
+        "sre-approvals": {
+            "resolution": {"kind": "slack", "address": "C0SREBOT"},
+            "approvers": {"users": ["U0EXAMPLE2"]}
+        },
+        "existing-approvals": {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+            "approvers": {"group": "S0EXAMPLE1"}
+        }
+    });
+    let agents = serde_json::json!([{
+        "id": AGENT_ID,
+        "name": "sre-bot",
+        "approval_routes": retained_routes,
+    }]);
+    let api_url = spawn_deployments_stub(&agents.to_string());
+    let route_map = harness.path().join("approval-seed-routes.json");
+
+    let applied = run_approval_seed_route_harness(harness.path(), &api_url, &route_map, false);
+    let applied_transcript = transcript(&applied);
+    assert!(
+        applied.status.success(),
+        "the approval seed must add e2e without dropping existing policy: {applied_transcript}"
+    );
+    let written: serde_json::Value = serde_json::from_slice(
+        &fs::read(&route_map).expect("the seed route write must receive a full route map"),
+    )
+    .expect("the seed route map must be JSON");
+    assert_eq!(
+        written["sre-approvals"],
+        serde_json::json!({
+            "resolution": {"kind": "slack", "address": "C0SREBOT"},
+            "approvers": {"users": ["U0EXAMPLE2"]}
+        }),
+        "the live sre-bot restriction must survive the deterministic e2e seed"
+    );
+    assert_eq!(
+        written["existing-approvals"],
+        serde_json::json!({
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE2"},
+            "approvers": {"group": "S0EXAMPLE1"}
+        }),
+        "an unrelated route and its approver restriction must survive the seed"
+    );
+    assert_eq!(
+        written["e2e"],
+        serde_json::json!({
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "approvers": {"users": ["U0EXAMPLE1"]}
+        }),
+        "the seed must replace only its deterministic e2e route"
+    );
+
+    let refused = run_approval_seed_route_harness(harness.path(), &api_url, &route_map, true);
+    let refused_transcript = transcript(&refused);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "a refused approval route mutation must stop the seed: {refused_transcript}"
+    );
+    assert!(
+        refused_transcript.contains(
+            r#"{"error":"seed route mutation rejected","fix":"keep the existing route map"}"#
+        ),
+        "the seed must reprint the API refusal JSON rather than hiding it: {refused_transcript}"
+    );
+
+    let notification_agents = serde_json::json!([{
+        "id": AGENT_ID,
+        "name": "sre-bot",
+        "approval_routes": {
+            "sre-approvals": {
+                "resolution": {"kind": "slack", "address": "C0SREBOT"},
+                "notification": {"kind": "slack", "address": "C0NOTIFY"},
+                "approvers": {"users": ["U0EXAMPLE2"]}
+            }
+        },
+    }]);
+    let notification_api_url = spawn_deployments_stub(&notification_agents.to_string());
+    let notification_route_map = harness
+        .path()
+        .join("notification-approval-seed-routes.json");
+    let notification_refused = run_approval_seed_route_harness(
+        harness.path(),
+        &notification_api_url,
+        &notification_route_map,
+        false,
+    );
+    let notification_transcript = transcript(&notification_refused);
+    assert_ne!(
+        notification_refused.status.code(),
+        Some(0),
+        "a retained notification route must stop the seed before a lossy write: {notification_transcript}"
+    );
+    assert!(
+        notification_transcript.contains("carry notification targets"),
+        "the refusal must explain why the retained policy cannot be represented: {notification_transcript}"
+    );
+    assert!(
+        !notification_route_map.exists(),
+        "the notification refusal must happen before any approvals route write is attempted"
     );
 }
 
@@ -3854,6 +4225,97 @@ fn cluster_ladder_defaults_to_curie_namespace_and_release() {
         kubectl.contains("-n curie") && kubectl.contains("deployment/curie-worker"),
         "the fake-model probe must read the default worker; kubectl:\n{kubectl}"
     );
+}
+
+#[test]
+fn cluster_ladder_uses_the_bound_channel_and_captured_context_for_retention() {
+    let (output, invocations, kubectl) =
+        run_cluster_target_control(&[("STUB_EXPECT_CHANNEL", "C0BOUND")]);
+    let output_transcript = transcript(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the retention turn must use the deployed agent's sole bound channel: {output_transcript}"
+    );
+    assert!(
+        output_transcript.contains("LADDER PASS"),
+        "a bound nondefault channel must pass the cluster ladder: {output_transcript}"
+    );
+    assert!(
+        invocations.lines().any(|line| {
+            line.starts_with(&format!(
+                "--json cluster --context stub-context surfaces {AGENT_ID} "
+            ))
+                && line.contains("--namespace curie")
+                && line.contains("--release curie")
+        }),
+        "the ladder must query this deployed agent's bound surfaces through the captured context: {invocations}"
+    );
+    assert!(
+        invocations.lines().any(|line| {
+            line.starts_with("--json cluster --context stub-context message ")
+                && line.contains("--channel C0BOUND")
+                && line.contains("--thread ")
+        }),
+        "the post-eval message must use the surfaced channel and captured context: {invocations}"
+    );
+    assert!(
+        !invocations.contains("--channel C0LOCALDEV"),
+        "a deployed nondefault channel must reject the former fixed C0LOCALDEV turn: {invocations}"
+    );
+    assert!(
+        kubectl.contains("--context stub-context") && kubectl.contains(" logs "),
+        "the retention proof must read worker logs through the same captured context: {kubectl}"
+    );
+}
+
+#[test]
+fn cluster_ladder_accepts_a_finalized_retention_reply_despite_its_cli_exit_status() {
+    let (output, _, _) = run_cluster_target_control(&[("STUB_RETENTION_MESSAGE_EXIT", "23")]);
+    let output_transcript = transcript(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a finalized retention reply with its timely claim proved must retain the prior passing outcome: {output_transcript}"
+    );
+    assert!(
+        output_transcript.contains("LADDER PASS"),
+        "the nonzero CLI status must not override the finalized reply contract: {output_transcript}"
+    );
+}
+
+#[test]
+fn cluster_ladder_rejects_missing_or_unrelated_post_eval_worker_claims() {
+    for mode in ["missing", "unrelated"] {
+        let (output, invocations, kubectl) =
+            run_cluster_target_control(&[("STUB_RETENTION_CLAIM_MODE", mode)]);
+        let output_transcript = transcript(&output);
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "a {mode} worker claim must fail the cluster ladder: {output_transcript}"
+        );
+        assert!(
+            !output_transcript.contains("LADDER PASS"),
+            "the ladder must not announce a pass without this turn's exact claim: {output_transcript}"
+        );
+        assert!(
+            output_transcript.contains("expected one exact worker claim for slack:C0LOCALDEV:"),
+            "the {mode} rejection must name the missing exact worker claim: {output_transcript}"
+        );
+        assert!(
+            invocations.lines().any(|line| {
+                line.starts_with("--json cluster --context stub-context message ")
+                    && line.contains("--thread ")
+                    && line.contains("--timeout-secs 300")
+            }),
+            "the negative must drive the real post-eval message caller: {invocations}"
+        );
+        assert!(
+            kubectl.contains(" logs ") && kubectl.contains("--timestamps"),
+            "the negative must reach the timestamped worker log proof: {kubectl}"
+        );
+    }
 }
 
 /// POSITIVE CONTROL. A task-named namespace and nondefault release must be

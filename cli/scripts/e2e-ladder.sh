@@ -373,6 +373,8 @@ WORKDIR="$(mktemp -d)"
 LOCAL_PRODUCT_EVIDENCE="$WORKDIR/product-observability-local.json"
 CLUSTER_PRODUCT_EVIDENCE="$WORKDIR/product-observability-cluster.json"
 APPROVAL_SEED_MESSAGE_PID=""
+APPROVAL_SEED_AGENT_ID=""
+APPROVAL_SEED_CHANNEL=""
 
 stop_approval_seed_message() {
     local mode="${1:-wait}" pid code=0
@@ -395,6 +397,10 @@ cleanup() {
     # before stack teardown so an interrupted seed cannot retain the stub port
     # after this run exits.
     stop_approval_seed_message terminate || true
+    if ! cleanup_approval_seed_fixture; then
+        echo "error: could not remove owned approval seed agent" >&2
+        [[ "$code" -ne 0 ]] || code=1
+    fi
     # The compose worker spawns runner containers as SIBLINGS on the host daemon
     # via the mounted docker socket, so a rung that died before `local down` can
     # strand them. This raw sweep is a BACKSTOP, not duplication: `local down`
@@ -1373,6 +1379,134 @@ print(d.get("reply", "") if isinstance(d, dict) else "")
     printf '%s' "$trace_id"
 }
 
+configure_deterministic_approval_seed_route() {
+    local tier="$1" agent_id="$2" channel="$3" routes_file status
+    routes_file="$(mktemp "$WORKDIR/approval-routes.XXXXXX")" || return 1
+    if ! python3 - "$agent_id" "${CURIE_API_URL:-http://localhost:28000}" "$routes_file" "$channel" <<'PYROUTES'
+import json, os, sys, urllib.error, urllib.request
+from pathlib import Path
+
+agent_id, api_base, routes_path, channel = sys.argv[1:5]
+request = urllib.request.Request(
+    api_base.rstrip("/") + "/agents",
+    headers={"Accept": "application/json", "X-API-Key": os.environ.get("CURIE_API_KEY") or "curie-dev-key"},
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        agents = json.load(response)
+except urllib.error.HTTPError as exc:
+    raise SystemExit("GET /agents failed with HTTP %s: %s" % (exc.code, exc.read().decode(errors="replace")))
+except urllib.error.URLError as exc:
+    raise SystemExit("GET /agents failed: %s" % exc.reason)
+if not isinstance(agents, list) or any(not isinstance(agent, dict) for agent in agents):
+    raise SystemExit("GET /agents returned an unexpected response")
+matches = [agent for agent in agents if agent.get("id") == agent_id or agent.get("name") == agent_id]
+if len(matches) != 1:
+    raise SystemExit("expected exactly one deployed agent matching %s" % agent_id)
+existing = matches[0].get("approval_routes") or dict()
+if not isinstance(existing, dict):
+    raise SystemExit("agent %s returned malformed approval_routes" % agent_id)
+with_notification = sorted(
+    name for name, binding in existing.items()
+    if name != "e2e" and isinstance(binding, dict) and binding.get("notification") is not None
+)
+if with_notification:
+    raise SystemExit(
+        "refusing to configure deterministic approval route: existing route(s) %s carry "
+        "notification targets whose hidden transport the API response does not expose; "
+        "a full route map write cannot preserve them" % ", ".join(with_notification)
+    )
+merged = dict(existing)
+merged["e2e"] = dict(
+    resolution=dict(kind="slack", address=channel),
+    approvers=dict(users=["U0EXAMPLE1"]),
+)
+Path(routes_path).write_text(json.dumps(merged, separators=(",", ":")) + "\n")
+PYROUTES
+    then
+        rm -f "$routes_file"
+        return 1
+    fi
+    if "$BIN" --json "$tier" approvals "$agent_id" --routes-from "$routes_file"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -f "$routes_file"
+    return "$status"
+}
+
+cleanup_approval_seed_fixture() {
+    [[ -n "${APPROVAL_SEED_AGENT_ID:-}" ]] || return 0
+    "$BIN" --json local kill "$APPROVAL_SEED_AGENT_ID" --yes || return 1
+    "$BIN" --json local delete "$APPROVAL_SEED_AGENT_ID" --yes || return 1
+    APPROVAL_SEED_AGENT_ID=""
+    APPROVAL_SEED_CHANNEL=""
+}
+
+prepare_approval_seed_fixture() {
+    local tier="$1" fixture_dir="$WORKDIR/approval-seed-bundle"
+    local fixture_name="approval-seed-$$-$RANDOM"
+    if [[ -n "${APPROVAL_SEED_AGENT_ID:-}" ]]; then
+        echo "seed-invalid: an approval seed fixture is already registered" >&2
+        return 1
+    fi
+    APPROVAL_SEED_CHANNEL="C0E2EAPPROVAL"
+    if ! python3 - "$fixture_dir" "$fixture_name" <<'PYBUNDLE'
+import json, sys
+from pathlib import Path
+
+bundle, name = Path(sys.argv[1]), sys.argv[2]
+(bundle / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+(bundle / "skills" / "approval-seed").mkdir(parents=True, exist_ok=True)
+manifest = dict(
+    name=name,
+    version="0.1.0",
+    description="Deterministic approval resume verification fixture.",
+    systemPrompt="Complete the requested approval verification.",
+    approvalPolicy=dict(gates=[dict(gate="Read", route="e2e", grantableViaPolicy=True)]),
+)
+(bundle / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest) + "\n")
+(bundle / "skills" / "approval-seed" / "SKILL.md").write_text(
+    "---\nname: approval-seed\ndescription: Verify approval suspend and resume.\n"
+    "allowed-tools: Bash\n---\n\nComplete the requested approval verification.\n"
+)
+(bundle / ".mcp.json").write_text('{"mcpServers":{}}\n')
+PYBUNDLE
+    then
+        return 1
+    fi
+    # Register the owned API identity before route configuration or deployment
+    # can fail, so the EXIT cleanup can always remove the transient agent.
+    if ! APPROVAL_SEED_AGENT_ID="$(python3 - "$fixture_name" "$APPROVAL_SEED_CHANNEL" <<'PYAGENT'
+import json, os, sys, urllib.error, urllib.request
+
+name, channel = sys.argv[1:3]
+request = urllib.request.Request(
+    (os.environ.get("CURIE_API_URL") or "http://localhost:28000").rstrip("/") + "/agents",
+    data=json.dumps(dict(name=name, channel=dict(kind="slack", address=channel))).encode(),
+    headers={"Content-Type": "application/json", "X-API-Key": os.environ.get("CURIE_API_KEY") or "curie-dev-key"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        agent = json.load(response)
+except urllib.error.HTTPError as exc:
+    raise SystemExit("POST /agents failed with HTTP %s: %s" % (exc.code, exc.read().decode(errors="replace")))
+except urllib.error.URLError as exc:
+    raise SystemExit("POST /agents failed: %s" % exc.reason)
+agent_id = agent.get("id")
+if not isinstance(agent_id, str) or not agent_id:
+    raise SystemExit("POST /agents omitted the owned fixture id")
+print(agent_id)
+PYAGENT
+    )"; then
+        return 1
+    fi
+    configure_deterministic_approval_seed_route "$tier" "$APPROVAL_SEED_AGENT_ID" "$APPROVAL_SEED_CHANNEL" || return 1
+    "$BIN" --json local deploy --plugin-dir "$fixture_dir"
+}
+
 seed_approval_resume_turn() {
     local tier="$1" agent_id="${2:-}" query_state="${3:-present}" marker="curie-seed-approval-$$-$RANDOM"
     local stream_start stream_end message_file message_stderr_file token_file pending_file approval_id token out trace_id
@@ -1386,6 +1520,11 @@ seed_approval_resume_turn() {
         return 1
     fi
     umask 077
+    if ! prepare_approval_seed_fixture "$tier"; then
+        echo "seed-invalid: could not prepare dedicated approval fixture" >&2
+        return 1
+    fi
+    agent_id="$APPROVAL_SEED_AGENT_ID"
     if ! message_file="$(mktemp "$WORKDIR/approval-message.XXXXXX")"; then
         echo "seed-invalid: could not create private approval message artifact" >&2
         return 1
@@ -1406,13 +1545,6 @@ seed_approval_resume_turn() {
         return 1
     fi
     local scope=()
-    if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
-        --route-resolution e2e=C0EXAMPLE1 --route-approvers e2e=users:U0EXAMPLE1 \
-        >/dev/null; then
-        rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
-        echo "seed-invalid: could not configure deterministic approval route" >&2
-        return 1
-    fi
     if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
         --mint-operator-principal U0EXAMPLE1 > "$token_file"; then
         rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
@@ -1436,7 +1568,7 @@ PY
         rm -f "$message_file" "$message_stderr_file" "$pending_file"
         return 1
     }
-    "$BIN" --json local message --channel C0LOCALDEV --timeout-secs 120 \
+    "$BIN" --json local message --channel "$APPROVAL_SEED_CHANNEL" --timeout-secs 120 \
         "[fake:request-approval:e2e] approve correlation $marker" > "$message_file" 2> "$message_stderr_file" &
     APPROVAL_SEED_MESSAGE_PID=$!
     approval_id=""
@@ -4509,6 +4641,7 @@ rung_local() {
         echo "=== exact approval wait/resolve/resume product-observability seed ==="
         seed_approval_resume_turn local "$agent_id" "$product_query_state"
         [[ "$LAST_APPROVAL_MEMBERSHIP" == "true" ]] || product_membership="false"
+        cleanup_approval_seed_fixture || return 1
     fi
     if [[ "$LIVE" == "1" ]]; then
         echo
@@ -5154,6 +5287,47 @@ validate_cluster_helm_release() {
 
 # Rung 3: the deployed release. Requires one to already exist; it is never
 # installed or torn down here, because the cluster is shared.
+assert_retention_claim() {
+    local logfile="$1" thread_key="$2" launch_epoch="$3"
+    python3 - "$logfile" "$thread_key" "$launch_epoch" <<'PYCLAIM'
+import datetime, json, re, sys
+from pathlib import Path
+
+logfile, thread_key, launch_epoch = sys.argv[1:4]
+launched = float(launch_epoch)
+pattern = re.compile(r"claim latency for " + re.escape(thread_key) + r": ([0-9]+) ms")
+claims = []
+for line in Path(logfile).read_text().splitlines():
+    try:
+        raw_timestamp, raw_record = line.split(" ", 1)
+        record = json.loads(raw_record)
+    except ValueError:
+        continue
+    if not isinstance(record, dict) or record.get("logger") != "curie_worker.kernel":
+        continue
+    message = record.get("message")
+    match = pattern.fullmatch(message) if isinstance(message, str) else None
+    if match is None:
+        continue
+    try:
+        timestamp = datetime.datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            raise ValueError("missing timestamp timezone")
+        claims.append((timestamp.timestamp(), int(match.group(1))))
+    except (ValueError, IndexError) as exc:
+        raise SystemExit("cluster: invalid claim timestamp for %s: %s" % (thread_key, exc))
+if len(claims) != 1:
+    raise SystemExit("cluster: expected one exact worker claim for %s, found %s" % (thread_key, len(claims)))
+claimed, duration_ms = claims[0]
+if not launched <= claimed <= launched + 45 or duration_ms >= 45000:
+    raise SystemExit(
+        "cluster: worker claim for %s missed the 45 second capacity bound "
+        "(completed %.3fs after launch, claim duration %sms)" % (thread_key, claimed - launched, duration_ms)
+    )
+print("cluster: timely worker claim proved for %s (%sms)" % (thread_key, duration_ms))
+PYCLAIM
+}
+
 rung_cluster() {
     if [[ "$PRODUCT_OBSERVABILITY" != "1" ]]; then
         CURIE_NAMESPACE="${CURIE_NAMESPACE-curie}"
@@ -5359,32 +5533,54 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
             echo "cluster: retention eval suite $eval_i reported a failing case. Not failing the rung: this rung's grade is report only (#1603)." >&2
         fi
     done
-    local retention_args=(--json cluster message)
+    local retention_thread retention_context retention_surfaces retention_channel
+    retention_context="$(kubectl config current-context)" || return 1
+    retention_surfaces="$("$BIN" --json cluster --context "$retention_context" surfaces "$agent_id" "${ns_rel[@]}")" || return 1
+    retention_channel="$(python3 -c '
+import json, sys
+surfaces = json.loads(sys.argv[1]).get("surfaces")
+if not isinstance(surfaces, list) or len(surfaces) != 1:
+    raise SystemExit("cluster: retention turn requires exactly one bound surface")
+surface = surfaces[0]
+if not isinstance(surface, dict) or surface.get("kind") != "slack":
+    raise SystemExit("cluster: retention turn requires a Slack surface")
+address = surface.get("address")
+if not isinstance(address, str) or not address or address != address.strip():
+    raise SystemExit("cluster: retention surface has no valid address")
+print(address)
+' "$retention_surfaces")" || return 1
+    retention_thread="$(python3 -c 'import time; now = time.time_ns(); print(f"{now // 1_000_000_000}.{(now // 1_000) % 1_000_000:06d}")')"
+    local retention_args=(--json cluster --context "$retention_context" message)
     retention_args+=("${ns_rel[@]}")
-    retention_args+=("$PROMPT")
+    retention_args+=("$PROMPT" --channel "$retention_channel")
+    retention_args+=(--thread "$retention_thread" --timeout-secs 300)
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
         retention_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
     fi
     echo "=== curie cluster message after repeated eval ==="
-    local retention_out retention_rc
+    local retention_out retention_log retention_launch_epoch retention_since
+    retention_log="$(mktemp "$WORKDIR/retention-worker.XXXXXX")" || return 1
+    retention_launch_epoch="$(python3 -c 'import time; print(time.time())')"
+    retention_since="$(python3 -c 'import datetime,sys; print(datetime.datetime.fromtimestamp(float(sys.argv[1]), datetime.timezone.utc).isoformat().replace("+00:00", "Z"))' "$retention_launch_epoch")"
     set +e
-    retention_out="$(timeout 45 "$BIN" "${retention_args[@]}")"
-    retention_rc=$?
+    retention_out="$("$BIN" "${retention_args[@]}")"
     set -e
     printf '%s\n' "$retention_out"
-    # GNU timeout can return 124 at the same boundary where the CLI has already
-    # emitted its complete finalized JSON but has not quite exited. The reply is
-    # the outcome this check exists to prove, so validate the captured outcome
-    # before diagnosing the process status. A timeout with absent, partial, or
-    # non-finalized JSON still fails here and retains the #1534 diagnosis.
-    if ! assert_finalized_reply "cluster" "$retention_out"; then
-        if [[ "$retention_rc" -eq 124 ]]; then
-            echo "cluster: message after repeated eval timed out at 45s without a finalized reply; eval-owned sandboxes likely still hold the quota (#1534)." >&2
-        fi
+    # Prove capacity from this turn's successful worker claim, independently
+    # of the time its live model needs to produce the finalized reply.
+    if ! kubectl --context "$retention_context" -n "$CURIE_NAMESPACE" logs \
+        -l "app.kubernetes.io/instance=$CURIE_RELEASE,app.kubernetes.io/component=worker" \
+        --timestamps --prefix=false --tail=-1 --since-time="$retention_since" > "$retention_log"; then
+        rm -f "$retention_log"
         return 1
     fi
-    if [[ "$retention_rc" -eq 124 ]]; then
-        echo "cluster: finalized reply was captured at the 45s timeout boundary; accepting the proved outcome."
+    if ! assert_retention_claim "$retention_log" "slack:$retention_channel:$retention_thread" "$retention_launch_epoch"; then
+        rm -f "$retention_log"
+        return 1
+    fi
+    rm -f "$retention_log"
+    if ! assert_finalized_reply "cluster" "$retention_out"; then
+        return 1
     fi
 
     assert_bundle_identity "cluster" "$digest"
