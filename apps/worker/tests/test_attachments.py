@@ -31,6 +31,7 @@ import importlib
 import json
 import sys
 import threading
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -279,6 +280,81 @@ def test_discarding_either_overlapping_set_preserves_the_other_and_its_keys(
     current = coordinator.current(THREAD_KEY)
     assert current is not None
     assert current.object_keys == surviving_set.object_keys
+
+
+class _FailingScanStore(RetainingObjectStore):
+    """The store, plus one transient listing outage of the retention ledger.
+
+    An object store is a network service, so a listing can time out for reasons
+    that have nothing to do with this thread and will be gone on the next call.
+    ``armed`` is flipped off again the moment it fires, so the rest of the test
+    drives the real store: the point is what survives ONE failure, not what a
+    permanently broken store does.
+    """
+
+    def __init__(self, ledger_prefix: str) -> None:
+        super().__init__()
+        self.ledger_prefix = ledger_prefix
+        #: Armed by the test AFTER its setup listings, so the outage lands on
+        #: the discard's own scan and on nothing else.
+        self.armed = False
+
+    def list_keys(self, prefix: str) -> Iterator[str]:
+        if self.armed and prefix == self.ledger_prefix:
+            self.armed = False
+            raise TimeoutError("object listing timed out")
+        yield from super().list_keys(prefix)
+
+
+def test_a_failed_owner_scan_during_discard_leaves_the_bytes_owned_and_reapable(
+    attachments: Any,
+) -> None:
+    """A discard that cannot finish must not drop the durable cleanup obligation.
+
+    ``discard_prepared`` has to consult the remaining owners before it removes
+    any object, because a concurrent resolve on the same generation parks under
+    the same keys. That consultation is a store call and store calls fail. If
+    this resolve's own owner record is already gone when the scan raises, the
+    bytes are left in the bucket named by nothing: ``Kernel._discard_prepared_
+    attachments`` logs the failure and does not retry, and no retention sweep
+    can reach an object no ledger record mentions, so it outlives retention
+    forever. Keeping the record until the work depending on it has succeeded is
+    what makes the failure merely a deferral -- the expiry sweep still owns the
+    bytes and collects them on its own clock, which is exactly what the second
+    half of this test drives.
+    """
+
+    objects = _FailingScanStore(attachments.ATTACHMENT_LEDGER_PREFIX)
+    clock = MovableClock()
+    files = FakeSlackFiles({"F1": [b"still_owned_bytes"]})
+    coordinator, _store = _coordinator(
+        attachments,
+        files,
+        objects=objects,
+        bounds=limits(attachments, retention_ttl_seconds=600),
+        clock=clock,
+    )
+    prepared = _resolve(coordinator, [_ref("F1")], generation="abandoned")
+    (owner_key,) = _owner_keys(attachments, objects)
+    objects.armed = True
+
+    with pytest.raises(TimeoutError):
+        coordinator.discard_prepared(thread_key=THREAD_KEY, prepared=prepared)
+
+    assert objects.armed is False, "the discard must have reached the owner scan"
+    assert owner_key in objects.objects, (
+        "the owner record must survive a failed discard, or nothing names the bytes"
+    )
+
+    clock.advance(601)
+    assert coordinator.enumerate_expired() == [THREAD_KEY]
+    candidate = coordinator.begin_expired_reap(THREAD_KEY)
+    assert candidate is not None
+    assert coordinator.finish_expired_reap(candidate) is True
+
+    assert list(objects.list_keys(attachments.ATTACHMENT_OBJECT_PREFIX)) == []
+    assert list(objects.list_keys(attachments.ATTACHMENT_LEDGER_PREFIX)) == []
+    assert coordinator.current(THREAD_KEY) is None
 
 
 def test_the_minted_reference_is_a_short_lived_signed_one_object_capability(
