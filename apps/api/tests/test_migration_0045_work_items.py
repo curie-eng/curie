@@ -13,7 +13,7 @@ from alembic import command
 from alembic.config import Config
 from curie_api.config import get_settings
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
@@ -44,8 +44,15 @@ def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str,
 
 
 def _rejects(statement: str, params: dict[str, Any]) -> None:
-    with pytest.raises(IntegrityError):
+    with pytest.raises(DBAPIError) as excinfo:
         _sql(statement, params)
+    assert getattr(excinfo.value.orig, "sqlstate", None) in {
+        "23502",
+        "23503",
+        "23505",
+        "23514",
+        "P0001",
+    }
 
 
 def _seed_agent() -> uuid.UUID:
@@ -575,7 +582,13 @@ def test_0045_request_identity_active_uniqueness_and_cascade(
     _reject_request(work_item_id, sequence=0)
     _reject_request(work_item_id, sequence=2, version=0)
     _reject_request(work_item_id, sequence=2, status="unknown")
-    _reject_request(work_item_id, sequence=2, status="running")
+    _reject_request(
+        work_item_id,
+        sequence=2,
+        status="running",
+        started_at=STAMP,
+        execution_deadline=STAMP + timedelta(seconds=1800),
+    )
     _reject_request(
         work_item_id,
         id=uuid.uuid4(),
