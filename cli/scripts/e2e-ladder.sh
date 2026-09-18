@@ -4780,21 +4780,46 @@ rung_local_release() {
     if [[ -f "$WORKDIR/bundle-release/evals/trajectory.json" ]]; then
         compose_profile="full"
     fi
+
+    # Resolve the generated artifact with every caller supplied overlay before
+    # either preflight. Enable every profile while rendering so the disabled
+    # dispatcher service remains available to the one shot image derivation.
+    local resolved_release_compose="$WORKDIR/compose.release.resolved.yaml"
+    local release_config_args=(docker compose -p "$COMPOSE_PROJECT" -f "$release_compose")
+    local extra_i
+    for ((extra_i = 1; extra_i < ${#COMPOSE_FILES[@]}; extra_i++)); do
+        release_config_args+=(-f "${COMPOSE_FILES[$extra_i]}")
+    done
+    "${release_config_args[@]}" --profile '*' config > "$resolved_release_compose"
+
     python3 "$REPO_ROOT/compose/release_images.py" \
-        --compose "$release_compose" --profiles "$compose_profile" --check || return 1
+        --compose "$resolved_release_compose" --profiles "$compose_profile" --check || return 1
     # Derive the required GHCR refs from the generated compose plus the
     # images `local message` still needs (dispatcher one-shot, runner env)
     # rather than a hardcoded list that grows one missing image at a time
     # (#2005, #2245).
-    local missing=0 image
+    local missing=0 image helper_status=""
     while IFS= read -r image; do
         [[ -n "$image" ]] || continue
+        if [[ "$image" == __CURIE_ENSURE_RELEASE_IMAGES_STATUS__=* ]]; then
+            helper_status="${image#*=}"
+            continue
+        fi
         if ! docker image inspect "$image" >/dev/null 2>&1; then
             echo "error: image '$image' is required by compose.release.yaml's $compose_profile profile and is not present locally." >&2
             missing=1
         fi
-    done < <(python3 "$REPO_ROOT/compose/ensure_release_images.py" \
-        --compose-file "$release_compose" --profiles "$compose_profile" --list)
+    done < <(
+        set +e
+        python3 "$REPO_ROOT/compose/ensure_release_images.py" \
+            --compose-file "$resolved_release_compose" --profiles "$compose_profile" --list
+        helper_exit=$?
+        printf '__CURIE_ENSURE_RELEASE_IMAGES_STATUS__=%s\n' "$helper_exit"
+    )
+    if [[ "$helper_status" != "0" ]]; then
+        echo "error: could not derive required images from resolved compose config." >&2
+        return 1
+    fi
     if (( missing )); then
         echo "fix: python3 compose/ensure_release_images.py --profiles $compose_profile --build-missing, then re-run." >&2
         return 1
@@ -4822,7 +4847,6 @@ rung_local_release() {
         # actual cold start rather than one that might silently inherit state
         # and mask the exact compose-env-wiring drift (#545) it exists to catch.
         local down_args=(local down --wipe --yes --project "$COMPOSE_PROJECT" -f "$release_compose")
-        local extra_i
         for ((extra_i = 1; extra_i < ${#COMPOSE_FILES[@]}; extra_i++)); do
             down_args+=(-f "${COMPOSE_FILES[$extra_i]}")
         done
