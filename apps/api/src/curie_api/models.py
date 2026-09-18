@@ -420,6 +420,28 @@ class Approval(Base):
     # Set once the resume turn is enqueued onto the runs stream (#411); NULL on a
     # resolved record means the wake is still owed (the reconciler's work-list).
     resumed_at: Mapped[datetime | None] = mapped_column(default=None)
+    # Break-glass recovery (#2753, migration 0045). ``recovery_key`` is the
+    # caller-supplied idempotency key of the administrative operation that last
+    # touched this row; it is UNIQUE where not null, so a replayed request is a
+    # read of the recorded outcome rather than a second act.
+    recovery_key: Mapped[str | None] = mapped_column(default=None)
+    # The resume TOMBSTONE. Non-NULL means an owed wake was administratively
+    # cancelled: every ``resumed_at`` writer skips the row, and the worker
+    # refuses the resume turn at execution even if an entry is already on the
+    # stream. It RETAINS -- no reply-identity column and no audit row is
+    # deleted, because the tombstone has to stay explainable afterwards.
+    resume_cancelled_at: Mapped[datetime | None] = mapped_column(default=None)
+    resume_cancelled_reason: Mapped[str | None] = mapped_column(default=None)
+    resume_cancelled_by: Mapped[str | None] = mapped_column(default=None)
+    # The execution RECORD (#2753). The worker writes it at the execution
+    # boundary under the delivery lease it holds; it excludes nothing, so a
+    # redelivery after a crash re-records and runs. Cancellation refuses any
+    # resume whose ``resume_executing_at`` is set; the lease, owner and
+    # generation columns only feed that refusal's diagnostic.
+    resume_executing_at: Mapped[datetime | None] = mapped_column(default=None)
+    resume_executing_lease_key: Mapped[str | None] = mapped_column(default=None)
+    resume_executing_owner: Mapped[str | None] = mapped_column(default=None)
+    resume_executing_generation: Mapped[int | None] = mapped_column(default=None)
     # Durable gate provenance (#544, Decision C), written by the runner -- the
     # only component that knows which tool ``can_use_tool`` denied. ``gate_kind``
     # is ``'permission'`` when the tool-permission gate denied a real tool call,

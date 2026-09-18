@@ -420,6 +420,50 @@ export const commandManifest = {
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Report installation-wide approval identity FACTS, plus the declaration skeleton to fill in and feed back to the upgrade. A pure read: no agent lookup, no principal, nothing mutated",
+              "id": "report_identity",
+              "long": "report-identity",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Administratively reject this approval under the installation-wide recovery grant (`api.approvalRecovery.enabled`). Requires --reason and --recovery-key; every use is audited",
+              "id": "recover",
+              "long": "recover",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Tombstone this approval's resume turn without resolving the record. Requires --reason and --recovery-key; every use is audited",
+              "id": "cancel_resume",
+              "long": "cancel-resume",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Why this administrative recovery is being performed. Written verbatim to the durable audit row. Required by --recover and --cancel-resume",
+              "id": "reason",
+              "long": "reason",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The caller-chosen idempotency key for --recover/--cancel-resume. Retrying the identical command with the same key is absorbed by the server as one act; the CLI never generates or decorates it",
+              "id": "recovery_key",
+              "long": "recovery-key",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -1865,6 +1909,50 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Report installation-wide approval identity FACTS, plus the declaration skeleton to fill in and feed back to the upgrade. A pure read: no agent lookup, no principal, nothing mutated",
+              "id": "report_identity",
+              "long": "report-identity",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Administratively reject this approval under the installation-wide recovery grant (`api.approvalRecovery.enabled`). Requires --reason and --recovery-key; every use is audited",
+              "id": "recover",
+              "long": "recover",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Tombstone this approval's resume turn without resolving the record. Requires --reason and --recovery-key; every use is audited",
+              "id": "cancel_resume",
+              "long": "cancel-resume",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Why this administrative recovery is being performed. Written verbatim to the durable audit row. Required by --recover and --cancel-resume",
+              "id": "reason",
+              "long": "reason",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The caller-chosen idempotency key for --recover/--cancel-resume. Retrying the identical command with the same key is absorbed by the server as one act; the CLI never generates or decorates it",
+              "id": "recovery_key",
+              "long": "recovery-key",
+              "positional": false,
               "required": false
             }
           ],
@@ -5086,6 +5174,50 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Report installation-wide approval identity FACTS, plus the declaration skeleton to fill in and feed back to the upgrade. A pure read: no agent lookup, no principal, nothing mutated",
+              "id": "report_identity",
+              "long": "report-identity",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Administratively reject this approval under the installation-wide recovery grant (`api.approvalRecovery.enabled`). Requires --reason and --recovery-key; every use is audited",
+              "id": "recover",
+              "long": "recover",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Tombstone this approval's resume turn without resolving the record. Requires --reason and --recovery-key; every use is audited",
+              "id": "cancel_resume",
+              "long": "cancel-resume",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Why this administrative recovery is being performed. Written verbatim to the durable audit row. Required by --recover and --cancel-resume",
+              "id": "reason",
+              "long": "reason",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The caller-chosen idempotency key for --recover/--cancel-resume. Retrying the identical command with the same key is absorbed by the server as one act; the CLI never generates or decorates it",
+              "id": "recovery_key",
+              "long": "recovery-key",
+              "positional": false,
               "required": false
             }
           ],

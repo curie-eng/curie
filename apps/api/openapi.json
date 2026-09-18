@@ -1112,6 +1112,129 @@
         "title": "ApprovalAuditOut",
         "type": "object"
       },
+      "ApprovalIdentityFactsOut": {
+        "description": "Per-row FACTS about one pending approval (#2753).\n\nFacts, never verdicts: nothing here says a row cannot be resolved. A route\nwhose approver set is the card channel's membership is a HEALTHY route that\nany attested chat click resolves, and it is reported like any other row.",
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "card_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Card Channel"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "facts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Facts",
+            "type": "array"
+          },
+          "has_reply_placeholder": {
+            "title": "Has Reply Placeholder",
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "reply_adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Adapter"
+          },
+          "reply_channel": {
+            "title": "Reply Channel",
+            "type": "string"
+          },
+          "reply_kind": {
+            "title": "Reply Kind",
+            "type": "string"
+          },
+          "route": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "status",
+          "route",
+          "reply_kind",
+          "reply_adapter",
+          "reply_channel",
+          "card_channel",
+          "has_reply_placeholder",
+          "created_at",
+          "facts"
+        ],
+        "title": "ApprovalIdentityFactsOut",
+        "type": "object"
+      },
+      "ApprovalIdentityReportOut": {
+        "description": "A pure read an operator runs on a broken installation.\n\nIt makes no Slack call and reads only ``approvals`` and ``agent_channels``,\nso it still answers against a schema old enough that the fence refuses to\nserve it.",
+        "properties": {
+          "approvals": {
+            "items": {
+              "$ref": "#/components/schemas/ApprovalIdentityFactsOut"
+            },
+            "title": "Approvals",
+            "type": "array"
+          },
+          "declarations": {
+            "items": {
+              "$ref": "#/components/schemas/ApprovalReplyIdentityDeclaration"
+            },
+            "title": "Declarations",
+            "type": "array"
+          }
+        },
+        "required": [
+          "approvals",
+          "declarations"
+        ],
+        "title": "ApprovalIdentityReportOut",
+        "type": "object"
+      },
       "ApprovalNotificationTarget": {
         "additionalProperties": false,
         "description": "A visibility-only approval ping target and its server-side transport.\n\nSlack may use the worker's configured default transport. Every other kind\nneeds the full endpoint/adapter pair at write time, so a declared\nnotification cannot persist as a permanently undeliverable best-effort\nbranch.",
@@ -1385,6 +1508,161 @@
         "title": "ApprovalPrincipalOut",
         "type": "object"
       },
+      "ApprovalRecover": {
+        "description": "One administrative settlement of a stranded approval.\n\n``rejected`` is the only disposition there is. There is deliberately no\napprove-on-behalf-of: an administrative path that could grant would let a\nplatform-key holder authorize the action a human was asked about, which is\na different power from settling a record nobody can reach.",
+        "properties": {
+          "disposition": {
+            "const": "rejected",
+            "title": "Disposition",
+            "type": "string"
+          },
+          "reason": {
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "recovery_key": {
+            "minLength": 1,
+            "title": "Recovery Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "recovery_key",
+          "disposition"
+        ],
+        "title": "ApprovalRecover",
+        "type": "object"
+      },
+      "ApprovalRecoveryOut": {
+        "description": "The RECORDED outcome of an administrative settlement.\n\nEvery field is read back off the row, so a replay of the same\n``recovery_key`` renders an identical body rather than a fresh one.",
+        "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "approval_id": {
+            "format": "uuid",
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "recovered_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovered At"
+          },
+          "recovery_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Key"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approval_id",
+          "status",
+          "recovery_key",
+          "reason",
+          "actor",
+          "recovered_at"
+        ],
+        "title": "ApprovalRecoveryOut",
+        "type": "object"
+      },
+      "ApprovalReplyIdentityDeclaration": {
+        "description": "The skeleton the migration workflow consumes.\n\nEverything but the id is the OPERATOR's to fill in. The report never\npre-fills provenance it does not have: a guessed reply kind is precisely the\nsilent misroute the declaration document exists to prevent.",
+        "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "approval_id": {
+            "format": "uuid",
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "reply_adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Adapter"
+          },
+          "reply_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Kind"
+          }
+        },
+        "required": [
+          "approval_id"
+        ],
+        "title": "ApprovalReplyIdentityDeclaration",
+        "type": "object"
+      },
       "ApprovalRequest": {
         "description": "A durable approval request (#244), created by the worker when a run ends\nawaiting-approval.\n\n``dedupe_key`` is the triggering event id, so a redelivered turn adopts the\nexisting record instead of forking a second one. ``route``/``card_channel``\n(#247) record the manifest route the request named and the channel the worker\nrouted the card to after binding resolution; the authorizer proves membership\nagainst ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate\nprovenance (#544, Decision C) written by the runner; both stay optional for\nthe rolling-deploy window.\n\n``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s\nrouting pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress\nselector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:\nan absent kind puts the silent misroute back on the resume path, where it is\nleast observable, and ADR-0096 phase 2 buys the right to reject it with a\nquiescent cutover rather than a rolling-deploy window. ``reply_adapter`` is\nnullable because ``slack`` legitimately has no adapter -- its route is the\nworker's configured Slack origin.",
         "properties": {
@@ -1580,6 +1858,96 @@
           "decision"
         ],
         "title": "ApprovalResolve",
+        "type": "object"
+      },
+      "ApprovalResumeCancel": {
+        "description": "One administrative cancellation of an owed resume (the tombstone).",
+        "properties": {
+          "reason": {
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "recovery_key": {
+            "minLength": 1,
+            "title": "Recovery Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "recovery_key"
+        ],
+        "title": "ApprovalResumeCancel",
+        "type": "object"
+      },
+      "ApprovalResumeCancelOut": {
+        "description": "The RECORDED outcome of an administrative resume cancellation.",
+        "properties": {
+          "actor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor"
+          },
+          "approval_id": {
+            "format": "uuid",
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "cancelled_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancelled At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "recovery_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Key"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approval_id",
+          "status",
+          "recovery_key",
+          "reason",
+          "actor",
+          "cancelled_at"
+        ],
+        "title": "ApprovalResumeCancelOut",
         "type": "object"
       },
       "ApprovalRouteBinding": {
@@ -8923,6 +9291,56 @@
         ]
       }
     },
+    "/approvals/identity-report": {
+      "get": {
+        "description": "Per-row facts for every pending approval, plus the declaration skeleton.\n\nA pure read, needing only the platform key, making NO Slack call, and\nexcluding nothing: an ordinarily resolvable row appears here with an empty\nfact list rather than being filtered out, because a reporter that quietly\ndropped rows would be answering a question it cannot answer.",
+        "operationId": "identity_report_approvals_identity_report_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalIdentityReportOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Identity Report",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
     "/approvals/principals/operator": {
       "post": {
         "description": "Mint an operator credential; the platform key authorizes issuance only.\n\nThe token is returned once and marked non-cacheable.  Resolution will\nauthenticate the subject from this credential rather than accepting a\ncaller-supplied actor string.",
@@ -9106,6 +9524,108 @@
         ]
       }
     },
+    "/approvals/{approval_id}/recover": {
+      "post": {
+        "description": "Settle a stranded approval as ``rejected`` and wake its session.\n\nThe compare-and-set, the ``recovery_key`` write and the audit append are one\ntransaction with one commit, so there is no window in which the status\nflipped and the row explaining it does not exist. The resume then rides the\nORDINARY path -- the same runs stream every other resolution uses -- because\na break-glass wake that travelled a private route would be the one wake\nnobody could reason about.",
+        "operationId": "recover_approval_approvals__approval_id__recover_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "approval_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Approval Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Principal"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalRecover"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalRecoveryOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recover Approval",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
     "/approvals/{approval_id}/resolve": {
       "post": {
         "description": "Claim the resolution (resolve-once) and wake the suspended session.\n\nThe authorizer runs first, server-side (#246): the route's approvers decide\nwhether the authenticated principal belongs -- an explicit user list, a\nSlack user group, or (declaring none) the card channel's members (#420).\nRequester equality neither grants nor vetoes membership. Then exactly one\nauthorized resolver wins\nthe conditional UPDATE; a loser gets 409 naming who resolved it, and a\npast-SLA record flips to expired and returns 410 while still enqueuing the\nexpiry resume turn so the suspended session wakes down its timeout branch.\nThe winner's response is sent only after the resume turn is enqueued.",
@@ -9187,6 +9707,108 @@
           }
         },
         "summary": "Resolve Approval",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
+    "/approvals/{approval_id}/resume/cancel": {
+      "post": {
+        "description": "Tombstone an owed resume so no wake for it ever executes.\n\nLegal only while the record is settled and the wake is still owed. A CAS on\n``resumed_at`` alone could not retract a stream entry that already exists,\nso the tombstone is a DATABASE veto the execution side reads, not a queue\noperation. Only a resume that has NEVER started executing can be\ncancelled: once a delivery has recorded execution, this returns 409 naming\nthat record, because nothing here can prove a started execution stopped.\nThe resume must be allowed to complete (the worker's reclaim of an\norphaned delivery interrupts an orphan runner and proves it idle).\nCancelling a started resume is a named follow-up.\n\nIt retains everything: every reply-identity column and every\nprior audit row survives, because a tombstone nobody can explain afterwards\nis worse than the stranded resume it replaced.",
+        "operationId": "cancel_approval_resume_approvals__approval_id__resume_cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "approval_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Approval Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Principal"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Curie Console Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalResumeCancel"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalResumeCancelOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Approval Resume",
         "tags": [
           "approvals"
         ]

@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from channel_protocol import scoped_conversation_id
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1944,7 +1944,13 @@ async def mark_approval_resumed(session: AsyncSession, approval_id: uuid.UUID) -
 
     await session.execute(
         update(Approval)
-        .where(Approval.id == approval_id, Approval.resumed_at.is_(None))
+        .where(
+            Approval.id == approval_id,
+            Approval.resumed_at.is_(None),
+            # A tombstoned wake is never written off as delivered (#2753): the
+            # row must stay visibly un-resumed and visibly cancelled.
+            Approval.resume_cancelled_at.is_(None),
+        )
         .values(resumed_at=func.now())
     )
     await session.commit()
@@ -1987,6 +1993,8 @@ async def reopen_dead_lettered_resume(
             Approval.status.in_(_RESUMABLE_STATUSES),
             Approval.resumed_at.is_not(None),
             Approval.resumed_at < dead_lettered_after,
+            # Never re-open a tombstoned row onto the work-list (#2753).
+            Approval.resume_cancelled_at.is_(None),
         )
         .values(resumed_at=None)
         .returning(Approval.id)
@@ -2030,6 +2038,8 @@ async def claim_resume_row(session: AsyncSession, approval_id: uuid.UUID) -> App
             Approval.purpose != "publication",
             Approval.resumed_at.is_(None),
             Approval.status.in_(_RESUMABLE_STATUSES),
+            # A tombstoned wake is not owed, so it is never claimed (#2753).
+            Approval.resume_cancelled_at.is_(None),
         )
         .with_for_update(skip_locked=True)
     )
@@ -2065,6 +2075,9 @@ async def list_resolved_unresumed(
             Approval.resolved_at.is_not(None),
             Approval.resumed_at.is_(None),
             Approval.resolved_at <= resolved_before,
+            # A tombstoned wake is not owed, so it never enters the
+            # reconciler's work-list (#2753).
+            Approval.resume_cancelled_at.is_(None),
         )
         .order_by(Approval.resolved_at)
         .limit(limit)
@@ -2110,6 +2123,245 @@ async def append_approval_audit(
     await session.commit()
     await session.refresh(entry)
     return entry
+
+
+# --- break-glass recovery (#2753) --------------------------------------------
+#
+# ONE transaction, ONE commit, per operation. ``claim_approval_resolution``
+# commits internally, and so does ``append_approval_audit``; composing the two
+# leaves a crash window in which the status flipped and the audit row that
+# explains it never existed. For a path whose whole justification is that every
+# use is reviewable afterwards, that window is the failure, so these two
+# functions do the compare-and-set, the ``recovery_key`` write and the audit
+# append inside a single ``session.begin()`` block instead of calling either.
+#
+# The audit row is built from the module-level ``ApprovalAuditEntry``, exactly
+# as ``append_approval_audit`` does. That is deliberate and load-bearing: the
+# seam between the CAS and the audit append has to be the same one the existing
+# writer exposes, so a test can interrupt precisely there. A Core ``insert()``
+# here would move the seam.
+
+#: Everything the caller must supply about WHO acted. Recovery takes its actor
+#: from the ADR-0106 operator principal for attribution only; no membership is
+#: consulted and nothing widens.
+_RECOVERY_AUTHORIZER = "approval_recovery"
+
+
+class PublicationSettlementConflict(Exception):
+    """The recovered approval's publication moved under the recovery.
+
+    Raised INSIDE the recovery transaction so the whole administrative act --
+    the approval CAS, the publication settlement and the audit row -- rolls back
+    together. A recovery that settled the approval and left the publication
+    pending would be exactly the stranded effect this path exists to remove.
+    """
+
+
+async def reread_approval(session: AsyncSession, approval_id: uuid.UUID) -> Approval | None:
+    """Read an approval back from the database, not from the identity map.
+
+    An ORM-enabled Core UPDATE expires the columns it touched on any instance
+    already in the session, so a plain ``session.get`` hands back an object
+    whose next attribute access is a lazy load -- which under the async session
+    is a ``MissingGreenlet``, not a refresh. ``claim_approval_resolution``
+    refreshes for the same reason.
+    """
+
+    approval = await session.get(Approval, approval_id)
+    if approval is not None:
+        await session.refresh(approval)
+    return approval
+
+
+async def recover_approval_atomic(
+    session: AsyncSession,
+    approval_id: uuid.UUID,
+    *,
+    reason: str,
+    recovery_key: str,
+    actor: str,
+    actor_channel: str | None,
+    principal_kind: str | None,
+    facts: list[str],
+) -> Approval | None:
+    """Administratively settle a pending approval as ``rejected``, atomically.
+
+    The CAS is guarded on ``status = 'pending'`` exactly as the ordinary
+    resolve-once claim is, plus ``recovery_key IS NULL`` so a row that already
+    carries an administrative outcome is never re-stamped. Returns None when the
+    CAS matched nothing; the caller re-reads to tell a replay (same key, return
+    the recorded outcome) from a genuine conflict.
+
+    ``facts`` are the reporter's OBSERVATIONS, recorded as evidence. They state
+    what was seen about the row. They never assert that the ordinary path was
+    unavailable -- nothing here is in a position to know that.
+    """
+
+    recovered: uuid.UUID | None
+    async with session.begin():
+        # The associated publication, read inside the SAME transaction that
+        # settles the approval. ``claim_approval_resolution`` settles it too,
+        # but it commits internally, so it cannot be reused here: composing it
+        # would put the publication's fate in a second transaction and reopen
+        # the crash window this whole function exists to close.
+        publication = await get_publication_by_approval(session, approval_id)
+        values: dict[str, Any] = {
+            "status": ApprovalStatus.rejected,
+            "resolved_by": actor,
+            "resolution_note": reason,
+            "resolved_at": func.now(),
+            "recovery_key": recovery_key,
+        }
+        if publication is not None:
+            # A publication outcome is reported by the platform worker through
+            # the stored reply route, never by a resumed model turn. Mark the
+            # wake as owing nothing in the same CAS, exactly as the ordinary
+            # resolve path does, so the reconciler never picks the row up for a
+            # resume the router deliberately does not enqueue.
+            values["resumed_at"] = func.now()
+        result = await session.execute(
+            update(Approval)
+            .where(
+                Approval.id == approval_id,
+                Approval.status == ApprovalStatus.pending,
+                Approval.recovery_key.is_(None),
+            )
+            .values(**values)
+            .returning(Approval.id)
+        )
+        recovered = result.scalar_one_or_none()
+        if recovered is None:
+            return None
+        if publication is not None:
+            # The same denial the ordinary reject performs, under the same
+            # version check: status denied, the patch dropped, the terminal
+            # instant recorded. Without it the recovered approval is settled and
+            # its publication waits forever -- the expiry sweeper no longer
+            # selects a rejected approval, and no resume is enqueued to repair
+            # it, so nothing else in the system would ever touch it again.
+            changed = await session.execute(
+                update(Publication)
+                .where(
+                    Publication.id == publication.id,
+                    Publication.status == "pending",
+                    Publication.version == publication.version,
+                )
+                .values(
+                    status="denied",
+                    version=Publication.version + 1,
+                    updated_at=func.now(),
+                    terminal_at=func.now(),
+                    patch_bytes=None,
+                )
+                .returning(Publication.id)
+            )
+            if changed.scalar_one_or_none() is None:
+                raise PublicationSettlementConflict(
+                    "the approval's publication is no longer pending at the "
+                    "version this recovery read; nothing was changed"
+                )
+        entry = ApprovalAuditEntry(
+            approval_id=approval_id,
+            action="administratively_recovered",
+            actor=actor,
+            actor_channel=actor_channel,
+            principal_kind=principal_kind,
+            authenticated=True,
+            decision=ApprovalStatus.rejected,
+            authorizer=_RECOVERY_AUTHORIZER,
+            authorized=True,
+            reason=reason,
+            evidence={
+                "kind": "administrative_recovery",
+                "recovery_key": recovery_key,
+                "facts": facts,
+            },
+        )
+        session.add(entry)
+    return await reread_approval(session, approval_id)
+
+
+async def cancel_approval_resume_atomic(
+    session: AsyncSession,
+    approval_id: uuid.UUID,
+    *,
+    reason: str,
+    recovery_key: str,
+    actor: str,
+    actor_channel: str | None,
+    principal_kind: str | None,
+    facts: list[str],
+) -> Approval | None:
+    """Tombstone an owed resume that has NEVER started executing, atomically
+    with its audit row.
+
+    Legal only while the record is settled (``resolved_at`` set), the wake is
+    still owed (``resumed_at IS NULL``), and no delivery has ever recorded that
+    it started executing it (``resume_executing_at IS NULL``).
+    ``recovery_key IS NULL OR = :recovery_key`` keeps a row that already
+    carries another administrative outcome from being re-stamped by a second
+    intent.
+
+    A started resume is NOT cancellable here. Proving a started execution has
+    stopped needs runner-idleness evidence that only the worker's orphan-runner
+    reclaim produces, so such a resume must be allowed to complete. Cancelling
+    a started resume is a named follow-up.
+
+    Exactness: the worker's execution record (``... WHERE resume_cancelled_at
+    IS NULL``) and this tombstone (``... WHERE resume_executing_at IS NULL``)
+    are conditional writes on the same row, so Postgres serializes them and
+    exactly one wins. Returns None when the predicate does not match; the
+    caller re-reads and reports why.
+
+    This RETAINS. No reply-identity column is cleared and no audit row is
+    removed; the only writes are the tombstone columns and one new audit row.
+    """
+
+    cancelled: uuid.UUID | None
+    async with session.begin():
+        result = await session.execute(
+            update(Approval)
+            .where(
+                Approval.id == approval_id,
+                Approval.resolved_at.is_not(None),
+                Approval.resumed_at.is_(None),
+                Approval.resume_executing_at.is_(None),
+                Approval.resume_cancelled_at.is_(None),
+                or_(
+                    Approval.recovery_key.is_(None),
+                    Approval.recovery_key == recovery_key,
+                ),
+            )
+            .values(
+                resume_cancelled_at=func.now(),
+                resume_cancelled_reason=reason,
+                resume_cancelled_by=actor,
+                recovery_key=recovery_key,
+            )
+            .returning(Approval.id)
+        )
+        cancelled = result.scalar_one_or_none()
+        if cancelled is None:
+            return None
+        entry = ApprovalAuditEntry(
+            approval_id=approval_id,
+            action="resume_cancelled",
+            actor=actor,
+            actor_channel=actor_channel,
+            principal_kind=principal_kind,
+            authenticated=True,
+            decision="resume_cancelled",
+            authorizer=_RECOVERY_AUTHORIZER,
+            authorized=True,
+            reason=reason,
+            evidence={
+                "kind": "administrative_resume_cancellation",
+                "recovery_key": recovery_key,
+                "facts": facts,
+            },
+        )
+        session.add(entry)
+    return await reread_approval(session, approval_id)
 
 
 async def list_approval_audit(

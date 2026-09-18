@@ -56,6 +56,24 @@ class Settings(BaseSettings):
             "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "approval_chat_attester_secret"
         ),
     )
+    # Break-glass approval recovery (#2753). OFF by default, and it is NOT a
+    # credential: there is no second secret and no new auth scheme. Enabling it
+    # widens what the EXISTING platform key can do, deliberately and
+    # installation-wide -- any platform-key holder can then reject an approval
+    # and cancel an owed resume, INCLUDING on approvals the ordinary path could
+    # have resolved perfectly well. That blast radius is accepted rather than
+    # mitigated, because a recovery authority restricted to rows some predicate
+    # calls unrecoverable is useless in exactly the situation nobody foresaw.
+    # What makes the acceptance reviewable is that every use writes its audit
+    # row in the SAME transaction as its effect, so the trail cannot be missing
+    # for an effect that landed. Leave it false except during a recovery.
+    approval_recovery_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "CURIE_APPROVAL_RECOVERY_ENABLED", "approval_recovery_enabled"
+        ),
+    )
+
     # Separate trust boundary for credential redemption. The operator/CLI API
     # key can administer deployments but cannot redeem the GitHub identity.
     internal_worker_token: str = Field(

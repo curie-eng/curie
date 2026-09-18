@@ -1203,6 +1203,24 @@ api:
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
   # expiry sweeper entirely. Default matches the app's built-in 30s cadence.
   approvalSweepIntervalSeconds: 30
+  # Break-glass approval recovery (#2753). OFF by default. Turn it on only for
+  # the duration of a recovery, then turn it off again.
+  #
+  # Read this before enabling it. This is NOT a new credential and NOT a new
+  # authentication scheme: it widens what the EXISTING platform API key can do.
+  # Once enabled, ANY holder of api.apiKey can administratively reject an
+  # approval and cancel an owed resume, ANYWHERE in this installation, INCLUDING
+  # on approvals the ordinary approver set could have resolved perfectly well.
+  # That blast radius is accepted deliberately rather than fenced behind a
+  # predicate: a recovery path restricted to rows something already classifies
+  # as unrecoverable is useless in exactly the situation nobody anticipated.
+  #
+  # What keeps the acceptance reviewable is that every use is audited, and the
+  # audit row is written in the SAME database transaction as its effect, so the
+  # trail can never be missing for an effect that landed. Read it afterwards
+  # with GET /approvals/{id}/audit; the rows carry authorizer=approval_recovery.
+  approvalRecovery:
+    enabled: false
   # How long (seconds) the API reuses a fetched Slack user-group member set when
   # resolving a user-group approver (#420). Default matches the app's built-in
   # 60s. The tradeoff: within the window a member revoked from the group can
@@ -1267,6 +1285,23 @@ api:
     # Apply contract/irreversible migrations. Default false refuses them
     # before mutation so a patch rollback window stays intact (#2300).
     forwardOnly: false
+    # How long the identity-bearing revisions wait to fence `approvals` and
+    # `agent_channels` before refusing (#2753). The fence makes concurrent
+    # intake block and then succeed rather than race the preflight, so this is
+    # the bounded maintenance interval: a writer holding a conflicting lock
+    # longer than this fails the upgrade before anything is mutated, instead of
+    # holding it open. Raise it only if a legitimately long transaction on
+    # those tables is expected during maintenance.
+    fenceLockTimeoutMs: 15000
+    # A Secret carrying `declarations.json`: the operator-authored provenance
+    # declarations the identity revisions honor for approvals whose original
+    # reply identity cannot be reconstructed from any current binding (#2753).
+    # Empty means none are supplied and nothing is mounted, which is the normal
+    # case. A declaration is honored only for a row the preflight could not
+    # reconstruct, is refused for any row it could, and is recorded as an
+    # append-only approval audit entry -- the migration never infers, defaults,
+    # or deletes. See docs/operations.md.
+    provenanceDeclarationsSecret: ""
   # Resume reconciler (#411): the background loop that re-enqueues resume turns
   # for approvals whose inline enqueue failed, so a suspended session is never
   # permanently stranded. `enabled` is the off-switch -- with it false the loop

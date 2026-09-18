@@ -43,6 +43,7 @@ from .resumereconciler import ResumeReconciler
 from .routers import (
     actions,
     agents,
+    approval_recovery,
     approvals,
     bundles,
     channels,
@@ -391,6 +392,9 @@ def create_app() -> FastAPI:
     app.include_router(runs.router)
     app.include_router(state.router)
     app.include_router(memory.router)
+    # BEFORE approvals.router: GET /approvals/identity-report would otherwise
+    # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
+    app.include_router(approval_recovery.router)
     app.include_router(approvals.router)
     app.include_router(actions.router)
     app.include_router(publications.router)

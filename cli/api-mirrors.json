@@ -291,6 +291,16 @@
       "struct": "RoutingCheck",
       "schema": "RoutingCheck",
       "omissions": []
+    },
+    {
+      "struct": "ApprovalRecoveryOutcome",
+      "schema": "ApprovalRecoveryOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalResumeCancellation",
+      "schema": "ApprovalResumeCancelOut",
+      "omissions": []
     }
   ],
   "non_mirrors": [
