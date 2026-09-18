@@ -373,6 +373,8 @@ WORKDIR="$(mktemp -d)"
 LOCAL_PRODUCT_EVIDENCE="$WORKDIR/product-observability-local.json"
 CLUSTER_PRODUCT_EVIDENCE="$WORKDIR/product-observability-cluster.json"
 APPROVAL_SEED_MESSAGE_PID=""
+APPROVAL_SEED_AGENT_ID=""
+APPROVAL_SEED_CHANNEL=""
 
 stop_approval_seed_message() {
     local mode="${1:-wait}" pid code=0
@@ -395,6 +397,10 @@ cleanup() {
     # before stack teardown so an interrupted seed cannot retain the stub port
     # after this run exits.
     stop_approval_seed_message terminate || true
+    if ! cleanup_approval_seed_fixture; then
+        echo "error: could not remove owned approval seed agent" >&2
+        [[ "$code" -ne 0 ]] || code=1
+    fi
     # The compose worker spawns runner containers as SIBLINGS on the host daemon
     # via the mounted docker socket, so a rung that died before `local down` can
     # strand them. This raw sweep is a BACKSTOP, not duplication: `local down`
@@ -1374,13 +1380,13 @@ print(d.get("reply", "") if isinstance(d, dict) else "")
 }
 
 configure_deterministic_approval_seed_route() {
-    local tier="$1" agent_id="$2" routes_file status
+    local tier="$1" agent_id="$2" channel="$3" routes_file status
     routes_file="$(mktemp "$WORKDIR/approval-routes.XXXXXX")" || return 1
-    if ! python3 - "$agent_id" "${CURIE_API_URL:-http://localhost:28000}" "$routes_file" <<'PYROUTES'
+    if ! python3 - "$agent_id" "${CURIE_API_URL:-http://localhost:28000}" "$routes_file" "$channel" <<'PYROUTES'
 import json, os, sys, urllib.error, urllib.request
 from pathlib import Path
 
-agent_id, api_base, routes_path = sys.argv[1:4]
+agent_id, api_base, routes_path, channel = sys.argv[1:5]
 request = urllib.request.Request(
     api_base.rstrip("/") + "/agents",
     headers={"Accept": "application/json", "X-API-Key": os.environ.get("CURIE_API_KEY") or "curie-dev-key"},
@@ -1412,7 +1418,7 @@ if with_notification:
     )
 merged = dict(existing)
 merged["e2e"] = dict(
-    resolution=dict(kind="slack", address="C0EXAMPLE1"),
+    resolution=dict(kind="slack", address=channel),
     approvers=dict(users=["U0EXAMPLE1"]),
 )
 Path(routes_path).write_text(json.dumps(merged, separators=(",", ":")) + "\n")
@@ -1430,6 +1436,77 @@ PYROUTES
     return "$status"
 }
 
+cleanup_approval_seed_fixture() {
+    [[ -n "${APPROVAL_SEED_AGENT_ID:-}" ]] || return 0
+    "$BIN" --json local kill "$APPROVAL_SEED_AGENT_ID" --yes || return 1
+    "$BIN" --json local delete "$APPROVAL_SEED_AGENT_ID" --yes || return 1
+    APPROVAL_SEED_AGENT_ID=""
+    APPROVAL_SEED_CHANNEL=""
+}
+
+prepare_approval_seed_fixture() {
+    local tier="$1" fixture_dir="$WORKDIR/approval-seed-bundle"
+    local fixture_name="approval-seed-$$-$RANDOM"
+    if [[ -n "${APPROVAL_SEED_AGENT_ID:-}" ]]; then
+        echo "seed-invalid: an approval seed fixture is already registered" >&2
+        return 1
+    fi
+    APPROVAL_SEED_CHANNEL="C0E2EAPPROVAL"
+    if ! python3 - "$fixture_dir" "$fixture_name" <<'PYBUNDLE'
+import json, sys
+from pathlib import Path
+
+bundle, name = Path(sys.argv[1]), sys.argv[2]
+(bundle / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+(bundle / "skills" / "approval-seed").mkdir(parents=True, exist_ok=True)
+manifest = dict(
+    name=name,
+    version="0.1.0",
+    description="Deterministic approval resume verification fixture.",
+    systemPrompt="Complete the requested approval verification.",
+    approvalPolicy=dict(gates=[dict(gate="Read", route="e2e", grantableViaPolicy=True)]),
+)
+(bundle / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest) + "\n")
+(bundle / "skills" / "approval-seed" / "SKILL.md").write_text(
+    "---\nname: approval-seed\ndescription: Verify approval suspend and resume.\n"
+    "allowed-tools: Bash\n---\n\nComplete the requested approval verification.\n"
+)
+(bundle / ".mcp.json").write_text('{"mcpServers":{}}\n')
+PYBUNDLE
+    then
+        return 1
+    fi
+    # Register the owned API identity before route configuration or deployment
+    # can fail, so the EXIT cleanup can always remove the transient agent.
+    if ! APPROVAL_SEED_AGENT_ID="$(python3 - "$fixture_name" "$APPROVAL_SEED_CHANNEL" <<'PYAGENT'
+import json, os, sys, urllib.error, urllib.request
+
+name, channel = sys.argv[1:3]
+request = urllib.request.Request(
+    (os.environ.get("CURIE_API_URL") or "http://localhost:28000").rstrip("/") + "/agents",
+    data=json.dumps(dict(name=name, channel=dict(kind="slack", address=channel))).encode(),
+    headers={"Content-Type": "application/json", "X-API-Key": os.environ.get("CURIE_API_KEY") or "curie-dev-key"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        agent = json.load(response)
+except urllib.error.HTTPError as exc:
+    raise SystemExit("POST /agents failed with HTTP %s: %s" % (exc.code, exc.read().decode(errors="replace")))
+except urllib.error.URLError as exc:
+    raise SystemExit("POST /agents failed: %s" % exc.reason)
+agent_id = agent.get("id")
+if not isinstance(agent_id, str) or not agent_id:
+    raise SystemExit("POST /agents omitted the owned fixture id")
+print(agent_id)
+PYAGENT
+    )"; then
+        return 1
+    fi
+    configure_deterministic_approval_seed_route "$tier" "$APPROVAL_SEED_AGENT_ID" "$APPROVAL_SEED_CHANNEL" || return 1
+    "$BIN" --json local deploy --plugin-dir "$fixture_dir"
+}
+
 seed_approval_resume_turn() {
     local tier="$1" agent_id="${2:-}" query_state="${3:-present}" marker="curie-seed-approval-$$-$RANDOM"
     local stream_start stream_end message_file message_stderr_file token_file pending_file approval_id token out trace_id
@@ -1443,6 +1520,11 @@ seed_approval_resume_turn() {
         return 1
     fi
     umask 077
+    if ! prepare_approval_seed_fixture "$tier"; then
+        echo "seed-invalid: could not prepare dedicated approval fixture" >&2
+        return 1
+    fi
+    agent_id="$APPROVAL_SEED_AGENT_ID"
     if ! message_file="$(mktemp "$WORKDIR/approval-message.XXXXXX")"; then
         echo "seed-invalid: could not create private approval message artifact" >&2
         return 1
@@ -1463,11 +1545,6 @@ seed_approval_resume_turn() {
         return 1
     fi
     local scope=()
-    if ! configure_deterministic_approval_seed_route "$tier" "$agent_id"; then
-        rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
-        echo "seed-invalid: could not configure deterministic approval route" >&2
-        return 1
-    fi
     if ! "$BIN" --json "$tier" approvals "$agent_id" "${scope[@]}" \
         --mint-operator-principal U0EXAMPLE1 > "$token_file"; then
         rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"
@@ -1491,7 +1568,7 @@ PY
         rm -f "$message_file" "$message_stderr_file" "$pending_file"
         return 1
     }
-    "$BIN" --json local message --channel C0LOCALDEV --timeout-secs 120 \
+    "$BIN" --json local message --channel "$APPROVAL_SEED_CHANNEL" --timeout-secs 120 \
         "[fake:request-approval:e2e] approve correlation $marker" > "$message_file" 2> "$message_stderr_file" &
     APPROVAL_SEED_MESSAGE_PID=$!
     approval_id=""
@@ -4564,6 +4641,7 @@ rung_local() {
         echo "=== exact approval wait/resolve/resume product-observability seed ==="
         seed_approval_resume_turn local "$agent_id" "$product_query_state"
         [[ "$LAST_APPROVAL_MEMBERSHIP" == "true" ]] || product_membership="false"
+        cleanup_approval_seed_fixture || return 1
     fi
     if [[ "$LIVE" == "1" ]]; then
         echo
@@ -5457,7 +5535,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     done
     local retention_thread retention_context retention_surfaces retention_channel
     retention_context="$(kubectl config current-context)" || return 1
-    retention_surfaces="$("$BIN" --json cluster surfaces "$agent_id" "${ns_rel[@]}" --context "$retention_context")" || return 1
+    retention_surfaces="$("$BIN" --json cluster --context "$retention_context" surfaces "$agent_id" "${ns_rel[@]}")" || return 1
     retention_channel="$(python3 -c '
 import json, sys
 surfaces = json.loads(sys.argv[1]).get("surfaces")
@@ -5472,8 +5550,8 @@ if not isinstance(address, str) or not address or address != address.strip():
 print(address)
 ' "$retention_surfaces")" || return 1
     retention_thread="$(python3 -c 'import time; now = time.time_ns(); print(f"{now // 1_000_000_000}.{(now // 1_000) % 1_000_000:06d}")')"
-    local retention_args=(--json cluster message)
-    retention_args+=("${ns_rel[@]}" --context "$retention_context")
+    local retention_args=(--json cluster --context "$retention_context" message)
+    retention_args+=("${ns_rel[@]}")
     retention_args+=("$PROMPT" --channel "$retention_channel")
     retention_args+=(--thread "$retention_thread" --timeout-secs 300)
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then

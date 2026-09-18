@@ -8,6 +8,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import urllib.request
 import uuid
@@ -427,9 +428,40 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             removed = _run(["docker", "rm", "-f", *connector_ids])
             if removed.returncode:
                 teardown_errors.append(f"connector removal failed: {removed.stderr}")
+        runner_ids = _run(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                "label=curietech.ai/managed-by=curie-sandbox-substrate",
+                "--filter",
+                f"network={project}_runner",
+            ]
+        ).stdout.split()
+        if runner_ids:
+            removed = _run(["docker", "rm", "-f", *runner_ids])
+            if removed.returncode:
+                teardown_errors.append(f"runner removal failed: {removed.stderr}")
         down = _run(compose + ["down", "-v", "--remove-orphans"], env=env, timeout=180)
         if down.returncode:
             teardown_errors.append(f"Compose teardown failed: {down.stdout}\n{down.stderr}")
+        local_source_tags = [
+            f"ghcr.io/curie-eng/curie-{component}:{env['CURIE_LOCAL_IMAGE_TAG']}"
+            for component in ("api", "worker", "dispatcher", "runner")
+        ]
+        local_source_tags.append(f"{project}-curie-worker:latest")
+        owned_source_tags = [
+            tag
+            for tag in local_source_tags
+            if _run(["docker", "image", "inspect", tag]).returncode == 0
+        ]
+        if owned_source_tags:
+            image_rm = _run(["docker", "image", "rm", "-f", *owned_source_tags])
+            if image_rm.returncode:
+                teardown_errors.append(
+                    f"source image cleanup failed: {image_rm.stderr}"
+                )
         existing_tags = [
             tag
             for tag in tags
@@ -504,59 +536,126 @@ run_deploy
     return _run(["bash", "-c", script], env=case.env, timeout=240)
 
 
-def _drive_approval_seed(case: LocalCase, agent_id: str) -> subprocess.CompletedProcess[str]:
+def _configure_approval_seed_route(
+    case: LocalCase,
+    agent_id: str,
+    channel: str = "C0EXAMPLE1",
+) -> subprocess.CompletedProcess[str]:
     source = LADDER.read_text()
-    functions = "\n".join(
-        part
-        for part in (
-            _function(source, "configure_deterministic_approval_seed_route", optional=True),
-            _function(source, "seed_approval_resume_turn"),
-        )
-        if part
-    )
-    resolved = case.root / "approval-seed-resolved"
-    wrapper = case.root / "approval-seed-curie"
-    wrapper.write_text(
-        f"""#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ " $* " == *" local approvals "* && " $* " == *" --list "* ]]; then
-    printf '%s\\n' '{{"pending":[{{"id":"approval-seed","status":"pending","route":"e2e"}}]}}'
-    exit 0
-fi
-if [[ " $* " == *" local approvals "* && " $* " == *" --resolve "* ]]; then
-    : > "$STUB_APPROVAL_SEED_RESOLVED"
-    printf '%s\\n' '{{"status":"approved"}}'
-    exit 0
-fi
-if [[ " $* " == *" local message "* ]]; then
-    while [[ ! -f "$STUB_APPROVAL_SEED_RESOLVED" ]]; do
-        sleep 0.01
-    done
-    printf '%s\\n' '{{"finalized":true,"reply":"approval resumed"}}'
-    exit 0
-fi
-exec {shlex.quote(str(case.binary))} "$@"
-"""
-    )
-    wrapper.chmod(0o755)
     script = f"""set -euo pipefail
-BIN={shlex.quote(str(wrapper))}
+BIN={shlex.quote(str(case.binary))}
+WORKDIR={shlex.quote(str(case.root))}
+{_function(source, "configure_deterministic_approval_seed_route")}
+configure_deterministic_approval_seed_route local {shlex.quote(agent_id)} {shlex.quote(channel)}
+"""
+    return _run(["bash", "-c", script], env=case.env, timeout=120)
+
+
+def _dedicated_approval_seed_source(source: str) -> str:
+    return "\n".join(
+        _function(source, name)
+        for name in (
+            "stop_approval_seed_message",
+            "assert_finalized_reply",
+            "approval_resume_failure_summary",
+            "configure_deterministic_approval_seed_route",
+            "prepare_approval_seed_fixture",
+            "cleanup_approval_seed_fixture",
+            "seed_approval_resume_turn",
+        )
+    )
+
+
+def _start_isolated_approval_seed_worker(case: LocalCase) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        case.env["CURIE_LOCAL_STUB_PORT"] = str(probe.getsockname()[1])
+    env = dict(case.env)
+    env["BUILDX_BUILDER"] = "default"
+    env["CURIE_FAKE_MODEL"] = "1"
+    result = _run(
+        [str(case.binary), "--json", "local", "up", "--minimal", "--build"],
+        env=env,
+        timeout=1800,
+    )
+    _require(result, "starting the isolated local worker for the approval seed")
+
+
+def _drive_dedicated_approval_seed(
+    case: LocalCase,
+    functions: str,
+    parity_agent_id: str,
+) -> subprocess.CompletedProcess[str]:
+    script = f"""set -euo pipefail
+BIN={shlex.quote(str(case.binary))}
 WORKDIR={shlex.quote(str(case.root))}
 LIVE=0
 APPROVAL_SEED_MESSAGE_PID=''
+APPROVAL_SEED_AGENT_ID=''
+APPROVAL_SEED_CHANNEL=''
+{functions}
 capture_stream_cursor() {{ printf 'stream-cursor'; }}
-assert_finalized_reply() {{ return 0; }}
 discover_trace_id_for_seed() {{ printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; }}
 query_exact_seed_trace() {{ LAST_QUERY_MEMBERSHIP=true; return 0; }}
-stop_approval_seed_message() {{ wait "$APPROVAL_SEED_MESSAGE_PID"; }}
-approval_resume_failure_summary() {{ return 0; }}
-{functions}
-seed_approval_resume_turn local {shlex.quote(agent_id)}
+cleanup_seed() {{
+    local code=$?
+    cleanup_approval_seed_fixture || code=$?
+    exit "$code"
+}}
+trap cleanup_seed EXIT
+seed_approval_resume_turn local {shlex.quote(parity_agent_id)} stub
+python3 - "$CURIE_API_URL" "$APPROVAL_SEED_AGENT_ID" "$APPROVAL_SEED_CHANNEL" <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+api_base, agent_id, channel = sys.argv[1:]
+if not agent_id:
+    raise SystemExit("approval seed did not expose APPROVAL_SEED_AGENT_ID")
+if channel != "C0E2EAPPROVAL":
+    raise SystemExit("approval seed did not expose its dedicated Slack channel")
+request = urllib.request.Request(
+    api_base.rstrip("/") + "/agents/" + agent_id,
+    headers={{"Accept": "application/json", "X-API-Key": os.environ["CURIE_API_KEY"]}},
+)
+with urllib.request.urlopen(request, timeout=30) as response:
+    agent = json.load(response)
+route = agent.get("approval_routes", {{}}).get("e2e")
+expected = {{
+    "resolution": {{"kind": "slack", "address": channel}},
+    "notification": None,
+    "approvers": {{"group": None, "users": ["U0EXAMPLE1"]}},
+}}
+if agent.get("name", "").startswith("approval-seed-") is False:
+    raise SystemExit("approval seed did not create an owned agent name")
+if route != expected:
+    raise SystemExit("approval seed did not bind the dedicated explicit-user e2e route")
+for path in ("/agents/" + agent_id + "/versions", "/deployments?agent_id=" + agent_id):
+    request = urllib.request.Request(
+        api_base.rstrip("/") + path,
+        headers={{"Accept": "application/json", "X-API-Key": os.environ["CURIE_API_KEY"]}},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        if not json.load(response):
+            raise SystemExit("approval seed fixture did not deploy its owned agent")
+print("DEDICATED_APPROVAL_SEED_FINALIZED agent=" + agent_id + " channel=" + channel)
+PY
 """
-    env = dict(case.env)
-    env["STUB_APPROVAL_SEED_RESOLVED"] = str(resolved)
-    return _run(["bash", "-c", script], env=env, timeout=240)
+    return _run(["bash", "-c", script], env=case.env, timeout=300)
+
+
+def _approval_seed_failure_category(result: subprocess.CompletedProcess[str]) -> str:
+    output = result.stdout + result.stderr
+    if "awaiting-approval record did not become pending" in output:
+        return "pending_approval_missing"
+    if "deterministic approval resolution command failed" in output:
+        return "approval_resolution_failed"
+    if "approval resolution did not resume to a final reply" in output:
+        return "finalized_reply_missing"
+    if "could not prepare dedicated approval fixture" in output:
+        return "fixture_preparation_failed"
+    return "unclassified"
 
 
 def _json_objects(text: str) -> list[object]:
@@ -643,7 +742,7 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
             }
         },
     )
-    approval_seed = _drive_approval_seed(local_case, agent_id)
+    approval_seed = _configure_approval_seed_route(local_case, agent_id)
     assert approval_seed.returncode == 0, approval_seed.stdout + approval_seed.stderr
     seeded_agent = _api(local_case.api_url, "GET", f"/agents/{agent_id}")
     assert set(seeded_agent["approval_routes"]) == {
@@ -681,7 +780,7 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
         },
     )
     seeded_routes = seeded["approval_routes"]
-    notification_refused = _drive_approval_seed(local_case, agent_id)
+    notification_refused = _configure_approval_seed_route(local_case, agent_id)
     assert notification_refused.returncode == 1, (
         notification_refused.stdout + notification_refused.stderr
     )
@@ -754,3 +853,57 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
         stock_receipt["deployment"]["id"],
         receipt["deployment"]["id"],
     }
+
+
+@pytest.mark.parametrize("local_case", ["local"], indirect=True)
+def test_dedicated_approval_seed_prepares_and_resumes_an_owned_local_agent(
+    local_case: LocalCase,
+) -> None:
+    functions = _dedicated_approval_seed_source(LADDER.read_text())
+    suffix = uuid.uuid4().hex[:10]
+    sentinel = _api(
+        local_case.api_url,
+        "POST",
+        "/agents",
+        {
+            "name": f"approval-seed-parity-{suffix}",
+            "channel": {"kind": "slack", "address": f"C0{suffix.upper()}"},
+            "approval_routes": {
+                "restricted": {
+                    "resolution": {"kind": "slack", "address": "C0PARITYROUTE"},
+                    "approvers": {"users": ["U0PARITYUSER"]},
+                }
+            },
+        },
+    )
+    parity_agent_id = sentinel["id"]
+    before_routes = sentinel["approval_routes"]
+    assert _api(local_case.api_url, "GET", f"/agents/{parity_agent_id}/versions") == []
+    assert _api(local_case.api_url, "GET", f"/deployments?agent_id={parity_agent_id}") == []
+    _start_isolated_approval_seed_worker(local_case)
+
+    try:
+        completed = _drive_dedicated_approval_seed(local_case, functions, parity_agent_id)
+        assert completed.returncode == 0, (
+            "dedicated approval lifecycle failed with category="
+            f"{_approval_seed_failure_category(completed)}"
+        )
+        match = re.search(
+            r"DEDICATED_APPROVAL_SEED_FINALIZED agent=([^\s]+) channel=(C0E2EAPPROVAL)",
+            completed.stdout,
+        )
+        assert match, completed.stdout
+        agent_id, channel = match.groups()
+        assert channel == "C0E2EAPPROVAL"
+        agents = _api(local_case.api_url, "GET", "/agents")
+        assert all(agent["id"] != agent_id for agent in agents)
+        parity_agent = _api(local_case.api_url, "GET", f"/agents/{parity_agent_id}")
+        assert parity_agent["approval_routes"] == before_routes
+        assert _api(local_case.api_url, "GET", f"/agents/{parity_agent_id}/versions") == []
+        assert _api(
+            local_case.api_url,
+            "GET",
+            f"/deployments?agent_id={parity_agent_id}",
+        ) == []
+    finally:
+        _api(local_case.api_url, "DELETE", f"/agents/{parity_agent_id}")

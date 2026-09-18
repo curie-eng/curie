@@ -1915,6 +1915,31 @@ fn cluster_rung_proves_the_post_eval_claim_without_cutting_the_reply_budget() {
     );
 }
 
+#[test]
+fn cluster_context_precedes_message_in_the_real_cli_grammar() {
+    let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args([
+            "--json",
+            "cluster",
+            "--context",
+            "ctx",
+            "message",
+            "retention",
+            "--help",
+        ])
+        .output()
+        .expect("run cluster message help through the compiled CLI");
+    let help = transcript(&output);
+    assert!(
+        output.status.success(),
+        "a cluster scoped context must parse before message: {help}"
+    );
+    assert!(
+        help.contains("Drive the deployed Kubernetes release end to end"),
+        "the parsed command must reach cluster message help: {help}"
+    );
+}
+
 fn run_retention_claim_assertion(log: &str) -> Output {
     let harness = tempfile::tempdir().expect("create retention claim harness directory");
     let log_file = harness.path().join("worker.log");
@@ -2112,6 +2137,18 @@ require_retention_context() {
         echo "unexpected retention context: $context" >&2
         exit 97
     fi
+}
+
+require_parent_retention_context() {
+    expect_context="${STUB_EXPECT_CONTEXT:-stub-context}"
+    case "$*" in
+        "--json cluster --context $expect_context message "*)
+            ;;
+        *)
+            echo "retention context must be scoped to cluster before message: $*" >&2
+            exit 97
+            ;;
+    esac
 }
 
 require_retention_channel() {
@@ -2356,7 +2393,7 @@ print(json.dumps({
         printf '%s' "$bundle_dir" > "$STUB_STATE/last_plugin_dir"
         emit_deploy "${STUB_CLUSTER_SHA256:-$(sha_of_bundle "$bundle_dir")}"
         ;;
-    "--json cluster surfaces $STUB_AGENT_ID --namespace "*)
+    "--json cluster --context ${STUB_EXPECT_CONTEXT:-stub-context} surfaces $STUB_AGENT_ID --namespace "*)
         require_expected_ns_rel "$@"
         require_retention_context
         printf '{"agent":"%s","surfaces":[{"kind":"slack","address":"%s"}],"changed":false}\n' \
@@ -2365,9 +2402,10 @@ print(json.dumps({
     "--json local message "*)
         printf '%s\n' '{"finalized":true,"reply":"stub local weather reply"}'
         ;;
-    "--json cluster message "*)
+    "--json cluster --context ${STUB_EXPECT_CONTEXT:-stub-context} message "*|"--json cluster message "*)
         require_expected_ns_rel "$@"
         if [ -n "$thread_key" ]; then
+            require_parent_retention_context "$@"
             require_retention_context
             require_retention_channel
             printf '%s' "$thread_key" > "$STUB_STATE/retention-thread"
@@ -2854,7 +2892,6 @@ fn run_approval_seed_route_harness(
     refuse_route_mutation: bool,
 ) -> Output {
     let helper = ladder_function("configure_deterministic_approval_seed_route");
-    let seed = ladder_function("seed_approval_resume_turn");
     let curie = harness.join("approval-seed-curie");
     write_executable(
         &curie,
@@ -2880,31 +2917,6 @@ if [ -n "$route_file" ]; then
     exit 0
 fi
 
-case " $* " in
-    *" --route-resolution "*)
-        printf '%s\n' '{"error":"seed route mutation rejected","fix":"keep the existing route map"}'
-        exit 22
-        ;;
-    *" --mint-operator-principal "*)
-        printf '%s\n' '{"operator_principal":{"token":"approval-seed-token"}}'
-        exit 0
-        ;;
-    *" --list "*)
-        printf '%s\n' '{"pending":[{"id":"approval-seed","status":"pending","route":"e2e"}]}'
-        exit 0
-        ;;
-    *" --resolve "*)
-        : > "$STUB_APPROVAL_SEED_RESOLVED"
-        printf '%s\n' '{"status":"approved"}'
-        exit 0
-        ;;
-    *" local message "*)
-        while [ ! -f "$STUB_APPROVAL_SEED_RESOLVED" ]; do sleep 0.01; done
-        printf '%s\n' '{"finalized":true,"reply":"approval resumed"}'
-        exit 0
-        ;;
-esac
-
 printf 'unexpected approval seed command: %s\n' "$*" >&2
 exit 97
 "#,
@@ -2914,26 +2926,16 @@ exit 97
         "set -euo pipefail\n".to_owned(),
         format!("BIN={}\n", sh_single_quote(&curie)),
         format!("WORKDIR={}\n", sh_single_quote(harness)),
-        "LIVE=0\nAPPROVAL_SEED_MESSAGE_PID=''\n".to_owned(),
-        "capture_stream_cursor() { printf 'stream-cursor'; }\n".to_owned(),
-        "assert_finalized_reply() { return 0; }\n".to_owned(),
-        "discover_trace_id_for_seed() { printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; }\n".to_owned(),
-        "query_exact_seed_trace() { LAST_QUERY_MEMBERSHIP=true; return 0; }\n".to_owned(),
-        "stop_approval_seed_message() { wait \"$APPROVAL_SEED_MESSAGE_PID\"; }\n".to_owned(),
-        "approval_resume_failure_summary() { return 0; }\n".to_owned(),
         helper,
-        seed,
-        format!("seed_approval_resume_turn local {AGENT_ID}\n"),
+        format!("configure_deterministic_approval_seed_route local {AGENT_ID} C0EXAMPLE1\n"),
     ]
     .concat();
-    let resolved = harness.join("approval-seed-resolved");
     Command::new("bash")
         .arg("-c")
         .arg(script)
         .env("CURIE_API_URL", api_url)
         .env("CURIE_API_KEY", "curie-dev-key")
         .env("STUB_ROUTE_MAP", route_map)
-        .env("STUB_APPROVAL_SEED_RESOLVED", resolved)
         .env(
             "STUB_REFUSE_ROUTE_MUTATION",
             if refuse_route_mutation { "1" } else { "0" },
@@ -4241,18 +4243,18 @@ fn cluster_ladder_uses_the_bound_channel_and_captured_context_for_retention() {
     );
     assert!(
         invocations.lines().any(|line| {
-            line.starts_with(&format!("--json cluster surfaces {AGENT_ID} "))
+            line.starts_with(&format!(
+                "--json cluster --context stub-context surfaces {AGENT_ID} "
+            ))
                 && line.contains("--namespace curie")
                 && line.contains("--release curie")
-                && line.contains("--context stub-context")
         }),
         "the ladder must query this deployed agent's bound surfaces through the captured context: {invocations}"
     );
     assert!(
         invocations.lines().any(|line| {
-            line.starts_with("--json cluster message ")
+            line.starts_with("--json cluster --context stub-context message ")
                 && line.contains("--channel C0BOUND")
-                && line.contains("--context stub-context")
                 && line.contains("--thread ")
         }),
         "the post-eval message must use the surfaced channel and captured context: {invocations}"
@@ -4303,7 +4305,7 @@ fn cluster_ladder_rejects_missing_or_unrelated_post_eval_worker_claims() {
         );
         assert!(
             invocations.lines().any(|line| {
-                line.starts_with("--json cluster message ")
+                line.starts_with("--json cluster --context stub-context message ")
                     && line.contains("--thread ")
                     && line.contains("--timeout-secs 300")
             }),
