@@ -51,7 +51,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from aci_protocol import Attachment
@@ -293,6 +293,18 @@ class PreparedAttachments:
     object_keys: tuple[str, ...]
     retention_expires_at_epoch: int
 
+    #: Which durable owner record in the retention ledger this exact resolve
+    #: wrote. Two workers resolving the same thread outside the route lock can
+    #: produce byte-identical field values, and each still has to be able to
+    #: discard ITS OWN record without touching the other's, so identity comes
+    #: from a token minted per construction rather than from the fields. It is
+    #: excluded from ``init`` so the three-argument constructor is unchanged,
+    #: and from ``compare``/``repr`` so equality, hashing and logging are what
+    #: they were before it existed.
+    _owner_token: str = field(
+        init=False, compare=False, repr=False, default_factory=lambda: uuid.uuid4().hex
+    )
+
     def claim_env(self) -> dict[str, str]:
         """The claim-env contribution, EMPTY for a turn carrying no files.
 
@@ -329,16 +341,21 @@ class _AttachmentSet:
         ).encode("utf-8")
 
     @classmethod
-    def decode(
-        cls, payload: bytes, *, expected_thread_key: str | None = None
-    ) -> _AttachmentSet:
+    def decode(cls, payload: bytes) -> _AttachmentSet:
+        """Decode one owner record, taking the thread it names at face value.
+
+        There is deliberately no expected-thread argument. Every discovery path
+        is one scan of the whole ledger prefix, so the decoder meets other
+        threads' records constantly; refusing them here would turn any
+        neighbour's record into a failure of this thread's discard or reap.
+        Callers filter on the decoded ``thread_key`` instead.
+        """
+
         try:
             raw = json.loads(payload)
             if raw.get("version") != 1:
                 raise ValueError("unsupported attachment record version")
             thread_key = str(raw["thread_key"])
-            if expected_thread_key is not None and thread_key != expected_thread_key:
-                raise ValueError("attachment record names a different thread")
             object_keys = tuple(str(key) for key in raw["object_keys"])
             record = cls(
                 thread_key=thread_key,
@@ -363,9 +380,15 @@ class _AttachmentSet:
 
 @dataclass(frozen=True)
 class AttachmentReapCandidate:
-    """Exact expired ledger observed before its potentially slow object cleanup."""
+    """The exact expired owners observed, before their slow object cleanup.
 
-    record: _AttachmentSet
+    Opaque to the kernel, which only carries it from ``begin`` to ``finish``
+    across its lock renewal and reads no field of it. The snapshots are what
+    ``finish`` is allowed to delete and nothing else: an owner that appeared
+    after this was taken was never observed, so it is not this reap's to touch.
+    """
+
+    owners: tuple[tuple[str, _AttachmentSet], ...]
     deleted_object_keys: tuple[str, ...]
 
 
@@ -713,22 +736,35 @@ class AttachmentCoordinator:
 
         The caller knows the exact bytes it prepared but not whether another
         worker resolved a later turn for the same thread while the route was
-        being decided.  Its own objects are always safe to remove; the sibling
-        ledger is removed only when it is still the exact record for this set.
+        being decided.  Its OWN owner record is always safe to remove, because
+        the token identifies exactly the record this resolve wrote; its objects
+        are not, because a concurrent resolve on the same generation parks under
+        the same keys and names them in a record of its own.
+
+        The ledger is therefore read AFTER the owner record is gone and BEFORE
+        any object is deleted. The old order deleted the bytes first and only
+        then asked who owned them, which is how a discard could destroy the
+        objects a live turn was about to install.
         """
 
+        if not prepared.object_keys:
+            # An empty set owns no bytes, so it wrote no owner record and has
+            # nothing to protect against. Returning here keeps the common
+            # file-free turn at exactly zero store calls.
+            return
+
         with self._lock:
-            self._discard(prepared.object_keys)
-            current = self._load(thread_key)
-            expected = _AttachmentSet(
-                thread_key=thread_key,
-                refs=prepared.refs,
-                object_keys=prepared.object_keys,
-                expires_at_epoch=prepared.retention_expires_at_epoch,
+            # Idempotent: the store treats a delete of an absent key as done,
+            # so a retried discard is not an error.
+            self.objects.delete(self._owner_key(thread_key, prepared._owner_token))
+            protected: set[str] = set()
+            for _key, record in self._scan_owners():
+                if record.thread_key != thread_key:
+                    continue
+                protected.update(record.object_keys)
+            self._discard(
+                key for key in dict.fromkeys(prepared.object_keys) if key not in protected
             )
-            if current != expected:
-                return
-            self.objects.delete(self._ledger_key(thread_key))
 
     @staticmethod
     def _object_key(*, agent_id: str, generation: str, index: int) -> str:
@@ -745,65 +781,120 @@ class AttachmentCoordinator:
     # -- retention ----------------------------------------------------------
 
     def current(self, thread_key: str) -> _AttachmentSet | None:
-        """The retained set for this thread, or None once it has lapsed.
+        """The retained set for this thread, or None once every owner has lapsed.
+
+        Several owners can name one thread at once -- two workers resolving the
+        same turn, or a replaced set still inside its retention window -- so
+        "the" set is the unexpired owner with the greatest expiry, with the
+        owner key breaking a tie so the answer is stable rather than dependent
+        on listing order.
 
         A read path never mutates an expiry it observed: reaping is a separate
         enumerate -> distributed-lock -> exact re-read operation, so a fresh
         resolve landing beside this read cannot be deleted by it.
         """
 
-        with self._lock:
-            record = self._load(thread_key)
-            if record is None or record.expires_at_epoch <= int(self._clock()):
-                return None
-            return record
-
-    def enumerate_expired(self) -> list[str]:
-        """Snapshot expired thread ids without mutating their durable ledgers."""
-
-        expired: list[str] = []
         now = int(self._clock())
         with self._lock:
-            for ledger_key in tuple(self.objects.list_keys(ATTACHMENT_LEDGER_PREFIX)):
-                record = self._load_key(ledger_key)
-                if record.expires_at_epoch <= now:
-                    expired.append(record.thread_key)
-        return sorted(expired)
+            best: tuple[tuple[int, str], _AttachmentSet] | None = None
+            for key, record in self._scan_owners():
+                if record.thread_key != thread_key or record.expires_at_epoch <= now:
+                    continue
+                rank = (record.expires_at_epoch, key)
+                if best is None or rank > best[0]:
+                    best = (rank, record)
+            return None if best is None else best[1]
+
+    def enumerate_expired(self) -> list[str]:
+        """Snapshot expired thread ids without mutating their durable ledgers.
+
+        Deduplicated: a thread with three expired owners is still one thread to
+        reap, and the sweep below removes all of them in one pass.
+        """
+
+        now = int(self._clock())
+        with self._lock:
+            return sorted(
+                {
+                    record.thread_key
+                    for _key, record in self._scan_owners()
+                    if record.expires_at_epoch <= now
+                }
+            )
 
     def begin_expired_reap(self, thread_key: str) -> AttachmentReapCandidate | None:
-        """Re-read one expiry and delete only the objects that snapshot names.
+        """Re-read this thread's owners and delete only what no live one names.
 
-        The enumeration above is advisory, so this re-reads the exact ledger: a
-        set recorded by another worker after the snapshot must not be deleted
-        out from under a live turn.
+        The enumeration above is advisory, so this re-reads the ledger: a set
+        recorded by another worker after the snapshot is a LIVE owner here and
+        protects every object key it names, including a key an expired owner
+        names too. Deleting per expired set instead would take bytes out from
+        under a turn that is still entitled to them.
         """
 
+        now = int(self._clock())
         with self._lock:
-            record = self._load(thread_key)
-            if record is None or record.expires_at_epoch > int(self._clock()):
+            expired: list[tuple[str, _AttachmentSet]] = []
+            protected: set[str] = set()
+            for key, record in self._scan_owners():
+                if record.thread_key != thread_key:
+                    continue
+                if record.expires_at_epoch <= now:
+                    expired.append((key, record))
+                else:
+                    protected.update(record.object_keys)
+            if not expired:
                 return None
             deleted: list[str] = []
-            for key in dict.fromkeys(record.object_keys):
+            for key in dict.fromkeys(
+                object_key for _owner, record in expired for object_key in record.object_keys
+            ):
+                if key in protected:
+                    continue
                 self.objects.delete(key)
                 deleted.append(key)
-            return AttachmentReapCandidate(record=record, deleted_object_keys=tuple(deleted))
+            return AttachmentReapCandidate(
+                owners=tuple(expired), deleted_object_keys=tuple(deleted)
+            )
 
     def finish_expired_reap(self, candidate: AttachmentReapCandidate) -> bool:
-        """Delete only the UNCHANGED ledger, after the caller fences its lock.
+        """Delete only the UNCHANGED owners, after the caller fences its lock.
 
         The object deletes in ``begin`` can outlive the original lease, so the
-        exact-record comparison is the second fence behind the route lock: a
-        fresh resolve landing between the two halves survives.
+        exact-record comparison is the second fence behind the route lock. It is
+        per owner and by key, not by thread: a fresh resolve between the two
+        halves mints its own record and leaves every observed one untouched, so
+        the sweep completes instead of abandoning a genuinely expired set. An
+        observed owner that is gone or different was discarded or rewritten
+        under this reap, and the answer is False rather than a delete of
+        whatever occupies the thread now.
         """
 
         with self._lock:
-            current = self._load(candidate.record.thread_key)
-            if current != candidate.record:
-                return False
-            self.objects.delete(self._ledger_key(candidate.record.thread_key))
-            return True
+            intact = True
+            for key, record in candidate.owners:
+                try:
+                    observed = self._load_key(key)
+                except Exception as exc:
+                    if self._is_missing_object(exc):
+                        intact = False
+                        continue
+                    raise
+                if observed != record:
+                    intact = False
+                    continue
+                self.objects.delete(key)
+            return intact
 
     def _record(self, thread_key: str, prepared: PreparedAttachments) -> None:
+        """Write this resolve's own immutable owner record, exactly once.
+
+        One key per resolve rather than one per thread. A single mutable
+        ``_attachments/<digest>.json`` made the last writer the only owner, so
+        the other worker's installed objects were named by nothing -- beyond the
+        reach of every sweep and every discard. The payload is unchanged v1.
+        """
+
         with self._lock:
             record = _AttachmentSet(
                 thread_key=thread_key,
@@ -811,31 +902,54 @@ class AttachmentCoordinator:
                 object_keys=prepared.object_keys,
                 expires_at_epoch=prepared.retention_expires_at_epoch,
             )
-            self.objects.put_stream(self._ledger_key(thread_key), (record.encode(),))
+            self.objects.put_stream(
+                self._owner_key(thread_key, prepared._owner_token), (record.encode(),)
+            )
 
     @staticmethod
-    def _ledger_key(thread_key: str) -> str:
+    def _owner_key(thread_key: str, owner_token: str) -> str:
+        """The immutable key this resolve's record lives at, derived not stored.
+
+        The thread digest keeps a thread's owners together for a human reading
+        the bucket; the token is what makes the key unique per resolve.
+        """
+
         digest = hashlib.sha256(thread_key.encode("utf-8")).hexdigest()
-        return f"{ATTACHMENT_LEDGER_PREFIX}/{digest}.json"
+        return f"{ATTACHMENT_LEDGER_PREFIX}/{digest}/{owner_token}.json"
 
-    def _load(self, thread_key: str) -> _AttachmentSet | None:
-        key = self._ledger_key(thread_key)
-        try:
-            return self._load_key(key, expected_thread_key=thread_key)
-        except Exception as exc:
-            if self._is_missing_object(exc):
-                return None
-            raise
+    def _scan_owners(self) -> Iterator[tuple[str, _AttachmentSet]]:
+        """THE owner discovery path: one listing of the whole ledger prefix.
 
-    def _load_key(
-        self, key: str, *, expected_thread_key: str | None = None
-    ) -> _AttachmentSet:
+        Never a listing of one thread's subprefix. ``list_keys`` matches on
+        ``<prefix>/``, so scoping the scan to ``<prefix>/<digest>`` would walk
+        straight past the pre-upgrade ``<prefix>/<digest>.json`` record that is
+        already in the bucket of every deployment that ran the mutable ledger,
+        and strand its objects forever. One scan and one decoder means an old
+        record and a new one are the same thing to every caller, with no
+        migration step and no second code path to keep honest.
+
+        A key can be deleted by another worker's discard or reap between the
+        listing and the read, which is ordinary rather than exceptional, so a
+        missing object is skipped. Nothing else is: a record that is present but
+        undecodable is a real fault and still raises.
+        """
+
+        for key in tuple(self.objects.list_keys(ATTACHMENT_LEDGER_PREFIX)):
+            try:
+                record = self._load_key(key)
+            except Exception as exc:
+                if self._is_missing_object(exc):
+                    continue
+                raise
+            yield key, record
+
+    def _load_key(self, key: str) -> _AttachmentSet:
         payload = b"".join(self.objects.get_stream(key))
         if len(payload) > 256 * 1024:
             raise AttachmentResolutionError(
                 "retention-ledger", "private attachment record is oversized"
             )
-        return _AttachmentSet.decode(payload, expected_thread_key=expected_thread_key)
+        return _AttachmentSet.decode(payload)
 
     @staticmethod
     def _is_missing_object(exc: Exception) -> bool:
