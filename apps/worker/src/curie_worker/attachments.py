@@ -320,7 +320,13 @@ class PreparedAttachments:
 
 @dataclass(frozen=True)
 class _AttachmentSet:
-    """The durable retention record for one thread's latest resolved set."""
+    """The durable retention record for ONE resolved set, not one thread.
+
+    A thread can have several of these at once -- two workers resolving the same
+    turn, or a replaced set still inside its retention window -- and each names
+    only the objects its own resolve parked. That is what keeps an installed set
+    owned, and therefore sweepable, after a later resolve supersedes it.
+    """
 
     thread_key: str
     refs: tuple[AttachmentRef, ...]
