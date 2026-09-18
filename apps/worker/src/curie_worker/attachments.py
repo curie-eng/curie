@@ -813,13 +813,12 @@ class AttachmentCoordinator:
 
         now = int(self._clock())
         with self._lock:
-            best: tuple[tuple[int, str], _AttachmentSet] | None = None
-            for key, record in self._scan_owners():
-                if record.thread_key != thread_key or record.expires_at_epoch <= now:
-                    continue
-                rank = (record.expires_at_epoch, key)
-                if best is None or rank > best[0]:
-                    best = (rank, record)
+            live = (
+                (key, record)
+                for key, record in self._scan_owners()
+                if record.thread_key == thread_key and record.expires_at_epoch > now
+            )
+            best = max(live, key=lambda owned: (owned[1].expires_at_epoch, owned[0]), default=None)
             return None if best is None else best[1]
 
     def enumerate_expired(self) -> list[str]:
