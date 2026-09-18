@@ -2271,6 +2271,12 @@ run_matrix() {
         return 0
     fi
     run_install_086
+    # The recovery scenario deploys the fixture bundle that DECLARES the gated
+    # route; the default coder bundle gates nothing, so no approval would ever
+    # be raised (#2753).
+    if [[ "$SCENARIO" == "approval-recovery" ]]; then
+        PLUGIN_DIR="$RECOVERY_PLUGIN_DIR"
+    fi
     deploy_agent || true
     send_turn "2426 seed turn before upgrade" || true
     # Seeded BEFORE the candidate upgrade so the rows genuinely cross the
