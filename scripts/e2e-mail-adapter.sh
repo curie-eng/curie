@@ -118,9 +118,6 @@ create_inbox denied
 [[ "$(<"$TMP/adapter-id")" != "$(<"$TMP/allowed-id")" ]] \
   || fail "external E2E unmet: disposable inbox isolation probe returned duplicate ids"
 
-AGENTMAIL_CIDRS_JSON="$(getent ahostsv4 api.agentmail.to | awk '{print $1"/32"}' | sort -u | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"
-[[ "$AGENTMAIL_CIDRS_JSON" != "[]" ]] || fail "could not resolve AgentMail HTTPS CIDRs"
-
 kubectl --context "$CONTEXT" create namespace "$NAMESPACE" >/dev/null
 kubectl --context "$CONTEXT" label namespace "$NAMESPACE" "$OWNED_LABEL=true" --overwrite >/dev/null
 
@@ -128,7 +125,7 @@ write_values() {
   local deploy_mail="$1" token_file="${2:-}"
   KEY_FILE="$KEY_FILE" TOKEN_FILE="$token_file" VALUES_FILE="$VALUES_FILE" \
     ADAPTER_EMAIL_FILE="$TMP/adapter-email" ALLOWED_EMAIL_FILE="$TMP/allowed-email" \
-    AGENTMAIL_CIDRS_JSON="$AGENTMAIL_CIDRS_JSON" IMAGE="$IMAGE" DEPLOY_MAIL="$deploy_mail" \
+    IMAGE="$IMAGE" DEPLOY_MAIL="$deploy_mail" \
     python3 - <<'PY'
 import json, os
 
@@ -159,7 +156,9 @@ values = {
         "agentmail": {
             "apiKey": open(os.environ["KEY_FILE"]).read(),
             "baseUrl": "https://api.agentmail.to/v0",
-            "httpsCidrs": json.loads(os.environ["AGENTMAIL_CIDRS_JSON"]),
+            # Resolved /32 pins go stale when CloudFront moves
+            # api.agentmail.to (#2824), so this run uses the CDN-safe mode.
+            "egressMode": "publicHttps",
         },
         "persistence": {"size": "1Gi", "storageClass": "", "existingClaim": ""},
     },
